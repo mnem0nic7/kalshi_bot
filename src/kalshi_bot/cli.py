@@ -61,7 +61,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "stream":
-            markets = args.markets or [mapping.market_ticker for mapping in container.weather_directory.all()]
+            markets = args.markets or await container.discovery_service.list_stream_markets()
             processed = await container.stream_service.stream(
                 market_tickers=markets,
                 include_private=not args.public_only,

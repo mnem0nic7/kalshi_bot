@@ -32,13 +32,16 @@ services:
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      KALSHI_READ_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
-      KALSHI_WRITE_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
+      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
+      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      - ${KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}:ro
+      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     restart: "no"
 
   app_blue:
@@ -57,13 +60,16 @@ services:
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      KALSHI_READ_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
-      KALSHI_WRITE_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
+      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
+      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      - ${KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}:ro
+      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     expose:
       - "8000"
     restart: unless-stopped
@@ -84,13 +90,16 @@ services:
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      KALSHI_READ_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
-      KALSHI_WRITE_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
+      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
+      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      - ${KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}:ro
+      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     expose:
       - "8000"
     restart: unless-stopped
@@ -112,13 +121,16 @@ services:
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      KALSHI_READ_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
-      KALSHI_WRITE_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
+      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
+      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      - ${KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}:ro
+      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     restart: unless-stopped
 
   daemon_green:
@@ -138,13 +150,16 @@ services:
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      KALSHI_READ_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
-      KALSHI_WRITE_PRIVATE_KEY_PATH: ${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}
+      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
+      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      - ${KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi.pem}:ro
+      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     restart: unless-stopped
 
   nginx:

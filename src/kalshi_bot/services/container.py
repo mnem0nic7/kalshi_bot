@@ -99,6 +99,7 @@ class AppContainer:
             settings,
             session_factory,
             weather_directory,
+            discovery_service,
             stream_service,
             reconciliation_service,
             research_coordinator,

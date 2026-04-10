@@ -97,9 +97,9 @@ class WorkflowSupervisor:
             await session.commit()
 
             try:
-                mapping = self.weather_directory.get(room.market_ticker)
                 market_response = await self.kalshi.get_market(room.market_ticker)
                 market = market_response.get("market", market_response)
+                mapping = self.weather_directory.resolve_market(room.market_ticker, market)
                 weather_bundle = (
                     await self.weather.build_market_snapshot(mapping)
                     if mapping is not None and mapping.supports_structured_weather

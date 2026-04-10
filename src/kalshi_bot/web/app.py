@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, TypeVar
 
@@ -18,6 +19,7 @@ from kalshi_bot.services.container import AppContainer
 
 templates = Jinja2Templates(directory="src/kalshi_bot/web/templates")
 ModelT = TypeVar("ModelT", bound=BaseModel)
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -152,19 +154,45 @@ def create_app() -> FastAPI:
             await session.commit()
         dossiers_by_market = {record.market_ticker: record.payload for record in dossier_records}
         configured_markets = []
+        try:
+            discoveries = await app_container.discovery_service.discover_configured_markets()
+        except Exception:
+            logger.exception("Failed to load live market discovery for index page")
+            discoveries = []
+        seen_markets: set[str] = set()
+        for discovery in discoveries:
+            configured_markets.append(
+                {
+                    "market_ticker": discovery.mapping.market_ticker,
+                    "label": discovery.mapping.label,
+                    "market_type": discovery.mapping.market_type,
+                    "status": discovery.status,
+                    "can_trade": discovery.can_trade,
+                    "notes": discovery.notes,
+                    "series_ticker": discovery.mapping.series_ticker,
+                    "dossier": dossiers_by_market.get(discovery.mapping.market_ticker),
+                }
+            )
+            seen_markets.add(discovery.mapping.market_ticker)
         for mapping in app_container.weather_directory.all():
+            if mapping.market_ticker in seen_markets:
+                continue
             configured_markets.append(
                 {
                     "market_ticker": mapping.market_ticker,
                     "label": mapping.label,
                     "market_type": mapping.market_type,
+                    "status": "configured",
+                    "can_trade": False,
+                    "notes": ["No live market snapshot loaded yet."],
+                    "series_ticker": mapping.series_ticker,
                     "dossier": dossiers_by_market.get(mapping.market_ticker),
                 }
             )
         return templates.TemplateResponse(
+            request,
             "index.html",
             {
-                "request": request,
                 "rooms": rooms,
                 "control": control,
                 "positions": positions,
@@ -213,9 +241,9 @@ def create_app() -> FastAPI:
             research_runs = await repo.list_research_runs(market_ticker=room.market_ticker, limit=5)
             await session.commit()
         return templates.TemplateResponse(
+            request,
             "room.html",
             {
-                "request": request,
                 "room": room,
                 "messages": messages,
                 "research_dossier": (dossier_artifact.payload if dossier_artifact is not None else latest_dossier.payload if latest_dossier is not None else None),

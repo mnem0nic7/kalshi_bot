@@ -176,9 +176,9 @@ class ResearchCoordinator:
             await session.commit()
 
             try:
-                mapping = self.weather_directory.get(market_ticker)
                 market_response = await self.kalshi.get_market(market_ticker)
                 market = _coerce_market(market_response)
+                mapping = self.weather_directory.resolve_market(market_ticker, market)
                 await repo.log_exchange_event("research", "market_snapshot", market_response, market_ticker=market_ticker)
 
                 weather_bundle: dict[str, Any] | None = None
@@ -265,7 +265,7 @@ class ResearchCoordinator:
                 raise
 
     async def handle_market_update(self, market_ticker: str) -> None:
-        if self.weather_directory.get(market_ticker) is None:
+        if not self.weather_directory.supports_market_ticker(market_ticker):
             return
         if market_ticker in self._inflight_markets:
             return

@@ -39,15 +39,17 @@ Typical operational loop:
 ```bash
 kalshi-bot-cli init-db
 kalshi-bot-cli discover
-kalshi-bot-cli stream --markets WEATHER-NYC-HIGH-80F --max-messages 100
+kalshi-bot-cli stream --max-messages 100
 kalshi-bot-cli reconcile
 kalshi-bot-cli status
 ```
 
+By default, `discover` and `stream` now expand any configured `series_templates` from `docs/examples/weather_markets.example.yaml` into the currently active greater/less daily temperature contracts for those locations.
+
 To let live market updates launch rooms automatically:
 
 ```bash
-kalshi-bot-cli stream --markets WEATHER-NYC-HIGH-80F --auto-trigger
+kalshi-bot-cli stream --auto-trigger
 ```
 
 To run the full long-lived production worker:
@@ -76,9 +78,16 @@ The behavior is controlled by:
 For manual room execution:
 
 ```bash
-room_id="$(kalshi-bot-cli create-room --name 'manual room' --market-ticker WEATHER-NYC-HIGH-80F)"
+room_id="$(kalshi-bot-cli create-room --name 'manual room' --market-ticker KXHIGHNY-26APR11-T68)"
 kalshi-bot-cli run-room "$room_id"
 ```
+
+For Docker deployments that need both environments available, `infra/docker-compose.yml` now mounts separate live and demo PEMs into the containers and relies on:
+
+- `LIVE_KALSHI_KEY_PATH_HOST`
+- `DEMO_KALSHI_KEY_PATH_HOST`
+- `LIVE_KALSHI_API_KEY`
+- `DEMO_KALSHI_API_KEY`
 
 ## Backups
 

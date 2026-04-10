@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.auto_trigger import AutoTriggerService
+from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.streaming import MarketStreamService
@@ -22,6 +23,7 @@ class DaemonService:
         settings: Settings,
         session_factory: async_sessionmaker,
         weather_directory: WeatherMarketDirectory,
+        discovery_service: DiscoveryService,
         stream_service: MarketStreamService,
         reconciliation_service: ReconciliationService,
         research_coordinator: ResearchCoordinator,
@@ -30,6 +32,7 @@ class DaemonService:
         self.settings = settings
         self.session_factory = session_factory
         self.weather_directory = weather_directory
+        self.discovery_service = discovery_service
         self.stream_service = stream_service
         self.reconciliation_service = reconciliation_service
         self.research_coordinator = research_coordinator
@@ -81,7 +84,7 @@ class DaemonService:
         max_messages: int | None = None,
         run_seconds: float | None = None,
     ) -> dict[str, Any]:
-        selected_markets = markets or [mapping.market_ticker for mapping in self.weather_directory.all()]
+        selected_markets = markets or await self.discovery_service.list_stream_markets()
         should_auto_trigger = self.settings.trigger_enable_auto_rooms if auto_trigger is None else auto_trigger
         self._auto_trigger_enabled_for_run = should_auto_trigger
 

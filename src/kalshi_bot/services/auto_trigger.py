@@ -36,7 +36,7 @@ class AutoTriggerService:
     async def handle_market_update(self, market_ticker: str) -> None:
         if not self.settings.trigger_enable_auto_rooms:
             return
-        if self.weather_directory.get(market_ticker) is None:
+        if not self.weather_directory.supports_market_ticker(market_ticker):
             return
         if market_ticker in self._inflight_markets:
             return

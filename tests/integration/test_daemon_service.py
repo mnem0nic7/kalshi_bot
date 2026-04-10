@@ -13,7 +13,11 @@ from kalshi_bot.weather.models import WeatherMarketMapping
 
 
 class FakeStreamService:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
     async def stream(self, *, market_tickers, include_private, max_messages, on_market_update=None):
+        self.calls.append(list(market_tickers))
         return 3
 
 
@@ -45,6 +49,11 @@ class FakeResearchCoordinator:
         return None
 
 
+class FakeDiscoveryService:
+    async def list_stream_markets(self) -> list[str]:
+        return ["WX-DISCOVERED"]
+
+
 @pytest.mark.asyncio
 async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> None:
     settings = Settings(
@@ -69,17 +78,19 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
             )
         }
     )
+    stream_service = FakeStreamService()
     daemon = DaemonService(
         settings,
         session_factory,
         directory,
-        FakeStreamService(),  # type: ignore[arg-type]
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        stream_service,  # type: ignore[arg-type]
         FakeReconciliationService(),  # type: ignore[arg-type]
         FakeResearchCoordinator(),  # type: ignore[arg-type]
         FakeAutoTriggerService(),  # type: ignore[arg-type]
     )
 
-    result = await daemon.run(markets=["WX-TEST"], max_messages=3)
+    result = await daemon.run(max_messages=3)
 
     async with session_factory() as session:
         heartbeat = (
@@ -88,6 +99,7 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
 
     assert result["completed"] == "stream"
     assert result["processed_messages"] == 3
+    assert stream_service.calls == [["WX-DISCOVERED"]]
     assert heartbeat.summary == "Daemon heartbeat"
 
     await engine.dispose()

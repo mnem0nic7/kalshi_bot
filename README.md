@@ -14,28 +14,29 @@ For training prep and dataset exports, use [docs/training.md](docs/training.md).
 
 1. Copy `.env.example` to `.env`.
 2. Set a local `POSTGRES_PASSWORD` in `.env`, or replace the full `DATABASE_URL` if you are using an existing database. The Compose stack reads the password from your local `.env` instead of checking one into `docker-compose.yml`.
-3. Set `KALSHI_API_KEY` or the split read/write key variables.
-4. Point `KALSHI_READ_PRIVATE_KEY_PATH` and `KALSHI_WRITE_PRIVATE_KEY_PATH` at your PEM file, or keep the default local key file path fallback.
-5. Review `docs/examples/weather_markets.example.yaml` and replace it with real supported market mappings.
-6. Start Postgres:
+3. Set `LIVE_KALSHI_API_KEY` and `DEMO_KALSHI_API_KEY` in `.env`.
+4. Set the live/demo PEM host paths for Docker with `LIVE_KALSHI_KEY_PATH_HOST` and `DEMO_KALSHI_KEY_PATH_HOST`, or use the default local filenames.
+5. If you run the app outside Docker, point `LIVE_KALSHI_READ_PRIVATE_KEY_PATH` / `DEMO_KALSHI_READ_PRIVATE_KEY_PATH` at the local PEM files, or keep the default local key file path fallback.
+6. Review `docs/examples/weather_markets.example.yaml`. It now uses `series_templates`, so the app can discover current daily temperature contracts automatically for the configured locations.
+7. Start Postgres:
 
 ```bash
 docker compose -f infra/docker-compose.yml up --build -d postgres
 ```
 
-7. Run migrations:
+8. Run migrations:
 
 ```bash
 docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
 ```
 
-8. Start the app stack:
+9. Start the app stack:
 
 ```bash
 docker compose -f infra/docker-compose.yml up --build -d app_blue app_green daemon_blue daemon_green nginx
 ```
 
-9. Open `http://localhost:8080`.
+10. Open `http://localhost:8080`.
 
 ## Local Python workflow
 
@@ -56,21 +57,23 @@ After activating the virtualenv:
 ```bash
 kalshi-bot-cli init-db
 kalshi-bot-cli discover --json
-kalshi-bot-cli stream --markets WEATHER-NYC-HIGH-80F --max-messages 25
-kalshi-bot-cli stream --markets WEATHER-NYC-HIGH-80F --auto-trigger
+kalshi-bot-cli stream --max-messages 25
+kalshi-bot-cli stream --auto-trigger
 kalshi-bot-cli daemon --auto-trigger
-kalshi-bot-cli research-refresh WEATHER-NYC-HIGH-80F
-kalshi-bot-cli research-show WEATHER-NYC-HIGH-80F
+kalshi-bot-cli research-refresh KXHIGHNY-26APR11-T68
+kalshi-bot-cli research-show KXHIGHNY-26APR11-T68
 kalshi-bot-cli research-failures
 kalshi-bot-cli training-export --mode bundles --output data/training/room_bundles.jsonl
 kalshi-bot-cli training-export --mode role-sft --roles researcher trader --output data/training/role_sft.jsonl
-kalshi-bot-cli create-room --name "NYC weather" --market-ticker WEATHER-NYC-HIGH-80F
+kalshi-bot-cli create-room --name "NYC weather" --market-ticker KXHIGHNY-26APR11-T68
 kalshi-bot-cli run-room <room-id>
 kalshi-bot-cli reconcile
 kalshi-bot-cli status
 kalshi-bot-cli kill-switch on
 kalshi-bot-cli promote green
 ```
+
+`discover --json` now expands any configured `series_templates` into the currently active greater/less daily temperature markets, and the control room uses the same live discovery path.
 
 ## GitHub Actions smoke workflows
 
