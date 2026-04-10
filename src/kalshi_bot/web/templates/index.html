@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <h1>Control Room</h1>
+  <p>Active color: <strong>{{ control.active_color }}</strong> | Kill switch: <strong>{{ control.kill_switch_enabled }}</strong></p>
+  <div class="actions">
+    <button onclick="toggleKill(true)">Enable Kill Switch</button>
+    <button onclick="toggleKill(false)">Disable Kill Switch</button>
+    <button onclick="promote('blue')">Promote Blue</button>
+    <button onclick="promote('green')">Promote Green</button>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Create Room</h2>
+  <form id="room-form">
+    <label>Name <input type="text" name="name" required /></label>
+    <label>Market ticker <input type="text" name="market_ticker" required /></label>
+    <label>Prompt <textarea name="prompt" rows="3"></textarea></label>
+    <button type="submit">Create</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Recent Rooms</h2>
+  <div class="room-list">
+    {% for room in rooms %}
+    <a class="room-card" href="/rooms/{{ room.id }}">
+      <strong>{{ room.name }}</strong>
+      <span>{{ room.market_ticker }}</span>
+      <span>{{ room.stage }}</span>
+      <span>{{ room.updated_at }}</span>
+    </a>
+    {% else %}
+    <p>No rooms yet.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Research Status</h2>
+  <div class="room-list">
+    {% for market in configured_markets %}
+    <div class="room-card">
+      <strong>{{ market.label }}</strong>
+      <span>{{ market.market_ticker }} · {{ market.market_type }}</span>
+      {% if market.dossier %}
+      <span>
+        gate {{ "passed" if market.dossier.gate.passed else "blocked" }}
+        · mode {{ market.dossier.mode }}
+        · confidence {{ "%.2f"|format(market.dossier.summary.research_confidence) }}
+      </span>
+      <span>
+        refreshed {{ market.dossier.freshness.refreshed_at }}
+        · expires {{ market.dossier.freshness.expires_at }}
+      </span>
+      <span>{{ market.dossier.summary.source_coverage }}</span>
+      <div class="actions">
+        <button type="button" onclick="refreshResearch('{{ market.market_ticker }}')">Refresh Research</button>
+        <a href="/api/research/{{ market.market_ticker }}" target="_blank" rel="noreferrer">Open JSON</a>
+      </div>
+      {% else %}
+      <span>No dossier yet.</span>
+      <div class="actions">
+        <button type="button" onclick="refreshResearch('{{ market.market_ticker }}')">Create Dossier</button>
+      </div>
+      {% endif %}
+    </div>
+    {% else %}
+    <p>No configured markets loaded.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Positions</h2>
+  <div class="room-list">
+    {% for position in positions %}
+    <div class="room-card">
+      <strong>{{ position.market_ticker }}</strong>
+      <span>{{ position.side }} {{ position.count_fp }}</span>
+      <span>avg {{ position.average_price_dollars }}</span>
+    </div>
+    {% else %}
+    <p>No reconciled positions yet.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Ops Events</h2>
+  <div class="room-list">
+    {% for event in ops_events %}
+    <div class="room-card">
+      <strong>{{ event.severity }}</strong>
+      <span>{{ event.summary }}</span>
+      <span>{{ event.source }}</span>
+    </div>
+    {% else %}
+    <p>No ops events recorded yet.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<script>
+  document.getElementById("room-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const formData = new FormData(event.target);
+    const payload = Object.fromEntries(formData.entries());
+    const response = await fetch("/api/rooms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json();
+    window.location.href = data.redirect;
+  });
+
+  async function toggleKill(enabled) {
+    await fetch(`/api/control/kill-switch/${enabled}`, { method: "POST" });
+    window.location.reload();
+  }
+
+  async function promote(color) {
+    await fetch(`/api/control/promote/${color}`, { method: "POST" });
+    window.location.reload();
+  }
+
+  async function refreshResearch(marketTicker) {
+    await fetch(`/api/research/${marketTicker}/refresh`, { method: "POST" });
+    window.location.reload();
+  }
+</script>
+{% endblock %}
