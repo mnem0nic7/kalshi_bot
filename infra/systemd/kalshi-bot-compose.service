@@ -1,0 +1,14 @@
+[Unit]
+Description=Kalshi Bot Docker Compose Stack (web and daemon)
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/kalshi_bot
+ExecStart=/bin/bash -lc '/usr/bin/docker compose -f infra/docker-compose.yml up -d postgres && /usr/bin/docker compose -f infra/docker-compose.yml run --rm --no-deps migrate && /usr/bin/docker compose -f infra/docker-compose.yml up -d --build app_blue app_green daemon_blue daemon_green nginx'
+ExecStop=/usr/bin/docker compose -f infra/docker-compose.yml down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

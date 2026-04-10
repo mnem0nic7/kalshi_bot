@@ -1,0 +1,105 @@
+name: Live Smoke
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-smoke:
+    name: Live REST and WebSocket Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: live
+    env:
+      KALSHI_ENV: production
+      LIVE_KALSHI_API_KEY: ${{ secrets.LIVE_KALSHI_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Validate secrets
+        run: |
+          set -euo pipefail
+          test -n "${LIVE_KALSHI_API_KEY}" || { echo "Missing secret LIVE_KALSHI_API_KEY"; exit 1; }
+          test -n "${{ secrets.LIVE_KALSHI_PRIVATE_KEY_PEM }}" || { echo "Missing secret LIVE_KALSHI_PRIVATE_KEY_PEM"; exit 1; }
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Write live PEM
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/github-secrets
+          printf '%s\n' "${{ secrets.LIVE_KALSHI_PRIVATE_KEY_PEM }}" > .tmp/github-secrets/kalshi-live.pem
+          chmod 600 .tmp/github-secrets/kalshi-live.pem
+        shell: bash
+
+      - name: Run live smoke checks
+        env:
+          LIVE_KALSHI_READ_PRIVATE_KEY_PATH: .tmp/github-secrets/kalshi-live.pem
+          LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: .tmp/github-secrets/kalshi-live.pem
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio
+          import json
+          import os
+
+          from kalshi_bot.config import Settings
+          from kalshi_bot.integrations.kalshi import KalshiClient, KalshiWebSocketClient
+
+
+          async def main() -> None:
+              settings = Settings()
+              client = KalshiClient(settings)
+              ws = KalshiWebSocketClient(settings, client)
+              summary: dict[str, object] = {
+                  "environment": settings.kalshi_env,
+                  "read_key_path": str(settings.key_path(write=False)),
+              }
+              try:
+                  balance = await client.get_balance()
+                  positions = await client.get_positions()
+                  summary["balance_fields"] = sorted(balance.keys())
+                  summary["position_count"] = len(positions.get("market_positions", positions.get("positions", [])))
+
+                  await ws.connect()
+                  await ws.subscribe(["market_lifecycle_v2"])
+                  async for message in ws.iter_messages():
+                      summary["websocket_first_type"] = message.get("type")
+                      summary["websocket_first_channel"] = message.get("msg", {}).get("channel")
+                      break
+              finally:
+                  await ws.close()
+                  await client.close()
+
+              if summary.get("websocket_first_type") != "subscribed":
+                  raise RuntimeError(f"Unexpected websocket response: {summary}")
+
+              print(json.dumps(summary, indent=2))
+              summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary_file:
+                  with open(summary_file, "a", encoding="utf-8") as handle:
+                      handle.write("## Kalshi Live Smoke\n")
+                      handle.write("```json\n")
+                      handle.write(json.dumps(summary, indent=2))
+                      handle.write("\n```\n")
+
+
+          asyncio.run(main())
+          PY
+
+      - name: Remove live PEM
+        if: always()
+        run: rm -f .tmp/github-secrets/kalshi-live.pem

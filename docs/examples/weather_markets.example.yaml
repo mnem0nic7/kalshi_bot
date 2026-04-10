@@ -1,0 +1,20 @@
+markets:
+  - market_ticker: WEATHER-NYC-HIGH-80F
+    station_id: KNYC
+    location_name: New York City
+    latitude: 40.7146
+    longitude: -74.0071
+    threshold_f: 80
+    operator: ">="
+    metric: daily_high_f
+    settlement_source: NWS station observation
+  - market_ticker: WEATHER-ORD-HIGH-90F
+    station_id: KORD
+    location_name: Chicago O'Hare
+    latitude: 41.995
+    longitude: -87.9336
+    threshold_f: 90
+    operator: ">="
+    metric: daily_high_f
+    settlement_source: NWS station observation
+
