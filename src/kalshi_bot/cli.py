@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from dataclasses import asdict
 import json
+from pathlib import Path
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.db.repositories import PlatformRepository
@@ -11,6 +12,14 @@ from kalshi_bot.db.session import init_models
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
 from kalshi_bot.core.schemas import RoomCreate
+
+
+def _write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record))
+            handle.write("\n")
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
@@ -95,6 +104,30 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if args.command == "research-failures":
             failures = await container.research_coordinator.list_failed_runs(limit=args.limit)
             print(json.dumps(failures, indent=2))
+            return 0
+
+        if args.command == "training-export":
+            room_ids = [args.room_id] if args.room_id else None
+            output_path = Path(args.output)
+            if args.mode == "bundles":
+                bundles = await container.training_export_service.export_room_bundles(
+                    room_ids=room_ids,
+                    market_ticker=args.market_ticker,
+                    limit=args.limit,
+                    include_non_complete=args.include_non_complete,
+                )
+                payload = [bundle.model_dump(mode="json") for bundle in bundles]
+            else:
+                examples = await container.training_export_service.export_role_training_examples(
+                    room_ids=room_ids,
+                    market_ticker=args.market_ticker,
+                    limit=args.limit,
+                    include_non_complete=args.include_non_complete,
+                    roles=args.roles,
+                )
+                payload = [example.model_dump(mode="json") for example in examples]
+            _write_jsonl(output_path, payload)
+            print(json.dumps({"output": str(output_path), "count": len(payload), "mode": args.mode}, indent=2))
             return 0
 
         async with container.session_factory() as session:
@@ -210,6 +243,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     research_failures = subparsers.add_parser("research-failures")
     research_failures.add_argument("--limit", type=int, default=10)
+
+    training_export = subparsers.add_parser("training-export")
+    training_export.add_argument("--output", required=True)
+    training_export.add_argument("--mode", choices=["bundles", "role-sft"], default="bundles")
+    training_export.add_argument("--room-id", default=None)
+    training_export.add_argument("--market-ticker", default=None)
+    training_export.add_argument("--limit", type=int, default=100)
+    training_export.add_argument("--include-non-complete", action="store_true")
+    training_export.add_argument(
+        "--roles",
+        nargs="*",
+        default=None,
+        choices=["researcher", "president", "trader", "memory_librarian"],
+    )
 
     run_room = subparsers.add_parser("run-room")
     run_room.add_argument("room_id")

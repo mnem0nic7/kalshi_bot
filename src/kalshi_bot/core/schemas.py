@@ -180,6 +180,59 @@ class ResearchDossier(BaseModel):
     last_run_id: str | None = None
 
 
+class TrainingRoomOutcome(BaseModel):
+    final_status: str
+    room_stage: str
+    shadow_mode: bool
+    kill_switch_enabled: bool
+    research_gate_passed: bool | None = None
+    risk_status: str | None = None
+    ticket_generated: bool = False
+    orders_submitted: int = 0
+    fills_observed: int = 0
+    settlement_seen: bool = False
+    settlement_pnl_dollars: Decimal | None = None
+
+    @field_validator("settlement_pnl_dollars", mode="before")
+    @classmethod
+    def validate_settlement_price(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return Decimal(str(value)).quantize(Decimal("0.0001"))
+
+
+class TrainingRoomBundle(BaseModel):
+    export_version: str = "room-bundle.v1"
+    exported_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    room: dict[str, Any]
+    messages: list[RoomMessageRead] = Field(default_factory=list)
+    signal: dict[str, Any] | None = None
+    research_dossier: dict[str, Any] | None = None
+    research_delta: dict[str, Any] | None = None
+    market_snapshot: dict[str, Any] | None = None
+    weather_bundle: dict[str, Any] | None = None
+    research_sources: list[dict[str, Any]] = Field(default_factory=list)
+    trade_ticket: dict[str, Any] | None = None
+    risk_verdict: dict[str, Any] | None = None
+    orders: list[dict[str, Any]] = Field(default_factory=list)
+    fills: list[dict[str, Any]] = Field(default_factory=list)
+    memory_note: dict[str, Any] | None = None
+    settlement: dict[str, Any] | None = None
+    outcome: TrainingRoomOutcome
+
+
+class RoleTrainingExample(BaseModel):
+    export_version: str = "role-sft.v1"
+    exported_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    room_id: str
+    market_ticker: str
+    role: str
+    task: str
+    input_context: dict[str, Any]
+    target: dict[str, Any]
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class RoomMessageCreate(BaseModel):
     role: AgentRole
     kind: MessageKind

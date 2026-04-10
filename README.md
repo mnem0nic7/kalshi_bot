@@ -8,6 +8,8 @@ Multi-agent Kalshi weather trading platform with a visible control room, determi
 - `infra`: Docker, reverse proxy, scripts, and systemd assets for VPS deployment.
 - `docs`: architecture, agent protocol, strategy, security, database, and operations guides.
 
+For training prep and dataset exports, use [docs/training.md](docs/training.md).
+
 ## Quick start
 
 1. Copy `.env.example` to `.env`.
@@ -60,6 +62,8 @@ kalshi-bot-cli daemon --auto-trigger
 kalshi-bot-cli research-refresh WEATHER-NYC-HIGH-80F
 kalshi-bot-cli research-show WEATHER-NYC-HIGH-80F
 kalshi-bot-cli research-failures
+kalshi-bot-cli training-export --mode bundles --output data/training/room_bundles.jsonl
+kalshi-bot-cli training-export --mode role-sft --roles researcher trader --output data/training/role_sft.jsonl
 kalshi-bot-cli create-room --name "NYC weather" --market-ticker WEATHER-NYC-HIGH-80F
 kalshi-bot-cli run-room <room-id>
 kalshi-bot-cli reconcile

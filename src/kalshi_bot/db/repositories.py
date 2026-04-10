@@ -119,6 +119,21 @@ class PlatformRepository:
         result = await self.session.execute(select(Room).order_by(Room.updated_at.desc()).limit(limit))
         return list(result.scalars())
 
+    async def list_rooms_for_export(
+        self,
+        *,
+        limit: int = 100,
+        market_ticker: str | None = None,
+        include_non_complete: bool = False,
+    ) -> list[Room]:
+        stmt = select(Room)
+        if market_ticker is not None:
+            stmt = stmt.where(Room.market_ticker == market_ticker)
+        if not include_non_complete:
+            stmt = stmt.where(Room.stage == RoomStage.COMPLETE.value)
+        result = await self.session.execute(stmt.order_by(Room.updated_at.desc()).limit(limit))
+        return list(result.scalars())
+
     async def count_active_rooms(self) -> int:
         stmt = select(func.count()).select_from(Room).where(Room.stage.not_in([RoomStage.COMPLETE.value, RoomStage.FAILED.value]))
         return int((await self.session.execute(stmt)).scalar_one())
@@ -280,6 +295,10 @@ class PlatformRepository:
     async def get_market_state(self, market_ticker: str) -> MarketState | None:
         return await self.session.get(MarketState, market_ticker)
 
+    async def get_latest_signal_for_room(self, room_id: str) -> Signal | None:
+        stmt = select(Signal).where(Signal.room_id == room_id).order_by(Signal.created_at.desc()).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def save_signal(
         self,
         *,
@@ -304,6 +323,15 @@ class PlatformRepository:
         await self.session.flush()
         return record
 
+    async def get_latest_trade_ticket_for_room(self, room_id: str) -> TradeTicketRecord | None:
+        stmt = (
+            select(TradeTicketRecord)
+            .where(TradeTicketRecord.room_id == room_id)
+            .order_by(TradeTicketRecord.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def save_trade_ticket(self, room_id: str, ticket: TradeTicket, client_order_id: str, message_id: str | None = None) -> TradeTicketRecord:
         record = TradeTicketRecord(
             room_id=room_id,
@@ -320,6 +348,15 @@ class PlatformRepository:
         self.session.add(record)
         await self.session.flush()
         return record
+
+    async def get_latest_risk_verdict_for_room(self, room_id: str) -> RiskVerdictRecord | None:
+        stmt = (
+            select(RiskVerdictRecord)
+            .where(RiskVerdictRecord.room_id == room_id)
+            .order_by(RiskVerdictRecord.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def save_risk_verdict(
         self,
@@ -418,6 +455,15 @@ class PlatformRepository:
         await self.session.flush()
         return record
 
+    async def list_orders_for_room(self, room_id: str) -> list[OrderRecord]:
+        stmt = (
+            select(OrderRecord)
+            .join(TradeTicketRecord, OrderRecord.trade_ticket_id == TradeTicketRecord.id)
+            .where(TradeTicketRecord.room_id == room_id)
+            .order_by(OrderRecord.created_at.asc())
+        )
+        return list((await self.session.execute(stmt)).scalars())
+
     async def save_fill(
         self,
         *,
@@ -487,6 +533,16 @@ class PlatformRepository:
             record.is_taker = is_taker
         await self.session.flush()
         return record
+
+    async def list_fills_for_room(self, room_id: str) -> list[FillRecord]:
+        stmt = (
+            select(FillRecord)
+            .join(OrderRecord, FillRecord.order_id == OrderRecord.id)
+            .join(TradeTicketRecord, OrderRecord.trade_ticket_id == TradeTicketRecord.id)
+            .where(TradeTicketRecord.room_id == room_id)
+            .order_by(FillRecord.created_at.asc())
+        )
+        return list((await self.session.execute(stmt)).scalars())
 
     async def upsert_position(
         self,
@@ -675,6 +731,15 @@ class PlatformRepository:
         result = await self.session.execute(select(MemoryNoteRecord).order_by(MemoryNoteRecord.created_at.desc()).limit(limit))
         return list(result.scalars())
 
+    async def get_latest_memory_note_for_room(self, room_id: str) -> MemoryNoteRecord | None:
+        stmt = (
+            select(MemoryNoteRecord)
+            .where(MemoryNoteRecord.room_id == room_id)
+            .order_by(MemoryNoteRecord.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def list_positions(self, limit: int = 50) -> list[PositionRecord]:
         result = await self.session.execute(select(PositionRecord).order_by(PositionRecord.updated_at.desc()).limit(limit))
         return list(result.scalars())
@@ -698,3 +763,21 @@ class PlatformRepository:
     async def get_checkpoint(self, stream_name: str) -> Checkpoint | None:
         stmt = select(Checkpoint).where(Checkpoint.stream_name == stream_name)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_exchange_events(
+        self,
+        *,
+        stream_name: str | None = None,
+        event_type: str | None = None,
+        market_ticker: str | None = None,
+        limit: int = 50,
+    ) -> list[RawExchangeEvent]:
+        stmt = select(RawExchangeEvent)
+        if stream_name is not None:
+            stmt = stmt.where(RawExchangeEvent.stream_name == stream_name)
+        if event_type is not None:
+            stmt = stmt.where(RawExchangeEvent.event_type == event_type)
+        if market_ticker is not None:
+            stmt = stmt.where(RawExchangeEvent.market_ticker == market_ticker)
+        stmt = stmt.order_by(RawExchangeEvent.created_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())

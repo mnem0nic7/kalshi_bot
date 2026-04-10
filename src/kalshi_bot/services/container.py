@@ -22,6 +22,7 @@ from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine
 from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.services.streaming import MarketStreamService
+from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -45,6 +46,7 @@ class AppContainer:
     discovery_service: DiscoveryService
     reconciliation_service: ReconciliationService
     stream_service: MarketStreamService
+    training_export_service: TrainingExportService
     agents: AgentSuite
     supervisor: WorkflowSupervisor
 
@@ -68,6 +70,7 @@ class AppContainer:
         discovery_service = DiscoveryService(kalshi, weather_directory)
         reconciliation_service = ReconciliationService(kalshi)
         stream_service = MarketStreamService(settings, session_factory, kalshi_ws)
+        training_export_service = TrainingExportService(session_factory)
         research_coordinator = ResearchCoordinator(
             settings,
             session_factory,
@@ -120,6 +123,7 @@ class AppContainer:
             discovery_service=discovery_service,
             reconciliation_service=reconciliation_service,
             stream_service=stream_service,
+            training_export_service=training_export_service,
             agents=agents,
             supervisor=supervisor,
         )
