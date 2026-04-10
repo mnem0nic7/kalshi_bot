@@ -31,6 +31,7 @@ from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
+from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
 
 try:
     from duckduckgo_search import DDGS
@@ -325,14 +326,14 @@ class ResearchCoordinator:
                 changed_fields.append(key)
                 updates[key] = value
         if weather_bundle is not None:
-            forecast_high = weather_bundle.get("forecast", {}).get("properties", {}).get("periods", [{}])[0].get("temperature")
-            current_temp = weather_bundle.get("observation", {}).get("properties", {}).get("temperature", {}).get("value")
+            forecast_high = extract_forecast_high_f(weather_bundle.get("forecast", {}))
+            current_temp = extract_current_temp_f(weather_bundle.get("observation", {}))
             if forecast_high is not None and dossier.summary.current_numeric_facts.get("forecast_high_f") != forecast_high:
                 changed_fields.append("forecast_high_f")
                 updates["forecast_high_f"] = forecast_high
-            if current_temp is not None and dossier.summary.current_numeric_facts.get("current_temp_c") != current_temp:
-                changed_fields.append("current_temp_c")
-                updates["current_temp_c"] = current_temp
+            if current_temp is not None and dossier.summary.current_numeric_facts.get("current_temp_f") != current_temp:
+                changed_fields.append("current_temp_f")
+                updates["current_temp_f"] = current_temp
         summary = (
             "No material changes since the shared dossier refresh."
             if not changed_fields

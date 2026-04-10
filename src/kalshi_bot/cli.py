@@ -130,6 +130,33 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps({"output": str(output_path), "count": len(payload), "mode": args.mode}, indent=2))
             return 0
 
+        if args.command == "shadow-run":
+            result = await container.shadow_training_service.run_shadow_room(
+                args.market_ticker,
+                name=args.name,
+                prompt=args.prompt,
+                reason=args.reason,
+            )
+            print(json.dumps({"room_id": result.room_id, "market_ticker": result.market_ticker, "stage": result.stage}, indent=2))
+            return 0
+
+        if args.command == "shadow-sweep":
+            results = await container.shadow_training_service.run_shadow_sweep(
+                markets=args.markets,
+                limit=args.limit,
+                reason=args.reason,
+            )
+            print(
+                json.dumps(
+                    [
+                        {"room_id": item.room_id, "market_ticker": item.market_ticker, "room_name": item.room_name, "stage": item.stage}
+                        for item in results
+                    ],
+                    indent=2,
+                )
+            )
+            return 0
+
         async with container.session_factory() as session:
             repo = PlatformRepository(session)
 
@@ -257,6 +284,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["researcher", "president", "trader", "memory_librarian"],
     )
+
+    shadow_run = subparsers.add_parser("shadow-run")
+    shadow_run.add_argument("market_ticker")
+    shadow_run.add_argument("--name", default=None)
+    shadow_run.add_argument("--prompt", default=None)
+    shadow_run.add_argument("--reason", default="cli_shadow_run")
+
+    shadow_sweep = subparsers.add_parser("shadow-sweep")
+    shadow_sweep.add_argument("--markets", nargs="*", default=None)
+    shadow_sweep.add_argument("--limit", type=int, default=None)
+    shadow_sweep.add_argument("--reason", default="cli_shadow_sweep")
 
     run_room = subparsers.add_parser("run-room")
     run_room.add_argument("room_id")

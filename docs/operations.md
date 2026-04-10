@@ -39,6 +39,7 @@ Typical operational loop:
 ```bash
 kalshi-bot-cli init-db
 kalshi-bot-cli discover
+kalshi-bot-cli shadow-sweep --limit 3
 kalshi-bot-cli stream --max-messages 100
 kalshi-bot-cli reconcile
 kalshi-bot-cli status
@@ -81,6 +82,15 @@ For manual room execution:
 room_id="$(kalshi-bot-cli create-room --name 'manual room' --market-ticker KXHIGHNY-26APR11-T68)"
 kalshi-bot-cli run-room "$room_id"
 ```
+
+For quick shadow transcript collection without creating the room separately:
+
+```bash
+kalshi-bot-cli shadow-run KXHIGHNY-26APR11-T68
+kalshi-bot-cli shadow-sweep --limit 3
+```
+
+The control room index page offers the same behavior with the `Run Shadow Room` button on each discovered market card.
 
 For Docker deployments that need both environments available, `infra/docker-compose.yml` now mounts separate live and demo PEMs into the containers and relies on:
 

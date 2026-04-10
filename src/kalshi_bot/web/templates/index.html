@@ -59,6 +59,7 @@
       </span>
       <span>{{ market.dossier.summary.source_coverage }}</span>
       <div class="actions">
+        <button type="button" onclick='runShadowRoom({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Run Shadow Room</button>
         <button type="button" onclick='createRoomForMarket({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Create Room</button>
         <button type="button" onclick="refreshResearch('{{ market.market_ticker }}')">Refresh Research</button>
         <a href="/api/research/{{ market.market_ticker }}" target="_blank" rel="noreferrer">Open JSON</a>
@@ -69,6 +70,7 @@
       <span>{{ market.notes|join(" | ") }}</span>
       {% endif %}
       <div class="actions">
+        <button type="button" onclick='runShadowRoom({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Run Shadow Room</button>
         <button type="button" onclick='createRoomForMarket({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Create Room</button>
         <button type="button" onclick="refreshResearch('{{ market.market_ticker }}')">Create Dossier</button>
       </div>
@@ -147,6 +149,20 @@
         name: `room ${label}`,
         market_ticker: marketTicker,
         prompt: `Operator-created room for ${marketTicker}.`,
+      }),
+    });
+    const data = await response.json();
+    window.location.href = data.redirect;
+  }
+
+  async function runShadowRoom(marketTicker, label) {
+    const response = await fetch(`/api/markets/${encodeURIComponent(marketTicker)}/shadow-run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: `shadow ${label}`,
+        prompt: `Shadow room launched from control room for ${marketTicker}.`,
+        reason: "ui_shadow_run",
       }),
     });
     const data = await response.json();

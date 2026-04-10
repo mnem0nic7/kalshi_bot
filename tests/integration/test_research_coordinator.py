@@ -168,3 +168,47 @@ async def test_research_refresh_supports_generic_web_dossier(tmp_path) -> None:
     assert dossier.gate.passed is True
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_room_delta_uses_same_weather_units_as_dossier(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/research_delta.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    directory = WeatherMarketDirectory(
+        {
+            "WX-TEST": WeatherMarketMapping(
+                market_ticker="WX-TEST",
+                market_type="weather",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+                settlement_source="NWS station observation",
+            )
+        }
+    )
+    coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        FakeKalshi(),  # type: ignore[arg-type]
+        FakeWeather(),  # type: ignore[arg-type]
+        directory,
+        FakeProviders(),  # type: ignore[arg-type]
+        WeatherSignalEngine(settings),
+    )
+
+    dossier = await coordinator.refresh_market_dossier("WX-TEST", trigger_reason="test")
+    delta = coordinator.build_room_delta(
+        dossier=dossier,
+        market_response=await FakeKalshi().get_market("WX-TEST"),
+        weather_bundle=await FakeWeather().build_market_snapshot(directory.require("WX-TEST")),
+    )
+
+    assert delta.changed_fields == []
+    assert delta.numeric_fact_updates == {}
+
+    await engine.dispose()

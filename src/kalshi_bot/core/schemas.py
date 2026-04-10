@@ -270,6 +270,12 @@ class TriggerRequest(BaseModel):
     reason: str = "manual"
 
 
+class ShadowRunRequest(BaseModel):
+    reason: str = "shadow_run"
+    name: str | None = None
+    prompt: str | None = None
+
+
 class TradeDecisionContext(BaseModel):
     room_id: UUID
     market_ticker: str

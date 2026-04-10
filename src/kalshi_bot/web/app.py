@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ValidationError
 
-from kalshi_bot.core.schemas import RoomCreate, TriggerRequest
+from kalshi_bot.core.schemas import RoomCreate, ShadowRunRequest, TriggerRequest
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.container import AppContainer
 
@@ -224,6 +224,25 @@ def create_app() -> FastAPI:
         app_container = container(request)
         asyncio.create_task(app_container.supervisor.run_room(room_id, reason=payload.reason))
         return JSONResponse({"status": "scheduled", "room_id": room_id})
+
+    @app.post("/api/markets/{market_ticker}/shadow-run")
+    async def shadow_run_market_endpoint(market_ticker: str, request: Request) -> JSONResponse:
+        payload = await parse_json_model(request, ShadowRunRequest, default_on_empty=True)
+        app_container = container(request)
+        result = await app_container.shadow_training_service.create_shadow_room(
+            market_ticker,
+            name=payload.name,
+            prompt=payload.prompt,
+        )
+        asyncio.create_task(app_container.supervisor.run_room(result.room_id, reason=payload.reason))
+        return JSONResponse(
+            {
+                "status": "scheduled",
+                "room_id": result.room_id,
+                "market_ticker": market_ticker,
+                "redirect": f"/rooms/{result.room_id}",
+            }
+        )
 
     @app.get("/rooms/{room_id}", response_class=HTMLResponse)
     async def room_detail(room_id: str, request: Request) -> HTMLResponse:

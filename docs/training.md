@@ -38,6 +38,15 @@ Role SFT exports derive training rows from those bundles and currently support:
 4. Let the system accumulate rooms across multiple market conditions.
 5. Export bundles for analysis before curating role-specific SFT examples.
 
+The fastest shadow-mode collection loop is now:
+
+```bash
+kalshi-bot-cli shadow-sweep --limit 3
+kalshi-bot-cli training-export --mode bundles --output data/training/room_bundles.jsonl
+```
+
+You can also launch one room at a time from the control room homepage with `Run Shadow Room`.
+
 ## Export Commands
 
 Export complete room bundles:
@@ -75,6 +84,12 @@ kalshi-bot-cli training-export \
   --room-id <ROOM_ID> \
   --mode bundles \
   --output data/training/single_room.jsonl
+```
+
+Create and run one shadow room directly from the CLI:
+
+```bash
+kalshi-bot-cli shadow-run KXHIGHNY-26APR11-T68
 ```
 
 Include non-complete rooms if you want failure or partial-workflow examples:

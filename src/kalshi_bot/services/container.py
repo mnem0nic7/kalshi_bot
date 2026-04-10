@@ -20,6 +20,7 @@ from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine
+from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.training import TrainingExportService
@@ -47,6 +48,7 @@ class AppContainer:
     reconciliation_service: ReconciliationService
     stream_service: MarketStreamService
     training_export_service: TrainingExportService
+    shadow_training_service: ShadowTrainingService
     agents: AgentSuite
     supervisor: WorkflowSupervisor
 
@@ -94,6 +96,12 @@ class AppContainer:
             research_coordinator=research_coordinator,
             agents=agents,
         )
+        shadow_training_service = ShadowTrainingService(
+            settings,
+            session_factory,
+            discovery_service,
+            supervisor,
+        )
         auto_trigger_service = AutoTriggerService(settings, session_factory, weather_directory, supervisor)
         daemon_service = DaemonService(
             settings,
@@ -125,6 +133,7 @@ class AppContainer:
             reconciliation_service=reconciliation_service,
             stream_service=stream_service,
             training_export_service=training_export_service,
+            shadow_training_service=shadow_training_service,
             agents=agents,
             supervisor=supervisor,
         )

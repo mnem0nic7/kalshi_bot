@@ -60,6 +60,8 @@ kalshi-bot-cli discover --json
 kalshi-bot-cli stream --max-messages 25
 kalshi-bot-cli stream --auto-trigger
 kalshi-bot-cli daemon --auto-trigger
+kalshi-bot-cli shadow-run KXHIGHNY-26APR11-T68
+kalshi-bot-cli shadow-sweep --limit 3
 kalshi-bot-cli research-refresh KXHIGHNY-26APR11-T68
 kalshi-bot-cli research-show KXHIGHNY-26APR11-T68
 kalshi-bot-cli research-failures
@@ -74,6 +76,8 @@ kalshi-bot-cli promote green
 ```
 
 `discover --json` now expands any configured `series_templates` into the currently active greater/less daily temperature markets, and the control room uses the same live discovery path.
+
+The control room also supports one-click `Run Shadow Room` actions from the market cards. That path creates a room and immediately runs the workflow in shadow mode so you can build training transcripts quickly without placing orders.
 
 ## GitHub Actions smoke workflows
 
