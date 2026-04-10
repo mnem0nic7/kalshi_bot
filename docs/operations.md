@@ -1,5 +1,7 @@
 # Operations
 
+For the first post-merge rollout, use [First Shadow Rollout](first_shadow_rollout.md) as the primary runbook.
+
 ## Blue/green model
 
 - `app_blue` and `app_green` run simultaneously.

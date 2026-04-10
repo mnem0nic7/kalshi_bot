@@ -8,6 +8,8 @@ Multi-agent Kalshi weather trading platform with a visible control room, determi
 - `infra`: Docker, reverse proxy, scripts, and systemd assets for VPS deployment.
 - `docs`: architecture, agent protocol, strategy, security, database, and operations guides.
 
+For the first deploy after merging, use [docs/first_shadow_rollout.md](docs/first_shadow_rollout.md).
+
 ## Quick start
 
 1. Copy `.env.example` to `.env`.
