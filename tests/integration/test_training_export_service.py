@@ -184,6 +184,9 @@ async def test_training_export_service_builds_room_bundle_and_role_examples(tmp_
     trader_example = next(example for example in examples if example.role == "trader")
     assert trader_example.target["payload"]["market_ticker"] == "WX-TEST"
     assert trader_example.input_context["research_dossier"] is not None
+    assert trader_example.messages[0]["role"] == "system"
+    assert trader_example.messages[1]["role"] == "user"
+    assert trader_example.messages[2]["role"] == "assistant"
 
     memory_example = next(example for example in examples if example.role == "memory_librarian")
     assert memory_example.input_context["room_outcome"]["final_status"] == "submitted"

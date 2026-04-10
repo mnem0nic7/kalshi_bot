@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import Decimal
+import json
 from typing import Any, Iterable
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -122,6 +122,7 @@ class TrainingExportService:
                     market_ticker=bundle.room["market_ticker"],
                     role=role,
                     task=task,
+                    messages=self._chat_messages_for_example(role=role, input_context=input_context, target_message=target_message),
                     input_context=input_context,
                     target=self._target_message_dict(target_message),
                     metadata={
@@ -285,12 +286,44 @@ class TrainingExportService:
             )
         return base
 
+    def _chat_messages_for_example(
+        self,
+        *,
+        role: str,
+        input_context: dict[str, Any],
+        target_message: RoomMessageRead,
+    ) -> list[dict[str, str]]:
+        return [
+            {"role": "system", "content": self._system_prompt_for_role(role)},
+            {
+                "role": "user",
+                "content": (
+                    f"Complete the {role} task using this structured context.\n\n"
+                    f"{json.dumps(input_context, sort_keys=True)}"
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps(self._target_message_dict(target_message), sort_keys=True),
+            },
+        ]
+
     @staticmethod
     def _find_message(messages: list[RoomMessageRead], role: str) -> tuple[int, RoomMessageRead] | None:
         for index, message in enumerate(messages):
             if message.role == role:
                 return index, message
         return None
+
+    @staticmethod
+    def _system_prompt_for_role(role: str) -> str:
+        prompts = {
+            AgentRole.RESEARCHER.value: "You are the researcher agent in a Kalshi trading room. Be factual and concise.",
+            AgentRole.PRESIDENT.value: "You are an advisory president agent setting posture for a trading room.",
+            AgentRole.TRADER.value: "You are the trader agent. Speak clearly and reference the deterministic rationale.",
+            AgentRole.MEMORY_LIBRARIAN.value: "You write concise trading memory notes for future retrieval.",
+        }
+        return prompts.get(role, f"You are the {role} agent.")
 
     @staticmethod
     def _message_read(record: Any) -> RoomMessageRead:

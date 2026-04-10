@@ -5,7 +5,7 @@ This project supports two export formats for training preparation:
 - room bundles: full decision records for analysis, curation, and custom dataset generation
 - role SFT examples: role-specific prompt/target records for `researcher`, `president`, `trader`, and `memory_librarian`
 
-The exports are JSONL so they can feed notebooks, curation scripts, or direct fine-tuning pipelines.
+The exports are JSONL so they can feed notebooks, curation scripts, or direct fine-tuning pipelines. Role SFT exports include both structured `input_context` / `target` fields and a model-ready `messages` array for chat-style fine-tuning.
 
 ## What Gets Captured
 

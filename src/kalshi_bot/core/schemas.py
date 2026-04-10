@@ -228,6 +228,7 @@ class RoleTrainingExample(BaseModel):
     market_ticker: str
     role: str
     task: str
+    messages: list[dict[str, str]] = Field(default_factory=list)
     input_context: dict[str, Any]
     target: dict[str, Any]
     metadata: dict[str, Any] = Field(default_factory=dict)
