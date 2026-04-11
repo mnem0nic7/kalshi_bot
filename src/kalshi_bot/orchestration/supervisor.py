@@ -22,7 +22,7 @@ from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
-from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine
+from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine, evaluate_trade_eligibility
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 logger = logging.getLogger(__name__)
@@ -130,11 +130,6 @@ class WorkflowSupervisor:
                     market_response=market_response,
                     weather_bundle=weather_bundle,
                 )
-                signal = self.research_coordinator.build_signal_from_dossier(
-                    dossier,
-                    market_response,
-                    min_edge_bps=thresholds.risk_min_edge_bps,
-                )
 
                 await repo.log_exchange_event("rest_market", "market_snapshot", market_response, market_ticker=room.market_ticker)
                 if mapping is not None and mapping.station_id is not None and weather_bundle is not None:
@@ -146,6 +141,23 @@ class WorkflowSupervisor:
                     yes_ask_dollars=as_decimal(market["yes_ask_dollars"]) if market.get("yes_ask_dollars") is not None else None,
                     last_trade_dollars=as_decimal(market["last_price_dollars"]) if market.get("last_price_dollars") is not None else None,
                 )
+                signal = self.research_coordinator.build_signal_from_dossier(
+                    dossier,
+                    market_response,
+                    min_edge_bps=thresholds.risk_min_edge_bps,
+                )
+                signal.eligibility = evaluate_trade_eligibility(
+                    settings=self.settings,
+                    signal=signal,
+                    market_snapshot=market_response,
+                    market_observed_at=market_state.observed_at,
+                    research_freshness=dossier.freshness,
+                    thresholds=thresholds,
+                )
+                signal.strategy_mode = signal.eligibility.strategy_mode
+                signal.stand_down_reason = signal.eligibility.stand_down_reason
+                if signal.eligibility.reasons and not signal.eligibility.eligible:
+                    signal.summary = f"{signal.summary} Stand down: {' '.join(signal.eligibility.reasons)}"
                 await repo.save_signal(
                     room_id=room.id,
                     market_ticker=room.market_ticker,
@@ -159,6 +171,12 @@ class WorkflowSupervisor:
                         "research_last_run_id": dossier.last_run_id,
                         "research_delta": delta.model_dump(mode="json"),
                         "trader_context": dossier.trader_context.model_dump(mode="json"),
+                        "research_freshness": dossier.freshness.model_dump(mode="json"),
+                        "effective_research_freshness": dossier.freshness.model_dump(mode="json"),
+                        "resolution_state": signal.resolution_state.value,
+                        "strategy_mode": signal.strategy_mode.value,
+                        "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
+                        "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
                         "agent_pack_version": pack.version,
                     },
                 )
@@ -374,11 +392,21 @@ class WorkflowSupervisor:
                         ops_record = await repo.append_message(
                             room.id,
                             await self.agents.ops_message(
-                                summary="Ops monitor noted that the room stood down because no executable edge was available.",
-                                payload={"market_ticker": room.market_ticker, "status": "stand_down"},
+                                summary=(
+                                    "Ops monitor noted that the room stood down before risk or execution because "
+                                    "the setup was not actionable."
+                                ),
+                                payload={
+                                    "market_ticker": room.market_ticker,
+                                    "status": "stand_down",
+                                    "eligibility": (
+                                        signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None
+                                    ),
+                                },
                             ),
                         )
                         rationale_ids.append(ops_record.id)
+                        final_status = "stand_down"
                         await session.commit()
 
                 await repo.update_room_stage(room.id, RoomStage.AUDITING)

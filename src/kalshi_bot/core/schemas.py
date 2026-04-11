@@ -7,7 +7,17 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
-from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage, TradeAction
+from kalshi_bot.core.enums import (
+    AgentRole,
+    ContractSide,
+    MessageKind,
+    RiskStatus,
+    RoomStage,
+    StandDownReason,
+    StrategyMode,
+    TradeAction,
+    WeatherResolutionState,
+)
 from kalshi_bot.core.fixed_point import quantize_count, quantize_price
 
 
@@ -134,6 +144,8 @@ class ResearchTraderContext(BaseModel):
     structured_source_used: bool = False
     web_source_used: bool = False
     autonomous_ready: bool = False
+    resolution_state: WeatherResolutionState = WeatherResolutionState.UNRESOLVED
+    strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED
 
     @field_validator("fair_yes_dollars", mode="before")
     @classmethod
@@ -154,6 +166,27 @@ class ResearchGateVerdict(BaseModel):
     passed: bool
     reasons: list[str] = Field(default_factory=list)
     cited_source_keys: list[str] = Field(default_factory=list)
+
+
+class TradeEligibilityVerdict(BaseModel):
+    eligible: bool
+    strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED
+    resolution_state: WeatherResolutionState = WeatherResolutionState.UNRESOLVED
+    stand_down_reason: StandDownReason | None = None
+    reasons: list[str] = Field(default_factory=list)
+    market_stale: bool = False
+    research_stale: bool = False
+    remaining_payout_dollars: Decimal | None = None
+    market_spread_bps: int | None = None
+    edge_after_quality_buffer_bps: int | None = None
+    blocked_upstream: bool = False
+
+    @field_validator("remaining_payout_dollars", mode="before")
+    @classmethod
+    def validate_remaining_payout(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return quantize_price(value)
 
 
 class ResearchDelta(BaseModel):
@@ -285,6 +318,10 @@ class TrainingRoomOutcome(BaseModel):
     kill_switch_enabled: bool
     research_gate_passed: bool | None = None
     risk_status: str | None = None
+    resolution_state: str | None = None
+    eligibility_passed: bool | None = None
+    stand_down_reason: str | None = None
+    blocked_by: str | None = None
     ticket_generated: bool = False
     orders_submitted: int = 0
     fills_observed: int = 0
@@ -340,6 +377,33 @@ class ResearchAuditIssue(BaseModel):
     code: str
     summary: str
     details: dict[str, Any] = Field(default_factory=dict)
+
+
+class StrategyAuditResult(BaseModel):
+    room_id: str
+    market_ticker: str
+    thesis_correctness: str
+    trade_quality: str
+    block_correctness: str
+    missed_stand_down: bool = False
+    stale_data_mismatch: bool = False
+    resolution_state: str | None = None
+    eligibility_passed: bool | None = None
+    stand_down_reason: str | None = None
+    blocked_by: str | None = None
+    reasons: list[str] = Field(default_factory=list)
+
+
+class StrategyAuditSummary(BaseModel):
+    room_count: int = 0
+    stale_mismatch_count: int = 0
+    low_upside_proposal_count: int = 0
+    resolved_contract_proposal_count: int = 0
+    missed_stand_down_count: int = 0
+    thesis_counts: dict[str, int] = Field(default_factory=dict)
+    trade_quality_counts: dict[str, int] = Field(default_factory=dict)
+    block_correctness_counts: dict[str, int] = Field(default_factory=dict)
+    samples: list[StrategyAuditResult] = Field(default_factory=list)
 
 
 class TrainingReadiness(BaseModel):

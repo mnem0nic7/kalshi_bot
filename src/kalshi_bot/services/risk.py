@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import RiskStatus
+from kalshi_bot.core.enums import RiskStatus, WeatherResolutionState
 from kalshi_bot.core.schemas import RiskVerdictPayload, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.agent_packs import RuntimeThresholds
@@ -58,6 +58,12 @@ class DeterministicRiskEngine:
             reasons.append("Global kill switch is enabled.")
         if signal.recommended_action is None or signal.recommended_side is None:
             reasons.append("Signal engine did not recommend a live trade.")
+        if signal.resolution_state != WeatherResolutionState.UNRESOLVED:
+            reasons.append("Contract is already resolved under the base weather strategy.")
+        if signal.eligibility is not None and not signal.eligibility.eligible:
+            reasons.extend(
+                [reason for reason in signal.eligibility.reasons if reason not in reasons]
+            )
         if signal.edge_bps < active_thresholds.risk_min_edge_bps:
             reasons.append(f"Edge {signal.edge_bps}bps is below configured minimum of {active_thresholds.risk_min_edge_bps}bps.")
 

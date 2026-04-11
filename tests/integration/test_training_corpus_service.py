@@ -7,7 +7,7 @@ import pytest
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import RoomStage
-from kalshi_bot.core.schemas import RoomCreate, TrainingBuildRequest
+from kalshi_bot.core.schemas import RoomCreate, TrainingBuildRequest, TrainingRoomBundle, TrainingRoomOutcome
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.orchestration.supervisor import WorkflowSupervisor
@@ -302,3 +302,95 @@ async def test_training_status_separates_active_and_legacy_failure_noise(tmp_pat
     assert status["campaign_settings"]["daemon_reconcile_interval_seconds"] == settings.daemon_reconcile_interval_seconds
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_strategy_audit_classifies_correct_thesis_but_weak_trade(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-audit.db")
+    corpus_service = TrainingCorpusService(
+        settings,
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        WeatherMarketDirectory({}),
+    )
+
+    bundle = TrainingRoomBundle(
+        room={"id": "a29a4ded-e1c0-4d16-ba48-1d432b415476", "market_ticker": "KXHIGHCHI-26APR11-T51"},
+        signal={
+            "fair_yes_dollars": "0.0003",
+            "payload": {
+                "resolution_state": "locked_no",
+                "eligibility": {
+                    "eligible": False,
+                    "stand_down_reason": "resolved_contract",
+                    "remaining_payout_dollars": "0.0100",
+                    "market_spread_bps": 4500,
+                },
+            },
+        },
+        trade_ticket={"market_ticker": "KXHIGHCHI-26APR11-T51", "side": "no", "yes_price_dollars": "0.0100"},
+        risk_verdict={"status": "blocked", "reasons": ["Research data is stale."]},
+        weather_bundle={
+            "mapping": {"operator": "<", "threshold_f": 51},
+            "observation": {"properties": {"temperature": {"value": 11.0}}},
+        },
+        outcome=TrainingRoomOutcome(
+            final_status="blocked",
+            room_stage="complete",
+            shadow_mode=True,
+            kill_switch_enabled=True,
+            research_gate_passed=True,
+            risk_status="blocked",
+            resolution_state="locked_no",
+            eligibility_passed=False,
+            stand_down_reason="resolved_contract",
+            blocked_by="risk",
+            ticket_generated=True,
+            orders_submitted=0,
+            fills_observed=0,
+        ),
+    )
+
+    audit = corpus_service._audit_bundle(bundle)
+
+    assert audit.thesis_correctness == "correct"
+    assert audit.trade_quality == "weak_trade"
+    assert audit.missed_stand_down is True
+
+
+@pytest.mark.asyncio
+async def test_strategy_audit_classifies_incorrect_locked_yes_thesis(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-audit-incorrect.db")
+    corpus_service = TrainingCorpusService(
+        settings,
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        WeatherMarketDirectory({}),
+    )
+
+    bundle = TrainingRoomBundle(
+        room={"id": "room-incorrect", "market_ticker": "KXHIGHNY-26APR11-T80"},
+        signal={"fair_yes_dollars": "0.1200", "payload": {"resolution_state": "locked_yes"}},
+        weather_bundle={
+            "mapping": {"operator": ">", "threshold_f": 80},
+            "observation": {"properties": {"temperature": {"value": 27.0}}},
+        },
+        outcome=TrainingRoomOutcome(
+            final_status="stand_down",
+            room_stage="complete",
+            shadow_mode=True,
+            kill_switch_enabled=True,
+            research_gate_passed=True,
+            resolution_state="locked_yes",
+            eligibility_passed=False,
+            stand_down_reason="resolved_contract",
+            blocked_by="eligibility",
+            ticket_generated=False,
+        ),
+    )
+
+    audit = corpus_service._audit_bundle(bundle)
+
+    assert audit.thesis_correctness == "incorrect"

@@ -76,12 +76,56 @@ class FakeWeather:
             },
             "observation": {
                 "properties": {
-                    "temperature": {"value": 29.0},
+                    "temperature": {"value": 25.0},
                     "timestamp": "2026-04-10T01:00:00+00:00",
                 }
             },
             "points": {},
         }
+
+    async def close(self) -> None:
+        return None
+
+
+class ResolvedNoWeather:
+    async def build_market_snapshot(self, mapping: WeatherMarketMapping) -> dict:
+        return {
+            "mapping": mapping.model_dump(mode="json"),
+            "forecast": {
+                "properties": {
+                    "updated": "2026-04-10T00:00:00+00:00",
+                    "periods": [{"isDaytime": True, "temperature": 80, "temperatureUnit": "F"}],
+                }
+            },
+            "observation": {
+                "properties": {
+                    "temperature": {"value": 11.0},
+                    "timestamp": "2026-04-10T18:00:00+00:00",
+                }
+            },
+            "points": {},
+        }
+
+    async def close(self) -> None:
+        return None
+
+
+class WideChicagoKalshi:
+    write_credentials = object()
+
+    async def get_market(self, ticker: str) -> dict:
+        return {
+            "market": {
+                "ticker": ticker,
+                "yes_bid_dollars": "0.0100",
+                "yes_ask_dollars": "0.4600",
+                "no_ask_dollars": "0.9900",
+                "last_price_dollars": "0.9000",
+            }
+        }
+
+    async def create_order(self, payload: dict) -> dict:
+        return {"order": {"order_id": "order-should-not-exist", "status": "submitted"}, "echo": payload}
 
     async def close(self) -> None:
         return None
@@ -173,5 +217,103 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     assert stored_room.stage == "complete"
     assert any(message.role == "trader" for message in messages)
     assert any(message.kind == "ExecReceipt" for message in messages)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stands_down_on_resolved_contract_before_risk(tmp_path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path}/resolved.db"
+    settings = Settings(
+        database_url=database_url,
+        app_color="blue",
+        app_shadow_mode=False,
+        risk_min_edge_bps=10,
+        risk_max_order_notional_dollars=50,
+        risk_max_position_notional_dollars=100,
+        risk_max_order_count_fp=20,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    providers = FakeProviders()
+    agent_pack_service = AgentPackService(settings)
+    agents = AgentSuite(settings, providers)  # type: ignore[arg-type]
+    signal_engine = WeatherSignalEngine(settings)
+    risk_engine = DeterministicRiskEngine(settings)
+    execution_service = ExecutionService(settings, WideChicagoKalshi())  # type: ignore[arg-type]
+    memory_service = MemoryService(providers)  # type: ignore[arg-type]
+    directory = WeatherMarketDirectory(
+        {
+            "KXHIGHCHI-26APR11-T51": WeatherMarketMapping(
+                market_ticker="KXHIGHCHI-26APR11-T51",
+                market_type="weather",
+                station_id="KMDW",
+                location_name="Chicago",
+                latitude=41.7868,
+                longitude=-87.7522,
+                threshold_f=51,
+                operator="<",
+                settlement_source="NWS station observation",
+            )
+        }
+    )
+    research_coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        WideChicagoKalshi(),  # type: ignore[arg-type]
+        ResolvedNoWeather(),  # type: ignore[arg-type]
+        directory,
+        providers,  # type: ignore[arg-type]
+        signal_engine,
+        agent_pack_service,
+    )
+    supervisor = WorkflowSupervisor(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=WideChicagoKalshi(),  # type: ignore[arg-type]
+        weather=ResolvedNoWeather(),  # type: ignore[arg-type]
+        weather_directory=directory,
+        agent_pack_service=agent_pack_service,
+        signal_engine=signal_engine,
+        risk_engine=risk_engine,
+        execution_service=execution_service,
+        memory_service=memory_service,
+        research_coordinator=research_coordinator,
+        agents=agents,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(settings.app_color)
+        room = await repo.create_room(
+            RoomCreate(name="Resolved Room", market_ticker="KXHIGHCHI-26APR11-T51"),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        await session.commit()
+
+    await supervisor.run_room(room.id, reason="resolved_test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        messages = await repo.list_messages(room.id)
+        trade_ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        risk_verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        signal = await repo.get_latest_signal_for_room(room.id)
+        await session.commit()
+
+    trader_messages = [message for message in messages if message.role == "trader"]
+    assert trade_ticket is None
+    assert risk_verdict is None
+    assert trader_messages
+    assert trader_messages[-1].payload["decision"] == "stand_down"
+    assert trader_messages[-1].payload["stand_down_reason"] == "resolved_contract"
+    assert signal is not None
+    assert signal.payload["resolution_state"] == "locked_no"
+    assert signal.payload["eligibility"]["eligible"] is False
 
     await engine.dispose()

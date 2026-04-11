@@ -232,6 +232,50 @@ def test_status_api_includes_runtime_health(tmp_path, monkeypatch) -> None:
     get_settings.cache_clear()
 
 
+def test_strategy_audit_endpoints_render(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "strategy.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> str:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                control = await repo.get_deployment_control()
+                pack = await container.agent_pack_service.get_pack_for_color(repo, container.settings.app_color)
+                room = await repo.create_room(
+                    room=RoomCreate(name="Strategy Audit Room", market_ticker="WX-STRAT"),
+                    active_color=container.settings.app_color,
+                    shadow_mode=True,
+                    kill_switch_enabled=control.kill_switch_enabled,
+                    kalshi_env=container.settings.kalshi_env,
+                    agent_pack_version=pack.version,
+                )
+                await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+                await session.commit()
+                return room.id
+
+        room_id = asyncio.run(seed())
+
+        room_response = client.get(f"/api/strategy-audit/rooms/{room_id}")
+        assert room_response.status_code == 200
+        assert room_response.json()["room_id"] == room_id
+
+        summary_response = client.get("/api/strategy-audit/summary")
+        assert summary_response.status_code == 200
+        assert "room_count" in summary_response.json()
+
+    get_settings.cache_clear()
+
+
 def test_room_events_stream_includes_stage_and_payload(tmp_path, monkeypatch) -> None:
     map_path = tmp_path / "markets.yaml"
     map_path.write_text("markets: []\n", encoding="utf-8")

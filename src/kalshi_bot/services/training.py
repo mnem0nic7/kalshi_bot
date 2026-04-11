@@ -49,6 +49,7 @@ class TrainingExportService:
         outcome = self._derive_outcome(
             room=self._room_dict(room),
             messages=messages,
+            signal=(self._signal_dict(signal) if signal is not None else None),
             dossier=(dossier_artifact.payload if dossier_artifact is not None else None),
             risk_verdict=(self._risk_verdict_dict(risk_verdict) if risk_verdict is not None else None),
             trade_ticket=(self._trade_ticket_dict(trade_ticket) if trade_ticket is not None else None),
@@ -195,6 +196,7 @@ class TrainingExportService:
         *,
         room: dict[str, Any],
         messages: list[RoomMessageRead],
+        signal: dict[str, Any] | None,
         dossier: dict[str, Any] | None,
         risk_verdict: dict[str, Any] | None,
         trade_ticket: dict[str, Any] | None,
@@ -220,6 +222,16 @@ class TrainingExportService:
         if isinstance(settlement, dict):
             settlement_pnl = settlement.get("realized_pnl_dollars") or settlement.get("pnl_dollars")
 
+        signal_payload = (signal or {}).get("payload") or {}
+        eligibility = signal_payload.get("eligibility") if isinstance(signal_payload, dict) else None
+        blocked_by = None
+        if research_gate_passed is False:
+            blocked_by = "research_gate"
+        elif isinstance(eligibility, dict) and not bool(eligibility.get("eligible")):
+            blocked_by = "eligibility"
+        elif isinstance(risk_verdict, dict) and risk_verdict.get("status") == "blocked":
+            blocked_by = "risk"
+
         return TrainingRoomOutcome(
             final_status=final_status,
             room_stage=room["stage"],
@@ -227,6 +239,10 @@ class TrainingExportService:
             kill_switch_enabled=bool(room["kill_switch_enabled"]),
             research_gate_passed=research_gate_passed,
             risk_status=(risk_verdict.get("status") if isinstance(risk_verdict, dict) else None),
+            resolution_state=signal_payload.get("resolution_state") if isinstance(signal_payload, dict) else None,
+            eligibility_passed=(eligibility.get("eligible") if isinstance(eligibility, dict) else None),
+            stand_down_reason=signal_payload.get("stand_down_reason") if isinstance(signal_payload, dict) else None,
+            blocked_by=blocked_by,
             ticket_generated=trade_ticket is not None,
             orders_submitted=len(orders),
             fills_observed=len(fills),

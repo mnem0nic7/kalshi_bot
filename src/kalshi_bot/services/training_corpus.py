@@ -3,14 +3,18 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import ContractSide, WeatherResolutionState
 from kalshi_bot.core.schemas import (
     ResearchAuditIssue,
+    StrategyAuditResult,
+    StrategyAuditSummary,
     TrainingBuildRequest,
     TrainingDatasetBuildSummary,
     TrainingReadiness,
@@ -293,6 +297,39 @@ class TrainingCorpusService:
                 )
         return issues[:limit]
 
+    async def strategy_audit_room(self, room_id: str) -> StrategyAuditResult:
+        bundle = await self.training_export_service.build_room_bundle(room_id)
+        return self._audit_bundle(bundle)
+
+    async def strategy_audit_summary(self, *, days: int | None = None, limit: int = 100) -> StrategyAuditSummary:
+        request = TrainingBuildRequest(
+            mode="room-bundles",
+            limit=limit,
+            days=days or self.settings.training_window_days,
+            good_research_only=False,
+        )
+        bundles = await self._selected_bundles(request)
+        audits = [self._audit_bundle(bundle) for bundle in bundles]
+        thesis_counts = Counter(audit.thesis_correctness for audit in audits)
+        trade_quality_counts = Counter(audit.trade_quality for audit in audits)
+        block_correctness_counts = Counter(audit.block_correctness for audit in audits)
+        return StrategyAuditSummary(
+            room_count=len(audits),
+            stale_mismatch_count=sum(1 for audit in audits if audit.stale_data_mismatch),
+            low_upside_proposal_count=sum(1 for audit in audits if audit.trade_quality == "weak_trade"),
+            resolved_contract_proposal_count=sum(
+                1
+                for audit in audits
+                if audit.resolution_state in {WeatherResolutionState.LOCKED_NO.value, WeatherResolutionState.LOCKED_YES.value}
+                and audit.trade_quality == "weak_trade"
+            ),
+            missed_stand_down_count=sum(1 for audit in audits if audit.missed_stand_down),
+            thesis_counts=dict(thesis_counts),
+            trade_quality_counts=dict(trade_quality_counts),
+            block_correctness_counts=dict(block_correctness_counts),
+            samples=audits[: min(10, len(audits))],
+        )
+
     async def select_learning_room_ids(
         self,
         *,
@@ -409,6 +446,116 @@ class TrainingCorpusService:
                 "dominant_city_share": round((city_counts.most_common(1)[0][1] / len(bundles)), 4) if bundles else 0.0,
             },
         )
+
+    def _audit_bundle(self, bundle: TrainingRoomBundle) -> StrategyAuditResult:
+        signal = bundle.signal or {}
+        signal_payload = signal.get("payload") or {}
+        risk = bundle.risk_verdict or {}
+        risk_reasons = [str(reason) for reason in ((risk.get("reasons") if isinstance(risk, dict) else None) or [])]
+        eligibility = signal_payload.get("eligibility") if isinstance(signal_payload, dict) else None
+        resolution_state = self._bundle_resolution_state(bundle)
+        thesis_correctness = self._thesis_correctness(bundle, resolution_state)
+        trade_quality = self._trade_quality(bundle, resolution_state, signal_payload)
+        stale_mismatch = bool(
+            bundle.outcome.research_gate_passed
+            and any("stale" in reason.lower() for reason in risk_reasons)
+            and not (isinstance(eligibility, dict) and eligibility.get("research_stale"))
+        )
+        missed_stand_down = trade_quality == "weak_trade" and bundle.outcome.ticket_generated
+        if bundle.outcome.blocked_by == "risk":
+            block_correctness = "correct_block" if risk_reasons else "blocked"
+        elif bundle.outcome.blocked_by == "eligibility":
+            block_correctness = "early_stand_down"
+        elif bundle.outcome.blocked_by == "research_gate":
+            block_correctness = "research_gate_block"
+        else:
+            block_correctness = "not_applicable"
+
+        reasons: list[str] = []
+        if thesis_correctness == "correct" and trade_quality == "weak_trade":
+            reasons.append("Directional thesis was reasonable, but the setup should have stood down earlier.")
+        if resolution_state != WeatherResolutionState.UNRESOLVED.value:
+            reasons.append(f"Observed weather state implies {resolution_state}.")
+        if stale_mismatch:
+            reasons.append("Room allowed analysis through research gate but stale data only surfaced downstream in risk.")
+        if isinstance(eligibility, dict) and eligibility.get("stand_down_reason"):
+            reasons.append(f"Eligibility stand-down reason: {eligibility['stand_down_reason']}.")
+        reasons.extend(risk_reasons[:2])
+
+        return StrategyAuditResult(
+            room_id=bundle.room["id"],
+            market_ticker=bundle.room["market_ticker"],
+            thesis_correctness=thesis_correctness,
+            trade_quality=trade_quality,
+            block_correctness=block_correctness,
+            missed_stand_down=missed_stand_down,
+            stale_data_mismatch=stale_mismatch,
+            resolution_state=resolution_state,
+            eligibility_passed=bundle.outcome.eligibility_passed,
+            stand_down_reason=bundle.outcome.stand_down_reason,
+            blocked_by=bundle.outcome.blocked_by,
+            reasons=reasons,
+        )
+
+    def _bundle_resolution_state(self, bundle: TrainingRoomBundle) -> str:
+        signal = bundle.signal or {}
+        signal_payload = signal.get("payload") or {}
+        resolution = signal_payload.get("resolution_state")
+        if resolution:
+            return str(resolution)
+        dossier = bundle.research_dossier or {}
+        trader_context = dossier.get("trader_context") or {}
+        resolution = trader_context.get("resolution_state")
+        if resolution:
+            return str(resolution)
+        weather_bundle = bundle.weather_bundle or {}
+        mapping = weather_bundle.get("mapping") or {}
+        operator = str(mapping.get("operator") or "")
+        threshold = mapping.get("threshold_f")
+        observation = ((weather_bundle.get("observation") or {}).get("properties") or {}).get("temperature") or {}
+        current_c = observation.get("value")
+        current_temp_f = None if current_c in (None, "") else (float(current_c) * 9 / 5) + 32
+        if threshold is None or current_temp_f is None:
+            return WeatherResolutionState.UNRESOLVED.value
+        if operator in (">", ">=") and current_temp_f >= float(threshold):
+            return WeatherResolutionState.LOCKED_YES.value
+        if operator in ("<", "<=") and current_temp_f > float(threshold):
+            return WeatherResolutionState.LOCKED_NO.value
+        return WeatherResolutionState.UNRESOLVED.value
+
+    def _thesis_correctness(self, bundle: TrainingRoomBundle, resolution_state: str) -> str:
+        fair_yes = bundle.signal.get("fair_yes_dollars") if bundle.signal else None
+        try:
+            fair_yes_value = Decimal(str(fair_yes)) if fair_yes not in (None, "") else None
+        except Exception:
+            fair_yes_value = None
+        if resolution_state == WeatherResolutionState.LOCKED_NO.value:
+            if fair_yes_value is not None and fair_yes_value <= Decimal("0.5000"):
+                return "correct"
+            return "incorrect"
+        if resolution_state == WeatherResolutionState.LOCKED_YES.value:
+            if fair_yes_value is not None and fair_yes_value >= Decimal("0.5000"):
+                return "correct"
+            return "incorrect"
+        return "unresolved"
+
+    def _trade_quality(self, bundle: TrainingRoomBundle, resolution_state: str, signal_payload: dict[str, Any]) -> str:
+        if not bundle.outcome.ticket_generated:
+            return "stand_down"
+        if resolution_state != WeatherResolutionState.UNRESOLVED.value:
+            return "weak_trade"
+        eligibility = signal_payload.get("eligibility") if isinstance(signal_payload, dict) else None
+        if isinstance(eligibility, dict):
+            remaining = eligibility.get("remaining_payout_dollars")
+            try:
+                if remaining is not None and Decimal(str(remaining)) < Decimal("0.0300"):
+                    return "weak_trade"
+            except Exception:
+                pass
+            spread = eligibility.get("market_spread_bps")
+            if spread is not None and int(spread) > self.settings.trigger_max_spread_bps:
+                return "weak_trade"
+        return "good_trade"
 
     def _dataset_item(self, bundle: TrainingRoomBundle) -> dict[str, Any]:
         return {

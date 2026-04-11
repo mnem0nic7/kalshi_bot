@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import ContractSide, TradeAction
+from kalshi_bot.core.enums import ContractSide, StandDownReason, StrategyMode, TradeAction, WeatherResolutionState
 from kalshi_bot.core.fixed_point import as_decimal, quantize_price
+from kalshi_bot.core.schemas import ResearchFreshness, TradeEligibilityVerdict
 from kalshi_bot.weather.models import WeatherMarketMapping
 from kalshi_bot.weather.scoring import WeatherSignalSnapshot, score_weather_market
 
@@ -21,6 +23,108 @@ class StrategySignal:
     target_yes_price_dollars: Decimal | None
     summary: str
     weather: WeatherSignalSnapshot | None = None
+    resolution_state: WeatherResolutionState = WeatherResolutionState.UNRESOLVED
+    strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED
+    eligibility: TradeEligibilityVerdict | None = None
+    stand_down_reason: StandDownReason | None = None
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def market_spread_bps(market_snapshot: dict[str, Any]) -> int | None:
+    market = market_snapshot.get("market", market_snapshot)
+    yes_bid = quantize_price(market.get("yes_bid_dollars")) if market.get("yes_bid_dollars") is not None else None
+    yes_ask = quantize_price(market.get("yes_ask_dollars")) if market.get("yes_ask_dollars") is not None else None
+    if yes_bid is None or yes_ask is None:
+        return None
+    return int(((yes_ask - yes_bid) * Decimal("10000")).to_integral_value())
+
+
+def remaining_payout_dollars(side: ContractSide, yes_price_dollars: Decimal) -> Decimal:
+    if side == ContractSide.YES:
+        return quantize_price(Decimal("1.0000") - yes_price_dollars)
+    return quantize_price(yes_price_dollars)
+
+
+def evaluate_trade_eligibility(
+    *,
+    settings: Settings,
+    signal: StrategySignal,
+    market_snapshot: dict[str, Any],
+    market_observed_at: datetime | None,
+    research_freshness: ResearchFreshness,
+    thresholds: Any,
+) -> TradeEligibilityVerdict:
+    reasons: list[str] = []
+    stand_down_reason: StandDownReason | None = None
+    now = datetime.now(UTC)
+    market_seen_at = _as_utc(market_observed_at)
+    market_stale = market_seen_at is None or (now - market_seen_at).total_seconds() > settings.risk_stale_market_seconds
+    research_stale = bool(research_freshness.stale)
+    spread_bps = market_spread_bps(market_snapshot)
+    remaining_payout: Decimal | None = None
+    edge_after_quality_buffer_bps = signal.edge_bps - settings.strategy_quality_edge_buffer_bps
+
+    strategy_mode = signal.strategy_mode
+    if signal.resolution_state != WeatherResolutionState.UNRESOLVED:
+        strategy_mode = StrategyMode.RESOLVED_CLEANUP_CANDIDATE
+    elif signal.recommended_action is None:
+        strategy_mode = StrategyMode.LATE_DAY_AVOID
+
+    if research_stale:
+        reasons.append("Research context is stale at decision time.")
+        stand_down_reason = StandDownReason.RESEARCH_STALE
+    elif market_stale:
+        reasons.append("Market quotes are stale at decision time.")
+        stand_down_reason = StandDownReason.MARKET_STALE
+    elif signal.resolution_state != WeatherResolutionState.UNRESOLVED:
+        reasons.append("Contract is already resolved by observed weather state.")
+        stand_down_reason = StandDownReason.RESOLVED_CONTRACT
+    elif signal.recommended_action is None or signal.recommended_side is None or signal.target_yes_price_dollars is None:
+        reasons.append("Signal did not produce an actionable order after weather pricing.")
+        stand_down_reason = StandDownReason.INSUFFICIENT_EDGE_QUALITY
+    else:
+        remaining_payout = remaining_payout_dollars(signal.recommended_side, signal.target_yes_price_dollars)
+        if remaining_payout <= (Decimal(settings.strategy_min_remaining_payout_bps) / Decimal("10000")):
+            reasons.append(
+                f"Remaining payout {remaining_payout} is below configured minimum of "
+                f"{Decimal(settings.strategy_min_remaining_payout_bps) / Decimal('10000'):.4f}."
+            )
+            stand_down_reason = StandDownReason.INSUFFICIENT_REMAINING_PAYOUT
+        elif spread_bps is not None and spread_bps > thresholds.trigger_max_spread_bps:
+            reasons.append(
+                f"Market spread {spread_bps}bps exceeds configured maximum of {thresholds.trigger_max_spread_bps}bps."
+            )
+            stand_down_reason = StandDownReason.SPREAD_TOO_WIDE
+        elif edge_after_quality_buffer_bps < thresholds.risk_min_edge_bps:
+            reasons.append(
+                f"Edge after quality buffer is {edge_after_quality_buffer_bps}bps, below the configured minimum "
+                f"of {thresholds.risk_min_edge_bps}bps."
+            )
+            stand_down_reason = StandDownReason.INSUFFICIENT_EDGE_QUALITY
+
+    if stand_down_reason is not None and strategy_mode == StrategyMode.DIRECTIONAL_UNRESOLVED:
+        strategy_mode = StrategyMode.LATE_DAY_AVOID
+
+    return TradeEligibilityVerdict(
+        eligible=stand_down_reason is None,
+        strategy_mode=strategy_mode,
+        resolution_state=signal.resolution_state,
+        stand_down_reason=stand_down_reason,
+        reasons=reasons or ["Trade passed marketability checks."],
+        market_stale=market_stale,
+        research_stale=research_stale,
+        remaining_payout_dollars=remaining_payout,
+        market_spread_bps=spread_bps,
+        edge_after_quality_buffer_bps=edge_after_quality_buffer_bps,
+        blocked_upstream=stand_down_reason is not None,
+    )
 
 
 class WeatherSignalEngine:
@@ -90,6 +194,12 @@ class WeatherSignalEngine:
             target_yes_price_dollars=target_yes,
             summary=summary,
             weather=weather,
+            resolution_state=weather.resolution_state,
+            strategy_mode=(
+                StrategyMode.RESOLVED_CLEANUP_CANDIDATE
+                if weather.resolution_state != WeatherResolutionState.UNRESOLVED
+                else StrategyMode.DIRECTIONAL_UNRESOLVED
+            ),
         )
 
 

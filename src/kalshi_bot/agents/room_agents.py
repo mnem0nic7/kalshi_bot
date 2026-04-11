@@ -61,6 +61,9 @@ class AgentSuite:
             if dossier.trader_context.fair_yes_dollars is not None
             else None,
             "edge_bps": signal.edge_bps,
+            "resolution_state": signal.resolution_state.value,
+            "strategy_mode": signal.strategy_mode.value,
+            "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
             "research_gate_passed": dossier.gate.passed,
             "research_gate_reasons": dossier.gate.reasons,
             "delta": delta.model_dump(mode="json"),
@@ -79,7 +82,11 @@ class AgentSuite:
         signal: StrategySignal,
         role_config: AgentPackRoleConfig | None = None,
     ) -> tuple[RoomMessageCreate, dict]:
-        posture = "press_when_clear" if signal.edge_bps >= self.settings.risk_min_edge_bps else "stay_disciplined"
+        posture = (
+            "press_when_clear"
+            if signal.edge_bps >= self.settings.risk_min_edge_bps and (signal.eligibility is None or signal.eligibility.eligible)
+            else "stay_disciplined"
+        )
         fallback = (
             f"Session posture is {posture}. Focus only on weather thresholds with fresh evidence; "
             f"do not stretch beyond configured limits or trade when the edge is ambiguous."
@@ -113,6 +120,33 @@ class AgentSuite:
         role_config: AgentPackRoleConfig | None = None,
         max_order_notional_dollars: float | None = None,
     ) -> tuple[RoomMessageCreate, TradeTicket | None, str | None, dict]:
+        if signal.eligibility is not None and not signal.eligibility.eligible:
+            reason_text = " ".join(signal.eligibility.reasons)
+            content = f"Stand down. {reason_text}"
+            return (
+                RoomMessageCreate(
+                    role=AgentRole.TRADER,
+                    kind=MessageKind.TRADE_IDEA,
+                    stage=RoomStage.PROPOSING,
+                    content=content,
+                    payload={
+                        "decision": "stand_down",
+                        "edge_bps": signal.edge_bps,
+                        "resolution_state": signal.resolution_state.value,
+                        "strategy_mode": signal.strategy_mode.value,
+                        "eligibility": signal.eligibility.model_dump(mode="json"),
+                        "stand_down_reason": (
+                            signal.eligibility.stand_down_reason.value
+                            if signal.eligibility.stand_down_reason is not None
+                            else None
+                        ),
+                    },
+                ),
+                None,
+                None,
+                {"provider": "none", "model": None, "temperature": 0.0, "fallback_used": True},
+            )
+
         if signal.recommended_action is None or signal.recommended_side is None or signal.target_yes_price_dollars is None:
             content = "No executable taker order clears the configured edge threshold right now."
             return (
@@ -121,7 +155,14 @@ class AgentSuite:
                     kind=MessageKind.TRADE_IDEA,
                     stage=RoomStage.PROPOSING,
                     content=content,
-                    payload={"decision": "stand_down", "edge_bps": signal.edge_bps},
+                    payload={
+                        "decision": "stand_down",
+                        "edge_bps": signal.edge_bps,
+                        "resolution_state": signal.resolution_state.value,
+                        "strategy_mode": signal.strategy_mode.value,
+                        "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
+                        "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
+                    },
                 ),
                 None,
                 None,
@@ -167,7 +208,12 @@ class AgentSuite:
                 kind=MessageKind.TRADE_TICKET,
                 stage=RoomStage.PROPOSING,
                 content=content,
-                payload=ticket.model_dump(mode="json"),
+                payload={
+                    **ticket.model_dump(mode="json"),
+                    "resolution_state": signal.resolution_state.value,
+                    "strategy_mode": signal.strategy_mode.value,
+                    "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
+                },
             ),
             ticket,
             client_order_id,

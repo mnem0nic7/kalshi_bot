@@ -77,7 +77,7 @@ class FakeWeather:
             },
             "observation": {
                 "properties": {
-                    "temperature": {"value": 29.0},
+                    "temperature": {"value": 25.0},
                     "timestamp": "2026-04-10T01:00:00+00:00",
                 }
             },

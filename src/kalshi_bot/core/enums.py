@@ -52,6 +52,27 @@ class ContractSide(StrEnum):
     NO = "no"
 
 
+class WeatherResolutionState(StrEnum):
+    UNRESOLVED = "unresolved"
+    LOCKED_YES = "locked_yes"
+    LOCKED_NO = "locked_no"
+
+
+class StrategyMode(StrEnum):
+    DIRECTIONAL_UNRESOLVED = "directional_unresolved"
+    LATE_DAY_AVOID = "late_day_avoid"
+    RESOLVED_CLEANUP_CANDIDATE = "resolved_cleanup_candidate"
+
+
+class StandDownReason(StrEnum):
+    RESEARCH_STALE = "research_stale"
+    MARKET_STALE = "market_stale"
+    RESOLVED_CONTRACT = "resolved_contract"
+    INSUFFICIENT_EDGE_QUALITY = "insufficient_edge_quality"
+    SPREAD_TOO_WIDE = "spread_too_wide"
+    INSUFFICIENT_REMAINING_PAYOUT = "insufficient_remaining_payout"
+
+
 class RiskStatus(StrEnum):
     APPROVED = "approved"
     BLOCKED = "blocked"
@@ -61,4 +82,3 @@ class RiskStatus(StrEnum):
 class DeploymentColor(StrEnum):
     BLUE = "blue"
     GREEN = "green"
-

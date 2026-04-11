@@ -355,6 +355,7 @@ def _research_quality_summary(research_dossier: dict | None, research_health: di
 
 def _decision_summary(
     room: dict,
+    signal: dict | None,
     research_dossier: dict | None,
     trade_ticket: dict | None,
     risk_verdict: dict | None,
@@ -383,11 +384,26 @@ def _decision_summary(
     else:
         execution_status = "stand_down"
 
+    signal_payload = (signal or {}).get("payload") or {}
+    eligibility = signal_payload.get("eligibility") if isinstance(signal_payload, dict) else None
+    blocked_by = None
+    if ((research_dossier or {}).get("gate") or {}).get("passed") is False:
+        blocked_by = "research_gate"
+    elif isinstance(eligibility, dict) and eligibility.get("eligible") is False:
+        blocked_by = "eligibility"
+    elif (risk_verdict or {}).get("status") == "blocked":
+        blocked_by = "risk"
+
     return {
         "room_stage": room.get("stage"),
         "research_gate_passed": ((research_dossier or {}).get("gate") or {}).get("passed"),
         "research_gate_reasons": ((research_dossier or {}).get("gate") or {}).get("reasons") or [],
         "trade_proposed": trade_ticket is not None,
+        "resolution_state": signal_payload.get("resolution_state") if isinstance(signal_payload, dict) else None,
+        "strategy_mode": signal_payload.get("strategy_mode") if isinstance(signal_payload, dict) else None,
+        "eligibility": eligibility,
+        "stand_down_reason": signal_payload.get("stand_down_reason") if isinstance(signal_payload, dict) else None,
+        "blocked_by": blocked_by,
         "risk_status": (risk_verdict or {}).get("status"),
         "execution_status": execution_status,
         "order_count": len(orders),
@@ -466,6 +482,7 @@ async def _load_room_snapshot(app_container: AppContainer, room_id: str, *, incl
             "research_quality": _research_quality_summary(research_dossier, serialized_research_health),
             "decision": _decision_summary(
                 serialized_room,
+                serialized_signal,
                 research_dossier,
                 serialized_ticket,
                 serialized_verdict,
@@ -634,6 +651,18 @@ def create_app() -> FastAPI:
         app_container = container(request)
         issues = await app_container.training_corpus_service.research_audit(limit=50)
         return JSONResponse({"issues": [issue.model_dump(mode="json") for issue in issues]})
+
+    @app.get("/api/strategy-audit/rooms/{room_id}")
+    async def strategy_audit_room(room_id: str, request: Request) -> JSONResponse:
+        app_container = container(request)
+        return JSONResponse((await app_container.training_corpus_service.strategy_audit_room(room_id)).model_dump(mode="json"))
+
+    @app.get("/api/strategy-audit/summary")
+    async def strategy_audit_summary(request: Request, days: int | None = None, limit: int = 100) -> JSONResponse:
+        app_container = container(request)
+        return JSONResponse(
+            (await app_container.training_corpus_service.strategy_audit_summary(days=days, limit=limit)).model_dump(mode="json")
+        )
 
     @app.post("/api/shadow-campaign/run")
     async def shadow_campaign_run(request: Request) -> JSONResponse:

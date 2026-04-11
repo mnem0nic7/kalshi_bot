@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import ContractSide, DeploymentColor, RiskStatus, TradeAction
+from kalshi_bot.core.enums import ContractSide, DeploymentColor, RiskStatus, TradeAction, WeatherResolutionState
 from kalshi_bot.core.schemas import TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
@@ -16,6 +16,7 @@ def make_signal(edge_bps: int = 100) -> StrategySignal:
         confidence=0.8,
         forecast_high_f=86,
         current_temp_f=78,
+        resolution_state=WeatherResolutionState.UNRESOLVED,
         observation_time=datetime.now(UTC),
         forecast_updated_time=datetime.now(UTC),
         summary="test signal",

@@ -82,6 +82,8 @@ class Settings(BaseSettings):
     risk_stale_market_seconds: int = 30
     risk_stale_weather_seconds: int = 900
     risk_min_edge_bps: int = 50
+    strategy_min_remaining_payout_bps: int = 300
+    strategy_quality_edge_buffer_bps: int = 25
 
     memory_embedding_dimensions: int = 16
     sse_poll_interval_seconds: float = 1.0

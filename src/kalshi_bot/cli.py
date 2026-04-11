@@ -112,6 +112,16 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps([issue.model_dump(mode="json") for issue in issues], indent=2))
             return 0
 
+        if args.command == "strategy-audit":
+            if args.strategy_audit_command == "room":
+                result = await container.training_corpus_service.strategy_audit_room(args.room_id)
+                print(json.dumps(result.model_dump(mode="json"), indent=2))
+                return 0
+            if args.strategy_audit_command == "summary":
+                result = await container.training_corpus_service.strategy_audit_summary(days=args.days, limit=args.limit)
+                print(json.dumps(result.model_dump(mode="json"), indent=2))
+                return 0
+
         if args.command == "training-export":
             room_ids = [args.room_id] if args.room_id else None
             output_path = Path(args.output)
@@ -405,6 +415,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     research_audit = subparsers.add_parser("research-audit")
     research_audit.add_argument("--limit", type=int, default=50)
+
+    strategy_audit = subparsers.add_parser("strategy-audit")
+    strategy_audit_subparsers = strategy_audit.add_subparsers(dest="strategy_audit_command", required=True)
+    strategy_audit_room = strategy_audit_subparsers.add_parser("room")
+    strategy_audit_room.add_argument("room_id")
+    strategy_audit_summary = strategy_audit_subparsers.add_parser("summary")
+    strategy_audit_summary.add_argument("--days", type=int, default=None)
+    strategy_audit_summary.add_argument("--limit", type=int, default=100)
 
     training_export = subparsers.add_parser("training-export")
     training_export.add_argument("--output", required=True)

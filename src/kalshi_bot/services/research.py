@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import AgentRole, ContractSide, TradeAction
+from kalshi_bot.core.enums import AgentRole, ContractSide, StrategyMode, TradeAction, WeatherResolutionState
 from kalshi_bot.core.fixed_point import as_decimal, quantize_price
 from kalshi_bot.core.schemas import (
     ResearchClaim,
@@ -142,7 +142,7 @@ class ResearchCoordinator:
             await session.commit()
         if record is None:
             return None
-        return ResearchDossier.model_validate(record.payload)
+        return self._hydrate_runtime_fields(ResearchDossier.model_validate(record.payload))
 
     async def list_recent_runs(self, market_ticker: str, limit: int = 10, *, status: str | None = None) -> list[dict[str, Any]]:
         async with self.session_factory() as session:
@@ -311,7 +311,7 @@ class ResearchCoordinator:
         if market_state is None:
             return
         if dossier_record is not None:
-            dossier = ResearchDossier.model_validate(dossier_record.payload)
+            dossier = self._hydrate_runtime_fields(ResearchDossier.model_validate(dossier_record.payload))
             previous_bid = _to_float(dossier.summary.current_numeric_facts.get("yes_bid_dollars"))
             previous_ask = _to_float(dossier.summary.current_numeric_facts.get("yes_ask_dollars"))
             current_bid = _to_float(market_state.yes_bid_dollars)
@@ -372,6 +372,7 @@ class ResearchCoordinator:
         *,
         min_edge_bps: int | None = None,
     ) -> StrategySignal:
+        dossier = self._hydrate_runtime_fields(dossier)
         market = _coerce_market(market_response)
         fair_yes = dossier.trader_context.fair_yes_dollars or Decimal("0.5000")
         ask_yes = quantize_price(market.get("yes_ask_dollars")) if market.get("yes_ask_dollars") is not None else None
@@ -418,6 +419,8 @@ class ResearchCoordinator:
             target_yes_price_dollars=target_yes,
             summary=summary,
             weather=None,
+            resolution_state=dossier.trader_context.resolution_state,
+            strategy_mode=dossier.trader_context.strategy_mode,
         )
 
     def _build_dossier(
@@ -457,6 +460,8 @@ class ResearchCoordinator:
                 {
                     "forecast_high_f": weather_snapshot.forecast_high_f,
                     "current_temp_f": weather_snapshot.current_temp_f,
+                    "threshold_f": mapping.threshold_f if mapping is not None else None,
+                    "resolution_state": weather_snapshot.resolution_state.value,
                 }
             )
         elif web_payload is not None:
@@ -504,6 +509,18 @@ class ResearchCoordinator:
             structured_source_used=structured_used,
             web_source_used=web_used,
             autonomous_ready=fair_yes is not None,
+            resolution_state=(
+                weather_signal.weather.resolution_state
+                if weather_signal is not None and weather_signal.weather is not None
+                else WeatherResolutionState.UNRESOLVED
+            ),
+            strategy_mode=(
+                StrategyMode.RESOLVED_CLEANUP_CANDIDATE
+                if weather_signal is not None
+                and weather_signal.weather is not None
+                and weather_signal.weather.resolution_state != WeatherResolutionState.UNRESOLVED
+                else StrategyMode.DIRECTIONAL_UNRESOLVED
+            ),
         )
         contradiction_count = sum(1 for claim in claims if claim.stance == "contradicts")
         unresolved_count = len(summary.unresolved_uncertainties)
@@ -544,7 +561,49 @@ class ResearchCoordinator:
             last_run_id=last_run_id,
         )
 
+    def _effective_freshness(self, freshness: ResearchFreshness) -> ResearchFreshness:
+        now = datetime.now(UTC)
+        refreshed_at = freshness.refreshed_at.astimezone(UTC)
+        expires_at = freshness.expires_at.astimezone(UTC)
+        stale = now >= expires_at
+        elapsed_since_refresh = max(0, int((now - refreshed_at).total_seconds()))
+        return ResearchFreshness(
+            refreshed_at=refreshed_at,
+            expires_at=expires_at,
+            stale=stale,
+            max_source_age_seconds=max(freshness.max_source_age_seconds, elapsed_since_refresh),
+        )
+
+    def _hydrate_runtime_fields(self, dossier: ResearchDossier) -> ResearchDossier:
+        freshness = self._effective_freshness(dossier.freshness)
+        gate = self._gate_dossier(
+            sources=dossier.sources,
+            summary=dossier.summary,
+            trader_context=dossier.trader_context,
+            freshness=freshness,
+            settlement_covered=dossier.settlement_covered,
+        )
+        quality = self._quality_summary(
+            mapping=None,
+            sources=dossier.sources,
+            claims=dossier.claims,
+            summary=dossier.summary,
+            trader_context=dossier.trader_context,
+            freshness=freshness,
+            settlement_covered=dossier.settlement_covered,
+            contradiction_count=dossier.contradiction_count,
+        )
+        return dossier.model_copy(
+            update={
+                "freshness": freshness,
+                "gate": gate,
+                "quality": quality,
+                "status": "ready" if gate.passed else "blocked",
+            }
+        )
+
     def training_quality_snapshot(self, dossier: ResearchDossier) -> dict[str, Any]:
+        dossier = self._hydrate_runtime_fields(dossier)
         structured_training_ready = dossier.mode in {"structured", "mixed"} and dossier.trader_context.structured_source_used
         good_for_training = (
             dossier.gate.passed
@@ -569,12 +628,15 @@ class ResearchCoordinator:
                 "quality": dossier.quality.model_dump(mode="json"),
                 "gate": dossier.gate.model_dump(mode="json"),
                 "freshness": dossier.freshness.model_dump(mode="json"),
+                "effective_freshness": dossier.freshness.model_dump(mode="json"),
                 "source_count": len(dossier.sources),
                 "settlement_covered": dossier.settlement_covered,
                 "contradiction_count": dossier.contradiction_count,
                 "unresolved_count": dossier.unresolved_count,
                 "structured_source_used": dossier.trader_context.structured_source_used,
                 "web_source_used": dossier.trader_context.web_source_used,
+                "resolution_state": dossier.trader_context.resolution_state.value,
+                "strategy_mode": dossier.trader_context.strategy_mode.value,
             },
         }
 

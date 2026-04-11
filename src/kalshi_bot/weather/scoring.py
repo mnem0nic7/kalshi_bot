@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from kalshi_bot.core.enums import WeatherResolutionState
 from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.weather.models import WeatherMarketMapping
 
@@ -46,6 +47,7 @@ class WeatherSignalSnapshot:
     confidence: float
     forecast_high_f: float | None
     current_temp_f: float | None
+    resolution_state: WeatherResolutionState
     observation_time: datetime | None
     forecast_updated_time: datetime | None
     summary: str
@@ -65,7 +67,28 @@ def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[s
         raise RuntimeError(f"{mapping.market_ticker} is missing structured weather configuration")
     forecast_high_f = extract_forecast_high_f(forecast_payload)
     current_temp_f = extract_current_temp_f(observation_payload)
-    if forecast_high_f is None:
+    resolution_state = WeatherResolutionState.UNRESOLVED
+    if current_temp_f is not None:
+        if mapping.operator in (">", ">=") and current_temp_f >= mapping.threshold_f:
+            resolution_state = WeatherResolutionState.LOCKED_YES
+        elif mapping.operator in ("<", "<=") and current_temp_f > mapping.threshold_f:
+            resolution_state = WeatherResolutionState.LOCKED_NO
+
+    if resolution_state == WeatherResolutionState.LOCKED_YES:
+        fair = Decimal("1.0000")
+        confidence = 1.0
+        summary = (
+            f"Current observed temperature {current_temp_f:.1f}F has already met or exceeded "
+            f"the {mapping.threshold_f:.1f}F threshold, so the contract is locked yes."
+        )
+    elif resolution_state == WeatherResolutionState.LOCKED_NO:
+        fair = Decimal("0.0000")
+        confidence = 1.0
+        summary = (
+            f"Current observed temperature {current_temp_f:.1f}F has already exceeded "
+            f"the {mapping.threshold_f:.1f}F ceiling, so the contract is locked no."
+        )
+    elif forecast_high_f is None:
         fair = Decimal("0.5000")
         confidence = 0.2
         summary = "Forecast high was unavailable, so the model defaulted to neutral pricing."
@@ -74,11 +97,6 @@ def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[s
         if mapping.operator in ("<", "<="):
             delta_f = -delta_f
         probability = logistic_probability(delta_f)
-        if current_temp_f is not None:
-            if mapping.operator in (">", ">=") and current_temp_f >= mapping.threshold_f:
-                probability = max(probability, 0.98)
-            if mapping.operator in ("<", "<=") and current_temp_f <= mapping.threshold_f:
-                probability = max(probability, 0.98)
         fair = quantize_price(probability)
         confidence = min(0.95, 0.45 + min(abs(delta_f) / 12, 0.35) + (0.15 if current_temp_f is not None else 0.0))
         summary = (
@@ -90,6 +108,7 @@ def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[s
         confidence=confidence,
         forecast_high_f=forecast_high_f,
         current_temp_f=current_temp_f,
+        resolution_state=resolution_state,
         observation_time=parse_iso_datetime(observation_payload.get("properties", {}).get("timestamp")),
         forecast_updated_time=parse_iso_datetime(forecast_payload.get("properties", {}).get("updated")),
         summary=summary,
