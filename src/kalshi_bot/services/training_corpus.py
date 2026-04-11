@@ -80,14 +80,16 @@ class TrainingCorpusService:
         )
         good_research_count = sum(1 for health in research_healths if health.get("good_for_training") is True)
         settled_count = sum(1 for bundle in bundles if bundle.outcome.settlement_seen)
+        unsettled_count = sum(1 for bundle in bundles if not bundle.outcome.settlement_seen)
         trade_positive_count = sum(1 for bundle in bundles if bundle.outcome.ticket_generated)
-        failed_reason_counts = Counter(self._failed_reason_bucket(run.error_text) for run in failed_runs)
+        active_failed_reason_counts, legacy_failed_reason_counts = self._partition_failed_reason_counts(failed_runs)
         pack_versions = sorted({bundle.room.get("agent_pack_version") for bundle in bundles if bundle.room.get("agent_pack_version")})
         recent_builds = [self._summary_from_record(record).model_dump(mode="json") for record in builds]
 
         trainable_request = request.model_copy(update={"good_research_only": True})
         trainable_bundles = await self._selected_bundles(trainable_request)
         holdout_count = max(1, int(len(trainable_bundles) * self.settings.self_improve_holdout_ratio)) if trainable_bundles else 0
+        oldest_unsettled_age_seconds = self._oldest_unsettled_age_seconds(bundles)
 
         return {
             "window_days": request.days,
@@ -97,13 +99,18 @@ class TrainingCorpusService:
             "research_gate_pass_rate": gate_pass_rate,
             "dossier_freshness_pass_rate": freshness_pass_rate,
             "good_research_room_count": good_research_count,
+            "unsettled_complete_room_count": unsettled_count,
+            "oldest_unsettled_room_age_seconds": oldest_unsettled_age_seconds,
             "settled_label_coverage": round(settled_count / len(bundles), 4) if bundles else 0.0,
             "trade_positive_coverage": round(trade_positive_count / len(bundles), 4) if bundles else 0.0,
-            "failed_research_reasons": dict(failed_reason_counts.most_common()),
+            "failed_research_reasons": dict(active_failed_reason_counts.most_common()),
+            "active_failed_research_reasons": dict(active_failed_reason_counts.most_common()),
+            "legacy_failed_research_reasons": dict(legacy_failed_reason_counts.most_common()),
             "trainable_room_count": len(trainable_bundles),
             "evaluation_holdout_room_count": holdout_count,
             "pack_versions": pack_versions,
             "recent_dataset_builds": recent_builds,
+            "campaign_settings": self._campaign_settings_snapshot(),
             "readiness": readiness.model_dump(mode="json"),
             "last_readiness_snapshot": latest_snapshot.payload if latest_snapshot is not None else None,
             "top_missing_data": readiness.missing_indicators,
@@ -200,6 +207,15 @@ class TrainingCorpusService:
     async def research_audit(self, *, limit: int = 100) -> list[ResearchAuditIssue]:
         discoveries = await self.discovery_service.discover_configured_markets()
         discovery_by_market = {item.mapping.market_ticker: item for item in discoveries}
+        monitored_mappings = {
+            item.mapping.market_ticker: item.mapping
+            for item in discoveries
+            if item.mapping.market_type == "weather"
+        }
+        for mapping in self.weather_directory.all():
+            if mapping.market_type != "weather":
+                continue
+            monitored_mappings.setdefault(mapping.market_ticker, mapping)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             dossiers = {record.market_ticker: record for record in await repo.list_research_dossiers(limit=limit * 4)}
@@ -208,9 +224,7 @@ class TrainingCorpusService:
 
         failed_counts = Counter(run.market_ticker for run in failed_runs)
         issues: list[ResearchAuditIssue] = []
-        for mapping in self.weather_directory.all():
-            if mapping.market_type != "weather":
-                continue
+        for mapping in monitored_mappings.values():
             if not mapping.supports_structured_weather:
                 issues.append(
                     ResearchAuditIssue(
@@ -275,8 +289,8 @@ class TrainingCorpusService:
                             code="structured_weather_incomplete",
                             summary="Structured weather facts are incomplete in the latest dossier.",
                             details={"quality": quality},
-                        )
                     )
+                )
         return issues[:limit]
 
     async def select_learning_room_ids(
@@ -494,6 +508,60 @@ class TrainingCorpusService:
         if not text:
             return "unknown"
         return "other"
+
+    def _partition_failed_reason_counts(self, failed_runs: list[Any]) -> tuple[Counter[str], Counter[str]]:
+        active = Counter()
+        legacy = Counter()
+        for run in failed_runs:
+            bucket = self._failed_reason_bucket(getattr(run, "error_text", None))
+            market_ticker = getattr(run, "market_ticker", None)
+            if self._is_supported_market_ticker(market_ticker):
+                active[bucket] += 1
+            else:
+                legacy[bucket] += 1
+        return active, legacy
+
+    def _is_supported_market_ticker(self, market_ticker: str | None) -> bool:
+        if not market_ticker:
+            return False
+        return self.weather_directory.supports_market_ticker(market_ticker)
+
+    def _oldest_unsettled_age_seconds(self, bundles: list[TrainingRoomBundle]) -> int | None:
+        now = datetime.now(UTC)
+        ages = [
+            int((now - created_at).total_seconds())
+            for bundle in bundles
+            if not bundle.outcome.settlement_seen
+            for created_at in [self._room_created_at(bundle)]
+            if created_at is not None
+        ]
+        if not ages:
+            return None
+        return max(ages)
+
+    @staticmethod
+    def _room_created_at(bundle: TrainingRoomBundle) -> datetime | None:
+        created_at = bundle.room.get("created_at")
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                return created_at.replace(tzinfo=UTC)
+            return created_at
+        if isinstance(created_at, str) and created_at:
+            parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=UTC)
+            return parsed
+        return None
+
+    def _campaign_settings_snapshot(self) -> dict[str, Any]:
+        return {
+            "enabled": self.settings.training_campaign_enabled,
+            "rooms_per_run": self.settings.training_campaign_rooms_per_run,
+            "lookback_hours": self.settings.training_campaign_lookback_hours,
+            "cooldown_seconds": self.settings.training_campaign_cooldown_seconds,
+            "max_recent_per_market": self.settings.training_campaign_max_recent_per_market,
+            "daemon_reconcile_interval_seconds": self.settings.daemon_reconcile_interval_seconds,
+        }
 
     @staticmethod
     def _rate(matches: list[float], *, total: int) -> float:

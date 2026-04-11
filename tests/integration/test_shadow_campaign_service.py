@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -40,11 +41,11 @@ class FakeResearchCoordinator:
         return None
 
 
-def _discovery(mapping: WeatherMarketMapping, *, bid: str, ask: str, no_ask: str) -> MarketDiscovery:
+def _discovery(mapping: WeatherMarketMapping, *, bid: str, ask: str, no_ask: str, close_ts: int | None = None) -> MarketDiscovery:
     return MarketDiscovery(
         mapping=mapping,
         status="open",
-        close_ts=None,
+        close_ts=close_ts,
         yes_bid_dollars=Decimal(bid),
         yes_ask_dollars=Decimal(ask),
         no_ask_dollars=Decimal(no_ask),
@@ -153,5 +154,87 @@ async def test_shadow_campaign_service_balances_selection_and_skips_recent_marke
     assert len(supervisor.calls) == 2
     assert any(campaign.payload.get("market_ticker") == "WX-B" for campaign in campaigns)
     assert any(campaign.payload.get("market_ticker") == "WX-C" for campaign in campaigns)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shadow_campaign_service_prefers_soon_to_settle_markets_and_records_urgency(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/shadow-campaign-urgency.db",
+        app_shadow_mode=True,
+        app_enable_kill_switch=True,
+        training_campaign_cooldown_seconds=0,
+        training_campaign_max_recent_per_market=10,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    now = datetime.now(UTC)
+    mappings = [
+        WeatherMarketMapping(
+            market_ticker="WX-SOON",
+            market_type="weather",
+            station_id="KNYC",
+            location_name="NYC",
+            latitude=40.0,
+            longitude=-73.0,
+            threshold_f=80,
+        ),
+        WeatherMarketMapping(
+            market_ticker="WX-LATER",
+            market_type="weather",
+            station_id="KORD",
+            location_name="Chicago",
+            latitude=41.0,
+            longitude=-87.0,
+            threshold_f=80,
+        ),
+    ]
+    discoveries = [
+        _discovery(
+            mappings[0],
+            bid="0.54",
+            ask="0.56",
+            no_ask="0.45",
+            close_ts=int((now + timedelta(hours=2)).timestamp()),
+        ),
+        _discovery(
+            mappings[1],
+            bid="0.54",
+            ask="0.56",
+            no_ask="0.45",
+            close_ts=int((now + timedelta(hours=30)).timestamp()),
+        ),
+    ]
+
+    supervisor = FakeSupervisor()
+    shadow_service = ShadowTrainingService(
+        settings,
+        session_factory,
+        FakeDiscoveryService(discoveries),  # type: ignore[arg-type]
+        AgentPackService(settings),
+        supervisor,
+    )
+    campaign_service = ShadowCampaignService(
+        settings,
+        session_factory,
+        FakeDiscoveryService(discoveries),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        shadow_service,
+    )
+
+    results = await campaign_service.run(ShadowCampaignRequest(limit=1, reason="urgency_campaign"))
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        campaigns = await repo.list_room_campaigns(limit=10)
+        await session.commit()
+
+    assert len(results) == 1
+    assert results[0].market_ticker == "WX-SOON"
+    assert campaigns[0].payload["market_ticker"] == "WX-SOON"
+    assert campaigns[0].payload["settlement_urgency_bucket"] == "closing_soon"
 
     await engine.dispose()

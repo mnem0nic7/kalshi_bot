@@ -6,6 +6,7 @@ import pytest
 
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import RoomStage
 from kalshi_bot.core.schemas import RoomCreate, TrainingBuildRequest
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -20,7 +21,7 @@ from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
-from kalshi_bot.weather.models import WeatherMarketMapping
+from kalshi_bot.weather.models import WeatherMarketMapping, WeatherSeriesTemplate
 
 
 class FakeProviders:
@@ -202,6 +203,8 @@ async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_p
 
     status = await corpus_service.get_status(persist_readiness=True)
     assert status["room_count"] == 2
+    assert status["unsettled_complete_room_count"] == 0
+    assert status["oldest_unsettled_room_age_seconds"] is None
     assert status["readiness"]["ready_for_sft_export"] is True
     assert status["readiness"]["ready_for_critique"] is True
     assert status["readiness"]["ready_for_evaluation"] is True
@@ -222,5 +225,80 @@ async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_p
 
     assert [item.room_id for item in build_one_items] == [item.room_id for item in build_two_items]
     assert {item.room_id for item in build_one_items} == {room_one.id, room_two.id}
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_training_status_separates_active_and_legacy_failure_noise(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/training-status.db",
+        app_color="blue",
+        app_shadow_mode=True,
+        training_status_room_limit=20,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    directory = WeatherMarketDirectory(
+        {},
+        {
+            "KXHIGHNY": WeatherSeriesTemplate(
+                series_ticker="KXHIGHNY",
+                display_name="NYC Daily High Temperature",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+            )
+        },
+    )
+
+    class NoopDiscoveryService:
+        async def discover_configured_markets(self):
+            return []
+
+    corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        NoopDiscoveryService(),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_kill_switch_enabled=True)
+        room = await repo.create_room(
+            RoomCreate(name="shadow room", market_ticker="KXHIGHNY-26APR12-T70"),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=True,
+            kalshi_env=settings.kalshi_env,
+        )
+        await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+        active_run = await repo.create_research_run(
+            market_ticker="KXHIGHNY-26APR12-T70",
+            trigger_reason="test_active_failure",
+        )
+        await repo.complete_research_run(active_run.id, status="failed", error_text="404 market not found")
+        legacy_run = await repo.create_research_run(
+            market_ticker="WEATHER-NYC-HIGH-80F",
+            trigger_reason="test_legacy_failure",
+        )
+        await repo.complete_research_run(legacy_run.id, status="failed", error_text="404 market not found")
+        await session.commit()
+
+    status = await corpus_service.get_status(persist_readiness=False)
+
+    assert status["room_count"] == 1
+    assert status["unsettled_complete_room_count"] == 1
+    assert status["oldest_unsettled_room_age_seconds"] is not None
+    assert status["active_failed_research_reasons"] == {"market lookup failures": 1}
+    assert status["legacy_failed_research_reasons"] == {"market lookup failures": 1}
+    assert status["failed_research_reasons"] == {"market lookup failures": 1}
+    assert status["campaign_settings"]["rooms_per_run"] == settings.training_campaign_rooms_per_run
+    assert status["campaign_settings"]["daemon_reconcile_interval_seconds"] == settings.daemon_reconcile_interval_seconds
 
     await engine.dispose()

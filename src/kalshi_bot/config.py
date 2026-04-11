@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     trigger_cooldown_seconds: int = 300
     trigger_max_spread_bps: int = 1200
     trigger_max_concurrent_rooms: int = 4
-    daemon_reconcile_interval_seconds: int = 300
+    daemon_reconcile_interval_seconds: int = 60
     daemon_heartbeat_interval_seconds: int = 60
     daemon_start_with_reconcile: bool = True
     self_improve_window_days: int = 14
@@ -113,10 +113,10 @@ class Settings(BaseSettings):
     training_min_trade_positive_rooms: int = 8
     training_good_research_threshold: float = 0.7
     training_campaign_enabled: bool = False
-    training_campaign_rooms_per_run: int = 1
+    training_campaign_rooms_per_run: int = 3
     training_campaign_lookback_hours: int = 24
-    training_campaign_cooldown_seconds: int = 1800
-    training_campaign_max_recent_per_market: int = 3
+    training_campaign_cooldown_seconds: int = 600
+    training_campaign_max_recent_per_market: int = 5
 
     def model_post_init(self, __context: object) -> None:
         if self.database_url:

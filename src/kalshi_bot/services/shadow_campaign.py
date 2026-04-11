@@ -23,6 +23,7 @@ class ShadowCampaignCandidate:
     market_regime_bucket: str
     difficulty_bucket: str
     outcome_bucket: str
+    settlement_urgency_bucket: str
     recent_count: int
     payload: dict[str, Any]
 
@@ -94,6 +95,7 @@ class ShadowCampaignService:
                     discovery,
                     dossier=recent_dossiers.get(mapping.market_ticker),
                     recent_count=market_recent_count[mapping.market_ticker],
+                    now=now,
                 )
             )
 
@@ -113,6 +115,7 @@ class ShadowCampaignService:
                 "market_regime_bucket": candidate.market_regime_bucket,
                 "difficulty_bucket": candidate.difficulty_bucket,
                 "outcome_bucket": candidate.outcome_bucket,
+                "settlement_urgency_bucket": candidate.settlement_urgency_bucket,
             }
             results.append(
                 await self.shadow_training_service.run_shadow_room(
@@ -138,6 +141,7 @@ class ShadowCampaignService:
             remaining.sort(
                 key=lambda item: (
                     item.recent_count,
+                    self._urgency_rank(item.settlement_urgency_bucket),
                     selected_city[item.city_bucket],
                     selected_regime[item.market_regime_bucket],
                     selected_outcome[item.outcome_bucket],
@@ -158,6 +162,7 @@ class ShadowCampaignService:
         *,
         dossier: dict[str, Any] | None,
         recent_count: int,
+        now: datetime,
     ) -> ShadowCampaignCandidate:
         mapping = discovery.mapping
         fair_yes = self._decimal_or_none(((dossier or {}).get("trader_context") or {}).get("fair_yes_dollars"))
@@ -174,6 +179,7 @@ class ShadowCampaignService:
         market_regime_bucket = self._regime_bucket(discovery)
         difficulty_bucket = self._difficulty_bucket(mapping.threshold_f, dossier)
         outcome_bucket = self._outcome_bucket(discovery, fair_yes=fair_yes, dossier=dossier, signal=signal)
+        settlement_urgency_bucket = self._settlement_urgency_bucket(discovery.close_ts, now=now)
         payload = {
             "market_label": mapping.label,
             "series_ticker": mapping.series_ticker,
@@ -191,6 +197,7 @@ class ShadowCampaignService:
             market_regime_bucket=market_regime_bucket,
             difficulty_bucket=difficulty_bucket,
             outcome_bucket=outcome_bucket,
+            settlement_urgency_bucket=settlement_urgency_bucket,
             recent_count=recent_count,
             payload=payload,
         )
@@ -256,6 +263,26 @@ class ShadowCampaignService:
             "far_from_threshold": 2,
             "unknown": 3,
         }.get(bucket, 4)
+
+    @staticmethod
+    def _settlement_urgency_bucket(close_ts: int | None, *, now: datetime) -> str:
+        if close_ts is None:
+            return "later"
+        close_at = datetime.fromtimestamp(close_ts, tz=UTC)
+        delta_seconds = (close_at - now).total_seconds()
+        if delta_seconds <= 6 * 60 * 60:
+            return "closing_soon"
+        if delta_seconds <= 24 * 60 * 60:
+            return "closing_today"
+        return "later"
+
+    @staticmethod
+    def _urgency_rank(bucket: str) -> int:
+        return {
+            "closing_soon": 0,
+            "closing_today": 1,
+            "later": 2,
+        }.get(bucket, 3)
 
     @staticmethod
     def _decimal_or_none(value: Any) -> Decimal | None:

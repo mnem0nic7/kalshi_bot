@@ -48,10 +48,21 @@
     | Settled coverage: <strong>{{ "%.2f"|format(training_status.settled_label_coverage) }}</strong>
   </p>
   <p>
+    Unsettled complete rooms: <strong>{{ training_status.unsettled_complete_room_count }}</strong>
+    | Oldest unsettled age: <strong>{{ training_status.oldest_unsettled_room_age_seconds if training_status.oldest_unsettled_room_age_seconds is not none else "n/a" }}</strong>s
+  </p>
+  <p>
     Ready for SFT: <strong>{{ training_status.readiness.ready_for_sft_export }}</strong>
     | Critique: <strong>{{ training_status.readiness.ready_for_critique }}</strong>
     | Eval: <strong>{{ training_status.readiness.ready_for_evaluation }}</strong>
     | Promote: <strong>{{ training_status.readiness.ready_for_promotion }}</strong>
+  </p>
+  <p>
+    Campaign enabled: <strong>{{ training_status.campaign_settings.enabled }}</strong>
+    | Rooms/run: <strong>{{ training_status.campaign_settings.rooms_per_run }}</strong>
+    | Cooldown: <strong>{{ training_status.campaign_settings.cooldown_seconds }}</strong>s
+    | Max recent/market: <strong>{{ training_status.campaign_settings.max_recent_per_market }}</strong>
+    | Reconcile cadence: <strong>{{ training_status.campaign_settings.daemon_reconcile_interval_seconds }}</strong>s
   </p>
   <div class="actions">
     <button type="button" onclick="runShadowCampaign()">Run Shadow Campaign</button>
@@ -62,6 +73,24 @@
   {% if training_status.top_missing_data %}
   <p>Top missing data: {{ training_status.top_missing_data|join(" | ") }}</p>
   {% endif %}
+  <div class="room-list">
+    <div class="room-card">
+      <strong>Active failure reasons</strong>
+      {% for reason, count in training_status.active_failed_research_reasons.items() %}
+      <span>{{ reason }} · {{ count }}</span>
+      {% else %}
+      <span>No active-config failures.</span>
+      {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Legacy failure reasons</strong>
+      {% for reason, count in training_status.legacy_failed_research_reasons.items() %}
+      <span>{{ reason }} · {{ count }}</span>
+      {% else %}
+      <span>No legacy failures recorded.</span>
+      {% endfor %}
+    </div>
+  </div>
   <div class="room-list">
     {% for market_ticker, count in training_status.complete_rooms_per_market.items() %}
     <div class="room-card">
