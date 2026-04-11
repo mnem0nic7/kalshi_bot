@@ -1,101 +1,245 @@
 {% extends "base.html" %}
+{% block extra_head %}
+<link rel="stylesheet" href="/static/room.css" />
+{% endblock %}
 {% block content %}
-<section class="panel">
-  <h1>{{ room.name }}</h1>
-  <p>{{ room.market_ticker }} | Stage: {{ room.stage }} | Shadow: {{ room.shadow_mode }} | Pack: {{ room.agent_pack_version or "n/a" }}</p>
-  <div class="actions">
-    <button onclick="runRoom()">Run Workflow</button>
-    <button onclick="refreshResearch()">Refresh Research</button>
-  </div>
-</section>
+<script id="room-bootstrap" type="application/json">{{ room_bootstrap|tojson }}</script>
 
-<section class="panel">
-  <h2>Runtime</h2>
-  <div class="room-list">
-    {% for role, config in room.role_models.items() %}
-    <div class="room-card">
-      <strong>{{ role }}</strong>
-      <span>{{ config.provider }} · {{ config.model or "n/a" }}</span>
-      <span>temperature {{ config.temperature }}</span>
-      {% if config.fallback_used %}
-      <span>fallback used</span>
-      {% endif %}
+<section class="panel room-command-strip">
+  <div class="room-command-main">
+    <div>
+      <p class="eyebrow">Operator Cockpit</p>
+      <h1 id="room-name">{{ room.name }}</h1>
+      <p class="subtle-text">
+        <span id="room-market">{{ room.market_ticker }}</span>
+        · stage <strong id="room-stage">{{ room.stage }}</strong>
+        · <span id="room-shadow">{{ "shadow" if room.shadow_mode else "live" }}</span>
+        · pack <strong id="room-pack">{{ room.agent_pack_version or "n/a" }}</strong>
+      </p>
     </div>
-    {% else %}
-    <p>No runtime model metadata recorded yet.</p>
-    {% endfor %}
+    <div class="actions">
+      <button id="run-room-button" type="button">Run Workflow</button>
+      <button id="refresh-research-button" type="button" class="secondary-button">Refresh Research</button>
+    </div>
+  </div>
+  <div class="summary-strip">
+    <div class="summary-tile">
+      <span class="summary-label">Research Gate</span>
+      <strong id="summary-research-gate">{{ "Passed" if snapshot.analytics.decision.research_gate_passed else "Blocked" }}</strong>
+    </div>
+    <div class="summary-tile">
+      <span class="summary-label">Risk</span>
+      <strong id="summary-risk-status">{{ snapshot.analytics.decision.risk_status or "n/a" }}</strong>
+    </div>
+    <div class="summary-tile">
+      <span class="summary-label">Execution</span>
+      <strong id="summary-execution-status">{{ snapshot.analytics.decision.execution_status or "n/a" }}</strong>
+    </div>
+    <div class="summary-tile">
+      <span class="summary-label">Fair Yes</span>
+      <strong id="summary-fair-yes">{{ snapshot.analytics.pricing.fair_yes_dollars or "n/a" }}</strong>
+    </div>
+    <div class="summary-tile">
+      <span class="summary-label">Edge</span>
+      <strong id="summary-edge-bps">{{ snapshot.analytics.pricing.edge_bps if snapshot.analytics.pricing.edge_bps is not none else "n/a" }}</strong>
+    </div>
+    <div class="summary-tile">
+      <span class="summary-label">Confidence</span>
+      <strong id="summary-confidence">{{ "%.2f"|format(snapshot.analytics.pricing.confidence or 0.0) if snapshot.analytics.pricing.confidence is not none else "n/a" }}</strong>
+    </div>
   </div>
 </section>
 
-<section class="room-grid">
-  <section class="panel">
-    <h2>Research Dossier</h2>
-    {% if research_dossier %}
-    <div class="dossier-grid">
-      <div class="badge-row">
-        <span class="status-pill {{ 'status-good' if research_dossier.gate.passed else 'status-bad' }}">
-          {{ 'Research Gate Passed' if research_dossier.gate.passed else 'Research Gate Blocked' }}
-        </span>
-        <span class="status-pill">{{ research_dossier.mode }}</span>
-        <span class="status-pill">confidence {{ "%.2f"|format(research_dossier.summary.research_confidence) }}</span>
+<section class="room-cockpit">
+  <section class="room-main-lane">
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Workflow</p>
+          <h2>Timeline</h2>
+        </div>
+        <p class="subtle-text">Current room progression by stage.</p>
       </div>
-      <p>{{ research_dossier.summary.narrative }}</p>
-      <div class="room-list">
-        <div class="room-card">
-          <strong>Bullish Case</strong>
-          <span>{{ research_dossier.summary.bullish_case }}</span>
+      <ol id="workflow-timeline" class="workflow-timeline">
+        {% for item in snapshot.stage_timeline %}
+        <li class="timeline-step timeline-{{ item.status }}">
+          <span class="timeline-dot"></span>
+          <div class="timeline-content">
+            <strong>{{ item.label }}</strong>
+            <span class="subtle-text">{{ item.status }}</span>
+            {% if item.at %}
+            <span class="subtle-text">{{ item.at }}</span>
+            {% endif %}
+          </div>
+        </li>
+        {% endfor %}
+      </ol>
+    </section>
+
+    <section class="panel transcript-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Live Room</p>
+          <h2>Transcript</h2>
         </div>
-        <div class="room-card">
-          <strong>Bearish Case</strong>
-          <span>{{ research_dossier.summary.bearish_case }}</span>
-        </div>
-        <div class="room-card">
-          <strong>Settlement</strong>
-          <span>{{ research_dossier.summary.settlement_mechanics }}</span>
-        </div>
-        <div class="room-card">
-          <strong>Freshness</strong>
-          <span>refreshed {{ research_dossier.freshness.refreshed_at }}</span>
-          <span>expires {{ research_dossier.freshness.expires_at }}</span>
-        </div>
-      </div>
-      <div class="room-list">
-        <div class="room-card">
-          <strong>Fair Yes</strong>
-          <span>{{ research_dossier.trader_context.fair_yes_dollars }}</span>
-        </div>
-        <div class="room-card">
-          <strong>Source Coverage</strong>
-          <span>{{ research_dossier.summary.source_coverage }}</span>
-        </div>
-        <div class="room-card">
-          <strong>Warnings</strong>
-          {% for item in research_dossier.summary.unresolved_uncertainties %}
-          <span>{{ item }}</span>
-          {% else %}
-          <span>No unresolved warnings.</span>
-          {% endfor %}
-        </div>
-        <div class="room-card">
-          <strong>Gate Reasons</strong>
-          {% for reason in research_dossier.gate.reasons %}
-          <span>{{ reason }}</span>
-          {% endfor %}
+        <div class="actions">
+          <button id="follow-toggle" type="button" class="secondary-button">Follow: On</button>
+          <span id="transcript-unread" class="status-pill hidden">0 new</span>
         </div>
       </div>
-      {% if research_delta %}
-      <div class="room-card">
-        <strong>Room Delta</strong>
-        <span>{{ research_delta.summary }}</span>
-        {% for key, value in research_delta.numeric_fact_updates.items() %}
-        <span>{{ key }} = {{ value }}</span>
+      <div id="transcript" class="transcript">
+        {% set ns = namespace(last_stage="") %}
+        {% for message in messages %}
+          {% if message.stage and message.stage != ns.last_stage %}
+          <div class="stage-divider stage-{{ message.stage }}">{{ message.stage|replace("_", " ")|title }}</div>
+          {% set ns.last_stage = message.stage %}
+          {% endif %}
+          <article class="message-card role-{{ message.role|replace('_', '-') }}">
+            <header class="message-head">
+              <div class="message-role-block">
+                <strong class="message-role">{{ message.role|replace("_", " ")|title }}</strong>
+                <span class="badge kind-badge">{{ message.kind }}</span>
+                {% if message.stage %}
+                <span class="badge stage-badge">{{ message.stage|replace("_", " ")|title }}</span>
+                {% endif %}
+              </div>
+              <div class="message-meta">
+                <span>#{{ message.sequence }}</span>
+                <span>{{ message.created_at }}</span>
+              </div>
+            </header>
+            <div class="message-body">{{ message.content }}</div>
+            {% if message.payload %}
+            <details class="payload-drawer">
+              <summary>View details</summary>
+              <pre class="payload-json">{{ message.payload|tojson(indent=2) }}</pre>
+            </details>
+            {% endif %}
+          </article>
+        {% else %}
+        <p class="empty-state">No transcript messages yet.</p>
         {% endfor %}
       </div>
+    </section>
+  </section>
+
+  <aside class="room-side-rail">
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Decision</p>
+          <h2>Execution State</h2>
+        </div>
+      </div>
+      <div id="decision-grid" class="metric-grid">
+        <div class="metric-card">
+          <span class="metric-label">Trade Proposed</span>
+          <strong>{{ "Yes" if snapshot.analytics.decision.trade_proposed else "No" }}</strong>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Orders</span>
+          <strong>{{ snapshot.analytics.decision.order_count }}</strong>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Fills</span>
+          <strong>{{ snapshot.analytics.decision.fill_count }}</strong>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Latest Order</span>
+          <strong>{{ snapshot.analytics.decision.latest_order_status or "n/a" }}</strong>
+        </div>
+      </div>
+      {% if snapshot.analytics.decision.latest_ops_summary %}
+      <p id="latest-ops-summary" class="subtle-callout">{{ snapshot.analytics.decision.latest_ops_summary }}</p>
       {% endif %}
-      <h3>Evidence Cards</h3>
-      <div class="room-list">
-        {% for source in research_sources %}
-        <div class="room-card">
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Market</p>
+          <h2>Pricing Lens</h2>
+        </div>
+      </div>
+      <div class="chart-shell">
+        <svg id="pricing-chart" class="analytics-chart" viewBox="0 0 360 220" aria-label="Pricing chart"></svg>
+      </div>
+      <div id="pricing-metrics" class="metric-grid">
+        <div class="metric-card"><span class="metric-label">Yes Bid</span><strong>{{ snapshot.analytics.pricing.yes_bid_dollars or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Yes Ask</span><strong>{{ snapshot.analytics.pricing.yes_ask_dollars or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">No Ask</span><strong>{{ snapshot.analytics.pricing.no_ask_dollars or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Last</span><strong>{{ snapshot.analytics.pricing.last_price_dollars or "n/a" }}</strong></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Weather</p>
+          <h2>Threshold Lens</h2>
+        </div>
+      </div>
+      <div class="chart-shell">
+        <svg id="weather-chart" class="analytics-chart" viewBox="0 0 360 220" aria-label="Weather chart"></svg>
+      </div>
+      <div id="weather-metrics" class="metric-grid">
+        <div class="metric-card"><span class="metric-label">Threshold</span><strong>{{ snapshot.analytics.weather.threshold_f or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Forecast High</span><strong>{{ snapshot.analytics.weather.forecast_high_f or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Current Temp</span><strong>{{ snapshot.analytics.weather.current_temp_f or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Station</span><strong>{{ snapshot.analytics.weather.station_id or "n/a" }}</strong></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Research</p>
+          <h2>Quality</h2>
+        </div>
+      </div>
+      <div class="chart-shell">
+        <svg id="quality-chart" class="analytics-chart" viewBox="0 0 360 220" aria-label="Research quality chart"></svg>
+      </div>
+      <div id="quality-metrics" class="metric-grid">
+        <div class="metric-card"><span class="metric-label">Overall</span><strong>{{ snapshot.analytics.research_quality.overall_score or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Freshness</span><strong>{{ snapshot.analytics.research_quality.freshness_score or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Settlement</span><strong>{{ snapshot.analytics.research_quality.settlement_clarity_score or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Contradictions</span><strong>{{ snapshot.analytics.research_quality.contradiction_count or 0 }}</strong></div>
+      </div>
+      <div id="research-summary">
+        {% if snapshot.research_dossier %}
+        <p id="research-narrative" class="subtle-text">{{ snapshot.research_dossier.summary.narrative }}</p>
+        {% if snapshot.research_delta %}
+        <div id="research-delta-card" class="mini-card">
+          <strong>Room Delta</strong>
+          <span>{{ snapshot.research_delta.summary }}</span>
+        </div>
+        {% endif %}
+        {% else %}
+        <p id="research-narrative" class="empty-state">No dossier available yet for this room.</p>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Evidence</p>
+          <h2>Sources & Runs</h2>
+        </div>
+      </div>
+      <div id="source-summary" class="chip-cloud">
+        <span class="badge">sources {{ snapshot.analytics.source_summary.count }}</span>
+        {% for source_class, count in snapshot.analytics.source_summary.by_class.items() %}
+        <span class="badge">{{ source_class }} · {{ count }}</span>
+        {% endfor %}
+        {% for trust_tier, count in snapshot.analytics.source_summary.by_trust.items() %}
+        <span class="badge">{{ trust_tier }} · {{ count }}</span>
+        {% endfor %}
+      </div>
+      <div id="evidence-cards" class="room-list compact-list">
+        {% for source in snapshot.research_sources %}
+        <div class="mini-card">
           <strong>{{ source.title }}</strong>
           <span>{{ source.publisher }} · {{ source.trust_tier }} · {{ source.source_class }}</span>
           <span>{{ source.snippet }}</span>
@@ -104,79 +248,85 @@
           {% endif %}
         </div>
         {% else %}
-        <p>No source cards saved yet.</p>
+        <p class="empty-state">No source cards saved yet.</p>
         {% endfor %}
       </div>
-      <h3>Recent Research Runs</h3>
-      <div class="room-list">
-        {% for run in research_runs %}
-        <div class="room-card">
+      <div id="research-run-strip" class="room-list compact-list">
+        {% for run in snapshot.research_runs %}
+        <div class="mini-card">
           <strong>{{ run.status }}</strong>
           <span>{{ run.trigger_reason }}</span>
           <span>{{ run.started_at }}</span>
         </div>
         {% else %}
-        <p>No research runs recorded yet.</p>
+        <p class="empty-state">No research runs recorded yet.</p>
         {% endfor %}
       </div>
-    </div>
-    {% else %}
-    <p>No dossier available yet for this room.</p>
-    {% endif %}
-  </section>
+    </section>
 
-  <section class="panel">
-    <h2>Transcript</h2>
-    <div id="transcript" class="transcript">
-      {% for message in messages %}
-      <article class="message">
-        <div class="message-meta">{{ message.sequence }} · {{ message.role }} · {{ message.kind }}</div>
-        <div class="message-body">{{ message.content }}</div>
-      </article>
-      {% endfor %}
-    </div>
-  </section>
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Runtime</p>
+          <h2>Models</h2>
+        </div>
+      </div>
+      <div id="runtime-models" class="room-list compact-list">
+        {% for role, config in room.role_models.items() %}
+        <div class="mini-card">
+          <strong>{{ role }}</strong>
+          <span>{{ config.provider }} · {{ config.model or "n/a" }}</span>
+          <span>temperature {{ config.temperature }}</span>
+          {% if config.fallback_used %}
+          <span>fallback used</span>
+          {% endif %}
+        </div>
+        {% else %}
+        <p class="empty-state">No runtime model metadata recorded yet.</p>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Audit</p>
+          <h2>Memory & Campaign</h2>
+        </div>
+      </div>
+      <div id="memory-summary" class="room-list compact-list">
+        {% if snapshot.memory_note %}
+        <div class="mini-card">
+          <strong>{{ snapshot.memory_note.title }}</strong>
+          <span>{{ snapshot.memory_note.summary }}</span>
+          {% if snapshot.memory_note.tags %}
+          <span>{{ snapshot.memory_note.tags|join(", ") }}</span>
+          {% endif %}
+        </div>
+        {% else %}
+        <p class="empty-state">No memory note recorded yet.</p>
+        {% endif %}
+        <div class="mini-card">
+          <strong>Rationale Chain</strong>
+          {% for item in snapshot.analytics.decision.audit_rationale_ids %}
+          <span>{{ item }}</span>
+          {% else %}
+          <span>No auditor rationale ids recorded yet.</span>
+          {% endfor %}
+        </div>
+        {% if snapshot.campaign %}
+        <div class="mini-card">
+          <strong>Campaign Context</strong>
+          <span>{{ snapshot.campaign.trigger_source }}</span>
+          <span>{{ snapshot.campaign.city_bucket or "n/a" }} · {{ snapshot.campaign.market_regime_bucket or "n/a" }}</span>
+          <span>{{ snapshot.campaign.difficulty_bucket or "n/a" }} · {{ snapshot.campaign.outcome_bucket or "n/a" }}</span>
+        </div>
+        {% endif %}
+      </div>
+    </section>
+  </aside>
 </section>
-
-<script>
-  const transcript = document.getElementById("transcript");
-  let lastSequence = {{ messages[-1].sequence if messages else 0 }};
-
-  function renderMessage(message) {
-    const article = document.createElement("article");
-    article.className = "message";
-    const meta = document.createElement("div");
-    meta.className = "message-meta";
-    meta.textContent = `${message.sequence} · ${message.role} · ${message.kind}`;
-
-    const body = document.createElement("div");
-    body.className = "message-body";
-    body.textContent = message.content ?? "";
-
-    article.append(meta, body);
-    transcript.appendChild(article);
-  }
-
-  async function runRoom() {
-    await fetch("/api/rooms/{{ room.id }}/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason: "manual_run" }),
-    });
-  }
-
-  async function refreshResearch() {
-    await fetch("/api/research/{{ room.market_ticker }}/refresh", { method: "POST" });
-    window.location.reload();
-  }
-
-  const stream = new EventSource(`/rooms/{{ room.id }}/events?after=${lastSequence}`);
-  stream.onmessage = (event) => {
-    const messages = JSON.parse(event.data);
-    for (const message of messages) {
-      renderMessage(message);
-      lastSequence = message.sequence;
-    }
-  };
-</script>
+{% endblock %}
+{% block extra_scripts %}
+<script src="/static/room.js"></script>
 {% endblock %}

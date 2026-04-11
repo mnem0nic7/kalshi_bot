@@ -1,0 +1,372 @@
+.room-command-strip {
+  display: grid;
+  gap: 1rem;
+}
+
+.room-command-main {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.eyebrow {
+  margin: 0 0 0.35rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.72rem;
+  color: #9fb7d9;
+}
+
+.subtle-text {
+  color: #b9c7db;
+}
+
+.subtle-callout,
+.empty-state {
+  color: #c7d3e5;
+  background: rgba(7, 16, 28, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 0.85rem 0.95rem;
+}
+
+.summary-strip {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.summary-tile,
+.metric-card,
+.mini-card {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.85rem 0.95rem;
+  border-radius: 14px;
+  background: rgba(6, 13, 24, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.summary-label,
+.metric-label {
+  font-size: 0.74rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #96aecf;
+}
+
+.room-cockpit {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.95fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.room-main-lane,
+.room-side-rail {
+  display: grid;
+  gap: 1rem;
+}
+
+.room-side-rail {
+  position: sticky;
+  top: 1rem;
+}
+
+.panel-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+  margin-bottom: 0.85rem;
+}
+
+.panel-heading h2 {
+  margin: 0;
+}
+
+.secondary-button {
+  background: rgba(244, 246, 251, 0.08);
+  color: #f4f6fb;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.hidden {
+  display: none;
+}
+
+.workflow-timeline {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.timeline-step {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 0.8rem;
+  align-items: start;
+}
+
+.timeline-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  margin-top: 0.2rem;
+  background: rgba(255, 255, 255, 0.18);
+  border: 2px solid rgba(255, 255, 255, 0.15);
+}
+
+.timeline-complete .timeline-dot {
+  background: #7ce9bf;
+  border-color: rgba(124, 233, 191, 0.4);
+}
+
+.timeline-current .timeline-dot {
+  background: #f9d77e;
+  border-color: rgba(249, 215, 126, 0.4);
+  box-shadow: 0 0 0 6px rgba(249, 215, 126, 0.12);
+}
+
+.timeline-content {
+  display: grid;
+  gap: 0.22rem;
+}
+
+.transcript-panel {
+  min-height: 70vh;
+}
+
+.transcript {
+  display: grid;
+  gap: 0.85rem;
+  max-height: 72vh;
+  overflow: auto;
+  padding-right: 0.25rem;
+}
+
+.stage-divider {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 0.45rem 0.8rem;
+  border-radius: 999px;
+  width: fit-content;
+  background: rgba(249, 215, 126, 0.14);
+  color: #f9d77e;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.message-card {
+  display: grid;
+  gap: 0.7rem;
+  padding: 1rem;
+  border-radius: 18px;
+  background: rgba(6, 13, 24, 0.58);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.message-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  align-items: flex-start;
+}
+
+.message-role-block {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.message-role {
+  font-size: 1rem;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.24rem 0.56rem;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  background: rgba(255, 255, 255, 0.08);
+  color: #d6e0ef;
+}
+
+.kind-badge {
+  background: rgba(115, 177, 255, 0.16);
+  color: #b7d7ff;
+}
+
+.stage-badge {
+  background: rgba(249, 215, 126, 0.14);
+  color: #f9d77e;
+}
+
+.message-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  justify-content: flex-end;
+  color: #9db2cf;
+  font-size: 0.78rem;
+}
+
+.message-body {
+  font-size: 1rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.payload-drawer {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 0.7rem;
+}
+
+.payload-drawer summary {
+  cursor: pointer;
+  color: #f9d77e;
+  font-weight: 600;
+}
+
+.payload-json {
+  margin: 0.7rem 0 0;
+  padding: 0.9rem;
+  border-radius: 14px;
+  background: rgba(5, 10, 18, 0.8);
+  overflow: auto;
+  color: #d9e3f1;
+  font-size: 0.84rem;
+}
+
+.role-researcher {
+  border-left: 4px solid #69d2ff;
+}
+
+.role-president {
+  border-left: 4px solid #f9d77e;
+}
+
+.role-trader {
+  border-left: 4px solid #9ef0d4;
+}
+
+.role-risk-officer {
+  border-left: 4px solid #ffb86b;
+}
+
+.role-execution-clerk {
+  border-left: 4px solid #b59bff;
+}
+
+.role-ops-monitor {
+  border-left: 4px solid #ff8c8c;
+}
+
+.role-auditor {
+  border-left: 4px solid #d5e7ff;
+}
+
+.role-memory-librarian {
+  border-left: 4px solid #8bf0cc;
+}
+
+.role-supervisor {
+  border-left: 4px solid #7ea4ff;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.chip-cloud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.9rem;
+}
+
+.compact-list {
+  gap: 0.6rem;
+}
+
+.chart-shell {
+  padding: 0.35rem 0;
+}
+
+.analytics-chart {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 14px;
+  background: rgba(7, 16, 28, 0.45);
+}
+
+.chart-axis {
+  stroke: rgba(255, 255, 255, 0.1);
+  stroke-width: 1;
+}
+
+.chart-label {
+  fill: #b9c7db;
+  font-size: 12px;
+  font-family: "IBM Plex Sans", "Helvetica Neue", sans-serif;
+}
+
+.chart-value {
+  fill: #f4f6fb;
+  font-size: 12px;
+  font-family: "IBM Plex Sans", "Helvetica Neue", sans-serif;
+}
+
+.chart-bar-pricing {
+  fill: #67d0ff;
+}
+
+.chart-bar-weather {
+  fill: #9ef0d4;
+}
+
+.chart-bar-quality {
+  fill: #f9d77e;
+}
+
+@media (max-width: 1100px) {
+  .summary-strip {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .room-cockpit {
+    grid-template-columns: 1fr;
+  }
+
+  .room-side-rail {
+    position: static;
+  }
+}
+
+@media (max-width: 700px) {
+  .room-command-main,
+  .panel-heading,
+  .message-head {
+    flex-direction: column;
+  }
+
+  .summary-strip,
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .transcript {
+    max-height: none;
+  }
+}

@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kalshi Bot Control Room</title>
     <link rel="stylesheet" href="/static/style.css" />
+    {% block extra_head %}{% endblock %}
   </head>
   <body>
     <header class="shell-header">
@@ -16,6 +17,6 @@
     <main class="shell-main">
       {% block content %}{% endblock %}
     </main>
+    {% block extra_scripts %}{% endblock %}
   </body>
 </html>
-

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+import json
 
 from fastapi.testclient import TestClient
 
 from kalshi_bot.config import get_settings
+from kalshi_bot.core.enums import AgentRole, MessageKind, RoomStage
 from kalshi_bot.core.schemas import (
     ResearchDossier,
     ResearchFreshness,
@@ -14,6 +16,7 @@ from kalshi_bot.core.schemas import (
     ResearchSummary,
     ResearchTraderContext,
     RoomCreate,
+    RoomMessageCreate,
 )
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.web.app import create_app
@@ -167,6 +170,17 @@ def test_web_pages_render_index_and_room_detail(tmp_path, monkeypatch) -> None:
         room_response = client.get(f"/rooms/{room_id}")
         assert room_response.status_code == 200
         assert "UI Room" in room_response.text
+        assert "Operator Cockpit" in room_response.text
+        assert "Transcript" in room_response.text
+        assert "Pricing Lens" in room_response.text
+        assert "/static/room.js" in room_response.text
+
+        snapshot_response = client.get(f"/api/rooms/{room_id}/snapshot")
+        assert snapshot_response.status_code == 200
+        snapshot_body = snapshot_response.json()
+        assert snapshot_body["room"]["id"] == room_id
+        assert "analytics" in snapshot_body
+        assert "messages" not in snapshot_body
 
     get_settings.cache_clear()
 
@@ -215,4 +229,59 @@ def test_status_api_includes_runtime_health(tmp_path, monkeypatch) -> None:
         assert body["runtime_health"]["colors"]["blue"]["daemon"]["healthy"] is True
         assert body["runtime_health"]["last_boot_recovery"]["reason"] == "seed_boot"
 
+    get_settings.cache_clear()
+
+
+def test_room_events_stream_includes_stage_and_payload(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "events.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    monkeypatch.setenv("SSE_POLL_INTERVAL_SECONDS", "0.01")
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> str:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                control = await repo.get_deployment_control()
+                pack = await container.agent_pack_service.get_pack_for_color(repo, container.settings.app_color)
+                room = await repo.create_room(
+                    room=RoomCreate(name="Event Room", market_ticker="WX-EVENT"),
+                    active_color=container.settings.app_color,
+                    shadow_mode=True,
+                    kill_switch_enabled=control.kill_switch_enabled,
+                    kalshi_env=container.settings.kalshi_env,
+                    agent_pack_version=pack.version,
+                )
+                await repo.append_message(
+                    room.id,
+                    RoomMessageCreate(
+                        role=AgentRole.RESEARCHER,
+                        kind=MessageKind.OBSERVATION,
+                        stage=RoomStage.RESEARCHING,
+                        content="Research update",
+                        payload={"note": "fresh dossier"},
+                    ),
+                )
+                await session.commit()
+                return room.id
+
+        room_id = asyncio.run(seed())
+
+        response = client.get(f"/rooms/{room_id}/events?after=0&once=true")
+        assert response.status_code == 200
+        line = next(item for item in response.text.splitlines() if item.startswith("data: "))
+
+    payload = line.removeprefix("data: ")
+    body = json.loads(payload)
+    assert body[0]["stage"] == "researching"
+    assert body[0]["payload"] == {"note": "fresh dossier"}
+    assert body[0]["created_at"]
     get_settings.cache_clear()
