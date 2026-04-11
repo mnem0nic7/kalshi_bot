@@ -7,6 +7,8 @@ This project supports two export formats for training preparation:
 
 The exports are JSONL so they can feed notebooks, curation scripts, or direct fine-tuning pipelines. Role SFT exports include both structured `input_context` / `target` fields and a model-ready `messages` array for chat-style fine-tuning.
 
+Those same exported bundles are also the substrate for the self-improvement loop described in [self_improve.md](self_improve.md). The daily critique and holdout evaluation path works only on stored shadow or demo rooms, never on raw live market access.
+
 ## What Gets Captured
 
 Room bundle exports include:
@@ -22,6 +24,7 @@ Room bundle exports include:
 - memory note
 - optional settlement label when reconciliation has already seen that market settle
 - derived outcome summary such as final status, research gate result, risk status, and order/fill counts
+- agent-pack version, runtime environment, and per-role provider or model provenance
 
 Role SFT exports derive training rows from those bundles and currently support:
 

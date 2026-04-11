@@ -5,6 +5,7 @@ import pytest
 from kalshi_bot.config import Settings
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
@@ -31,6 +32,7 @@ async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> 
     session_factory = create_session_factory(engine)
     await init_models(engine)
     supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
     directory = WeatherMarketDirectory(
         {
             "WX-TEST": WeatherMarketMapping(
@@ -43,7 +45,7 @@ async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> 
             )
         }
     )
-    service = AutoTriggerService(settings, session_factory, directory, supervisor)
+    service = AutoTriggerService(settings, session_factory, directory, agent_pack_service, supervisor)
 
     async with session_factory() as session:
         repo = PlatformRepository(session)
@@ -87,6 +89,7 @@ async def test_auto_trigger_skips_when_color_is_inactive(tmp_path) -> None:
     session_factory = create_session_factory(engine)
     await init_models(engine)
     supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
     directory = WeatherMarketDirectory(
         {
             "WX-TEST": WeatherMarketMapping(
@@ -99,7 +102,7 @@ async def test_auto_trigger_skips_when_color_is_inactive(tmp_path) -> None:
             )
         }
     )
-    service = AutoTriggerService(settings, session_factory, directory, supervisor)
+    service = AutoTriggerService(settings, session_factory, directory, agent_pack_service, supervisor)
 
     async with session_factory() as session:
         repo = PlatformRepository(session)

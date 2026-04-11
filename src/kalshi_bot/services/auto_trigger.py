@@ -11,6 +11,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.models import MarketState
 from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -24,11 +25,13 @@ class AutoTriggerService:
         settings: Settings,
         session_factory: async_sessionmaker,
         weather_directory: WeatherMarketDirectory,
+        agent_pack_service: AgentPackService,
         supervisor: SupervisorProtocol,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.weather_directory = weather_directory
+        self.agent_pack_service = agent_pack_service
         self.supervisor = supervisor
         self._inflight_markets: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
@@ -47,8 +50,10 @@ class AutoTriggerService:
             if control.active_color != self.settings.app_color:
                 await session.commit()
                 return
+            pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
+            thresholds = self.agent_pack_service.runtime_thresholds(pack)
             market_state = await repo.get_market_state(market_ticker)
-            if market_state is None or not self._market_is_actionable(market_state):
+            if market_state is None or not self._market_is_actionable(market_state, thresholds):
                 await session.commit()
                 return
 
@@ -72,7 +77,7 @@ class AutoTriggerService:
                 last_triggered_at = checkpoint.payload.get("last_triggered_at")
                 if last_triggered_at is not None:
                     last_trigger_time = datetime.fromisoformat(last_triggered_at)
-                    if datetime.now(UTC) - last_trigger_time < timedelta(seconds=self.settings.trigger_cooldown_seconds):
+                    if datetime.now(UTC) - last_trigger_time < timedelta(seconds=thresholds.trigger_cooldown_seconds):
                         await session.commit()
                         return
             spread_bps = self._spread_bps(market_state)
@@ -82,9 +87,11 @@ class AutoTriggerService:
                     market_ticker=market_ticker,
                     prompt=f"Auto-triggered from live orderbook with spread {spread_bps}bps.",
                 ),
-                active_color=control.active_color,
+                active_color=self.settings.app_color,
                 shadow_mode=self.settings.app_shadow_mode,
                 kill_switch_enabled=control.kill_switch_enabled,
+                kalshi_env=self.settings.kalshi_env,
+                agent_pack_version=pack.version,
             )
             await repo.set_checkpoint(
                 f"auto_trigger:{market_ticker}",
@@ -93,13 +100,14 @@ class AutoTriggerService:
                     "last_triggered_at": datetime.now(UTC).isoformat(),
                     "room_id": room.id,
                     "spread_bps": spread_bps,
+                    "agent_pack_version": pack.version,
                 },
             )
             await repo.log_ops_event(
                 severity="info",
                 summary=f"Auto-trigger launched room for {market_ticker}",
                 source="auto_trigger",
-                payload={"market_ticker": market_ticker, "room_id": room.id, "spread_bps": spread_bps},
+                payload={"market_ticker": market_ticker, "room_id": room.id, "spread_bps": spread_bps, "agent_pack_version": pack.version},
                 room_id=room.id,
             )
             await session.commit()
@@ -119,7 +127,7 @@ class AutoTriggerService:
         if self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
-    def _market_is_actionable(self, market_state: MarketState) -> bool:
+    def _market_is_actionable(self, market_state: MarketState, thresholds: RuntimeThresholds) -> bool:
         yes_bid = market_state.yes_bid_dollars
         yes_ask = market_state.yes_ask_dollars
         if yes_bid is None or yes_ask is None:
@@ -127,7 +135,7 @@ class AutoTriggerService:
         spread_bps = self._spread_bps(market_state)
         if spread_bps <= 0:
             return False
-        return spread_bps <= self.settings.trigger_max_spread_bps
+        return spread_bps <= thresholds.trigger_max_spread_bps
 
     @staticmethod
     def _spread_bps(market_state: MarketState) -> int:

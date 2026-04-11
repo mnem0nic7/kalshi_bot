@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import OpsEvent
+from kalshi_bot.db.models import Checkpoint, OpsEvent
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.daemon import DaemonService
 from kalshi_bot.services.reconcile import ReconcileSummary
@@ -54,6 +54,18 @@ class FakeDiscoveryService:
         return ["WX-DISCOVERED"]
 
 
+class FakeShadowTrainingService:
+    async def run_shadow_sweep(self, *, limit=None, reason="shadow_sweep", markets=None):
+        return []
+
+
+class FakeSelfImproveService:
+    async def monitor_rollouts(self):
+        from kalshi_bot.services.self_improve import SelfImproveResult
+
+        return SelfImproveResult(status="idle", payload={})
+
+
 @pytest.mark.asyncio
 async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> None:
     settings = Settings(
@@ -88,6 +100,8 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
         FakeReconciliationService(),  # type: ignore[arg-type]
         FakeResearchCoordinator(),  # type: ignore[arg-type]
         FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        FakeSelfImproveService(),  # type: ignore[arg-type]
     )
 
     result = await daemon.run(max_messages=3)
@@ -96,10 +110,19 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
         heartbeat = (
             await session.execute(select(OpsEvent).where(OpsEvent.source == "daemon").order_by(OpsEvent.updated_at.desc()))
         ).scalar_one()
+        heartbeat_checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:blue"))
+        ).scalar_one()
+        reconcile_checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_reconcile:blue"))
+        ).scalar_one()
 
     assert result["completed"] == "stream"
     assert result["processed_messages"] == 3
     assert stream_service.calls == [["WX-DISCOVERED"]]
     assert heartbeat.summary == "Daemon heartbeat"
+    assert heartbeat_checkpoint.payload["app_color"] == "blue"
+    assert "heartbeat_at" in heartbeat_checkpoint.payload
+    assert "reconciled_at" in reconcile_checkpoint.payload
 
     await engine.dispose()

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Kalshi Bot Watchdog Every Minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=kalshi-bot-watchdog.service
+
+[Install]
+WantedBy=timers.target

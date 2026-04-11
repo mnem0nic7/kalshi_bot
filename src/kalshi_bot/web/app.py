@@ -13,7 +13,13 @@ from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ValidationError
 
-from kalshi_bot.core.schemas import RoomCreate, ShadowRunRequest, TriggerRequest
+from kalshi_bot.core.schemas import (
+    RoomCreate,
+    ShadowRunRequest,
+    SelfImprovePromoteRequest,
+    SelfImproveRollbackRequest,
+    TriggerRequest,
+)
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.container import AppContainer
 
@@ -84,12 +90,15 @@ def create_app() -> FastAPI:
                 {"market_ticker": room.market_ticker, "stage": room.stage}
                 for room in await repo.list_rooms(limit=10)
             ]
+            runtime_health = await app_container.watchdog_service.get_status(repo)
             await session.commit()
         return JSONResponse(
             {
                 "active_color": control.active_color,
                 "kill_switch_enabled": control.kill_switch_enabled,
                 "execution_lock_holder": control.execution_lock_holder,
+                "self_improve": dict(control.notes.get("agent_packs") or {}),
+                "runtime_health": runtime_health,
                 "rooms": dossiers,
                 "positions": [
                     {
@@ -137,6 +146,40 @@ def create_app() -> FastAPI:
         )
         return JSONResponse({"status": "scheduled", "market_ticker": market_ticker})
 
+    @app.get("/api/self-improve/status")
+    async def self_improve_status(request: Request) -> JSONResponse:
+        app_container = container(request)
+        return JSONResponse(await app_container.self_improve_service.get_status())
+
+    @app.post("/api/self-improve/critique")
+    async def self_improve_critique(request: Request) -> JSONResponse:
+        app_container = container(request)
+        result = await app_container.self_improve_service.critique_recent_rooms()
+        return JSONResponse(result.payload)
+
+    @app.post("/api/self-improve/eval/{candidate_version}")
+    async def self_improve_eval(candidate_version: str, request: Request) -> JSONResponse:
+        app_container = container(request)
+        result = await app_container.self_improve_service.evaluate_candidate(candidate_version=candidate_version)
+        return JSONResponse(result.payload)
+
+    @app.post("/api/self-improve/promote")
+    async def self_improve_promote(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, SelfImprovePromoteRequest)
+        result = await app_container.self_improve_service.promote_candidate(
+            evaluation_run_id=payload.evaluation_run_id,
+            reason=payload.reason,
+        )
+        return JSONResponse(result.payload)
+
+    @app.post("/api/self-improve/rollback")
+    async def self_improve_rollback(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, SelfImproveRollbackRequest, default_on_empty=True)
+        result = await app_container.self_improve_service.rollback(reason=payload.reason)
+        return JSONResponse(result.payload)
+
     @app.get("/metrics")
     async def metrics() -> PlainTextResponse:
         return PlainTextResponse(generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
@@ -151,7 +194,9 @@ def create_app() -> FastAPI:
             positions = await repo.list_positions(limit=8)
             ops_events = await repo.list_ops_events(limit=8)
             dossier_records = await repo.list_research_dossiers(limit=100)
+            runtime_health = await app_container.watchdog_service.get_status(repo)
             await session.commit()
+        self_improve_status_payload = await app_container.self_improve_service.get_status()
         dossiers_by_market = {record.market_ticker: record.payload for record in dossier_records}
         configured_markets = []
         try:
@@ -198,6 +243,8 @@ def create_app() -> FastAPI:
                 "positions": positions,
                 "ops_events": ops_events,
                 "configured_markets": configured_markets,
+                "self_improve_status": self_improve_status_payload,
+                "runtime_health": runtime_health,
                 "settings": app_container.settings,
             },
         )
@@ -209,11 +256,14 @@ def create_app() -> FastAPI:
         async with app_container.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.ensure_deployment_control(app_container.settings.app_color)
+            pack = await app_container.agent_pack_service.get_pack_for_color(repo, app_container.settings.app_color)
             room = await repo.create_room(
                 payload,
-                active_color=control.active_color,
+                active_color=app_container.settings.app_color,
                 shadow_mode=app_container.settings.app_shadow_mode,
                 kill_switch_enabled=control.kill_switch_enabled,
+                kalshi_env=app_container.settings.kalshi_env,
+                agent_pack_version=pack.version,
             )
             await session.commit()
         return JSONResponse({"id": room.id, "redirect": f"/rooms/{room.id}"})

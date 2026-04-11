@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     llm_local_base_url: str = "http://localhost:11434/v1"
     llm_local_api_key: str = "dummy"
     llm_local_model: str = "llama3.1:8b"
+    gemini_api_key: str | None = None
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_model_researcher: str = "gemini-2.5-flash"
+    gemini_model_president: str = "gemini-2.5-pro"
+    gemini_model_trader: str = "gemini-2.5-pro"
+    gemini_model_risk_officer: str = "gemini-2.5-flash"
+    gemini_model_ops_monitor: str = "gemini-2.5-flash"
+    gemini_model_memory_librarian: str = "gemini-2.5-flash"
+    active_agent_pack_version: str = "builtin-gemini-v1"
     llm_request_timeout_seconds: float = 30.0
 
     risk_max_order_notional_dollars: float = 50.0
@@ -83,6 +92,15 @@ class Settings(BaseSettings):
     daemon_reconcile_interval_seconds: int = 300
     daemon_heartbeat_interval_seconds: int = 60
     daemon_start_with_reconcile: bool = True
+    self_improve_window_days: int = 14
+    self_improve_holdout_ratio: float = 0.2
+    self_improve_min_improvement: float = 0.02
+    self_improve_max_critical_regression: float = 0.01
+    self_improve_canary_min_rooms: int = 25
+    self_improve_canary_min_seconds: int = 7200
+    self_improve_live_monitor_seconds: int = 86400
+    self_improve_research_gate_failure_threshold: float = 0.6
+    self_improve_blocked_order_threshold: float = 0.8
 
     def model_post_init(self, __context: object) -> None:
         if self.database_url:

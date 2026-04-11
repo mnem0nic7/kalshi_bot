@@ -1,0 +1,10 @@
+[Unit]
+Description=Kalshi Bot Watchdog Recovery Pass
+After=kalshi-bot-compose.service docker.service network-online.target
+Requires=kalshi-bot-compose.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/workspace/kalshi_bot
+ExecStart=/bin/bash -lc './infra/scripts/watchdog-run-once.sh'

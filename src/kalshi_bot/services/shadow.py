@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.discovery import DiscoveryService
 
 
@@ -25,11 +26,13 @@ class ShadowTrainingService:
         settings: Settings,
         session_factory: async_sessionmaker,
         discovery_service: DiscoveryService,
+        agent_pack_service: AgentPackService,
         supervisor,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.discovery_service = discovery_service
+        self.agent_pack_service = agent_pack_service
         self.supervisor = supervisor
 
     async def create_shadow_room(
@@ -44,17 +47,20 @@ class ShadowTrainingService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.get_deployment_control()
+            pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
             room = await repo.create_room(
                 RoomCreate(name=room_name, market_ticker=market_ticker, prompt=room_prompt),
-                active_color=control.active_color,
+                active_color=self.settings.app_color,
                 shadow_mode=self.settings.app_shadow_mode,
                 kill_switch_enabled=control.kill_switch_enabled,
+                kalshi_env=self.settings.kalshi_env,
+                agent_pack_version=pack.version,
             )
             await repo.log_ops_event(
                 severity="info",
                 summary=f"Created shadow room for {market_ticker}",
                 source="shadow_training",
-                payload={"room_id": room.id, "market_ticker": market_ticker},
+                payload={"room_id": room.id, "market_ticker": market_ticker, "agent_pack_version": pack.version},
                 room_id=room.id,
             )
             await session.commit()

@@ -8,6 +8,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import ResearchSourceCard
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -50,10 +51,22 @@ class FakeWeather:
 
 
 class FakeProviders:
+    async def rewrite_with_metadata(self, *, role, fallback_text: str, system_prompt: str, user_prompt: str, role_config=None):
+        return fallback_text, {"provider": "fake", "model": "fake-model", "temperature": 0.0, "fallback_used": False}
+
     async def maybe_rewrite(self, *, role, fallback_text: str, system_prompt: str, user_prompt: str) -> str:
         return fallback_text
 
-    async def maybe_complete_json(self, *, role, fallback_payload: dict, system_prompt: str, user_prompt: str) -> dict:
+    async def complete_json_with_metadata(self, *, role, fallback_payload: dict, system_prompt: str, user_prompt: str, role_config=None, schema_model=None):
+        payload = await self.maybe_complete_json(
+            role=role,
+            fallback_payload=fallback_payload,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+        return payload, {"provider": "fake", "model": "fake-model", "temperature": 0.0, "fallback_used": False}
+
+    async def maybe_complete_json(self, *, role, fallback_payload: dict, system_prompt: str, user_prompt: str, role_config=None, schema_model=None) -> dict:
         payload = dict(fallback_payload)
         payload.update(
             {
@@ -98,6 +111,7 @@ async def test_research_refresh_persists_weather_dossier(tmp_path) -> None:
         directory,
         FakeProviders(),  # type: ignore[arg-type]
         WeatherSignalEngine(settings),
+        AgentPackService(settings),
     )
 
     dossier = await coordinator.refresh_market_dossier("WX-TEST", trigger_reason="test")
@@ -144,9 +158,10 @@ async def test_research_refresh_supports_generic_web_dossier(tmp_path) -> None:
         directory,
         FakeProviders(),  # type: ignore[arg-type]
         WeatherSignalEngine(settings),
+        AgentPackService(settings),
     )
 
-    async def fake_web_sources(mapping, market):
+    async def fake_web_sources(mapping, market, *, pack):
         return [
             ResearchSourceCard(
                 source_key="web-1",
@@ -199,6 +214,7 @@ async def test_room_delta_uses_same_weather_units_as_dossier(tmp_path) -> None:
         directory,
         FakeProviders(),  # type: ignore[arg-type]
         WeatherSignalEngine(settings),
+        AgentPackService(settings),
     )
 
     dossier = await coordinator.refresh_market_dossier("WX-TEST", trigger_reason="test")

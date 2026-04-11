@@ -1,0 +1,153 @@
+name: Self Improve
+
+"on":
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Days of shadow/demo rooms to inspect
+        default: "14"
+      limit:
+        description: Max room count to include
+        default: "200"
+      stage_candidate:
+        description: Stage a passing candidate on the inactive color
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  offline-guard:
+    name: Offline Guard Rails
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run self-improve test slice
+        run: |
+          set -euo pipefail
+          python -m pytest -q \
+            tests/unit/test_provider_router_gemini.py \
+            tests/unit/test_agent_pack_service.py \
+            tests/unit/test_self_improve_service.py \
+            tests/integration/test_training_export_service.py
+
+  remote-loop:
+    name: Remote Critique, Eval, and Stage
+    runs-on: ubuntu-latest
+    needs: offline-guard
+    timeout-minutes: 30
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      INPUT_DAYS: ${{ github.event.inputs.days }}
+      INPUT_LIMIT: ${{ github.event.inputs.limit }}
+      INPUT_STAGE_CANDIDATE: ${{ github.event.inputs.stage_candidate }}
+    steps:
+      - name: Skip when deploy or Gemini secrets are missing
+        if: env.DEPLOY_HOST == '' || env.DEPLOY_USER == '' || env.DEPLOY_SSH_KEY == '' || env.DEPLOY_APP_DIR == '' || env.GEMINI_API_KEY == ''
+        run: |
+          {
+            echo "## Self Improve"
+            echo
+            echo "Skipped remote self-improve because one or more required secrets are missing."
+            echo "Needed: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_APP_DIR, GEMINI_API_KEY"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Prepare SSH
+        if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' && env.DEPLOY_APP_DIR != '' && env.GEMINI_API_KEY != ''
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Run critique, eval, and optional staging
+        if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' && env.DEPLOY_APP_DIR != '' && env.GEMINI_API_KEY != ''
+        id: self_improve
+        run: |
+          set -euo pipefail
+
+          days="${INPUT_DAYS:-14}"
+          limit="${INPUT_LIMIT:-200}"
+          stage_candidate="${INPUT_STAGE_CANDIDATE:-true}"
+
+          app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
+          gemini_quoted="$(printf '%q' "${GEMINI_API_KEY}")"
+          remote_prefix="cd ${app_dir_quoted} && export GEMINI_API_KEY=${gemini_quoted}"
+
+          sync_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && python3 -c \"from pathlib import Path; import json, os; env_path = Path('.env'); gemini = os.environ['GEMINI_API_KEY']; lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []; updated = []; found = False; [updated.append(f'GEMINI_API_KEY={gemini}') if line.startswith('GEMINI_API_KEY=') else updated.append(line) for line in lines]; found = any(line.startswith('GEMINI_API_KEY=') for line in lines); updated = updated if found else updated + [f'GEMINI_API_KEY={gemini}']; env_path.write_text('\\n'.join(updated) + '\\n', encoding='utf-8'); print(json.dumps({'synced': True}))\"")"
+
+          critique_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh critique --days ${days} --limit ${limit}")"
+          printf '%s\n' "${critique_json}" > critique.json
+          candidate_version="$(jq -r '.candidate_version // empty' critique.json)"
+          if [[ -z "${candidate_version}" ]]; then
+            echo "Candidate version missing from critique output" >&2
+            exit 1
+          fi
+
+          eval_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh eval --candidate-version ${candidate_version} --days ${days} --limit ${limit}")"
+          printf '%s\n' "${eval_json}" > eval.json
+          evaluation_run_id="$(jq -r '.evaluation_run_id // empty' eval.json)"
+          passed="$(jq -r '.passed // false' eval.json)"
+
+          staged="false"
+          inactive_color=""
+          if [[ "${passed}" == "true" && "${stage_candidate}" == "true" ]]; then
+            promote_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh promote --evaluation-run-id ${evaluation_run_id} --reason github_actions_self_improve")"
+            printf '%s\n' "${promote_json}" > promote.json
+            inactive_color="$(jq -r '.inactive_color // empty' promote.json)"
+            if [[ -z "${inactive_color}" ]]; then
+              echo "Inactive color missing from promote output" >&2
+              exit 1
+            fi
+            ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "cd ${app_dir_quoted} && infra/scripts/restart-color.sh ${inactive_color}"
+            staged="true"
+          fi
+
+          {
+            echo "candidate_version=${candidate_version}"
+            echo "evaluation_run_id=${evaluation_run_id}"
+            echo "passed=${passed}"
+            echo "staged=${staged}"
+            echo "inactive_color=${inactive_color}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Self Improve"
+            echo
+            echo "- Gemini env synced on remote host: \`$(jq -r '.synced' <<<"${sync_json}")\`"
+            echo "- Candidate version: \`${candidate_version}\`"
+            echo "- Evaluation run: \`${evaluation_run_id}\`"
+            echo "- Passed: \`${passed}\`"
+            echo "- Staged on inactive color: \`${staged}\`"
+            if [[ -n "${inactive_color}" ]]; then
+              echo "- Inactive color restarted: \`${inactive_color}\`"
+            fi
+            echo
+            echo "### Evaluation"
+            echo '```json'
+            cat eval.json
+            echo
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

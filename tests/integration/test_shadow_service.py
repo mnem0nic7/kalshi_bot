@@ -5,6 +5,7 @@ import pytest
 from kalshi_bot.config import Settings
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
@@ -39,10 +40,12 @@ async def test_shadow_service_runs_sweep_and_creates_rooms(tmp_path) -> None:
         await session.commit()
 
     supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
     service = ShadowTrainingService(
         settings,
         session_factory,
         FakeDiscoveryService(),  # type: ignore[arg-type]
+        agent_pack_service,
         supervisor,
     )
 

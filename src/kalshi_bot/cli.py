@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import asdict
 import json
 from pathlib import Path
+import sys
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.db.repositories import PlatformRepository
@@ -130,6 +131,92 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps({"output": str(output_path), "count": len(payload), "mode": args.mode}, indent=2))
             return 0
 
+        if args.command == "self-improve":
+            action = args.self_improve_command
+            if action == "status":
+                print(json.dumps(await container.self_improve_service.get_status(), indent=2))
+                return 0
+            if action == "critique":
+                result = await container.self_improve_service.critique_recent_rooms(days=args.days, limit=args.limit)
+                print(json.dumps(result.payload, indent=2))
+                return 0
+            if action == "eval":
+                result = await container.self_improve_service.evaluate_candidate(
+                    candidate_version=args.candidate_version,
+                    days=args.days,
+                    limit=args.limit,
+                )
+                print(json.dumps(result.payload, indent=2))
+                return 0
+            if action == "promote":
+                result = await container.self_improve_service.promote_candidate(
+                    evaluation_run_id=args.evaluation_run_id,
+                    reason=args.reason,
+                )
+                print(json.dumps(result.payload, indent=2))
+                return 0
+            if action == "rollback":
+                result = await container.self_improve_service.rollback(reason=args.reason)
+                print(json.dumps(result.payload, indent=2))
+                return 0
+
+        if args.command == "health-check":
+            if args.health_command == "app":
+                payload = await container.watchdog_service.app_health(color=args.color)
+                print(json.dumps(payload, indent=2))
+                return 0 if payload["healthy"] else 1
+            if args.health_command == "daemon":
+                async with container.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    payload = await container.watchdog_service.daemon_health(repo, color=args.color)
+                    await session.commit()
+                print(json.dumps(payload, indent=2))
+                return 0 if payload["healthy"] else 1
+
+        if args.command == "watchdog":
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                if args.watchdog_command == "status":
+                    payload = await container.watchdog_service.get_status(repo)
+                    await session.commit()
+                    print(json.dumps(payload, indent=2))
+                    return 0
+                if args.watchdog_command == "run-once":
+                    payload = await container.watchdog_service.run_once(
+                        repo,
+                        app_statuses={
+                            "blue": args.app_blue_status,
+                            "green": args.app_green_status,
+                        },
+                        source=args.source,
+                    )
+                    await session.commit()
+                    print(json.dumps(payload, indent=2))
+                    return 0
+                if args.watchdog_command == "record-action":
+                    payload = await container.watchdog_service.record_action(
+                        repo,
+                        action=args.action,
+                        outcome=args.outcome,
+                        reason=args.reason,
+                        target_color=args.target_color,
+                        failed_color=args.failed_color,
+                        source=args.source,
+                    )
+                    await session.commit()
+                    print(json.dumps(payload, indent=2))
+                    return 0
+                if args.watchdog_command == "mark-boot":
+                    payload = await container.watchdog_service.record_boot(
+                        repo,
+                        status=args.status,
+                        reason=args.reason,
+                        payload={"working_directory": str(Path.cwd())},
+                    )
+                    await session.commit()
+                    print(json.dumps(payload, indent=2))
+                    return 0
+
         if args.command == "shadow-run":
             result = await container.shadow_training_service.run_shadow_room(
                 args.market_ticker,
@@ -162,11 +249,14 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
             if args.command == "create-room":
                 control = await repo.get_deployment_control()
+                pack = await container.agent_pack_service.get_pack_for_color(repo, container.settings.app_color)
                 room = await repo.create_room(
                     RoomCreate(name=args.name, market_ticker=args.market_ticker, prompt=args.prompt),
-                    active_color=control.active_color,
+                    active_color=container.settings.app_color,
                     shadow_mode=container.settings.app_shadow_mode,
                     kill_switch_enabled=control.kill_switch_enabled,
+                    kalshi_env=container.settings.kalshi_env,
+                    agent_pack_version=pack.version,
                 )
                 await session.commit()
                 print(room.id)
@@ -285,6 +375,55 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["researcher", "president", "trader", "memory_librarian"],
     )
 
+    self_improve = subparsers.add_parser("self-improve")
+    self_improve_subparsers = self_improve.add_subparsers(dest="self_improve_command", required=True)
+
+    self_improve_subparsers.add_parser("status")
+
+    critique = self_improve_subparsers.add_parser("critique")
+    critique.add_argument("--days", type=int, default=None)
+    critique.add_argument("--limit", type=int, default=200)
+
+    evaluate = self_improve_subparsers.add_parser("eval")
+    evaluate.add_argument("--candidate-version", required=True)
+    evaluate.add_argument("--days", type=int, default=None)
+    evaluate.add_argument("--limit", type=int, default=200)
+
+    promote_pack = self_improve_subparsers.add_parser("promote")
+    promote_pack.add_argument("--evaluation-run-id", required=True)
+    promote_pack.add_argument("--reason", default="manual_promote")
+
+    rollback_pack = self_improve_subparsers.add_parser("rollback")
+    rollback_pack.add_argument("--reason", default="manual_rollback")
+
+    health_check = subparsers.add_parser("health-check")
+    health_subparsers = health_check.add_subparsers(dest="health_command", required=True)
+    health_app = health_subparsers.add_parser("app")
+    health_app.add_argument("--color", required=True, choices=["blue", "green"])
+    health_daemon = health_subparsers.add_parser("daemon")
+    health_daemon.add_argument("--color", required=True, choices=["blue", "green"])
+
+    watchdog = subparsers.add_parser("watchdog")
+    watchdog_subparsers = watchdog.add_subparsers(dest="watchdog_command", required=True)
+    watchdog_subparsers.add_parser("status")
+
+    watchdog_run_once = watchdog_subparsers.add_parser("run-once")
+    watchdog_run_once.add_argument("--app-blue-status", default="unknown")
+    watchdog_run_once.add_argument("--app-green-status", default="unknown")
+    watchdog_run_once.add_argument("--source", default="manual_watchdog")
+
+    watchdog_record = watchdog_subparsers.add_parser("record-action")
+    watchdog_record.add_argument("--action", required=True)
+    watchdog_record.add_argument("--outcome", required=True, choices=["succeeded", "failed"])
+    watchdog_record.add_argument("--reason", required=True)
+    watchdog_record.add_argument("--target-color", default=None)
+    watchdog_record.add_argument("--failed-color", default=None)
+    watchdog_record.add_argument("--source", default="watchdog_timer")
+
+    watchdog_boot = watchdog_subparsers.add_parser("mark-boot")
+    watchdog_boot.add_argument("--status", default="success")
+    watchdog_boot.add_argument("--reason", default="systemd_boot")
+
     shadow_run = subparsers.add_parser("shadow-run")
     shadow_run.add_argument("market_ticker")
     shadow_run.add_argument("--name", default=None)
@@ -316,7 +455,7 @@ def main() -> None:
     configure_logging()
     parser = build_parser()
     args = parser.parse_args()
-    raise SystemExit(asyncio.run(_run_cli(args)))
+    sys.exit(asyncio.run(_run_cli(args)))
 
 
 if __name__ == "__main__":

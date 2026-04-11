@@ -11,6 +11,7 @@ from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.orchestration.supervisor import WorkflowSupervisor
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
@@ -21,10 +22,16 @@ from kalshi_bot.weather.models import WeatherMarketMapping
 
 
 class FakeProviders:
+    async def rewrite_with_metadata(self, *, role, fallback_text: str, system_prompt: str, user_prompt: str, role_config=None):
+        return fallback_text, {"provider": "fake", "model": "fake-model", "temperature": 0.0, "fallback_used": False}
+
     async def maybe_rewrite(self, *, role, fallback_text: str, system_prompt: str, user_prompt: str) -> str:
         return fallback_text
 
-    async def maybe_complete_json(self, *, role, fallback_payload: dict, system_prompt: str, user_prompt: str) -> dict:
+    async def complete_json_with_metadata(self, *, role, fallback_payload: dict, system_prompt: str, user_prompt: str, role_config=None, schema_model=None):
+        return fallback_payload, {"provider": "fake", "model": "fake-model", "temperature": 0.0, "fallback_used": False}
+
+    async def maybe_complete_json(self, *, role, fallback_payload: dict, system_prompt: str, user_prompt: str, role_config=None, schema_model=None) -> dict:
         return fallback_payload
 
     def embed_text(self, text: str) -> list[float]:
@@ -97,6 +104,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     await init_models(engine)
 
     providers = FakeProviders()
+    agent_pack_service = AgentPackService(settings)
     agents = AgentSuite(settings, providers)  # type: ignore[arg-type]
     signal_engine = WeatherSignalEngine(settings)
     risk_engine = DeterministicRiskEngine(settings)
@@ -124,6 +132,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         directory,
         providers,  # type: ignore[arg-type]
         signal_engine,
+        agent_pack_service,
     )
     supervisor = WorkflowSupervisor(
         settings=settings,
@@ -131,6 +140,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         kalshi=FakeKalshi(),  # type: ignore[arg-type]
         weather=FakeWeather(),  # type: ignore[arg-type]
         weather_directory=directory,
+        agent_pack_service=agent_pack_service,
         signal_engine=signal_engine,
         risk_engine=risk_engine,
         execution_service=execution_service,
@@ -147,6 +157,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
             active_color="blue",
             shadow_mode=False,
             kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
         )
         await session.commit()
 

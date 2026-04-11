@@ -17,10 +17,14 @@ class Room(Base, IdMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255))
     market_ticker: Mapped[str] = mapped_column(String(128), index=True)
     prompt: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    kalshi_env: Mapped[str] = mapped_column(String(32), default="demo", index=True)
     stage: Mapped[str] = mapped_column(String(32), default=RoomStage.TRIGGERED.value)
     active_color: Mapped[str] = mapped_column(String(16), default=DeploymentColor.BLUE.value)
     shadow_mode: Mapped[bool] = mapped_column(Boolean, default=True)
     kill_switch_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    agent_pack_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    evaluation_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    role_models: Mapped[dict] = mapped_column(JSON, default=dict)
 
     messages: Mapped[list["RoomMessage"]] = relationship(back_populates="room", cascade="all, delete-orphan")
 
@@ -254,6 +258,57 @@ class MemoryEmbedding(Base, IdMixin, TimestampMixin):
     memory_note_id: Mapped[str] = mapped_column(ForeignKey("memory_notes.id", ondelete="CASCADE"), unique=True, index=True)
     provider: Mapped[str] = mapped_column(String(64))
     embedding: Mapped[list[float] | None] = mapped_column(EmbeddingType(16), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class AgentPackRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "agent_packs"
+    __table_args__ = (UniqueConstraint("version", name="uq_agent_packs_version"),)
+
+    version: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="candidate", index=True)
+    parent_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), default="builtin")
+    description: Mapped[str] = mapped_column(Text(), default="")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class CritiqueRunRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "critique_runs"
+
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    source_pack_version: Mapped[str] = mapped_column(String(128), index=True)
+    candidate_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    room_count: Mapped[int] = mapped_column(Integer, default=0)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+
+class EvaluationRunRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "evaluation_runs"
+
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    champion_version: Mapped[str] = mapped_column(String(128), index=True)
+    candidate_version: Mapped[str] = mapped_column(String(128), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    holdout_room_count: Mapped[int] = mapped_column(Integer, default=0)
+    passed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+
+class PromotionEventRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "promotion_events"
+
+    status: Mapped[str] = mapped_column(String(32), default="staged", index=True)
+    candidate_version: Mapped[str] = mapped_column(String(128), index=True)
+    previous_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    target_color: Mapped[str] = mapped_column(String(16), index=True)
+    evaluation_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    rollback_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
