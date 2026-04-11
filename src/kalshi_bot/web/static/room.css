@@ -151,11 +151,15 @@
 .stage-divider {
   position: sticky;
   top: 0;
-  z-index: 1;
-  padding: 0.45rem 0.8rem;
-  border-radius: 999px;
-  width: fit-content;
-  background: rgba(249, 215, 126, 0.14);
+  z-index: 2;
+  box-sizing: border-box;
+  padding: 0.55rem 0.8rem;
+  border-radius: 14px;
+  width: 100%;
+  background: linear-gradient(90deg, rgba(249, 215, 126, 0.2), rgba(249, 215, 126, 0.08));
+  border: 1px solid rgba(249, 215, 126, 0.18);
+  box-shadow: 0 10px 24px rgba(5, 10, 18, 0.22);
+  backdrop-filter: blur(10px);
   color: #f9d77e;
   font-size: 0.78rem;
   letter-spacing: 0.08em;
