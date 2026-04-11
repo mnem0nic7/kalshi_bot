@@ -103,6 +103,7 @@ The repo includes manual read-only smoke workflows for both Kalshi environments:
 - `.github/workflows/compose-shadow-smoke.yml`
 - `.github/workflows/self-improve.yml`
 - `.github/workflows/rollback-agent-pack.yml`
+- `.github/workflows/sync-gemini-runtime.yml`
 
 Add these GitHub Secrets before running them:
 
@@ -128,6 +129,8 @@ Each workflow writes the PEM to a temporary file at runtime, runs REST plus WebS
 - Move `LIVE_KALSHI_API_KEY` and `LIVE_KALSHI_PRIVATE_KEY_PEM` into that environment if you want the live credentials isolated from repo-wide secrets
 
 `Self Improve` runs a local offline guard test slice, then critiques and evaluates the last 14 days of shadow or demo rooms on the VPS. If the candidate pack passes the holdout gates, it stages the pack on the inactive color and restarts only that color so canary shadow rooms can begin. `Rollback Agent Pack` is manual-only and is designed to live behind the GitHub Actions `live` environment.
+
+`Sync Gemini Runtime` is the simplest way to use the repo Gemini secret on the VPS. It syncs `GEMINI_KEY` (or `GEMINI_API_KEY`) into the remote `.env`, recreates both app and daemon colors so Docker picks the new env up, and confirms the runtime can see the Gemini key.
 
 ## Current defaults
 

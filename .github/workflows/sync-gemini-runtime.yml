@@ -1,0 +1,66 @@
+name: Sync Gemini Runtime
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-runtime:
+    name: Sync Gemini Secret To VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: live
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
+      GEMINI_KEY_VALUE: ${{ secrets.GEMINI_KEY || secrets.GEMINI_API_KEY }}
+    steps:
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+          test -n "${DEPLOY_HOST}" || { echo "Missing DEPLOY_HOST"; exit 1; }
+          test -n "${DEPLOY_USER}" || { echo "Missing DEPLOY_USER"; exit 1; }
+          test -n "${DEPLOY_SSH_KEY}" || { echo "Missing DEPLOY_SSH_KEY"; exit 1; }
+          test -n "${DEPLOY_APP_DIR}" || { echo "Missing DEPLOY_APP_DIR"; exit 1; }
+          test -n "${GEMINI_KEY_VALUE}" || { echo "Missing GEMINI_KEY or GEMINI_API_KEY"; exit 1; }
+
+      - name: Prepare SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Sync .env and recreate app services
+        run: |
+          set -euo pipefail
+
+          app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
+          gemini_quoted="$(printf '%q' "${GEMINI_KEY_VALUE}")"
+          remote_prefix="cd ${app_dir_quoted} && export GEMINI_KEY=${gemini_quoted}"
+
+          sync_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && python3 -c \"from pathlib import Path; import json, os; env_path = Path('.env'); gemini = os.environ['GEMINI_KEY']; lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []; legacy_seen = any(line.startswith('GEMINI_API_KEY=') for line in lines); updated = [line for line in lines if not line.startswith('GEMINI_KEY=') and not line.startswith('GEMINI_API_KEY=')]; updated.append(f'GEMINI_KEY={gemini}'); env_path.write_text('\\n'.join(updated) + '\\n', encoding='utf-8'); print(json.dumps({'synced': True, 'gemini_key_present': True, 'removed_legacy_api_key': legacy_seen}))\"")"
+          printf '%s\n' "${sync_json}" > sync.json
+
+          ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "cd ${app_dir_quoted} && infra/scripts/restart-color.sh blue && infra/scripts/restart-color.sh green"
+
+          health_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml exec -T app_blue python - <<'PY'\nfrom kalshi_bot.config import Settings\nimport json\ns = Settings()\nprint(json.dumps({'gemini_configured': bool(s.gemini_api_key)}))\nPY")"
+          printf '%s\n' "${health_json}" > health.json
+
+          {
+            echo "## Sync Gemini Runtime"
+            echo
+            echo "- Synced Gemini secret into remote \`.env\`: \`$(jq -r '.synced' sync.json)\`"
+            echo "- Removed legacy \`GEMINI_API_KEY\` entry: \`$(jq -r '.removed_legacy_api_key' sync.json)\`"
+            echo "- Runtime sees Gemini key: \`$(jq -r '.gemini_configured' health.json)\`"
+            echo
+            echo '```json'
+            cat health.json
+            echo
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -8,6 +8,6 @@ if [[ "${color}" != "blue" && "${color}" != "green" ]]; then
   exit 1
 fi
 
-docker compose -f infra/docker-compose.yml restart "app_${color}" "daemon_${color}"
+docker compose -f infra/docker-compose.yml up -d --no-deps --force-recreate "app_${color}" "daemon_${color}"
 
-echo "Restarted ${color}"
+echo "Recreated ${color}"
