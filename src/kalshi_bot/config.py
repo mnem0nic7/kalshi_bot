@@ -14,6 +14,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        populate_by_name=True,
     )
 
     app_name: str = "kalshi-bot"
@@ -60,7 +61,10 @@ class Settings(BaseSettings):
     llm_local_base_url: str = "http://localhost:11434/v1"
     llm_local_api_key: str = "dummy"
     llm_local_model: str = "llama3.1:8b"
-    gemini_api_key: str | None = None
+    gemini_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GEMINI_API_KEY", "GEMINI_KEY"),
+    )
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     gemini_model_researcher: str = "gemini-2.5-flash"
     gemini_model_president: str = "gemini-2.5-pro"

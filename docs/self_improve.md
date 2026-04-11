@@ -72,7 +72,7 @@ Two workflows support the control plane:
 `Self Improve` does three things:
 
 1. Runs a local offline test slice for Gemini, agent-pack, and training export logic.
-2. SSHes to the VPS, syncs `GEMINI_API_KEY` into the remote `.env`, then runs:
+2. SSHes to the VPS, syncs the configured Gemini key into the remote `.env`, then runs:
    - `self-improve critique`
    - `self-improve eval`
    - `self-improve promote` when the holdout summary passes
@@ -82,7 +82,7 @@ Two workflows support the control plane:
 
 Required GitHub Secrets:
 
-- `GEMINI_API_KEY`
+- `GEMINI_KEY` or `GEMINI_API_KEY`
 - `DEPLOY_HOST`
 - `DEPLOY_USER`
 - `DEPLOY_SSH_KEY`
@@ -110,7 +110,7 @@ Guardrails that trigger automatic rollback:
 
 Important runtime envs:
 
-- `GEMINI_API_KEY`
+- `GEMINI_KEY` or `GEMINI_API_KEY`
 - `GEMINI_BASE_URL`
 - `GEMINI_MODEL_RESEARCHER`
 - `GEMINI_MODEL_PRESIDENT`

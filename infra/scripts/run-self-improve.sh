@@ -10,8 +10,9 @@ compose_file="${COMPOSE_FILE:-infra/docker-compose.yml}"
 service="${APP_SERVICE:-app_blue}"
 
 extra_env=()
-if [[ -n "${GEMINI_API_KEY:-}" ]]; then
-  extra_env+=(-e "GEMINI_API_KEY=${GEMINI_API_KEY}")
+gemini_runtime_key="${GEMINI_API_KEY:-${GEMINI_KEY:-}}"
+if [[ -n "${gemini_runtime_key}" ]]; then
+  extra_env+=(-e "GEMINI_API_KEY=${gemini_runtime_key}")
 fi
 
 docker compose -f "${compose_file}" exec -T "${extra_env[@]}" "${service}" \

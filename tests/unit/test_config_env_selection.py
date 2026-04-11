@@ -57,3 +57,12 @@ def test_database_url_escapes_reserved_characters_in_credentials() -> None:
         settings.database_url
         == "postgresql+asyncpg://bot%40ops:p%40ss%3Aword%2Fwith%3Fchars@db.internal:5432/kalshi_bot"
     )
+
+
+def test_gemini_key_alias_is_accepted(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_KEY", "alias-key")
+
+    settings = Settings()
+
+    assert settings.gemini_api_key == "alias-key"

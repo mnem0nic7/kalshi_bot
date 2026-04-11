@@ -58,7 +58,7 @@ jobs:
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
       DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.GEMINI_KEY }}
       INPUT_DAYS: ${{ github.event.inputs.days }}
       INPUT_LIMIT: ${{ github.event.inputs.limit }}
       INPUT_STAGE_CANDIDATE: ${{ github.event.inputs.stage_candidate }}
@@ -70,7 +70,7 @@ jobs:
             echo "## Self Improve"
             echo
             echo "Skipped remote self-improve because one or more required secrets are missing."
-            echo "Needed: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_APP_DIR, GEMINI_API_KEY"
+            echo "Needed: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_APP_DIR, GEMINI_KEY or GEMINI_API_KEY"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Prepare SSH
