@@ -133,3 +133,31 @@ async def test_watchdog_requests_stack_restart_when_both_colors_unhealthy(tmp_pa
 
     assert payload["action"] == "restart_stack"
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_does_not_restart_stack_while_apps_are_starting(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/watchdog.db",
+        daemon_heartbeat_interval_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = WatchdogService(settings)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_active_color="green")
+        await _seed_daemon_checkpoint(repo, color="blue", age_seconds=0)
+        await _seed_daemon_checkpoint(repo, color="green", age_seconds=0)
+        payload = await service.run_once(
+            repo,
+            app_statuses={"blue": "starting", "green": "starting"},
+            source="test_watchdog",
+        )
+        await session.commit()
+
+    assert payload["action"] == "none"
+    assert payload["reason"] == "all colors healthy"
+    await engine.dispose()

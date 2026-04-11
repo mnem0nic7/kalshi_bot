@@ -21,6 +21,7 @@ For the Docker deployment flow:
 
 ```bash
 docker compose -f infra/docker-compose.yml up -d postgres
+docker compose -f infra/docker-compose.yml build migrate
 docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
 ```
 

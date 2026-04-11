@@ -20,3 +20,12 @@ def test_compose_file_declares_service_healthchecks() -> None:
     assert "healthcheck:" in compose_text
     assert "http://127.0.0.1:8000/readyz" in compose_text
     assert "kalshi_bot.cli\", \"health-check\", \"daemon" in compose_text
+
+
+def test_runtime_scripts_rebuild_migrate_image_before_using_it() -> None:
+    start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
+    watchdog = Path("infra/scripts/watchdog-run-once.sh").read_text(encoding="utf-8")
+
+    assert 'docker compose -f "${compose_file}" build migrate >/dev/null' in start_stack
+    assert "run_migrate" in start_stack
+    assert 'docker compose -f "${compose_file}" build migrate >/dev/null' in watchdog

@@ -135,8 +135,8 @@ class WatchdogService:
         reason = "all colors healthy"
         wait_seconds = 0
 
-        active_healthy = colors[active_color]["combined_healthy"]
-        inactive_healthy = colors[inactive_color]["combined_healthy"]
+        active_healthy = self._recovery_healthy(colors[active_color])
+        inactive_healthy = self._recovery_healthy(colors[inactive_color])
 
         if active_healthy:
             if pending.get("color") == active_color:
@@ -315,6 +315,14 @@ class WatchdogService:
             "unknown": "watchdog has no app status",
         }.get(raw, f"container status {raw}")
         return {"status": raw, "healthy": healthy, "detail": detail}
+
+    @staticmethod
+    def _recovery_healthy(color_status: dict[str, Any]) -> bool:
+        app = dict(color_status.get("app") or {})
+        daemon = dict(color_status.get("daemon") or {})
+        if not daemon.get("healthy"):
+            return False
+        return app.get("status") in {"healthy", "starting"}
 
     @staticmethod
     def _age_seconds(now: datetime, observed_at: datetime | None) -> float | None:

@@ -28,6 +28,7 @@ docker compose -f infra/docker-compose.yml up --build -d postgres
 8. Run migrations:
 
 ```bash
+docker compose -f infra/docker-compose.yml build migrate
 docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
 ```
 
@@ -170,5 +171,6 @@ sudo systemctl enable --now kalshi-bot-watchdog.timer
 If you are upgrading an already-running stack, run migrations before using the new watchdog CLI or timer:
 
 ```bash
+docker compose -f infra/docker-compose.yml build migrate
 docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
 ```

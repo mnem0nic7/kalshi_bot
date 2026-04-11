@@ -3,6 +3,10 @@ set -euo pipefail
 
 compose_file="infra/docker-compose.yml"
 
+build_migrate_image() {
+  docker compose -f "${compose_file}" build migrate >/dev/null
+}
+
 container_status() {
   local service="$1"
   local container_id
@@ -24,6 +28,7 @@ run_control() {
     docker compose -f "${compose_file}" exec -T app_green "${cmd[@]}"
     return
   fi
+  build_migrate_image
   docker compose -f "${compose_file}" run --rm --no-deps migrate "${cmd[@]}"
 }
 

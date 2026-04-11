@@ -69,6 +69,7 @@ jobs:
       - name: Run migrations
         run: |
           set -euo pipefail
+          docker compose -f infra/docker-compose.yml build migrate
           docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
 
       - name: Start web stack
