@@ -34,22 +34,22 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
 
       - name: Sync .env and recreate app services
         run: |
           set -euo pipefail
 
+          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
           app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
           gemini_quoted="$(printf '%q' "${GEMINI_KEY_VALUE}")"
           remote_prefix="cd ${app_dir_quoted} && export GEMINI_KEY=${gemini_quoted}"
 
-          sync_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && python3 -c \"from pathlib import Path; import json, os; env_path = Path('.env'); gemini = os.environ['GEMINI_KEY']; lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []; legacy_seen = any(line.startswith('GEMINI_API_KEY=') for line in lines); updated = [line for line in lines if not line.startswith('GEMINI_KEY=') and not line.startswith('GEMINI_API_KEY=')]; updated.append(f'GEMINI_KEY={gemini}'); env_path.write_text('\\n'.join(updated) + '\\n', encoding='utf-8'); print(json.dumps({'synced': True, 'gemini_key_present': True, 'removed_legacy_api_key': legacy_seen}))\"")"
+          sync_json="$("${ssh_cmd[@]}" "${remote_prefix} && python3 -c \"from pathlib import Path; import json, os; env_path = Path('.env'); gemini = os.environ['GEMINI_KEY']; lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []; legacy_seen = any(line.startswith('GEMINI_API_KEY=') for line in lines); updated = [line for line in lines if not line.startswith('GEMINI_KEY=') and not line.startswith('GEMINI_API_KEY=')]; updated.append(f'GEMINI_KEY={gemini}'); env_path.write_text('\\n'.join(updated) + '\\n', encoding='utf-8'); print(json.dumps({'synced': True, 'gemini_key_present': True, 'removed_legacy_api_key': legacy_seen}))\"")"
           printf '%s\n' "${sync_json}" > sync.json
 
-          ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "cd ${app_dir_quoted} && infra/scripts/restart-color.sh blue && infra/scripts/restart-color.sh green"
+          "${ssh_cmd[@]}" "cd ${app_dir_quoted} && infra/scripts/restart-color.sh blue && infra/scripts/restart-color.sh green"
 
-          health_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml exec -T app_blue python - <<'PY'\nfrom kalshi_bot.config import Settings\nimport json\ns = Settings()\nprint(json.dumps({'gemini_configured': bool(s.gemini_api_key)}))\nPY")"
+          health_json="$("${ssh_cmd[@]}" "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml exec -T app_blue python - <<'PY'\nfrom kalshi_bot.config import Settings\nimport json\ns = Settings()\nprint(json.dumps({'gemini_configured': bool(s.gemini_api_key)}))\nPY")"
           printf '%s\n' "${health_json}" > health.json
 
           {
