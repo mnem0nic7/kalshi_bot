@@ -49,7 +49,7 @@ jobs:
 
           "${ssh_cmd[@]}" "cd ${app_dir_quoted} && infra/scripts/restart-color.sh blue && infra/scripts/restart-color.sh green"
 
-          health_json="$("${ssh_cmd[@]}" "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml exec -T app_blue python - <<'PY'\nfrom kalshi_bot.config import Settings\nimport json\ns = Settings()\nprint(json.dumps({'gemini_configured': bool(s.gemini_api_key)}))\nPY")"
+          health_json="$("${ssh_cmd[@]}" "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml exec -T app_blue python -c \"from kalshi_bot.config import Settings; import json; s = Settings(); print(json.dumps({'gemini_configured': bool(s.gemini_api_key)}))\"")"
           printf '%s\n' "${health_json}" > health.json
 
           {
