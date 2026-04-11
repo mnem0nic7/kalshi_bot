@@ -150,6 +150,10 @@ class KalshiWebSocketClient:
         self.websocket = await websockets.connect(
             self.settings.kalshi_websocket_url,
             additional_headers=self.kalshi.websocket_auth_headers(),
+            ping_interval=20,
+            ping_timeout=60,
+            close_timeout=10,
+            max_queue=1024,
         )
 
     async def close(self) -> None:

@@ -93,3 +93,62 @@ async def test_streaming_service_processes_messages_and_persists_state(tmp_path)
     assert checkpoint.cursor == "2"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_service_handles_interleaved_market_sequences_by_sid(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/stream-interleaved.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = MarketStreamService(settings, session_factory, DummyWebSocketClient())  # type: ignore[arg-type]
+
+    messages = [
+        {
+            "type": "orderbook_snapshot",
+            "sid": 4,
+            "seq": 1,
+            "msg": {
+                "market_ticker": "WX-ALPHA",
+                "yes_dollars_fp": [["0.4300", "4.00"]],
+                "no_dollars_fp": [["0.5200", "6.00"]],
+            },
+        },
+        {
+            "type": "orderbook_snapshot",
+            "sid": 4,
+            "seq": 2,
+            "msg": {
+                "market_ticker": "WX-BETA",
+                "yes_dollars_fp": [["0.3300", "7.00"]],
+                "no_dollars_fp": [["0.6200", "5.00"]],
+            },
+        },
+        {
+            "type": "orderbook_delta",
+            "sid": 4,
+            "seq": 3,
+            "msg": {
+                "market_ticker": "WX-ALPHA",
+                "side": "yes",
+                "price_dollars": "0.4400",
+                "delta_fp": "2.00",
+            },
+        },
+    ]
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        for message in messages:
+            await service.process_message(repo, message)
+        await session.commit()
+
+        alpha = (await session.execute(select(MarketState).where(MarketState.market_ticker == "WX-ALPHA"))).scalar_one()
+        beta = (await session.execute(select(MarketState).where(MarketState.market_ticker == "WX-BETA"))).scalar_one()
+        checkpoint = (await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws:blue:4"))).scalar_one()
+
+    assert str(alpha.yes_bid_dollars) == "0.4400"
+    assert str(beta.yes_bid_dollars) == "0.3300"
+    assert checkpoint.cursor == "3"
+
+    await engine.dispose()

@@ -521,7 +521,12 @@ def main() -> None:
     configure_logging()
     parser = build_parser()
     args = parser.parse_args()
-    sys.exit(asyncio.run(_run_cli(args)))
+    try:
+        sys.exit(asyncio.run(_run_cli(args)))
+    except (ValueError, KeyError, RuntimeError) as exc:
+        message = exc.args[0] if exc.args else str(exc)
+        print(json.dumps({"error": message}, indent=2), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -14,3 +15,32 @@ def test_python_module_cli_entrypoint_runs_help() -> None:
 
     assert result.returncode == 0
     assert "kalshi-bot-cli" in result.stdout
+
+
+def test_python_module_cli_entrypoint_reports_operator_errors_cleanly(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "self-improve",
+            "eval",
+            "--candidate-version",
+            "builtin-gemini-v1",
+            "--limit",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    assert '"error"' in result.stderr
+    assert "Training corpus is not ready for evaluation" in result.stderr
+    assert "Traceback" not in result.stderr

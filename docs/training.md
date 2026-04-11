@@ -70,8 +70,8 @@ Export only one market:
 ```bash
 kalshi-bot-cli training-export \
   --mode bundles \
-  --market-ticker WEATHER-NYC-HIGH-80F \
-  --output data/training/nyc_room_bundles.jsonl
+  --market-ticker <MARKET_TICKER> \
+  --output data/training/market_room_bundles.jsonl
 ```
 
 Export role-specific SFT examples:

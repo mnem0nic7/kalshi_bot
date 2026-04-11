@@ -40,8 +40,6 @@ class OrderBookState:
         return state
 
     def apply_delta(self, msg: dict[str, Any], seq: int | None) -> None:
-        if self.seq is not None and seq is not None and seq != self.seq + 1:
-            raise SequenceGapError(f"Expected seq {self.seq + 1}, got {seq} for {self.market_ticker}")
         levels = self.yes_levels if msg["side"] == "yes" else self.no_levels
         price = quantize_price(msg["price_dollars"])
         next_size = levels.get(price, Decimal("0")) + Decimal(str(msg["delta_fp"]))
@@ -92,6 +90,7 @@ class MarketStreamService:
         self.websocket_client = websocket_client
         self.orderbooks: dict[str, OrderBookState] = {}
         self.channel_names: dict[int, str] = {}
+        self.sid_sequences: dict[int, int] = {}
 
     async def stream(
         self,
@@ -105,6 +104,7 @@ class MarketStreamService:
         pending_tasks: set[asyncio.Task] = set()
         while True:
             try:
+                self._reset_connection_state()
                 await self.websocket_client.connect()
                 await self._subscribe(market_tickers, include_private=include_private)
                 async for message in self.websocket_client.iter_messages():
@@ -156,6 +156,13 @@ class MarketStreamService:
         if message_type == "subscribed" and sid and message.get("msg", {}).get("channel"):
             self.channel_names[sid] = message["msg"]["channel"]
         await repo.log_exchange_event("ws", message_type, message, market_ticker=self._market_ticker_for_message(message))
+        if sid and seq is not None:
+            self._validate_sid_sequence(
+                sid=sid,
+                seq=int(seq),
+                message_type=message_type,
+                market_ticker=self._market_ticker_for_message(message),
+            )
         if sid:
             await repo.set_checkpoint(
                 self._checkpoint_name(sid),
@@ -197,7 +204,14 @@ class MarketStreamService:
         market_ticker = msg["market_ticker"]
         state = self.orderbooks.get(market_ticker)
         if state is None:
-            raise SequenceGapError(f"Received delta without snapshot for {market_ticker}")
+            logger.warning("received orderbook delta before snapshot", extra={"market_ticker": market_ticker, "sid": sid, "seq": seq})
+            await repo.log_ops_event(
+                severity="warning",
+                summary="Skipped orderbook delta before snapshot",
+                source="stream",
+                payload={"market_ticker": market_ticker, "sid": sid, "seq": seq, "message": msg},
+            )
+            return
         state.apply_delta(msg, seq=seq)
         FEED_FRESHNESS_SECONDS.labels(feed="kalshi_ws").set(0)
         await self._persist_market_state(repo, market_ticker)
@@ -267,3 +281,23 @@ class MarketStreamService:
 
     def _checkpoint_name(self, sid: int) -> str:
         return f"kalshi_ws:{self.settings.app_color}:{sid}"
+
+    def _reset_connection_state(self) -> None:
+        self.orderbooks.clear()
+        self.channel_names.clear()
+        self.sid_sequences.clear()
+
+    def _validate_sid_sequence(
+        self,
+        *,
+        sid: int,
+        seq: int,
+        message_type: str,
+        market_ticker: str | None,
+    ) -> None:
+        last_seq = self.sid_sequences.get(sid)
+        if last_seq is not None and seq != last_seq + 1:
+            raise SequenceGapError(
+                f"Expected sid {sid} seq {last_seq + 1}, got {seq} for {message_type} {market_ticker or 'unknown'}"
+            )
+        self.sid_sequences[sid] = seq
