@@ -10,11 +10,25 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kalshi_bot.core.enums import DeploymentColor, MessageKind, RiskStatus, RoomStage
-from kalshi_bot.core.schemas import MemoryNotePayload, ResearchClaim, ResearchDossier, ResearchSourceCard, RoomCreate, RoomMessageCreate, TradeTicket
+from kalshi_bot.core.schemas import (
+    AgentPack,
+    EvaluationSummary,
+    MemoryNotePayload,
+    ResearchClaim,
+    ResearchDossier,
+    ResearchSourceCard,
+    RoomCreate,
+    RoomMessageCreate,
+    SelfImproveCritiqueItem,
+    TradeTicket,
+)
 from kalshi_bot.db.models import (
+    AgentPackRecord,
     Artifact,
     Checkpoint,
+    CritiqueRunRecord,
     DeploymentControl,
+    EvaluationRunRecord,
     FillRecord,
     MarketState,
     MemoryEmbedding,
@@ -22,6 +36,7 @@ from kalshi_bot.db.models import (
     OpsEvent,
     OrderRecord,
     PositionRecord,
+    PromotionEventRecord,
     ResearchClaimRecord,
     ResearchDossierRecord,
     ResearchRunRecord,
@@ -67,6 +82,15 @@ class PlatformRepository:
         if control.active_color != str(color):
             control.execution_lock_holder = None
         control.active_color = str(color)
+        notes = dict(control.notes or {})
+        agent_pack_notes = dict(notes.get("agent_packs") or {})
+        if agent_pack_notes:
+            active_version = agent_pack_notes.get("blue_version") if str(color) == DeploymentColor.BLUE.value else agent_pack_notes.get("green_version")
+            if active_version is not None:
+                agent_pack_notes["active_version"] = active_version
+                agent_pack_notes["champion_version"] = active_version
+                notes["agent_packs"] = agent_pack_notes
+                control.notes = notes
         await self.session.flush()
         return control
 
@@ -94,6 +118,12 @@ class PlatformRepository:
             control.execution_lock_holder = None
             await self.session.flush()
 
+    async def update_deployment_notes(self, notes: dict[str, Any]) -> DeploymentControl:
+        control = await self.ensure_deployment_control(DeploymentColor.BLUE.value)
+        control.notes = notes
+        await self.session.flush()
+        return control
+
     async def create_room(
         self,
         room: RoomCreate,
@@ -101,15 +131,23 @@ class PlatformRepository:
         active_color: str,
         shadow_mode: bool,
         kill_switch_enabled: bool,
+        kalshi_env: str,
+        agent_pack_version: str | None = None,
+        evaluation_run_id: str | None = None,
+        role_models: dict[str, Any] | None = None,
     ) -> Room:
         record = Room(
             name=room.name,
             market_ticker=room.market_ticker,
             prompt=room.prompt,
+            kalshi_env=kalshi_env,
             stage=RoomStage.TRIGGERED.value,
             active_color=active_color,
             shadow_mode=shadow_mode,
             kill_switch_enabled=kill_switch_enabled,
+            agent_pack_version=agent_pack_version,
+            evaluation_run_id=evaluation_run_id,
+            role_models=role_models or {},
         )
         self.session.add(record)
         await self.session.flush()
@@ -117,6 +155,45 @@ class PlatformRepository:
 
     async def list_rooms(self, limit: int = 25) -> list[Room]:
         result = await self.session.execute(select(Room).order_by(Room.updated_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def list_rooms_for_export(
+        self,
+        *,
+        limit: int = 100,
+        market_ticker: str | None = None,
+        include_non_complete: bool = False,
+    ) -> list[Room]:
+        stmt = select(Room)
+        if market_ticker is not None:
+            stmt = stmt.where(Room.market_ticker == market_ticker)
+        if not include_non_complete:
+            stmt = stmt.where(Room.stage == RoomStage.COMPLETE.value)
+        result = await self.session.execute(stmt.order_by(Room.updated_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def list_rooms_for_learning(
+        self,
+        *,
+        since: datetime,
+        limit: int = 500,
+        pack_version: str | None = None,
+        color: str | None = None,
+    ) -> list[Room]:
+        stmt = (
+            select(Room)
+            .where(
+                Room.stage == RoomStage.COMPLETE.value,
+                Room.created_at >= since,
+                (Room.shadow_mode.is_(True)) | (Room.kalshi_env != "production"),
+            )
+            .order_by(Room.created_at.asc())
+        )
+        if pack_version is not None:
+            stmt = stmt.where(Room.agent_pack_version == pack_version)
+        if color is not None:
+            stmt = stmt.where(Room.active_color == color)
+        result = await self.session.execute(stmt.limit(limit))
         return list(result.scalars())
 
     async def count_active_rooms(self) -> int:
@@ -141,6 +218,27 @@ class PlatformRepository:
             room.stage = stage.value
             room.updated_at = datetime.now(UTC)
             await self.session.flush()
+
+    async def update_room_runtime(
+        self,
+        room_id: str,
+        *,
+        agent_pack_version: str | None = None,
+        evaluation_run_id: str | None = None,
+        role_models: dict[str, Any] | None = None,
+    ) -> Room | None:
+        room = await self.get_room(room_id)
+        if room is None:
+            return None
+        if agent_pack_version is not None:
+            room.agent_pack_version = agent_pack_version
+        if evaluation_run_id is not None:
+            room.evaluation_run_id = evaluation_run_id
+        if role_models is not None:
+            room.role_models = role_models
+        room.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        return room
 
     async def append_message(self, room_id: str, message: RoomMessageCreate) -> RoomMessage:
         sequence_query: Select[tuple[int]] = select(func.coalesce(func.max(RoomMessage.sequence), 0) + 1).where(
@@ -280,6 +378,10 @@ class PlatformRepository:
     async def get_market_state(self, market_ticker: str) -> MarketState | None:
         return await self.session.get(MarketState, market_ticker)
 
+    async def get_latest_signal_for_room(self, room_id: str) -> Signal | None:
+        stmt = select(Signal).where(Signal.room_id == room_id).order_by(Signal.created_at.desc()).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def save_signal(
         self,
         *,
@@ -304,6 +406,15 @@ class PlatformRepository:
         await self.session.flush()
         return record
 
+    async def get_latest_trade_ticket_for_room(self, room_id: str) -> TradeTicketRecord | None:
+        stmt = (
+            select(TradeTicketRecord)
+            .where(TradeTicketRecord.room_id == room_id)
+            .order_by(TradeTicketRecord.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def save_trade_ticket(self, room_id: str, ticket: TradeTicket, client_order_id: str, message_id: str | None = None) -> TradeTicketRecord:
         record = TradeTicketRecord(
             room_id=room_id,
@@ -320,6 +431,15 @@ class PlatformRepository:
         self.session.add(record)
         await self.session.flush()
         return record
+
+    async def get_latest_risk_verdict_for_room(self, room_id: str) -> RiskVerdictRecord | None:
+        stmt = (
+            select(RiskVerdictRecord)
+            .where(RiskVerdictRecord.room_id == room_id)
+            .order_by(RiskVerdictRecord.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def save_risk_verdict(
         self,
@@ -418,6 +538,15 @@ class PlatformRepository:
         await self.session.flush()
         return record
 
+    async def list_orders_for_room(self, room_id: str) -> list[OrderRecord]:
+        stmt = (
+            select(OrderRecord)
+            .join(TradeTicketRecord, OrderRecord.trade_ticket_id == TradeTicketRecord.id)
+            .where(TradeTicketRecord.room_id == room_id)
+            .order_by(OrderRecord.created_at.asc())
+        )
+        return list((await self.session.execute(stmt)).scalars())
+
     async def save_fill(
         self,
         *,
@@ -487,6 +616,16 @@ class PlatformRepository:
             record.is_taker = is_taker
         await self.session.flush()
         return record
+
+    async def list_fills_for_room(self, room_id: str) -> list[FillRecord]:
+        stmt = (
+            select(FillRecord)
+            .join(OrderRecord, FillRecord.order_id == OrderRecord.id)
+            .join(TradeTicketRecord, OrderRecord.trade_ticket_id == TradeTicketRecord.id)
+            .where(TradeTicketRecord.room_id == room_id)
+            .order_by(FillRecord.created_at.asc())
+        )
+        return list((await self.session.execute(stmt)).scalars())
 
     async def upsert_position(
         self,
@@ -655,6 +794,171 @@ class PlatformRepository:
         )
         return list(result.scalars())
 
+    async def create_agent_pack(self, pack: AgentPack) -> AgentPackRecord:
+        record = AgentPackRecord(
+            version=pack.version,
+            status=pack.status,
+            parent_version=pack.parent_version,
+            source=pack.source,
+            description=pack.description,
+            payload=pack.model_dump(mode="json"),
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def update_agent_pack(self, pack: AgentPack) -> AgentPackRecord:
+        record = await self.get_agent_pack(pack.version)
+        if record is None:
+            return await self.create_agent_pack(pack)
+        record.status = pack.status
+        record.parent_version = pack.parent_version
+        record.source = pack.source
+        record.description = pack.description
+        record.payload = pack.model_dump(mode="json")
+        await self.session.flush()
+        return record
+
+    async def get_agent_pack(self, version: str) -> AgentPackRecord | None:
+        stmt = select(AgentPackRecord).where(AgentPackRecord.version == version).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_agent_packs(self, limit: int = 20) -> list[AgentPackRecord]:
+        result = await self.session.execute(select(AgentPackRecord).order_by(AgentPackRecord.created_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def create_critique_run(
+        self,
+        *,
+        source_pack_version: str,
+        payload: dict[str, Any],
+    ) -> CritiqueRunRecord:
+        record = CritiqueRunRecord(source_pack_version=source_pack_version, payload=payload)
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def complete_critique_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        payload: dict[str, Any],
+        candidate_version: str | None = None,
+        room_count: int | None = None,
+        error_text: str | None = None,
+    ) -> CritiqueRunRecord:
+        record = await self.session.get(CritiqueRunRecord, run_id)
+        if record is None:
+            raise KeyError(f"Critique run {run_id} not found")
+        record.status = status
+        record.finished_at = datetime.now(UTC)
+        record.payload = payload
+        record.candidate_version = candidate_version
+        if room_count is not None:
+            record.room_count = room_count
+        record.error_text = error_text
+        await self.session.flush()
+        return record
+
+    async def get_critique_run(self, run_id: str) -> CritiqueRunRecord | None:
+        return await self.session.get(CritiqueRunRecord, run_id)
+
+    async def list_critique_runs(self, limit: int = 20) -> list[CritiqueRunRecord]:
+        result = await self.session.execute(select(CritiqueRunRecord).order_by(CritiqueRunRecord.started_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def create_evaluation_run(
+        self,
+        *,
+        champion_version: str,
+        candidate_version: str,
+        payload: dict[str, Any],
+    ) -> EvaluationRunRecord:
+        record = EvaluationRunRecord(
+            champion_version=champion_version,
+            candidate_version=candidate_version,
+            payload=payload,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def complete_evaluation_run(
+        self,
+        run_id: str,
+        *,
+        summary: EvaluationSummary,
+        holdout_room_count: int,
+        error_text: str | None = None,
+    ) -> EvaluationRunRecord:
+        record = await self.session.get(EvaluationRunRecord, run_id)
+        if record is None:
+            raise KeyError(f"Evaluation run {run_id} not found")
+        record.status = "completed" if error_text is None else "failed"
+        record.finished_at = datetime.now(UTC)
+        record.holdout_room_count = holdout_room_count
+        record.passed = summary.passed if error_text is None else False
+        record.payload = summary.model_dump(mode="json")
+        record.error_text = error_text
+        await self.session.flush()
+        return record
+
+    async def get_evaluation_run(self, run_id: str) -> EvaluationRunRecord | None:
+        return await self.session.get(EvaluationRunRecord, run_id)
+
+    async def list_evaluation_runs(self, limit: int = 20) -> list[EvaluationRunRecord]:
+        result = await self.session.execute(select(EvaluationRunRecord).order_by(EvaluationRunRecord.started_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def create_promotion_event(
+        self,
+        *,
+        candidate_version: str,
+        previous_version: str | None,
+        target_color: str,
+        evaluation_run_id: str | None,
+        payload: dict[str, Any],
+        status: str = "staged",
+    ) -> PromotionEventRecord:
+        record = PromotionEventRecord(
+            candidate_version=candidate_version,
+            previous_version=previous_version,
+            target_color=target_color,
+            evaluation_run_id=evaluation_run_id,
+            payload=payload,
+            status=status,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def update_promotion_event(
+        self,
+        promotion_event_id: str,
+        *,
+        status: str,
+        payload: dict[str, Any] | None = None,
+        rollback_reason: str | None = None,
+    ) -> PromotionEventRecord:
+        record = await self.session.get(PromotionEventRecord, promotion_event_id)
+        if record is None:
+            raise KeyError(f"Promotion event {promotion_event_id} not found")
+        record.status = status
+        if payload is not None:
+            record.payload = payload
+        if rollback_reason is not None:
+            record.rollback_reason = rollback_reason
+        await self.session.flush()
+        return record
+
+    async def get_promotion_event(self, promotion_event_id: str) -> PromotionEventRecord | None:
+        return await self.session.get(PromotionEventRecord, promotion_event_id)
+
+    async def list_promotion_events(self, limit: int = 20) -> list[PromotionEventRecord]:
+        result = await self.session.execute(select(PromotionEventRecord).order_by(PromotionEventRecord.created_at.desc()).limit(limit))
+        return list(result.scalars())
+
     async def save_memory_note(self, *, room_id: str | None, payload: MemoryNotePayload, embedding: list[float] | None, provider: str) -> MemoryNoteRecord:
         note = MemoryNoteRecord(
             room_id=room_id,
@@ -674,6 +978,15 @@ class PlatformRepository:
     async def list_recent_memory_notes(self, limit: int = 10) -> list[MemoryNoteRecord]:
         result = await self.session.execute(select(MemoryNoteRecord).order_by(MemoryNoteRecord.created_at.desc()).limit(limit))
         return list(result.scalars())
+
+    async def get_latest_memory_note_for_room(self, room_id: str) -> MemoryNoteRecord | None:
+        stmt = (
+            select(MemoryNoteRecord)
+            .where(MemoryNoteRecord.room_id == room_id)
+            .order_by(MemoryNoteRecord.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def list_positions(self, limit: int = 50) -> list[PositionRecord]:
         result = await self.session.execute(select(PositionRecord).order_by(PositionRecord.updated_at.desc()).limit(limit))
@@ -698,3 +1011,21 @@ class PlatformRepository:
     async def get_checkpoint(self, stream_name: str) -> Checkpoint | None:
         stmt = select(Checkpoint).where(Checkpoint.stream_name == stream_name)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_exchange_events(
+        self,
+        *,
+        stream_name: str | None = None,
+        event_type: str | None = None,
+        market_ticker: str | None = None,
+        limit: int = 50,
+    ) -> list[RawExchangeEvent]:
+        stmt = select(RawExchangeEvent)
+        if stream_name is not None:
+            stmt = stmt.where(RawExchangeEvent.stream_name == stream_name)
+        if event_type is not None:
+            stmt = stmt.where(RawExchangeEvent.event_type == event_type)
+        if market_ticker is not None:
+            stmt = stmt.where(RawExchangeEvent.market_ticker == market_ticker)
+        stmt = stmt.order_by(RawExchangeEvent.created_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())

@@ -13,6 +13,7 @@ from kalshi_bot.core.schemas import (
     ResearchSourceCard,
     ResearchSummary,
     ResearchTraderContext,
+    RoomCreate,
 )
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.web.app import create_app
@@ -110,5 +111,108 @@ def test_research_api_serves_dossier_and_history(tmp_path, monkeypatch) -> None:
         refresh = client.post("/api/research/API-TEST/refresh")
         assert refresh.status_code == 200
         assert refresh.json()["status"] == "scheduled"
+
+    get_settings.cache_clear()
+
+
+def test_web_pages_render_index_and_room_detail(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text(
+        (
+            "markets:\n"
+            "  - market_ticker: WX-UI\n"
+            "    station_id: KNYC\n"
+            "    location_name: New York City\n"
+            "    latitude: 40.7146\n"
+            "    longitude: -74.0071\n"
+            "    threshold_f: 80\n"
+            "    settlement_source: NWS station observation\n"
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "ui.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> str:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                control = await repo.get_deployment_control()
+                pack = await container.agent_pack_service.get_pack_for_color(repo, container.settings.app_color)
+                room = await repo.create_room(
+                    room=RoomCreate(name="UI Room", market_ticker="WX-UI"),
+                    active_color=container.settings.app_color,
+                    shadow_mode=True,
+                    kill_switch_enabled=control.kill_switch_enabled,
+                    kalshi_env=container.settings.kalshi_env,
+                    agent_pack_version=pack.version,
+                )
+                await session.commit()
+                return room.id
+
+        room_id = asyncio.run(seed())
+
+        index_response = client.get("/")
+        assert index_response.status_code == 200
+        assert "WX-UI" in index_response.text
+        assert "Runtime Health" in index_response.text
+
+        room_response = client.get(f"/rooms/{room_id}")
+        assert room_response.status_code == 200
+        assert "UI Room" in room_response.text
+
+    get_settings.cache_clear()
+
+
+def test_status_api_includes_runtime_health(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "status.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> None:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                await repo.ensure_deployment_control("blue", initial_active_color="blue")
+                await repo.set_checkpoint(
+                    "daemon_heartbeat:blue",
+                    None,
+                    {"heartbeat_at": datetime.now(UTC).isoformat()},
+                )
+                await repo.set_checkpoint(
+                    "daemon_heartbeat:green",
+                    None,
+                    {"heartbeat_at": (datetime.now(UTC) - timedelta(seconds=500)).isoformat()},
+                )
+                await container.watchdog_service.record_boot(
+                    repo,
+                    status="success",
+                    reason="seed_boot",
+                )
+                await session.commit()
+
+        asyncio.run(seed())
+
+        response = client.get("/api/status")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["runtime_health"]["active_color"] == "blue"
+        assert body["runtime_health"]["colors"]["blue"]["daemon"]["healthy"] is True
+        assert body["runtime_health"]["last_boot_recovery"]["reason"] == "seed_boot"
 
     get_settings.cache_clear()

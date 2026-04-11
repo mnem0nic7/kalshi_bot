@@ -2,10 +2,28 @@
 {% block content %}
 <section class="panel">
   <h1>{{ room.name }}</h1>
-  <p>{{ room.market_ticker }} | Stage: {{ room.stage }} | Shadow: {{ room.shadow_mode }}</p>
+  <p>{{ room.market_ticker }} | Stage: {{ room.stage }} | Shadow: {{ room.shadow_mode }} | Pack: {{ room.agent_pack_version or "n/a" }}</p>
   <div class="actions">
     <button onclick="runRoom()">Run Workflow</button>
     <button onclick="refreshResearch()">Refresh Research</button>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Runtime</h2>
+  <div class="room-list">
+    {% for role, config in room.role_models.items() %}
+    <div class="room-card">
+      <strong>{{ role }}</strong>
+      <span>{{ config.provider }} · {{ config.model or "n/a" }}</span>
+      <span>temperature {{ config.temperature }}</span>
+      {% if config.fallback_used %}
+      <span>fallback used</span>
+      {% endif %}
+    </div>
+    {% else %}
+    <p>No runtime model metadata recorded yet.</p>
+    {% endfor %}
   </div>
 </section>
 

@@ -6,7 +6,6 @@ import pytest
 
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import RiskStatus
 from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -17,6 +16,7 @@ from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine
 from kalshi_bot.services.signal import WeatherSignalEngine
+from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
 
@@ -52,6 +52,7 @@ class FakeKalshi:
                 "yes_ask_dollars": "0.5600",
                 "no_ask_dollars": "0.4500",
                 "last_price_dollars": "0.5500",
+                "settlement_sources": ["Official source"],
             }
         }
 
@@ -88,7 +89,7 @@ class FakeWeather:
 
 
 @pytest.mark.asyncio
-async def test_supervisor_completes_room_workflow(tmp_path) -> None:
+async def test_training_export_service_builds_room_bundle_and_role_examples(tmp_path) -> None:
     database_url = f"sqlite+aiosqlite:///{tmp_path}/app.db"
     settings = Settings(
         database_url=database_url,
@@ -148,12 +149,13 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         research_coordinator=research_coordinator,
         agents=agents,
     )
+    training_service = TrainingExportService(session_factory)
 
     async with session_factory() as session:
         repo = PlatformRepository(session)
         await repo.ensure_deployment_control(settings.app_color)
         room = await repo.create_room(
-            RoomCreate(name="Test Room", market_ticker="WX-TEST"),
+            RoomCreate(name="Training Room", market_ticker="WX-TEST"),
             active_color="blue",
             shadow_mode=False,
             kill_switch_enabled=False,
@@ -161,17 +163,43 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         )
         await session.commit()
 
-    await supervisor.run_room(room.id, reason="test")
+    await supervisor.run_room(room.id, reason="training_test")
 
     async with session_factory() as session:
         repo = PlatformRepository(session)
-        stored_room = await repo.get_room(room.id)
-        messages = await repo.list_messages(room.id)
+        await repo.log_exchange_event(
+            "reconcile",
+            "settlements",
+            {"settlements": [{"market_ticker": "WX-TEST", "realized_pnl_dollars": "2.5000"}]},
+        )
         await session.commit()
 
-    assert stored_room is not None
-    assert stored_room.stage == "complete"
-    assert any(message.role == "trader" for message in messages)
-    assert any(message.kind == "ExecReceipt" for message in messages)
+    bundle = await training_service.build_room_bundle(room.id)
+
+    assert bundle.room["market_ticker"] == "WX-TEST"
+    assert bundle.signal is not None
+    assert bundle.research_dossier is not None
+    assert bundle.trade_ticket is not None
+    assert bundle.risk_verdict is not None
+    assert bundle.orders
+    assert bundle.outcome.final_status == "submitted"
+    assert bundle.outcome.research_gate_passed is True
+    assert bundle.outcome.orders_submitted == 1
+    assert bundle.outcome.settlement_seen is True
+    assert bundle.outcome.settlement_pnl_dollars == Decimal("2.5000")
+
+    examples = training_service.build_role_training_examples(bundle)
+    roles = {example.role for example in examples}
+
+    assert roles == {"researcher", "president", "trader", "memory_librarian"}
+    trader_example = next(example for example in examples if example.role == "trader")
+    assert trader_example.target["payload"]["market_ticker"] == "WX-TEST"
+    assert trader_example.input_context["research_dossier"] is not None
+    assert trader_example.messages[0]["role"] == "system"
+    assert trader_example.messages[1]["role"] == "user"
+    assert trader_example.messages[2]["role"] == "assistant"
+
+    memory_example = next(example for example in examples if example.role == "memory_librarian")
+    assert memory_example.input_context["room_outcome"]["final_status"] == "submitted"
 
     await engine.dispose()

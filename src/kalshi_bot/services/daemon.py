@@ -10,8 +10,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.auto_trigger import AutoTriggerService
+from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
+from kalshi_bot.services.self_improve import SelfImproveService
+from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
@@ -22,24 +25,39 @@ class DaemonService:
         settings: Settings,
         session_factory: async_sessionmaker,
         weather_directory: WeatherMarketDirectory,
+        discovery_service: DiscoveryService,
         stream_service: MarketStreamService,
         reconciliation_service: ReconciliationService,
         research_coordinator: ResearchCoordinator,
         auto_trigger_service: AutoTriggerService,
+        shadow_training_service: ShadowTrainingService,
+        self_improve_service: SelfImproveService,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.weather_directory = weather_directory
+        self.discovery_service = discovery_service
         self.stream_service = stream_service
         self.reconciliation_service = reconciliation_service
         self.research_coordinator = research_coordinator
         self.auto_trigger_service = auto_trigger_service
+        self.shadow_training_service = shadow_training_service
+        self.self_improve_service = self_improve_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
 
     async def reconcile_once(self) -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             summary = await self.reconciliation_service.reconcile(repo, subaccount=self.settings.kalshi_subaccount)
+            await repo.set_checkpoint(
+                f"daemon_reconcile:{self.settings.app_color}",
+                None,
+                {
+                    "reconciled_at": self._now_iso(),
+                    "summary": asdict(summary),
+                    "kalshi_env": self.settings.kalshi_env,
+                },
+            )
             await session.commit()
         return asdict(summary)
 
@@ -49,18 +67,21 @@ class DaemonService:
             "kalshi_env": self.settings.kalshi_env,
             "shadow_mode": self.settings.app_shadow_mode,
             "auto_rooms_enabled": self.settings.trigger_enable_auto_rooms,
+            "heartbeat_at": self._now_iso(),
         }
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.get_deployment_control()
             active_rooms = await repo.count_active_rooms()
             checkpoint = await repo.get_checkpoint("reconcile")
+            self_improve_status = dict(control.notes.get("agent_packs") or {})
             payload.update(
                 {
                     "active_color": control.active_color,
                     "kill_switch_enabled": control.kill_switch_enabled,
                     "active_rooms": active_rooms,
                     "has_reconcile_checkpoint": checkpoint is not None,
+                    "agent_pack_status": self_improve_status,
                 }
             )
             await repo.log_ops_event(
@@ -69,7 +90,25 @@ class DaemonService:
                 source="daemon",
                 payload=payload,
             )
+            last_reconcile = await repo.get_checkpoint(f"daemon_reconcile:{self.settings.app_color}")
+            await repo.set_checkpoint(
+                f"daemon_heartbeat:{self.settings.app_color}",
+                None,
+                {
+                    **payload,
+                    "last_reconcile_at": (
+                        last_reconcile.payload.get("reconciled_at")
+                        if last_reconcile is not None and isinstance(last_reconcile.payload, dict)
+                        else None
+                    ),
+                },
+            )
             await session.commit()
+        rollout_result = await self.self_improve_service.monitor_rollouts()
+        if rollout_result.status == "canary_running":
+            canary = rollout_result.payload
+            if self.settings.app_color == canary.get("color"):
+                await self.shadow_training_service.run_shadow_sweep(limit=1, reason="canary_shadow")
         return payload
 
     async def run(
@@ -81,7 +120,7 @@ class DaemonService:
         max_messages: int | None = None,
         run_seconds: float | None = None,
     ) -> dict[str, Any]:
-        selected_markets = markets or [mapping.market_ticker for mapping in self.weather_directory.all()]
+        selected_markets = markets or await self.discovery_service.list_stream_markets()
         should_auto_trigger = self.settings.trigger_enable_auto_rooms if auto_trigger is None else auto_trigger
         self._auto_trigger_enabled_for_run = should_auto_trigger
 
@@ -148,3 +187,9 @@ class DaemonService:
         while True:
             await asyncio.sleep(self.settings.daemon_heartbeat_interval_seconds)
             await self.heartbeat_once()
+
+    @staticmethod
+    def _now_iso() -> str:
+        from datetime import UTC, datetime
+
+        return datetime.now(UTC).isoformat()

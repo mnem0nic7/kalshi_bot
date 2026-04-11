@@ -32,12 +32,20 @@ class WeatherSignalEngine:
         raw = market.get(key)
         return quantize_price(raw) if raw is not None else None
 
-    def evaluate(self, mapping: WeatherMarketMapping, market_snapshot: dict[str, Any], weather_bundle: dict[str, Any]) -> StrategySignal:
+    def evaluate(
+        self,
+        mapping: WeatherMarketMapping,
+        market_snapshot: dict[str, Any],
+        weather_bundle: dict[str, Any],
+        *,
+        min_edge_bps: int | None = None,
+    ) -> StrategySignal:
         weather = score_weather_market(mapping, weather_bundle.get("forecast", {}), weather_bundle.get("observation", {}))
         ask_yes = self._market_price(market_snapshot, "yes_ask_dollars")
         bid_yes = self._market_price(market_snapshot, "yes_bid_dollars")
         ask_no = self._market_price(market_snapshot, "no_ask_dollars")
-        min_edge = Decimal(self.settings.risk_min_edge_bps) / Decimal("10000")
+        effective_min_edge_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
+        min_edge = Decimal(effective_min_edge_bps) / Decimal("10000")
 
         recommendation_action = None
         recommendation_side = None

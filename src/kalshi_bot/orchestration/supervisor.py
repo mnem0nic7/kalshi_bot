@@ -17,6 +17,7 @@ from kalshi_bot.db.models import Room
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
@@ -50,6 +51,7 @@ class WorkflowSupervisor:
         kalshi: KalshiClient,
         weather: NWSWeatherClient,
         weather_directory: WeatherMarketDirectory,
+        agent_pack_service: AgentPackService,
         signal_engine: WeatherSignalEngine,
         risk_engine: DeterministicRiskEngine,
         execution_service: ExecutionService,
@@ -62,6 +64,7 @@ class WorkflowSupervisor:
         self.kalshi = kalshi
         self.weather = weather
         self.weather_directory = weather_directory
+        self.agent_pack_service = agent_pack_service
         self.signal_engine = signal_engine
         self.risk_engine = risk_engine
         self.execution_service = execution_service
@@ -97,9 +100,25 @@ class WorkflowSupervisor:
             await session.commit()
 
             try:
-                mapping = self.weather_directory.get(room.market_ticker)
+                pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
+                thresholds = self.agent_pack_service.runtime_thresholds(pack)
+                role_models: dict[str, Any] = {
+                    role_name: {
+                        "provider": config.provider,
+                        "model": config.model,
+                        "temperature": config.temperature,
+                    }
+                    for role_name, config in pack.roles.items()
+                }
+                await repo.update_room_runtime(
+                    room.id,
+                    agent_pack_version=pack.version,
+                    role_models=role_models,
+                )
+                await session.commit()
                 market_response = await self.kalshi.get_market(room.market_ticker)
                 market = market_response.get("market", market_response)
+                mapping = self.weather_directory.resolve_market(room.market_ticker, market)
                 weather_bundle = (
                     await self.weather.build_market_snapshot(mapping)
                     if mapping is not None and mapping.supports_structured_weather
@@ -111,7 +130,11 @@ class WorkflowSupervisor:
                     market_response=market_response,
                     weather_bundle=weather_bundle,
                 )
-                signal = self.research_coordinator.build_signal_from_dossier(dossier, market_response)
+                signal = self.research_coordinator.build_signal_from_dossier(
+                    dossier,
+                    market_response,
+                    min_edge_bps=thresholds.risk_min_edge_bps,
+                )
 
                 await repo.log_exchange_event("rest_market", "market_snapshot", market_response, market_ticker=room.market_ticker)
                 if mapping is not None and mapping.station_id is not None and weather_bundle is not None:
@@ -136,20 +159,23 @@ class WorkflowSupervisor:
                         "research_last_run_id": dossier.last_run_id,
                         "research_delta": delta.model_dump(mode="json"),
                         "trader_context": dossier.trader_context.model_dump(mode="json"),
+                        "agent_pack_version": pack.version,
                     },
                 )
                 await session.commit()
 
                 recent_memories = [note.summary for note in await repo.list_recent_memory_notes(limit=5)]
                 await repo.update_room_stage(room.id, RoomStage.RESEARCHING)
-                researcher_message = await self.agents.researcher_message(
+                researcher_message, researcher_usage = await self.agents.researcher_message(
                     signal=signal,
                     dossier=dossier,
                     delta=delta,
                     room=room,
                     recent_memories=recent_memories,
+                    role_config=self.agent_pack_service.role_config(pack, AgentRole.RESEARCHER),
                 )
                 researcher_record = await repo.append_message(room.id, researcher_message)
+                role_models[AgentRole.RESEARCHER.value] = researcher_usage
                 await repo.save_artifact(
                     room_id=room.id,
                     message_id=researcher_record.id,
@@ -213,18 +239,26 @@ class WorkflowSupervisor:
                     await session.commit()
                 else:
                     await repo.update_room_stage(room.id, RoomStage.POSTURE)
-                    president_record = await repo.append_message(room.id, await self.agents.president_message(signal=signal))
+                    president_message, president_usage = await self.agents.president_message(
+                        signal=signal,
+                        role_config=self.agent_pack_service.role_config(pack, AgentRole.PRESIDENT),
+                    )
+                    president_record = await repo.append_message(room.id, president_message)
+                    role_models[AgentRole.PRESIDENT.value] = president_usage
                     rationale_ids.append(president_record.id)
                     await session.commit()
 
                     await repo.update_room_stage(room.id, RoomStage.PROPOSING)
-                    trader_message, ticket, client_order_id = await self.agents.trader_message(
+                    trader_message, ticket, client_order_id, trader_usage = await self.agents.trader_message(
                         signal=signal,
                         room_id=room.id,
                         market_ticker=room.market_ticker,
                         rationale_ids=rationale_ids.copy(),
+                        role_config=self.agent_pack_service.role_config(pack, AgentRole.TRADER),
+                        max_order_notional_dollars=thresholds.risk_max_order_notional_dollars,
                     )
                     trader_record = await repo.append_message(room.id, trader_message)
+                    role_models[AgentRole.TRADER.value] = trader_usage
                     rationale_ids.append(trader_record.id)
                     await session.commit()
 
@@ -241,6 +275,7 @@ class WorkflowSupervisor:
                             ticket=ticket,
                             signal=signal,
                             context=risk_context,
+                            thresholds=thresholds,
                         )
                         await repo.save_risk_verdict(
                             room_id=room.id,
@@ -251,7 +286,12 @@ class WorkflowSupervisor:
                             approved_count_fp=verdict.approved_count_fp,
                             payload=verdict.model_dump(mode="json"),
                         )
-                        risk_record = await repo.append_message(room.id, await self.agents.risk_message(verdict=verdict))
+                        risk_message, risk_usage = await self.agents.risk_message(
+                            verdict=verdict,
+                            role_config=self.agent_pack_service.role_config(pack, AgentRole.RISK_OFFICER),
+                        )
+                        risk_record = await repo.append_message(room.id, risk_message)
+                        role_models[AgentRole.RISK_OFFICER.value] = risk_usage
                         rationale_ids.append(risk_record.id)
                         await session.commit()
 
@@ -323,15 +363,22 @@ class WorkflowSupervisor:
                 await session.commit()
 
                 all_messages = [_room_message_read(message) for message in await repo.list_messages(room.id)]
-                memory_payload = await self.memory_service.build_note(room, all_messages)
+                memory_payload, memory_usage = await self.memory_service.build_note(
+                    room,
+                    all_messages,
+                    memory_config=pack.memory,
+                    role_config=self.agent_pack_service.role_config(pack, AgentRole.MEMORY_LIBRARIAN),
+                )
                 await repo.update_room_stage(room.id, RoomStage.MEMORY)
                 await repo.append_message(room.id, await self.agents.memory_message(memory_payload))
+                role_models[AgentRole.MEMORY_LIBRARIAN.value] = memory_usage
                 await repo.save_memory_note(
                     room_id=room.id,
                     payload=memory_payload,
                     embedding=self.agents.providers.embed_text(memory_payload.summary),
                     provider="hash-router-v1",
                 )
+                await repo.update_room_runtime(room.id, role_models=role_models)
                 await repo.update_room_stage(room.id, RoomStage.COMPLETE)
                 ROOM_RUNS_TOTAL.labels(status="success").inc()
                 await session.commit()

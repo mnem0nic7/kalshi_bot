@@ -180,6 +180,146 @@ class ResearchDossier(BaseModel):
     last_run_id: str | None = None
 
 
+class AgentRoleRuntime(BaseModel):
+    provider: str = "gemini"
+    model: str | None = None
+    temperature: float = 0.2
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+
+class AgentPackRoleConfig(AgentRoleRuntime):
+    system_prompt: str
+
+
+class AgentPackResearchConfig(BaseModel):
+    synthesis_system_prompt: str
+    critique_system_prompt: str
+    web_max_queries: int | None = None
+    web_max_results: int | None = None
+
+
+class AgentPackMemoryConfig(BaseModel):
+    system_prompt: str
+    max_sentences: int = 2
+
+
+class AgentPackThresholds(BaseModel):
+    risk_min_edge_bps: int | None = None
+    risk_max_order_notional_dollars: float | None = None
+    risk_max_position_notional_dollars: float | None = None
+    trigger_max_spread_bps: int | None = None
+    trigger_cooldown_seconds: int | None = None
+
+
+class AgentPack(BaseModel):
+    version: str
+    status: str = "builtin"
+    parent_version: str | None = None
+    source: str = "builtin"
+    description: str = ""
+    roles: dict[str, AgentPackRoleConfig] = Field(default_factory=dict)
+    research: AgentPackResearchConfig
+    memory: AgentPackMemoryConfig
+    thresholds: AgentPackThresholds = Field(default_factory=AgentPackThresholds)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class SelfImproveCritiqueItem(BaseModel):
+    room_id: str
+    market_ticker: str
+    research_quality: float = 0.0
+    directional_agreement: float = 0.0
+    risk_compliance: float = 0.0
+    memory_usefulness: float = 0.0
+    strengths: list[str] = Field(default_factory=list)
+    weaknesses: list[str] = Field(default_factory=list)
+    suggested_prompt_changes: dict[str, str] = Field(default_factory=dict)
+    suggested_thresholds: AgentPackThresholds = Field(default_factory=AgentPackThresholds)
+
+
+class EvaluationMetrics(BaseModel):
+    composite_score: float = 0.0
+    research_quality: float = 0.0
+    directional_agreement: float = 0.0
+    risk_compliance: float = 0.0
+    memory_usefulness: float = 0.0
+    invalid_payload_rate: float = 0.0
+    gate_violation_count: int = 0
+    safety_violation_count: int = 0
+    settled_pnl_score: float | None = None
+    sample_size: int = 0
+
+
+class EvaluationSummary(BaseModel):
+    candidate_version: str
+    champion_version: str
+    passed: bool = False
+    improvement: float = 0.0
+    max_critical_regression: float = 0.0
+    candidate_metrics: EvaluationMetrics = Field(default_factory=EvaluationMetrics)
+    champion_metrics: EvaluationMetrics = Field(default_factory=EvaluationMetrics)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class TrainingRoomOutcome(BaseModel):
+    final_status: str
+    room_stage: str
+    shadow_mode: bool
+    kill_switch_enabled: bool
+    research_gate_passed: bool | None = None
+    risk_status: str | None = None
+    ticket_generated: bool = False
+    orders_submitted: int = 0
+    fills_observed: int = 0
+    settlement_seen: bool = False
+    settlement_pnl_dollars: Decimal | None = None
+
+    @field_validator("settlement_pnl_dollars", mode="before")
+    @classmethod
+    def validate_settlement_price(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return Decimal(str(value)).quantize(Decimal("0.0001"))
+
+
+class TrainingRoomBundle(BaseModel):
+    export_version: str = "room-bundle.v1"
+    exported_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    room: dict[str, Any]
+    messages: list[RoomMessageRead] = Field(default_factory=list)
+    signal: dict[str, Any] | None = None
+    research_dossier: dict[str, Any] | None = None
+    research_delta: dict[str, Any] | None = None
+    market_snapshot: dict[str, Any] | None = None
+    weather_bundle: dict[str, Any] | None = None
+    research_sources: list[dict[str, Any]] = Field(default_factory=list)
+    trade_ticket: dict[str, Any] | None = None
+    risk_verdict: dict[str, Any] | None = None
+    orders: list[dict[str, Any]] = Field(default_factory=list)
+    fills: list[dict[str, Any]] = Field(default_factory=list)
+    memory_note: dict[str, Any] | None = None
+    settlement: dict[str, Any] | None = None
+    outcome: TrainingRoomOutcome
+
+
+class RoleTrainingExample(BaseModel):
+    export_version: str = "role-sft.v1"
+    exported_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    room_id: str
+    market_ticker: str
+    role: str
+    task: str
+    messages: list[dict[str, str]] = Field(default_factory=list)
+    input_context: dict[str, Any]
+    target: dict[str, Any]
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class RoomMessageCreate(BaseModel):
     role: AgentRole
     kind: MessageKind
@@ -214,6 +354,21 @@ class RoomState(BaseModel):
 
 class TriggerRequest(BaseModel):
     reason: str = "manual"
+
+
+class ShadowRunRequest(BaseModel):
+    reason: str = "shadow_run"
+    name: str | None = None
+    prompt: str | None = None
+
+
+class SelfImprovePromoteRequest(BaseModel):
+    evaluation_run_id: str
+    reason: str = "auto_promote"
+
+
+class SelfImproveRollbackRequest(BaseModel):
+    reason: str = "manual_rollback"
 
 
 class TradeDecisionContext(BaseModel):

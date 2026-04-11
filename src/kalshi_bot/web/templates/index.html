@@ -12,6 +12,30 @@
 </section>
 
 <section class="panel">
+  <h2>Runtime Health</h2>
+  <p>Watchdog updated: <strong>{{ runtime_health.updated_at or "never" }}</strong></p>
+  <div class="room-list">
+    {% for color, health in runtime_health.colors.items() %}
+    <div class="room-card">
+      <strong>{{ color }}</strong>
+      <span>app {{ health.app.status }}{% if health.app.observed_at %} · {{ health.app.observed_at }}{% endif %}</span>
+      <span>daemon {{ "healthy" if health.daemon.healthy else "unhealthy" }} · age {{ health.daemon.heartbeat_age_seconds if health.daemon.heartbeat_age_seconds is not none else "n/a" }}s</span>
+      <span>combined {{ "healthy" if health.combined_healthy else "degraded" }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% if runtime_health.last_action %}
+  <p>Last action: {{ runtime_health.last_action.action }} · {{ runtime_health.last_action.outcome }} · {{ runtime_health.last_action.reason }}</p>
+  {% endif %}
+  {% if runtime_health.last_failover %}
+  <p>Last failover: {{ runtime_health.last_failover.from_color }} -> {{ runtime_health.last_failover.to_color }} · {{ runtime_health.last_failover.reason }}</p>
+  {% endif %}
+  {% if runtime_health.last_boot_recovery %}
+  <p>Last boot recovery: {{ runtime_health.last_boot_recovery.status }} · {{ runtime_health.last_boot_recovery.reason }}</p>
+  {% endif %}
+</section>
+
+<section class="panel">
   <h2>Create Room</h2>
   <form id="room-form">
     <label>Name <input type="text" name="name" required /></label>
@@ -19,6 +43,43 @@
     <label>Prompt <textarea name="prompt" rows="3"></textarea></label>
     <button type="submit">Create</button>
   </form>
+</section>
+
+<section class="panel">
+  <h2>Self Improve</h2>
+  <p>
+    Champion: <strong>{{ self_improve_status.agent_packs.champion_version or "n/a" }}</strong>
+    | Candidate: <strong>{{ self_improve_status.agent_packs.candidate_version or "none" }}</strong>
+    | Blue pack: <strong>{{ self_improve_status.agent_packs.blue_version or "n/a" }}</strong>
+    | Green pack: <strong>{{ self_improve_status.agent_packs.green_version or "n/a" }}</strong>
+  </p>
+  {% if self_improve_status.agent_packs.canary %}
+  <p>Canary: {{ self_improve_status.agent_packs.canary.status }} on {{ self_improve_status.agent_packs.canary.color }} for {{ self_improve_status.agent_packs.canary.version }}</p>
+  {% endif %}
+  {% if self_improve_status.agent_packs.live_monitor %}
+  <p>Live monitor: {{ self_improve_status.agent_packs.live_monitor.status }} for {{ self_improve_status.agent_packs.live_monitor.version }}</p>
+  {% endif %}
+  <div class="actions">
+    <button type="button" onclick="runCritique()">Run Critique</button>
+    {% if self_improve_status.recent_critiques and self_improve_status.recent_critiques[0].candidate_version %}
+    <button type="button" onclick="runEval('{{ self_improve_status.recent_critiques[0].candidate_version }}')">Eval Latest Candidate</button>
+    {% endif %}
+    {% if self_improve_status.recent_evaluations and self_improve_status.recent_evaluations[0].passed %}
+    <button type="button" onclick="promotePack('{{ self_improve_status.recent_evaluations[0].id }}')">Promote Passing Eval</button>
+    {% endif %}
+    <button type="button" onclick="rollbackPack()">Rollback Pack</button>
+  </div>
+  <div class="room-list">
+    {% for pack in self_improve_status.recent_packs %}
+    <div class="room-card">
+      <strong>{{ pack.version }}</strong>
+      <span>{{ pack.status }} · {{ pack.source }}</span>
+      <span>{{ pack.description }}</span>
+    </div>
+    {% else %}
+    <p>No agent packs recorded yet.</p>
+    {% endfor %}
+  </div>
 </section>
 
 <section class="panel">
@@ -43,7 +104,10 @@
     {% for market in configured_markets %}
     <div class="room-card">
       <strong>{{ market.label }}</strong>
-      <span>{{ market.market_ticker }} · {{ market.market_type }}</span>
+      <span>{{ market.market_ticker }} · {{ market.market_type }} · {{ market.status }}</span>
+      {% if market.series_ticker %}
+      <span>series {{ market.series_ticker }}</span>
+      {% endif %}
       {% if market.dossier %}
       <span>
         gate {{ "passed" if market.dossier.gate.passed else "blocked" }}
@@ -56,12 +120,19 @@
       </span>
       <span>{{ market.dossier.summary.source_coverage }}</span>
       <div class="actions">
+        <button type="button" onclick='runShadowRoom({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Run Shadow Room</button>
+        <button type="button" onclick='createRoomForMarket({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Create Room</button>
         <button type="button" onclick="refreshResearch('{{ market.market_ticker }}')">Refresh Research</button>
         <a href="/api/research/{{ market.market_ticker }}" target="_blank" rel="noreferrer">Open JSON</a>
       </div>
       {% else %}
       <span>No dossier yet.</span>
+      {% if market.notes %}
+      <span>{{ market.notes|join(" | ") }}</span>
+      {% endif %}
       <div class="actions">
+        <button type="button" onclick='runShadowRoom({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Run Shadow Room</button>
+        <button type="button" onclick='createRoomForMarket({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Create Room</button>
         <button type="button" onclick="refreshResearch('{{ market.market_ticker }}')">Create Dossier</button>
       </div>
       {% endif %}
@@ -128,6 +199,58 @@
 
   async function refreshResearch(marketTicker) {
     await fetch(`/api/research/${marketTicker}/refresh`, { method: "POST" });
+    window.location.reload();
+  }
+
+  async function createRoomForMarket(marketTicker, label) {
+    const response = await fetch("/api/rooms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: `room ${label}`,
+        market_ticker: marketTicker,
+        prompt: `Operator-created room for ${marketTicker}.`,
+      }),
+    });
+    const data = await response.json();
+    window.location.href = data.redirect;
+  }
+
+  async function runShadowRoom(marketTicker, label) {
+    const response = await fetch(`/api/markets/${encodeURIComponent(marketTicker)}/shadow-run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: `shadow ${label}`,
+        prompt: `Shadow room launched from control room for ${marketTicker}.`,
+        reason: "ui_shadow_run",
+      }),
+    });
+    const data = await response.json();
+    window.location.href = data.redirect;
+  }
+
+  async function runCritique() {
+    await fetch("/api/self-improve/critique", { method: "POST" });
+    window.location.reload();
+  }
+
+  async function runEval(candidateVersion) {
+    await fetch(`/api/self-improve/eval/${encodeURIComponent(candidateVersion)}`, { method: "POST" });
+    window.location.reload();
+  }
+
+  async function promotePack(evaluationRunId) {
+    await fetch("/api/self-improve/promote", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ evaluation_run_id: evaluationRunId, reason: "ui_promote" }),
+    });
+    window.location.reload();
+  }
+
+  async function rollbackPack() {
+    await fetch("/api/self-improve/rollback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason: "ui_rollback" }) });
     window.location.reload();
   }
 </script>

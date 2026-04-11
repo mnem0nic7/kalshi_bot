@@ -1,0 +1,114 @@
+name: Compose Shadow Smoke
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose-shadow-smoke:
+    name: Docker Compose Shadow Deploy Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate secrets
+        run: |
+          set -euo pipefail
+          test -n "${POSTGRES_PASSWORD}" || { echo "Missing secret POSTGRES_PASSWORD"; exit 1; }
+
+      - name: Write temporary env and key files
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/github-secrets
+          cat > .tmp/github-secrets/dummy.pem <<'EOF'
+          -----BEGIN PRIVATE KEY-----
+          ZHVtbXkta2V5LW5vdC11c2VkLWluLWNoZWNr
+          -----END PRIVATE KEY-----
+          EOF
+          chmod 600 .tmp/github-secrets/dummy.pem
+
+          cat > .env <<EOF
+          APP_ENV=ci
+          APP_HOST=0.0.0.0
+          APP_PORT=8000
+          APP_COLOR=blue
+          APP_SHADOW_MODE=true
+          APP_AUTO_INIT_DB=false
+          APP_ENABLE_KILL_SWITCH=true
+          POSTGRES_HOST=localhost
+          POSTGRES_PORT=5432
+          POSTGRES_DB=kalshi_bot
+          POSTGRES_USER=postgres
+          POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+          KALSHI_ENV=demo
+          LIVE_KALSHI_KEY_PATH_HOST=.tmp/github-secrets/dummy.pem
+          LIVE_KALSHI_KEY_PATH_CONTAINER=/run/secrets/kalshi-live.pem
+          DEMO_KALSHI_KEY_PATH_HOST=.tmp/github-secrets/dummy.pem
+          DEMO_KALSHI_KEY_PATH_CONTAINER=/run/secrets/kalshi-demo.pem
+          LLM_LOCAL_API_KEY=dummy
+          WEATHER_USER_AGENT=kalshi-bot-ci/0.1 (ops@example.com)
+          EOF
+
+      - name: Render Compose config
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker-compose.yml config >/tmp/kalshi-compose.rendered.yaml
+
+      - name: Start Postgres
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker-compose.yml up -d postgres
+
+      - name: Run migrations
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
+
+      - name: Start web stack
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker-compose.yml up -d --build app_blue app_green nginx
+
+      - name: Check health endpoints
+        run: |
+          set -euo pipefail
+          curl -fsS http://127.0.0.1:8080/healthz
+          curl -fsS http://127.0.0.1:8080/readyz
+          curl -fsS http://127.0.0.1:8080/api/status | tee /tmp/compose-shadow-status.json
+
+      - name: Write summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Compose Shadow Smoke"
+            echo
+            if [ -f /tmp/compose-shadow-status.json ]; then
+              echo "```json"
+              cat /tmp/compose-shadow-status.json
+              echo
+              echo "```"
+            else
+              echo "No status payload was captured before the workflow exited."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          docker compose -f infra/docker-compose.yml ps
+          docker compose -f infra/docker-compose.yml logs --tail=200 postgres app_blue app_green nginx
+
+      - name: Tear down stack
+        if: always()
+        run: |
+          docker compose -f infra/docker-compose.yml down -v --remove-orphans
+          rm -f .env .tmp/github-secrets/dummy.pem

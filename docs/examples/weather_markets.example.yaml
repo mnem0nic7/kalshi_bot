@@ -1,20 +1,31 @@
-markets:
-  - market_ticker: WEATHER-NYC-HIGH-80F
-    station_id: KNYC
+series_templates:
+  - series_ticker: KXHIGHNY
+    display_name: NYC Daily High Temperature
     location_name: New York City
+    station_id: KNYC
     latitude: 40.7146
     longitude: -74.0071
-    threshold_f: 80
-    operator: ">="
-    metric: daily_high_f
-    settlement_source: NWS station observation
-  - market_ticker: WEATHER-ORD-HIGH-90F
-    station_id: KORD
-    location_name: Chicago O'Hare
-    latitude: 41.995
-    longitude: -87.9336
-    threshold_f: 90
-    operator: ">="
-    metric: daily_high_f
-    settlement_source: NWS station observation
-
+    settlement_source: NWS Climatological Report (Daily) for Central Park, New York
+    research_queries:
+      - NYC high temperature forecast today site:weather.gov
+      - Central Park New York daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHCHI
+    display_name: Chicago Daily High Temperature
+    location_name: Chicago
+    station_id: KMDW
+    latitude: 41.7868
+    longitude: -87.7522
+    settlement_source: NWS Climatological Report (Daily) for Chicago Midway, IL
+    research_queries:
+      - Chicago Midway daily high temperature forecast site:weather.gov
+      - Chicago high temperature forecast today site:weather.gov
+  - series_ticker: KXHIGHMIA
+    display_name: Miami Daily High Temperature
+    location_name: Miami
+    station_id: KMIA
+    latitude: 25.7959
+    longitude: -80.2870
+    settlement_source: NWS Climatological Report (Daily) for Miami International Airport
+    research_queries:
+      - Miami International Airport daily high temperature forecast site:weather.gov
+      - Miami high temperature forecast today site:weather.gov

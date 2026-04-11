@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, TypeVar
 
@@ -12,12 +13,19 @@ from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ValidationError
 
-from kalshi_bot.core.schemas import RoomCreate, TriggerRequest
+from kalshi_bot.core.schemas import (
+    RoomCreate,
+    ShadowRunRequest,
+    SelfImprovePromoteRequest,
+    SelfImproveRollbackRequest,
+    TriggerRequest,
+)
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.container import AppContainer
 
 templates = Jinja2Templates(directory="src/kalshi_bot/web/templates")
 ModelT = TypeVar("ModelT", bound=BaseModel)
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -82,12 +90,15 @@ def create_app() -> FastAPI:
                 {"market_ticker": room.market_ticker, "stage": room.stage}
                 for room in await repo.list_rooms(limit=10)
             ]
+            runtime_health = await app_container.watchdog_service.get_status(repo)
             await session.commit()
         return JSONResponse(
             {
                 "active_color": control.active_color,
                 "kill_switch_enabled": control.kill_switch_enabled,
                 "execution_lock_holder": control.execution_lock_holder,
+                "self_improve": dict(control.notes.get("agent_packs") or {}),
+                "runtime_health": runtime_health,
                 "rooms": dossiers,
                 "positions": [
                     {
@@ -135,6 +146,40 @@ def create_app() -> FastAPI:
         )
         return JSONResponse({"status": "scheduled", "market_ticker": market_ticker})
 
+    @app.get("/api/self-improve/status")
+    async def self_improve_status(request: Request) -> JSONResponse:
+        app_container = container(request)
+        return JSONResponse(await app_container.self_improve_service.get_status())
+
+    @app.post("/api/self-improve/critique")
+    async def self_improve_critique(request: Request) -> JSONResponse:
+        app_container = container(request)
+        result = await app_container.self_improve_service.critique_recent_rooms()
+        return JSONResponse(result.payload)
+
+    @app.post("/api/self-improve/eval/{candidate_version}")
+    async def self_improve_eval(candidate_version: str, request: Request) -> JSONResponse:
+        app_container = container(request)
+        result = await app_container.self_improve_service.evaluate_candidate(candidate_version=candidate_version)
+        return JSONResponse(result.payload)
+
+    @app.post("/api/self-improve/promote")
+    async def self_improve_promote(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, SelfImprovePromoteRequest)
+        result = await app_container.self_improve_service.promote_candidate(
+            evaluation_run_id=payload.evaluation_run_id,
+            reason=payload.reason,
+        )
+        return JSONResponse(result.payload)
+
+    @app.post("/api/self-improve/rollback")
+    async def self_improve_rollback(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, SelfImproveRollbackRequest, default_on_empty=True)
+        result = await app_container.self_improve_service.rollback(reason=payload.reason)
+        return JSONResponse(result.payload)
+
     @app.get("/metrics")
     async def metrics() -> PlainTextResponse:
         return PlainTextResponse(generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
@@ -149,27 +194,57 @@ def create_app() -> FastAPI:
             positions = await repo.list_positions(limit=8)
             ops_events = await repo.list_ops_events(limit=8)
             dossier_records = await repo.list_research_dossiers(limit=100)
+            runtime_health = await app_container.watchdog_service.get_status(repo)
             await session.commit()
+        self_improve_status_payload = await app_container.self_improve_service.get_status()
         dossiers_by_market = {record.market_ticker: record.payload for record in dossier_records}
         configured_markets = []
+        try:
+            discoveries = await app_container.discovery_service.discover_configured_markets()
+        except Exception:
+            logger.exception("Failed to load live market discovery for index page")
+            discoveries = []
+        seen_markets: set[str] = set()
+        for discovery in discoveries:
+            configured_markets.append(
+                {
+                    "market_ticker": discovery.mapping.market_ticker,
+                    "label": discovery.mapping.label,
+                    "market_type": discovery.mapping.market_type,
+                    "status": discovery.status,
+                    "can_trade": discovery.can_trade,
+                    "notes": discovery.notes,
+                    "series_ticker": discovery.mapping.series_ticker,
+                    "dossier": dossiers_by_market.get(discovery.mapping.market_ticker),
+                }
+            )
+            seen_markets.add(discovery.mapping.market_ticker)
         for mapping in app_container.weather_directory.all():
+            if mapping.market_ticker in seen_markets:
+                continue
             configured_markets.append(
                 {
                     "market_ticker": mapping.market_ticker,
                     "label": mapping.label,
                     "market_type": mapping.market_type,
+                    "status": "configured",
+                    "can_trade": False,
+                    "notes": ["No live market snapshot loaded yet."],
+                    "series_ticker": mapping.series_ticker,
                     "dossier": dossiers_by_market.get(mapping.market_ticker),
                 }
             )
         return templates.TemplateResponse(
+            request,
             "index.html",
             {
-                "request": request,
                 "rooms": rooms,
                 "control": control,
                 "positions": positions,
                 "ops_events": ops_events,
                 "configured_markets": configured_markets,
+                "self_improve_status": self_improve_status_payload,
+                "runtime_health": runtime_health,
                 "settings": app_container.settings,
             },
         )
@@ -181,11 +256,14 @@ def create_app() -> FastAPI:
         async with app_container.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.ensure_deployment_control(app_container.settings.app_color)
+            pack = await app_container.agent_pack_service.get_pack_for_color(repo, app_container.settings.app_color)
             room = await repo.create_room(
                 payload,
-                active_color=control.active_color,
+                active_color=app_container.settings.app_color,
                 shadow_mode=app_container.settings.app_shadow_mode,
                 kill_switch_enabled=control.kill_switch_enabled,
+                kalshi_env=app_container.settings.kalshi_env,
+                agent_pack_version=pack.version,
             )
             await session.commit()
         return JSONResponse({"id": room.id, "redirect": f"/rooms/{room.id}"})
@@ -196,6 +274,25 @@ def create_app() -> FastAPI:
         app_container = container(request)
         asyncio.create_task(app_container.supervisor.run_room(room_id, reason=payload.reason))
         return JSONResponse({"status": "scheduled", "room_id": room_id})
+
+    @app.post("/api/markets/{market_ticker}/shadow-run")
+    async def shadow_run_market_endpoint(market_ticker: str, request: Request) -> JSONResponse:
+        payload = await parse_json_model(request, ShadowRunRequest, default_on_empty=True)
+        app_container = container(request)
+        result = await app_container.shadow_training_service.create_shadow_room(
+            market_ticker,
+            name=payload.name,
+            prompt=payload.prompt,
+        )
+        asyncio.create_task(app_container.supervisor.run_room(result.room_id, reason=payload.reason))
+        return JSONResponse(
+            {
+                "status": "scheduled",
+                "room_id": result.room_id,
+                "market_ticker": market_ticker,
+                "redirect": f"/rooms/{result.room_id}",
+            }
+        )
 
     @app.get("/rooms/{room_id}", response_class=HTMLResponse)
     async def room_detail(room_id: str, request: Request) -> HTMLResponse:
@@ -213,9 +310,9 @@ def create_app() -> FastAPI:
             research_runs = await repo.list_research_runs(market_ticker=room.market_ticker, limit=5)
             await session.commit()
         return templates.TemplateResponse(
+            request,
             "room.html",
             {
-                "request": request,
                 "room": room,
                 "messages": messages,
                 "research_dossier": (dossier_artifact.payload if dossier_artifact is not None else latest_dossier.payload if latest_dossier is not None else None),

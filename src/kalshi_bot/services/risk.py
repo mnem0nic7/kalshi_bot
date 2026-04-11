@@ -9,6 +9,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import RiskStatus
 from kalshi_bot.core.schemas import RiskVerdictPayload, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
+from kalshi_bot.services.agent_packs import RuntimeThresholds
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
 
 
@@ -39,18 +40,26 @@ class DeterministicRiskEngine:
         ticket: TradeTicket,
         signal: StrategySignal,
         context: RiskContext,
+        thresholds: RuntimeThresholds | None = None,
     ) -> RiskVerdictPayload:
         reasons: list[str] = []
         now = datetime.now(UTC)
         market_observed_at = self._as_utc(context.market_observed_at)
         research_observed_at = self._as_utc(context.research_observed_at)
+        active_thresholds = thresholds or RuntimeThresholds(
+            risk_min_edge_bps=self.settings.risk_min_edge_bps,
+            risk_max_order_notional_dollars=self.settings.risk_max_order_notional_dollars,
+            risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
+            trigger_max_spread_bps=self.settings.trigger_max_spread_bps,
+            trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
+        )
 
         if control.kill_switch_enabled:
             reasons.append("Global kill switch is enabled.")
         if signal.recommended_action is None or signal.recommended_side is None:
             reasons.append("Signal engine did not recommend a live trade.")
-        if signal.edge_bps < self.settings.risk_min_edge_bps:
-            reasons.append(f"Edge {signal.edge_bps}bps is below configured minimum of {self.settings.risk_min_edge_bps}bps.")
+        if signal.edge_bps < active_thresholds.risk_min_edge_bps:
+            reasons.append(f"Edge {signal.edge_bps}bps is below configured minimum of {active_thresholds.risk_min_edge_bps}bps.")
 
         if market_observed_at is None or (now - market_observed_at).total_seconds() > self.settings.risk_stale_market_seconds:
             reasons.append("Kalshi market data is stale.")
@@ -61,9 +70,9 @@ class DeterministicRiskEngine:
             reasons.append("Ticket size exceeds max order count.")
 
         order_notional = estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, ticket.count_fp)
-        if float(order_notional) > self.settings.risk_max_order_notional_dollars:
+        if float(order_notional) > active_thresholds.risk_max_order_notional_dollars:
             reasons.append("Ticket notional exceeds max order notional.")
-        if float(context.current_position_notional_dollars + order_notional) > self.settings.risk_max_position_notional_dollars:
+        if float(context.current_position_notional_dollars + order_notional) > active_thresholds.risk_max_position_notional_dollars:
             reasons.append("Projected position exceeds max position notional.")
 
         if room.shadow_mode:

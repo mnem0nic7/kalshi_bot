@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from pydantic import BaseModel
 
 from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.config import Settings
@@ -28,9 +29,11 @@ from kalshi_bot.core.schemas import (
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
+from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
 
 try:
     from duckduckgo_search import DDGS
@@ -98,6 +101,16 @@ def _to_iso(value: datetime | None) -> str | None:
     return value.astimezone(UTC).isoformat() if value is not None else None
 
 
+class WebSynthesisPayload(BaseModel):
+    narrative: str
+    bullish_case: str
+    bearish_case: str
+    unresolved_uncertainties: list[str]
+    fair_yes_dollars: Decimal | None = None
+    confidence: float
+    thesis: str
+
+
 class ResearchCoordinator:
     def __init__(
         self,
@@ -108,6 +121,7 @@ class ResearchCoordinator:
         weather_directory: WeatherMarketDirectory,
         providers: ProviderRouter,
         signal_engine: WeatherSignalEngine,
+        agent_pack_service: AgentPackService,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -116,6 +130,7 @@ class ResearchCoordinator:
         self.weather_directory = weather_directory
         self.providers = providers
         self.signal_engine = signal_engine
+        self.agent_pack_service = agent_pack_service
         self._inflight_markets: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
 
@@ -176,9 +191,11 @@ class ResearchCoordinator:
             await session.commit()
 
             try:
-                mapping = self.weather_directory.get(market_ticker)
+                pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
+                thresholds = self.agent_pack_service.runtime_thresholds(pack)
                 market_response = await self.kalshi.get_market(market_ticker)
                 market = _coerce_market(market_response)
+                mapping = self.weather_directory.resolve_market(market_ticker, market)
                 await repo.log_exchange_event("research", "market_snapshot", market_response, market_ticker=market_ticker)
 
                 weather_bundle: dict[str, Any] | None = None
@@ -186,7 +203,12 @@ class ResearchCoordinator:
                 if mapping is not None and mapping.supports_structured_weather:
                     weather_bundle = await self.weather.build_market_snapshot(mapping)
                     await repo.log_weather_event(mapping.station_id, "research_weather_bundle", weather_bundle)
-                    weather_signal = self.signal_engine.evaluate(mapping, market_response, weather_bundle)
+                    weather_signal = self.signal_engine.evaluate(
+                        mapping,
+                        market_response,
+                        weather_bundle,
+                        min_edge_bps=thresholds.risk_min_edge_bps,
+                    )
 
                 sources = self._kalshi_sources(mapping, market_ticker, market)
                 claims = self._kalshi_claims(mapping, market_ticker, market, sources[0].source_key)
@@ -199,13 +221,14 @@ class ResearchCoordinator:
                 use_web = mapping is None or not mapping.supports_structured_weather
                 web_payload: dict[str, Any] | None = None
                 if use_web:
-                    web_sources = await self._web_sources(mapping, market)
+                    web_sources = await self._web_sources(mapping, market, pack=pack)
                     sources.extend(web_sources)
                     claims.extend(self._web_claims(web_sources))
                     web_payload = await self._web_synthesis_payload(
                         mapping=mapping,
                         market=market,
                         sources=web_sources,
+                        pack=pack,
                     )
 
                 dossier = self._build_dossier(
@@ -249,6 +272,7 @@ class ResearchCoordinator:
                         "fair_yes_dollars": str(dossier.trader_context.fair_yes_dollars)
                         if dossier.trader_context.fair_yes_dollars is not None
                         else None,
+                        "agent_pack_version": pack.version,
                     },
                 )
                 await session.commit()
@@ -265,7 +289,7 @@ class ResearchCoordinator:
                 raise
 
     async def handle_market_update(self, market_ticker: str) -> None:
-        if self.weather_directory.get(market_ticker) is None:
+        if not self.weather_directory.supports_market_ticker(market_ticker):
             return
         if market_ticker in self._inflight_markets:
             return
@@ -325,14 +349,14 @@ class ResearchCoordinator:
                 changed_fields.append(key)
                 updates[key] = value
         if weather_bundle is not None:
-            forecast_high = weather_bundle.get("forecast", {}).get("properties", {}).get("periods", [{}])[0].get("temperature")
-            current_temp = weather_bundle.get("observation", {}).get("properties", {}).get("temperature", {}).get("value")
+            forecast_high = extract_forecast_high_f(weather_bundle.get("forecast", {}))
+            current_temp = extract_current_temp_f(weather_bundle.get("observation", {}))
             if forecast_high is not None and dossier.summary.current_numeric_facts.get("forecast_high_f") != forecast_high:
                 changed_fields.append("forecast_high_f")
                 updates["forecast_high_f"] = forecast_high
-            if current_temp is not None and dossier.summary.current_numeric_facts.get("current_temp_c") != current_temp:
-                changed_fields.append("current_temp_c")
-                updates["current_temp_c"] = current_temp
+            if current_temp is not None and dossier.summary.current_numeric_facts.get("current_temp_f") != current_temp:
+                changed_fields.append("current_temp_f")
+                updates["current_temp_f"] = current_temp
         summary = (
             "No material changes since the shared dossier refresh."
             if not changed_fields
@@ -340,13 +364,20 @@ class ResearchCoordinator:
         )
         return ResearchDelta(summary=summary, changed_fields=changed_fields, numeric_fact_updates=updates)
 
-    def build_signal_from_dossier(self, dossier: ResearchDossier, market_response: dict[str, Any]) -> StrategySignal:
+    def build_signal_from_dossier(
+        self,
+        dossier: ResearchDossier,
+        market_response: dict[str, Any],
+        *,
+        min_edge_bps: int | None = None,
+    ) -> StrategySignal:
         market = _coerce_market(market_response)
         fair_yes = dossier.trader_context.fair_yes_dollars or Decimal("0.5000")
         ask_yes = quantize_price(market.get("yes_ask_dollars")) if market.get("yes_ask_dollars") is not None else None
         bid_yes = quantize_price(market.get("yes_bid_dollars")) if market.get("yes_bid_dollars") is not None else None
         ask_no = quantize_price(market.get("no_ask_dollars")) if market.get("no_ask_dollars") is not None else None
-        min_edge = Decimal(self.settings.risk_min_edge_bps) / Decimal("10000")
+        effective_min_edge_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
+        min_edge = Decimal(effective_min_edge_bps) / Decimal("10000")
 
         recommendation_action = None
         recommendation_side = None
@@ -615,12 +646,13 @@ class ResearchCoordinator:
         ]
         return [source], claims
 
-    async def _web_sources(self, mapping: WeatherMarketMapping | None, market: dict[str, Any]) -> list[ResearchSourceCard]:
+    async def _web_sources(self, mapping: WeatherMarketMapping | None, market: dict[str, Any], *, pack) -> list[ResearchSourceCard]:
         queries = self._web_queries(mapping, market)
         urls = list(mapping.research_urls) if mapping is not None else []
         sources: list[ResearchSourceCard] = []
+        max_results = pack.research.web_max_results or self.settings.research_web_max_results
         if urls:
-            for url in urls[: self.settings.research_web_max_results]:
+            for url in urls[: max_results]:
                 publisher = _publisher_from_url(url)
                 sources.append(
                     ResearchSourceCard(
@@ -635,7 +667,8 @@ class ResearchCoordinator:
                 )
         if DDGS is None:
             return sources
-        results = await asyncio.to_thread(self._search_web, queries)
+        max_queries = pack.research.web_max_queries or self.settings.research_web_max_queries
+        results = await asyncio.to_thread(self._search_web, queries, max_queries=max_queries, max_results=max_results)
         for result in results:
             url = result.get("href") or result.get("url")
             title = str(result.get("title") or "Web research result")
@@ -654,16 +687,16 @@ class ResearchCoordinator:
                     snippet=snippet[:800],
                 )
             )
-        return self._dedupe_sources(sources)[: self.settings.research_web_max_results]
+        return self._dedupe_sources(sources)[: max_results]
 
-    def _search_web(self, queries: list[str]) -> list[dict[str, Any]]:
+    def _search_web(self, queries: list[str], *, max_queries: int, max_results: int) -> list[dict[str, Any]]:
         if DDGS is None:
             return []
         results: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
         with DDGS() as ddgs:
-            for query in queries[: self.settings.research_web_max_queries]:
-                for item in ddgs.text(query, max_results=self.settings.research_web_max_results):
+            for query in queries[: max_queries]:
+                for item in ddgs.text(query, max_results=max_results):
                     url = item.get("href") or item.get("url")
                     if not url or url in seen_urls:
                         continue
@@ -677,6 +710,7 @@ class ResearchCoordinator:
         mapping: WeatherMarketMapping | None,
         market: dict[str, Any],
         sources: list[ResearchSourceCard],
+        pack,
     ) -> dict[str, Any]:
         market_title = str(market.get("title") or market.get("ticker"))
         fallback = {
@@ -703,15 +737,14 @@ class ResearchCoordinator:
             },
             indent=2,
         )
+        role_config = pack.roles.get(AgentRole.RESEARCHER.value)
         return await self.providers.maybe_complete_json(
             role=AgentRole.RESEARCHER,
             fallback_payload=fallback,
-            system_prompt=(
-                "You are the research synthesis agent for a Kalshi trading system. "
-                "Return JSON only. Estimate fair_yes_dollars only if the cited sources support a reasoned probability view. "
-                "Do not fabricate citations. Keep unresolved_uncertainties concise."
-            ),
+            system_prompt=pack.research.synthesis_system_prompt,
             user_prompt=user_prompt,
+            role_config=role_config,
+            schema_model=WebSynthesisPayload,
         )
 
     def _web_claims(self, sources: Sequence[ResearchSourceCard]) -> list[ResearchClaim]:

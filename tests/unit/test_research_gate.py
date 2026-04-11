@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import ResearchFreshness, ResearchSourceCard, ResearchSummary, ResearchTraderContext
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -18,6 +19,7 @@ def make_coordinator() -> ResearchCoordinator:
         WeatherMarketDirectory({}),
         None,
         WeatherSignalEngine(Settings(database_url="sqlite+aiosqlite:///./test.db")),
+        AgentPackService(Settings(database_url="sqlite+aiosqlite:///./test.db")),
     )
 
 
