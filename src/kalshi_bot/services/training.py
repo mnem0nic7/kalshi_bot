@@ -41,6 +41,8 @@ class TrainingExportService:
             market_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="market_snapshot")
             weather_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="weather_bundle")
             research_sources = await repo.list_artifacts(room_id=room_id, artifact_type="research_source", limit=100)
+            campaign = await repo.get_room_campaign(room_id)
+            research_health = await repo.get_room_research_health(room_id)
             settlement = await self._latest_settlement_for_market(repo, room.market_ticker)
             await session.commit()
 
@@ -57,6 +59,8 @@ class TrainingExportService:
 
         return TrainingRoomBundle(
             room=self._room_dict(room),
+            campaign=(self._campaign_dict(campaign) if campaign is not None else None),
+            research_health=(self._research_health_dict(research_health) if research_health is not None else None),
             messages=messages,
             signal=self._signal_dict(signal) if signal is not None else None,
             research_dossier=dossier_artifact.payload if dossier_artifact is not None else None,
@@ -460,4 +464,42 @@ class TrainingExportService:
             "tags": note.tags,
             "linked_message_ids": note.linked_message_ids,
             "created_at": note.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def _campaign_dict(campaign: Any) -> dict[str, Any]:
+        return {
+            "id": campaign.id,
+            "room_id": campaign.room_id,
+            "campaign_id": campaign.campaign_id,
+            "trigger_source": campaign.trigger_source,
+            "city_bucket": campaign.city_bucket,
+            "market_regime_bucket": campaign.market_regime_bucket,
+            "difficulty_bucket": campaign.difficulty_bucket,
+            "outcome_bucket": campaign.outcome_bucket,
+            "dossier_artifact_id": campaign.dossier_artifact_id,
+            "payload": campaign.payload,
+            "created_at": campaign.created_at.isoformat(),
+            "updated_at": campaign.updated_at.isoformat(),
+        }
+
+    @staticmethod
+    def _research_health_dict(record: Any) -> dict[str, Any]:
+        return {
+            "room_id": record.room_id,
+            "market_ticker": record.market_ticker,
+            "dossier_status": record.dossier_status,
+            "gate_passed": record.gate_passed,
+            "valid_dossier": record.valid_dossier,
+            "good_for_training": record.good_for_training,
+            "quality_score": record.quality_score,
+            "citation_coverage_score": record.citation_coverage_score,
+            "settlement_clarity_score": record.settlement_clarity_score,
+            "freshness_score": record.freshness_score,
+            "contradiction_count": record.contradiction_count,
+            "structured_completeness_score": record.structured_completeness_score,
+            "fair_value_score": record.fair_value_score,
+            "dossier_artifact_id": record.dossier_artifact_id,
+            "payload": record.payload,
+            "updated_at": record.updated_at.isoformat(),
         }

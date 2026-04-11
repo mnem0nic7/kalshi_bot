@@ -101,6 +101,18 @@ class Settings(BaseSettings):
     self_improve_live_monitor_seconds: int = 86400
     self_improve_research_gate_failure_threshold: float = 0.6
     self_improve_blocked_order_threshold: float = 0.8
+    training_window_days: int = 30
+    training_status_room_limit: int = 500
+    training_min_complete_rooms: int = 25
+    training_min_market_diversity: int = 4
+    training_min_settled_rooms: int = 10
+    training_min_trade_positive_rooms: int = 8
+    training_good_research_threshold: float = 0.7
+    training_campaign_enabled: bool = False
+    training_campaign_rooms_per_run: int = 1
+    training_campaign_lookback_hours: int = 24
+    training_campaign_cooldown_seconds: int = 1800
+    training_campaign_max_recent_per_market: int = 3
 
     def model_post_init(self, __context: object) -> None:
         if self.database_url:

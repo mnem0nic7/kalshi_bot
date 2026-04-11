@@ -36,6 +36,54 @@
 </section>
 
 <section class="panel">
+  <h2>Training And Research</h2>
+  <p>
+    Complete rooms: <strong>{{ training_status.room_count }}</strong>
+    | Trainable rooms: <strong>{{ training_status.trainable_room_count }}</strong>
+    | Holdout rooms: <strong>{{ training_status.evaluation_holdout_room_count }}</strong>
+  </p>
+  <p>
+    Research gate pass rate: <strong>{{ "%.2f"|format(training_status.research_gate_pass_rate) }}</strong>
+    | Freshness pass rate: <strong>{{ "%.2f"|format(training_status.dossier_freshness_pass_rate) }}</strong>
+    | Settled coverage: <strong>{{ "%.2f"|format(training_status.settled_label_coverage) }}</strong>
+  </p>
+  <p>
+    Ready for SFT: <strong>{{ training_status.readiness.ready_for_sft_export }}</strong>
+    | Critique: <strong>{{ training_status.readiness.ready_for_critique }}</strong>
+    | Eval: <strong>{{ training_status.readiness.ready_for_evaluation }}</strong>
+    | Promote: <strong>{{ training_status.readiness.ready_for_promotion }}</strong>
+  </p>
+  <div class="actions">
+    <button type="button" onclick="runShadowCampaign()">Run Shadow Campaign</button>
+    <button type="button" onclick="buildTrainingDataset('room-bundles')">Build Room Bundles</button>
+    <button type="button" onclick="buildTrainingDataset('role-sft')">Build Role SFT</button>
+    <button type="button" onclick="buildTrainingDataset('evaluation-holdout')">Build Eval Holdout</button>
+  </div>
+  {% if training_status.top_missing_data %}
+  <p>Top missing data: {{ training_status.top_missing_data|join(" | ") }}</p>
+  {% endif %}
+  <div class="room-list">
+    {% for market_ticker, count in training_status.complete_rooms_per_market.items() %}
+    <div class="room-card">
+      <strong>{{ market_ticker }}</strong>
+      <span>{{ count }} complete rooms</span>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="room-list">
+    {% for build in training_status.recent_dataset_builds %}
+    <div class="room-card">
+      <strong>{{ build.build_version }}</strong>
+      <span>{{ build.mode }} · {{ build.status }}</span>
+      <span>{{ build.room_count }} rooms</span>
+    </div>
+    {% else %}
+    <p>No dataset builds recorded yet.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
   <h2>Create Room</h2>
   <form id="room-form">
     <label>Name <input type="text" name="name" required /></label>
@@ -43,6 +91,21 @@
     <label>Prompt <textarea name="prompt" rows="3"></textarea></label>
     <button type="submit">Create</button>
   </form>
+</section>
+
+<section class="panel">
+  <h2>Research Audit</h2>
+  <div class="room-list">
+    {% for issue in research_audit %}
+    <div class="room-card">
+      <strong>{{ issue.market_ticker }}</strong>
+      <span>{{ issue.severity }} · {{ issue.code }}</span>
+      <span>{{ issue.summary }}</span>
+    </div>
+    {% else %}
+    <p>No research audit issues detected.</p>
+    {% endfor %}
+  </div>
 </section>
 
 <section class="panel">
@@ -228,6 +291,24 @@
     });
     const data = await response.json();
     window.location.href = data.redirect;
+  }
+
+  async function runShadowCampaign() {
+    await fetch("/api/shadow-campaign/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 3, reason: "ui_shadow_campaign" }),
+    });
+    window.location.reload();
+  }
+
+  async function buildTrainingDataset(mode) {
+    await fetch("/api/training/build", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode, limit: 100, days: 30, good_research_only: true }),
+    });
+    window.location.reload();
   }
 
   async function runCritique() {

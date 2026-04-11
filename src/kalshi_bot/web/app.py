@@ -15,9 +15,11 @@ from pydantic import BaseModel, ValidationError
 
 from kalshi_bot.core.schemas import (
     RoomCreate,
+    ShadowCampaignRequest,
     ShadowRunRequest,
     SelfImprovePromoteRequest,
     SelfImproveRollbackRequest,
+    TrainingBuildRequest,
     TriggerRequest,
 )
 from kalshi_bot.db.repositories import PlatformRepository
@@ -92,12 +94,14 @@ def create_app() -> FastAPI:
             ]
             runtime_health = await app_container.watchdog_service.get_status(repo)
             await session.commit()
+        training_status_payload = await app_container.training_corpus_service.get_status(persist_readiness=False)
         return JSONResponse(
             {
                 "active_color": control.active_color,
                 "kill_switch_enabled": control.kill_switch_enabled,
                 "execution_lock_holder": control.execution_lock_holder,
                 "self_improve": dict(control.notes.get("agent_packs") or {}),
+                "training": training_status_payload,
                 "runtime_health": runtime_health,
                 "rooms": dossiers,
                 "positions": [
@@ -151,6 +155,55 @@ def create_app() -> FastAPI:
         app_container = container(request)
         return JSONResponse(await app_container.self_improve_service.get_status())
 
+    @app.get("/api/training/status")
+    async def training_status(request: Request) -> JSONResponse:
+        app_container = container(request)
+        return JSONResponse(await app_container.training_corpus_service.get_status(persist_readiness=True))
+
+    @app.post("/api/training/build")
+    async def training_build(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, TrainingBuildRequest, default_on_empty=True)
+        return JSONResponse(await app_container.training_corpus_service.build_dataset(payload))
+
+    @app.get("/api/training/builds")
+    async def training_builds(request: Request) -> JSONResponse:
+        app_container = container(request)
+        builds = await app_container.training_corpus_service.list_builds(limit=10)
+        return JSONResponse({"builds": [build.model_dump(mode="json") for build in builds]})
+
+    @app.get("/api/research-audit")
+    async def research_audit_alias(request: Request) -> JSONResponse:
+        app_container = container(request)
+        issues = await app_container.training_corpus_service.research_audit(limit=50)
+        return JSONResponse({"issues": [issue.model_dump(mode="json") for issue in issues]})
+
+    @app.get("/api/research/audit")
+    async def research_audit(request: Request) -> JSONResponse:
+        app_container = container(request)
+        issues = await app_container.training_corpus_service.research_audit(limit=50)
+        return JSONResponse({"issues": [issue.model_dump(mode="json") for issue in issues]})
+
+    @app.post("/api/shadow-campaign/run")
+    async def shadow_campaign_run(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, ShadowCampaignRequest, default_on_empty=True)
+        results = await app_container.shadow_campaign_service.run(payload)
+        return JSONResponse(
+            {
+                "status": "completed",
+                "count": len(results),
+                "rooms": [
+                    {
+                        "room_id": result.room_id,
+                        "market_ticker": result.market_ticker,
+                        "redirect": f"/rooms/{result.room_id}",
+                    }
+                    for result in results
+                ],
+            }
+        )
+
     @app.post("/api/self-improve/critique")
     async def self_improve_critique(request: Request) -> JSONResponse:
         app_container = container(request)
@@ -197,6 +250,8 @@ def create_app() -> FastAPI:
             runtime_health = await app_container.watchdog_service.get_status(repo)
             await session.commit()
         self_improve_status_payload = await app_container.self_improve_service.get_status()
+        training_status_payload = await app_container.training_corpus_service.get_status(persist_readiness=False)
+        research_audit_payload = await app_container.training_corpus_service.research_audit(limit=8)
         dossiers_by_market = {record.market_ticker: record.payload for record in dossier_records}
         configured_markets = []
         try:
@@ -244,6 +299,8 @@ def create_app() -> FastAPI:
                 "ops_events": ops_events,
                 "configured_markets": configured_markets,
                 "self_improve_status": self_improve_status_payload,
+                "training_status": training_status_payload,
+                "research_audit": [issue.model_dump(mode="json") for issue in research_audit_payload],
                 "runtime_health": runtime_health,
                 "settings": app_container.settings,
             },

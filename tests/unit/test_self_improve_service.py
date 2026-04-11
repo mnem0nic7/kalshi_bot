@@ -13,6 +13,7 @@ def test_self_improve_evaluation_summary_blocks_regressions_and_invalid_payloads
         None,
         None,
         None,
+        None,
         AgentPackService(settings),
         None,
     )
@@ -51,6 +52,7 @@ def test_self_improve_guardrail_failure_reason_detects_regression_spikes() -> No
         None,
         None,
         None,
+        None,
         AgentPackService(settings),
         None,
     )
@@ -71,6 +73,7 @@ def test_self_improve_evaluation_summary_passes_on_clean_improvement() -> None:
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
     service = SelfImproveService(  # type: ignore[arg-type]
         settings,
+        None,
         None,
         None,
         None,

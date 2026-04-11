@@ -20,6 +20,7 @@ from kalshi_bot.core.schemas import (
     RoomCreate,
     RoomMessageCreate,
     SelfImproveCritiqueItem,
+    TrainingReadiness,
     TradeTicket,
 )
 from kalshi_bot.db.models import (
@@ -45,8 +46,13 @@ from kalshi_bot.db.models import (
     RawWeatherEvent,
     RiskVerdictRecord,
     Room,
+    RoomCampaignRecord,
     RoomMessage,
+    RoomResearchHealthRecord,
     Signal,
+    TrainingDatasetBuildItemRecord,
+    TrainingDatasetBuildRecord,
+    TrainingReadinessRecord,
     TradeTicketRecord,
 )
 
@@ -153,6 +159,78 @@ class PlatformRepository:
         await self.session.flush()
         return record
 
+    async def save_room_campaign(
+        self,
+        *,
+        room_id: str,
+        campaign_id: str,
+        trigger_source: str,
+        city_bucket: str | None = None,
+        market_regime_bucket: str | None = None,
+        difficulty_bucket: str | None = None,
+        outcome_bucket: str | None = None,
+        dossier_artifact_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> RoomCampaignRecord:
+        record = await self.get_room_campaign(room_id)
+        if record is None:
+            record = RoomCampaignRecord(
+                room_id=room_id,
+                campaign_id=campaign_id,
+                trigger_source=trigger_source,
+                city_bucket=city_bucket,
+                market_regime_bucket=market_regime_bucket,
+                difficulty_bucket=difficulty_bucket,
+                outcome_bucket=outcome_bucket,
+                dossier_artifact_id=dossier_artifact_id,
+                payload=payload or {},
+            )
+            self.session.add(record)
+        else:
+            record.campaign_id = campaign_id
+            record.trigger_source = trigger_source
+            record.city_bucket = city_bucket
+            record.market_regime_bucket = market_regime_bucket
+            record.difficulty_bucket = difficulty_bucket
+            record.outcome_bucket = outcome_bucket
+            record.dossier_artifact_id = dossier_artifact_id
+            record.payload = payload or record.payload
+        await self.session.flush()
+        return record
+
+    async def update_room_campaign(
+        self,
+        room_id: str,
+        *,
+        dossier_artifact_id: str | None = None,
+        payload_updates: dict[str, Any] | None = None,
+    ) -> RoomCampaignRecord | None:
+        record = await self.get_room_campaign(room_id)
+        if record is None:
+            return None
+        if dossier_artifact_id is not None:
+            record.dossier_artifact_id = dossier_artifact_id
+        if payload_updates:
+            record.payload = {**(record.payload or {}), **payload_updates}
+        await self.session.flush()
+        return record
+
+    async def get_room_campaign(self, room_id: str) -> RoomCampaignRecord | None:
+        stmt = select(RoomCampaignRecord).where(RoomCampaignRecord.room_id == room_id).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_room_campaigns(
+        self,
+        *,
+        limit: int = 200,
+        campaign_id: str | None = None,
+    ) -> list[RoomCampaignRecord]:
+        stmt = select(RoomCampaignRecord)
+        if campaign_id is not None:
+            stmt = stmt.where(RoomCampaignRecord.campaign_id == campaign_id)
+        result = await self.session.execute(stmt.order_by(RoomCampaignRecord.created_at.desc()).limit(limit))
+        return list(result.scalars())
+
     async def list_rooms(self, limit: int = 25) -> list[Room]:
         result = await self.session.execute(select(Room).order_by(Room.updated_at.desc()).limit(limit))
         return list(result.scalars())
@@ -179,6 +257,7 @@ class PlatformRepository:
         limit: int = 500,
         pack_version: str | None = None,
         color: str | None = None,
+        market_ticker: str | None = None,
     ) -> list[Room]:
         stmt = (
             select(Room)
@@ -193,6 +272,8 @@ class PlatformRepository:
             stmt = stmt.where(Room.agent_pack_version == pack_version)
         if color is not None:
             stmt = stmt.where(Room.active_color == color)
+        if market_ticker is not None:
+            stmt = stmt.where(Room.market_ticker == market_ticker)
         result = await self.session.execute(stmt.limit(limit))
         return list(result.scalars())
 
@@ -794,6 +875,61 @@ class PlatformRepository:
         )
         return list(result.scalars())
 
+    async def upsert_room_research_health(
+        self,
+        *,
+        room_id: str,
+        market_ticker: str,
+        dossier_status: str,
+        gate_passed: bool,
+        valid_dossier: bool,
+        good_for_training: bool,
+        quality_score: float,
+        citation_coverage_score: float,
+        settlement_clarity_score: float,
+        freshness_score: float,
+        contradiction_count: int,
+        structured_completeness_score: float,
+        fair_value_score: float,
+        dossier_artifact_id: str | None,
+        payload: dict[str, Any],
+    ) -> RoomResearchHealthRecord:
+        record = await self.session.get(RoomResearchHealthRecord, room_id)
+        if record is None:
+            record = RoomResearchHealthRecord(room_id=room_id, market_ticker=market_ticker, payload={})
+            self.session.add(record)
+        record.market_ticker = market_ticker
+        record.dossier_status = dossier_status
+        record.gate_passed = gate_passed
+        record.valid_dossier = valid_dossier
+        record.good_for_training = good_for_training
+        record.quality_score = quality_score
+        record.citation_coverage_score = citation_coverage_score
+        record.settlement_clarity_score = settlement_clarity_score
+        record.freshness_score = freshness_score
+        record.contradiction_count = contradiction_count
+        record.structured_completeness_score = structured_completeness_score
+        record.fair_value_score = fair_value_score
+        record.dossier_artifact_id = dossier_artifact_id
+        record.payload = payload
+        await self.session.flush()
+        return record
+
+    async def get_room_research_health(self, room_id: str) -> RoomResearchHealthRecord | None:
+        return await self.session.get(RoomResearchHealthRecord, room_id)
+
+    async def list_room_research_health(
+        self,
+        *,
+        limit: int = 200,
+        good_for_training: bool | None = None,
+    ) -> list[RoomResearchHealthRecord]:
+        stmt = select(RoomResearchHealthRecord)
+        if good_for_training is not None:
+            stmt = stmt.where(RoomResearchHealthRecord.good_for_training.is_(good_for_training))
+        result = await self.session.execute(stmt.order_by(RoomResearchHealthRecord.updated_at.desc()).limit(limit))
+        return list(result.scalars())
+
     async def create_agent_pack(self, pack: AgentPack) -> AgentPackRecord:
         record = AgentPackRecord(
             version=pack.version,
@@ -958,6 +1094,99 @@ class PlatformRepository:
     async def list_promotion_events(self, limit: int = 20) -> list[PromotionEventRecord]:
         result = await self.session.execute(select(PromotionEventRecord).order_by(PromotionEventRecord.created_at.desc()).limit(limit))
         return list(result.scalars())
+
+    async def create_training_dataset_build(
+        self,
+        *,
+        build_version: str,
+        mode: str,
+        status: str,
+        selection_window_start: datetime | None,
+        selection_window_end: datetime | None,
+        room_count: int,
+        filters: dict[str, Any],
+        label_stats: dict[str, Any],
+        pack_versions: list[str],
+        payload: dict[str, Any],
+        completed_at: datetime | None = None,
+    ) -> TrainingDatasetBuildRecord:
+        record = TrainingDatasetBuildRecord(
+            build_version=build_version,
+            mode=mode,
+            status=status,
+            selection_window_start=selection_window_start,
+            selection_window_end=selection_window_end,
+            room_count=room_count,
+            filters=filters,
+            label_stats=label_stats,
+            pack_versions=pack_versions,
+            payload=payload,
+            completed_at=completed_at,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def set_training_dataset_build_items(
+        self,
+        *,
+        dataset_build_id: str,
+        items: list[dict[str, Any]],
+    ) -> list[TrainingDatasetBuildItemRecord]:
+        existing = await self.session.execute(
+            select(TrainingDatasetBuildItemRecord).where(TrainingDatasetBuildItemRecord.dataset_build_id == dataset_build_id)
+        )
+        for record in existing.scalars():
+            await self.session.delete(record)
+        created: list[TrainingDatasetBuildItemRecord] = []
+        for sequence, item in enumerate(items, start=1):
+            record = TrainingDatasetBuildItemRecord(
+                dataset_build_id=dataset_build_id,
+                room_id=item["room_id"],
+                sequence=sequence,
+                payload=item,
+            )
+            self.session.add(record)
+            created.append(record)
+        await self.session.flush()
+        return created
+
+    async def get_training_dataset_build(self, build_id: str) -> TrainingDatasetBuildRecord | None:
+        return await self.session.get(TrainingDatasetBuildRecord, build_id)
+
+    async def list_training_dataset_builds(self, limit: int = 20) -> list[TrainingDatasetBuildRecord]:
+        result = await self.session.execute(
+            select(TrainingDatasetBuildRecord).order_by(TrainingDatasetBuildRecord.created_at.desc()).limit(limit)
+        )
+        return list(result.scalars())
+
+    async def list_training_dataset_build_items(self, build_id: str) -> list[TrainingDatasetBuildItemRecord]:
+        result = await self.session.execute(
+            select(TrainingDatasetBuildItemRecord)
+            .where(TrainingDatasetBuildItemRecord.dataset_build_id == build_id)
+            .order_by(TrainingDatasetBuildItemRecord.sequence.asc())
+        )
+        return list(result.scalars())
+
+    async def create_training_readiness_snapshot(self, readiness: TrainingReadiness) -> TrainingReadinessRecord:
+        record = TrainingReadinessRecord(
+            ready_for_sft_export=readiness.ready_for_sft_export,
+            ready_for_critique=readiness.ready_for_critique,
+            ready_for_evaluation=readiness.ready_for_evaluation,
+            ready_for_promotion=readiness.ready_for_promotion,
+            complete_room_count=readiness.complete_room_count,
+            market_diversity_count=readiness.market_diversity_count,
+            settled_room_count=readiness.settled_room_count,
+            trade_positive_room_count=readiness.trade_positive_room_count,
+            payload=readiness.model_dump(mode="json"),
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def get_latest_training_readiness(self) -> TrainingReadinessRecord | None:
+        stmt = select(TrainingReadinessRecord).order_by(TrainingReadinessRecord.created_at.desc()).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def save_memory_note(self, *, room_id: str | None, payload: MemoryNotePayload, embedding: list[float] | None, provider: str) -> MemoryNoteRecord:
         note = MemoryNoteRecord(

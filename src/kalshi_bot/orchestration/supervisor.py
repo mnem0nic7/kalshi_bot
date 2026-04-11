@@ -176,7 +176,7 @@ class WorkflowSupervisor:
                 )
                 researcher_record = await repo.append_message(room.id, researcher_message)
                 role_models[AgentRole.RESEARCHER.value] = researcher_usage
-                await repo.save_artifact(
+                dossier_artifact = await repo.save_artifact(
                     room_id=room.id,
                     message_id=researcher_record.id,
                     artifact_type="research_dossier_snapshot",
@@ -220,6 +220,33 @@ class WorkflowSupervisor:
                         url=source.url,
                         external_id=source.source_key,
                     )
+                research_health = self.research_coordinator.training_quality_snapshot(dossier)
+                await repo.upsert_room_research_health(
+                    room_id=room.id,
+                    market_ticker=room.market_ticker,
+                    dossier_status=research_health["dossier_status"],
+                    gate_passed=research_health["gate_passed"],
+                    valid_dossier=research_health["valid_dossier"],
+                    good_for_training=research_health["good_for_training"],
+                    quality_score=research_health["quality_score"],
+                    citation_coverage_score=research_health["citation_coverage_score"],
+                    settlement_clarity_score=research_health["settlement_clarity_score"],
+                    freshness_score=research_health["freshness_score"],
+                    contradiction_count=research_health["contradiction_count"],
+                    structured_completeness_score=research_health["structured_completeness_score"],
+                    fair_value_score=research_health["fair_value_score"],
+                    dossier_artifact_id=dossier_artifact.id,
+                    payload=research_health["payload"],
+                )
+                await repo.update_room_campaign(
+                    room.id,
+                    dossier_artifact_id=dossier_artifact.id,
+                    payload_updates={
+                        "research_mode": dossier.mode,
+                        "research_gate_passed": dossier.gate.passed,
+                        "quality_score": dossier.quality.overall_score,
+                    },
+                )
                 await session.commit()
 
                 receipt = ExecReceiptPayload(status="no_trade", details={})
@@ -377,6 +404,13 @@ class WorkflowSupervisor:
                     payload=memory_payload,
                     embedding=self.agents.providers.embed_text(memory_payload.summary),
                     provider="hash-router-v1",
+                )
+                await repo.update_room_campaign(
+                    room.id,
+                    payload_updates={
+                        "final_status": final_status,
+                        "room_completed_at": datetime.now(UTC).isoformat(),
+                    },
                 )
                 await repo.update_room_runtime(room.id, role_models=role_models)
                 await repo.update_room_stage(room.id, RoomStage.COMPLETE)

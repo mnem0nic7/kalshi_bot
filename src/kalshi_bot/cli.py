@@ -8,11 +8,11 @@ from pathlib import Path
 import sys
 
 from kalshi_bot.config import get_settings
+from kalshi_bot.core.schemas import RoomCreate, ShadowCampaignRequest, TrainingBuildRequest
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
-from kalshi_bot.core.schemas import RoomCreate
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -107,6 +107,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(failures, indent=2))
             return 0
 
+        if args.command == "research-audit":
+            issues = await container.training_corpus_service.research_audit(limit=args.limit)
+            print(json.dumps([issue.model_dump(mode="json") for issue in issues], indent=2))
+            return 0
+
         if args.command == "training-export":
             room_ids = [args.room_id] if args.room_id else None
             output_path = Path(args.output)
@@ -129,6 +134,29 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 payload = [example.model_dump(mode="json") for example in examples]
             _write_jsonl(output_path, payload)
             print(json.dumps({"output": str(output_path), "count": len(payload), "mode": args.mode}, indent=2))
+            return 0
+
+        if args.command == "training-status":
+            print(json.dumps(await container.training_corpus_service.get_status(persist_readiness=True), indent=2))
+            return 0
+
+        if args.command == "training-build":
+            request = TrainingBuildRequest(
+                mode=args.mode,
+                limit=args.limit,
+                days=args.days,
+                settled_only=args.settled_only,
+                include_non_complete=args.include_non_complete,
+                good_research_only=args.good_research_only,
+                market_ticker=args.market_ticker,
+                output=args.output,
+            )
+            print(json.dumps(await container.training_corpus_service.build_dataset(request), indent=2))
+            return 0
+
+        if args.command == "training-build-list":
+            builds = await container.training_corpus_service.list_builds(limit=args.limit)
+            print(json.dumps([build.model_dump(mode="json") for build in builds], indent=2))
             return 0
 
         if args.command == "self-improve":
@@ -233,6 +261,20 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 limit=args.limit,
                 reason=args.reason,
             )
+            print(
+                json.dumps(
+                    [
+                        {"room_id": item.room_id, "market_ticker": item.market_ticker, "room_name": item.room_name, "stage": item.stage}
+                        for item in results
+                    ],
+                    indent=2,
+                )
+            )
+            return 0
+
+        if args.command == "shadow-campaign" and args.shadow_campaign_command == "run":
+            request = ShadowCampaignRequest(limit=args.limit, reason=args.reason)
+            results = await container.shadow_campaign_service.run(request)
             print(
                 json.dumps(
                     [
@@ -361,6 +403,9 @@ def build_parser() -> argparse.ArgumentParser:
     research_failures = subparsers.add_parser("research-failures")
     research_failures.add_argument("--limit", type=int, default=10)
 
+    research_audit = subparsers.add_parser("research-audit")
+    research_audit.add_argument("--limit", type=int, default=50)
+
     training_export = subparsers.add_parser("training-export")
     training_export.add_argument("--output", required=True)
     training_export.add_argument("--mode", choices=["bundles", "role-sft"], default="bundles")
@@ -374,6 +419,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["researcher", "president", "trader", "memory_librarian"],
     )
+
+    subparsers.add_parser("training-status")
+
+    training_build = subparsers.add_parser("training-build")
+    training_build.add_argument("--mode", choices=["room-bundles", "role-sft", "evaluation-holdout"], default="room-bundles")
+    training_build.add_argument("--limit", type=int, default=200)
+    training_build.add_argument("--days", type=int, default=30)
+    training_build.add_argument("--settled-only", action="store_true")
+    training_build.add_argument("--include-non-complete", action="store_true")
+    training_build.add_argument("--good-research-only", action="store_true")
+    training_build.add_argument("--market-ticker", default=None)
+    training_build.add_argument("--output", default=None)
+
+    training_build_list = subparsers.add_parser("training-build-list")
+    training_build_list.add_argument("--limit", type=int, default=20)
 
     self_improve = subparsers.add_parser("self-improve")
     self_improve_subparsers = self_improve.add_subparsers(dest="self_improve_command", required=True)
@@ -434,6 +494,12 @@ def build_parser() -> argparse.ArgumentParser:
     shadow_sweep.add_argument("--markets", nargs="*", default=None)
     shadow_sweep.add_argument("--limit", type=int, default=None)
     shadow_sweep.add_argument("--reason", default="cli_shadow_sweep")
+
+    shadow_campaign = subparsers.add_parser("shadow-campaign")
+    shadow_campaign_subparsers = shadow_campaign.add_subparsers(dest="shadow_campaign_command", required=True)
+    shadow_campaign_run = shadow_campaign_subparsers.add_parser("run")
+    shadow_campaign_run.add_argument("--limit", type=int, default=3)
+    shadow_campaign_run.add_argument("--reason", default="cli_shadow_campaign")
 
     run_room = subparsers.add_parser("run-room")
     run_room.add_argument("room_id")

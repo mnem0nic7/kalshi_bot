@@ -163,12 +163,24 @@ class ResearchDelta(BaseModel):
     source_keys: list[str] = Field(default_factory=list)
 
 
+class ResearchQualitySummary(BaseModel):
+    citation_coverage_score: float = 0.0
+    settlement_clarity_score: float = 0.0
+    freshness_score: float = 0.0
+    contradiction_score: float = 0.0
+    structured_completeness_score: float = 0.0
+    fair_value_score: float = 0.0
+    overall_score: float = 0.0
+    issues: list[str] = Field(default_factory=list)
+
+
 class ResearchDossier(BaseModel):
     market_ticker: str
     status: str
     mode: str
     summary: ResearchSummary
     freshness: ResearchFreshness
+    quality: ResearchQualitySummary = Field(default_factory=ResearchQualitySummary)
     trader_context: ResearchTraderContext
     gate: ResearchGateVerdict
     sources: list[ResearchSourceCard] = Field(default_factory=list)
@@ -291,6 +303,8 @@ class TrainingRoomBundle(BaseModel):
     export_version: str = "room-bundle.v1"
     exported_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     room: dict[str, Any]
+    campaign: dict[str, Any] | None = None
+    research_health: dict[str, Any] | None = None
     messages: list[RoomMessageRead] = Field(default_factory=list)
     signal: dict[str, Any] | None = None
     research_dossier: dict[str, Any] | None = None
@@ -318,6 +332,57 @@ class RoleTrainingExample(BaseModel):
     input_context: dict[str, Any]
     target: dict[str, Any]
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchAuditIssue(BaseModel):
+    market_ticker: str
+    severity: str
+    code: str
+    summary: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class TrainingReadiness(BaseModel):
+    complete_room_count: int = 0
+    market_diversity_count: int = 0
+    settled_room_count: int = 0
+    trade_positive_room_count: int = 0
+    ready_for_sft_export: bool = False
+    ready_for_critique: bool = False
+    ready_for_evaluation: bool = False
+    ready_for_promotion: bool = False
+    missing_indicators: list[str] = Field(default_factory=list)
+    thresholds: dict[str, int] = Field(default_factory=dict)
+    stats: dict[str, Any] = Field(default_factory=dict)
+
+
+class TrainingDatasetBuildSummary(BaseModel):
+    id: str
+    build_version: str
+    mode: str
+    status: str
+    room_count: int = 0
+    filters: dict[str, Any] = Field(default_factory=dict)
+    label_stats: dict[str, Any] = Field(default_factory=dict)
+    pack_versions: list[str] = Field(default_factory=list)
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class TrainingBuildRequest(BaseModel):
+    mode: str = "room-bundles"
+    limit: int = 200
+    days: int = 30
+    settled_only: bool = False
+    include_non_complete: bool = False
+    good_research_only: bool = False
+    market_ticker: str | None = None
+    output: str | None = None
+
+
+class ShadowCampaignRequest(BaseModel):
+    limit: int = 3
+    reason: str = "shadow_campaign"
 
 
 class RoomMessageCreate(BaseModel):

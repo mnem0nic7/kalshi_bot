@@ -41,7 +41,8 @@ Typical operational loop:
 ```bash
 kalshi-bot-cli init-db
 kalshi-bot-cli discover
-kalshi-bot-cli shadow-sweep --limit 3
+kalshi-bot-cli shadow-campaign run --limit 3
+kalshi-bot-cli training-status
 kalshi-bot-cli stream --max-messages 100
 kalshi-bot-cli reconcile
 kalshi-bot-cli status
@@ -93,9 +94,25 @@ For quick shadow transcript collection without creating the room separately:
 ```bash
 kalshi-bot-cli shadow-run KXHIGHNY-26APR11-T68
 kalshi-bot-cli shadow-sweep --limit 3
+kalshi-bot-cli shadow-campaign run --limit 3
 ```
 
-The control room index page offers the same behavior with the `Run Shadow Room` button on each discovered market card.
+The control room index page offers the same behavior with `Run Shadow Room`, plus a `Training And Research` panel that shows corpus readiness, recent dataset builds, research audit issues, and a one-click shadow campaign action.
+
+## Training corpus
+
+Use the training-first commands to keep the weather corpus clean and reproducible:
+
+```bash
+kalshi-bot-cli training-status
+kalshi-bot-cli research-audit --limit 20
+kalshi-bot-cli training-build --mode room-bundles --good-research-only
+kalshi-bot-cli training-build --mode role-sft --good-research-only
+kalshi-bot-cli training-build --mode evaluation-holdout --settled-only
+kalshi-bot-cli training-build-list
+```
+
+The self-improvement loop now respects corpus readiness gates. If the corpus is too small, too concentrated, or too weakly labeled, critique and evaluation commands will stop early instead of generating noisy candidates.
 
 ## Boot and self-healing
 

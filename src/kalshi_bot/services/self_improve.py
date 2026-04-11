@@ -24,6 +24,7 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
 from kalshi_bot.services.training import TrainingExportService
+from kalshi_bot.services.training_corpus import TrainingCorpusService
 
 
 @dataclass(slots=True)
@@ -39,6 +40,7 @@ class SelfImproveService:
         session_factory: async_sessionmaker,
         providers: ProviderRouter,
         training_export_service: TrainingExportService,
+        training_corpus_service: TrainingCorpusService | None,
         agent_pack_service: AgentPackService,
         risk_engine: DeterministicRiskEngine,
     ) -> None:
@@ -46,10 +48,18 @@ class SelfImproveService:
         self.session_factory = session_factory
         self.providers = providers
         self.training_export_service = training_export_service
+        self.training_corpus_service = training_corpus_service
         self.agent_pack_service = agent_pack_service
         self.risk_engine = risk_engine
 
     async def get_status(self) -> dict[str, Any]:
+        if self.training_corpus_service is None:
+            raise RuntimeError("Training corpus service is not configured")
+        readiness = await self.training_corpus_service.compute_readiness(persist=False)
+        dataset_builds = [
+            build.model_dump(mode="json")
+            for build in await self.training_corpus_service.list_builds(limit=5)
+        ]
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             await self.agent_pack_service.ensure_initialized(repo)
@@ -94,15 +104,27 @@ class SelfImproveService:
                 }
                 for record in promotions
             ],
+            "training_readiness": readiness.model_dump(mode="json"),
+            "recent_dataset_builds": dataset_builds,
         }
 
     async def critique_recent_rooms(self, *, days: int | None = None, limit: int = 200) -> SelfImproveResult:
         days = days or self.settings.self_improve_window_days
+        if self.training_corpus_service is None:
+            raise RuntimeError("Training corpus service is not configured")
+        readiness = await self.training_corpus_service.compute_readiness(persist=True)
+        if not readiness.ready_for_critique:
+            raise ValueError(f"Training corpus is not ready for critique: {', '.join(readiness.missing_indicators)}")
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             await self.agent_pack_service.ensure_initialized(repo)
             champion_pack = await self.agent_pack_service.get_active_pack(repo)
-            room_ids = await self._learning_room_ids(repo, days=days, limit=limit)
+            room_ids = await self.training_corpus_service.select_learning_room_ids(
+                days=days,
+                limit=limit,
+                settled_only=False,
+                good_research_only=True,
+            )
             critique_run = await repo.create_critique_run(
                 source_pack_version=champion_pack.version,
                 payload={"days": days, "room_ids": room_ids},
@@ -152,12 +174,22 @@ class SelfImproveService:
         limit: int = 200,
     ) -> SelfImproveResult:
         days = days or self.settings.self_improve_window_days
+        if self.training_corpus_service is None:
+            raise RuntimeError("Training corpus service is not configured")
+        readiness = await self.training_corpus_service.compute_readiness(persist=True)
+        if not readiness.ready_for_evaluation:
+            raise ValueError(f"Training corpus is not ready for evaluation: {', '.join(readiness.missing_indicators)}")
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             await self.agent_pack_service.ensure_initialized(repo)
             champion_pack = await self.agent_pack_service.get_active_pack(repo)
             candidate_pack = await self.agent_pack_service.get_pack(repo, candidate_version)
-            room_ids = await self._learning_room_ids(repo, days=days, limit=limit)
+            room_ids = await self.training_corpus_service.select_learning_room_ids(
+                days=days,
+                limit=limit,
+                settled_only=False,
+                good_research_only=True,
+            )
             holdout_ids = self._holdout_room_ids(room_ids)
             evaluation = await repo.create_evaluation_run(
                 champion_version=champion_pack.version,
@@ -202,6 +234,11 @@ class SelfImproveService:
             raise
 
     async def promote_candidate(self, *, evaluation_run_id: str, reason: str = "auto_promote") -> SelfImproveResult:
+        if self.training_corpus_service is None:
+            raise RuntimeError("Training corpus service is not configured")
+        readiness = await self.training_corpus_service.compute_readiness(persist=True)
+        if not readiness.ready_for_promotion:
+            raise ValueError(f"Training corpus is not ready for promotion: {', '.join(readiness.missing_indicators)}")
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             await self.agent_pack_service.ensure_initialized(repo)
@@ -585,11 +622,6 @@ class SelfImproveService:
             champion_metrics=champion_metrics,
             reasons=reasons or ["Evaluation passed."],
         )
-
-    async def _learning_room_ids(self, repo: PlatformRepository, *, days: int, limit: int) -> list[str]:
-        since = datetime.now(UTC) - timedelta(days=days)
-        rooms = await repo.list_rooms_for_learning(since=since, limit=limit)
-        return [room.id for room in rooms]
 
     def _holdout_room_ids(self, room_ids: list[str]) -> list[str]:
         if not room_ids:

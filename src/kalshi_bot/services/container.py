@@ -26,7 +26,9 @@ from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.training import TrainingExportService
+from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.services.watchdog import WatchdogService
+from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -52,7 +54,9 @@ class AppContainer:
     reconciliation_service: ReconciliationService
     stream_service: MarketStreamService
     training_export_service: TrainingExportService
+    training_corpus_service: TrainingCorpusService
     shadow_training_service: ShadowTrainingService
+    shadow_campaign_service: ShadowCampaignService
     self_improve_service: SelfImproveService
     watchdog_service: WatchdogService
     agents: AgentSuite
@@ -81,6 +85,13 @@ class AppContainer:
         reconciliation_service = ReconciliationService(kalshi)
         stream_service = MarketStreamService(settings, session_factory, kalshi_ws)
         training_export_service = TrainingExportService(session_factory)
+        training_corpus_service = TrainingCorpusService(
+            settings,
+            session_factory,
+            discovery_service,
+            training_export_service,
+            weather_directory,
+        )
         research_coordinator = ResearchCoordinator(
             settings,
             session_factory,
@@ -97,6 +108,7 @@ class AppContainer:
             session_factory,
             providers,
             training_export_service,
+            training_corpus_service,
             agent_pack_service,
             risk_engine,
         )
@@ -121,6 +133,13 @@ class AppContainer:
             agent_pack_service,
             supervisor,
         )
+        shadow_campaign_service = ShadowCampaignService(
+            settings,
+            session_factory,
+            discovery_service,
+            research_coordinator,
+            shadow_training_service,
+        )
         auto_trigger_service = AutoTriggerService(settings, session_factory, weather_directory, agent_pack_service, supervisor)
         daemon_service = DaemonService(
             settings,
@@ -132,6 +151,7 @@ class AppContainer:
             research_coordinator,
             auto_trigger_service,
             shadow_training_service,
+            shadow_campaign_service,
             self_improve_service,
         )
         container = cls(
@@ -155,7 +175,9 @@ class AppContainer:
             reconciliation_service=reconciliation_service,
             stream_service=stream_service,
             training_export_service=training_export_service,
+            training_corpus_service=training_corpus_service,
             shadow_training_service=shadow_training_service,
+            shadow_campaign_service=shadow_campaign_service,
             self_improve_service=self_improve_service,
             watchdog_service=watchdog_service,
             agents=agents,

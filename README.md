@@ -64,9 +64,14 @@ kalshi-bot-cli stream --auto-trigger
 kalshi-bot-cli daemon --auto-trigger
 kalshi-bot-cli shadow-run KXHIGHNY-26APR11-T68
 kalshi-bot-cli shadow-sweep --limit 3
+kalshi-bot-cli shadow-campaign run --limit 3
 kalshi-bot-cli research-refresh KXHIGHNY-26APR11-T68
 kalshi-bot-cli research-show KXHIGHNY-26APR11-T68
 kalshi-bot-cli research-failures
+kalshi-bot-cli research-audit --limit 20
+kalshi-bot-cli training-status
+kalshi-bot-cli training-build --mode room-bundles --good-research-only
+kalshi-bot-cli training-build-list
 kalshi-bot-cli training-export --mode bundles --output data/training/room_bundles.jsonl
 kalshi-bot-cli training-export --mode role-sft --roles researcher trader --output data/training/role_sft.jsonl
 kalshi-bot-cli self-improve status
@@ -87,7 +92,7 @@ kalshi-bot-cli promote green
 
 `discover --json` now expands any configured `series_templates` into the currently active greater/less daily temperature markets, and the control room uses the same live discovery path.
 
-The control room also supports one-click `Run Shadow Room` actions from the market cards. That path creates a room and immediately runs the workflow in shadow mode so you can build training transcripts quickly without placing orders.
+The control room also supports one-click `Run Shadow Room` actions from the market cards, plus a dedicated training panel for corpus status, research audit issues, dataset builds, and one-click shadow campaigns.
 
 ## GitHub Actions smoke workflows
 
@@ -137,6 +142,8 @@ Each workflow writes the PEM to a temporary file at runtime, runs REST plus WebS
 - Optional checkpointed Kalshi websocket ingestion via `kalshi-bot-cli stream`
 - Optional auto-room launching from streamed books via `kalshi-bot-cli stream --auto-trigger`
 - Long-running daemon mode via `kalshi-bot-cli daemon`
+- Training-first corpus engine with research-health scoring, reproducible dataset builds, and readiness gates
+- Optional structured-weather shadow campaigns via `kalshi-bot-cli shadow-campaign run`
 - Gemini-first runtime routing for LLM-backed roles with local fallback
 - Versioned agent packs and GitHub Actions self-improvement loop
 - Host-native watchdog recovery with compose healthchecks and color failover

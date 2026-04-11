@@ -101,6 +101,7 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
         FakeResearchCoordinator(),  # type: ignore[arg-type]
         FakeAutoTriggerService(),  # type: ignore[arg-type]
         FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
         FakeSelfImproveService(),  # type: ignore[arg-type]
     )
 

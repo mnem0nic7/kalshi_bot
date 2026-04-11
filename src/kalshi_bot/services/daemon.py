@@ -8,11 +8,13 @@ from typing import Any
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.schemas import ShadowCampaignRequest
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
+from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.streaming import MarketStreamService
@@ -31,6 +33,7 @@ class DaemonService:
         research_coordinator: ResearchCoordinator,
         auto_trigger_service: AutoTriggerService,
         shadow_training_service: ShadowTrainingService,
+        shadow_campaign_service: ShadowCampaignService | None,
         self_improve_service: SelfImproveService,
     ) -> None:
         self.settings = settings
@@ -42,6 +45,7 @@ class DaemonService:
         self.research_coordinator = research_coordinator
         self.auto_trigger_service = auto_trigger_service
         self.shadow_training_service = shadow_training_service
+        self.shadow_campaign_service = shadow_campaign_service
         self.self_improve_service = self_improve_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
 
@@ -82,6 +86,7 @@ class DaemonService:
                     "active_rooms": active_rooms,
                     "has_reconcile_checkpoint": checkpoint is not None,
                     "agent_pack_status": self_improve_status,
+                    "training_campaign_enabled": self.settings.training_campaign_enabled,
                 }
             )
             await repo.log_ops_event(
@@ -104,6 +109,17 @@ class DaemonService:
                 },
             )
             await session.commit()
+        if (
+            self.shadow_campaign_service is not None
+            and self.settings.training_campaign_enabled
+            and self.settings.app_color == payload.get("active_color")
+        ):
+            await self.shadow_campaign_service.run(
+                ShadowCampaignRequest(
+                    limit=self.settings.training_campaign_rooms_per_run,
+                    reason="daemon_shadow_campaign",
+                )
+            )
         rollout_result = await self.self_improve_service.monitor_rollouts()
         if rollout_result.status == "canary_running":
             canary = rollout_result.payload

@@ -22,6 +22,7 @@ from kalshi_bot.core.schemas import (
     ResearchDossier,
     ResearchFreshness,
     ResearchGateVerdict,
+    ResearchQualitySummary,
     ResearchSourceCard,
     ResearchSummary,
     ResearchTraderContext,
@@ -513,6 +514,16 @@ class ResearchCoordinator:
             freshness=freshness,
             settlement_covered=settlement_covered,
         )
+        quality = self._quality_summary(
+            mapping=mapping,
+            sources=sources,
+            claims=claims,
+            summary=summary,
+            trader_context=trader_context,
+            freshness=freshness,
+            settlement_covered=settlement_covered,
+            contradiction_count=contradiction_count,
+        )
         status = "ready" if gate.passed else "blocked"
         mode = "mixed" if structured_used and web_used else "structured" if structured_used else "web" if web_used else "market_only"
         return ResearchDossier(
@@ -521,6 +532,7 @@ class ResearchCoordinator:
             mode=mode,
             summary=summary,
             freshness=freshness,
+            quality=quality,
             trader_context=trader_context,
             gate=gate,
             sources=sources,
@@ -531,6 +543,40 @@ class ResearchCoordinator:
             created_at=now,
             last_run_id=last_run_id,
         )
+
+    def training_quality_snapshot(self, dossier: ResearchDossier) -> dict[str, Any]:
+        structured_training_ready = dossier.mode in {"structured", "mixed"} and dossier.trader_context.structured_source_used
+        good_for_training = (
+            dossier.gate.passed
+            and structured_training_ready
+            and dossier.quality.overall_score >= self.settings.training_good_research_threshold
+        )
+        return {
+            "market_ticker": dossier.market_ticker,
+            "dossier_status": dossier.status,
+            "gate_passed": dossier.gate.passed,
+            "valid_dossier": dossier.status == "ready" and not dossier.freshness.stale,
+            "good_for_training": good_for_training,
+            "quality_score": dossier.quality.overall_score,
+            "citation_coverage_score": dossier.quality.citation_coverage_score,
+            "settlement_clarity_score": dossier.quality.settlement_clarity_score,
+            "freshness_score": dossier.quality.freshness_score,
+            "contradiction_count": dossier.contradiction_count,
+            "structured_completeness_score": dossier.quality.structured_completeness_score,
+            "fair_value_score": dossier.quality.fair_value_score,
+            "payload": {
+                "mode": dossier.mode,
+                "quality": dossier.quality.model_dump(mode="json"),
+                "gate": dossier.gate.model_dump(mode="json"),
+                "freshness": dossier.freshness.model_dump(mode="json"),
+                "source_count": len(dossier.sources),
+                "settlement_covered": dossier.settlement_covered,
+                "contradiction_count": dossier.contradiction_count,
+                "unresolved_count": dossier.unresolved_count,
+                "structured_source_used": dossier.trader_context.structured_source_used,
+                "web_source_used": dossier.trader_context.web_source_used,
+            },
+        }
 
     def _gate_dossier(
         self,
@@ -558,6 +604,99 @@ class ResearchCoordinator:
         if trader_context.fair_yes_dollars is None:
             reasons.append("Research dossier did not produce a fair-value estimate.")
         return ResearchGateVerdict(passed=not reasons, reasons=reasons or ["Research gate passed."], cited_source_keys=cited)
+
+    def _quality_summary(
+        self,
+        *,
+        mapping: WeatherMarketMapping | None,
+        sources: Sequence[ResearchSourceCard],
+        claims: Sequence[ResearchClaim],
+        summary: ResearchSummary,
+        trader_context: ResearchTraderContext,
+        freshness: ResearchFreshness,
+        settlement_covered: bool,
+        contradiction_count: int,
+    ) -> ResearchQualitySummary:
+        issues: list[str] = []
+        citation_coverage_score = 0.0
+        if claims:
+            cited_claims = sum(1 for claim in claims if claim.citations)
+            citation_coverage_score = round(cited_claims / len(claims), 4)
+        elif sources:
+            citation_coverage_score = 1.0
+
+        has_settlement_unknown = any("settlement" in item.lower() for item in summary.unresolved_uncertainties)
+        if settlement_covered and not has_settlement_unknown:
+            settlement_clarity_score = 1.0
+        elif settlement_covered:
+            settlement_clarity_score = 0.5
+        else:
+            settlement_clarity_score = 0.0
+
+        freshness_score = 0.0 if freshness.stale else max(
+            0.0,
+            round(1.0 - (freshness.max_source_age_seconds / max(1, self.settings.research_stale_seconds)), 4),
+        )
+
+        contradiction_score = 1.0
+        if claims:
+            contradiction_score = max(0.0, round(1.0 - (contradiction_count / len(claims)), 4))
+        elif contradiction_count:
+            contradiction_score = 0.0
+
+        structured_completeness_score = 0.0
+        if mapping is not None and mapping.supports_structured_weather:
+            required_facts = [
+                trader_context.numeric_facts.get("forecast_high_f"),
+                trader_context.numeric_facts.get("current_temp_f"),
+                mapping.threshold_f,
+            ]
+            structured_completeness_score = round(
+                sum(1 for item in required_facts if item not in (None, "")) / len(required_facts),
+                4,
+            )
+        elif trader_context.structured_source_used:
+            structured_completeness_score = 1.0
+
+        fair_value_score = 1.0 if trader_context.fair_yes_dollars is not None else 0.0
+
+        overall_score = round(
+            (
+                citation_coverage_score * 0.20
+                + settlement_clarity_score * 0.20
+                + freshness_score * 0.20
+                + contradiction_score * 0.15
+                + structured_completeness_score * 0.15
+                + fair_value_score * 0.10
+            ),
+            4,
+        )
+
+        if citation_coverage_score < 1.0:
+            issues.append("Not every research claim is explicitly cited.")
+        if settlement_clarity_score < 1.0:
+            issues.append("Settlement mechanics are incomplete or still partially unresolved.")
+        if freshness_score < 0.5:
+            issues.append("Research sources are aging toward the stale threshold.")
+        if contradiction_count > 0:
+            issues.append("Research contains contradictory evidence that should be reviewed.")
+        if mapping is not None and mapping.supports_structured_weather and structured_completeness_score < 1.0:
+            issues.append("Structured weather facts are incomplete for this market.")
+        if fair_value_score == 0.0:
+            issues.append("No fair-value estimate is available for autonomous training.")
+        if not any(source.trust_tier in {"primary", "reputable"} for source in sources):
+            issues.append("Source trust is below the preferred training threshold.")
+
+        return ResearchQualitySummary(
+            citation_coverage_score=citation_coverage_score,
+            settlement_clarity_score=settlement_clarity_score,
+            freshness_score=freshness_score,
+            contradiction_score=contradiction_score,
+            structured_completeness_score=structured_completeness_score,
+            fair_value_score=fair_value_score,
+            overall_score=overall_score,
+            issues=issues,
+        )
 
     def _kalshi_sources(self, mapping: WeatherMarketMapping | None, market_ticker: str, market: dict[str, Any]) -> list[ResearchSourceCard]:
         title = str(market.get("title") or mapping.label if mapping is not None else market_ticker)

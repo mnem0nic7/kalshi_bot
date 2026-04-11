@@ -242,6 +242,41 @@ class ResearchClaimRecord(Base, IdMixin, TimestampMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class RoomCampaignRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "room_campaigns"
+    __table_args__ = (UniqueConstraint("room_id", name="uq_room_campaign_room_id"),)
+
+    room_id: Mapped[str] = mapped_column(ForeignKey("rooms.id", ondelete="CASCADE"), index=True)
+    campaign_id: Mapped[str] = mapped_column(String(64), index=True)
+    trigger_source: Mapped[str] = mapped_column(String(64), index=True)
+    city_bucket: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    market_regime_bucket: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    difficulty_bucket: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    outcome_bucket: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    dossier_artifact_id: Mapped[str | None] = mapped_column(ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class RoomResearchHealthRecord(Base, TimestampMixin):
+    __tablename__ = "room_research_health"
+
+    room_id: Mapped[str] = mapped_column(ForeignKey("rooms.id", ondelete="CASCADE"), primary_key=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    dossier_status: Mapped[str] = mapped_column(String(32), default="missing", index=True)
+    gate_passed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    valid_dossier: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    good_for_training: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    quality_score: Mapped[float] = mapped_column(default=0.0, index=True)
+    citation_coverage_score: Mapped[float] = mapped_column(default=0.0)
+    settlement_clarity_score: Mapped[float] = mapped_column(default=0.0)
+    freshness_score: Mapped[float] = mapped_column(default=0.0)
+    contradiction_count: Mapped[int] = mapped_column(Integer, default=0)
+    structured_completeness_score: Mapped[float] = mapped_column(default=0.0)
+    fair_value_score: Mapped[float] = mapped_column(default=0.0)
+    dossier_artifact_id: Mapped[str | None] = mapped_column(ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class MemoryNoteRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "memory_notes"
 
@@ -309,6 +344,47 @@ class PromotionEventRecord(Base, IdMixin, TimestampMixin):
     target_color: Mapped[str] = mapped_column(String(16), index=True)
     evaluation_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     rollback_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class TrainingDatasetBuildRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "training_dataset_builds"
+    __table_args__ = (UniqueConstraint("build_version", name="uq_training_dataset_builds_version"),)
+
+    build_version: Mapped[str] = mapped_column(String(128), index=True)
+    mode: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="completed", index=True)
+    selection_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    selection_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    room_count: Mapped[int] = mapped_column(Integer, default=0)
+    filters: Mapped[dict] = mapped_column(JSON, default=dict)
+    label_stats: Mapped[dict] = mapped_column(JSON, default=dict)
+    pack_versions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+
+class TrainingDatasetBuildItemRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "training_dataset_build_items"
+    __table_args__ = (UniqueConstraint("dataset_build_id", "room_id", name="uq_training_dataset_build_items_room"),)
+
+    dataset_build_id: Mapped[str] = mapped_column(ForeignKey("training_dataset_builds.id", ondelete="CASCADE"), index=True)
+    room_id: Mapped[str] = mapped_column(ForeignKey("rooms.id", ondelete="CASCADE"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class TrainingReadinessRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "training_readiness"
+
+    ready_for_sft_export: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    ready_for_critique: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    ready_for_evaluation: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    ready_for_promotion: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    complete_room_count: Mapped[int] = mapped_column(Integer, default=0)
+    market_diversity_count: Mapped[int] = mapped_column(Integer, default=0)
+    settled_room_count: Mapped[int] = mapped_column(Integer, default=0)
+    trade_positive_room_count: Mapped[int] = mapped_column(Integer, default=0)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
