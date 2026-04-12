@@ -64,6 +64,12 @@
     | Max recent/market: <strong>{{ training_status.campaign_settings.max_recent_per_market }}</strong>
     | Reconcile cadence: <strong>{{ training_status.campaign_settings.daemon_reconcile_interval_seconds }}</strong>s
   </p>
+  <p>
+    Audited rooms: <strong>{{ training_status.strategy_audit_progress.audited_room_count }}</strong>
+    | Forward: <strong>{{ training_status.strategy_audit_progress.forward_audit_count }}</strong>
+    | Backfilled: <strong>{{ training_status.strategy_audit_progress.backfilled_audit_count }}</strong>
+    | Pending backfill: <strong>{{ training_status.strategy_audit_progress.pending_backfill_room_count }}</strong>
+  </p>
   <div class="actions">
     <button type="button" onclick="runShadowCampaign()">Run Shadow Campaign</button>
     <button type="button" onclick="buildTrainingDataset('room-bundles')">Build Room Bundles</button>
@@ -73,6 +79,23 @@
   {% if training_status.top_missing_data %}
   <p>Top missing data: {{ training_status.top_missing_data|join(" | ") }}</p>
   {% endif %}
+  <div class="room-list">
+    <div class="room-card">
+      <strong>Quality Debt</strong>
+      <span>stale mismatch · {{ training_status.quality_debt_summary.stale_mismatch_count }}</span>
+      <span>missed stand-down · {{ training_status.quality_debt_summary.missed_stand_down_count }}</span>
+      <span>weak resolved trade · {{ training_status.quality_debt_summary.weak_resolved_trade_count }}</span>
+      <span>cleaned trainable · {{ training_status.quality_debt_summary.cleaned_trainable_room_count }}</span>
+    </div>
+    <div class="room-card">
+      <strong>Top Exclusion Reasons</strong>
+      {% for reason, count in training_status.quality_exclusion_reasons.items() %}
+      <span>{{ reason }} · {{ count }}</span>
+      {% else %}
+      <span>No current quality exclusions.</span>
+      {% endfor %}
+    </div>
+  </div>
   <div class="room-list">
     <div class="room-card">
       <strong>Active failure reasons</strong>

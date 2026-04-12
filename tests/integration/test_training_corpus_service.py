@@ -7,7 +7,7 @@ import pytest
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import RoomStage
-from kalshi_bot.core.schemas import RoomCreate, TrainingBuildRequest, TrainingRoomBundle, TrainingRoomOutcome
+from kalshi_bot.core.schemas import RoomCreate, StrategyAuditResult, TrainingBuildRequest, TrainingRoomBundle, TrainingRoomOutcome
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.orchestration.supervisor import WorkflowSupervisor
@@ -132,6 +132,14 @@ async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_p
     )
     kalshi = FakeKalshi()
     weather = FakeWeather()
+    training_export_service = TrainingExportService(session_factory)
+    corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        DiscoveryService(kalshi, directory),  # type: ignore[arg-type]
+        training_export_service,
+        directory,
+    )
     research_coordinator = ResearchCoordinator(
         settings,
         session_factory,
@@ -154,15 +162,8 @@ async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_p
         execution_service=execution_service,
         memory_service=memory_service,
         research_coordinator=research_coordinator,
+        training_corpus_service=corpus_service,
         agents=agents,
-    )
-    training_export_service = TrainingExportService(session_factory)
-    corpus_service = TrainingCorpusService(
-        settings,
-        session_factory,
-        DiscoveryService(kalshi, directory),  # type: ignore[arg-type]
-        training_export_service,
-        directory,
     )
 
     async with session_factory() as session:
@@ -221,10 +222,14 @@ async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_p
         repo = PlatformRepository(session)
         build_one_items = await repo.list_training_dataset_build_items(build_one["build"]["id"])
         build_two_items = await repo.list_training_dataset_build_items(build_two["build"]["id"])
+        audit_one = await repo.get_room_strategy_audit(room_one.id)
+        audit_two = await repo.get_room_strategy_audit(room_two.id)
         await session.commit()
 
     assert [item.room_id for item in build_one_items] == [item.room_id for item in build_two_items]
     assert {item.room_id for item in build_one_items} == {room_one.id, room_two.id}
+    assert audit_one is not None
+    assert audit_two is not None
 
     await engine.dispose()
 
@@ -394,3 +399,180 @@ async def test_strategy_audit_classifies_incorrect_locked_yes_thesis(tmp_path) -
     audit = corpus_service._audit_bundle(bundle)
 
     assert audit.thesis_correctness == "incorrect"
+
+
+@pytest.mark.asyncio
+async def test_strategy_audit_backfill_is_idempotent(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-audit-backfill.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    directory = WeatherMarketDirectory(
+        {
+            "WX-BACKFILL": WeatherMarketMapping(
+                market_ticker="WX-BACKFILL",
+                market_type="weather",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+            )
+        }
+    )
+
+    class NoopDiscoveryService:
+        async def discover_configured_markets(self):
+            return []
+
+    corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        NoopDiscoveryService(),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_kill_switch_enabled=True)
+        room = await repo.create_room(
+            RoomCreate(name="backfill room", market_ticker="WX-BACKFILL"),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=True,
+            kalshi_env=settings.kalshi_env,
+        )
+        await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+        await session.commit()
+
+    first = await corpus_service.backfill_strategy_audits(days=30, limit=10)
+    second = await corpus_service.backfill_strategy_audits(days=30, limit=10)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        audit = await repo.get_room_strategy_audit(room.id)
+        await session.commit()
+
+    assert first["created_count"] == 1
+    assert second["updated_count"] == 1
+    assert audit is not None
+    assert audit.audit_source == "historical_backfill"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_quality_cleaned_dataset_excludes_bad_audits(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/quality-cleaned.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    class NoopDiscoveryService:
+        async def discover_configured_markets(self):
+            return []
+
+    corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        NoopDiscoveryService(),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        WeatherMarketDirectory({}),
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_kill_switch_enabled=True)
+        good_room = await repo.create_room(
+            RoomCreate(name="good room", market_ticker="WX-GOOD"),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=True,
+            kalshi_env=settings.kalshi_env,
+        )
+        bad_room = await repo.create_room(
+            RoomCreate(name="bad room", market_ticker="WX-BAD"),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=True,
+            kalshi_env=settings.kalshi_env,
+        )
+        await repo.update_room_stage(good_room.id, RoomStage.COMPLETE)
+        await repo.update_room_stage(bad_room.id, RoomStage.COMPLETE)
+        good_audit = StrategyAuditResult(
+            room_id=good_room.id,
+            market_ticker="WX-GOOD",
+            thesis_correctness="unresolved",
+            trade_quality="stand_down",
+            block_correctness="not_applicable",
+            audit_source="live_forward",
+            audit_version="weather-quality-v1",
+            trainable_default=True,
+        )
+        bad_audit = StrategyAuditResult(
+            room_id=bad_room.id,
+            market_ticker="WX-BAD",
+            thesis_correctness="correct",
+            trade_quality="weak_trade",
+            block_correctness="correct_block",
+            stale_data_mismatch=True,
+            audit_source="historical_backfill",
+            audit_version="weather-quality-v1",
+            trainable_default=False,
+            exclude_reason="stale_data_mismatch",
+            quality_warnings=["stale_data_mismatch", "weak_trade"],
+        )
+        await repo.upsert_room_strategy_audit(
+            room_id=good_audit.room_id,
+            market_ticker=good_audit.market_ticker,
+            audit_source=good_audit.audit_source or "live_forward",
+            audit_version=good_audit.audit_version or "weather-quality-v1",
+            thesis_correctness=good_audit.thesis_correctness,
+            trade_quality=good_audit.trade_quality,
+            block_correctness=good_audit.block_correctness,
+            missed_stand_down=good_audit.missed_stand_down,
+            stale_data_mismatch=good_audit.stale_data_mismatch,
+            effective_freshness_agreement=good_audit.effective_freshness_agreement,
+            resolution_state=good_audit.resolution_state,
+            eligibility_passed=good_audit.eligibility_passed,
+            stand_down_reason=good_audit.stand_down_reason,
+            trainable_default=good_audit.trainable_default,
+            exclude_reason=good_audit.exclude_reason,
+            quality_warnings=good_audit.quality_warnings,
+            payload=good_audit.model_dump(mode="json"),
+        )
+        await repo.upsert_room_strategy_audit(
+            room_id=bad_audit.room_id,
+            market_ticker=bad_audit.market_ticker,
+            audit_source=bad_audit.audit_source or "historical_backfill",
+            audit_version=bad_audit.audit_version or "weather-quality-v1",
+            thesis_correctness=bad_audit.thesis_correctness,
+            trade_quality=bad_audit.trade_quality,
+            block_correctness=bad_audit.block_correctness,
+            missed_stand_down=bad_audit.missed_stand_down,
+            stale_data_mismatch=bad_audit.stale_data_mismatch,
+            effective_freshness_agreement=bad_audit.effective_freshness_agreement,
+            resolution_state=bad_audit.resolution_state,
+            eligibility_passed=bad_audit.eligibility_passed,
+            stand_down_reason=bad_audit.stand_down_reason,
+            trainable_default=bad_audit.trainable_default,
+            exclude_reason=bad_audit.exclude_reason,
+            quality_warnings=bad_audit.quality_warnings,
+            payload=bad_audit.model_dump(mode="json"),
+        )
+        await session.commit()
+
+    build = await corpus_service.build_dataset(TrainingBuildRequest(mode="room-bundles", limit=10, days=30))
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        items = await repo.list_training_dataset_build_items(build["build"]["id"])
+        await session.commit()
+
+    assert build["build"]["room_count"] == 1
+    assert build["build"]["label_stats"]["excluded_stale_mismatches"] == 1
+    assert [item.room_id for item in items] == [good_room.id]
+
+    await engine.dispose()

@@ -34,6 +34,9 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             handle.write("\n")
 
 
+STRATEGY_AUDIT_VERSION = "weather-quality-v1"
+
+
 class TrainingCorpusService:
     def __init__(
         self,
@@ -55,9 +58,12 @@ class TrainingCorpusService:
             limit=self.settings.training_status_room_limit,
             days=self.settings.training_window_days,
             good_research_only=False,
+            quality_cleaned_only=False,
         )
         bundles = await self._selected_bundles(request)
-        readiness = self._readiness_for_bundles(bundles)
+        audits = [self._bundle_strategy_audit(bundle) for bundle in bundles]
+        readiness_bundles = await self._selected_bundles(request.model_copy(update={"quality_cleaned_only": True}))
+        readiness = self._readiness_for_bundles(readiness_bundles)
         if persist_readiness:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session)
@@ -90,10 +96,33 @@ class TrainingCorpusService:
         pack_versions = sorted({bundle.room.get("agent_pack_version") for bundle in bundles if bundle.room.get("agent_pack_version")})
         recent_builds = [self._summary_from_record(record).model_dump(mode="json") for record in builds]
 
-        trainable_request = request.model_copy(update={"good_research_only": True})
+        trainable_request = request.model_copy(update={"good_research_only": True, "quality_cleaned_only": True})
         trainable_bundles = await self._selected_bundles(trainable_request)
         holdout_count = max(1, int(len(trainable_bundles) * self.settings.self_improve_holdout_ratio)) if trainable_bundles else 0
         oldest_unsettled_age_seconds = self._oldest_unsettled_age_seconds(bundles)
+        exclusion_reason_counts = Counter(
+            bundle.exclude_reason for bundle in bundles if bundle.exclude_reason
+        )
+        forward_audit_count = sum(1 for bundle in bundles if bundle.audit_source == "live_forward")
+        backfilled_audit_count = sum(1 for bundle in bundles if bundle.audit_source == "historical_backfill")
+        audited_room_count = forward_audit_count + backfilled_audit_count
+        quality_debt_summary = {
+            "stale_mismatch_count": sum(1 for audit in audits if audit.stale_data_mismatch),
+            "missed_stand_down_count": sum(1 for audit in audits if audit.missed_stand_down),
+            "weak_resolved_trade_count": sum(
+                1
+                for audit in audits
+                if audit.trade_quality == "weak_trade"
+                and audit.resolution_state in {WeatherResolutionState.LOCKED_NO.value, WeatherResolutionState.LOCKED_YES.value}
+            ),
+            "cleaned_trainable_room_count": len(trainable_bundles),
+        }
+        audit_progress = {
+            "audited_room_count": audited_room_count,
+            "forward_audit_count": forward_audit_count,
+            "backfilled_audit_count": backfilled_audit_count,
+            "pending_backfill_room_count": max(0, len(bundles) - audited_room_count),
+        }
 
         return {
             "window_days": request.days,
@@ -111,17 +140,23 @@ class TrainingCorpusService:
             "active_failed_research_reasons": dict(active_failed_reason_counts.most_common()),
             "legacy_failed_research_reasons": dict(legacy_failed_reason_counts.most_common()),
             "trainable_room_count": len(trainable_bundles),
+            "cleaned_trainable_room_count": len(trainable_bundles),
             "evaluation_holdout_room_count": holdout_count,
             "pack_versions": pack_versions,
             "recent_dataset_builds": recent_builds,
             "campaign_settings": self._campaign_settings_snapshot(),
+            "quality_debt_summary": quality_debt_summary,
+            "strategy_audit_progress": audit_progress,
+            "quality_exclusion_reasons": dict(exclusion_reason_counts.most_common()),
             "readiness": readiness.model_dump(mode="json"),
             "last_readiness_snapshot": latest_snapshot.payload if latest_snapshot is not None else None,
             "top_missing_data": readiness.missing_indicators,
         }
 
     async def build_dataset(self, request: TrainingBuildRequest) -> dict[str, Any]:
-        bundles = await self._selected_bundles(request)
+        candidate_request = request.model_copy(update={"quality_cleaned_only": False})
+        candidate_bundles = await self._selected_bundles(candidate_request, persist_missing_audits=True)
+        bundles = self._filter_bundles_by_request(candidate_bundles, request)
         selected_bundles = self._apply_mode_slice(request.mode, bundles)
         if request.mode == "role-sft":
             export_records = [
@@ -135,7 +170,7 @@ class TrainingCorpusService:
         build_version = f"{request.mode}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
         room_items = [self._dataset_item(bundle) for bundle in selected_bundles]
         selection_window_start, selection_window_end = self._selection_window(selected_bundles)
-        label_stats = self._label_stats(selected_bundles)
+        label_stats = self._label_stats(selected_bundles, candidate_bundles=candidate_bundles)
         pack_versions = sorted(
             {
                 bundle.room.get("agent_pack_version")
@@ -198,6 +233,7 @@ class TrainingCorpusService:
                 limit=self.settings.training_status_room_limit,
                 days=self.settings.training_window_days,
                 good_research_only=False,
+                quality_cleaned_only=True,
             )
         )
         readiness = self._readiness_for_bundles(bundles)
@@ -299,7 +335,11 @@ class TrainingCorpusService:
 
     async def strategy_audit_room(self, room_id: str) -> StrategyAuditResult:
         bundle = await self.training_export_service.build_room_bundle(room_id)
-        return self._audit_bundle(bundle)
+        if bundle.strategy_audit is not None:
+            return self._bundle_strategy_audit(bundle)
+        audit = self._audit_bundle(bundle, audit_source="historical_backfill")
+        await self._persist_audit(audit)
+        return audit
 
     async def strategy_audit_summary(self, *, days: int | None = None, limit: int = 100) -> StrategyAuditSummary:
         request = TrainingBuildRequest(
@@ -307,14 +347,19 @@ class TrainingCorpusService:
             limit=limit,
             days=days or self.settings.training_window_days,
             good_research_only=False,
+            quality_cleaned_only=False,
         )
         bundles = await self._selected_bundles(request)
-        audits = [self._audit_bundle(bundle) for bundle in bundles]
+        audits = [self._bundle_strategy_audit(bundle) for bundle in bundles]
         thesis_counts = Counter(audit.thesis_correctness for audit in audits)
         trade_quality_counts = Counter(audit.trade_quality for audit in audits)
         block_correctness_counts = Counter(audit.block_correctness for audit in audits)
+        exclusion_reason_counts = Counter(audit.exclude_reason for audit in audits if audit.exclude_reason)
         return StrategyAuditSummary(
             room_count=len(audits),
+            audited_room_count=sum(1 for audit in audits if audit.audit_source in {"live_forward", "historical_backfill"}),
+            forward_audit_count=sum(1 for audit in audits if audit.audit_source == "live_forward"),
+            backfilled_audit_count=sum(1 for audit in audits if audit.audit_source == "historical_backfill"),
             stale_mismatch_count=sum(1 for audit in audits if audit.stale_data_mismatch),
             low_upside_proposal_count=sum(1 for audit in audits if audit.trade_quality == "weak_trade"),
             resolved_contract_proposal_count=sum(
@@ -324,11 +369,50 @@ class TrainingCorpusService:
                 and audit.trade_quality == "weak_trade"
             ),
             missed_stand_down_count=sum(1 for audit in audits if audit.missed_stand_down),
+            cleaned_trainable_room_count=sum(1 for audit in audits if audit.trainable_default),
+            exclusion_reason_counts=dict(exclusion_reason_counts.most_common()),
             thesis_counts=dict(thesis_counts),
             trade_quality_counts=dict(trade_quality_counts),
             block_correctness_counts=dict(block_correctness_counts),
             samples=audits[: min(10, len(audits))],
         )
+
+    async def backfill_strategy_audits(self, *, days: int = 30, limit: int = 200) -> dict[str, Any]:
+        request = TrainingBuildRequest(
+            mode="room-bundles",
+            limit=limit,
+            days=days,
+            good_research_only=False,
+            quality_cleaned_only=False,
+        )
+        bundles = await self._selected_bundles(request, persist_missing_audits=False)
+        created = 0
+        updated = 0
+        audits: list[StrategyAuditResult] = []
+        for bundle in bundles:
+            existing = bundle.audit_source in {"live_forward", "historical_backfill"}
+            audit = self._audit_bundle(bundle, audit_source="historical_backfill")
+            await self._persist_audit(audit)
+            audits.append(audit)
+            if existing:
+                updated += 1
+            else:
+                created += 1
+        return {
+            "status": "completed",
+            "days": days,
+            "room_count": len(bundles),
+            "created_count": created,
+            "updated_count": updated,
+            "audit_version": STRATEGY_AUDIT_VERSION,
+            "samples": [audit.model_dump(mode="json") for audit in audits[: min(10, len(audits))]],
+        }
+
+    async def persist_strategy_audit_for_room(self, room_id: str, *, audit_source: str = "live_forward") -> StrategyAuditResult:
+        bundle = await self.training_export_service.build_room_bundle(room_id)
+        audit = self._audit_bundle(bundle, audit_source=audit_source)
+        await self._persist_audit(audit)
+        return audit
 
     async def select_learning_room_ids(
         self,
@@ -348,7 +432,12 @@ class TrainingCorpusService:
         bundles = await self._selected_bundles(request)
         return [bundle.room["id"] for bundle in bundles]
 
-    async def _selected_bundles(self, request: TrainingBuildRequest) -> list[TrainingRoomBundle]:
+    async def _selected_bundles(
+        self,
+        request: TrainingBuildRequest,
+        *,
+        persist_missing_audits: bool = False,
+    ) -> list[TrainingRoomBundle]:
         since = datetime.now(UTC) - timedelta(days=request.days)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -364,11 +453,60 @@ class TrainingCorpusService:
             limit=len(rooms),
             include_non_complete=request.include_non_complete,
         )
+        audited_bundles = await self._attach_strategy_audits(bundles, persist_missing=persist_missing_audits)
+        return self._filter_bundles_by_request(audited_bundles, request)
+
+    async def _attach_strategy_audits(
+        self,
+        bundles: list[TrainingRoomBundle],
+        *,
+        persist_missing: bool,
+    ) -> list[TrainingRoomBundle]:
+        attached: list[TrainingRoomBundle] = []
+        for bundle in bundles:
+            if bundle.strategy_audit is not None:
+                attached.append(bundle)
+                continue
+            audit = self._audit_bundle(bundle, audit_source="historical_backfill")
+            if persist_missing:
+                await self._persist_audit(audit)
+                next_source = audit.audit_source
+                next_version = audit.audit_version
+                next_trainable = audit.trainable_default
+                next_exclude_reason = audit.exclude_reason
+                next_payload = audit.model_dump(mode="json")
+            else:
+                preview_audit = audit.model_copy(update={"audit_source": "computed_preview"})
+                next_source = preview_audit.audit_source
+                next_version = preview_audit.audit_version
+                next_trainable = preview_audit.trainable_default
+                next_exclude_reason = preview_audit.exclude_reason
+                next_payload = preview_audit.model_dump(mode="json")
+            attached.append(
+                bundle.model_copy(
+                    update={
+                        "strategy_audit": next_payload,
+                        "audit_source": next_source,
+                        "audit_version": next_version,
+                        "trainable_default": next_trainable,
+                        "exclude_reason": next_exclude_reason,
+                    }
+                )
+            )
+        return attached
+
+    def _filter_bundles_by_request(
+        self,
+        bundles: list[TrainingRoomBundle],
+        request: TrainingBuildRequest,
+    ) -> list[TrainingRoomBundle]:
         filtered: list[TrainingRoomBundle] = []
         for bundle in bundles:
             if request.good_research_only and not bool((bundle.research_health or {}).get("good_for_training")):
                 continue
             if request.settled_only and not bundle.outcome.settlement_seen:
+                continue
+            if request.quality_cleaned_only and bundle.trainable_default is False:
                 continue
             if not request.include_non_complete and bundle.room.get("stage") != "complete":
                 continue
@@ -447,7 +585,17 @@ class TrainingCorpusService:
             },
         )
 
-    def _audit_bundle(self, bundle: TrainingRoomBundle) -> StrategyAuditResult:
+    def _bundle_strategy_audit(self, bundle: TrainingRoomBundle) -> StrategyAuditResult:
+        if bundle.strategy_audit is not None:
+            return StrategyAuditResult.model_validate(bundle.strategy_audit)
+        return self._audit_bundle(bundle)
+
+    def _audit_bundle(
+        self,
+        bundle: TrainingRoomBundle,
+        *,
+        audit_source: str | None = None,
+    ) -> StrategyAuditResult:
         signal = bundle.signal or {}
         signal_payload = signal.get("payload") or {}
         risk = bundle.risk_verdict or {}
@@ -461,6 +609,7 @@ class TrainingCorpusService:
             and any("stale" in reason.lower() for reason in risk_reasons)
             and not (isinstance(eligibility, dict) and eligibility.get("research_stale"))
         )
+        effective_freshness_agreement = not stale_mismatch
         missed_stand_down = trade_quality == "weak_trade" and bundle.outcome.ticket_generated
         if bundle.outcome.blocked_by == "risk":
             block_correctness = "correct_block" if risk_reasons else "blocked"
@@ -482,6 +631,20 @@ class TrainingCorpusService:
             reasons.append(f"Eligibility stand-down reason: {eligibility['stand_down_reason']}.")
         reasons.extend(risk_reasons[:2])
 
+        quality_warnings = self._quality_warnings(
+            trade_quality=trade_quality,
+            resolution_state=resolution_state,
+            missed_stand_down=missed_stand_down,
+            stale_data_mismatch=stale_mismatch,
+        )
+        exclude_reason = self._exclude_reason(
+            trade_quality=trade_quality,
+            resolution_state=resolution_state,
+            missed_stand_down=missed_stand_down,
+            stale_data_mismatch=stale_mismatch,
+        )
+        trainable_default = exclude_reason is None
+
         return StrategyAuditResult(
             room_id=bundle.room["id"],
             market_ticker=bundle.room["market_ticker"],
@@ -490,10 +653,17 @@ class TrainingCorpusService:
             block_correctness=block_correctness,
             missed_stand_down=missed_stand_down,
             stale_data_mismatch=stale_mismatch,
+            effective_freshness_agreement=effective_freshness_agreement,
             resolution_state=resolution_state,
             eligibility_passed=bundle.outcome.eligibility_passed,
             stand_down_reason=bundle.outcome.stand_down_reason,
             blocked_by=bundle.outcome.blocked_by,
+            audit_source=audit_source,
+            audit_version=STRATEGY_AUDIT_VERSION,
+            trainable_default=trainable_default,
+            exclude_reason=exclude_reason,
+            quality_warnings=quality_warnings,
+            audited_at=datetime.now(UTC),
             reasons=reasons,
         )
 
@@ -557,13 +727,78 @@ class TrainingCorpusService:
                 return "weak_trade"
         return "good_trade"
 
+    @staticmethod
+    def _quality_warnings(
+        *,
+        trade_quality: str,
+        resolution_state: str | None,
+        missed_stand_down: bool,
+        stale_data_mismatch: bool,
+    ) -> list[str]:
+        warnings: list[str] = []
+        if stale_data_mismatch:
+            warnings.append("stale_data_mismatch")
+        if missed_stand_down:
+            warnings.append("missed_stand_down")
+        if trade_quality == "weak_trade":
+            warnings.append("weak_trade")
+        if resolution_state in {WeatherResolutionState.LOCKED_NO.value, WeatherResolutionState.LOCKED_YES.value}:
+            warnings.append("resolved_contract")
+        return warnings
+
+    @staticmethod
+    def _exclude_reason(
+        *,
+        trade_quality: str,
+        resolution_state: str | None,
+        missed_stand_down: bool,
+        stale_data_mismatch: bool,
+    ) -> str | None:
+        if stale_data_mismatch:
+            return "stale_data_mismatch"
+        if resolution_state in {WeatherResolutionState.LOCKED_NO.value, WeatherResolutionState.LOCKED_YES.value} and trade_quality == "weak_trade":
+            return "resolved_contract_proposal"
+        if missed_stand_down:
+            return "missed_stand_down"
+        return None
+
+    async def _persist_audit(self, audit: StrategyAuditResult) -> None:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.upsert_room_strategy_audit(
+                room_id=audit.room_id,
+                market_ticker=audit.market_ticker,
+                audit_source=audit.audit_source or "historical_backfill",
+                audit_version=audit.audit_version or STRATEGY_AUDIT_VERSION,
+                thesis_correctness=audit.thesis_correctness,
+                trade_quality=audit.trade_quality,
+                block_correctness=audit.block_correctness,
+                missed_stand_down=audit.missed_stand_down,
+                stale_data_mismatch=audit.stale_data_mismatch,
+                effective_freshness_agreement=audit.effective_freshness_agreement,
+                resolution_state=audit.resolution_state,
+                eligibility_passed=audit.eligibility_passed,
+                stand_down_reason=audit.stand_down_reason,
+                trainable_default=audit.trainable_default,
+                exclude_reason=audit.exclude_reason,
+                quality_warnings=audit.quality_warnings,
+                payload=audit.model_dump(mode="json"),
+            )
+            await session.commit()
+
     def _dataset_item(self, bundle: TrainingRoomBundle) -> dict[str, Any]:
+        audit = self._bundle_strategy_audit(bundle)
         return {
             "room_id": bundle.room["id"],
             "market_ticker": bundle.room["market_ticker"],
             "agent_pack_version": bundle.room.get("agent_pack_version"),
             "campaign": bundle.campaign,
             "research_health": bundle.research_health,
+            "strategy_audit": audit.model_dump(mode="json"),
+            "audit_source": audit.audit_source,
+            "audit_version": audit.audit_version,
+            "trainable_default": audit.trainable_default,
+            "exclude_reason": audit.exclude_reason,
             "labels": {
                 "research_gate_passed": bundle.outcome.research_gate_passed,
                 "trade_proposed": bundle.outcome.ticket_generated,
@@ -580,7 +815,19 @@ class TrainingCorpusService:
             },
         }
 
-    def _label_stats(self, bundles: list[TrainingRoomBundle]) -> dict[str, Any]:
+    def _label_stats(
+        self,
+        bundles: list[TrainingRoomBundle],
+        *,
+        candidate_bundles: list[TrainingRoomBundle] | None = None,
+    ) -> dict[str, Any]:
+        candidates = candidate_bundles or bundles
+        selected_room_ids = {selected.room["id"] for selected in bundles}
+        excluded_audits = [
+            self._bundle_strategy_audit(bundle)
+            for bundle in candidates
+            if bundle.room["id"] not in selected_room_ids
+        ]
         return {
             "research_gate_passed": sum(1 for bundle in bundles if bundle.outcome.research_gate_passed is True),
             "trade_proposed": sum(1 for bundle in bundles if bundle.outcome.ticket_generated),
@@ -591,6 +838,13 @@ class TrainingCorpusService:
             "fills_present": sum(1 for bundle in bundles if bundle.outcome.fills_observed > 0),
             "settlement_seen": sum(1 for bundle in bundles if bundle.outcome.settlement_seen),
             "good_research": sum(1 for bundle in bundles if bool((bundle.research_health or {}).get("good_for_training"))),
+            "excluded_weak_trades": sum(1 for audit in excluded_audits if audit.trade_quality == "weak_trade"),
+            "excluded_stale_mismatches": sum(1 for audit in excluded_audits if audit.stale_data_mismatch),
+            "excluded_resolved_contract_proposals": sum(
+                1 for audit in excluded_audits if audit.exclude_reason == "resolved_contract_proposal"
+            ),
+            "forward_audit_count": sum(1 for bundle in bundles if bundle.audit_source == "live_forward"),
+            "backfilled_audit_count": sum(1 for bundle in bundles if bundle.audit_source == "historical_backfill"),
         }
 
     def _selection_window(

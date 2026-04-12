@@ -43,6 +43,7 @@ class TrainingExportService:
             research_sources = await repo.list_artifacts(room_id=room_id, artifact_type="research_source", limit=100)
             campaign = await repo.get_room_campaign(room_id)
             research_health = await repo.get_room_research_health(room_id)
+            strategy_audit = await repo.get_room_strategy_audit(room_id)
             settlement = await self._latest_settlement_for_market(repo, room.market_ticker)
             await session.commit()
 
@@ -62,6 +63,11 @@ class TrainingExportService:
             room=self._room_dict(room),
             campaign=(self._campaign_dict(campaign) if campaign is not None else None),
             research_health=(self._research_health_dict(research_health) if research_health is not None else None),
+            strategy_audit=(dict(strategy_audit.payload or {}) if strategy_audit is not None else None),
+            audit_source=(strategy_audit.audit_source if strategy_audit is not None else None),
+            audit_version=(strategy_audit.audit_version if strategy_audit is not None else None),
+            trainable_default=(strategy_audit.trainable_default if strategy_audit is not None else None),
+            exclude_reason=(strategy_audit.exclude_reason if strategy_audit is not None else None),
             messages=messages,
             signal=self._signal_dict(signal) if signal is not None else None,
             research_dossier=dossier_artifact.payload if dossier_artifact is not None else None,

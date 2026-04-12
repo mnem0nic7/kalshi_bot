@@ -117,6 +117,10 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 result = await container.training_corpus_service.strategy_audit_room(args.room_id)
                 print(json.dumps(result.model_dump(mode="json"), indent=2))
                 return 0
+            if args.strategy_audit_command == "backfill":
+                result = await container.training_corpus_service.backfill_strategy_audits(days=args.days, limit=args.limit)
+                print(json.dumps(result, indent=2))
+                return 0
             if args.strategy_audit_command == "summary":
                 result = await container.training_corpus_service.strategy_audit_summary(days=args.days, limit=args.limit)
                 print(json.dumps(result.model_dump(mode="json"), indent=2))
@@ -158,6 +162,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 settled_only=args.settled_only,
                 include_non_complete=args.include_non_complete,
                 good_research_only=args.good_research_only,
+                quality_cleaned_only=args.quality_cleaned_only,
                 market_ticker=args.market_ticker,
                 output=args.output,
             )
@@ -420,6 +425,9 @@ def build_parser() -> argparse.ArgumentParser:
     strategy_audit_subparsers = strategy_audit.add_subparsers(dest="strategy_audit_command", required=True)
     strategy_audit_room = strategy_audit_subparsers.add_parser("room")
     strategy_audit_room.add_argument("room_id")
+    strategy_audit_backfill = strategy_audit_subparsers.add_parser("backfill")
+    strategy_audit_backfill.add_argument("--days", type=int, default=30)
+    strategy_audit_backfill.add_argument("--limit", type=int, default=200)
     strategy_audit_summary = strategy_audit_subparsers.add_parser("summary")
     strategy_audit_summary.add_argument("--days", type=int, default=None)
     strategy_audit_summary.add_argument("--limit", type=int, default=100)
@@ -447,6 +455,11 @@ def build_parser() -> argparse.ArgumentParser:
     training_build.add_argument("--settled-only", action="store_true")
     training_build.add_argument("--include-non-complete", action="store_true")
     training_build.add_argument("--good-research-only", action="store_true")
+    training_build.add_argument(
+        "--quality-cleaned-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     training_build.add_argument("--market-ticker", default=None)
     training_build.add_argument("--output", default=None)
 

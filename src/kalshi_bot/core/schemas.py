@@ -342,6 +342,11 @@ class TrainingRoomBundle(BaseModel):
     room: dict[str, Any]
     campaign: dict[str, Any] | None = None
     research_health: dict[str, Any] | None = None
+    strategy_audit: dict[str, Any] | None = None
+    audit_source: str | None = None
+    audit_version: str | None = None
+    trainable_default: bool | None = None
+    exclude_reason: str | None = None
     messages: list[RoomMessageRead] = Field(default_factory=list)
     signal: dict[str, Any] | None = None
     research_dossier: dict[str, Any] | None = None
@@ -387,19 +392,31 @@ class StrategyAuditResult(BaseModel):
     block_correctness: str
     missed_stand_down: bool = False
     stale_data_mismatch: bool = False
+    effective_freshness_agreement: bool = True
     resolution_state: str | None = None
     eligibility_passed: bool | None = None
     stand_down_reason: str | None = None
     blocked_by: str | None = None
+    audit_source: str | None = None
+    audit_version: str | None = None
+    trainable_default: bool = True
+    exclude_reason: str | None = None
+    quality_warnings: list[str] = Field(default_factory=list)
+    audited_at: datetime | None = None
     reasons: list[str] = Field(default_factory=list)
 
 
 class StrategyAuditSummary(BaseModel):
     room_count: int = 0
+    audited_room_count: int = 0
+    forward_audit_count: int = 0
+    backfilled_audit_count: int = 0
     stale_mismatch_count: int = 0
     low_upside_proposal_count: int = 0
     resolved_contract_proposal_count: int = 0
     missed_stand_down_count: int = 0
+    cleaned_trainable_room_count: int = 0
+    exclusion_reason_counts: dict[str, int] = Field(default_factory=dict)
     thesis_counts: dict[str, int] = Field(default_factory=dict)
     trade_quality_counts: dict[str, int] = Field(default_factory=dict)
     block_correctness_counts: dict[str, int] = Field(default_factory=dict)
@@ -440,6 +457,7 @@ class TrainingBuildRequest(BaseModel):
     settled_only: bool = False
     include_non_complete: bool = False
     good_research_only: bool = False
+    quality_cleaned_only: bool = True
     market_ticker: str | None = None
     output: str | None = None
 

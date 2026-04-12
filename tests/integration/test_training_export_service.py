@@ -17,6 +17,8 @@ from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine
 from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.services.training import TrainingExportService
+from kalshi_bot.services.training_corpus import TrainingCorpusService
+from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
 
@@ -135,6 +137,13 @@ async def test_training_export_service_builds_room_bundle_and_role_examples(tmp_
         signal_engine,
         agent_pack_service,
     )
+    training_corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        DiscoveryService(FakeKalshi(), directory),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
     supervisor = WorkflowSupervisor(
         settings=settings,
         session_factory=session_factory,
@@ -147,6 +156,7 @@ async def test_training_export_service_builds_room_bundle_and_role_examples(tmp_
         execution_service=execution_service,
         memory_service=memory_service,
         research_coordinator=research_coordinator,
+        training_corpus_service=training_corpus_service,
         agents=agents,
     )
     training_service = TrainingExportService(session_factory)
@@ -179,6 +189,7 @@ async def test_training_export_service_builds_room_bundle_and_role_examples(tmp_
     assert bundle.room["market_ticker"] == "WX-TEST"
     assert bundle.signal is not None
     assert bundle.research_dossier is not None
+    assert bundle.strategy_audit is not None
     assert bundle.trade_ticket is not None
     assert bundle.risk_verdict is not None
     assert bundle.orders

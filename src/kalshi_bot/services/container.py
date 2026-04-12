@@ -124,6 +124,7 @@ class AppContainer:
             execution_service=execution_service,
             memory_service=memory_service,
             research_coordinator=research_coordinator,
+            training_corpus_service=training_corpus_service,
             agents=agents,
         )
         shadow_training_service = ShadowTrainingService(

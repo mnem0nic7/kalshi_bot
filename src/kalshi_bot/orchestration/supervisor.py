@@ -23,6 +23,7 @@ from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
 from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine, evaluate_trade_eligibility
+from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class WorkflowSupervisor:
         execution_service: ExecutionService,
         memory_service: MemoryService,
         research_coordinator: ResearchCoordinator,
+        training_corpus_service: TrainingCorpusService,
         agents: AgentSuite,
     ) -> None:
         self.settings = settings
@@ -70,6 +72,7 @@ class WorkflowSupervisor:
         self.execution_service = execution_service
         self.memory_service = memory_service
         self.research_coordinator = research_coordinator
+        self.training_corpus_service = training_corpus_service
         self.agents = agents
 
     async def run_room(self, room_id: str, reason: str = "manual") -> None:
@@ -444,6 +447,13 @@ class WorkflowSupervisor:
                 await repo.update_room_stage(room.id, RoomStage.COMPLETE)
                 ROOM_RUNS_TOTAL.labels(status="success").inc()
                 await session.commit()
+                try:
+                    await self.training_corpus_service.persist_strategy_audit_for_room(
+                        room.id,
+                        audit_source="live_forward",
+                    )
+                except Exception:
+                    logger.exception("failed to persist strategy audit", extra={"room_id": room.id})
             except Exception as exc:
                 logger.exception("room workflow failed", extra={"room_id": room_id})
                 await session.rollback()

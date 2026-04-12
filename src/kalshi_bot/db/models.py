@@ -277,6 +277,28 @@ class RoomResearchHealthRecord(Base, TimestampMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class RoomStrategyAuditRecord(Base, TimestampMixin):
+    __tablename__ = "room_strategy_audits"
+
+    room_id: Mapped[str] = mapped_column(ForeignKey("rooms.id", ondelete="CASCADE"), primary_key=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    audit_source: Mapped[str] = mapped_column(String(32), default="live_forward", index=True)
+    audit_version: Mapped[str] = mapped_column(String(64), default="weather-quality-v1", index=True)
+    thesis_correctness: Mapped[str] = mapped_column(String(32), default="unresolved", index=True)
+    trade_quality: Mapped[str] = mapped_column(String(32), default="stand_down", index=True)
+    block_correctness: Mapped[str] = mapped_column(String(32), default="not_applicable", index=True)
+    missed_stand_down: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    stale_data_mismatch: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    effective_freshness_agreement: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    resolution_state: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    eligibility_passed: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
+    stand_down_reason: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    trainable_default: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    exclude_reason: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    quality_warnings: Mapped[list[str]] = mapped_column(JSON, default=list)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class MemoryNoteRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "memory_notes"
 

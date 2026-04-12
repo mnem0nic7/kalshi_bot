@@ -228,6 +228,7 @@ def test_status_api_includes_runtime_health(tmp_path, monkeypatch) -> None:
         assert body["runtime_health"]["active_color"] == "blue"
         assert body["runtime_health"]["colors"]["blue"]["daemon"]["healthy"] is True
         assert body["runtime_health"]["last_boot_recovery"]["reason"] == "seed_boot"
+        assert "quality_debt_summary" in body["training"]
 
     get_settings.cache_clear()
 
@@ -268,6 +269,8 @@ def test_strategy_audit_endpoints_render(tmp_path, monkeypatch) -> None:
         room_response = client.get(f"/api/strategy-audit/rooms/{room_id}")
         assert room_response.status_code == 200
         assert room_response.json()["room_id"] == room_id
+        assert room_response.json()["audit_source"] in {"historical_backfill", "computed_preview"}
+        assert room_response.json()["audit_version"] == "weather-quality-v1"
 
         summary_response = client.get("/api/strategy-audit/summary")
         assert summary_response.status_code == 200

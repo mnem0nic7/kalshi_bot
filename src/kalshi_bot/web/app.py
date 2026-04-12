@@ -430,6 +430,7 @@ async def _load_room_snapshot(app_container: AppContainer, room_id: str, *, incl
         memory_note = await repo.get_latest_memory_note_for_room(room_id)
         campaign = await repo.get_room_campaign(room_id)
         research_health = await repo.get_room_research_health(room_id)
+        strategy_audit = await repo.get_room_strategy_audit(room_id)
         dossier_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="research_dossier_snapshot")
         delta_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="research_delta")
         market_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="market_snapshot")
@@ -449,6 +450,7 @@ async def _load_room_snapshot(app_container: AppContainer, room_id: str, *, incl
     serialized_memory = _serialize_memory_note(memory_note)
     serialized_campaign = _serialize_campaign(campaign)
     serialized_research_health = _serialize_research_health(research_health)
+    serialized_strategy_audit = dict(strategy_audit.payload or {}) if strategy_audit is not None else None
     serialized_sources = [artifact.payload for artifact in source_artifacts]
     research_dossier = (
         dossier_artifact.payload
@@ -470,6 +472,7 @@ async def _load_room_snapshot(app_container: AppContainer, room_id: str, *, incl
         "memory_note": serialized_memory,
         "campaign": serialized_campaign,
         "research_health": serialized_research_health,
+        "strategy_audit": serialized_strategy_audit,
         "research_dossier": research_dossier,
         "research_delta": research_delta,
         "research_sources": serialized_sources,

@@ -49,6 +49,7 @@ from kalshi_bot.db.models import (
     RoomCampaignRecord,
     RoomMessage,
     RoomResearchHealthRecord,
+    RoomStrategyAuditRecord,
     Signal,
     TrainingDatasetBuildItemRecord,
     TrainingDatasetBuildRecord,
@@ -928,6 +929,74 @@ class PlatformRepository:
         if good_for_training is not None:
             stmt = stmt.where(RoomResearchHealthRecord.good_for_training.is_(good_for_training))
         result = await self.session.execute(stmt.order_by(RoomResearchHealthRecord.updated_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def upsert_room_strategy_audit(
+        self,
+        *,
+        room_id: str,
+        market_ticker: str,
+        audit_source: str,
+        audit_version: str,
+        thesis_correctness: str,
+        trade_quality: str,
+        block_correctness: str,
+        missed_stand_down: bool,
+        stale_data_mismatch: bool,
+        effective_freshness_agreement: bool,
+        resolution_state: str | None,
+        eligibility_passed: bool | None,
+        stand_down_reason: str | None,
+        trainable_default: bool,
+        exclude_reason: str | None,
+        quality_warnings: list[str],
+        payload: dict[str, Any],
+    ) -> RoomStrategyAuditRecord:
+        record = await self.session.get(RoomStrategyAuditRecord, room_id)
+        if record is None:
+            record = RoomStrategyAuditRecord(room_id=room_id, market_ticker=market_ticker, payload={})
+            self.session.add(record)
+        record.market_ticker = market_ticker
+        record.audit_source = audit_source
+        record.audit_version = audit_version
+        record.thesis_correctness = thesis_correctness
+        record.trade_quality = trade_quality
+        record.block_correctness = block_correctness
+        record.missed_stand_down = missed_stand_down
+        record.stale_data_mismatch = stale_data_mismatch
+        record.effective_freshness_agreement = effective_freshness_agreement
+        record.resolution_state = resolution_state
+        record.eligibility_passed = eligibility_passed
+        record.stand_down_reason = stand_down_reason
+        record.trainable_default = trainable_default
+        record.exclude_reason = exclude_reason
+        record.quality_warnings = quality_warnings
+        record.payload = payload
+        await self.session.flush()
+        return record
+
+    async def get_room_strategy_audit(self, room_id: str) -> RoomStrategyAuditRecord | None:
+        return await self.session.get(RoomStrategyAuditRecord, room_id)
+
+    async def list_room_strategy_audits(
+        self,
+        *,
+        limit: int = 200,
+        since: datetime | None = None,
+        market_ticker: str | None = None,
+        audit_source: str | None = None,
+        trainable_default: bool | None = None,
+    ) -> list[RoomStrategyAuditRecord]:
+        stmt = select(RoomStrategyAuditRecord)
+        if since is not None:
+            stmt = stmt.where(RoomStrategyAuditRecord.updated_at >= since)
+        if market_ticker is not None:
+            stmt = stmt.where(RoomStrategyAuditRecord.market_ticker == market_ticker)
+        if audit_source is not None:
+            stmt = stmt.where(RoomStrategyAuditRecord.audit_source == audit_source)
+        if trainable_default is not None:
+            stmt = stmt.where(RoomStrategyAuditRecord.trainable_default.is_(trainable_default))
+        result = await self.session.execute(stmt.order_by(RoomStrategyAuditRecord.updated_at.desc()).limit(limit))
         return list(result.scalars())
 
     async def create_agent_pack(self, pack: AgentPack) -> AgentPackRecord:

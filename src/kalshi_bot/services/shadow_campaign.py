@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import WeatherResolutionState
 from kalshi_bot.core.schemas import ResearchDossier, ShadowCampaignRequest
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.discovery import DiscoveryService, MarketDiscovery
@@ -85,6 +86,19 @@ class ShadowCampaignService:
                 continue
             if failure_count[mapping.market_ticker] >= 3 and mapping.market_ticker not in recent_dossiers:
                 continue
+            dossier_payload = recent_dossiers.get(mapping.market_ticker)
+            signal = None
+            if dossier_payload is not None:
+                try:
+                    dossier_model = ResearchDossier.model_validate(dossier_payload)
+                    quality = self.research_coordinator.training_quality_snapshot(dossier_model)
+                    if not bool(quality.get("valid_dossier")):
+                        continue
+                    signal = self.research_coordinator.build_signal_from_dossier(dossier_model, discovery.raw)
+                    if signal.resolution_state != WeatherResolutionState.UNRESOLVED:
+                        continue
+                except Exception:
+                    signal = None
             last_seen = market_last_seen.get(mapping.market_ticker)
             if last_seen is not None and (now - last_seen).total_seconds() < self.settings.training_campaign_cooldown_seconds:
                 continue
@@ -93,9 +107,10 @@ class ShadowCampaignService:
             candidates.append(
                 self._candidate_from_discovery(
                     discovery,
-                    dossier=recent_dossiers.get(mapping.market_ticker),
+                    dossier=dossier_payload,
                     recent_count=market_recent_count[mapping.market_ticker],
                     now=now,
+                    signal=signal,
                 )
             )
 
@@ -163,11 +178,11 @@ class ShadowCampaignService:
         dossier: dict[str, Any] | None,
         recent_count: int,
         now: datetime,
+        signal: Any = None,
     ) -> ShadowCampaignCandidate:
         mapping = discovery.mapping
         fair_yes = self._decimal_or_none(((dossier or {}).get("trader_context") or {}).get("fair_yes_dollars"))
-        signal = None
-        if dossier is not None:
+        if signal is None and dossier is not None:
             try:
                 signal = self.research_coordinator.build_signal_from_dossier(
                     ResearchDossier.model_validate(dossier),

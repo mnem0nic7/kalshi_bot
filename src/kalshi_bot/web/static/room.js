@@ -555,6 +555,30 @@
     container.replaceChildren(...cards);
   }
 
+  function renderStrategyAudit() {
+    const audit = state.snapshot.strategy_audit || null;
+    setSummaryText("strategy-audit-source", audit ? audit.audit_source || "n/a" : "n/a");
+    setSummaryText("strategy-audit-version", audit ? audit.audit_version || "n/a" : "n/a");
+    setSummaryText("strategy-audit-trade-quality", audit ? formatStage(audit.trade_quality || "n/a") : "n/a");
+    setSummaryText("strategy-audit-trainable", audit ? String(Boolean(audit.trainable_default)) : "n/a");
+    setSummaryText("strategy-audit-exclusion", audit ? audit.exclude_reason || "none" : "none");
+
+    const warnings = document.getElementById("strategy-audit-warnings");
+    if (warnings) {
+      const items = safeArray(audit && audit.quality_warnings);
+      if (!items.length) {
+        warnings.replaceChildren(buildBadge("", "no warnings"));
+      } else {
+        warnings.replaceChildren(...items.map((warning) => buildBadge("", String(warning))));
+      }
+    }
+
+    const empty = document.getElementById("strategy-audit-empty");
+    if (empty) {
+      empty.textContent = audit ? "" : "No persisted strategy audit recorded yet.";
+    }
+  }
+
   function renderMemorySummary() {
     const container = document.getElementById("memory-summary");
     if (!container) {
@@ -607,6 +631,7 @@
     renderWeatherPanel();
     renderQualityPanel();
     renderSourcePanel();
+    renderStrategyAudit();
     renderRuntimeModels();
     renderMemorySummary();
   }

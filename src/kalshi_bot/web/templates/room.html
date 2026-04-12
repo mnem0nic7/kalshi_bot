@@ -267,6 +267,36 @@
     <section class="panel">
       <div class="panel-heading">
         <div>
+          <p class="eyebrow">Audit</p>
+          <h2>Strategy Quality</h2>
+        </div>
+      </div>
+      {% if snapshot.strategy_audit %}
+      <div class="metric-grid">
+        <div class="metric-card"><span class="metric-label">Source</span><strong id="strategy-audit-source">{{ snapshot.strategy_audit.audit_source or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Version</span><strong id="strategy-audit-version">{{ snapshot.strategy_audit.audit_version or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Trade Quality</span><strong id="strategy-audit-trade-quality">{{ snapshot.strategy_audit.trade_quality }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Trainable</span><strong id="strategy-audit-trainable">{{ snapshot.strategy_audit.trainable_default }}</strong></div>
+      </div>
+      <div class="mini-card">
+        <strong>Exclusion</strong>
+        <span id="strategy-audit-exclusion">{{ snapshot.strategy_audit.exclude_reason or "none" }}</span>
+      </div>
+      {% if snapshot.strategy_audit.quality_warnings %}
+      <div id="strategy-audit-warnings" class="chip-cloud">
+        {% for warning in snapshot.strategy_audit.quality_warnings %}
+        <span class="badge">{{ warning }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% else %}
+      <p id="strategy-audit-empty" class="empty-state">No persisted strategy audit recorded yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
           <p class="eyebrow">Runtime</p>
           <h2>Models</h2>
         </div>

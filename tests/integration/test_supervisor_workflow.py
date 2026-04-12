@@ -17,6 +17,9 @@ from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine
 from kalshi_bot.services.signal import WeatherSignalEngine
+from kalshi_bot.services.training import TrainingExportService
+from kalshi_bot.services.training_corpus import TrainingCorpusService
+from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
 
@@ -178,6 +181,13 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         signal_engine,
         agent_pack_service,
     )
+    training_corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        DiscoveryService(FakeKalshi(), directory),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
     supervisor = WorkflowSupervisor(
         settings=settings,
         session_factory=session_factory,
@@ -190,6 +200,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         execution_service=execution_service,
         memory_service=memory_service,
         research_coordinator=research_coordinator,
+        training_corpus_service=training_corpus_service,
         agents=agents,
     )
 
@@ -211,12 +222,15 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         repo = PlatformRepository(session)
         stored_room = await repo.get_room(room.id)
         messages = await repo.list_messages(room.id)
+        audit = await repo.get_room_strategy_audit(room.id)
         await session.commit()
 
     assert stored_room is not None
     assert stored_room.stage == "complete"
     assert any(message.role == "trader" for message in messages)
     assert any(message.kind == "ExecReceipt" for message in messages)
+    assert audit is not None
+    assert audit.audit_source == "live_forward"
 
     await engine.dispose()
 
@@ -269,6 +283,13 @@ async def test_supervisor_stands_down_on_resolved_contract_before_risk(tmp_path)
         signal_engine,
         agent_pack_service,
     )
+    training_corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        DiscoveryService(WideChicagoKalshi(), directory),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
     supervisor = WorkflowSupervisor(
         settings=settings,
         session_factory=session_factory,
@@ -281,6 +302,7 @@ async def test_supervisor_stands_down_on_resolved_contract_before_risk(tmp_path)
         execution_service=execution_service,
         memory_service=memory_service,
         research_coordinator=research_coordinator,
+        training_corpus_service=training_corpus_service,
         agents=agents,
     )
 
