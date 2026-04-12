@@ -288,3 +288,288 @@ series_templates:
         assert historical_room_id == lines[0]["room"]["id"]
 
     get_settings.cache_clear()
+
+
+def test_historical_repair_refresh_rebuilds_replay_corpus_and_marks_builds_stale(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    stale_output_path = tmp_path / "historical_stale_build.jsonl"
+    stale_output_path.write_text('{"status":"old"}\n', encoding="utf-8")
+    map_path.write_text(
+        """
+series_templates:
+  - series_ticker: KXHIGHNY
+    display_name: NYC Daily High Temperature
+    station_id: KNYC
+    daily_summary_station_id: USW00094728
+    location_name: New York City
+    timezone_name: America/New_York
+    latitude: 40.7146
+    longitude: -74.0071
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "historical-refresh.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> str:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                control = await repo.get_deployment_control()
+                stale_room = await repo.create_room(
+                    RoomCreate(name="Historical Stale Replay", market_ticker="KXHIGHNY-26APR11-T61"),
+                    active_color=container.settings.app_color,
+                    shadow_mode=False,
+                    kill_switch_enabled=False,
+                    kalshi_env=container.settings.kalshi_env,
+                    room_origin=RoomOrigin.HISTORICAL_REPLAY.value,
+                    agent_pack_version="builtin-gemini-v1",
+                )
+                await repo.update_room_stage(stale_room.id, RoomStage.COMPLETE)
+                close_ts = datetime(2026, 4, 11, 23, 59, 59, tzinfo=UTC)
+                settlement_ts = datetime(2026, 4, 12, 0, 30, tzinfo=UTC)
+                await repo.upsert_historical_settlement_label(
+                    market_ticker="KXHIGHNY-26APR11-T61",
+                    series_ticker="KXHIGHNY",
+                    local_market_day="2026-04-11",
+                    source_kind="kalshi_primary",
+                    kalshi_result="yes",
+                    settlement_value_dollars=Decimal("1.0000"),
+                    settlement_ts=settlement_ts,
+                    crosscheck_status="match",
+                    crosscheck_high_f=Decimal("81.00"),
+                    crosscheck_result="yes",
+                    payload={
+                        "market": {
+                            "ticker": "KXHIGHNY-26APR11-T61",
+                            "strike_type": "greater",
+                            "floor_strike": 61,
+                            "close_time": close_ts.isoformat(),
+                        }
+                    },
+                )
+                for label, asof_ts, yes_bid in (
+                    ("open_0900", datetime(2026, 4, 11, 12, 55, tzinfo=UTC), Decimal("0.5100")),
+                    ("midday_1300", datetime(2026, 4, 11, 16, 55, tzinfo=UTC), Decimal("0.5400")),
+                    ("late_1700", datetime(2026, 4, 11, 20, 55, tzinfo=UTC), Decimal("0.5700")),
+                ):
+                    await repo.upsert_historical_market_snapshot(
+                        market_ticker="KXHIGHNY-26APR11-T61",
+                        series_ticker="KXHIGHNY",
+                        station_id="KNYC",
+                        local_market_day="2026-04-11",
+                        asof_ts=asof_ts,
+                        source_kind="captured_market_snapshot",
+                        source_id=f"market-{label}",
+                        source_hash=f"hash-market-{label}",
+                        close_ts=close_ts,
+                        settlement_ts=settlement_ts,
+                        yes_bid_dollars=yes_bid,
+                        yes_ask_dollars=yes_bid + Decimal("0.0400"),
+                        no_ask_dollars=Decimal("1.0000") - yes_bid,
+                        last_price_dollars=yes_bid + Decimal("0.0100"),
+                        payload={
+                            "market": {
+                                "ticker": "KXHIGHNY-26APR11-T61",
+                                "strike_type": "greater",
+                                "floor_strike": 61,
+                                "updated_time": asof_ts.isoformat(),
+                            }
+                        },
+                    )
+                    await repo.upsert_historical_weather_snapshot(
+                        station_id="KNYC",
+                        series_ticker="KXHIGHNY",
+                        local_market_day="2026-04-11",
+                        asof_ts=asof_ts,
+                        source_kind="archived_weather_bundle",
+                        source_id=f"weather-{label}",
+                        source_hash=f"hash-weather-{label}",
+                        observation_ts=asof_ts,
+                        forecast_updated_ts=asof_ts - timedelta(minutes=15),
+                        forecast_high_f=Decimal("81.00"),
+                        current_temp_f=Decimal("72.00"),
+                        payload={"asof_ts": asof_ts.isoformat()},
+                    )
+                await repo.create_historical_replay_run(
+                    room_id=stale_room.id,
+                    market_ticker="KXHIGHNY-26APR11-T61",
+                    series_ticker="KXHIGHNY",
+                    local_market_day="2026-04-11",
+                    checkpoint_label="late_1700",
+                    checkpoint_ts=datetime(2026, 4, 11, 21, 0, tzinfo=UTC),
+                    status="completed",
+                    agent_pack_version="builtin-gemini-v1",
+                    payload={
+                        "historical_provenance": {
+                            "room_origin": RoomOrigin.HISTORICAL_REPLAY.value,
+                            "local_market_day": "2026-04-11",
+                            "checkpoint_label": "late_1700",
+                            "checkpoint_ts": "2026-04-11T21:00:00+00:00",
+                            "timezone_name": "America/New_York",
+                            "market_snapshot_source_id": "stale-market-source",
+                            "weather_snapshot_source_id": "weather-late_1700",
+                            "market_source_kind": "captured_market_snapshot",
+                            "weather_source_kind": "archived_weather_bundle",
+                            "settlement_label_id": "settlement-1",
+                            "coverage_class": "late_only_coverage",
+                            "source_coverage": {
+                                "market_snapshot": True,
+                                "weather_snapshot": True,
+                                "settlement_label": True,
+                            },
+                        }
+                    },
+                )
+                build = await repo.create_training_dataset_build(
+                    build_version="historical-bundles-test-refresh",
+                    mode="historical-bundles",
+                    status="completed",
+                    selection_window_start=datetime(2026, 4, 11, 13, 0, tzinfo=UTC),
+                    selection_window_end=datetime(2026, 4, 11, 21, 0, tzinfo=UTC),
+                    room_count=1,
+                    filters={"date_from": "2026-04-11", "date_to": "2026-04-11"},
+                    label_stats={},
+                    pack_versions=["builtin-gemini-v1"],
+                    payload={"room_ids": [stale_room.id], "output": str(stale_output_path)},
+                    completed_at=datetime(2026, 4, 12, 0, 0, tzinfo=UTC),
+                )
+                await repo.set_training_dataset_build_items(
+                    dataset_build_id=build.id,
+                    items=[{"room_id": stale_room.id, "sequence": 1}],
+                )
+                await session.commit()
+                return stale_room.id
+
+        stale_room_id = asyncio.run(seed())
+
+        status_before = client.get("/api/historical/status?verbose=true")
+        assert status_before.status_code == 200
+        before_payload = status_before.json()
+        assert before_payload["source_replay_coverage"]["full_checkpoint_coverage_count"] == 1
+        assert before_payload["checkpoint_archive_coverage"]["checkpoint_coverage_counts"]["full_checkpoint_coverage"] == 0
+        assert before_payload["replay_corpus"]["coverage_class_counts"]["late_only_coverage"] == 1
+        assert before_payload["refresh_needed"] is True
+
+        async def fake_replay_weather_history(*, date_from, date_to, series=None):
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                labels = await repo.list_historical_settlement_labels(
+                    series_tickers=series or None,
+                    date_from=date_from.isoformat(),
+                    date_to=date_to.isoformat(),
+                    limit=100,
+                )
+                control = await repo.get_deployment_control()
+                created = 0
+                for label in labels:
+                    mapping = container.historical_training_service._mapping_for_market(
+                        label.market_ticker,
+                        (label.payload or {}).get("market"),
+                    )
+                    assert mapping is not None
+                    selections = await container.historical_training_service._resolve_market_day_selections(
+                        repo,
+                        label=label,
+                        mapping=mapping,
+                    )
+                    coverage_class = container.historical_training_service._coverage_class(selections)
+                    for selection in selections:
+                        if not selection.replayable:
+                            continue
+                        room = await repo.create_room(
+                            RoomCreate(
+                                name=f"Historical Refresh {selection.checkpoint_label}",
+                                market_ticker=label.market_ticker,
+                            ),
+                            active_color=control.active_color,
+                            shadow_mode=False,
+                            kill_switch_enabled=False,
+                            kalshi_env=container.settings.kalshi_env,
+                            room_origin=RoomOrigin.HISTORICAL_REPLAY.value,
+                            agent_pack_version="builtin-gemini-v1",
+                        )
+                        await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+                        await repo.create_historical_replay_run(
+                            room_id=room.id,
+                            market_ticker=label.market_ticker,
+                            series_ticker=label.series_ticker,
+                            local_market_day=label.local_market_day,
+                            checkpoint_label=selection.checkpoint_label,
+                            checkpoint_ts=selection.checkpoint_ts,
+                            status="completed",
+                            agent_pack_version="builtin-gemini-v1",
+                            payload={
+                                "historical_provenance": {
+                                    "room_origin": RoomOrigin.HISTORICAL_REPLAY.value,
+                                    "local_market_day": label.local_market_day,
+                                    "checkpoint_label": selection.checkpoint_label,
+                                    "checkpoint_ts": selection.checkpoint_ts.isoformat(),
+                                    "timezone_name": "America/New_York",
+                                    "market_snapshot_source_id": selection.market_snapshot.id,
+                                    "weather_snapshot_source_id": selection.weather_snapshot.id,
+                                    "market_source_kind": selection.market_source_kind,
+                                    "weather_source_kind": selection.weather_source_kind,
+                                    "settlement_label_id": label.id,
+                                    "coverage_class": coverage_class,
+                                    "source_coverage": {
+                                        "market_snapshot": True,
+                                        "weather_snapshot": True,
+                                        "settlement_label": True,
+                                    },
+                                }
+                            },
+                        )
+                        created += 1
+                await session.commit()
+            return {
+                "status": "completed",
+                "created_room_count": created,
+                "replayed_market_day_count": 1,
+                "skipped_existing_count": 0,
+                "missing_reason_counts": {},
+                "samples": [],
+            }
+
+        container.historical_training_service.replay_weather_history = fake_replay_weather_history  # type: ignore[method-assign]
+
+        refresh = asyncio.run(
+            container.historical_training_service.refresh_historical_replay(
+                date_from=datetime(2026, 4, 11, tzinfo=UTC).date(),
+                date_to=datetime(2026, 4, 11, tzinfo=UTC).date(),
+                series=["KXHIGHNY"],
+            )
+        )
+        assert refresh["deleted_room_count"] == 1
+        assert refresh["stale_build_count"] >= 1
+        assert refresh["replay"]["created_room_count"] == 3
+        assert stale_output_path.exists() is True
+
+        status_after = client.get("/api/historical/status?verbose=true")
+        assert status_after.status_code == 200
+        after_payload = status_after.json()
+        assert after_payload["refresh_needed"] is False
+        assert after_payload["replay_corpus"]["coverage_class_counts"]["full_checkpoint_coverage"] == 1
+        assert after_payload["replay_corpus"]["coverage_class_counts"]["late_only_coverage"] == 0
+        assert after_payload["stale_build_count"] >= 1
+        assert after_payload["replayed_checkpoint_count"] == 3
+
+        async def verify_room_deleted() -> None:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                assert await repo.get_room(stale_room_id) is None
+                builds = await repo.list_training_dataset_builds(limit=10, mode_prefix="historical-")
+                assert any(build.status == "stale" for build in builds)
+                await session.commit()
+
+        asyncio.run(verify_room_deleted())
+
+    get_settings.cache_clear()

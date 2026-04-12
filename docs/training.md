@@ -29,6 +29,12 @@ For each settled market-day we:
 If a checkpoint is missing a captured market snapshot or weather bundle, it is skipped rather than fabricated. That keeps the historical corpus traceable and leakage-resistant.
 Going forward, the daemon also captures dedicated checkpoint weather bundles on schedule so future settled days can become full-coverage historical replay days without depending on room traffic.
 
+Deploy findings from April 12, 2026:
+
+- the new checkpoint archive path is healthy, but a manual `historical-archive checkpoint-capture --once` may correctly return zero captures when no checkpoint slot is currently due
+- settlement backfill is already proving useful on the live shadow corpus and should be treated as a normal maturity-repair tool, not an emergency-only action
+- the current blocker for historical Gemini fine-tuning is still missing full-checkpoint weather coverage, so exports should remain `draft_only` until distinct full-coverage market-days accumulate naturally
+
 ## What Gets Captured
 
 Room bundle exports include:

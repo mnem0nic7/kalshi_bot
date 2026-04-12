@@ -268,6 +268,119 @@ def test_gemini_export_manifest_contains_boundaries_and_audit_stats(tmp_path) ->
     assert manifest["source_windows"]["local_market_day_start"] == "2026-04-10"
 
 
+def test_replay_audit_detects_missing_stale_and_orphan_replays() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    coverage_rows = [
+        {
+            "market_ticker": "KXHIGHNY-26APR11-T61",
+            "series_ticker": "KXHIGHNY",
+            "local_market_day": "2026-04-11",
+            "coverage_class": HistoricalTrainingService.COVERAGE_FULL,
+            "checkpoints": [
+                {
+                    "checkpoint_label": "open_0900",
+                    "checkpoint_ts": "2026-04-11T13:00:00+00:00",
+                    "replayable": True,
+                    "market_source_kind": HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+                    "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
+                    "market_snapshot_id": "market-source-1",
+                    "weather_snapshot_id": "weather-source-1",
+                    "missing_reasons": [],
+                }
+            ],
+        },
+        {
+            "market_ticker": "KXHIGHNY-26APR11-T68",
+            "series_ticker": "KXHIGHNY",
+            "local_market_day": "2026-04-11",
+            "coverage_class": HistoricalTrainingService.COVERAGE_FULL,
+            "checkpoints": [
+                {
+                    "checkpoint_label": "midday_1300",
+                    "checkpoint_ts": "2026-04-11T17:00:00+00:00",
+                    "replayable": True,
+                    "market_source_kind": HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+                    "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
+                    "market_snapshot_id": "market-source-2",
+                    "weather_snapshot_id": "weather-source-2",
+                    "missing_reasons": [],
+                }
+            ],
+        },
+        {
+            "market_ticker": "KXHIGHNY-26APR11-T75",
+            "series_ticker": "KXHIGHNY",
+            "local_market_day": "2026-04-11",
+            "coverage_class": HistoricalTrainingService.COVERAGE_NONE,
+            "checkpoints": [
+                {
+                    "checkpoint_label": "late_1700",
+                    "checkpoint_ts": "2026-04-11T21:00:00+00:00",
+                    "replayable": False,
+                    "market_source_kind": None,
+                    "weather_source_kind": None,
+                    "market_snapshot_id": None,
+                    "weather_snapshot_id": None,
+                    "missing_reasons": ["weather_snapshot_missing"],
+                }
+            ],
+        },
+    ]
+    replay_runs = [
+        SimpleNamespace(
+            id="run-stale",
+            room_id="room-stale",
+            status="completed",
+            market_ticker="KXHIGHNY-26APR11-T61",
+            series_ticker="KXHIGHNY",
+            local_market_day="2026-04-11",
+            checkpoint_label="open_0900",
+            checkpoint_ts=datetime(2026, 4, 11, 13, 0, tzinfo=UTC),
+            payload={
+                "historical_provenance": {
+                    "coverage_class": HistoricalTrainingService.COVERAGE_LATE_ONLY,
+                    "market_source_kind": HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+                    "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
+                    "market_snapshot_source_id": "stale-market-source",
+                    "weather_snapshot_source_id": "weather-source-1",
+                }
+            },
+        ),
+        SimpleNamespace(
+            id="run-orphan",
+            room_id="room-orphan",
+            status="completed",
+            market_ticker="KXHIGHNY-26APR11-T75",
+            series_ticker="KXHIGHNY",
+            local_market_day="2026-04-11",
+            checkpoint_label="late_1700",
+            checkpoint_ts=datetime(2026, 4, 11, 21, 0, tzinfo=UTC),
+            payload={
+                "historical_provenance": {
+                    "coverage_class": HistoricalTrainingService.COVERAGE_LATE_ONLY,
+                    "market_source_kind": HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+                    "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
+                    "market_snapshot_source_id": "market-source-orphan",
+                    "weather_snapshot_source_id": "weather-source-orphan",
+                }
+            },
+        ),
+    ]
+
+    audit = HistoricalTrainingService._build_replay_audit(
+        service,
+        coverage_rows=coverage_rows,
+        replay_runs=replay_runs,
+        verbose=True,
+    )
+
+    assert audit["refresh_needed"] is True
+    assert audit["issue_counts"]["stale_replay"] == 1
+    assert audit["issue_counts"]["missing_replay"] == 1
+    assert audit["issue_counts"]["orphan_replay"] == 1
+    assert sorted(audit["affected_room_ids"]) == ["room-orphan", "room-stale"]
+
+
 def test_json_safe_serializes_decimal_values() -> None:
     payload = {"crosscheck": {"daily_high_f": Decimal("82.00")}}
 

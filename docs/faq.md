@@ -80,6 +80,16 @@ That makes the maturity dashboard more honest and helps move old rooms into outc
 
 Read more: `docs/training.md`
 
+## What did we learn from the April 12, 2026 deploy?
+
+Three things mattered:
+
+- New schema changes require a rebuilt `migrate` image. Rebuilding only the app or daemon containers can leave Alembic stuck on the previous head even though the new code is already live.
+- `historical-archive checkpoint-capture --once` returning zero captures is normal when no checkpoint slot is currently due. That is a scheduling outcome, not a job failure.
+- Settlement backfill is now a normal repair tool for maturity. The first live sweep immediately reduced the likely-ingestion-gap backlog, while historical Gemini readiness correctly stayed blocked because full checkpoint coverage still is not there yet.
+
+Read more: `docs/operations.md`, `docs/training.md`
+
 ## Why might self-improvement still be blocked?
 
 Because readiness is gated by corpus volume and label quality, not just by plumbing. We need enough complete rooms, enough diversity, enough trade-positive examples, and enough settled rooms before critique, evaluation, or promotion should be trusted.

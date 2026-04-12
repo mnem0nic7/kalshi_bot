@@ -100,6 +100,15 @@ FAQ_SECTIONS = [
                 "read_more": ["docs/training.md", "docs/operations.md", "docs/faq.md"],
             },
             {
+                "question": "What did we learn from the April 12, 2026 deploy?",
+                "answer": [
+                    "New schema changes require a rebuilt migrate image. Rebuilding only app or daemon containers can leave Alembic stuck on the previous head even though the new code is already live.",
+                    "Checkpoint capture returning zero is normal when no checkpoint slot is due, and settlement backfill is now a normal maturity-repair tool for closed markets with missing labels.",
+                    "Historical Gemini fine-tuning should still remain draft-only until real full-checkpoint coverage exists; the right fix is more checkpoint coverage, not weaker readiness rules.",
+                ],
+                "read_more": ["docs/operations.md", "docs/training.md", "docs/faq.md"],
+            },
+            {
                 "question": "Why might self-improvement still be blocked?",
                 "answer": [
                     "Because readiness is gated by corpus volume and label quality, not just by plumbing. We need enough complete rooms, enough diversity, enough trade-positive examples, and enough settled rooms before critique, evaluation, or promotion should be trusted.",

@@ -311,6 +311,14 @@ class PlatformRepository:
     async def get_room(self, room_id: str) -> Room | None:
         return await self.session.get(Room, room_id)
 
+    async def delete_room(self, room_id: str) -> bool:
+        room = await self.get_room(room_id)
+        if room is None:
+            return False
+        await self.session.delete(room)
+        await self.session.flush()
+        return True
+
     async def get_latest_active_room_for_market(self, market_ticker: str) -> Room | None:
         stmt = (
             select(Room)
@@ -1249,11 +1257,70 @@ class PlatformRepository:
     async def get_training_dataset_build(self, build_id: str) -> TrainingDatasetBuildRecord | None:
         return await self.session.get(TrainingDatasetBuildRecord, build_id)
 
-    async def list_training_dataset_builds(self, limit: int = 20) -> list[TrainingDatasetBuildRecord]:
+    async def list_training_dataset_builds(
+        self,
+        limit: int = 20,
+        *,
+        mode_prefix: str | None = None,
+        statuses: list[str] | None = None,
+        exclude_statuses: list[str] | None = None,
+    ) -> list[TrainingDatasetBuildRecord]:
+        stmt = select(TrainingDatasetBuildRecord)
+        if mode_prefix is not None:
+            stmt = stmt.where(TrainingDatasetBuildRecord.mode.like(f"{mode_prefix}%"))
+        if statuses:
+            stmt = stmt.where(TrainingDatasetBuildRecord.status.in_(statuses))
+        if exclude_statuses:
+            stmt = stmt.where(TrainingDatasetBuildRecord.status.not_in(exclude_statuses))
         result = await self.session.execute(
-            select(TrainingDatasetBuildRecord).order_by(TrainingDatasetBuildRecord.created_at.desc()).limit(limit)
+            stmt.order_by(TrainingDatasetBuildRecord.created_at.desc()).limit(limit)
         )
         return list(result.scalars())
+
+    async def list_training_dataset_builds_for_room_ids(
+        self,
+        room_ids: list[str],
+        *,
+        mode_prefix: str | None = None,
+        limit: int = 1000,
+    ) -> list[TrainingDatasetBuildRecord]:
+        if not room_ids:
+            return []
+        stmt = (
+            select(TrainingDatasetBuildRecord)
+            .join(
+                TrainingDatasetBuildItemRecord,
+                TrainingDatasetBuildItemRecord.dataset_build_id == TrainingDatasetBuildRecord.id,
+            )
+            .where(TrainingDatasetBuildItemRecord.room_id.in_(room_ids))
+            .distinct()
+        )
+        if mode_prefix is not None:
+            stmt = stmt.where(TrainingDatasetBuildRecord.mode.like(f"{mode_prefix}%"))
+        result = await self.session.execute(
+            stmt.order_by(TrainingDatasetBuildRecord.created_at.desc()).limit(limit)
+        )
+        return list(result.scalars())
+
+    async def update_training_dataset_build(
+        self,
+        build_id: str,
+        *,
+        status: str | None = None,
+        payload_updates: dict[str, Any] | None = None,
+        completed_at: datetime | None = None,
+    ) -> TrainingDatasetBuildRecord | None:
+        record = await self.get_training_dataset_build(build_id)
+        if record is None:
+            return None
+        if status is not None:
+            record.status = status
+        if payload_updates:
+            record.payload = {**(record.payload or {}), **payload_updates}
+        if completed_at is not None:
+            record.completed_at = completed_at
+        await self.session.flush()
+        return record
 
     async def list_training_dataset_build_items(self, build_id: str) -> list[TrainingDatasetBuildItemRecord]:
         result = await self.session.execute(
@@ -1410,7 +1477,13 @@ class PlatformRepository:
             stmt = stmt.where(HistoricalMarketSnapshotRecord.local_market_day == local_market_day)
         if before_asof is not None:
             stmt = stmt.where(HistoricalMarketSnapshotRecord.asof_ts <= before_asof)
-        result = await self.session.execute(stmt.order_by(HistoricalMarketSnapshotRecord.asof_ts.desc()).limit(limit))
+        result = await self.session.execute(
+            stmt.order_by(
+                HistoricalMarketSnapshotRecord.asof_ts.desc(),
+                HistoricalMarketSnapshotRecord.source_id.desc(),
+                HistoricalMarketSnapshotRecord.id.desc(),
+            ).limit(limit)
+        )
         return list(result.scalars())
 
     async def get_latest_historical_market_snapshot(
@@ -1499,7 +1572,13 @@ class PlatformRepository:
             stmt = stmt.where(HistoricalWeatherSnapshotRecord.local_market_day == local_market_day)
         if before_asof is not None:
             stmt = stmt.where(HistoricalWeatherSnapshotRecord.asof_ts <= before_asof)
-        result = await self.session.execute(stmt.order_by(HistoricalWeatherSnapshotRecord.asof_ts.desc()).limit(limit))
+        result = await self.session.execute(
+            stmt.order_by(
+                HistoricalWeatherSnapshotRecord.asof_ts.desc(),
+                HistoricalWeatherSnapshotRecord.source_id.desc(),
+                HistoricalWeatherSnapshotRecord.id.desc(),
+            ).limit(limit)
+        )
         return list(result.scalars())
 
     async def get_latest_historical_weather_snapshot(
@@ -1723,6 +1802,7 @@ class PlatformRepository:
     async def list_historical_replay_runs(
         self,
         *,
+        market_tickers: list[str] | None = None,
         series_tickers: list[str] | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
@@ -1730,6 +1810,8 @@ class PlatformRepository:
         limit: int = 1000,
     ) -> list[HistoricalReplayRunRecord]:
         stmt = select(HistoricalReplayRunRecord)
+        if market_tickers:
+            stmt = stmt.where(HistoricalReplayRunRecord.market_ticker.in_(market_tickers))
         if series_tickers:
             stmt = stmt.where(HistoricalReplayRunRecord.series_ticker.in_(series_tickers))
         if date_from is not None:
@@ -1742,6 +1824,14 @@ class PlatformRepository:
             stmt.order_by(HistoricalReplayRunRecord.checkpoint_ts.asc(), HistoricalReplayRunRecord.market_ticker.asc()).limit(limit)
         )
         return list(result.scalars())
+
+    async def delete_historical_replay_run(self, run_id: str) -> bool:
+        record = await self.session.get(HistoricalReplayRunRecord, run_id)
+        if record is None:
+            return False
+        await self.session.delete(record)
+        await self.session.flush()
+        return True
 
     async def save_memory_note(self, *, room_id: str | None, payload: MemoryNotePayload, embedding: list[float] | None, provider: str) -> MemoryNoteRecord:
         note = MemoryNoteRecord(

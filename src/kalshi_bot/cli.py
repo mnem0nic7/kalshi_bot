@@ -215,6 +215,25 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2))
             return 0
 
+        if args.command == "historical-repair" and args.historical_repair_command == "audit":
+            result = await container.historical_training_service.audit_historical_replay(
+                date_from=date.fromisoformat(args.date_from),
+                date_to=date.fromisoformat(args.date_to),
+                series=args.series or None,
+                verbose=args.verbose,
+            )
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.command == "historical-repair" and args.historical_repair_command == "refresh":
+            result = await container.historical_training_service.refresh_historical_replay(
+                date_from=date.fromisoformat(args.date_from),
+                date_to=date.fromisoformat(args.date_to),
+                series=args.series or None,
+            )
+            print(json.dumps(result, indent=2))
+            return 0
+
         if args.command == "historical-backfill" and args.historical_backfill_kind == "market":
             result = await container.historical_training_service.backfill_market_checkpoints(
                 date_from=date.fromisoformat(args.date_from),
@@ -622,6 +641,18 @@ def build_parser() -> argparse.ArgumentParser:
     historical_replay.add_argument("--date-from", required=True)
     historical_replay.add_argument("--date-to", required=True)
     historical_replay.add_argument("--series", nargs="*", default=None)
+
+    historical_repair = subparsers.add_parser("historical-repair")
+    historical_repair_subparsers = historical_repair.add_subparsers(dest="historical_repair_command", required=True)
+    historical_repair_audit = historical_repair_subparsers.add_parser("audit")
+    historical_repair_audit.add_argument("--date-from", required=True)
+    historical_repair_audit.add_argument("--date-to", required=True)
+    historical_repair_audit.add_argument("--series", nargs="*", default=None)
+    historical_repair_audit.add_argument("--verbose", action="store_true")
+    historical_repair_refresh = historical_repair_subparsers.add_parser("refresh")
+    historical_repair_refresh.add_argument("--date-from", required=True)
+    historical_repair_refresh.add_argument("--date-to", required=True)
+    historical_repair_refresh.add_argument("--series", nargs="*", default=None)
 
     self_improve = subparsers.add_parser("self-improve")
     self_improve_subparsers = self_improve.add_subparsers(dest="self_improve_command", required=True)

@@ -100,17 +100,21 @@
     <div class="room-card">
       <strong>Historical Corpus</strong>
       <span>imported market-days · {{ historical_status.imported_market_days }}</span>
-      <span>replayable market-days · {{ historical_status.replayable_market_day_count }}</span>
-      <span>full coverage days · {{ historical_status.full_checkpoint_coverage_count }}</span>
-      <span>late-only days · {{ historical_status.late_only_coverage_count }}</span>
-      <span>checkpoint full · {{ historical_status.checkpoint_coverage_counts.full_checkpoint_coverage }}</span>
-      <span>checkpoint late-only · {{ historical_status.checkpoint_coverage_counts.late_only_coverage }}</span>
+      <span>source replayable market-days · {{ historical_status.source_replay_coverage.replayable_market_day_count }}</span>
+      <span>source full coverage days · {{ historical_status.source_replay_coverage.full_checkpoint_coverage_count }}</span>
+      <span>source late-only days · {{ historical_status.source_replay_coverage.late_only_coverage_count }}</span>
+      <span>checkpoint-archive full · {{ historical_status.checkpoint_archive_coverage.checkpoint_coverage_counts.full_checkpoint_coverage }}</span>
+      <span>checkpoint-archive late-only · {{ historical_status.checkpoint_archive_coverage.checkpoint_coverage_counts.late_only_coverage }}</span>
       <span>imported markets · {{ historical_status.imported_market_count }}</span>
-      <span>replayed checkpoints · {{ historical_status.replayed_checkpoint_count }}</span>
+      <span>materialized replay rooms · {{ historical_status.replay_corpus.room_count }}</span>
+      <span>materialized replay checkpoints · {{ historical_status.replay_corpus.checkpoint_count }}</span>
+      <span>materialized replay market-days · {{ historical_status.replay_corpus.market_day_count }}</span>
       <span>clean trainable · {{ historical_status.clean_historical_trainable_count }}</span>
       <span>settlement mismatches · {{ historical_status.settlement_mismatch_count }}</span>
       <span>settlement backfilled · {{ historical_status.settlement_backfilled_count }}</span>
       <span>possible ingestion gaps · {{ historical_status.possible_ingestion_gap_count }}</span>
+      <span>refresh needed · {{ historical_status.refresh_needed }}</span>
+      <span>stale builds · {{ historical_status.stale_build_count }}</span>
       <span>Gemini training ready · {{ historical_status.training_ready }}</span>
       <span>draft only · {{ historical_status.draft_training_ready }}</span>
       {% if historical_status.origin_room_counts %}
@@ -129,15 +133,15 @@
   <div class="metric-grid">
     <div class="room-card">
       <strong>Historical Coverage Gaps</strong>
-      <span>missing market snapshots · {{ historical_status.source_coverage_gaps.missing_market_snapshot_count }}</span>
-      <span>missing weather snapshots · {{ historical_status.source_coverage_gaps.missing_weather_snapshot_count }}</span>
-      {% for reason, count in historical_status.missing_checkpoint_reason_counts.items() %}
+      <span>missing market snapshots · {{ historical_status.source_replay_coverage.source_coverage_gaps.missing_market_snapshot_count }}</span>
+      <span>missing weather snapshots · {{ historical_status.source_replay_coverage.source_coverage_gaps.missing_weather_snapshot_count }}</span>
+      {% for reason, count in historical_status.source_replay_coverage.missing_checkpoint_reason_counts.items() %}
       <span>{{ reason }} · {{ count }}</span>
       {% endfor %}
-      {% for reason, count in historical_status.checkpoint_capture_gaps.reason_counts.items() %}
+      {% for reason, count in historical_status.checkpoint_archive_coverage.checkpoint_capture_gaps.reason_counts.items() %}
       <span>{{ reason }} · {{ count }}</span>
       {% endfor %}
-      {% for sample in historical_status.source_coverage_gaps.samples %}
+      {% for sample in historical_status.source_replay_coverage.source_coverage_gaps.samples %}
       <span>{{ sample.market_ticker }} · {{ sample.checkpoint_label }} · {{ sample.gap }}</span>
       {% else %}
       <span>No historical coverage gaps sampled.</span>
@@ -153,6 +157,9 @@
       <span>train split rooms · {{ historical_status.historical_build_readiness.split_counts.train }}</span>
       <span>validation split rooms · {{ historical_status.historical_build_readiness.split_counts.validation }}</span>
       <span>holdout split rooms · {{ historical_status.historical_build_readiness.split_counts.holdout }}</span>
+      <span>stale replay checkpoints · {{ historical_status.replay_corpus.stale_replay_count }}</span>
+      <span>missing replay checkpoints · {{ historical_status.replay_corpus.missing_replay_count }}</span>
+      <span>orphan replay checkpoints · {{ historical_status.replay_corpus.orphan_replay_count }}</span>
     </div>
     <div class="room-card">
       <strong>Historical Import Runs</strong>
@@ -181,8 +188,8 @@
       {% endfor %}
     </div>
     <div class="room-card">
-      <strong>Historical Coverage Samples</strong>
-      {% for day in historical_status.market_day_coverage %}
+      <strong>Source Replay Coverage Samples</strong>
+      {% for day in historical_status.source_replay_coverage.market_day_coverage %}
       <span>{{ day.market_ticker }} · {{ day.local_market_day }} · {{ day.coverage_class }}</span>
       {% else %}
       <span>No historical market-day coverage sampled yet.</span>
@@ -190,10 +197,18 @@
     </div>
     <div class="room-card">
       <strong>Checkpoint Coverage Samples</strong>
-      {% for day in historical_status.checkpoint_market_day_coverage %}
+      {% for day in historical_status.checkpoint_archive_coverage.market_day_coverage %}
       <span>{{ day.market_ticker }} · {{ day.local_market_day }} · {{ day.coverage_class }}</span>
       {% else %}
       <span>No checkpoint coverage sampled yet.</span>
+      {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Replay Corpus Samples</strong>
+      {% for day in historical_status.replay_corpus.market_day_coverage %}
+      <span>{{ day.market_ticker }} · {{ day.local_market_day }} · {{ day.coverage_class }} · rooms {{ day.materialized_room_count }}</span>
+      {% else %}
+      <span>No replay corpus sampled yet.</span>
       {% endfor %}
     </div>
     <div class="room-card">

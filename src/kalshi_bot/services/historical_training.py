@@ -1006,12 +1006,130 @@ class HistoricalTrainingService:
             "output": output,
         }
 
+    async def audit_historical_replay(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+        verbose: bool = False,
+    ) -> dict[str, Any]:
+        templates = self._selected_templates(series)
+        series_tickers = [template.series_ticker for template in templates]
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            settlement_labels = await repo.list_historical_settlement_labels(
+                series_tickers=series_tickers or None,
+                date_from=date_from.isoformat(),
+                date_to=date_to.isoformat(),
+                limit=5000,
+            )
+            replay_runs = await repo.list_historical_replay_runs(
+                series_tickers=series_tickers or None,
+                date_from=date_from.isoformat(),
+                date_to=date_to.isoformat(),
+                limit=5000,
+            )
+            await session.commit()
+        coverage = await self._coverage_status(settlement_labels, verbose=True)
+        audit = self._build_replay_audit(
+            coverage_rows=coverage["all_market_day_coverage"],
+            replay_runs=replay_runs,
+            verbose=verbose,
+        )
+        return {
+            "status": "completed",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "series": series_tickers,
+            **audit,
+        }
+
+    async def refresh_historical_replay(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+    ) -> dict[str, Any]:
+        templates = self._selected_templates(series)
+        series_tickers = [template.series_ticker for template in templates]
+        audit_before = await self.audit_historical_replay(
+            date_from=date_from,
+            date_to=date_to,
+            series=series_tickers,
+            verbose=True,
+        )
+        if not audit_before.get("refresh_needed"):
+            return {
+                "status": "noop",
+                "date_from": date_from.isoformat(),
+                "date_to": date_to.isoformat(),
+                "series": series_tickers,
+                "audit": audit_before,
+                "deleted_room_count": 0,
+                "deleted_run_count": 0,
+                "stale_build_count": 0,
+                "replay": {
+                    "created_room_count": 0,
+                    "replayed_market_day_count": 0,
+                    "skipped_existing_count": 0,
+                    "missing_reason_counts": {},
+                    "samples": [],
+                },
+            }
+
+        stale_room_ids = sorted({str(room_id) for room_id in (audit_before.get("affected_room_ids") or []) if room_id})
+        affected_run_ids = sorted({str(run_id) for run_id in (audit_before.get("affected_run_ids") or []) if run_id})
+        stale_build_ids = await self._mark_historical_builds_stale(
+            date_from=date_from,
+            date_to=date_to,
+            affected_room_ids=stale_room_ids,
+            audit=audit_before,
+        )
+
+        deleted_room_count = 0
+        deleted_run_count = 0
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            for run_id in affected_run_ids:
+                deleted_run_count += int(await repo.delete_historical_replay_run(run_id))
+            for room_id in stale_room_ids:
+                deleted_room_count += int(await repo.delete_room(room_id))
+            await session.commit()
+
+        replay_result = await self.replay_weather_history(
+            date_from=date_from,
+            date_to=date_to,
+            series=series_tickers or None,
+        )
+        audit_after = await self.audit_historical_replay(
+            date_from=date_from,
+            date_to=date_to,
+            series=series_tickers,
+            verbose=True,
+        )
+        return {
+            "status": "completed",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "series": series_tickers,
+            "deleted_room_count": deleted_room_count,
+            "deleted_run_count": deleted_run_count,
+            "stale_build_count": len(stale_build_ids),
+            "stale_build_ids": stale_build_ids,
+            "audit_before": audit_before,
+            "replay": replay_result,
+            "audit_after": audit_after,
+        }
+
     async def get_status(self, *, verbose: bool = False) -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             import_runs = await repo.list_historical_import_runs(import_kind="weather", limit=10)
             settlement_labels = await repo.list_historical_settlement_labels(limit=5000)
             replay_runs = await repo.list_historical_replay_runs(limit=5000)
+            historical_builds = await repo.list_training_dataset_builds(limit=1000, mode_prefix="historical-")
             await session.commit()
 
         replay_room_ids = [run.room_id for run in replay_runs if run.room_id]
@@ -1031,6 +1149,13 @@ class HistoricalTrainingService:
         ]
         coverage = await self._coverage_status(settlement_labels, verbose=verbose)
         checkpoint_capture = await self._checkpoint_capture_status(settlement_labels, verbose=verbose)
+        replay_audit = self._build_replay_audit(
+            coverage_rows=coverage["all_market_day_coverage"],
+            replay_runs=replay_runs,
+            verbose=verbose,
+        )
+        public_coverage = dict(coverage)
+        public_coverage.pop("all_market_day_coverage", None)
         settlement_focus = await self.training_corpus_service.get_settlement_focus_summary(limit=200)
         origin_counts = Counter(bundle.room_origin or bundle.room.get("room_origin") for bundle in replay_bundles)
         readiness_split = self._split_historical_bundles(clean_trainable)
@@ -1066,6 +1191,13 @@ class HistoricalTrainingService:
             ),
             "clean_trainable_count": len(clean_trainable),
         }
+        replay_corpus = self._replay_corpus_status(
+            replay_runs=replay_runs,
+            replay_bundles=replay_bundles,
+            replay_audit=replay_audit,
+            verbose=verbose,
+        )
+        stale_build_count = sum(1 for build in historical_builds if build.status == "stale")
         return {
             "imported_market_days": len({label.local_market_day for label in settlement_labels}),
             "imported_market_count": len(settlement_labels),
@@ -1076,8 +1208,13 @@ class HistoricalTrainingService:
             "partial_checkpoint_coverage_count": coverage["partial_checkpoint_coverage_count"],
             "clean_historical_trainable_count": len(clean_trainable),
             "settlement_mismatch_count": sum(1 for label in settlement_labels if label.crosscheck_status == self.SETTLEMENT_MISMATCH),
-            "source_coverage_gaps": coverage["source_coverage_gaps"],
-            "missing_checkpoint_reason_counts": coverage["missing_checkpoint_reason_counts"],
+            "source_replay_coverage": public_coverage,
+            "checkpoint_archive_coverage": checkpoint_capture,
+            "replay_corpus": replay_corpus,
+            "refresh_needed": replay_audit["refresh_needed"],
+            "stale_build_count": stale_build_count,
+            "source_coverage_gaps": public_coverage["source_coverage_gaps"],
+            "missing_checkpoint_reason_counts": public_coverage["missing_checkpoint_reason_counts"],
             "checkpoint_coverage_counts": checkpoint_capture["checkpoint_coverage_counts"],
             "checkpoint_capture_gaps": checkpoint_capture["checkpoint_capture_gaps"],
             "draft_training_ready": draft_only,
@@ -1088,8 +1225,9 @@ class HistoricalTrainingService:
             "possible_ingestion_gap_count": int((settlement_focus.get("status_counts") or {}).get("possible_ingestion_gap", 0)),
             "settlement_backfilled_count": settlement_backfilled_count,
             "origin_room_counts": dict(origin_counts),
-            "market_day_coverage": coverage.get("market_day_coverage", []),
+            "market_day_coverage": public_coverage.get("market_day_coverage", []),
             "checkpoint_market_day_coverage": checkpoint_capture.get("market_day_coverage", []),
+            "replay_audit": replay_audit,
             "recent_import_runs": [
                 {
                     "id": run.id,
@@ -1102,6 +1240,261 @@ class HistoricalTrainingService:
                 for run in import_runs
             ],
         }
+
+    async def _mark_historical_builds_stale(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        affected_room_ids: list[str],
+        audit: dict[str, Any],
+    ) -> list[str]:
+        affected_room_id_set = set(affected_room_ids)
+        affected_build_ids: list[str] = []
+        now = datetime.now(UTC)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            builds = await repo.list_training_dataset_builds(limit=1000, mode_prefix="historical-")
+            for build in builds:
+                if build.status == "stale":
+                    continue
+                build_room_ids = {str(room_id) for room_id in ((build.payload or {}).get("room_ids") or []) if room_id}
+                if affected_room_id_set.intersection(build_room_ids) or self._historical_build_overlaps(
+                    build,
+                    date_from=date_from,
+                    date_to=date_to,
+                ):
+                    await repo.update_training_dataset_build(
+                        build.id,
+                        status="stale",
+                        payload_updates={
+                            "stale": {
+                                "reason": "historical_replay_refresh",
+                                "superseded_at": now.isoformat(),
+                                "affected_date_range": {
+                                    "date_from": date_from.isoformat(),
+                                    "date_to": date_to.isoformat(),
+                                },
+                                "affected_market_days": audit.get("affected_market_days") or [],
+                                "affected_checkpoints": audit.get("affected_checkpoints") or [],
+                                "replay_issue_counts": audit.get("issue_counts") or {},
+                            }
+                        },
+                    )
+                    affected_build_ids.append(build.id)
+            await session.commit()
+        return affected_build_ids
+
+    @staticmethod
+    def _historical_build_overlaps(build: Any, *, date_from: date, date_to: date) -> bool:
+        filters = dict(build.filters or {})
+        filter_start = filters.get("date_from")
+        filter_end = filters.get("date_to")
+        if filter_start and filter_end:
+            try:
+                return not (
+                    date.fromisoformat(str(filter_end)) < date_from
+                    or date.fromisoformat(str(filter_start)) > date_to
+                )
+            except ValueError:
+                return False
+        if build.selection_window_start is not None and build.selection_window_end is not None:
+            range_start = datetime.combine(date_from, time.min, tzinfo=UTC)
+            range_end = datetime.combine(date_to, time.max, tzinfo=UTC)
+            return not (
+                _as_utc(build.selection_window_end) < range_start
+                or _as_utc(build.selection_window_start) > range_end
+            )
+        return False
+
+    def _replay_corpus_status(
+        self,
+        *,
+        replay_runs: list[Any],
+        replay_bundles: list[Any],
+        replay_audit: dict[str, Any],
+        verbose: bool,
+    ) -> dict[str, Any]:
+        rows: dict[tuple[str, str], dict[str, Any]] = {}
+        coverage_counts: Counter[str] = Counter()
+        room_ids = {bundle.room["id"] for bundle in replay_bundles}
+        for run in replay_runs:
+            provenance = self._historical_provenance_from_run(run)
+            key = (run.market_ticker, run.local_market_day)
+            row = rows.setdefault(
+                key,
+                {
+                    "market_ticker": run.market_ticker,
+                    "series_ticker": run.series_ticker,
+                    "local_market_day": run.local_market_day,
+                    "coverage_class": provenance.get("coverage_class") or self.COVERAGE_NONE,
+                    "checkpoint_labels": [],
+                    "checkpoint_count": 0,
+                    "materialized_room_count": 0,
+                    "room_ids": [],
+                },
+            )
+            row["coverage_class"] = provenance.get("coverage_class") or row["coverage_class"]
+            row["checkpoint_labels"].append(run.checkpoint_label)
+            row["checkpoint_count"] += 1
+            if run.room_id:
+                row["room_ids"].append(run.room_id)
+                if run.room_id in room_ids:
+                    row["materialized_room_count"] += 1
+        for row in rows.values():
+            row["checkpoint_labels"] = sorted(set(row["checkpoint_labels"]))
+            row["room_ids"] = sorted(set(row["room_ids"]))
+            coverage_counts[row["coverage_class"]] += 1
+        return {
+            "room_count": len(room_ids),
+            "checkpoint_count": len(replay_runs),
+            "market_day_count": len(rows),
+            "coverage_class_counts": {
+                self.COVERAGE_FULL: coverage_counts.get(self.COVERAGE_FULL, 0),
+                self.COVERAGE_LATE_ONLY: coverage_counts.get(self.COVERAGE_LATE_ONLY, 0),
+                self.COVERAGE_PARTIAL: coverage_counts.get(self.COVERAGE_PARTIAL, 0),
+                self.COVERAGE_NONE: coverage_counts.get(self.COVERAGE_NONE, 0),
+            },
+            "stale_replay_count": int((replay_audit.get("issue_counts") or {}).get("stale_replay", 0)),
+            "missing_replay_count": int((replay_audit.get("issue_counts") or {}).get("missing_replay", 0)),
+            "orphan_replay_count": int((replay_audit.get("issue_counts") or {}).get("orphan_replay", 0)),
+            "market_day_coverage": list(rows.values()) if verbose else list(rows.values())[:12],
+        }
+
+    def _build_replay_audit(
+        self,
+        *,
+        coverage_rows: list[dict[str, Any]],
+        replay_runs: list[Any],
+        verbose: bool,
+    ) -> dict[str, Any]:
+        source_index: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in coverage_rows:
+            for checkpoint in row.get("checkpoints") or []:
+                source_index[(str(row["market_ticker"]), str(checkpoint["checkpoint_ts"]))] = {
+                    "market_ticker": row["market_ticker"],
+                    "series_ticker": row.get("series_ticker"),
+                    "local_market_day": row["local_market_day"],
+                    "coverage_class": row["coverage_class"],
+                    "checkpoint_label": checkpoint["checkpoint_label"],
+                    "checkpoint_ts": checkpoint["checkpoint_ts"],
+                    "replayable": bool(checkpoint.get("replayable")),
+                    "market_source_kind": checkpoint.get("market_source_kind"),
+                    "weather_source_kind": checkpoint.get("weather_source_kind"),
+                    "market_snapshot_id": checkpoint.get("market_snapshot_id"),
+                    "weather_snapshot_id": checkpoint.get("weather_snapshot_id"),
+                    "missing_reasons": list(checkpoint.get("missing_reasons") or []),
+                }
+        replay_index = {
+            (run.market_ticker, _as_utc(run.checkpoint_ts).isoformat()): {
+                "run_id": run.id,
+                "room_id": run.room_id,
+                "status": run.status,
+                "market_ticker": run.market_ticker,
+                "series_ticker": run.series_ticker,
+                "local_market_day": run.local_market_day,
+                "checkpoint_label": run.checkpoint_label,
+                "checkpoint_ts": _as_utc(run.checkpoint_ts).isoformat(),
+                **self._historical_provenance_from_run(run),
+            }
+            for run in replay_runs
+        }
+        counts: Counter[str] = Counter()
+        affected_room_ids: set[str] = set()
+        affected_run_ids: set[str] = set()
+        affected_market_days: set[tuple[str, str]] = set()
+        affected_checkpoints: list[dict[str, Any]] = []
+        issues: list[dict[str, Any]] = []
+
+        def _record_issue(classification: str, source: dict[str, Any] | None, replay: dict[str, Any] | None, reasons: list[str]) -> None:
+            counts[classification] += 1
+            market_ticker = str((source or replay or {}).get("market_ticker") or "")
+            local_market_day = str((source or replay or {}).get("local_market_day") or "")
+            checkpoint_ts = str((source or replay or {}).get("checkpoint_ts") or "")
+            checkpoint_label = str((source or replay or {}).get("checkpoint_label") or "")
+            if replay and replay.get("room_id"):
+                affected_room_ids.add(str(replay["room_id"]))
+            if replay and replay.get("run_id"):
+                affected_run_ids.add(str(replay["run_id"]))
+            if market_ticker and local_market_day:
+                affected_market_days.add((market_ticker, local_market_day))
+            affected_checkpoints.append(
+                {
+                    "market_ticker": market_ticker,
+                    "local_market_day": local_market_day,
+                    "checkpoint_label": checkpoint_label,
+                    "checkpoint_ts": checkpoint_ts,
+                    "classification": classification,
+                }
+            )
+            issues.append(
+                {
+                    "classification": classification,
+                    "market_ticker": market_ticker,
+                    "series_ticker": (source or replay or {}).get("series_ticker"),
+                    "local_market_day": local_market_day,
+                    "checkpoint_label": checkpoint_label,
+                    "checkpoint_ts": checkpoint_ts,
+                    "replay_room_id": (replay or {}).get("room_id"),
+                    "replay_run_id": (replay or {}).get("run_id"),
+                    "source_coverage_class": (source or {}).get("coverage_class"),
+                    "replay_coverage_class": (replay or {}).get("coverage_class"),
+                    "source_market_snapshot_id": (source or {}).get("market_snapshot_id"),
+                    "source_weather_snapshot_id": (source or {}).get("weather_snapshot_id"),
+                    "replay_market_snapshot_id": (replay or {}).get("market_snapshot_source_id"),
+                    "replay_weather_snapshot_id": (replay or {}).get("weather_snapshot_source_id"),
+                    "reasons": reasons,
+                    "missing_reasons": (source or {}).get("missing_reasons") or [],
+                }
+            )
+
+        for key, source in source_index.items():
+            replay = replay_index.pop(key, None)
+            if source["replayable"]:
+                if replay is None:
+                    _record_issue("missing_replay", source, None, ["replay_missing_for_source_coverage"])
+                    continue
+                mismatch_reasons: list[str] = []
+                if replay.get("status") != "completed":
+                    mismatch_reasons.append("replay_status_not_completed")
+                if not replay.get("room_id"):
+                    mismatch_reasons.append("replay_room_missing")
+                for field_name, replay_field in (
+                    ("coverage_class", "coverage_class"),
+                    ("market_source_kind", "market_source_kind"),
+                    ("weather_source_kind", "weather_source_kind"),
+                    ("market_snapshot_id", "market_snapshot_source_id"),
+                    ("weather_snapshot_id", "weather_snapshot_source_id"),
+                ):
+                    source_value = source.get(field_name)
+                    replay_value = replay.get(replay_field)
+                    if source_value != replay_value:
+                        mismatch_reasons.append(f"{field_name}_changed")
+                if mismatch_reasons:
+                    _record_issue("stale_replay", source, replay, mismatch_reasons)
+            elif replay is not None:
+                orphan_reasons = list(source.get("missing_reasons") or []) or ["source_no_longer_replayable"]
+                _record_issue("orphan_replay", source, replay, orphan_reasons)
+
+        for replay in replay_index.values():
+            _record_issue("orphan_replay", None, replay, ["source_checkpoint_missing"])
+
+        return {
+            "refresh_needed": bool(issues),
+            "issue_counts": dict(counts),
+            "affected_room_ids": sorted(affected_room_ids),
+            "affected_run_ids": sorted(affected_run_ids),
+            "affected_market_days": [
+                {"market_ticker": market_ticker, "local_market_day": local_market_day}
+                for market_ticker, local_market_day in sorted(affected_market_days)
+            ],
+            "affected_checkpoints": affected_checkpoints[:50] if not verbose else affected_checkpoints,
+            "issues": issues[:50] if not verbose else issues,
+        }
+
+    @staticmethod
+    def _historical_provenance_from_run(run: Any) -> dict[str, Any]:
+        return dict((run.payload or {}).get("historical_provenance") or {})
 
     async def _import_market_definitions(
         self,
@@ -1947,6 +2340,8 @@ class HistoricalTrainingService:
                             "replayable": selection.replayable,
                             "market_source_kind": selection.market_source_kind,
                             "weather_source_kind": selection.weather_source_kind,
+                            "market_snapshot_id": (selection.market_snapshot.id if selection.market_snapshot is not None else None),
+                            "weather_snapshot_id": (selection.weather_snapshot.id if selection.weather_snapshot is not None else None),
                             "missing_reasons": selection.missing_reasons,
                         }
                     )
@@ -1976,9 +2371,11 @@ class HistoricalTrainingService:
             "full_checkpoint_coverage_count": full_count,
             "late_only_coverage_count": late_only_count,
             "partial_checkpoint_coverage_count": partial_count,
+            "no_replayable_coverage_count": sum(1 for row in coverage_rows if row["coverage_class"] == self.COVERAGE_NONE),
             "missing_checkpoint_reason_counts": dict(missing_reason_counts),
             "source_coverage_gaps": source_coverage_gaps,
             "market_day_coverage": coverage_rows if verbose else coverage_rows[:12],
+            "all_market_day_coverage": coverage_rows,
         }
 
     async def _checkpoint_capture_status(self, settlement_labels: list[Any], *, verbose: bool) -> dict[str, Any]:

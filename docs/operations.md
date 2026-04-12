@@ -22,7 +22,7 @@ For the Docker deployment flow:
 ```bash
 docker compose -f infra/docker-compose.yml up -d postgres
 docker compose -f infra/docker-compose.yml build migrate
-docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
+docker compose -f infra/docker-compose.yml run --rm --build --no-deps migrate
 ```
 
 For local Python:
@@ -33,6 +33,12 @@ alembic upgrade head
 
 Always migrate before live promotion.
 Always migrate before enabling the watchdog timer on an already-running deployment, because the runtime now depends on the newer agent-pack tables and checkpoints.
+
+Deploy finding from April 12, 2026:
+
+- rebuilding `app_*` or `daemon_*` alone is not enough when a new Alembic revision has been added
+- if the `migrate` image is stale, `run --rm --no-deps migrate` can report success while still stopping at the old head
+- after any migration change, rebuild or run with `--build` on the `migrate` service before trusting the DB version
 
 ## CLI workflow
 
@@ -131,6 +137,12 @@ kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026
 Historical replay rooms are stored with `room_origin = historical_replay`. They reuse the room/export machinery, but the main control-room lists and live/shadow learning surfaces keep filtering to `shadow` and `live` by default so operator views stay focused.
 
 Historical status now reports replayable market-days, exact checkpoint-capture coverage, missing checkpoint reasons, settlement-backfill progress, and whether the Gemini export is only draft-ready or truly split-ready for training.
+
+Deploy findings from April 12, 2026:
+
+- `historical-archive checkpoint-capture --once` returning `captured_checkpoint_count = 0` is expected outside the due checkpoint windows; it means nothing was due, not that the job failed
+- `historical-backfill settlements` is now part of the operational repair path for closed markets with missing labels; the first live sweep backfilled labels immediately and materially reduced the `possible_ingestion_gap` backlog
+- historical replay readiness is still constrained by missing checkpoint-weather coverage, so the right next action is continued checkpoint capture, not lowering training-readiness thresholds
 
 The self-improvement loop now respects corpus readiness gates. If the corpus is too small, too concentrated, or too weakly labeled, critique and evaluation commands will stop early instead of generating noisy candidates.
 
