@@ -365,6 +365,45 @@ class ResearchCoordinator:
         )
         return ResearchDelta(summary=summary, changed_fields=changed_fields, numeric_fact_updates=updates)
 
+    def build_structured_dossier_from_snapshot(
+        self,
+        *,
+        market_ticker: str,
+        market_response: dict[str, Any],
+        mapping: WeatherMarketMapping,
+        weather_bundle: dict[str, Any],
+        reference_time: datetime,
+        last_run_id: str,
+    ) -> ResearchDossier:
+        market = _coerce_market(market_response)
+        weather_signal = self.signal_engine.evaluate(
+            mapping,
+            market_response,
+            weather_bundle,
+            min_edge_bps=self.settings.risk_min_edge_bps,
+        )
+        sources = self._kalshi_sources(mapping, market_ticker, market, retrieved_at=reference_time)
+        claims = self._kalshi_claims(mapping, market_ticker, market, sources[0].source_key)
+        weather_sources, weather_claims = self._structured_weather_research(
+            mapping,
+            weather_bundle,
+            weather_signal,
+            retrieved_at=reference_time,
+        )
+        sources.extend(weather_sources)
+        claims.extend(weather_claims)
+        return self._build_dossier(
+            market_ticker=market_ticker,
+            market=market,
+            mapping=mapping,
+            sources=self._dedupe_sources(sources),
+            claims=claims,
+            weather_signal=weather_signal,
+            web_payload=None,
+            last_run_id=last_run_id,
+            reference_time=reference_time,
+        )
+
     def build_signal_from_dossier(
         self,
         dossier: ResearchDossier,
@@ -443,8 +482,9 @@ class ResearchCoordinator:
         weather_signal: Any,
         web_payload: dict[str, Any] | None,
         last_run_id: str,
+        reference_time: datetime | None = None,
     ) -> ResearchDossier:
-        now = datetime.now(UTC)
+        now = (reference_time.astimezone(UTC) if reference_time is not None else datetime.now(UTC))
         narrative = ""
         bullish_case = ""
         bearish_case = ""
@@ -570,8 +610,8 @@ class ResearchCoordinator:
             last_run_id=last_run_id,
         )
 
-    def _effective_freshness(self, freshness: ResearchFreshness) -> ResearchFreshness:
-        now = datetime.now(UTC)
+    def _effective_freshness(self, freshness: ResearchFreshness, *, reference_time: datetime | None = None) -> ResearchFreshness:
+        now = reference_time.astimezone(UTC) if reference_time is not None else datetime.now(UTC)
         refreshed_at = freshness.refreshed_at.astimezone(UTC)
         expires_at = freshness.expires_at.astimezone(UTC)
         stale = now >= expires_at
@@ -583,8 +623,8 @@ class ResearchCoordinator:
             max_source_age_seconds=max(freshness.max_source_age_seconds, elapsed_since_refresh),
         )
 
-    def _hydrate_runtime_fields(self, dossier: ResearchDossier) -> ResearchDossier:
-        freshness = self._effective_freshness(dossier.freshness)
+    def _hydrate_runtime_fields(self, dossier: ResearchDossier, *, reference_time: datetime | None = None) -> ResearchDossier:
+        freshness = self._effective_freshness(dossier.freshness, reference_time=reference_time)
         gate = self._gate_dossier(
             sources=dossier.sources,
             summary=dossier.summary,
@@ -611,8 +651,8 @@ class ResearchCoordinator:
             }
         )
 
-    def training_quality_snapshot(self, dossier: ResearchDossier) -> dict[str, Any]:
-        dossier = self._hydrate_runtime_fields(dossier)
+    def training_quality_snapshot(self, dossier: ResearchDossier, *, reference_time: datetime | None = None) -> dict[str, Any]:
+        dossier = self._hydrate_runtime_fields(dossier, reference_time=reference_time)
         structured_training_ready = dossier.mode in {"structured", "mixed"} and dossier.trader_context.structured_source_used
         good_for_training = (
             dossier.gate.passed
@@ -769,7 +809,14 @@ class ResearchCoordinator:
             issues=issues,
         )
 
-    def _kalshi_sources(self, mapping: WeatherMarketMapping | None, market_ticker: str, market: dict[str, Any]) -> list[ResearchSourceCard]:
+    def _kalshi_sources(
+        self,
+        mapping: WeatherMarketMapping | None,
+        market_ticker: str,
+        market: dict[str, Any],
+        *,
+        retrieved_at: datetime | None = None,
+    ) -> list[ResearchSourceCard]:
         title = str(market.get("title") or mapping.label if mapping is not None else market_ticker)
         settlement = self._settlement_text(mapping, market)
         snippet = (
@@ -785,6 +832,7 @@ class ResearchCoordinator:
                 title=title,
                 url=None,
                 snippet=snippet,
+                retrieved_at=(retrieved_at.astimezone(UTC) if retrieved_at is not None else datetime.now(UTC)),
                 content={"market": market},
             )
         ]
@@ -822,6 +870,8 @@ class ResearchCoordinator:
         mapping: WeatherMarketMapping,
         weather_bundle: dict[str, Any],
         weather_signal: Any,
+        *,
+        retrieved_at: datetime | None = None,
     ) -> tuple[list[ResearchSourceCard], list[ResearchClaim]]:
         weather_snapshot = weather_signal.weather
         source_key = _source_key("weather_structured", mapping.market_ticker)
@@ -833,6 +883,7 @@ class ResearchCoordinator:
             title=f"Structured weather evidence for {mapping.label}",
             url="https://api.weather.gov",
             snippet=weather_signal.summary,
+            retrieved_at=(retrieved_at.astimezone(UTC) if retrieved_at is not None else datetime.now(UTC)),
             content={
                 "forecast_updated_time": _to_iso(weather_snapshot.forecast_updated_time),
                 "observation_time": _to_iso(weather_snapshot.observation_time),

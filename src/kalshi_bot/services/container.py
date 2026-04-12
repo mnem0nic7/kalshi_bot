@@ -14,6 +14,7 @@ from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.orchestration.supervisor import WorkflowSupervisor
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.agent_packs import AgentPackService
+from kalshi_bot.services.historical_training import HistoricalTrainingService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.services.daemon import DaemonService
@@ -55,6 +56,7 @@ class AppContainer:
     stream_service: MarketStreamService
     training_export_service: TrainingExportService
     training_corpus_service: TrainingCorpusService
+    historical_training_service: HistoricalTrainingService
     shadow_training_service: ShadowTrainingService
     shadow_campaign_service: ShadowCampaignService
     self_improve_service: SelfImproveService
@@ -103,6 +105,19 @@ class AppContainer:
             agent_pack_service,
         )
         agents = AgentSuite(settings, providers)
+        historical_training_service = HistoricalTrainingService(
+            settings,
+            session_factory,
+            kalshi,
+            weather_directory,
+            agent_pack_service,
+            research_coordinator,
+            risk_engine,
+            memory_service,
+            training_export_service,
+            training_corpus_service,
+            agents,
+        )
         self_improve_service = SelfImproveService(
             settings,
             session_factory,
@@ -178,6 +193,7 @@ class AppContainer:
             stream_service=stream_service,
             training_export_service=training_export_service,
             training_corpus_service=training_corpus_service,
+            historical_training_service=historical_training_service,
             shadow_training_service=shadow_training_service,
             shadow_campaign_service=shadow_campaign_service,
             self_improve_service=self_improve_service,
@@ -201,5 +217,6 @@ class AppContainer:
         await self.kalshi_ws.close()
         await self.kalshi.close()
         await self.weather.close()
+        await self.historical_training_service.close()
         await self.providers.close()
         await self.engine.dispose()

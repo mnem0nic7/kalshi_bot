@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import asdict
+from datetime import date
 import json
 from pathlib import Path
 import sys
 
 from kalshi_bot.config import get_settings
-from kalshi_bot.core.schemas import RoomCreate, ShadowCampaignRequest, TrainingBuildRequest
+from kalshi_bot.core.schemas import HistoricalTrainingBuildRequest, RoomCreate, ShadowCampaignRequest, TrainingBuildRequest
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
 from kalshi_bot.logging import configure_logging
@@ -155,6 +156,25 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "training-build":
+            if getattr(args, "training_build_scope", None) == "historical":
+                if not args.date_from or not args.date_to:
+                    raise ValueError("training-build historical requires --date-from and --date-to")
+                if args.mode not in {"bundles", "role-sft", "decision-eval", "outcome-eval", "gemini-finetune"}:
+                    raise ValueError("training-build historical supports bundles, role-sft, decision-eval, outcome-eval, or gemini-finetune")
+                request = HistoricalTrainingBuildRequest(
+                    mode=args.mode,
+                    limit=args.limit,
+                    date_from=args.date_from,
+                    date_to=args.date_to,
+                    series=args.series or [],
+                    quality_cleaned_only=args.quality_cleaned_only,
+                    include_pathology_examples=args.include_pathology_examples,
+                    output=args.output,
+                )
+                print(json.dumps(await container.historical_training_service.build_historical_dataset(request), indent=2))
+                return 0
+            if args.mode not in {"room-bundles", "role-sft", "evaluation-holdout"}:
+                raise ValueError("training-build supports room-bundles, role-sft, or evaluation-holdout")
             request = TrainingBuildRequest(
                 mode=args.mode,
                 limit=args.limit,
@@ -167,6 +187,28 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 output=args.output,
             )
             print(json.dumps(await container.training_corpus_service.build_dataset(request), indent=2))
+            return 0
+
+        if args.command == "historical-status":
+            print(json.dumps(await container.historical_training_service.get_status(), indent=2))
+            return 0
+
+        if args.command == "historical-import" and args.historical_kind == "weather":
+            result = await container.historical_training_service.import_weather_history(
+                date_from=date.fromisoformat(args.date_from),
+                date_to=date.fromisoformat(args.date_to),
+                series=args.series or None,
+            )
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.command == "historical-replay" and args.historical_kind == "weather":
+            result = await container.historical_training_service.replay_weather_history(
+                date_from=date.fromisoformat(args.date_from),
+                date_to=date.fromisoformat(args.date_to),
+                series=args.series or None,
+            )
+            print(json.dumps(result, indent=2))
             return 0
 
         if args.command == "training-build-list":
@@ -449,9 +491,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("training-status")
 
     training_build = subparsers.add_parser("training-build")
-    training_build.add_argument("--mode", choices=["room-bundles", "role-sft", "evaluation-holdout"], default="room-bundles")
+    training_build.add_argument("training_build_scope", nargs="?", choices=["historical"])
+    training_build.add_argument(
+        "--mode",
+        choices=["room-bundles", "role-sft", "evaluation-holdout", "bundles", "decision-eval", "outcome-eval", "gemini-finetune"],
+        default="room-bundles",
+    )
     training_build.add_argument("--limit", type=int, default=200)
     training_build.add_argument("--days", type=int, default=30)
+    training_build.add_argument("--date-from", default=None)
+    training_build.add_argument("--date-to", default=None)
+    training_build.add_argument("--series", nargs="*", default=None)
     training_build.add_argument("--settled-only", action="store_true")
     training_build.add_argument("--include-non-complete", action="store_true")
     training_build.add_argument("--good-research-only", action="store_true")
@@ -461,10 +511,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
     )
     training_build.add_argument("--market-ticker", default=None)
+    training_build.add_argument("--include-pathology-examples", action="store_true")
     training_build.add_argument("--output", default=None)
 
     training_build_list = subparsers.add_parser("training-build-list")
     training_build_list.add_argument("--limit", type=int, default=20)
+
+    historical_status = subparsers.add_parser("historical-status")
+
+    historical_import = subparsers.add_parser("historical-import")
+    historical_import.add_argument("historical_kind", choices=["weather"])
+    historical_import.add_argument("--date-from", required=True)
+    historical_import.add_argument("--date-to", required=True)
+    historical_import.add_argument("--series", nargs="*", default=None)
+
+    historical_replay = subparsers.add_parser("historical-replay")
+    historical_replay.add_argument("historical_kind", choices=["weather"])
+    historical_replay.add_argument("--date-from", required=True)
+    historical_replay.add_argument("--date-to", required=True)
+    historical_replay.add_argument("--series", nargs="*", default=None)
 
     self_improve = subparsers.add_parser("self-improve")
     self_improve_subparsers = self_improve.add_subparsers(dest="self_improve_command", required=True)

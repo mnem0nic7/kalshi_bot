@@ -81,6 +81,8 @@
     <button type="button" onclick="buildTrainingDataset('room-bundles')">Build Room Bundles</button>
     <button type="button" onclick="buildTrainingDataset('role-sft')">Build Role SFT</button>
     <button type="button" onclick="buildTrainingDataset('evaluation-holdout')">Build Eval Holdout</button>
+    <button type="button" onclick="buildHistoricalDataset('bundles')">Build Historical Bundles</button>
+    <button type="button" onclick="buildHistoricalDataset('gemini-finetune')">Build Gemini Fine-Tune</button>
   </div>
   {% if training_status.top_missing_data %}
   <p>Top missing data: {{ training_status.top_missing_data|join(" | ") }}</p>
@@ -96,11 +98,42 @@
       <span>recent missed stand-down · {{ training_status.quality_debt_summary.recent_missed_stand_down_count }}</span>
     </div>
     <div class="room-card">
+      <strong>Historical Corpus</strong>
+      <span>imported market-days · {{ historical_status.imported_market_days }}</span>
+      <span>imported markets · {{ historical_status.imported_market_count }}</span>
+      <span>replayed checkpoints · {{ historical_status.replayed_checkpoint_count }}</span>
+      <span>clean trainable · {{ historical_status.clean_historical_trainable_count }}</span>
+      <span>settlement mismatches · {{ historical_status.settlement_mismatch_count }}</span>
+      {% if historical_status.origin_room_counts %}
+      <span>origins · {{ historical_status.origin_room_counts }}</span>
+      {% endif %}
+    </div>
+    <div class="room-card">
       <strong>Top Exclusion Reasons</strong>
       {% for reason, count in training_status.quality_exclusion_reasons.items() %}
       <span>{{ reason }} · {{ count }}</span>
       {% else %}
       <span>No current quality exclusions.</span>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="metric-grid">
+    <div class="room-card">
+      <strong>Historical Coverage Gaps</strong>
+      <span>missing market snapshots · {{ historical_status.source_coverage_gaps.missing_market_snapshot_count }}</span>
+      <span>missing weather snapshots · {{ historical_status.source_coverage_gaps.missing_weather_snapshot_count }}</span>
+      {% for sample in historical_status.source_coverage_gaps.samples %}
+      <span>{{ sample.market_ticker }} · {{ sample.checkpoint_label }} · {{ sample.gap }}</span>
+      {% else %}
+      <span>No historical coverage gaps sampled.</span>
+      {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Historical Import Runs</strong>
+      {% for run in historical_status.recent_import_runs %}
+      <span>{{ run.status }} · {{ run.source }} · {{ run.started_at }}</span>
+      {% else %}
+      <span>No historical imports recorded yet.</span>
       {% endfor %}
     </div>
   </div>
@@ -419,6 +452,20 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode, limit: 100, days: 30, good_research_only: true }),
+    });
+    window.location.reload();
+  }
+
+  async function buildHistoricalDataset(mode) {
+    await fetch("/api/training/historical/build", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mode,
+        date_from: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+        date_to: new Date().toISOString().slice(0, 10),
+        quality_cleaned_only: true,
+      }),
     });
     window.location.reload();
   }

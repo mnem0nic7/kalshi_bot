@@ -6,7 +6,7 @@ from decimal import Decimal
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from kalshi_bot.core.enums import DeploymentColor, RiskStatus, RoomStage
+from kalshi_bot.core.enums import DeploymentColor, RiskStatus, RoomOrigin, RoomStage
 from kalshi_bot.db.base import Base, IdMixin, TimestampMixin
 from kalshi_bot.db.types import EmbeddingType
 
@@ -16,6 +16,7 @@ class Room(Base, IdMixin, TimestampMixin):
 
     name: Mapped[str] = mapped_column(String(255))
     market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    room_origin: Mapped[str] = mapped_column(String(32), default=RoomOrigin.SHADOW.value, index=True)
     prompt: Mapped[str | None] = mapped_column(Text(), nullable=True)
     kalshi_env: Mapped[str] = mapped_column(String(32), default="demo", index=True)
     stage: Mapped[str] = mapped_column(String(32), default=RoomStage.TRIGGERED.value)
@@ -407,6 +408,92 @@ class TrainingReadinessRecord(Base, IdMixin, TimestampMixin):
     market_diversity_count: Mapped[int] = mapped_column(Integer, default=0)
     settled_room_count: Mapped[int] = mapped_column(Integer, default=0)
     trade_positive_room_count: Mapped[int] = mapped_column(Integer, default=0)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class HistoricalImportRunRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "historical_import_runs"
+
+    import_kind: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    source: Mapped[str] = mapped_column(String(64), default="kalshi_history")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class HistoricalMarketSnapshotRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "historical_market_snapshots"
+    __table_args__ = (UniqueConstraint("market_ticker", "source_kind", "source_id", name="uq_historical_market_snapshot_source"),)
+
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    series_ticker: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    station_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    local_market_day: Mapped[str] = mapped_column(String(16), index=True)
+    asof_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source_kind: Mapped[str] = mapped_column(String(64), index=True)
+    source_id: Mapped[str] = mapped_column(String(255), index=True)
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    close_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    settlement_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    yes_bid_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    yes_ask_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    no_ask_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    last_price_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class HistoricalWeatherSnapshotRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "historical_weather_snapshots"
+    __table_args__ = (UniqueConstraint("station_id", "source_kind", "source_id", name="uq_historical_weather_snapshot_source"),)
+
+    station_id: Mapped[str] = mapped_column(String(32), index=True)
+    series_ticker: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    local_market_day: Mapped[str] = mapped_column(String(16), index=True)
+    asof_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source_kind: Mapped[str] = mapped_column(String(64), index=True)
+    source_id: Mapped[str] = mapped_column(String(255), index=True)
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    observation_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    forecast_updated_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    forecast_high_f: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    current_temp_f: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class HistoricalSettlementLabelRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "historical_settlement_labels"
+    __table_args__ = (UniqueConstraint("market_ticker", name="uq_historical_settlement_labels_market_ticker"),)
+
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    series_ticker: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    local_market_day: Mapped[str] = mapped_column(String(16), index=True)
+    source_kind: Mapped[str] = mapped_column(String(64), default="kalshi_primary", index=True)
+    kalshi_result: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    settlement_value_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    settlement_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    crosscheck_status: Mapped[str] = mapped_column(String(32), default="missing", index=True)
+    crosscheck_high_f: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    crosscheck_result: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class HistoricalReplayRunRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "historical_replay_runs"
+    __table_args__ = (
+        UniqueConstraint("room_id", name="uq_historical_replay_runs_room"),
+        UniqueConstraint("market_ticker", "checkpoint_ts", name="uq_historical_replay_runs_checkpoint"),
+    )
+
+    room_id: Mapped[str | None] = mapped_column(ForeignKey("rooms.id", ondelete="CASCADE"), nullable=True, index=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    series_ticker: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    local_market_day: Mapped[str] = mapped_column(String(16), index=True)
+    checkpoint_label: Mapped[str] = mapped_column(String(32))
+    checkpoint_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="completed", index=True)
+    agent_pack_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 

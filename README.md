@@ -11,6 +11,7 @@ Multi-agent Kalshi weather trading platform with a visible control room, determi
 For training prep and dataset exports, use [docs/training.md](docs/training.md).
 For Gemini runtime routing, agent packs, and daily self-improvement operations, use [docs/self_improve.md](docs/self_improve.md).
 For the plain-English operator walkthrough, use [docs/faq.md](docs/faq.md) or open `/faq` in the control room.
+For strict as-of historical replay and Gemini-first fine-tune exports, use [docs/training.md](docs/training.md).
 
 ## Quick start
 
@@ -72,6 +73,11 @@ kalshi-bot-cli research-failures
 kalshi-bot-cli research-audit --limit 20
 kalshi-bot-cli training-status
 kalshi-bot-cli training-build --mode room-bundles --good-research-only
+kalshi-bot-cli historical-status
+kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-replay weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli training-build historical --mode bundles --date-from 2026-03-01 --date-to 2026-03-31 --output data/training/historical_bundles.jsonl
+kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026-03-01 --date-to 2026-03-31 --output data/training/gemini_weather
 kalshi-bot-cli training-build-list
 kalshi-bot-cli training-export --mode bundles --output data/training/room_bundles.jsonl
 kalshi-bot-cli training-export --mode role-sft --roles researcher trader --output data/training/role_sft.jsonl
@@ -94,6 +100,7 @@ kalshi-bot-cli promote green
 `discover --json` now expands any configured `series_templates` into the currently active greater/less daily temperature markets, and the control room uses the same live discovery path.
 
 The control room also supports one-click `Run Shadow Room` actions from the market cards, plus a dedicated training panel for corpus status, research audit issues, dataset builds, and one-click shadow campaigns.
+It now also shows a historical corpus panel with imported market-days, replayed checkpoints, coverage gaps, and historical trainable counts.
 
 ## GitHub Actions smoke workflows
 

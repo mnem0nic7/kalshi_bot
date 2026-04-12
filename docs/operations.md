@@ -112,6 +112,18 @@ kalshi-bot-cli training-build --mode evaluation-holdout --settled-only
 kalshi-bot-cli training-build-list
 ```
 
+Historical replay and import loop:
+
+```bash
+kalshi-bot-cli historical-status
+kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-replay weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli training-build historical --mode bundles --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026-03-01 --date-to 2026-03-31 --output data/training/gemini_weather
+```
+
+Historical replay rooms are stored with `room_origin = historical_replay`. They reuse the room/export machinery, but the main control-room lists and live/shadow learning surfaces keep filtering to `shadow` and `live` by default so operator views stay focused.
+
 The self-improvement loop now respects corpus readiness gates. If the corpus is too small, too concentrated, or too weakly labeled, critique and evaluation commands will stop early instead of generating noisy candidates.
 
 ## Boot and self-healing

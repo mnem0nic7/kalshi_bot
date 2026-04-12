@@ -3,6 +3,8 @@ series_templates:
     display_name: NYC Daily High Temperature
     location_name: New York City
     station_id: KNYC
+    daily_summary_station_id: USW00094728
+    timezone_name: America/New_York
     latitude: 40.7146
     longitude: -74.0071
     settlement_source: NWS Climatological Report (Daily) for Central Park, New York
@@ -13,6 +15,8 @@ series_templates:
     display_name: Chicago Daily High Temperature
     location_name: Chicago
     station_id: KMDW
+    daily_summary_station_id: USW00014819
+    timezone_name: America/Chicago
     latitude: 41.7868
     longitude: -87.7522
     settlement_source: NWS Climatological Report (Daily) for Chicago Midway, IL
@@ -23,6 +27,8 @@ series_templates:
     display_name: Miami Daily High Temperature
     location_name: Miami
     station_id: KMIA
+    daily_summary_station_id: USW00012839
+    timezone_name: America/New_York
     latitude: 25.7959
     longitude: -80.2870
     settlement_source: NWS Climatological Report (Daily) for Miami International Airport

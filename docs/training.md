@@ -5,10 +5,28 @@ This project supports two export formats for training preparation:
 - room bundles: full decision records for analysis, curation, and custom dataset generation
 - role SFT examples: role-specific prompt/target records for `researcher`, `president`, `trader`, and `memory_librarian`
 - evaluation holdouts: reproducible room slices for offline pack comparisons
+- historical replay bundles and Gemini-first fine-tune exports built from strict as-of settled weather days
 
 The exports are JSONL so they can feed notebooks, curation scripts, or direct fine-tuning pipelines. Role SFT exports include both structured `input_context` / `target` fields and a model-ready `messages` array for chat-style fine-tuning.
 
 Those same exported bundles are also the substrate for the self-improvement loop described in [self_improve.md](self_improve.md). The daily critique and holdout evaluation path works only on stored shadow or demo rooms, never on raw live market access.
+
+Historical replay uses the same canonical room bundle shape, but marks rows with `room_origin = historical_replay` and stores provenance, replay checkpoint time, settlement label, and counterfactual PnL alongside the standard room artifacts.
+
+## Historical Replay
+
+Historical replay is strict as-of, weather-only, and structured-only.
+
+For each settled market-day we:
+
+- import Kalshi market metadata and settlement labels
+- import locally captured market snapshots and weather bundles when available
+- optionally ingest file-backed archived weather bundles from `HISTORICAL_WEATHER_ARCHIVE_PATH`
+- select fixed replay checkpoints at `09:00`, `13:00`, and `17:00` local market time, or `1 hour before close` if earlier
+- choose only sources with `source_ts <= checkpoint_ts`
+- rebuild dossier, signal, eligibility, strategy audit, and dry-run risk at that checkpoint
+
+If a checkpoint is missing a captured market snapshot or weather bundle, it is skipped rather than fabricated. That keeps the historical corpus traceable and leakage-resistant.
 
 ## What Gets Captured
 
@@ -26,6 +44,7 @@ Room bundle exports include:
 - orders and fills
 - memory note
 - optional settlement label when reconciliation has already seen that market settle
+- historical provenance, replay checkpoint time, and counterfactual realized PnL when the room came from historical replay
 - derived outcome summary such as final status, research gate result, risk status, and order/fill counts
 - agent-pack version, runtime environment, and per-role provider or model provenance
 
@@ -55,6 +74,30 @@ kalshi-bot-cli training-build --mode room-bundles --good-research-only
 You can also launch one room at a time from the control room homepage with `Run Shadow Room`.
 
 ## Export Commands
+
+Import settled historical weather market-days plus captured sources:
+
+```bash
+kalshi-bot-cli historical-import weather \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
+  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+```
+
+Replay historical checkpoints into room-shaped records:
+
+```bash
+kalshi-bot-cli historical-replay weather \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
+  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+```
+
+Inspect historical corpus status:
+
+```bash
+kalshi-bot-cli historical-status
+```
 
 Export complete room bundles:
 
@@ -127,6 +170,41 @@ List recent dataset builds:
 kalshi-bot-cli training-build-list
 ```
 
+Build historical replay datasets:
+
+```bash
+kalshi-bot-cli training-build historical \
+  --mode bundles \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
+  --output data/training/historical_bundles.jsonl
+```
+
+Build Gemini-first fine-tune artifacts:
+
+```bash
+kalshi-bot-cli training-build historical \
+  --mode gemini-finetune \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
+  --output data/training/gemini_weather
+```
+
+The Gemini export writes:
+
+- `train.jsonl`
+- `validation.jsonl`
+- `holdout.jsonl`
+- `manifest.json`
+
+The split is chronological by local settlement day:
+
+- oldest `70%` train
+- next `15%` validation
+- newest `15%` holdout
+
+All checkpoints from the same market-day stay together in one split.
+
 Include non-complete rooms if you want failure or partial-workflow examples:
 
 ```bash
@@ -159,3 +237,5 @@ Outcome labels are best-effort today:
 - settlement labels appear only after reconciliation has seen that market settle
 
 That means you can start behavioral training now, while outcome-labeled policy training becomes stronger as more reconciled settlements accumulate.
+
+For historical replay, settlement labels are expected up front, but NOAA cross-check mismatches are quarantined by default and excluded from quality-cleaned historical builds.

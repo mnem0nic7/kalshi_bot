@@ -104,6 +104,7 @@ class TrainingCorpusService:
         trade_positive_count = sum(1 for bundle in bundles if bundle.outcome.ticket_generated)
         active_failed_reason_counts, legacy_failed_reason_counts = self._partition_failed_reason_counts(failed_runs)
         pack_versions = sorted({bundle.room.get("agent_pack_version") for bundle in bundles if bundle.room.get("agent_pack_version")})
+        room_origin_counts = Counter(bundle.room_origin or bundle.room.get("room_origin") or "unknown" for bundle in bundles)
         recent_builds = [self._summary_from_record(record).model_dump(mode="json") for record in builds]
 
         trainable_request = request.model_copy(update={"good_research_only": True, "quality_cleaned_only": True})
@@ -188,6 +189,7 @@ class TrainingCorpusService:
             "trainable_room_count": len(trainable_bundles),
             "cleaned_trainable_room_count": len(trainable_bundles),
             "evaluation_holdout_room_count": holdout_count,
+            "room_origin_counts": dict(room_origin_counts),
             "pack_versions": pack_versions,
             "recent_dataset_builds": recent_builds,
             "campaign_settings": self._campaign_settings_snapshot(),

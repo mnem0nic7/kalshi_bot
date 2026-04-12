@@ -1,0 +1,1651 @@
+from __future__ import annotations
+
+import json
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
+import hashlib
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import httpx
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from kalshi_bot.agents.room_agents import AgentSuite
+from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import AgentRole, MessageKind, RiskStatus, RoomOrigin, RoomStage
+from kalshi_bot.core.schemas import (
+    HistoricalTrainingBuildRequest,
+    RoomCreate,
+    RoomMessageCreate,
+)
+from kalshi_bot.db.models import DeploymentControl
+from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.services.agent_packs import AgentPackService
+from kalshi_bot.services.memory import MemoryService
+from kalshi_bot.services.research import ResearchCoordinator
+from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
+from kalshi_bot.services.signal import evaluate_trade_eligibility
+from kalshi_bot.services.training import TrainingExportService
+from kalshi_bot.services.training_corpus import TrainingCorpusService
+from kalshi_bot.weather.mapping import WeatherMarketDirectory
+from kalshi_bot.weather.models import WeatherMarketMapping, WeatherSeriesTemplate
+from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
+from kalshi_bot.integrations.kalshi import KalshiClient
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def _parse_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    return Decimal(str(value)).quantize(Decimal("0.0001"))
+
+
+def _hash_payload(payload: dict[str, Any]) -> str:
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
+
+
+def _market_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return payload.get("market", payload)
+
+
+def _date_range(start: date, end: date) -> list[date]:
+    current = start
+    values: list[date] = []
+    while current <= end:
+        values.append(current)
+        current += timedelta(days=1)
+    return values
+
+
+@dataclass(slots=True)
+class HistoricalBuildSplit:
+    train: list[str]
+    validation: list[str]
+    holdout: list[str]
+
+
+class HistoricalTrainingService:
+    CHECKPOINTS = (
+        ("open_0900", 9),
+        ("midday_1300", 13),
+        ("late_1700", 17),
+    )
+    CAPTURED_MARKET_SOURCE = "captured_market_snapshot"
+    CAPTURED_WEATHER_SOURCE = "captured_weather_bundle"
+    FINAL_MARKET_SOURCE = "kalshi_final_market"
+    SETTLEMENT_MATCH = "match"
+    SETTLEMENT_MISMATCH = "mismatch"
+    SETTLEMENT_MISSING = "missing"
+    NCEI_DAILY_SUMMARY_URL = "https://www.ncei.noaa.gov/access/services/data/v1"
+
+    def __init__(
+        self,
+        settings: Settings,
+        session_factory: async_sessionmaker,
+        kalshi: KalshiClient,
+        weather_directory: WeatherMarketDirectory,
+        agent_pack_service: AgentPackService,
+        research_coordinator: ResearchCoordinator,
+        risk_engine: DeterministicRiskEngine,
+        memory_service: MemoryService,
+        training_export_service: TrainingExportService,
+        training_corpus_service: TrainingCorpusService,
+        agents: AgentSuite,
+    ) -> None:
+        self.settings = settings
+        self.session_factory = session_factory
+        self.kalshi = kalshi
+        self.weather_directory = weather_directory
+        self.agent_pack_service = agent_pack_service
+        self.research_coordinator = research_coordinator
+        self.risk_engine = risk_engine
+        self.memory_service = memory_service
+        self.training_export_service = training_export_service
+        self.training_corpus_service = training_corpus_service
+        self.agents = agents
+        self.client = httpx.AsyncClient(
+            timeout=30.0,
+            headers={
+                "User-Agent": settings.weather_user_agent,
+                "Accept": "application/json",
+            },
+        )
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    async def import_weather_history(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+    ) -> dict[str, Any]:
+        templates = self._selected_templates(series)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            run = await repo.create_historical_import_run(
+                import_kind="weather",
+                source="kalshi_history",
+                payload={
+                    "date_from": date_from.isoformat(),
+                    "date_to": date_to.isoformat(),
+                    "series": [template.series_ticker for template in templates],
+                },
+            )
+            await session.commit()
+
+        try:
+            imported_markets = await self._import_market_definitions(date_from=date_from, date_to=date_to, templates=templates)
+            imported_captured_markets = await self._import_captured_market_snapshots(
+                date_from=date_from,
+                date_to=date_to,
+                templates=templates,
+            )
+            imported_captured_weather = await self._import_captured_weather_snapshots(
+                date_from=date_from,
+                date_to=date_to,
+                templates=templates,
+            )
+            imported_file_weather = await self._import_file_weather_archives(
+                date_from=date_from,
+                date_to=date_to,
+                templates=templates,
+            )
+            summary = {
+                "status": "completed",
+                "date_from": date_from.isoformat(),
+                "date_to": date_to.isoformat(),
+                "series": [template.series_ticker for template in templates],
+                "imported_market_days": imported_markets["market_day_count"],
+                "kalshi_market_count": imported_markets["market_count"],
+                "captured_market_snapshot_count": imported_captured_markets,
+                "captured_weather_snapshot_count": imported_captured_weather,
+                "file_weather_snapshot_count": imported_file_weather,
+                "settlement_mismatch_count": imported_markets["settlement_mismatch_count"],
+                "crosscheck_missing_count": imported_markets["crosscheck_missing_count"],
+            }
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                await repo.complete_historical_import_run(run.id, status="completed", payload=summary)
+                await session.commit()
+            return summary
+        except Exception as exc:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                await repo.complete_historical_import_run(
+                    run.id,
+                    status="failed",
+                    payload={},
+                    error_text=str(exc),
+                )
+                await session.commit()
+            raise
+
+    async def replay_weather_history(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+    ) -> dict[str, Any]:
+        templates = self._selected_templates(series)
+        series_tickers = [template.series_ticker for template in templates]
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            settlement_labels = await repo.list_historical_settlement_labels(
+                series_tickers=series_tickers,
+                date_from=date_from.isoformat(),
+                date_to=date_to.isoformat(),
+                limit=5000,
+            )
+            await session.commit()
+
+        created_rooms = 0
+        skipped_missing_market = 0
+        skipped_missing_weather = 0
+        skipped_existing = 0
+        replayed_market_days = Counter()
+        samples: list[dict[str, Any]] = []
+
+        for label in settlement_labels:
+            mapping = self._mapping_for_market(label.market_ticker, (label.payload or {}).get("market"))
+            if mapping is None or not mapping.supports_structured_weather:
+                continue
+            checkpoints = self._checkpoint_times(
+                mapping,
+                local_market_day=label.local_market_day,
+                market_payload=(label.payload or {}).get("market", {}),
+            )
+            for checkpoint_label, checkpoint_ts in checkpoints:
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    existing = await repo.list_historical_replay_runs(
+                        status="completed",
+                        date_from=label.local_market_day,
+                        date_to=label.local_market_day,
+                        limit=500,
+                    )
+                    if any(
+                        record.market_ticker == label.market_ticker and record.checkpoint_ts == checkpoint_ts
+                        for record in existing
+                    ):
+                        await session.commit()
+                        skipped_existing += 1
+                        continue
+                    market_snapshot = await repo.get_latest_historical_market_snapshot(
+                        market_ticker=label.market_ticker,
+                        before_asof=checkpoint_ts,
+                        source_kind=self.CAPTURED_MARKET_SOURCE,
+                        local_market_day=label.local_market_day,
+                    )
+                    weather_snapshot = await repo.get_latest_historical_weather_snapshot(
+                        station_id=mapping.station_id,
+                        before_asof=checkpoint_ts,
+                        local_market_day=label.local_market_day,
+                    )
+                    await session.commit()
+
+                if market_snapshot is None:
+                    skipped_missing_market += 1
+                    continue
+                if weather_snapshot is None:
+                    skipped_missing_weather += 1
+                    continue
+
+                room_id = await self._run_replay_room(
+                    mapping=mapping,
+                    settlement_label=label,
+                    market_snapshot=market_snapshot,
+                    weather_snapshot=weather_snapshot,
+                    checkpoint_label=checkpoint_label,
+                    checkpoint_ts=checkpoint_ts,
+                )
+                created_rooms += 1
+                replayed_market_days[label.local_market_day] += 1
+                if len(samples) < 10:
+                    samples.append(
+                        {
+                            "room_id": room_id,
+                            "market_ticker": label.market_ticker,
+                            "local_market_day": label.local_market_day,
+                            "checkpoint_label": checkpoint_label,
+                            "checkpoint_ts": checkpoint_ts.isoformat(),
+                        }
+                    )
+
+        return {
+            "status": "completed",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "series": series_tickers,
+            "created_room_count": created_rooms,
+            "replayed_market_day_count": len(replayed_market_days),
+            "skipped_existing_count": skipped_existing,
+            "missing_market_snapshot_count": skipped_missing_market,
+            "missing_weather_snapshot_count": skipped_missing_weather,
+            "samples": samples,
+        }
+
+    async def build_historical_dataset(self, request: HistoricalTrainingBuildRequest) -> dict[str, Any]:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            runs = await repo.list_historical_replay_runs(
+                series_tickers=request.series or None,
+                date_from=request.date_from,
+                date_to=request.date_to,
+                status="completed",
+                limit=max(request.limit * 5, 500),
+            )
+            await session.commit()
+        room_ids = [record.room_id for record in runs if record.room_id][: request.limit]
+        bundles = await self.training_export_service.export_room_bundles(
+            room_ids=room_ids,
+            limit=len(room_ids),
+            include_non_complete=False,
+            origins=[RoomOrigin.HISTORICAL_REPLAY.value],
+        )
+        selected = self._filter_historical_bundles(
+            bundles,
+            quality_cleaned_only=request.quality_cleaned_only,
+            include_pathology_examples=request.include_pathology_examples,
+        )
+        split = self._split_historical_bundles(selected)
+        if request.mode == "bundles":
+            export_records = [self._bundle_with_split(bundle, split) for bundle in selected]
+            output = self._write_single_jsonl(request.output, export_records)
+        elif request.mode == "role-sft":
+            export_records = self._historical_role_examples(selected, split)
+            output = self._write_single_jsonl(request.output, export_records)
+        elif request.mode == "decision-eval":
+            export_records = [self._decision_eval_item(bundle, split) for bundle in selected]
+            output = self._write_single_jsonl(request.output, export_records)
+        elif request.mode == "outcome-eval":
+            export_records = [self._outcome_eval_item(bundle, split) for bundle in selected if bundle.settlement_label is not None]
+            output = self._write_single_jsonl(request.output, export_records)
+        elif request.mode == "gemini-finetune":
+            export_records = self._historical_role_examples(selected, split)
+            output = self._write_gemini_export(request.output, export_records, bundles=selected, split=split)
+        else:
+            raise ValueError(f"Unsupported historical build mode: {request.mode}")
+
+        label_stats = self._historical_label_stats(selected, split)
+        build_version = f"historical-{request.mode}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            record = await repo.create_training_dataset_build(
+                build_version=build_version,
+                mode=f"historical-{request.mode}",
+                status="completed",
+                selection_window_start=min((_parse_iso(bundle.replay_checkpoint_ts) if isinstance(bundle.replay_checkpoint_ts, str) else bundle.replay_checkpoint_ts) for bundle in selected) if selected else None,
+                selection_window_end=max((_parse_iso(bundle.replay_checkpoint_ts) if isinstance(bundle.replay_checkpoint_ts, str) else bundle.replay_checkpoint_ts) for bundle in selected) if selected else None,
+                room_count=len(selected),
+                filters=request.model_dump(mode="json"),
+                label_stats=label_stats,
+                pack_versions=sorted({bundle.room.get("agent_pack_version") for bundle in selected if bundle.room.get("agent_pack_version")}),
+                payload={
+                    "room_ids": [bundle.room["id"] for bundle in selected],
+                    "split_counts": {
+                        "train": len(split.train),
+                        "validation": len(split.validation),
+                        "holdout": len(split.holdout),
+                    },
+                    "output": output,
+                },
+                completed_at=datetime.now(UTC),
+            )
+            await repo.set_training_dataset_build_items(
+                dataset_build_id=record.id,
+                items=[self._historical_dataset_item(bundle, split) for bundle in selected],
+            )
+            await session.commit()
+
+        return {
+            "build": {
+                "id": record.id,
+                "build_version": build_version,
+                "mode": f"historical-{request.mode}",
+                "room_count": len(selected),
+                "label_stats": label_stats,
+            },
+            "output": output,
+        }
+
+    async def get_status(self) -> dict[str, Any]:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            import_runs = await repo.list_historical_import_runs(import_kind="weather", limit=10)
+            settlement_labels = await repo.list_historical_settlement_labels(limit=5000)
+            replay_runs = await repo.list_historical_replay_runs(limit=5000)
+            await session.commit()
+
+        replay_room_ids = [run.room_id for run in replay_runs if run.room_id]
+        replay_bundles = await self.training_export_service.export_room_bundles(
+            room_ids=replay_room_ids,
+            limit=len(replay_room_ids),
+            include_non_complete=False,
+            origins=[RoomOrigin.HISTORICAL_REPLAY.value],
+        ) if replay_room_ids else []
+
+        clean_trainable = [
+            bundle for bundle in replay_bundles
+            if bundle.trainable_default is not False
+            and ((bundle.settlement_label or {}).get("crosscheck_status") != self.SETTLEMENT_MISMATCH)
+        ]
+        source_coverage_gaps = await self._source_coverage_gaps(settlement_labels)
+        origin_counts = Counter(bundle.room_origin or bundle.room.get("room_origin") for bundle in replay_bundles)
+        return {
+            "imported_market_days": len({label.local_market_day for label in settlement_labels}),
+            "imported_market_count": len(settlement_labels),
+            "replayed_checkpoint_count": len(replay_runs),
+            "clean_historical_trainable_count": len(clean_trainable),
+            "settlement_mismatch_count": sum(1 for label in settlement_labels if label.crosscheck_status == self.SETTLEMENT_MISMATCH),
+            "source_coverage_gaps": source_coverage_gaps,
+            "origin_room_counts": dict(origin_counts),
+            "recent_import_runs": [
+                {
+                    "id": run.id,
+                    "status": run.status,
+                    "source": run.source,
+                    "started_at": run.started_at.isoformat(),
+                    "finished_at": run.finished_at.isoformat() if run.finished_at is not None else None,
+                    "payload": run.payload,
+                }
+                for run in import_runs
+            ],
+        }
+
+    async def _import_market_definitions(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        templates: list[WeatherSeriesTemplate],
+    ) -> dict[str, int]:
+        by_ticker: dict[str, tuple[WeatherMarketMapping, dict[str, Any]]] = {}
+        for template in templates:
+            for market in await self._list_recent_markets(template, date_from=date_from, date_to=date_to):
+                mapping = template.resolve_market(market)
+                if mapping is not None:
+                    by_ticker[mapping.market_ticker] = (mapping, market)
+            for market in await self._list_historical_markets(template, date_from=date_from, date_to=date_to):
+                mapping = template.resolve_market(market)
+                if mapping is not None:
+                    by_ticker.setdefault(mapping.market_ticker, (mapping, market))
+
+        mismatch_count = 0
+        missing_count = 0
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            for mapping, market in by_ticker.values():
+                local_day = self._market_local_day(mapping, market)
+                settlement_ts = self._market_timestamp(market, "settlement_ts", "settlement_time")
+                close_ts = self._market_timestamp(market, "close_time", "close_ts")
+                settlement_value = self._market_settlement_value(market)
+                crosscheck = await self._daily_summary_crosscheck(
+                    mapping,
+                    local_day,
+                    kalshi_result=str(market.get("result") or "") or None,
+                )
+                if crosscheck["status"] == self.SETTLEMENT_MISMATCH:
+                    mismatch_count += 1
+                elif crosscheck["status"] == self.SETTLEMENT_MISSING:
+                    missing_count += 1
+                await repo.upsert_historical_market_snapshot(
+                    market_ticker=mapping.market_ticker,
+                    series_ticker=mapping.series_ticker,
+                    station_id=mapping.station_id,
+                    local_market_day=local_day,
+                    asof_ts=settlement_ts or close_ts or datetime.now(UTC),
+                    source_kind=self.FINAL_MARKET_SOURCE,
+                    source_id=f"final:{mapping.market_ticker}",
+                    source_hash=_hash_payload(market),
+                    close_ts=close_ts,
+                    settlement_ts=settlement_ts,
+                    yes_bid_dollars=_parse_decimal(market.get("yes_bid_dollars")),
+                    yes_ask_dollars=_parse_decimal(market.get("yes_ask_dollars")),
+                    no_ask_dollars=_parse_decimal(market.get("no_ask_dollars")),
+                    last_price_dollars=_parse_decimal(market.get("last_price_dollars")),
+                    payload={"market": market},
+                )
+                await repo.upsert_historical_settlement_label(
+                    market_ticker=mapping.market_ticker,
+                    series_ticker=mapping.series_ticker,
+                    local_market_day=local_day,
+                    source_kind="kalshi_primary",
+                    kalshi_result=str(market.get("result") or "") or None,
+                    settlement_value_dollars=settlement_value,
+                    settlement_ts=settlement_ts,
+                    crosscheck_status=crosscheck["status"],
+                    crosscheck_high_f=crosscheck["daily_high_f"],
+                    crosscheck_result=crosscheck["result"],
+                    payload={
+                        "market": market,
+                        "crosscheck": crosscheck,
+                    },
+                )
+            await session.commit()
+        return {
+            "market_day_count": len({self._market_local_day(mapping, market) for mapping, market in by_ticker.values()}),
+            "market_count": len(by_ticker),
+            "settlement_mismatch_count": mismatch_count,
+            "crosscheck_missing_count": missing_count,
+        }
+
+    async def _import_captured_market_snapshots(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        templates: list[WeatherSeriesTemplate],
+    ) -> int:
+        after = datetime.combine(date_from, time.min, tzinfo=UTC) - timedelta(hours=self.settings.historical_replay_market_snapshot_lookback_hours)
+        before = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=UTC)
+        prefixes = tuple(template.series_ticker for template in templates)
+        created = 0
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            events = await repo.list_exchange_events(
+                event_type="market_snapshot",
+                created_after=after,
+                created_before=before,
+                limit=20000,
+            )
+            for event in events:
+                payload = _market_payload(event.payload)
+                ticker = str(payload.get("ticker") or event.market_ticker or "")
+                if not ticker.startswith(prefixes):
+                    continue
+                mapping = self._mapping_for_market(ticker, payload)
+                if mapping is None:
+                    continue
+                local_day = self._market_local_day(mapping, payload)
+                if not (date_from.isoformat() <= local_day <= date_to.isoformat()):
+                    continue
+                asof_ts = self._market_timestamp(payload, "updated_time") or _as_utc(event.created_at) or datetime.now(UTC)
+                await repo.upsert_historical_market_snapshot(
+                    market_ticker=ticker,
+                    series_ticker=mapping.series_ticker,
+                    station_id=mapping.station_id,
+                    local_market_day=local_day,
+                    asof_ts=asof_ts,
+                    source_kind=self.CAPTURED_MARKET_SOURCE,
+                    source_id=event.id,
+                    source_hash=_hash_payload(event.payload),
+                    close_ts=self._market_timestamp(payload, "close_time", "close_ts"),
+                    settlement_ts=self._market_timestamp(payload, "settlement_ts", "settlement_time"),
+                    yes_bid_dollars=_parse_decimal(payload.get("yes_bid_dollars")),
+                    yes_ask_dollars=_parse_decimal(payload.get("yes_ask_dollars")),
+                    no_ask_dollars=_parse_decimal(payload.get("no_ask_dollars")),
+                    last_price_dollars=_parse_decimal(payload.get("last_price_dollars")),
+                    payload=event.payload,
+                )
+                created += 1
+            await session.commit()
+        return created
+
+    async def _import_captured_weather_snapshots(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        templates: list[WeatherSeriesTemplate],
+    ) -> int:
+        after = datetime.combine(date_from, time.min, tzinfo=UTC) - timedelta(hours=self.settings.historical_replay_market_snapshot_lookback_hours)
+        before = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=UTC)
+        station_ids = {template.station_id for template in templates}
+        created = 0
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            events = await repo.list_weather_events(created_after=after, created_before=before, limit=20000)
+            for event in events:
+                if event.station_id not in station_ids:
+                    continue
+                payload = event.payload if isinstance(event.payload, dict) else {}
+                mapping_payload = payload.get("mapping") or {}
+                station_id = str(mapping_payload.get("station_id") or event.station_id)
+                template = next((item for item in templates if item.station_id == station_id), None)
+                if template is None:
+                    continue
+                mapping = WeatherMarketMapping(
+                    market_ticker=str(mapping_payload.get("market_ticker") or template.series_ticker),
+                    market_type="weather",
+                    display_name=mapping_payload.get("display_name") or template.display_name,
+                    description=mapping_payload.get("description") or template.description,
+                    research_queries=list(mapping_payload.get("research_queries") or template.research_queries),
+                    research_urls=list(mapping_payload.get("research_urls") or template.research_urls),
+                    station_id=template.station_id,
+                    daily_summary_station_id=template.daily_summary_station_id,
+                    location_name=template.location_name,
+                    timezone_name=template.timezone_name,
+                    latitude=template.latitude,
+                    longitude=template.longitude,
+                    threshold_f=float(mapping_payload.get("threshold_f") or 0) if mapping_payload.get("threshold_f") not in (None, "") else None,
+                    operator=str(mapping_payload.get("operator") or ">"),
+                    metric=template.metric,
+                    settlement_source=mapping_payload.get("settlement_source") or template.settlement_source,
+                    series_ticker=template.series_ticker,
+                )
+                local_day = self._weather_local_day(mapping, payload, fallback=_as_utc(event.created_at) or datetime.now(UTC))
+                if not (date_from.isoformat() <= local_day <= date_to.isoformat()):
+                    continue
+                observation_ts = _parse_iso(((payload.get("observation") or {}).get("properties") or {}).get("timestamp"))
+                forecast_updated_ts = _parse_iso(((payload.get("forecast") or {}).get("properties") or {}).get("updated"))
+                asof_ts = _as_utc(event.created_at) or observation_ts or forecast_updated_ts or datetime.now(UTC)
+                await repo.upsert_historical_weather_snapshot(
+                    station_id=station_id,
+                    series_ticker=template.series_ticker,
+                    local_market_day=local_day,
+                    asof_ts=asof_ts,
+                    source_kind=self.CAPTURED_WEATHER_SOURCE,
+                    source_id=event.id,
+                    source_hash=_hash_payload(payload),
+                    observation_ts=observation_ts,
+                    forecast_updated_ts=forecast_updated_ts,
+                    forecast_high_f=self._quantize_two(extract_forecast_high_f((payload.get("forecast") or {}))),
+                    current_temp_f=self._quantize_two(extract_current_temp_f((payload.get("observation") or {}))),
+                    payload=payload,
+                )
+                created += 1
+            await session.commit()
+        return created
+
+    async def _import_file_weather_archives(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        templates: list[WeatherSeriesTemplate],
+    ) -> int:
+        archive_dir = Path(self.settings.historical_weather_archive_path)
+        if not archive_dir.exists():
+            return 0
+        templates_by_station = {template.station_id: template for template in templates}
+        created = 0
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            for path in sorted(archive_dir.glob("*.jsonl")):
+                with path.open("r", encoding="utf-8") as handle:
+                    for line_number, line in enumerate(handle, start=1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        payload = json.loads(line)
+                        mapping_payload = payload.get("mapping") or {}
+                        station_id = str(mapping_payload.get("station_id") or "")
+                        template = templates_by_station.get(station_id)
+                        if template is None:
+                            continue
+                        mapping = template.resolve_market({"ticker": f"{template.series_ticker}-00JAN00-T0", "strike_type": "greater", "floor_strike": 0}) or WeatherMarketMapping(
+                            market_ticker=template.series_ticker,
+                            market_type="weather",
+                            display_name=template.display_name,
+                            description=template.description,
+                            research_queries=list(template.research_queries),
+                            research_urls=list(template.research_urls),
+                            station_id=template.station_id,
+                            daily_summary_station_id=template.daily_summary_station_id,
+                            location_name=template.location_name,
+                            timezone_name=template.timezone_name,
+                            latitude=template.latitude,
+                            longitude=template.longitude,
+                            threshold_f=0,
+                            operator=">",
+                            metric=template.metric,
+                            settlement_source=template.settlement_source,
+                            series_ticker=template.series_ticker,
+                        )
+                        local_day = self._weather_local_day(mapping, payload, fallback=datetime.now(UTC))
+                        if not (date_from.isoformat() <= local_day <= date_to.isoformat()):
+                            continue
+                        observation_ts = _parse_iso(((payload.get("observation") or {}).get("properties") or {}).get("timestamp"))
+                        forecast_updated_ts = _parse_iso(((payload.get("forecast") or {}).get("properties") or {}).get("updated"))
+                        asof_ts = max(item for item in [observation_ts, forecast_updated_ts, datetime.now(UTC)] if item is not None)
+                        await repo.upsert_historical_weather_snapshot(
+                            station_id=template.station_id,
+                            series_ticker=template.series_ticker,
+                            local_market_day=local_day,
+                            asof_ts=asof_ts,
+                            source_kind="file_weather_bundle",
+                            source_id=f"{path.name}:{line_number}",
+                            source_hash=_hash_payload(payload),
+                            observation_ts=observation_ts,
+                            forecast_updated_ts=forecast_updated_ts,
+                            forecast_high_f=self._quantize_two(extract_forecast_high_f((payload.get("forecast") or {}))),
+                            current_temp_f=self._quantize_two(extract_current_temp_f((payload.get("observation") or {}))),
+                            payload=payload,
+                        )
+                        created += 1
+            await session.commit()
+        return created
+
+    async def _run_replay_room(
+        self,
+        *,
+        mapping: WeatherMarketMapping,
+        settlement_label,
+        market_snapshot,
+        weather_snapshot,
+        checkpoint_label: str,
+        checkpoint_ts: datetime,
+    ) -> str:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            pack = await self.agent_pack_service.get_pack(repo, self.settings.active_agent_pack_version)
+            thresholds = self.agent_pack_service.runtime_thresholds(pack)
+            role_models = {
+                role_name: {
+                    "provider": config.provider,
+                    "model": config.model,
+                    "temperature": config.temperature,
+                }
+                for role_name, config in pack.roles.items()
+            }
+            room = await repo.create_room(
+                RoomCreate(
+                    name=f"Historical Replay {mapping.market_ticker} {checkpoint_label}",
+                    market_ticker=mapping.market_ticker,
+                    prompt=f"Historical replay for {settlement_label.local_market_day} at {checkpoint_label}",
+                ),
+                active_color=self.settings.app_color,
+                shadow_mode=False,
+                kill_switch_enabled=False,
+                kalshi_env=self.settings.kalshi_env,
+                room_origin=RoomOrigin.HISTORICAL_REPLAY.value,
+                agent_pack_version=pack.version,
+                role_models=role_models,
+            )
+            await repo.append_message(
+                room.id,
+                RoomMessageCreate(
+                    role=AgentRole.SUPERVISOR,
+                    kind=MessageKind.OBSERVATION,
+                    stage=RoomStage.TRIGGERED,
+                    content=(
+                        f"Supervisor started historical replay for {room.market_ticker} at "
+                        f"{checkpoint_ts.isoformat()}."
+                    ),
+                    payload={
+                        "reason": "historical_replay",
+                        "checkpoint_label": checkpoint_label,
+                        "checkpoint_ts": checkpoint_ts.isoformat(),
+                    },
+                ),
+            )
+
+            market_response = market_snapshot.payload
+            weather_bundle = weather_snapshot.payload
+            dossier = self.research_coordinator.build_structured_dossier_from_snapshot(
+                market_ticker=room.market_ticker,
+                market_response=market_response,
+                mapping=mapping,
+                weather_bundle=weather_bundle,
+                reference_time=checkpoint_ts,
+                last_run_id=f"historical:{settlement_label.id}:{checkpoint_label}",
+            )
+            delta = self.research_coordinator.build_room_delta(
+                dossier=dossier,
+                market_response=market_response,
+                weather_bundle=weather_bundle,
+            )
+            signal = self.research_coordinator.build_signal_from_dossier(
+                dossier,
+                market_response,
+                min_edge_bps=thresholds.risk_min_edge_bps,
+            )
+            signal.eligibility = evaluate_trade_eligibility(
+                settings=self.settings,
+                signal=signal,
+                market_snapshot=market_response,
+                market_observed_at=market_snapshot.asof_ts,
+                research_freshness=dossier.freshness,
+                thresholds=thresholds,
+            )
+            signal.strategy_mode = signal.eligibility.strategy_mode
+            signal.stand_down_reason = signal.eligibility.stand_down_reason
+            if signal.eligibility.reasons and not signal.eligibility.eligible:
+                signal.summary = f"{signal.summary} Stand down: {' '.join(signal.eligibility.reasons)}"
+
+            await repo.save_signal(
+                room_id=room.id,
+                market_ticker=room.market_ticker,
+                fair_yes_dollars=signal.fair_yes_dollars,
+                edge_bps=signal.edge_bps,
+                confidence=signal.confidence,
+                summary=signal.summary,
+                payload={
+                    "research_mode": dossier.mode,
+                    "research_gate_passed": dossier.gate.passed,
+                    "research_last_run_id": dossier.last_run_id,
+                    "research_delta": delta.model_dump(mode="json"),
+                    "trader_context": dossier.trader_context.model_dump(mode="json"),
+                    "research_freshness": dossier.freshness.model_dump(mode="json"),
+                    "effective_research_freshness": dossier.freshness.model_dump(mode="json"),
+                    "resolution_state": signal.resolution_state.value,
+                    "strategy_mode": signal.strategy_mode.value,
+                    "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
+                    "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
+                    "agent_pack_version": pack.version,
+                    "historical_replay": True,
+                },
+            )
+
+            recent_memories = [note.summary for note in await repo.list_recent_memory_notes(limit=5)]
+            await repo.save_artifact(
+                room_id=room.id,
+                artifact_type="historical_provenance",
+                source="historical_replay",
+                title=f"Historical replay provenance for {room.market_ticker}",
+                payload={
+                    "historical_provenance": {
+                        "room_origin": RoomOrigin.HISTORICAL_REPLAY.value,
+                        "local_market_day": settlement_label.local_market_day,
+                        "checkpoint_label": checkpoint_label,
+                        "checkpoint_ts": checkpoint_ts.isoformat(),
+                        "timezone_name": self._timezone_name(mapping),
+                        "market_snapshot_source_id": market_snapshot.id,
+                        "weather_snapshot_source_id": weather_snapshot.id,
+                        "settlement_label_id": settlement_label.id,
+                        "source_coverage": {
+                            "market_snapshot": True,
+                            "weather_snapshot": True,
+                            "settlement_label": True,
+                        },
+                    }
+                },
+            )
+            await repo.update_room_stage(room.id, RoomStage.RESEARCHING)
+            researcher_message, researcher_usage = await self.agents.researcher_message(
+                signal=signal,
+                dossier=dossier,
+                delta=delta,
+                room=room,
+                recent_memories=recent_memories,
+                role_config=self.agent_pack_service.role_config(pack, AgentRole.RESEARCHER),
+            )
+            researcher_record = await repo.append_message(room.id, researcher_message)
+            role_models[AgentRole.RESEARCHER.value] = researcher_usage
+            dossier_artifact = await repo.save_artifact(
+                room_id=room.id,
+                message_id=researcher_record.id,
+                artifact_type="research_dossier_snapshot",
+                source="historical_replay",
+                title=f"Research dossier snapshot for {room.market_ticker}",
+                payload=dossier.model_dump(mode="json"),
+            )
+            await repo.save_artifact(
+                room_id=room.id,
+                message_id=researcher_record.id,
+                artifact_type="research_delta",
+                source="historical_replay",
+                title=f"Research delta for {room.market_ticker}",
+                payload=delta.model_dump(mode="json"),
+            )
+            await repo.save_artifact(
+                room_id=room.id,
+                message_id=researcher_record.id,
+                artifact_type="market_snapshot",
+                source="historical_replay",
+                title=f"Market snapshot for {room.market_ticker}",
+                payload=market_response,
+            )
+            await repo.save_artifact(
+                room_id=room.id,
+                message_id=researcher_record.id,
+                artifact_type="weather_bundle",
+                source="historical_replay",
+                title=f"Weather bundle for {room.market_ticker}",
+                payload=weather_bundle,
+            )
+            for source in dossier.sources:
+                await repo.save_artifact(
+                    room_id=room.id,
+                    message_id=researcher_record.id,
+                    artifact_type="research_source",
+                    source=source.source_class,
+                    title=source.title,
+                    payload=source.model_dump(mode="json"),
+                    url=source.url,
+                    external_id=source.source_key,
+                )
+            research_health = self.research_coordinator.training_quality_snapshot(dossier, reference_time=checkpoint_ts)
+            await repo.upsert_room_research_health(
+                room_id=room.id,
+                market_ticker=room.market_ticker,
+                dossier_status=research_health["dossier_status"],
+                gate_passed=research_health["gate_passed"],
+                valid_dossier=research_health["valid_dossier"],
+                good_for_training=research_health["good_for_training"],
+                quality_score=research_health["quality_score"],
+                citation_coverage_score=research_health["citation_coverage_score"],
+                settlement_clarity_score=research_health["settlement_clarity_score"],
+                freshness_score=research_health["freshness_score"],
+                contradiction_count=research_health["contradiction_count"],
+                structured_completeness_score=research_health["structured_completeness_score"],
+                fair_value_score=research_health["fair_value_score"],
+                dossier_artifact_id=dossier_artifact.id,
+                payload=research_health["payload"],
+            )
+            await repo.save_artifact(
+                room_id=room.id,
+                artifact_type="historical_settlement_label",
+                source="historical_replay",
+                title=f"Historical settlement label for {room.market_ticker}",
+                payload={
+                    "market_ticker": settlement_label.market_ticker,
+                    "local_market_day": settlement_label.local_market_day,
+                    "kalshi_result": settlement_label.kalshi_result,
+                    "settlement_value_dollars": str(settlement_label.settlement_value_dollars)
+                    if settlement_label.settlement_value_dollars is not None
+                    else None,
+                    "crosscheck_status": settlement_label.crosscheck_status,
+                    "crosscheck_result": settlement_label.crosscheck_result,
+                    "crosscheck_high_f": (
+                        str(settlement_label.crosscheck_high_f) if settlement_label.crosscheck_high_f is not None else None
+                    ),
+                },
+            )
+            await repo.save_room_campaign(
+                room_id=room.id,
+                campaign_id=f"historical-{settlement_label.local_market_day}",
+                trigger_source="historical_replay",
+                city_bucket=mapping.location_name,
+                market_regime_bucket="historical_replay",
+                difficulty_bucket="historical",
+                outcome_bucket="historical",
+                dossier_artifact_id=dossier_artifact.id,
+                payload={
+                    "market_ticker": room.market_ticker,
+                    "checkpoint_label": checkpoint_label,
+                    "checkpoint_ts": checkpoint_ts.isoformat(),
+                    "local_market_day": settlement_label.local_market_day,
+                },
+            )
+
+            final_status = "no_trade"
+            rationale_ids = [researcher_record.id]
+
+            if not dossier.gate.passed:
+                ops_record = await repo.append_message(
+                    room.id,
+                    await self.agents.ops_message(
+                        summary=f"Research gate blocked the historical replay room: {' '.join(dossier.gate.reasons)}",
+                        payload=dossier.gate.model_dump(mode="json"),
+                    ),
+                )
+                rationale_ids.append(ops_record.id)
+                final_status = "research_blocked"
+            else:
+                await repo.update_room_stage(room.id, RoomStage.POSTURE)
+                president_message, president_usage = await self.agents.president_message(
+                    signal=signal,
+                    role_config=self.agent_pack_service.role_config(pack, AgentRole.PRESIDENT),
+                )
+                president_record = await repo.append_message(room.id, president_message)
+                role_models[AgentRole.PRESIDENT.value] = president_usage
+                rationale_ids.append(president_record.id)
+
+                await repo.update_room_stage(room.id, RoomStage.PROPOSING)
+                trader_message, ticket, client_order_id, trader_usage = await self.agents.trader_message(
+                    signal=signal,
+                    room_id=room.id,
+                    market_ticker=room.market_ticker,
+                    rationale_ids=rationale_ids.copy(),
+                    role_config=self.agent_pack_service.role_config(pack, AgentRole.TRADER),
+                    max_order_notional_dollars=thresholds.risk_max_order_notional_dollars,
+                )
+                trader_record = await repo.append_message(room.id, trader_message)
+                role_models[AgentRole.TRADER.value] = trader_usage
+                rationale_ids.append(trader_record.id)
+
+                if ticket is not None and client_order_id is not None:
+                    ticket_record = await repo.save_trade_ticket(room.id, ticket, client_order_id, message_id=trader_record.id)
+                    historical_control = DeploymentControl(
+                        id="historical",
+                        active_color=self.settings.app_color,
+                        kill_switch_enabled=False,
+                        shadow_color=self.settings.app_color,
+                    )
+                    verdict = self.risk_engine.evaluate(
+                        room=room,
+                        control=historical_control,
+                        ticket=ticket,
+                        signal=signal,
+                        context=RiskContext(
+                            market_observed_at=market_snapshot.asof_ts,
+                            research_observed_at=dossier.freshness.refreshed_at,
+                            decision_time=checkpoint_ts,
+                            current_position_notional_dollars=Decimal("0"),
+                        ),
+                        thresholds=thresholds,
+                    )
+                    await repo.save_risk_verdict(
+                        room_id=room.id,
+                        ticket_id=ticket_record.id,
+                        status=verdict.status,
+                        reasons=verdict.reasons,
+                        approved_notional_dollars=verdict.approved_notional_dollars,
+                        approved_count_fp=verdict.approved_count_fp,
+                        payload=verdict.model_dump(mode="json"),
+                    )
+                    risk_message, risk_usage = await self.agents.risk_message(
+                        verdict=verdict,
+                        role_config=self.agent_pack_service.role_config(pack, AgentRole.RISK_OFFICER),
+                    )
+                    risk_record = await repo.append_message(room.id, risk_message)
+                    role_models[AgentRole.RISK_OFFICER.value] = risk_usage
+                    rationale_ids.append(risk_record.id)
+
+                    counterfactual = self.training_export_service._counterfactual_pnl(
+                        trade_ticket=ticket.model_dump(mode="json"),
+                        settlement={
+                            "settlement_value_dollars": (
+                                str(settlement_label.settlement_value_dollars)
+                                if settlement_label.settlement_value_dollars is not None
+                                else None
+                            )
+                        },
+                    )
+                    execution_record = await repo.append_message(
+                        room.id,
+                        await self.agents.execution_message(
+                            "historical_skipped",
+                            {
+                                "status": "historical_skipped",
+                                "dry_run": True,
+                                "counterfactual_pnl_dollars": str(counterfactual) if counterfactual is not None else None,
+                            },
+                        ),
+                    )
+                    rationale_ids.append(execution_record.id)
+                    final_status = "historical_skipped" if verdict.status == RiskStatus.APPROVED else "blocked"
+                else:
+                    ops_record = await repo.append_message(
+                        room.id,
+                        await self.agents.ops_message(
+                            summary="Historical replay stood down before risk or execution because the setup was not actionable.",
+                            payload={
+                                "market_ticker": room.market_ticker,
+                                "status": "stand_down",
+                                "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
+                            },
+                        ),
+                    )
+                    rationale_ids.append(ops_record.id)
+                    final_status = "stand_down"
+
+            await repo.update_room_stage(room.id, RoomStage.AUDITING)
+            auditor_record = await repo.append_message(
+                room.id,
+                await self.agents.auditor_message(final_status=final_status, rationale_ids=rationale_ids),
+            )
+            rationale_ids.append(auditor_record.id)
+            all_messages = [message async for message in self._iter_room_messages(repo, room.id)]
+            memory_payload, memory_usage = await self.memory_service.build_note(
+                room,
+                all_messages,
+                memory_config=pack.memory,
+                role_config=self.agent_pack_service.role_config(pack, AgentRole.MEMORY_LIBRARIAN),
+            )
+            await repo.update_room_stage(room.id, RoomStage.MEMORY)
+            await repo.append_message(room.id, await self.agents.memory_message(memory_payload))
+            role_models[AgentRole.MEMORY_LIBRARIAN.value] = memory_usage
+            await repo.save_memory_note(
+                room_id=room.id,
+                payload=memory_payload,
+                embedding=self.agents.providers.embed_text(memory_payload.summary),
+                provider="hash-router-v1",
+            )
+            await repo.update_room_runtime(room.id, role_models=role_models)
+            await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+            await repo.create_historical_replay_run(
+                room_id=room.id,
+                market_ticker=room.market_ticker,
+                series_ticker=mapping.series_ticker,
+                local_market_day=settlement_label.local_market_day,
+                checkpoint_label=checkpoint_label,
+                checkpoint_ts=checkpoint_ts,
+                status="completed",
+                agent_pack_version=pack.version,
+                payload={
+                    "historical_provenance": {
+                        "room_origin": RoomOrigin.HISTORICAL_REPLAY.value,
+                        "local_market_day": settlement_label.local_market_day,
+                        "checkpoint_label": checkpoint_label,
+                        "checkpoint_ts": checkpoint_ts.isoformat(),
+                        "timezone_name": self._timezone_name(mapping),
+                        "market_snapshot_source_id": market_snapshot.id,
+                        "weather_snapshot_source_id": weather_snapshot.id,
+                        "settlement_label_id": settlement_label.id,
+                        "source_coverage": {
+                            "market_snapshot": True,
+                            "weather_snapshot": True,
+                            "settlement_label": True,
+                        },
+                    }
+                },
+            )
+            await session.commit()
+
+        try:
+            await self.training_corpus_service.persist_strategy_audit_for_room(
+                room.id,
+                audit_source="historical_replay",
+            )
+        except Exception:
+            pass
+        return room.id
+
+    async def _iter_room_messages(self, repo: PlatformRepository, room_id: str):
+        for message in await repo.list_messages(room_id):
+            yield self.training_export_service._message_read(message)
+
+    async def _list_recent_markets(
+        self,
+        template: WeatherSeriesTemplate,
+        *,
+        date_from: date,
+        date_to: date,
+    ) -> list[dict[str, Any]]:
+        min_close_ts = int(datetime.combine(date_from, time.min, tzinfo=UTC).timestamp())
+        max_close_ts = int(datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=UTC).timestamp())
+        markets: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            response = await self.kalshi.list_markets(
+                series_ticker=template.series_ticker,
+                min_close_ts=min_close_ts,
+                max_close_ts=max_close_ts,
+                status="settled,determined,closed",
+                limit=self.settings.historical_import_page_size,
+                cursor=cursor,
+            )
+            page = response.get("markets", [])
+            markets.extend(page)
+            cursor = response.get("cursor")
+            if not cursor or not page:
+                break
+        return markets
+
+    async def _list_historical_markets(
+        self,
+        template: WeatherSeriesTemplate,
+        *,
+        date_from: date,
+        date_to: date,
+    ) -> list[dict[str, Any]]:
+        markets: list[dict[str, Any]] = []
+        cursor: str | None = None
+        pages = 0
+        prefix = f"{template.series_ticker}-"
+        while pages < self.settings.historical_import_max_pages:
+            response = await self.kalshi.list_historical_markets(
+                limit=self.settings.historical_import_page_size,
+                cursor=cursor,
+            )
+            page = response.get("markets", [])
+            if not page:
+                break
+            for market in page:
+                ticker = str(market.get("ticker") or "")
+                if not ticker.startswith(prefix):
+                    continue
+                local_day = self._market_local_day(template.resolve_market(market) or WeatherMarketMapping(
+                    market_ticker=ticker,
+                    market_type="weather",
+                    station_id=template.station_id,
+                    daily_summary_station_id=template.daily_summary_station_id,
+                    location_name=template.location_name,
+                    timezone_name=template.timezone_name,
+                    latitude=template.latitude,
+                    longitude=template.longitude,
+                    threshold_f=float(market.get("floor_strike") or market.get("cap_strike") or 0),
+                    operator=">" if str(market.get("strike_type") or "") == "greater" else "<",
+                    metric=template.metric,
+                    settlement_source=template.settlement_source,
+                    series_ticker=template.series_ticker,
+                ), market)
+                if date_from.isoformat() <= local_day <= date_to.isoformat():
+                    markets.append(market)
+            cursor = response.get("cursor")
+            pages += 1
+            if not cursor:
+                break
+        return markets
+
+    async def _daily_summary_crosscheck(
+        self,
+        mapping: WeatherMarketMapping,
+        local_day: str,
+        *,
+        kalshi_result: str | None,
+    ) -> dict[str, Any]:
+        station = mapping.daily_summary_station_id or mapping.station_id
+        if not station or mapping.threshold_f is None:
+            return {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+        params = {
+            "dataset": "daily-summaries",
+            "stations": station,
+            "startDate": local_day,
+            "endDate": local_day,
+            "dataTypes": "TMAX",
+            "units": "standard",
+            "format": "json",
+        }
+        response = await self.client.get(self.NCEI_DAILY_SUMMARY_URL, params=params)
+        response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list) or not rows:
+            return {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+        value = rows[0].get("TMAX")
+        if value in (None, ""):
+            return {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+        high_f = Decimal(str(value)).quantize(Decimal("0.01"))
+        result = self._settlement_result_from_high(mapping, high_f)
+        kalshi_result_normalized = str(kalshi_result or "").strip().lower() or None
+        status = (
+            self.SETTLEMENT_MATCH
+            if kalshi_result_normalized in (None, result)
+            else self.SETTLEMENT_MISMATCH
+        )
+        return {"status": status, "daily_high_f": high_f, "result": result}
+
+    async def _source_coverage_gaps(self, settlement_labels: list[Any]) -> dict[str, Any]:
+        missing_market = 0
+        missing_weather = 0
+        preview: list[dict[str, Any]] = []
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            for label in settlement_labels[:200]:
+                mapping = self._mapping_for_market(label.market_ticker, (label.payload or {}).get("market"))
+                if mapping is None or not mapping.supports_structured_weather:
+                    continue
+                for checkpoint_label, checkpoint_ts in self._checkpoint_times(
+                    mapping,
+                    local_market_day=label.local_market_day,
+                    market_payload=(label.payload or {}).get("market", {}),
+                ):
+                    market_snapshot = await repo.get_latest_historical_market_snapshot(
+                        market_ticker=label.market_ticker,
+                        before_asof=checkpoint_ts,
+                        source_kind=self.CAPTURED_MARKET_SOURCE,
+                        local_market_day=label.local_market_day,
+                    )
+                    weather_snapshot = await repo.get_latest_historical_weather_snapshot(
+                        station_id=mapping.station_id,
+                        before_asof=checkpoint_ts,
+                        local_market_day=label.local_market_day,
+                    )
+                    if market_snapshot is None:
+                        missing_market += 1
+                        if len(preview) < 10:
+                            preview.append(
+                                {
+                                    "market_ticker": label.market_ticker,
+                                    "local_market_day": label.local_market_day,
+                                    "checkpoint_label": checkpoint_label,
+                                    "gap": "market_snapshot",
+                                }
+                            )
+                    if weather_snapshot is None:
+                        missing_weather += 1
+                        if len(preview) < 10:
+                            preview.append(
+                                {
+                                    "market_ticker": label.market_ticker,
+                                    "local_market_day": label.local_market_day,
+                                    "checkpoint_label": checkpoint_label,
+                                    "gap": "weather_snapshot",
+                                }
+                            )
+            await session.commit()
+        return {
+            "missing_market_snapshot_count": missing_market,
+            "missing_weather_snapshot_count": missing_weather,
+            "samples": preview,
+        }
+
+    def _split_historical_bundles(self, bundles: list[Any]) -> HistoricalBuildSplit:
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for bundle in bundles:
+            local_day = str((bundle.historical_provenance or {}).get("local_market_day") or (bundle.settlement_label or {}).get("local_market_day") or "")
+            if not local_day:
+                continue
+            grouped[local_day].append(bundle.room["id"])
+        ordered_days = sorted(grouped)
+        if not ordered_days:
+            return HistoricalBuildSplit(train=[], validation=[], holdout=[])
+        day_count = len(ordered_days)
+        train_days = max(1, int(day_count * 0.70))
+        validation_days = max(1, int(day_count * 0.15)) if day_count >= 3 else 0
+        if train_days + validation_days >= day_count:
+            validation_days = max(0, day_count - train_days - 1)
+        holdout_days = max(0, day_count - train_days - validation_days)
+        if holdout_days == 0 and day_count >= 2:
+            if validation_days > 0:
+                validation_days -= 1
+            else:
+                train_days -= 1
+            holdout_days = 1
+        train = ordered_days[:train_days]
+        validation = ordered_days[train_days : train_days + validation_days]
+        holdout = ordered_days[train_days + validation_days :]
+        return HistoricalBuildSplit(
+            train=[room_id for day in train for room_id in grouped[day]],
+            validation=[room_id for day in validation for room_id in grouped[day]],
+            holdout=[room_id for day in holdout for room_id in grouped[day]],
+        )
+
+    def _filter_historical_bundles(
+        self,
+        bundles: list[Any],
+        *,
+        quality_cleaned_only: bool,
+        include_pathology_examples: bool,
+    ) -> list[Any]:
+        selected: list[Any] = []
+        for bundle in bundles:
+            if bundle.settlement_label is None:
+                continue
+            if not include_pathology_examples and (bundle.settlement_label or {}).get("crosscheck_status") == self.SETTLEMENT_MISMATCH:
+                continue
+            if quality_cleaned_only and bundle.trainable_default is False:
+                continue
+            selected.append(bundle)
+        return selected
+
+    def _historical_role_examples(self, bundles: list[Any], split: HistoricalBuildSplit) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for bundle in bundles:
+            split_name = self._split_name(bundle.room["id"], split)
+            for example in self.training_export_service.build_role_training_examples(bundle):
+                payload = example.model_dump(mode="json")
+                payload["metadata"]["split"] = split_name
+                payload["metadata"]["room_origin"] = RoomOrigin.HISTORICAL_REPLAY.value
+                records.append(payload)
+        return records
+
+    def _decision_eval_item(self, bundle: Any, split: HistoricalBuildSplit) -> dict[str, Any]:
+        return {
+            "room_id": bundle.room["id"],
+            "market_ticker": bundle.room["market_ticker"],
+            "room_origin": bundle.room_origin,
+            "split": self._split_name(bundle.room["id"], split),
+            "replay_checkpoint_ts": self._dt_to_iso(bundle.replay_checkpoint_ts),
+            "historical_provenance": bundle.historical_provenance,
+            "signal": bundle.signal,
+            "strategy_audit": bundle.strategy_audit,
+            "research_health": bundle.research_health,
+            "trade_ticket": bundle.trade_ticket,
+            "risk_verdict": bundle.risk_verdict,
+            "outcome": bundle.outcome.model_dump(mode="json"),
+        }
+
+    def _outcome_eval_item(self, bundle: Any, split: HistoricalBuildSplit) -> dict[str, Any]:
+        return {
+            "room_id": bundle.room["id"],
+            "market_ticker": bundle.room["market_ticker"],
+            "room_origin": bundle.room_origin,
+            "split": self._split_name(bundle.room["id"], split),
+            "replay_checkpoint_ts": self._dt_to_iso(bundle.replay_checkpoint_ts),
+            "historical_provenance": bundle.historical_provenance,
+            "fair_yes_dollars": (bundle.signal or {}).get("fair_yes_dollars"),
+            "resolution_state": ((bundle.signal or {}).get("payload") or {}).get("resolution_state"),
+            "strategy_audit": bundle.strategy_audit,
+            "settlement_label": bundle.settlement_label,
+            "counterfactual_pnl_dollars": (
+                str(bundle.counterfactual_pnl_dollars) if bundle.counterfactual_pnl_dollars is not None else None
+            ),
+            "outcome": bundle.outcome.model_dump(mode="json"),
+        }
+
+    def _bundle_with_split(self, bundle: Any, split: HistoricalBuildSplit) -> dict[str, Any]:
+        payload = bundle.model_dump(mode="json")
+        payload["split"] = self._split_name(bundle.room["id"], split)
+        return payload
+
+    def _historical_dataset_item(self, bundle: Any, split: HistoricalBuildSplit) -> dict[str, Any]:
+        return {
+            "room_id": bundle.room["id"],
+            "market_ticker": bundle.room["market_ticker"],
+            "room_origin": bundle.room_origin,
+            "split": self._split_name(bundle.room["id"], split),
+            "replay_checkpoint_ts": self._dt_to_iso(bundle.replay_checkpoint_ts),
+            "historical_provenance": bundle.historical_provenance,
+            "strategy_audit": bundle.strategy_audit,
+            "audit_source": bundle.audit_source,
+            "audit_version": bundle.audit_version,
+            "trainable_default": bundle.trainable_default,
+            "exclude_reason": bundle.exclude_reason,
+            "settlement_label": bundle.settlement_label,
+            "counterfactual_pnl_dollars": (
+                str(bundle.counterfactual_pnl_dollars) if bundle.counterfactual_pnl_dollars is not None else None
+            ),
+        }
+
+    def _historical_label_stats(self, bundles: list[Any], split: HistoricalBuildSplit) -> dict[str, Any]:
+        return {
+            "origin_counts": dict(Counter(bundle.room_origin for bundle in bundles)),
+            "audit_source_counts": dict(Counter(bundle.audit_source for bundle in bundles if bundle.audit_source)),
+            "split_counts": {
+                "train": len(split.train),
+                "validation": len(split.validation),
+                "holdout": len(split.holdout),
+            },
+            "settlement_mismatch_count": sum(
+                1 for bundle in bundles if (bundle.settlement_label or {}).get("crosscheck_status") == self.SETTLEMENT_MISMATCH
+            ),
+            "trainable_default_count": sum(1 for bundle in bundles if bundle.trainable_default is not False),
+            "exclude_reason_counts": dict(Counter(bundle.exclude_reason for bundle in bundles if bundle.exclude_reason)),
+            "role_example_count": sum(len(self.training_export_service.build_role_training_examples(bundle)) for bundle in bundles),
+        }
+
+    def _write_single_jsonl(self, output: str | None, records: list[dict[str, Any]]) -> str | None:
+        if output is None:
+            return None
+        path = Path(output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, default=str))
+                handle.write("\n")
+        return str(path)
+
+    def _write_gemini_export(
+        self,
+        output: str | None,
+        records: list[dict[str, Any]],
+        *,
+        bundles: list[Any],
+        split: HistoricalBuildSplit,
+    ) -> dict[str, str] | None:
+        if output is None:
+            return None
+        output_dir = Path(output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for record in records:
+            grouped[str((record.get("metadata") or {}).get("split") or "train")].append(self._gemini_example(record))
+        paths: dict[str, str] = {}
+        for split_name in ("train", "validation", "holdout"):
+            path = output_dir / f"{split_name}.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                for record in grouped.get(split_name, []):
+                    handle.write(json.dumps(record, default=str))
+                    handle.write("\n")
+            paths[split_name] = str(path)
+        local_days = sorted(
+            {
+                str((bundle.historical_provenance or {}).get("local_market_day") or "")
+                for bundle in bundles
+                if (bundle.historical_provenance or {}).get("local_market_day")
+            }
+        )
+        checkpoint_values = [
+            self._dt_to_iso(bundle.replay_checkpoint_ts)
+            for bundle in bundles
+            if self._dt_to_iso(bundle.replay_checkpoint_ts) is not None
+        ]
+        exclusion_counts = dict(Counter(bundle.exclude_reason for bundle in bundles if bundle.exclude_reason))
+        audit_source_counts = dict(Counter(bundle.audit_source for bundle in bundles if bundle.audit_source))
+        pack_versions = sorted({bundle.room.get("agent_pack_version") for bundle in bundles if bundle.room.get("agent_pack_version")})
+        manifest = {
+            "format": "gemini-finetune.v1",
+            "format_target": "gemini_vertex_chat_jsonl",
+            "provider": "gemini",
+            "paths": paths,
+            "counts": {split_name: len(grouped.get(split_name, [])) for split_name in ("train", "validation", "holdout")},
+            "split_boundaries": {
+                "train_room_ids": split.train,
+                "validation_room_ids": split.validation,
+                "holdout_room_ids": split.holdout,
+            },
+            "source_windows": {
+                "local_market_day_start": local_days[0] if local_days else None,
+                "local_market_day_end": local_days[-1] if local_days else None,
+                "checkpoint_ts_start": checkpoint_values[0] if checkpoint_values else None,
+                "checkpoint_ts_end": checkpoint_values[-1] if checkpoint_values else None,
+            },
+            "pack_versions": pack_versions,
+            "audit_stats": {
+                "audit_sources": audit_source_counts,
+                "settlement_mismatch_count": sum(
+                    1
+                    for bundle in bundles
+                    if (bundle.settlement_label or {}).get("crosscheck_status") == self.SETTLEMENT_MISMATCH
+                ),
+                "trainable_default_count": sum(1 for bundle in bundles if bundle.trainable_default is not False),
+                "excluded_count": sum(1 for bundle in bundles if bundle.exclude_reason),
+                "exclusion_counts": exclusion_counts,
+            },
+        }
+        manifest_path = output_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+        paths["manifest"] = str(manifest_path)
+        return paths
+
+    @staticmethod
+    def _gemini_example(example: dict[str, Any]) -> dict[str, Any]:
+        messages = example.get("messages") or []
+        system_text = next((message.get("content") for message in messages if message.get("role") == "system"), "")
+        user_text = next((message.get("content") for message in messages if message.get("role") == "user"), "")
+        assistant_text = next((message.get("content") for message in messages if message.get("role") == "assistant"), "")
+        return {
+            "system_instruction": {
+                "parts": [{"text": system_text}],
+            },
+            "contents": [
+                {"role": "user", "parts": [{"text": user_text}]},
+                {"role": "model", "parts": [{"text": assistant_text}]},
+            ],
+            "metadata": example.get("metadata") or {},
+        }
+
+    def _split_name(self, room_id: str, split: HistoricalBuildSplit) -> str:
+        if room_id in split.validation:
+            return "validation"
+        if room_id in split.holdout:
+            return "holdout"
+        return "train"
+
+    def _selected_templates(self, series: list[str] | None) -> list[WeatherSeriesTemplate]:
+        templates = self.weather_directory.templates()
+        if not series:
+            return templates
+        wanted = {item.upper() for item in series}
+        return [template for template in templates if template.series_ticker.upper() in wanted]
+
+    def _mapping_for_market(self, market_ticker: str, market_payload: dict[str, Any] | None) -> WeatherMarketMapping | None:
+        mapping = self.weather_directory.get(market_ticker)
+        if mapping is not None:
+            return mapping
+        return self.weather_directory.resolve_market(market_ticker, market_payload or {})
+
+    def _market_local_day(self, mapping: WeatherMarketMapping, market: dict[str, Any]) -> str:
+        ticker = str(market.get("ticker") or mapping.market_ticker)
+        parts = ticker.split("-")
+        if len(parts) >= 3 and len(parts[1]) == 7:
+            try:
+                parsed = datetime.strptime(parts[1], "%y%b%d")
+                return parsed.date().isoformat()
+            except ValueError:
+                pass
+        close_at = self._market_timestamp(market, "close_time", "close_ts")
+        zone = ZoneInfo(self._timezone_name(mapping))
+        if close_at is not None:
+            return close_at.astimezone(zone).date().isoformat()
+        return datetime.now(zone).date().isoformat()
+
+    def _weather_local_day(self, mapping: WeatherMarketMapping, payload: dict[str, Any], *, fallback: datetime) -> str:
+        observation_ts = _parse_iso(((payload.get("observation") or {}).get("properties") or {}).get("timestamp"))
+        zone = ZoneInfo(self._timezone_name(mapping))
+        return (observation_ts or fallback).astimezone(zone).date().isoformat()
+
+    def _checkpoint_times(
+        self,
+        mapping: WeatherMarketMapping,
+        *,
+        local_market_day: str,
+        market_payload: dict[str, Any],
+    ) -> list[tuple[str, datetime]]:
+        zone = ZoneInfo(self._timezone_name(mapping))
+        local_day = datetime.fromisoformat(local_market_day).date()
+        close_at = self._market_timestamp(market_payload, "close_time", "close_ts")
+        close_local = close_at.astimezone(zone) if close_at is not None else None
+        checkpoints: list[tuple[str, datetime]] = []
+        for label, hour in self.CHECKPOINTS:
+            local_dt = datetime.combine(local_day, time(hour=hour), tzinfo=zone)
+            if label == "late_1700" and close_local is not None:
+                candidate = close_local - timedelta(hours=1)
+                if candidate < local_dt:
+                    local_dt = candidate
+            checkpoints.append((label, local_dt.astimezone(UTC)))
+        deduped: dict[str, datetime] = {}
+        for label, checkpoint in checkpoints:
+            deduped[checkpoint.isoformat()] = checkpoint
+        return [
+            (f"checkpoint_{index+1}", checkpoint)
+            for index, checkpoint in enumerate(sorted(deduped.values()))
+        ]
+
+    def _timezone_name(self, mapping: WeatherMarketMapping) -> str:
+        if mapping.timezone_name:
+            return mapping.timezone_name
+        longitude = mapping.longitude
+        if longitude is not None:
+            if longitude <= -85.0 and longitude > -100.0:
+                return "America/Chicago"
+            if longitude <= -60.0 and longitude > -85.0:
+                return "America/New_York"
+        if mapping.series_ticker == "KXHIGHCHI":
+            return "America/Chicago"
+        return "America/New_York"
+
+    @staticmethod
+    def _market_timestamp(market: dict[str, Any], *keys: str) -> datetime | None:
+        for key in keys:
+            value = market.get(key)
+            if value in (None, ""):
+                continue
+            if isinstance(value, (int, float)):
+                try:
+                    return datetime.fromtimestamp(int(value), tz=UTC)
+                except (OverflowError, OSError, ValueError):
+                    continue
+            parsed = _parse_iso(value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _market_settlement_value(market: dict[str, Any]) -> Decimal | None:
+        if market.get("settlement_value_dollars") not in (None, ""):
+            return _parse_decimal(market.get("settlement_value_dollars"))
+        result = str(market.get("result") or "").lower()
+        if result == "yes":
+            return Decimal("1.0000")
+        if result == "no":
+            return Decimal("0.0000")
+        return None
+
+    @staticmethod
+    def _settlement_result_from_high(mapping: WeatherMarketMapping, high_f: Decimal) -> str:
+        threshold = Decimal(str(mapping.threshold_f))
+        if mapping.operator in (">", ">="):
+            return "yes" if high_f >= threshold else "no"
+        return "yes" if high_f <= threshold else "no"
+
+    @staticmethod
+    def _quantize_two(value: float | None) -> Decimal | None:
+        if value is None:
+            return None
+        return Decimal(str(value)).quantize(Decimal("0.01"))
+
+    @staticmethod
+    def _dt_to_iso(value: Any) -> str | None:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str):
+            return value
+        return None

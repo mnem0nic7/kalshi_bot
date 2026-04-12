@@ -84,6 +84,14 @@ FAQ_SECTIONS = [
                 "read_more": ["docs/training.md"],
             },
             {
+                "question": "How does historical replay training work?",
+                "answer": [
+                    "Historical replay imports settled weather market-days, captured market snapshots, and point-in-time weather bundles, then rebuilds synthetic rooms using only data that existed at each replay checkpoint.",
+                    "Those replayed rooms are marked historical_replay, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files.",
+                ],
+                "read_more": ["docs/training.md", "docs/faq.md"],
+            },
+            {
                 "question": "Why might self-improvement still be blocked?",
                 "answer": [
                     "Because readiness is gated by corpus volume and label quality, not just by plumbing. We need enough complete rooms, enough diversity, enough trade-positive examples, and enough settled rooms before critique, evaluation, or promotion should be trusted.",

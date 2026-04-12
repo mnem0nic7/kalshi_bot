@@ -84,3 +84,9 @@ class RiskStatus(StrEnum):
 class DeploymentColor(StrEnum):
     BLUE = "blue"
     GREEN = "green"
+
+
+class RoomOrigin(StrEnum):
+    SHADOW = "shadow"
+    LIVE = "live"
+    HISTORICAL_REPLAY = "historical_replay"

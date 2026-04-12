@@ -18,6 +18,8 @@ from pydantic import BaseModel, ValidationError
 
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import (
+    HistoricalDateRangeRequest,
+    HistoricalTrainingBuildRequest,
     RoomCreate,
     ShadowCampaignRequest,
     ShadowRunRequest,
@@ -65,6 +67,7 @@ def _serialize_room(room) -> dict:
         "id": room.id,
         "name": room.name,
         "market_ticker": room.market_ticker,
+        "room_origin": room.room_origin,
         "prompt": room.prompt,
         "kalshi_env": room.kalshi_env,
         "stage": room.stage,
@@ -562,11 +565,13 @@ def create_app() -> FastAPI:
             ops_events = await repo.list_ops_events(limit=10)
             dossiers = [
                 {"market_ticker": room.market_ticker, "stage": room.stage}
-                for room in await repo.list_rooms(limit=10)
+                for room in await repo.list_rooms(limit=10, origins=["shadow", "live"])
             ]
             runtime_health = await app_container.watchdog_service.get_status(repo)
             await session.commit()
         training_status_payload = await app_container.training_corpus_service.get_status(persist_readiness=False)
+        historical_status_payload = await app_container.historical_training_service.get_status()
+        training_status_payload["historical"] = historical_status_payload
         return JSONResponse(
             {
                 "active_color": control.active_color,
@@ -630,13 +635,48 @@ def create_app() -> FastAPI:
     @app.get("/api/training/status")
     async def training_status(request: Request) -> JSONResponse:
         app_container = container(request)
-        return JSONResponse(await app_container.training_corpus_service.get_status(persist_readiness=True))
+        payload = await app_container.training_corpus_service.get_status(persist_readiness=True)
+        payload["historical"] = await app_container.historical_training_service.get_status()
+        return JSONResponse(payload)
 
     @app.post("/api/training/build")
     async def training_build(request: Request) -> JSONResponse:
         app_container = container(request)
         payload = await parse_json_model(request, TrainingBuildRequest, default_on_empty=True)
         return JSONResponse(await app_container.training_corpus_service.build_dataset(payload))
+
+    @app.get("/api/historical/status")
+    async def historical_status(request: Request) -> JSONResponse:
+        app_container = container(request)
+        return JSONResponse(await app_container.historical_training_service.get_status())
+
+    @app.post("/api/historical/import")
+    async def historical_import(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, HistoricalDateRangeRequest)
+        result = await app_container.historical_training_service.import_weather_history(
+            date_from=datetime.fromisoformat(payload.date_from).date(),
+            date_to=datetime.fromisoformat(payload.date_to).date(),
+            series=payload.series or None,
+        )
+        return JSONResponse(result)
+
+    @app.post("/api/historical/replay")
+    async def historical_replay(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, HistoricalDateRangeRequest)
+        result = await app_container.historical_training_service.replay_weather_history(
+            date_from=datetime.fromisoformat(payload.date_from).date(),
+            date_to=datetime.fromisoformat(payload.date_to).date(),
+            series=payload.series or None,
+        )
+        return JSONResponse(result)
+
+    @app.post("/api/training/historical/build")
+    async def historical_training_build(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, HistoricalTrainingBuildRequest)
+        return JSONResponse(await app_container.historical_training_service.build_historical_dataset(payload))
 
     @app.get("/api/training/builds")
     async def training_builds(request: Request) -> JSONResponse:
@@ -738,7 +778,7 @@ def create_app() -> FastAPI:
         app_container = container(request)
         async with app_container.session_factory() as session:
             repo = PlatformRepository(session)
-            rooms = await repo.list_rooms()
+            rooms = await repo.list_rooms(origins=["shadow", "live"])
             control = await repo.get_deployment_control()
             positions = await repo.list_positions(limit=8)
             ops_events = await repo.list_ops_events(limit=8)
@@ -747,6 +787,8 @@ def create_app() -> FastAPI:
             await session.commit()
         self_improve_status_payload = await app_container.self_improve_service.get_status()
         training_status_payload = await app_container.training_corpus_service.get_status(persist_readiness=False)
+        historical_status_payload = await app_container.historical_training_service.get_status()
+        training_status_payload["historical"] = historical_status_payload
         research_audit_payload = await app_container.training_corpus_service.research_audit(limit=8)
         dossiers_by_market = {record.market_ticker: record.payload for record in dossier_records}
         configured_markets = []
@@ -796,6 +838,7 @@ def create_app() -> FastAPI:
                 "configured_markets": configured_markets,
                 "self_improve_status": self_improve_status_payload,
                 "training_status": training_status_payload,
+                "historical_status": historical_status_payload,
                 "research_audit": [issue.model_dump(mode="json") for issue in research_audit_payload],
                 "runtime_health": runtime_health,
                 "settings": app_container.settings,

@@ -114,6 +114,17 @@ class KalshiClient:
     async def list_markets(self, **params: Any) -> dict[str, Any]:
         return await self._request("GET", "/markets", params=params)
 
+    async def list_historical_markets(self, **params: Any) -> dict[str, Any]:
+        return await self._request("GET", "/historical/markets", params=params)
+
+    async def get_market_candlesticks(
+        self,
+        series_ticker: str,
+        market_ticker: str,
+        **params: Any,
+    ) -> dict[str, Any]:
+        return await self._request("GET", f"/series/{series_ticker}/markets/{market_ticker}/candlesticks", params=params)
+
     async def get_balance(self) -> dict[str, Any]:
         return await self._request("GET", "/portfolio/balance")
 

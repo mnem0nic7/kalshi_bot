@@ -17,6 +17,7 @@ from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
 class RiskContext:
     market_observed_at: datetime | None
     research_observed_at: datetime | None
+    decision_time: datetime | None = None
     current_position_notional_dollars: Decimal = Decimal("0")
 
 
@@ -43,7 +44,7 @@ class DeterministicRiskEngine:
         thresholds: RuntimeThresholds | None = None,
     ) -> RiskVerdictPayload:
         reasons: list[str] = []
-        now = datetime.now(UTC)
+        now = self._as_utc(context.decision_time) or datetime.now(UTC)
         market_observed_at = self._as_utc(context.market_observed_at)
         research_observed_at = self._as_utc(context.research_observed_at)
         active_thresholds = thresholds or RuntimeThresholds(

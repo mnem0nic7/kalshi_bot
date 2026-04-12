@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kalshi_bot.core.enums import DeploymentColor, MessageKind, RiskStatus, RoomStage
+from kalshi_bot.core.enums import DeploymentColor, MessageKind, RiskStatus, RoomOrigin, RoomStage
 from kalshi_bot.core.schemas import (
     AgentPack,
     EvaluationSummary,
@@ -31,6 +31,11 @@ from kalshi_bot.db.models import (
     DeploymentControl,
     EvaluationRunRecord,
     FillRecord,
+    HistoricalImportRunRecord,
+    HistoricalMarketSnapshotRecord,
+    HistoricalReplayRunRecord,
+    HistoricalSettlementLabelRecord,
+    HistoricalWeatherSnapshotRecord,
     MarketState,
     MemoryEmbedding,
     MemoryNoteRecord,
@@ -139,6 +144,7 @@ class PlatformRepository:
         shadow_mode: bool,
         kill_switch_enabled: bool,
         kalshi_env: str,
+        room_origin: str | None = None,
         agent_pack_version: str | None = None,
         evaluation_run_id: str | None = None,
         role_models: dict[str, Any] | None = None,
@@ -146,6 +152,7 @@ class PlatformRepository:
         record = Room(
             name=room.name,
             market_ticker=room.market_ticker,
+            room_origin=room_origin or (RoomOrigin.SHADOW.value if shadow_mode else RoomOrigin.LIVE.value),
             prompt=room.prompt,
             kalshi_env=kalshi_env,
             stage=RoomStage.TRIGGERED.value,
@@ -232,8 +239,16 @@ class PlatformRepository:
         result = await self.session.execute(stmt.order_by(RoomCampaignRecord.created_at.desc()).limit(limit))
         return list(result.scalars())
 
-    async def list_rooms(self, limit: int = 25) -> list[Room]:
-        result = await self.session.execute(select(Room).order_by(Room.updated_at.desc()).limit(limit))
+    async def list_rooms(
+        self,
+        limit: int = 25,
+        *,
+        origins: list[str] | None = None,
+    ) -> list[Room]:
+        stmt = select(Room)
+        if origins:
+            stmt = stmt.where(Room.room_origin.in_(origins))
+        result = await self.session.execute(stmt.order_by(Room.updated_at.desc()).limit(limit))
         return list(result.scalars())
 
     async def list_rooms_for_export(
@@ -242,10 +257,13 @@ class PlatformRepository:
         limit: int = 100,
         market_ticker: str | None = None,
         include_non_complete: bool = False,
+        origins: list[str] | None = None,
     ) -> list[Room]:
         stmt = select(Room)
         if market_ticker is not None:
             stmt = stmt.where(Room.market_ticker == market_ticker)
+        if origins:
+            stmt = stmt.where(Room.room_origin.in_(origins))
         if not include_non_complete:
             stmt = stmt.where(Room.stage == RoomStage.COMPLETE.value)
         result = await self.session.execute(stmt.order_by(Room.updated_at.desc()).limit(limit))
@@ -259,16 +277,23 @@ class PlatformRepository:
         pack_version: str | None = None,
         color: str | None = None,
         market_ticker: str | None = None,
+        origins: list[str] | None = None,
     ) -> list[Room]:
         stmt = (
             select(Room)
             .where(
                 Room.stage == RoomStage.COMPLETE.value,
                 Room.created_at >= since,
-                (Room.shadow_mode.is_(True)) | (Room.kalshi_env != "production"),
             )
             .order_by(Room.created_at.asc())
         )
+        if origins:
+            stmt = stmt.where(Room.room_origin.in_(origins))
+        else:
+            stmt = stmt.where(
+                Room.room_origin.in_([RoomOrigin.SHADOW.value, RoomOrigin.LIVE.value]),
+                (Room.shadow_mode.is_(True)) | (Room.kalshi_env != "production"),
+            )
         if pack_version is not None:
             stmt = stmt.where(Room.agent_pack_version == pack_version)
         if color is not None:
@@ -1257,6 +1282,365 @@ class PlatformRepository:
         stmt = select(TrainingReadinessRecord).order_by(TrainingReadinessRecord.created_at.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def create_historical_import_run(
+        self,
+        *,
+        import_kind: str,
+        source: str,
+        payload: dict[str, Any],
+    ) -> HistoricalImportRunRecord:
+        record = HistoricalImportRunRecord(
+            import_kind=import_kind,
+            source=source,
+            payload=payload,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def complete_historical_import_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        payload: dict[str, Any],
+        error_text: str | None = None,
+    ) -> HistoricalImportRunRecord:
+        record = await self.session.get(HistoricalImportRunRecord, run_id)
+        if record is None:
+            raise KeyError(f"Historical import run {run_id} not found")
+        record.status = status
+        record.finished_at = datetime.now(UTC)
+        record.payload = payload
+        record.error_text = error_text
+        await self.session.flush()
+        return record
+
+    async def list_historical_import_runs(
+        self,
+        *,
+        import_kind: str | None = None,
+        limit: int = 20,
+    ) -> list[HistoricalImportRunRecord]:
+        stmt = select(HistoricalImportRunRecord)
+        if import_kind is not None:
+            stmt = stmt.where(HistoricalImportRunRecord.import_kind == import_kind)
+        result = await self.session.execute(stmt.order_by(HistoricalImportRunRecord.started_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def upsert_historical_market_snapshot(
+        self,
+        *,
+        market_ticker: str,
+        series_ticker: str | None,
+        station_id: str | None,
+        local_market_day: str,
+        asof_ts: datetime,
+        source_kind: str,
+        source_id: str,
+        source_hash: str | None,
+        close_ts: datetime | None,
+        settlement_ts: datetime | None,
+        yes_bid_dollars: Decimal | None,
+        yes_ask_dollars: Decimal | None,
+        no_ask_dollars: Decimal | None,
+        last_price_dollars: Decimal | None,
+        payload: dict[str, Any],
+    ) -> HistoricalMarketSnapshotRecord:
+        stmt = select(HistoricalMarketSnapshotRecord).where(
+            HistoricalMarketSnapshotRecord.market_ticker == market_ticker,
+            HistoricalMarketSnapshotRecord.source_kind == source_kind,
+            HistoricalMarketSnapshotRecord.source_id == source_id,
+        )
+        record = (await self.session.execute(stmt)).scalar_one_or_none()
+        if record is None:
+            record = HistoricalMarketSnapshotRecord(
+                market_ticker=market_ticker,
+                series_ticker=series_ticker,
+                station_id=station_id,
+                local_market_day=local_market_day,
+                asof_ts=asof_ts,
+                source_kind=source_kind,
+                source_id=source_id,
+                source_hash=source_hash,
+                close_ts=close_ts,
+                settlement_ts=settlement_ts,
+                yes_bid_dollars=yes_bid_dollars,
+                yes_ask_dollars=yes_ask_dollars,
+                no_ask_dollars=no_ask_dollars,
+                last_price_dollars=last_price_dollars,
+                payload=payload,
+            )
+            self.session.add(record)
+        else:
+            record.series_ticker = series_ticker
+            record.station_id = station_id
+            record.local_market_day = local_market_day
+            record.asof_ts = asof_ts
+            record.source_hash = source_hash
+            record.close_ts = close_ts
+            record.settlement_ts = settlement_ts
+            record.yes_bid_dollars = yes_bid_dollars
+            record.yes_ask_dollars = yes_ask_dollars
+            record.no_ask_dollars = no_ask_dollars
+            record.last_price_dollars = last_price_dollars
+            record.payload = payload
+        await self.session.flush()
+        return record
+
+    async def list_historical_market_snapshots(
+        self,
+        *,
+        market_ticker: str | None = None,
+        series_ticker: str | None = None,
+        source_kind: str | None = None,
+        local_market_day: str | None = None,
+        before_asof: datetime | None = None,
+        limit: int = 500,
+    ) -> list[HistoricalMarketSnapshotRecord]:
+        stmt = select(HistoricalMarketSnapshotRecord)
+        if market_ticker is not None:
+            stmt = stmt.where(HistoricalMarketSnapshotRecord.market_ticker == market_ticker)
+        if series_ticker is not None:
+            stmt = stmt.where(HistoricalMarketSnapshotRecord.series_ticker == series_ticker)
+        if source_kind is not None:
+            stmt = stmt.where(HistoricalMarketSnapshotRecord.source_kind == source_kind)
+        if local_market_day is not None:
+            stmt = stmt.where(HistoricalMarketSnapshotRecord.local_market_day == local_market_day)
+        if before_asof is not None:
+            stmt = stmt.where(HistoricalMarketSnapshotRecord.asof_ts <= before_asof)
+        result = await self.session.execute(stmt.order_by(HistoricalMarketSnapshotRecord.asof_ts.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def get_latest_historical_market_snapshot(
+        self,
+        *,
+        market_ticker: str,
+        before_asof: datetime,
+        source_kind: str | None = None,
+        local_market_day: str | None = None,
+    ) -> HistoricalMarketSnapshotRecord | None:
+        records = await self.list_historical_market_snapshots(
+            market_ticker=market_ticker,
+            source_kind=source_kind,
+            local_market_day=local_market_day,
+            before_asof=before_asof,
+            limit=1,
+        )
+        return records[0] if records else None
+
+    async def upsert_historical_weather_snapshot(
+        self,
+        *,
+        station_id: str,
+        series_ticker: str | None,
+        local_market_day: str,
+        asof_ts: datetime,
+        source_kind: str,
+        source_id: str,
+        source_hash: str | None,
+        observation_ts: datetime | None,
+        forecast_updated_ts: datetime | None,
+        forecast_high_f: Decimal | None,
+        current_temp_f: Decimal | None,
+        payload: dict[str, Any],
+    ) -> HistoricalWeatherSnapshotRecord:
+        stmt = select(HistoricalWeatherSnapshotRecord).where(
+            HistoricalWeatherSnapshotRecord.station_id == station_id,
+            HistoricalWeatherSnapshotRecord.source_kind == source_kind,
+            HistoricalWeatherSnapshotRecord.source_id == source_id,
+        )
+        record = (await self.session.execute(stmt)).scalar_one_or_none()
+        if record is None:
+            record = HistoricalWeatherSnapshotRecord(
+                station_id=station_id,
+                series_ticker=series_ticker,
+                local_market_day=local_market_day,
+                asof_ts=asof_ts,
+                source_kind=source_kind,
+                source_id=source_id,
+                source_hash=source_hash,
+                observation_ts=observation_ts,
+                forecast_updated_ts=forecast_updated_ts,
+                forecast_high_f=forecast_high_f,
+                current_temp_f=current_temp_f,
+                payload=payload,
+            )
+            self.session.add(record)
+        else:
+            record.series_ticker = series_ticker
+            record.local_market_day = local_market_day
+            record.asof_ts = asof_ts
+            record.source_hash = source_hash
+            record.observation_ts = observation_ts
+            record.forecast_updated_ts = forecast_updated_ts
+            record.forecast_high_f = forecast_high_f
+            record.current_temp_f = current_temp_f
+            record.payload = payload
+        await self.session.flush()
+        return record
+
+    async def list_historical_weather_snapshots(
+        self,
+        *,
+        station_id: str | None = None,
+        series_ticker: str | None = None,
+        local_market_day: str | None = None,
+        before_asof: datetime | None = None,
+        limit: int = 500,
+    ) -> list[HistoricalWeatherSnapshotRecord]:
+        stmt = select(HistoricalWeatherSnapshotRecord)
+        if station_id is not None:
+            stmt = stmt.where(HistoricalWeatherSnapshotRecord.station_id == station_id)
+        if series_ticker is not None:
+            stmt = stmt.where(HistoricalWeatherSnapshotRecord.series_ticker == series_ticker)
+        if local_market_day is not None:
+            stmt = stmt.where(HistoricalWeatherSnapshotRecord.local_market_day == local_market_day)
+        if before_asof is not None:
+            stmt = stmt.where(HistoricalWeatherSnapshotRecord.asof_ts <= before_asof)
+        result = await self.session.execute(stmt.order_by(HistoricalWeatherSnapshotRecord.asof_ts.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def get_latest_historical_weather_snapshot(
+        self,
+        *,
+        station_id: str,
+        before_asof: datetime,
+        local_market_day: str | None = None,
+    ) -> HistoricalWeatherSnapshotRecord | None:
+        records = await self.list_historical_weather_snapshots(
+            station_id=station_id,
+            local_market_day=local_market_day,
+            before_asof=before_asof,
+            limit=1,
+        )
+        return records[0] if records else None
+
+    async def upsert_historical_settlement_label(
+        self,
+        *,
+        market_ticker: str,
+        series_ticker: str | None,
+        local_market_day: str,
+        source_kind: str,
+        kalshi_result: str | None,
+        settlement_value_dollars: Decimal | None,
+        settlement_ts: datetime | None,
+        crosscheck_status: str,
+        crosscheck_high_f: Decimal | None,
+        crosscheck_result: str | None,
+        payload: dict[str, Any],
+    ) -> HistoricalSettlementLabelRecord:
+        stmt = select(HistoricalSettlementLabelRecord).where(HistoricalSettlementLabelRecord.market_ticker == market_ticker)
+        record = (await self.session.execute(stmt)).scalar_one_or_none()
+        if record is None:
+            record = HistoricalSettlementLabelRecord(
+                market_ticker=market_ticker,
+                series_ticker=series_ticker,
+                local_market_day=local_market_day,
+                source_kind=source_kind,
+                kalshi_result=kalshi_result,
+                settlement_value_dollars=settlement_value_dollars,
+                settlement_ts=settlement_ts,
+                crosscheck_status=crosscheck_status,
+                crosscheck_high_f=crosscheck_high_f,
+                crosscheck_result=crosscheck_result,
+                payload=payload,
+            )
+            self.session.add(record)
+        else:
+            record.series_ticker = series_ticker
+            record.local_market_day = local_market_day
+            record.source_kind = source_kind
+            record.kalshi_result = kalshi_result
+            record.settlement_value_dollars = settlement_value_dollars
+            record.settlement_ts = settlement_ts
+            record.crosscheck_status = crosscheck_status
+            record.crosscheck_high_f = crosscheck_high_f
+            record.crosscheck_result = crosscheck_result
+            record.payload = payload
+        await self.session.flush()
+        return record
+
+    async def get_historical_settlement_label(self, market_ticker: str) -> HistoricalSettlementLabelRecord | None:
+        stmt = select(HistoricalSettlementLabelRecord).where(HistoricalSettlementLabelRecord.market_ticker == market_ticker).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_historical_settlement_labels(
+        self,
+        *,
+        series_tickers: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int = 1000,
+    ) -> list[HistoricalSettlementLabelRecord]:
+        stmt = select(HistoricalSettlementLabelRecord)
+        if series_tickers:
+            stmt = stmt.where(HistoricalSettlementLabelRecord.series_ticker.in_(series_tickers))
+        if date_from is not None:
+            stmt = stmt.where(HistoricalSettlementLabelRecord.local_market_day >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(HistoricalSettlementLabelRecord.local_market_day <= date_to)
+        result = await self.session.execute(
+            stmt.order_by(HistoricalSettlementLabelRecord.local_market_day.asc(), HistoricalSettlementLabelRecord.market_ticker.asc()).limit(limit)
+        )
+        return list(result.scalars())
+
+    async def create_historical_replay_run(
+        self,
+        *,
+        room_id: str,
+        market_ticker: str,
+        series_ticker: str | None,
+        local_market_day: str,
+        checkpoint_label: str,
+        checkpoint_ts: datetime,
+        status: str,
+        agent_pack_version: str | None,
+        payload: dict[str, Any],
+    ) -> HistoricalReplayRunRecord:
+        record = HistoricalReplayRunRecord(
+            room_id=room_id,
+            market_ticker=market_ticker,
+            series_ticker=series_ticker,
+            local_market_day=local_market_day,
+            checkpoint_label=checkpoint_label,
+            checkpoint_ts=checkpoint_ts,
+            status=status,
+            agent_pack_version=agent_pack_version,
+            payload=payload,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def get_historical_replay_run_by_room(self, room_id: str) -> HistoricalReplayRunRecord | None:
+        stmt = select(HistoricalReplayRunRecord).where(HistoricalReplayRunRecord.room_id == room_id).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_historical_replay_runs(
+        self,
+        *,
+        series_tickers: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        status: str | None = None,
+        limit: int = 1000,
+    ) -> list[HistoricalReplayRunRecord]:
+        stmt = select(HistoricalReplayRunRecord)
+        if series_tickers:
+            stmt = stmt.where(HistoricalReplayRunRecord.series_ticker.in_(series_tickers))
+        if date_from is not None:
+            stmt = stmt.where(HistoricalReplayRunRecord.local_market_day >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(HistoricalReplayRunRecord.local_market_day <= date_to)
+        if status is not None:
+            stmt = stmt.where(HistoricalReplayRunRecord.status == status)
+        result = await self.session.execute(
+            stmt.order_by(HistoricalReplayRunRecord.checkpoint_ts.asc(), HistoricalReplayRunRecord.market_ticker.asc()).limit(limit)
+        )
+        return list(result.scalars())
+
     async def save_memory_note(self, *, room_id: str | None, payload: MemoryNotePayload, embedding: list[float] | None, provider: str) -> MemoryNoteRecord:
         note = MemoryNoteRecord(
             room_id=room_id,
@@ -1316,6 +1700,8 @@ class PlatformRepository:
         stream_name: str | None = None,
         event_type: str | None = None,
         market_ticker: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
         limit: int = 50,
     ) -> list[RawExchangeEvent]:
         stmt = select(RawExchangeEvent)
@@ -1325,5 +1711,30 @@ class PlatformRepository:
             stmt = stmt.where(RawExchangeEvent.event_type == event_type)
         if market_ticker is not None:
             stmt = stmt.where(RawExchangeEvent.market_ticker == market_ticker)
+        if created_after is not None:
+            stmt = stmt.where(RawExchangeEvent.created_at >= created_after)
+        if created_before is not None:
+            stmt = stmt.where(RawExchangeEvent.created_at <= created_before)
         stmt = stmt.order_by(RawExchangeEvent.created_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def list_weather_events(
+        self,
+        *,
+        station_id: str | None = None,
+        event_type: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = 200,
+    ) -> list[RawWeatherEvent]:
+        stmt = select(RawWeatherEvent)
+        if station_id is not None:
+            stmt = stmt.where(RawWeatherEvent.station_id == station_id)
+        if event_type is not None:
+            stmt = stmt.where(RawWeatherEvent.event_type == event_type)
+        if created_after is not None:
+            stmt = stmt.where(RawWeatherEvent.created_at >= created_after)
+        if created_before is not None:
+            stmt = stmt.where(RawWeatherEvent.created_at <= created_before)
+        stmt = stmt.order_by(RawWeatherEvent.created_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())

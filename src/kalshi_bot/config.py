@@ -119,6 +119,10 @@ class Settings(BaseSettings):
     training_campaign_lookback_hours: int = 24
     training_campaign_cooldown_seconds: int = 600
     training_campaign_max_recent_per_market: int = 5
+    historical_import_page_size: int = 500
+    historical_import_max_pages: int = 25
+    historical_replay_market_snapshot_lookback_hours: int = 36
+    historical_weather_archive_path: str = "data/historical_weather"
 
     def model_post_init(self, __context: object) -> None:
         if self.database_url:

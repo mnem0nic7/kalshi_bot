@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 import json
 from typing import Any, Iterable
 
@@ -44,7 +45,9 @@ class TrainingExportService:
             campaign = await repo.get_room_campaign(room_id)
             research_health = await repo.get_room_research_health(room_id)
             strategy_audit = await repo.get_room_strategy_audit(room_id)
+            historical_replay = await repo.get_historical_replay_run_by_room(room_id)
             settlement = await self._latest_settlement_for_market(repo, room.market_ticker)
+            settlement_label = await repo.get_historical_settlement_label(room.market_ticker)
             await session.commit()
 
         outcome = self._derive_outcome(
@@ -56,10 +59,11 @@ class TrainingExportService:
             trade_ticket=(self._trade_ticket_dict(trade_ticket) if trade_ticket is not None else None),
             orders=[self._order_dict(order) for order in orders],
             fills=[self._fill_dict(fill) for fill in fills],
-            settlement=settlement,
+            settlement=(settlement or (self._settlement_label_dict(settlement_label) if settlement_label is not None else None)),
         )
 
         return TrainingRoomBundle(
+            room_origin=room.room_origin,
             room=self._room_dict(room),
             campaign=(self._campaign_dict(campaign) if campaign is not None else None),
             research_health=(self._research_health_dict(research_health) if research_health is not None else None),
@@ -80,7 +84,18 @@ class TrainingExportService:
             orders=[self._order_dict(order) for order in orders],
             fills=[self._fill_dict(fill) for fill in fills],
             memory_note=self._memory_note_dict(memory_note) if memory_note is not None else None,
+            historical_provenance=(
+                dict((historical_replay.payload or {}).get("historical_provenance") or {})
+                if historical_replay is not None
+                else None
+            ),
+            replay_checkpoint_ts=(historical_replay.checkpoint_ts if historical_replay is not None else None),
             settlement=settlement,
+            settlement_label=(self._settlement_label_dict(settlement_label) if settlement_label is not None else None),
+            counterfactual_pnl_dollars=self._counterfactual_pnl(
+                trade_ticket=(self._trade_ticket_dict(trade_ticket) if trade_ticket is not None else None),
+                settlement=(settlement or (self._settlement_label_dict(settlement_label) if settlement_label is not None else None)),
+            ),
             outcome=outcome,
         )
 
@@ -91,11 +106,13 @@ class TrainingExportService:
         market_ticker: str | None = None,
         limit: int = 100,
         include_non_complete: bool = False,
+        origins: list[str] | None = None,
     ) -> list[TrainingRoomBundle]:
         target_room_ids = room_ids or await self._list_room_ids(
             market_ticker=market_ticker,
             limit=limit,
             include_non_complete=include_non_complete,
+            origins=origins,
         )
         return [await self.build_room_bundle(room_id) for room_id in target_room_ids[:limit]]
 
@@ -141,6 +158,7 @@ class TrainingExportService:
                         "research_gate_passed": bundle.outcome.research_gate_passed,
                         "shadow_mode": bundle.outcome.shadow_mode,
                         "room_stage": bundle.outcome.room_stage,
+                        "room_origin": bundle.room_origin or bundle.room.get("room_origin"),
                     },
                 )
             )
@@ -154,12 +172,14 @@ class TrainingExportService:
         limit: int = 100,
         include_non_complete: bool = False,
         roles: Iterable[str] | None = None,
+        origins: list[str] | None = None,
     ) -> list[RoleTrainingExample]:
         bundles = await self.export_room_bundles(
             room_ids=room_ids,
             market_ticker=market_ticker,
             limit=limit,
             include_non_complete=include_non_complete,
+            origins=origins,
         )
         examples: list[RoleTrainingExample] = []
         for bundle in bundles:
@@ -172,6 +192,7 @@ class TrainingExportService:
         market_ticker: str | None,
         limit: int,
         include_non_complete: bool,
+        origins: list[str] | None = None,
     ) -> list[str]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -179,6 +200,7 @@ class TrainingExportService:
                 market_ticker=market_ticker,
                 limit=limit,
                 include_non_complete=include_non_complete,
+                origins=origins,
             )
             await session.commit()
         return [room.id for room in rooms]
@@ -196,6 +218,26 @@ class TrainingExportService:
                 if ticker == market_ticker:
                     return settlement
         return None
+
+    def _counterfactual_pnl(
+        self,
+        *,
+        trade_ticket: dict[str, Any] | None,
+        settlement: dict[str, Any] | None,
+    ) -> Decimal | None:
+        if trade_ticket is None or settlement is None:
+            return None
+        settlement_value = settlement.get("settlement_value_dollars")
+        side = trade_ticket.get("side")
+        yes_price = trade_ticket.get("yes_price_dollars")
+        count_fp = trade_ticket.get("count_fp")
+        if settlement_value in (None, "") or yes_price in (None, "") or count_fp in (None, "") or side not in {"yes", "no"}:
+            return None
+        settled_yes = Decimal(str(settlement_value))
+        price = Decimal(str(yes_price))
+        count = Decimal(str(count_fp))
+        pnl = (settled_yes - price) * count if side == "yes" else (price - settled_yes) * count
+        return pnl.quantize(Decimal("0.0001"))
 
     def _derive_outcome(
         self,
@@ -382,6 +424,7 @@ class TrainingExportService:
             "id": room.id,
             "name": room.name,
             "market_ticker": room.market_ticker,
+            "room_origin": room.room_origin,
             "prompt": room.prompt,
             "kalshi_env": room.kalshi_env,
             "stage": room.stage,
@@ -486,6 +529,27 @@ class TrainingExportService:
             "tags": note.tags,
             "linked_message_ids": note.linked_message_ids,
             "created_at": note.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def _settlement_label_dict(label: Any) -> dict[str, Any]:
+        return {
+            "id": label.id,
+            "market_ticker": label.market_ticker,
+            "series_ticker": label.series_ticker,
+            "local_market_day": label.local_market_day,
+            "source_kind": label.source_kind,
+            "kalshi_result": label.kalshi_result,
+            "settlement_value_dollars": (
+                str(label.settlement_value_dollars) if label.settlement_value_dollars is not None else None
+            ),
+            "settlement_ts": label.settlement_ts.isoformat() if label.settlement_ts is not None else None,
+            "crosscheck_status": label.crosscheck_status,
+            "crosscheck_high_f": str(label.crosscheck_high_f) if label.crosscheck_high_f is not None else None,
+            "crosscheck_result": label.crosscheck_result,
+            "payload": label.payload,
+            "created_at": label.created_at.isoformat(),
+            "updated_at": label.updated_at.isoformat(),
         }
 
     @staticmethod

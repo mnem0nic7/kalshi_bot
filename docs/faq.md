@@ -66,6 +66,14 @@ You can still build raw legacy datasets when you want analysis instead of clean 
 
 Read more: `docs/training.md`
 
+## How does historical replay training work?
+
+Historical replay imports settled weather market-days, captured market snapshots, and point-in-time weather bundles, then rebuilds synthetic rooms using only data that existed at each replay checkpoint.
+
+Those replayed rooms are marked `historical_replay`, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files.
+
+Read more: `docs/training.md`
+
 ## Why might self-improvement still be blocked?
 
 Because readiness is gated by corpus volume and label quality, not just by plumbing. We need enough complete rooms, enough diversity, enough trade-positive examples, and enough settled rooms before critique, evaluation, or promotion should be trusted.

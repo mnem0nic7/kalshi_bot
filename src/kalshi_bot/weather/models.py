@@ -14,7 +14,9 @@ class WeatherMarketMapping(BaseModel):
     research_queries: list[str] = Field(default_factory=list)
     research_urls: list[str] = Field(default_factory=list)
     station_id: str | None = None
+    daily_summary_station_id: str | None = None
     location_name: str | None = None
+    timezone_name: str | None = None
     latitude: float | None = None
     longitude: float | None = None
     threshold_f: float | None = None
@@ -53,7 +55,9 @@ class WeatherSeriesTemplate(BaseModel):
     research_queries: list[str] = Field(default_factory=list)
     research_urls: list[str] = Field(default_factory=list)
     station_id: str
+    daily_summary_station_id: str | None = None
     location_name: str
+    timezone_name: str | None = None
     latitude: float
     longitude: float
     metric: str = "daily_high_f"
@@ -98,7 +102,9 @@ class WeatherSeriesTemplate(BaseModel):
             research_queries=list(self.research_queries),
             research_urls=list(self.research_urls),
             station_id=self.station_id,
+            daily_summary_station_id=self.daily_summary_station_id,
             location_name=self.location_name,
+            timezone_name=self.timezone_name,
             latitude=self.latitude,
             longitude=self.longitude,
             threshold_f=threshold_f,

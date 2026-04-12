@@ -12,6 +12,7 @@ from kalshi_bot.core.enums import (
     ContractSide,
     MessageKind,
     RiskStatus,
+    RoomOrigin,
     RoomStage,
     StandDownReason,
     StrategyMode,
@@ -339,6 +340,7 @@ class TrainingRoomOutcome(BaseModel):
 class TrainingRoomBundle(BaseModel):
     export_version: str = "room-bundle.v1"
     exported_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    room_origin: str | None = None
     room: dict[str, Any]
     campaign: dict[str, Any] | None = None
     research_health: dict[str, Any] | None = None
@@ -359,8 +361,19 @@ class TrainingRoomBundle(BaseModel):
     orders: list[dict[str, Any]] = Field(default_factory=list)
     fills: list[dict[str, Any]] = Field(default_factory=list)
     memory_note: dict[str, Any] | None = None
+    historical_provenance: dict[str, Any] | None = None
+    replay_checkpoint_ts: datetime | None = None
     settlement: dict[str, Any] | None = None
+    settlement_label: dict[str, Any] | None = None
+    counterfactual_pnl_dollars: Decimal | None = None
     outcome: TrainingRoomOutcome
+
+    @field_validator("counterfactual_pnl_dollars", mode="before")
+    @classmethod
+    def validate_counterfactual_pnl(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return Decimal(str(value)).quantize(Decimal("0.0001"))
 
 
 class RoleTrainingExample(BaseModel):
@@ -459,7 +472,46 @@ class TrainingBuildRequest(BaseModel):
     good_research_only: bool = False
     quality_cleaned_only: bool = True
     market_ticker: str | None = None
+    origins: list[str] | None = None
     output: str | None = None
+
+
+class HistoricalTrainingBuildRequest(BaseModel):
+    mode: str = "bundles"
+    limit: int = 1000
+    date_from: str
+    date_to: str
+    series: list[str] = Field(default_factory=list)
+    quality_cleaned_only: bool = True
+    include_pathology_examples: bool = False
+    output: str | None = None
+
+
+class HistoricalDateRangeRequest(BaseModel):
+    date_from: str
+    date_to: str
+    series: list[str] = Field(default_factory=list)
+
+
+class HistoricalReplayCheckpoint(BaseModel):
+    checkpoint_label: str
+    checkpoint_ts: datetime
+    local_market_day: str
+    timezone_name: str
+
+
+class HistoricalProvenance(BaseModel):
+    room_origin: RoomOrigin = RoomOrigin.HISTORICAL_REPLAY
+    import_run_id: str | None = None
+    replay_run_id: str | None = None
+    local_market_day: str
+    checkpoint_label: str
+    checkpoint_ts: datetime
+    timezone_name: str
+    market_snapshot_source_id: str | None = None
+    weather_snapshot_source_id: str | None = None
+    settlement_label_id: str | None = None
+    source_coverage: dict[str, Any] = Field(default_factory=dict)
 
 
 class ShadowCampaignRequest(BaseModel):
