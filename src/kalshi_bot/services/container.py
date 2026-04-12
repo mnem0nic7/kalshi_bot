@@ -14,6 +14,8 @@ from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.orchestration.supervisor import WorkflowSupervisor
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.agent_packs import AgentPackService
+from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
+from kalshi_bot.services.historical_intelligence import HistoricalIntelligenceService
 from kalshi_bot.services.historical_training import HistoricalTrainingService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.auto_trigger import AutoTriggerService
@@ -57,6 +59,8 @@ class AppContainer:
     training_export_service: TrainingExportService
     training_corpus_service: TrainingCorpusService
     historical_training_service: HistoricalTrainingService
+    historical_heuristic_service: HistoricalHeuristicService
+    historical_intelligence_service: HistoricalIntelligenceService
     shadow_training_service: ShadowTrainingService
     shadow_campaign_service: ShadowCampaignService
     self_improve_service: SelfImproveService
@@ -87,6 +91,7 @@ class AppContainer:
         reconciliation_service = ReconciliationService(kalshi)
         stream_service = MarketStreamService(settings, session_factory, kalshi_ws)
         training_export_service = TrainingExportService(session_factory)
+        historical_heuristic_service = HistoricalHeuristicService(settings)
         training_corpus_service = TrainingCorpusService(
             settings,
             session_factory,
@@ -111,12 +116,23 @@ class AppContainer:
             kalshi,
             weather_directory,
             agent_pack_service,
+            historical_heuristic_service,
             research_coordinator,
             risk_engine,
             memory_service,
             training_export_service,
             training_corpus_service,
             agents,
+        )
+        historical_intelligence_service = HistoricalIntelligenceService(
+            settings,
+            session_factory,
+            weather_directory,
+            agent_pack_service,
+            historical_heuristic_service,
+            research_coordinator,
+            training_export_service,
+            historical_training_service,
         )
         self_improve_service = SelfImproveService(
             settings,
@@ -138,6 +154,7 @@ class AppContainer:
             risk_engine=risk_engine,
             execution_service=execution_service,
             memory_service=memory_service,
+            historical_heuristic_service=historical_heuristic_service,
             research_coordinator=research_coordinator,
             training_corpus_service=training_corpus_service,
             agents=agents,
@@ -171,6 +188,7 @@ class AppContainer:
             self_improve_service,
             training_corpus_service,
             historical_training_service,
+            historical_intelligence_service,
         )
         container = cls(
             settings=settings,
@@ -195,6 +213,8 @@ class AppContainer:
             training_export_service=training_export_service,
             training_corpus_service=training_corpus_service,
             historical_training_service=historical_training_service,
+            historical_heuristic_service=historical_heuristic_service,
+            historical_intelligence_service=historical_intelligence_service,
             shadow_training_service=shadow_training_service,
             shadow_campaign_service=shadow_campaign_service,
             self_improve_service=self_improve_service,
@@ -211,6 +231,7 @@ class AppContainer:
                     initial_kill_switch_enabled=settings.app_enable_kill_switch,
                 )
                 await agent_pack_service.ensure_initialized(repo)
+                await historical_heuristic_service.ensure_initialized(repo)
                 await session.commit()
         return container
 

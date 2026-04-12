@@ -122,6 +122,19 @@
       {% endif %}
     </div>
     <div class="room-card">
+      <strong>Historical Heuristics</strong>
+      <span>active pack · {{ heuristic_status.active_pack_version }}</span>
+      <span>candidate pack · {{ heuristic_status.candidate_pack_version or "none" }}</span>
+      <span>window days · {{ heuristic_status.intelligence_window_days }}</span>
+      {% if heuristic_status.latest_run %}
+      <span>latest run · {{ heuristic_status.latest_run.status }}</span>
+      <span>latest rows · {{ heuristic_status.latest_run.row_count }}</span>
+      <span>promoted pack · {{ heuristic_status.latest_run.promoted_pack_version or "none" }}</span>
+      {% else %}
+      <span>No historical intelligence runs yet.</span>
+      {% endif %}
+    </div>
+    <div class="room-card">
       <strong>Top Exclusion Reasons</strong>
       {% for reason, count in training_status.quality_exclusion_reasons.items() %}
       <span>{{ reason }} · {{ count }}</span>

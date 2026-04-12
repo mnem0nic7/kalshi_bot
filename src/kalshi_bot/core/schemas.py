@@ -147,6 +147,7 @@ class ResearchTraderContext(BaseModel):
     autonomous_ready: bool = False
     resolution_state: WeatherResolutionState = WeatherResolutionState.UNRESOLVED
     strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED
+    heuristic_application: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("fair_yes_dollars", mode="before")
     @classmethod
@@ -370,6 +371,12 @@ class TrainingRoomBundle(BaseModel):
     settlement: dict[str, Any] | None = None
     settlement_label: dict[str, Any] | None = None
     counterfactual_pnl_dollars: Decimal | None = None
+    heuristic_pack_version: str | None = None
+    intelligence_run_id: str | None = None
+    candidate_pack_id: str | None = None
+    rule_trace: list[dict[str, Any]] = Field(default_factory=list)
+    support_window: dict[str, Any] | None = None
+    heuristic_summary: str | None = None
     outcome: TrainingRoomOutcome
 
     @field_validator("counterfactual_pnl_dollars", mode="before")
@@ -492,6 +499,87 @@ class HistoricalTrainingBuildRequest(BaseModel):
     late_only_ok: bool = False
     origins: list[str] = Field(default_factory=lambda: [RoomOrigin.HISTORICAL_REPLAY.value])
     output: str | None = None
+
+
+class HeuristicThresholds(BaseModel):
+    risk_min_edge_bps: int | None = None
+    trigger_max_spread_bps: int | None = None
+    strategy_quality_edge_buffer_bps: int | None = None
+    strategy_min_remaining_payout_bps: int | None = None
+
+
+class HeuristicCalibrationEntry(BaseModel):
+    series_ticker: str | None = None
+    city_bucket: str | None = None
+    threshold_bucket: str | None = None
+    daypart: str | None = None
+    forecast_delta_bucket: str | None = None
+    fair_yes_adjust_bps: int = 0
+    support_count: int = 0
+    mean_error_bps: float = 0.0
+
+
+class HeuristicPolicyCondition(BaseModel):
+    market_tickers: list[str] = Field(default_factory=list)
+    series_tickers: list[str] = Field(default_factory=list)
+    city_buckets: list[str] = Field(default_factory=list)
+    dayparts: list[str] = Field(default_factory=list)
+    threshold_buckets: list[str] = Field(default_factory=list)
+    forecast_delta_buckets: list[str] = Field(default_factory=list)
+    spread_regimes: list[str] = Field(default_factory=list)
+    coverage_classes: list[str] = Field(default_factory=list)
+    resolution_states: list[str] = Field(default_factory=list)
+    market_stale_values: list[bool] = Field(default_factory=list)
+    research_stale_values: list[bool] = Field(default_factory=list)
+
+
+class HeuristicPolicyAction(BaseModel):
+    fair_yes_adjust_bps: int | None = None
+    risk_min_edge_bps: int | None = None
+    trigger_max_spread_bps: int | None = None
+    strategy_quality_edge_buffer_bps: int | None = None
+    strategy_min_remaining_payout_bps: int | None = None
+    recommended_strategy_mode: StrategyMode | None = None
+    force_stand_down_reason: StandDownReason | None = None
+
+
+class HeuristicPolicyNode(BaseModel):
+    rule_id: str
+    description: str
+    priority: int = 100
+    support_count: int = 0
+    condition: HeuristicPolicyCondition = Field(default_factory=HeuristicPolicyCondition)
+    action: HeuristicPolicyAction = Field(default_factory=HeuristicPolicyAction)
+
+
+class HistoricalHeuristicPack(BaseModel):
+    version: str
+    status: str = "baseline"
+    parent_version: str | None = None
+    source: str = "historical_intelligence"
+    description: str = ""
+    thresholds: HeuristicThresholds = Field(default_factory=HeuristicThresholds)
+    calibration_entries: list[HeuristicCalibrationEntry] = Field(default_factory=list)
+    policy_graph: list[HeuristicPolicyNode] = Field(default_factory=list)
+    agent_summary: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class HistoricalIntelligenceRunRequest(BaseModel):
+    date_from: str
+    date_to: str
+    origins: list[str] = Field(default_factory=lambda: [RoomOrigin.HISTORICAL_REPLAY.value])
+    auto_promote: bool = True
+
+
+class HeuristicPackPromoteRequest(BaseModel):
+    candidate_version: str | None = None
+    reason: str = "manual_promote"
+
+
+class HeuristicPackRollbackRequest(BaseModel):
+    reason: str = "manual_rollback"
 
 
 class HistoricalDateRangeRequest(BaseModel):

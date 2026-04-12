@@ -122,8 +122,16 @@ class Settings(BaseSettings):
     historical_import_page_size: int = 500
     historical_import_max_pages: int = 25
     historical_replay_market_snapshot_lookback_hours: int = 36
+    historical_replay_market_stale_seconds: int = 900
     historical_weather_archive_path: str = "data/historical_weather"
     historical_checkpoint_capture_grace_seconds: int = 900
+    active_heuristic_pack_version: str = "historical-baseline-v1"
+    historical_intelligence_window_days: int = 30
+    historical_intelligence_min_full_market_days: int = 3
+    historical_intelligence_min_segment_support: int = 5
+    historical_intelligence_min_composite_improvement: float = 0.02
+    historical_intelligence_auto_promote: bool = True
+    historical_intelligence_daily_run_seconds: int = 86400
 
     def model_post_init(self, __context: object) -> None:
         if self.database_url:

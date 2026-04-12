@@ -149,6 +149,75 @@ def test_training_status_and_research_audit_endpoints_return_payloads(tmp_path, 
     get_settings.cache_clear()
 
 
+def test_historical_intelligence_and_heuristic_pack_endpoints_return_payloads(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        async def fake_status():
+            return {
+                "active_pack_version": "heuristic-baseline-v1",
+                "candidate_pack_version": "heuristic-candidate-v1",
+                "intelligence_window_days": 30,
+                "latest_run": {"status": "completed", "row_count": 12},
+            }
+
+        async def fake_run(payload):
+            return {
+                "status": "completed",
+                "date_from": payload.date_from,
+                "date_to": payload.date_to,
+                "candidate_pack_version": "heuristic-candidate-v1",
+            }
+
+        async def fake_explain(*, series=None):
+            return {"series": series or [], "agent_summary": "summary"}
+
+        async def fake_promote(*, candidate_version=None, reason: str):
+            return {"status": "promoted", "candidate_version": candidate_version, "reason": reason}
+
+        async def fake_rollback(*, reason: str):
+            return {"status": "rolled_back", "reason": reason}
+
+        client.app.state.container.historical_intelligence_service.get_status = fake_status  # type: ignore[method-assign]
+        client.app.state.container.historical_intelligence_service.run = fake_run  # type: ignore[method-assign]
+        client.app.state.container.historical_intelligence_service.explain = fake_explain  # type: ignore[method-assign]
+        client.app.state.container.historical_intelligence_service.promote = fake_promote  # type: ignore[method-assign]
+        client.app.state.container.historical_intelligence_service.rollback = fake_rollback  # type: ignore[method-assign]
+
+        status_response = client.get("/api/historical/intelligence/status")
+        run_response = client.post(
+            "/api/historical/intelligence/run",
+            json={"date_from": "2026-04-01", "date_to": "2026-04-10", "origins": ["historical_replay"]},
+        )
+        explain_response = client.get("/api/historical/intelligence/explain?series=KXHIGHCHI")
+        pack_status_response = client.get("/api/heuristic-pack/status")
+        promote_response = client.post("/api/heuristic-pack/promote", json={"candidate_version": "heuristic-candidate-v1"})
+        rollback_response = client.post("/api/heuristic-pack/rollback", json={"reason": "manual"})
+
+    assert status_response.status_code == 200
+    assert status_response.json()["active_pack_version"] == "heuristic-baseline-v1"
+    assert run_response.status_code == 200
+    assert run_response.json()["candidate_pack_version"] == "heuristic-candidate-v1"
+    assert explain_response.status_code == 200
+    assert explain_response.json()["series"] == ["KXHIGHCHI"]
+    assert pack_status_response.status_code == 200
+    assert pack_status_response.json()["candidate_pack_version"] == "heuristic-candidate-v1"
+    assert promote_response.status_code == 200
+    assert promote_response.json()["status"] == "promoted"
+    assert rollback_response.status_code == 200
+    assert rollback_response.json()["status"] == "rolled_back"
+    get_settings.cache_clear()
+
+
 def test_faq_page_and_header_link_render(tmp_path, monkeypatch) -> None:
     map_path = tmp_path / "markets.yaml"
     map_path.write_text("markets: []\n", encoding="utf-8")

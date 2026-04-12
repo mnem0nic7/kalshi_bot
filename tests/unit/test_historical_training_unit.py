@@ -185,6 +185,42 @@ def test_select_weather_snapshot_prefers_checkpoint_archives() -> None:
     assert result.source_kind == HistoricalTrainingService.CHECKPOINT_CAPTURED_WEATHER_SOURCE
 
 
+def test_select_market_snapshot_rejects_stale_captured_and_uses_fresh_reconstructed() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.settings = SimpleNamespace(risk_stale_market_seconds=300, historical_replay_market_stale_seconds=900)
+    checkpoint_ts = datetime(2026, 4, 10, 21, 0, tzinfo=UTC)
+
+    stale_captured = SimpleNamespace(
+        asof_ts=datetime(2026, 4, 9, 18, 33, tzinfo=UTC),
+        source_kind=HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+    )
+    fresh_reconstructed = SimpleNamespace(
+        asof_ts=datetime(2026, 4, 10, 20, 59, tzinfo=UTC),
+        source_kind=HistoricalTrainingService.RECONSTRUCTED_MARKET_SOURCE,
+    )
+
+    class _Repo:
+        async def get_latest_historical_market_snapshot(self, **kwargs):
+            if kwargs.get("source_kind") == HistoricalTrainingService.CAPTURED_MARKET_SOURCE:
+                return stale_captured
+            if kwargs.get("source_kind") == HistoricalTrainingService.RECONSTRUCTED_MARKET_SOURCE:
+                return fresh_reconstructed
+            return None
+
+    snapshot, reason = asyncio.run(
+        HistoricalTrainingService._select_market_snapshot(
+            service,
+            _Repo(),
+            market_ticker="KXHIGHMIA-26APR10-T76",
+            local_market_day="2026-04-10",
+            checkpoint_ts=checkpoint_ts,
+        )
+    )
+
+    assert snapshot is fresh_reconstructed
+    assert reason is None
+
+
 def test_gemini_build_readiness_requires_multiple_market_days_and_splits() -> None:
     service = object.__new__(HistoricalTrainingService)
     split = HistoricalBuildSplit(train=["room-a"], validation=[], holdout=[])
@@ -385,6 +421,63 @@ def test_json_safe_serializes_decimal_values() -> None:
     payload = {"crosscheck": {"daily_high_f": Decimal("82.00")}}
 
     assert _json_safe(payload) == {"crosscheck": {"daily_high_f": "82.00"}}
+
+
+def test_replay_audit_flags_logic_version_mismatch_as_stale() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    coverage_rows = [
+        {
+            "market_ticker": "KXHIGHNY-26APR11-T61",
+            "series_ticker": "KXHIGHNY",
+            "local_market_day": "2026-04-11",
+            "coverage_class": HistoricalTrainingService.COVERAGE_FULL,
+            "checkpoints": [
+                {
+                    "checkpoint_label": "open_0900",
+                    "checkpoint_ts": "2026-04-11T13:00:00+00:00",
+                    "replayable": True,
+                    "market_source_kind": HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+                    "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
+                    "market_snapshot_id": "market-source-1",
+                    "weather_snapshot_id": "weather-source-1",
+                    "missing_reasons": [],
+                }
+            ],
+        }
+    ]
+    replay_runs = [
+        SimpleNamespace(
+            id="run-logic",
+            room_id="room-logic",
+            status="completed",
+            market_ticker="KXHIGHNY-26APR11-T61",
+            series_ticker="KXHIGHNY",
+            local_market_day="2026-04-11",
+            checkpoint_label="open_0900",
+            checkpoint_ts=datetime(2026, 4, 11, 13, 0, tzinfo=UTC),
+            payload={
+                "historical_provenance": {
+                    "coverage_class": HistoricalTrainingService.COVERAGE_FULL,
+                    "replay_logic_version": "historical_replay_old_logic",
+                    "market_source_kind": HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+                    "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
+                    "market_snapshot_source_id": "market-source-1",
+                    "weather_snapshot_source_id": "weather-source-1",
+                }
+            },
+        )
+    ]
+
+    audit = HistoricalTrainingService._build_replay_audit(
+        service,
+        coverage_rows=coverage_rows,
+        replay_runs=replay_runs,
+        verbose=True,
+    )
+
+    assert audit["refresh_needed"] is True
+    assert audit["issue_counts"]["stale_replay"] == 1
+    assert audit["issues"][0]["reasons"] == ["replay_logic_version_changed"]
 
 
 @pytest.mark.asyncio

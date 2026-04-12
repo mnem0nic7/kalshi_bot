@@ -7,7 +7,12 @@ from types import SimpleNamespace
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, StandDownReason, StrategyMode, TradeAction, WeatherResolutionState
 from kalshi_bot.core.schemas import ResearchFreshness
-from kalshi_bot.services.signal import StrategySignal, base_strategy_summary, evaluate_trade_eligibility
+from kalshi_bot.services.signal import (
+    StrategySignal,
+    apply_heuristic_application_to_signal,
+    base_strategy_summary,
+    evaluate_trade_eligibility,
+)
 from kalshi_bot.weather.scoring import WeatherSignalSnapshot
 
 
@@ -248,3 +253,86 @@ def test_base_strategy_summary_strips_old_trade_suffixes() -> None:
     assert base_strategy_summary(broken_book_summary) == (
         "Forecast high 86.0F versus threshold 84.0F implies fair yes near 0.6391 with confidence 0.77"
     )
+
+
+def test_apply_heuristic_application_adjusts_signal_and_summary() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.5200"),
+        confidence=0.7,
+        edge_bps=0,
+        recommended_action=None,
+        recommended_side=None,
+        target_yes_price_dollars=None,
+        summary="Forecast high 81F versus threshold 80F implies fair yes near 0.5200.",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+        heuristic_application={
+            "fair_yes_adjust_bps": 300,
+            "adjusted_fair_yes_dollars": "0.5500",
+            "thresholds": {"risk_min_edge_bps": 50, "trigger_max_spread_bps": 1200},
+            "heuristic_pack_version": "heuristic-1",
+        },
+    )
+    market_snapshot = {"market": {"yes_bid_dollars": "0.5200", "yes_ask_dollars": "0.5300", "no_ask_dollars": "0.4700"}}
+
+    adjusted = apply_heuristic_application_to_signal(
+        settings=settings,
+        signal=signal,
+        market_snapshot=market_snapshot,
+        min_edge_bps=50,
+        spread_limit_bps=1200,
+    )
+
+    assert adjusted.fair_yes_dollars == Decimal("0.5500")
+    assert adjusted.recommended_side == ContractSide.YES
+    assert adjusted.recommended_action == TradeAction.BUY
+    assert adjusted.target_yes_price_dollars == Decimal("0.5300")
+    assert "Historical heuristics adjusted fair yes by +300bps" in adjusted.summary
+
+
+def test_trade_eligibility_respects_heuristic_forced_stand_down() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    market_snapshot = {"market": {"yes_bid_dollars": "0.5500", "yes_ask_dollars": "0.5800", "no_ask_dollars": "0.4200"}}
+    signal = _signal()
+    signal.heuristic_application = {
+        "recommended_strategy_mode": StrategyMode.LATE_DAY_AVOID.value,
+        "force_stand_down_reason": StandDownReason.NO_ACTIONABLE_EDGE.value,
+    }
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot=market_snapshot,
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.eligible is False
+    assert verdict.strategy_mode == StrategyMode.LATE_DAY_AVOID
+    assert verdict.stand_down_reason == StandDownReason.NO_ACTIONABLE_EDGE
+
+
+def test_trade_eligibility_uses_decision_time_for_historical_checks() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    market_snapshot = {"market": {"yes_bid_dollars": "0.5500", "yes_ask_dollars": "0.5800", "no_ask_dollars": "0.4200"}}
+    observed_at = datetime(2026, 4, 10, 18, 0, tzinfo=UTC)
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=_signal(),
+        market_snapshot=market_snapshot,
+        market_observed_at=observed_at,
+        research_freshness=ResearchFreshness(
+            refreshed_at=observed_at - timedelta(seconds=30),
+            expires_at=observed_at + timedelta(minutes=5),
+            stale=False,
+            max_source_age_seconds=30,
+        ),
+        thresholds=_thresholds(),
+        decision_time=observed_at + timedelta(seconds=30),
+    )
+
+    assert verdict.market_stale is False
+    assert verdict.research_stale is False

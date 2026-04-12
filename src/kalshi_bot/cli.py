@@ -10,7 +10,15 @@ import sys
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import RoomOrigin
-from kalshi_bot.core.schemas import HistoricalTrainingBuildRequest, RoomCreate, ShadowCampaignRequest, TrainingBuildRequest
+from kalshi_bot.core.schemas import (
+    HeuristicPackPromoteRequest,
+    HeuristicPackRollbackRequest,
+    HistoricalIntelligenceRunRequest,
+    HistoricalTrainingBuildRequest,
+    RoomCreate,
+    ShadowCampaignRequest,
+    TrainingBuildRequest,
+)
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
 from kalshi_bot.logging import configure_logging
@@ -196,6 +204,63 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if args.command == "historical-status":
             print(json.dumps(await container.historical_training_service.get_status(verbose=args.verbose), indent=2))
             return 0
+
+        if args.command == "historical-intelligence":
+            if args.historical_intelligence_command == "status":
+                print(json.dumps(await container.historical_intelligence_service.get_status(), indent=2))
+                return 0
+            if args.historical_intelligence_command == "run":
+                print(
+                    json.dumps(
+                        await container.historical_intelligence_service.run(
+                            HistoricalIntelligenceRunRequest(
+                                date_from=args.date_from,
+                                date_to=args.date_to,
+                                origins=args.origins or [RoomOrigin.HISTORICAL_REPLAY.value],
+                                auto_promote=args.auto_promote,
+                            )
+                        ),
+                        indent=2,
+                    )
+                )
+                return 0
+            if args.historical_intelligence_command == "explain":
+                print(
+                    json.dumps(
+                        await container.historical_intelligence_service.explain(series=args.series or None),
+                        indent=2,
+                    )
+                )
+                return 0
+
+        if args.command == "heuristic-pack":
+            if args.heuristic_pack_command == "status":
+                print(json.dumps(await container.historical_intelligence_service.get_status(), indent=2))
+                return 0
+            if args.heuristic_pack_command == "promote":
+                print(
+                    json.dumps(
+                        await container.historical_intelligence_service.promote(
+                            candidate_version=HeuristicPackPromoteRequest(
+                                candidate_version=args.candidate_version,
+                                reason=args.reason,
+                            ).candidate_version,
+                            reason=args.reason,
+                        ),
+                        indent=2,
+                    )
+                )
+                return 0
+            if args.heuristic_pack_command == "rollback":
+                print(
+                    json.dumps(
+                        await container.historical_intelligence_service.rollback(
+                            reason=HeuristicPackRollbackRequest(reason=args.reason).reason,
+                        ),
+                        indent=2,
+                    )
+                )
+                return 0
 
         if args.command == "historical-import" and args.historical_kind == "weather":
             result = await container.historical_training_service.import_weather_history(
@@ -600,6 +665,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     historical_status = subparsers.add_parser("historical-status")
     historical_status.add_argument("--verbose", action="store_true")
+
+    historical_intelligence = subparsers.add_parser("historical-intelligence")
+    historical_intelligence_subparsers = historical_intelligence.add_subparsers(
+        dest="historical_intelligence_command",
+        required=True,
+    )
+    historical_intelligence_subparsers.add_parser("status")
+    historical_intelligence_run = historical_intelligence_subparsers.add_parser("run")
+    historical_intelligence_run.add_argument("--date-from", required=True)
+    historical_intelligence_run.add_argument("--date-to", required=True)
+    historical_intelligence_run.add_argument("--origins", nargs="*", default=None)
+    historical_intelligence_run.add_argument(
+        "--auto-promote",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    historical_intelligence_explain = historical_intelligence_subparsers.add_parser("explain")
+    historical_intelligence_explain.add_argument("--series", nargs="*", default=None)
+
+    heuristic_pack = subparsers.add_parser("heuristic-pack")
+    heuristic_pack_subparsers = heuristic_pack.add_subparsers(dest="heuristic_pack_command", required=True)
+    heuristic_pack_subparsers.add_parser("status")
+    heuristic_pack_promote = heuristic_pack_subparsers.add_parser("promote")
+    heuristic_pack_promote.add_argument("--candidate-version", default=None)
+    heuristic_pack_promote.add_argument("--reason", default="manual_promote")
+    heuristic_pack_rollback = heuristic_pack_subparsers.add_parser("rollback")
+    heuristic_pack_rollback.add_argument("--reason", default="manual_rollback")
 
     historical_import = subparsers.add_parser("historical-import")
     historical_import.add_argument("historical_kind", choices=["weather"])

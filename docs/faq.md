@@ -72,6 +72,18 @@ Historical replay imports settled weather market-days, captured market snapshots
 
 Those replayed rooms are marked `historical_replay`, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files. If we do not have enough distinct full-coverage market-days yet, the Gemini export is marked draft-only instead of pretending it is ready to tune on.
 
+## How do I tell whether the historical checks are healthy?
+
+Read the historical status in three layers:
+
+- `source_replay_coverage`: what the current strict-asof source tables could replay right now
+- `checkpoint_archive_coverage`: what the scheduled checkpoint weather archive alone could support
+- `replay_corpus`: what has actually been rebuilt into `historical_replay` rooms and is safe to use for readiness or intelligence
+
+If source coverage is ahead of replay corpus materialization, run the historical repair refresh path before trusting the dashboard or the intelligence output.
+
+Healthy indicators should also look plausible. After the replay-time staleness fix, the historical intelligence output should mostly surface real trade-quality reasons like `spread_too_wide`, `resolved_contract`, `book_effectively_broken`, or `insufficient_remaining_payout` instead of collapsing into blanket `market_stale`.
+
 ## What is settlement backfill?
 
 Settlement backfill is the direct repair path for closed shadow/live room markets that still have no settlement label. Instead of waiting only for passive reconcile events, the bot can fetch the final market outcome directly from Kalshi, persist it as a labeled settlement, and clear rooms out of the `possible_ingestion_gap` backlog.
@@ -87,6 +99,8 @@ Three things mattered:
 - New schema changes require a rebuilt `migrate` image. Rebuilding only the app or daemon containers can leave Alembic stuck on the previous head even though the new code is already live.
 - `historical-archive checkpoint-capture --once` returning zero captures is normal when no checkpoint slot is currently due. That is a scheduling outcome, not a job failure.
 - Settlement backfill is now a normal repair tool for maturity. The first live sweep immediately reduced the likely-ingestion-gap backlog, while historical Gemini readiness correctly stayed blocked because full checkpoint coverage still is not there yet.
+- Historical replay repair is now part of normal maintenance after replay-logic changes. Derived replay rooms are safe to purge and rebuild; the raw historical sources stay immutable.
+- Historical intelligence got much more honest once replay checks started using checkpoint-time staleness and refreshed replay rows. That is why the dashboard should now be read as real indicator quality, not just raw counts.
 
 Read more: `docs/operations.md`, `docs/training.md`
 

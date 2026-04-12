@@ -82,6 +82,14 @@ kalshi-bot-cli historical-archive capture --once --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli historical-archive checkpoint-capture --once --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli historical-archive checkpoint-status --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI --verbose
 kalshi-bot-cli historical-replay weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-repair audit --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-repair refresh --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-intelligence status
+kalshi-bot-cli historical-intelligence run --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-intelligence explain --series KXHIGHNY
+kalshi-bot-cli heuristic-pack status
+kalshi-bot-cli heuristic-pack promote --reason manual_review
+kalshi-bot-cli heuristic-pack rollback --reason manual_rollback
 kalshi-bot-cli training-build historical --mode bundles --date-from 2026-03-01 --date-to 2026-03-31 --output data/training/historical_bundles.jsonl
 kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026-03-01 --date-to 2026-03-31 --output data/training/gemini_weather
 kalshi-bot-cli training-build-list
@@ -107,6 +115,7 @@ kalshi-bot-cli promote green
 
 The control room also supports one-click `Run Shadow Room` actions from the market cards, plus a dedicated training panel for corpus status, research audit issues, dataset builds, and one-click shadow campaigns.
 It now also shows a historical corpus panel with replayable market-days, exact checkpoint-capture coverage, missing checkpoint reasons, settlement-backfill progress, and whether Gemini fine-tuning is only draft-ready or actually training-ready.
+The historical checks should now be read as three separate layers: `source_replay_coverage` for what the current strict-asof sources could support, `checkpoint_archive_coverage` for dedicated checkpoint weather captures only, and `replay_corpus` for what has actually been materialized into `historical_replay` rooms.
 
 ## GitHub Actions smoke workflows
 

@@ -13,6 +13,7 @@ from kalshi_bot.core.enums import DeploymentColor, MessageKind, RiskStatus, Room
 from kalshi_bot.core.schemas import (
     AgentPack,
     EvaluationSummary,
+    HistoricalHeuristicPack,
     MemoryNotePayload,
     ResearchClaim,
     ResearchDossier,
@@ -32,11 +33,15 @@ from kalshi_bot.db.models import (
     EvaluationRunRecord,
     FillRecord,
     HistoricalCheckpointArchiveRecord,
+    HistoricalIntelligenceRunRecord,
     HistoricalImportRunRecord,
     HistoricalMarketSnapshotRecord,
     HistoricalReplayRunRecord,
     HistoricalSettlementLabelRecord,
     HistoricalWeatherSnapshotRecord,
+    HeuristicPackPromotionRecord,
+    HeuristicPackRecord,
+    HeuristicPatchSuggestionRecord,
     MarketState,
     MemoryEmbedding,
     MemoryNoteRecord,
@@ -1064,6 +1069,177 @@ class PlatformRepository:
 
     async def list_agent_packs(self, limit: int = 20) -> list[AgentPackRecord]:
         result = await self.session.execute(select(AgentPackRecord).order_by(AgentPackRecord.created_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def create_historical_intelligence_run(
+        self,
+        *,
+        date_from: str,
+        date_to: str,
+        active_pack_version: str | None,
+        payload: dict[str, Any],
+    ) -> HistoricalIntelligenceRunRecord:
+        record = HistoricalIntelligenceRunRecord(
+            date_from=date_from,
+            date_to=date_to,
+            active_pack_version=active_pack_version,
+            payload=payload,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def complete_historical_intelligence_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        payload: dict[str, Any],
+        room_count: int,
+        candidate_pack_version: str | None = None,
+        promoted_pack_version: str | None = None,
+        error_text: str | None = None,
+    ) -> HistoricalIntelligenceRunRecord:
+        record = await self.session.get(HistoricalIntelligenceRunRecord, run_id)
+        if record is None:
+            raise KeyError(f"Historical intelligence run {run_id} not found")
+        record.status = status
+        record.finished_at = datetime.now(UTC)
+        record.room_count = room_count
+        record.candidate_pack_version = candidate_pack_version
+        record.promoted_pack_version = promoted_pack_version
+        record.payload = payload
+        record.error_text = error_text
+        await self.session.flush()
+        return record
+
+    async def get_historical_intelligence_run(self, run_id: str) -> HistoricalIntelligenceRunRecord | None:
+        return await self.session.get(HistoricalIntelligenceRunRecord, run_id)
+
+    async def list_historical_intelligence_runs(self, limit: int = 20) -> list[HistoricalIntelligenceRunRecord]:
+        result = await self.session.execute(
+            select(HistoricalIntelligenceRunRecord)
+            .order_by(HistoricalIntelligenceRunRecord.started_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars())
+
+    async def create_heuristic_pack(self, pack: HistoricalHeuristicPack) -> HeuristicPackRecord:
+        record = HeuristicPackRecord(
+            version=pack.version,
+            status=pack.status,
+            parent_version=pack.parent_version,
+            source=pack.source,
+            description=pack.description,
+            payload=pack.model_dump(mode="json"),
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def update_heuristic_pack(self, pack: HistoricalHeuristicPack) -> HeuristicPackRecord:
+        record = await self.get_heuristic_pack(pack.version)
+        if record is None:
+            return await self.create_heuristic_pack(pack)
+        record.status = pack.status
+        record.parent_version = pack.parent_version
+        record.source = pack.source
+        record.description = pack.description
+        record.payload = pack.model_dump(mode="json")
+        await self.session.flush()
+        return record
+
+    async def get_heuristic_pack(self, version: str) -> HeuristicPackRecord | None:
+        stmt = select(HeuristicPackRecord).where(HeuristicPackRecord.version == version).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_heuristic_packs(self, limit: int = 20) -> list[HeuristicPackRecord]:
+        result = await self.session.execute(select(HeuristicPackRecord).order_by(HeuristicPackRecord.created_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def create_heuristic_pack_promotion(
+        self,
+        *,
+        candidate_version: str,
+        previous_version: str | None,
+        intelligence_run_id: str | None,
+        payload: dict[str, Any],
+        status: str = "staged",
+    ) -> HeuristicPackPromotionRecord:
+        record = HeuristicPackPromotionRecord(
+            candidate_version=candidate_version,
+            previous_version=previous_version,
+            intelligence_run_id=intelligence_run_id,
+            payload=payload,
+            status=status,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def update_heuristic_pack_promotion(
+        self,
+        promotion_id: str,
+        *,
+        status: str,
+        payload: dict[str, Any] | None = None,
+        rollback_reason: str | None = None,
+    ) -> HeuristicPackPromotionRecord:
+        record = await self.session.get(HeuristicPackPromotionRecord, promotion_id)
+        if record is None:
+            raise KeyError(f"Heuristic pack promotion {promotion_id} not found")
+        record.status = status
+        if payload is not None:
+            record.payload = payload
+        if rollback_reason is not None:
+            record.rollback_reason = rollback_reason
+        await self.session.flush()
+        return record
+
+    async def get_heuristic_pack_promotion(self, promotion_id: str) -> HeuristicPackPromotionRecord | None:
+        return await self.session.get(HeuristicPackPromotionRecord, promotion_id)
+
+    async def list_heuristic_pack_promotions(self, limit: int = 20) -> list[HeuristicPackPromotionRecord]:
+        result = await self.session.execute(
+            select(HeuristicPackPromotionRecord)
+            .order_by(HeuristicPackPromotionRecord.created_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars())
+
+    async def create_heuristic_patch_suggestion(
+        self,
+        *,
+        heuristic_pack_version: str,
+        intelligence_run_id: str | None,
+        status: str,
+        payload: dict[str, Any],
+    ) -> HeuristicPatchSuggestionRecord:
+        record = HeuristicPatchSuggestionRecord(
+            heuristic_pack_version=heuristic_pack_version,
+            intelligence_run_id=intelligence_run_id,
+            status=status,
+            payload=payload,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def list_heuristic_patch_suggestions(
+        self,
+        *,
+        heuristic_pack_version: str | None = None,
+        intelligence_run_id: str | None = None,
+        limit: int = 20,
+    ) -> list[HeuristicPatchSuggestionRecord]:
+        stmt = select(HeuristicPatchSuggestionRecord)
+        if heuristic_pack_version is not None:
+            stmt = stmt.where(HeuristicPatchSuggestionRecord.heuristic_pack_version == heuristic_pack_version)
+        if intelligence_run_id is not None:
+            stmt = stmt.where(HeuristicPatchSuggestionRecord.intelligence_run_id == intelligence_run_id)
+        result = await self.session.execute(
+            stmt.order_by(HeuristicPatchSuggestionRecord.created_at.desc()).limit(limit)
+        )
         return list(result.scalars())
 
     async def create_critique_run(

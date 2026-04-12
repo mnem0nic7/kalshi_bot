@@ -38,11 +38,20 @@ class AgentSuite:
         recent_memories: list[str],
         role_config: AgentPackRoleConfig | None = None,
     ) -> tuple[RoomMessageCreate, dict]:
+        heuristic_summary = None
+        heuristic_trace = []
+        heuristic_pack_version = None
+        if signal.heuristic_application:
+            heuristic_summary = signal.heuristic_application.get("agent_summary")
+            heuristic_trace = list(signal.heuristic_application.get("rule_trace") or [])
+            heuristic_pack_version = signal.heuristic_application.get("heuristic_pack_version")
         fallback = (
             f"{dossier.summary.narrative} Shared dossier cites {len(dossier.sources)} sources and "
             f"research gate is {'passing' if dossier.gate.passed else 'blocked'}. "
             f"Room delta: {delta.summary} Relevant memories: {', '.join(recent_memories) or 'none'}."
         )
+        if heuristic_summary:
+            fallback = f"{fallback} Historical heuristic pack {heuristic_pack_version or 'unknown'} guidance: {heuristic_summary}"
         content, usage = await self.providers.rewrite_with_metadata(
             role=AgentRole.RESEARCHER,
             fallback_text=fallback,
@@ -67,6 +76,9 @@ class AgentSuite:
             "research_gate_passed": dossier.gate.passed,
             "research_gate_reasons": dossier.gate.reasons,
             "delta": delta.model_dump(mode="json"),
+            "heuristic_pack_version": heuristic_pack_version,
+            "heuristic_summary": heuristic_summary,
+            "heuristic_rule_trace": heuristic_trace,
         }
         return RoomMessageCreate(
             role=AgentRole.RESEARCHER,
@@ -82,6 +94,11 @@ class AgentSuite:
         signal: StrategySignal,
         role_config: AgentPackRoleConfig | None = None,
     ) -> tuple[RoomMessageCreate, dict]:
+        heuristic_summary = None
+        heuristic_pack_version = None
+        if signal.heuristic_application:
+            heuristic_summary = signal.heuristic_application.get("agent_summary")
+            heuristic_pack_version = signal.heuristic_application.get("heuristic_pack_version")
         posture = (
             "press_when_clear"
             if signal.edge_bps >= self.settings.risk_min_edge_bps and (signal.eligibility is None or signal.eligibility.eligible)
@@ -91,6 +108,8 @@ class AgentSuite:
             f"Session posture is {posture}. Focus only on weather thresholds with fresh evidence; "
             f"do not stretch beyond configured limits or trade when the edge is ambiguous."
         )
+        if heuristic_summary:
+            fallback = f"{fallback} Active heuristic pack {heuristic_pack_version or 'unknown'} notes: {heuristic_summary}"
         content, usage = await self.providers.rewrite_with_metadata(
             role=AgentRole.PRESIDENT,
             fallback_text=fallback,
@@ -107,7 +126,13 @@ class AgentSuite:
             kind=MessageKind.POLICY_MEMO,
             stage=RoomStage.POSTURE,
             content=content,
-            payload={"posture": posture, "capital_tone": "small_clips", "constraints": ["respect risk engine"]},
+            payload={
+                "posture": posture,
+                "capital_tone": "small_clips",
+                "constraints": ["respect risk engine"],
+                "heuristic_pack_version": heuristic_pack_version,
+                "heuristic_summary": heuristic_summary,
+            },
         ), self._usage_dict(usage)
 
     async def trader_message(
@@ -120,6 +145,13 @@ class AgentSuite:
         role_config: AgentPackRoleConfig | None = None,
         max_order_notional_dollars: float | None = None,
     ) -> tuple[RoomMessageCreate, TradeTicket | None, str | None, dict]:
+        heuristic_pack_version = None
+        heuristic_summary = None
+        heuristic_trace = []
+        if signal.heuristic_application:
+            heuristic_pack_version = signal.heuristic_application.get("heuristic_pack_version")
+            heuristic_summary = signal.heuristic_application.get("agent_summary")
+            heuristic_trace = list(signal.heuristic_application.get("rule_trace") or [])
         if signal.eligibility is not None and not signal.eligibility.eligible:
             reason_text = " ".join(signal.eligibility.reasons)
             content = f"Stand down. {reason_text}"
@@ -140,6 +172,9 @@ class AgentSuite:
                             if signal.eligibility.stand_down_reason is not None
                             else None
                         ),
+                        "heuristic_pack_version": heuristic_pack_version,
+                        "heuristic_summary": heuristic_summary,
+                        "heuristic_rule_trace": heuristic_trace,
                     },
                 ),
                 None,
@@ -162,6 +197,9 @@ class AgentSuite:
                         "strategy_mode": signal.strategy_mode.value,
                         "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
                         "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
+                        "heuristic_pack_version": heuristic_pack_version,
+                        "heuristic_summary": heuristic_summary,
+                        "heuristic_rule_trace": heuristic_trace,
                     },
                 ),
                 None,
@@ -191,6 +229,8 @@ class AgentSuite:
             f"Expected edge is {signal.edge_bps}bps and estimated notional is "
             f"{estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, ticket.count_fp):.4f}."
         )
+        if heuristic_summary:
+            fallback = f"{fallback} Historical heuristic pack {heuristic_pack_version or 'unknown'} guidance: {heuristic_summary}"
         content, usage = await self.providers.rewrite_with_metadata(
             role=AgentRole.TRADER,
             fallback_text=fallback,
@@ -213,6 +253,9 @@ class AgentSuite:
                     "resolution_state": signal.resolution_state.value,
                     "strategy_mode": signal.strategy_mode.value,
                     "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
+                    "heuristic_pack_version": heuristic_pack_version,
+                    "heuristic_summary": heuristic_summary,
+                    "heuristic_rule_trace": heuristic_trace,
                 },
             ),
             ticket,

@@ -92,6 +92,14 @@ FAQ_SECTIONS = [
                 "read_more": ["docs/training.md", "docs/faq.md"],
             },
             {
+                "question": "How do I tell whether the historical checks are healthy?",
+                "answer": [
+                    "Read the historical status in three layers: source replay coverage for what the current strict-asof sources could replay, checkpoint archive coverage for dedicated scheduled checkpoint captures only, and replay corpus for what has actually been materialized into historical_replay rooms.",
+                    "Healthy historical intelligence should mostly show real trade-quality reasons like spread_too_wide, resolved_contract, book_effectively_broken, or insufficient_remaining_payout rather than collapsing into blanket market_stale results.",
+                ],
+                "read_more": ["docs/training.md", "docs/operations.md", "docs/faq.md"],
+            },
+            {
                 "question": "What is settlement backfill?",
                 "answer": [
                     "Settlement backfill is the direct repair path for closed shadow or live room markets that still have no settlement label. Instead of waiting only for passive reconcile events, the bot can fetch the final market outcome from Kalshi and persist it as a labeled settlement.",
@@ -104,6 +112,7 @@ FAQ_SECTIONS = [
                 "answer": [
                     "New schema changes require a rebuilt migrate image. Rebuilding only app or daemon containers can leave Alembic stuck on the previous head even though the new code is already live.",
                     "Checkpoint capture returning zero is normal when no checkpoint slot is due, and settlement backfill is now a normal maturity-repair tool for closed markets with missing labels.",
+                    "Historical replay repair is now part of normal maintenance after replay-logic changes, and historical intelligence is only trustworthy after the replay corpus has been refreshed from current sources.",
                     "Historical Gemini fine-tuning should still remain draft-only until real full-checkpoint coverage exists; the right fix is more checkpoint coverage, not weaker readiness rules.",
                 ],
                 "read_more": ["docs/operations.md", "docs/training.md", "docs/faq.md"],

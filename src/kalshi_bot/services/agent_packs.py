@@ -24,6 +24,8 @@ class RuntimeThresholds:
     risk_max_position_notional_dollars: float
     trigger_max_spread_bps: int
     trigger_cooldown_seconds: int
+    strategy_quality_edge_buffer_bps: int
+    strategy_min_remaining_payout_bps: int
 
 
 class AgentPackService:
@@ -222,6 +224,8 @@ class AgentPackService:
             ),
             trigger_max_spread_bps=thresholds.trigger_max_spread_bps or self.settings.trigger_max_spread_bps,
             trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds or self.settings.trigger_cooldown_seconds,
+            strategy_quality_edge_buffer_bps=self.settings.strategy_quality_edge_buffer_bps,
+            strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
         )
 
     def sanitize_candidate_pack(self, candidate: AgentPack, *, parent_version: str) -> AgentPack:

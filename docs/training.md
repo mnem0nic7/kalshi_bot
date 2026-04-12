@@ -13,6 +13,8 @@ Those same exported bundles are also the substrate for the self-improvement loop
 
 Historical replay uses the same canonical room bundle shape, but marks rows with `room_origin = historical_replay` and stores provenance, replay checkpoint time, settlement label, and counterfactual PnL alongside the standard room artifacts.
 
+Historical intelligence builds on top of those replayed rows. It consumes quality-cleaned historical replay bundles, computes execution and directional intelligence, and can stage versioned runtime heuristic packs when the support thresholds are honestly met.
+
 ## Historical Replay
 
 Historical replay is strict as-of, weather-only, and structured-only.
@@ -29,11 +31,23 @@ For each settled market-day we:
 If a checkpoint is missing a captured market snapshot or weather bundle, it is skipped rather than fabricated. That keeps the historical corpus traceable and leakage-resistant.
 Going forward, the daemon also captures dedicated checkpoint weather bundles on schedule so future settled days can become full-coverage historical replay days without depending on room traffic.
 
+Historical replay now uses checkpoint-time decision logic instead of wall-clock time. That matters because historical staleness and eligibility should be evaluated at the replay checkpoint, not at the moment the replay job happens to run.
+
+The historical status surfaces now separate three different truths:
+
+- `source_replay_coverage`: what the current strict-asof source tables could replay
+- `checkpoint_archive_coverage`: what dedicated scheduled checkpoint captures alone could replay
+- `replay_corpus`: what has actually been rebuilt into `historical_replay` rooms and is safe to use for readiness
+
+Historical training readiness should be read from the replay corpus, not from source potential alone.
+
 Deploy findings from April 12, 2026:
 
 - the new checkpoint archive path is healthy, but a manual `historical-archive checkpoint-capture --once` may correctly return zero captures when no checkpoint slot is currently due
 - settlement backfill is already proving useful on the live shadow corpus and should be treated as a normal maturity-repair tool, not an emergency-only action
 - the current blocker for historical Gemini fine-tuning is still missing full-checkpoint weather coverage, so exports should remain `draft_only` until distinct full-coverage market-days accumulate naturally
+- historical replay repair is now part of the normal maintenance path when replay logic changes; stale derived replay rooms should be refreshed rather than trusted
+- historical intelligence indicators are only trustworthy after replay refresh, because stale replay rooms can otherwise collapse into misleading blanket stand-down reasons like `market_stale`
 
 ## What Gets Captured
 
@@ -217,6 +231,36 @@ kalshi-bot-cli training-build historical \
   --date-to 2026-03-31 \
   --output data/training/historical_bundles.jsonl
 ```
+
+Repair stale historical replay rows when source selection or replay logic changes:
+
+```bash
+kalshi-bot-cli historical-repair audit \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
+  --series KXHIGHNY KXHIGHCHI \
+  --verbose
+
+kalshi-bot-cli historical-repair refresh \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
+  --series KXHIGHNY KXHIGHCHI
+```
+
+Run historical intelligence and inspect the active heuristic state:
+
+```bash
+kalshi-bot-cli historical-intelligence status
+kalshi-bot-cli historical-intelligence run --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-intelligence explain --series KXHIGHNY
+kalshi-bot-cli heuristic-pack status
+```
+
+Current interpretation guidance:
+
+- if `source_replay_coverage` is ahead of `replay_corpus`, a refresh is still needed
+- if `replay_corpus.refresh_needed = false` but `directional_candidate_allowed = false`, the indicators are healthy but support is still too small for heuristic promotion
+- if historical intelligence shows every row as `market_stale`, treat that as a replay-health bug and refresh problem, not as a real market-quality insight
 
 Build Gemini-first fine-tune artifacts:
 

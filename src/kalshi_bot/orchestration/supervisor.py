@@ -20,10 +20,17 @@ from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.historical_archive import append_weather_bundle_archive, weather_bundle_archive_metadata
+from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
-from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine, evaluate_trade_eligibility
+from kalshi_bot.services.signal import (
+    StrategySignal,
+    WeatherSignalEngine,
+    apply_heuristic_application_to_signal,
+    evaluate_trade_eligibility,
+    is_market_stale,
+)
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
@@ -58,6 +65,7 @@ class WorkflowSupervisor:
         risk_engine: DeterministicRiskEngine,
         execution_service: ExecutionService,
         memory_service: MemoryService,
+        historical_heuristic_service: HistoricalHeuristicService | None = None,
         research_coordinator: ResearchCoordinator,
         training_corpus_service: TrainingCorpusService,
         agents: AgentSuite,
@@ -72,6 +80,7 @@ class WorkflowSupervisor:
         self.risk_engine = risk_engine
         self.execution_service = execution_service
         self.memory_service = memory_service
+        self.historical_heuristic_service = historical_heuristic_service
         self.research_coordinator = research_coordinator
         self.training_corpus_service = training_corpus_service
         self.agents = agents
@@ -106,6 +115,11 @@ class WorkflowSupervisor:
             try:
                 pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
                 thresholds = self.agent_pack_service.runtime_thresholds(pack)
+                heuristic_pack = (
+                    await self.historical_heuristic_service.get_active_pack(repo)
+                    if self.historical_heuristic_service is not None
+                    else None
+                )
                 role_models: dict[str, Any] = {
                     role_name: {
                         "provider": config.provider,
@@ -179,6 +193,32 @@ class WorkflowSupervisor:
                     market_response,
                     min_edge_bps=thresholds.risk_min_edge_bps,
                 )
+                if mapping is not None and mapping.supports_structured_weather and self.historical_heuristic_service is not None:
+                    heuristic_application = self.historical_heuristic_service.apply_to_signal(
+                        pack=heuristic_pack,
+                        mapping=mapping,
+                        signal=signal,
+                        market_snapshot=market_response,
+                        reference_time=datetime.now(UTC),
+                        base_thresholds=thresholds,
+                        market_stale=is_market_stale(
+                            observed_at=market_state.observed_at,
+                            stale_after_seconds=self.settings.risk_stale_market_seconds,
+                        ),
+                        research_stale=dossier.freshness.stale,
+                    )
+                    thresholds = self.historical_heuristic_service.runtime_thresholds(
+                        base_thresholds=thresholds,
+                        application=heuristic_application,
+                    )
+                    signal.heuristic_application = heuristic_application
+                    signal = apply_heuristic_application_to_signal(
+                        settings=self.settings,
+                        signal=signal,
+                        market_snapshot=market_response,
+                        min_edge_bps=thresholds.risk_min_edge_bps,
+                        spread_limit_bps=thresholds.trigger_max_spread_bps,
+                    )
                 signal.eligibility = evaluate_trade_eligibility(
                     settings=self.settings,
                     signal=signal,
@@ -211,6 +251,36 @@ class WorkflowSupervisor:
                         "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
                         "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
                         "agent_pack_version": pack.version,
+                        "heuristic_pack_version": (
+                            (signal.heuristic_application or {}).get("heuristic_pack_version")
+                            if signal.heuristic_application is not None
+                            else None
+                        ),
+                        "intelligence_run_id": (
+                            (signal.heuristic_application or {}).get("intelligence_run_id")
+                            if signal.heuristic_application is not None
+                            else None
+                        ),
+                        "candidate_pack_id": (
+                            (signal.heuristic_application or {}).get("candidate_pack_id")
+                            if signal.heuristic_application is not None
+                            else None
+                        ),
+                        "heuristic_summary": (
+                            (signal.heuristic_application or {}).get("agent_summary")
+                            if signal.heuristic_application is not None
+                            else None
+                        ),
+                        "rule_trace": (
+                            list((signal.heuristic_application or {}).get("rule_trace") or [])
+                            if signal.heuristic_application is not None
+                            else []
+                        ),
+                        "support_window": (
+                            dict((signal.heuristic_application or {}).get("support_window") or {})
+                            if signal.heuristic_application is not None
+                            else {}
+                        ),
                     },
                 )
                 await session.commit()

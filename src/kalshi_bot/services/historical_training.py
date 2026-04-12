@@ -27,7 +27,12 @@ from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
-from kalshi_bot.services.signal import evaluate_trade_eligibility
+from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
+from kalshi_bot.services.signal import (
+    apply_heuristic_application_to_signal,
+    evaluate_trade_eligibility,
+    is_market_stale,
+)
 from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -121,6 +126,7 @@ class HistoricalTrainingService:
         ("midday_1300", 13),
         ("late_1700", 17),
     )
+    REPLAY_LOGIC_VERSION = "historical_replay_2026_04_12_decision_time_v1"
     CHECKPOINT_CAPTURED_WEATHER_SOURCE = "checkpoint_archived_weather_bundle"
     CAPTURED_MARKET_SOURCE = "captured_market_snapshot"
     RECONSTRUCTED_MARKET_SOURCE = "reconstructed_market_checkpoint"
@@ -145,6 +151,7 @@ class HistoricalTrainingService:
         kalshi: KalshiClient,
         weather_directory: WeatherMarketDirectory,
         agent_pack_service: AgentPackService,
+        historical_heuristic_service: HistoricalHeuristicService | None,
         research_coordinator: ResearchCoordinator,
         risk_engine: DeterministicRiskEngine,
         memory_service: MemoryService,
@@ -157,6 +164,7 @@ class HistoricalTrainingService:
         self.kalshi = kalshi
         self.weather_directory = weather_directory
         self.agent_pack_service = agent_pack_service
+        self.historical_heuristic_service = historical_heuristic_service
         self.research_coordinator = research_coordinator
         self.risk_engine = risk_engine
         self.memory_service = memory_service
@@ -173,6 +181,10 @@ class HistoricalTrainingService:
 
     async def close(self) -> None:
         await self.client.aclose()
+
+    @classmethod
+    def replay_logic_version(cls) -> str:
+        return cls.REPLAY_LOGIC_VERSION
 
     async def import_weather_history(
         self,
@@ -382,7 +394,15 @@ class HistoricalTrainingService:
                         local_market_day=label.local_market_day,
                     )
                     await session.commit()
-                if captured is not None or reconstructed is not None:
+                captured_valid = captured is not None and self._historical_market_snapshot_valid(
+                    captured,
+                    checkpoint_ts=checkpoint_ts,
+                )
+                reconstructed_valid = reconstructed is not None and self._historical_market_snapshot_valid(
+                    reconstructed,
+                    checkpoint_ts=checkpoint_ts,
+                )
+                if captured_valid or reconstructed_valid:
                     already_present += 1
                     continue
                 snapshot = await self._reconstruct_market_checkpoint(
@@ -1376,6 +1396,7 @@ class HistoricalTrainingService:
                     "series_ticker": row.get("series_ticker"),
                     "local_market_day": row["local_market_day"],
                     "coverage_class": row["coverage_class"],
+                    "replay_logic_version": self.replay_logic_version(),
                     "checkpoint_label": checkpoint["checkpoint_label"],
                     "checkpoint_ts": checkpoint["checkpoint_ts"],
                     "replayable": bool(checkpoint.get("replayable")),
@@ -1439,6 +1460,8 @@ class HistoricalTrainingService:
                     "replay_run_id": (replay or {}).get("run_id"),
                     "source_coverage_class": (source or {}).get("coverage_class"),
                     "replay_coverage_class": (replay or {}).get("coverage_class"),
+                    "source_replay_logic_version": (source or {}).get("replay_logic_version"),
+                    "replay_logic_version": (replay or {}).get("replay_logic_version"),
                     "source_market_snapshot_id": (source or {}).get("market_snapshot_id"),
                     "source_weather_snapshot_id": (source or {}).get("weather_snapshot_id"),
                     "replay_market_snapshot_id": (replay or {}).get("market_snapshot_source_id"),
@@ -1461,6 +1484,7 @@ class HistoricalTrainingService:
                     mismatch_reasons.append("replay_room_missing")
                 for field_name, replay_field in (
                     ("coverage_class", "coverage_class"),
+                    ("replay_logic_version", "replay_logic_version"),
                     ("market_source_kind", "market_source_kind"),
                     ("weather_source_kind", "weather_source_kind"),
                     ("market_snapshot_id", "market_snapshot_source_id"),
@@ -1780,6 +1804,7 @@ class HistoricalTrainingService:
             repo = PlatformRepository(session)
             pack = await self.agent_pack_service.get_pack(repo, self.settings.active_agent_pack_version)
             thresholds = self.agent_pack_service.runtime_thresholds(pack)
+            heuristic_pack = await self.historical_heuristic_service.get_active_pack(repo) if self.historical_heuristic_service is not None else None
             role_models = {
                 role_name: {
                     "provider": config.provider,
@@ -1840,6 +1865,34 @@ class HistoricalTrainingService:
                 market_response,
                 min_edge_bps=thresholds.risk_min_edge_bps,
             )
+            if self.historical_heuristic_service is not None:
+                heuristic_application = self.historical_heuristic_service.apply_to_signal(
+                    pack=heuristic_pack,
+                    mapping=mapping,
+                    signal=signal,
+                    market_snapshot=market_response,
+                    reference_time=checkpoint_ts,
+                    base_thresholds=thresholds,
+                    market_stale=is_market_stale(
+                        observed_at=market_snapshot.asof_ts,
+                        stale_after_seconds=self.settings.risk_stale_market_seconds,
+                        reference_time=checkpoint_ts,
+                    ),
+                    research_stale=dossier.freshness.stale,
+                    coverage_class=coverage_class,
+                )
+                thresholds = self.historical_heuristic_service.runtime_thresholds(
+                    base_thresholds=thresholds,
+                    application=heuristic_application,
+                )
+                signal.heuristic_application = heuristic_application
+                signal = apply_heuristic_application_to_signal(
+                    settings=self.settings,
+                    signal=signal,
+                    market_snapshot=market_response,
+                    min_edge_bps=thresholds.risk_min_edge_bps,
+                    spread_limit_bps=thresholds.trigger_max_spread_bps,
+                )
             signal.eligibility = evaluate_trade_eligibility(
                 settings=self.settings,
                 signal=signal,
@@ -1847,6 +1900,8 @@ class HistoricalTrainingService:
                 market_observed_at=market_snapshot.asof_ts,
                 research_freshness=dossier.freshness,
                 thresholds=thresholds,
+                decision_time=checkpoint_ts,
+                market_stale_after_seconds=self.settings.historical_replay_market_stale_seconds,
             )
             signal.strategy_mode = signal.eligibility.strategy_mode
             signal.stand_down_reason = signal.eligibility.stand_down_reason
@@ -1873,7 +1928,14 @@ class HistoricalTrainingService:
                     "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
                     "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
                     "agent_pack_version": pack.version,
+                    "heuristic_pack_version": (signal.heuristic_application or {}).get("heuristic_pack_version"),
+                    "intelligence_run_id": (signal.heuristic_application or {}).get("intelligence_run_id"),
+                    "candidate_pack_id": (signal.heuristic_application or {}).get("candidate_pack_id"),
+                    "heuristic_summary": (signal.heuristic_application or {}).get("agent_summary"),
+                    "rule_trace": list((signal.heuristic_application or {}).get("rule_trace") or []),
+                    "support_window": dict((signal.heuristic_application or {}).get("support_window") or {}),
                     "historical_replay": True,
+                    "historical_replay_logic_version": self.replay_logic_version(),
                 },
             )
 
@@ -1896,6 +1958,7 @@ class HistoricalTrainingService:
                         "weather_source_kind": weather_source_kind,
                         "settlement_label_id": settlement_label.id,
                         "coverage_class": coverage_class,
+                        "replay_logic_version": self.replay_logic_version(),
                         "source_coverage": {
                             "market_snapshot": True,
                             "weather_snapshot": True,
@@ -2170,6 +2233,7 @@ class HistoricalTrainingService:
                         "weather_source_kind": weather_source_kind,
                         "settlement_label_id": settlement_label.id,
                         "coverage_class": coverage_class,
+                        "replay_logic_version": self.replay_logic_version(),
                         "source_coverage": {
                             "market_snapshot": True,
                             "weather_snapshot": True,
@@ -2472,7 +2536,7 @@ class HistoricalTrainingService:
             local_market_day=label.local_market_day,
             market_payload=(label.payload or {}).get("market", {}),
         ):
-            market_snapshot = await self._select_market_snapshot(
+            market_snapshot, market_snapshot_reason = await self._select_market_snapshot(
                 repo,
                 market_ticker=label.market_ticker,
                 local_market_day=label.local_market_day,
@@ -2486,7 +2550,7 @@ class HistoricalTrainingService:
             )
             missing_reasons: list[str] = []
             if market_snapshot is None:
-                missing_reasons.append("market_snapshot_missing")
+                missing_reasons.append(market_snapshot_reason or "market_snapshot_missing")
             if weather_snapshot is None:
                 missing_reasons.append("weather_snapshot_missing")
             selections.append(
@@ -2502,6 +2566,13 @@ class HistoricalTrainingService:
             )
         return selections
 
+    def _historical_market_snapshot_valid(self, snapshot: Any, *, checkpoint_ts: datetime) -> bool:
+        return not is_market_stale(
+            observed_at=getattr(snapshot, "asof_ts", None),
+            stale_after_seconds=self.settings.historical_replay_market_stale_seconds,
+            reference_time=checkpoint_ts,
+        )
+
     async def _select_market_snapshot(
         self,
         repo: PlatformRepository,
@@ -2509,21 +2580,26 @@ class HistoricalTrainingService:
         market_ticker: str,
         local_market_day: str,
         checkpoint_ts: datetime,
-    ):
+    ) -> tuple[Any | None, str | None]:
         captured = await repo.get_latest_historical_market_snapshot(
             market_ticker=market_ticker,
             before_asof=checkpoint_ts,
             source_kind=self.CAPTURED_MARKET_SOURCE,
             local_market_day=local_market_day,
         )
-        if captured is not None:
-            return captured
-        return await repo.get_latest_historical_market_snapshot(
+        if captured is not None and self._historical_market_snapshot_valid(captured, checkpoint_ts=checkpoint_ts):
+            return captured, None
+        reconstructed = await repo.get_latest_historical_market_snapshot(
             market_ticker=market_ticker,
             before_asof=checkpoint_ts,
             source_kind=self.RECONSTRUCTED_MARKET_SOURCE,
             local_market_day=local_market_day,
         )
+        if reconstructed is not None and self._historical_market_snapshot_valid(reconstructed, checkpoint_ts=checkpoint_ts):
+            return reconstructed, None
+        if captured is not None or reconstructed is not None:
+            return None, "market_snapshot_stale"
+        return None, None
 
     async def _select_weather_snapshot(
         self,
@@ -2852,6 +2928,11 @@ class HistoricalTrainingService:
             "counterfactual_pnl_dollars": (
                 str(bundle.counterfactual_pnl_dollars) if bundle.counterfactual_pnl_dollars is not None else None
             ),
+            "heuristic_pack_version": bundle.heuristic_pack_version,
+            "intelligence_run_id": bundle.intelligence_run_id,
+            "candidate_pack_id": bundle.candidate_pack_id,
+            "rule_trace": bundle.rule_trace,
+            "support_window": bundle.support_window,
         }
 
     def _historical_label_stats(self, bundles: list[Any], split: HistoricalBuildSplit, *, draft_only: bool, training_ready: bool) -> dict[str, Any]:

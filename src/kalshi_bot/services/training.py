@@ -111,6 +111,34 @@ class TrainingExportService:
                 trade_ticket=(self._trade_ticket_dict(trade_ticket) if trade_ticket is not None else None),
                 settlement=(settlement or (self._settlement_label_dict(settlement_label) if settlement_label is not None else None)),
             ),
+            heuristic_pack_version=(
+                (((signal.payload or {}) if signal is not None else {}).get("heuristic_pack_version"))
+                if signal is not None
+                else None
+            ),
+            intelligence_run_id=(
+                (((signal.payload or {}) if signal is not None else {}).get("intelligence_run_id"))
+                if signal is not None
+                else None
+            ),
+            candidate_pack_id=(
+                (((signal.payload or {}) if signal is not None else {}).get("candidate_pack_id"))
+                if signal is not None
+                else None
+            ),
+            rule_trace=list(
+                ((((signal.payload or {}) if signal is not None else {}).get("rule_trace")) or [])
+            ),
+            support_window=(
+                ((((signal.payload or {}) if signal is not None else {}).get("support_window")) or None)
+                if signal is not None
+                else None
+            ),
+            heuristic_summary=(
+                ((((signal.payload or {}) if signal is not None else {}).get("heuristic_summary")) or None)
+                if signal is not None
+                else None
+            ),
             outcome=outcome,
         )
 

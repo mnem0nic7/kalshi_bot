@@ -370,6 +370,54 @@ class PromotionEventRecord(Base, IdMixin, TimestampMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class HistoricalIntelligenceRunRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "historical_intelligence_runs"
+
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    date_from: Mapped[str] = mapped_column(String(16), index=True)
+    date_to: Mapped[str] = mapped_column(String(16), index=True)
+    active_pack_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    candidate_pack_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    promoted_pack_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    room_count: Mapped[int] = mapped_column(Integer, default=0)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+
+class HeuristicPackRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "heuristic_packs"
+    __table_args__ = (UniqueConstraint("version", name="uq_heuristic_packs_version"),)
+
+    version: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="candidate", index=True)
+    parent_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(64), default="historical_intelligence")
+    description: Mapped[str] = mapped_column(Text(), default="")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class HeuristicPackPromotionRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "heuristic_pack_promotions"
+
+    status: Mapped[str] = mapped_column(String(32), default="staged", index=True)
+    candidate_version: Mapped[str] = mapped_column(String(128), index=True)
+    previous_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    intelligence_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    rollback_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class HeuristicPatchSuggestionRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "heuristic_patch_suggestions"
+
+    heuristic_pack_version: Mapped[str] = mapped_column(String(128), index=True)
+    intelligence_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="candidate", index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class TrainingDatasetBuildRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "training_dataset_builds"
     __table_args__ = (UniqueConstraint("build_version", name="uq_training_dataset_builds_version"),)

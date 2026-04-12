@@ -9,11 +9,12 @@ from typing import Any
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.schemas import ShadowCampaignRequest
+from kalshi_bot.core.schemas import HistoricalIntelligenceRunRequest, ShadowCampaignRequest
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.historical_training import HistoricalTrainingService
+from kalshi_bot.services.historical_intelligence import HistoricalIntelligenceService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
@@ -40,6 +41,7 @@ class DaemonService:
         self_improve_service: SelfImproveService,
         training_corpus_service: TrainingCorpusService | None = None,
         historical_training_service: HistoricalTrainingService | None = None,
+        historical_intelligence_service: HistoricalIntelligenceService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -54,6 +56,7 @@ class DaemonService:
         self.self_improve_service = self_improve_service
         self.training_corpus_service = training_corpus_service
         self.historical_training_service = historical_training_service
+        self.historical_intelligence_service = historical_intelligence_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
 
     async def reconcile_once(self) -> dict[str, Any]:
@@ -134,6 +137,9 @@ class DaemonService:
             settlement_follow_up = await self._maybe_run_settlement_follow_up()
             if settlement_follow_up is not None:
                 payload["settlement_follow_up"] = settlement_follow_up
+            historical_intelligence = await self._maybe_run_historical_intelligence()
+            if historical_intelligence is not None:
+                payload["historical_intelligence"] = historical_intelligence
         rollout_result = await self.self_improve_service.monitor_rollouts()
         if rollout_result.status == "canary_running":
             canary = rollout_result.payload
@@ -284,6 +290,37 @@ class DaemonService:
             return None
         return result
 
+    async def _maybe_run_historical_intelligence(self) -> dict[str, Any] | None:
+        if self.historical_intelligence_service is None:
+            return None
+        last_run_at = await self._checkpoint_time(f"daemon_historical_intelligence:{self.settings.app_color}")
+        now = datetime.now(UTC)
+        min_interval = timedelta(seconds=max(3600, self.settings.historical_intelligence_daily_run_seconds))
+        if last_run_at is not None and now - last_run_at < min_interval:
+            return None
+        date_from = (now - timedelta(days=self.settings.historical_intelligence_window_days)).date().isoformat()
+        date_to = now.date().isoformat()
+        result = await self.historical_intelligence_service.run(
+            HistoricalIntelligenceRunRequest(
+                date_from=date_from,
+                date_to=date_to,
+                origins=["historical_replay"],
+                auto_promote=self.settings.historical_intelligence_auto_promote,
+            )
+        )
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.set_checkpoint(
+                f"daemon_historical_intelligence:{self.settings.app_color}",
+                None,
+                {
+                    "ran_at": now.isoformat(),
+                    "result": result,
+                },
+            )
+            await session.commit()
+        return result
+
     async def _checkpoint_time(self, stream_name: str) -> datetime | None:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -291,7 +328,11 @@ class DaemonService:
             await session.commit()
         if checkpoint is None or not isinstance(checkpoint.payload, dict):
             return None
-        timestamp = checkpoint.payload.get("reconciled_at") or checkpoint.payload.get("followed_at")
+        timestamp = (
+            checkpoint.payload.get("reconciled_at")
+            or checkpoint.payload.get("followed_at")
+            or checkpoint.payload.get("ran_at")
+        )
         if not isinstance(timestamp, str) or not timestamp:
             return None
         try:

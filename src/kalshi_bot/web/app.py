@@ -18,7 +18,10 @@ from pydantic import BaseModel, ValidationError
 
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import (
+    HeuristicPackPromoteRequest,
+    HeuristicPackRollbackRequest,
     HistoricalDateRangeRequest,
+    HistoricalIntelligenceRunRequest,
     HistoricalTrainingBuildRequest,
     RoomCreate,
     ShadowCampaignRequest,
@@ -405,6 +408,10 @@ def _decision_summary(
         "trade_proposed": trade_ticket is not None,
         "resolution_state": signal_payload.get("resolution_state") if isinstance(signal_payload, dict) else None,
         "strategy_mode": signal_payload.get("strategy_mode") if isinstance(signal_payload, dict) else None,
+        "heuristic_pack_version": signal_payload.get("heuristic_pack_version") if isinstance(signal_payload, dict) else None,
+        "intelligence_run_id": signal_payload.get("intelligence_run_id") if isinstance(signal_payload, dict) else None,
+        "candidate_pack_id": signal_payload.get("candidate_pack_id") if isinstance(signal_payload, dict) else None,
+        "rule_trace": signal_payload.get("rule_trace") if isinstance(signal_payload, dict) else [],
         "eligibility": eligibility,
         "stand_down_reason": signal_payload.get("stand_down_reason") if isinstance(signal_payload, dict) else None,
         "blocked_by": blocked_by,
@@ -571,6 +578,7 @@ def create_app() -> FastAPI:
             await session.commit()
         training_status_payload = await app_container.training_corpus_service.get_status(persist_readiness=False)
         historical_status_payload = await app_container.historical_training_service.get_status()
+        heuristic_status_payload = await app_container.historical_intelligence_service.get_status()
         training_status_payload["historical"] = historical_status_payload
         return JSONResponse(
             {
@@ -579,6 +587,7 @@ def create_app() -> FastAPI:
                 "execution_lock_holder": control.execution_lock_holder,
                 "self_improve": dict(control.notes.get("agent_packs") or {}),
                 "training": training_status_payload,
+                "heuristics": heuristic_status_payload,
                 "runtime_health": runtime_health,
                 "rooms": dossiers,
                 "positions": [
@@ -637,6 +646,7 @@ def create_app() -> FastAPI:
         app_container = container(request)
         payload = await app_container.training_corpus_service.get_status(persist_readiness=True)
         payload["historical"] = await app_container.historical_training_service.get_status()
+        payload["heuristics"] = await app_container.historical_intelligence_service.get_status()
         return JSONResponse(payload)
 
     @app.post("/api/training/build")
@@ -649,6 +659,45 @@ def create_app() -> FastAPI:
     async def historical_status(request: Request, verbose: bool = False) -> JSONResponse:
         app_container = container(request)
         return JSONResponse(await app_container.historical_training_service.get_status(verbose=verbose))
+
+    @app.get("/api/historical/intelligence/status")
+    async def historical_intelligence_status(request: Request) -> JSONResponse:
+        app_container = container(request)
+        return JSONResponse(await app_container.historical_intelligence_service.get_status())
+
+    @app.post("/api/historical/intelligence/run")
+    async def historical_intelligence_run(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, HistoricalIntelligenceRunRequest)
+        return JSONResponse(await app_container.historical_intelligence_service.run(payload))
+
+    @app.get("/api/historical/intelligence/explain")
+    async def historical_intelligence_explain(request: Request, series: str | None = None) -> JSONResponse:
+        app_container = container(request)
+        series_values = [item for item in (series or "").split(",") if item]
+        return JSONResponse(await app_container.historical_intelligence_service.explain(series=series_values or None))
+
+    @app.get("/api/heuristic-pack/status")
+    async def heuristic_pack_status(request: Request) -> JSONResponse:
+        app_container = container(request)
+        return JSONResponse(await app_container.historical_intelligence_service.get_status())
+
+    @app.post("/api/heuristic-pack/promote")
+    async def heuristic_pack_promote(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, HeuristicPackPromoteRequest, default_on_empty=True)
+        return JSONResponse(
+            await app_container.historical_intelligence_service.promote(
+                candidate_version=payload.candidate_version,
+                reason=payload.reason,
+            )
+        )
+
+    @app.post("/api/heuristic-pack/rollback")
+    async def heuristic_pack_rollback(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, HeuristicPackRollbackRequest, default_on_empty=True)
+        return JSONResponse(await app_container.historical_intelligence_service.rollback(reason=payload.reason))
 
     @app.post("/api/historical/import")
     async def historical_import(request: Request) -> JSONResponse:
@@ -788,6 +837,7 @@ def create_app() -> FastAPI:
         self_improve_status_payload = await app_container.self_improve_service.get_status()
         training_status_payload = await app_container.training_corpus_service.get_status(persist_readiness=False)
         historical_status_payload = await app_container.historical_training_service.get_status()
+        heuristic_status_payload = await app_container.historical_intelligence_service.get_status()
         training_status_payload["historical"] = historical_status_payload
         research_audit_payload = await app_container.training_corpus_service.research_audit(limit=8)
         dossiers_by_market = {record.market_ticker: record.payload for record in dossier_records}
@@ -839,6 +889,7 @@ def create_app() -> FastAPI:
                 "self_improve_status": self_improve_status_payload,
                 "training_status": training_status_payload,
                 "historical_status": historical_status_payload,
+                "heuristic_status": heuristic_status_payload,
                 "research_audit": [issue.model_dump(mode="json") for issue in research_audit_payload],
                 "runtime_health": runtime_health,
                 "settings": app_container.settings,

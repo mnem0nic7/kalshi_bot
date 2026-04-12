@@ -421,6 +421,7 @@ series_templates:
                             "weather_source_kind": "archived_weather_bundle",
                             "settlement_label_id": "settlement-1",
                             "coverage_class": "late_only_coverage",
+                            "replay_logic_version": "historical_replay_old_logic",
                             "source_coverage": {
                                 "market_snapshot": True,
                                 "weather_snapshot": True,
@@ -518,16 +519,17 @@ series_templates:
                                     "weather_snapshot_source_id": selection.weather_snapshot.id,
                                     "market_source_kind": selection.market_source_kind,
                                     "weather_source_kind": selection.weather_source_kind,
-                                    "settlement_label_id": label.id,
-                                    "coverage_class": coverage_class,
-                                    "source_coverage": {
-                                        "market_snapshot": True,
-                                        "weather_snapshot": True,
-                                        "settlement_label": True,
-                                    },
-                                }
-                            },
-                        )
+                                        "settlement_label_id": label.id,
+                                        "coverage_class": coverage_class,
+                                        "replay_logic_version": container.historical_training_service.replay_logic_version(),
+                                        "source_coverage": {
+                                            "market_snapshot": True,
+                                            "weather_snapshot": True,
+                                            "settlement_label": True,
+                                        },
+                                    }
+                                },
+                            )
                         created += 1
                 await session.commit()
             return {

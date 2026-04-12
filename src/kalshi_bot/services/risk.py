@@ -53,6 +53,8 @@ class DeterministicRiskEngine:
             risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
             trigger_max_spread_bps=self.settings.trigger_max_spread_bps,
             trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
+            strategy_quality_edge_buffer_bps=self.settings.strategy_quality_edge_buffer_bps,
+            strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
         )
 
         if control.kill_switch_enabled:

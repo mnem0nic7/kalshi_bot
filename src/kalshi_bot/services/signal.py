@@ -29,6 +29,7 @@ class StrategySignal:
     strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED
     eligibility: TradeEligibilityVerdict | None = None
     stand_down_reason: StandDownReason | None = None
+    heuristic_application: dict[str, Any] | None = None
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -37,6 +38,17 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def is_market_stale(
+    *,
+    observed_at: datetime | None,
+    stale_after_seconds: int,
+    reference_time: datetime | None = None,
+) -> bool:
+    now = _as_utc(reference_time) or datetime.now(UTC)
+    market_seen_at = _as_utc(observed_at)
+    return market_seen_at is None or (now - market_seen_at).total_seconds() > stale_after_seconds
 
 
 def market_spread_bps(market_snapshot: dict[str, Any]) -> int | None:
@@ -122,6 +134,97 @@ def remaining_payout_dollars(side: ContractSide, yes_price_dollars: Decimal) -> 
     return quantize_price(yes_price_dollars)
 
 
+def _trade_recommendation(
+    *,
+    fair_yes_dollars: Decimal,
+    market_snapshot: dict[str, Any],
+    min_edge_bps: int,
+) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int]:
+    quotes = market_quotes(market_snapshot)
+    ask_yes = quotes["yes_ask"]
+    bid_yes = quotes["yes_bid"]
+    ask_no = quotes["no_ask"]
+    min_edge = Decimal(min_edge_bps) / Decimal("10000")
+
+    recommendation_action: TradeAction | None = None
+    recommendation_side: ContractSide | None = None
+    target_yes: Decimal | None = None
+    edge_bps = 0
+
+    if ask_yes is not None:
+        edge_yes = fair_yes_dollars - ask_yes
+        if edge_yes >= min_edge:
+            recommendation_action = TradeAction.BUY
+            recommendation_side = ContractSide.YES
+            target_yes = ask_yes
+            edge_bps = int((edge_yes * Decimal("10000")).to_integral_value())
+
+    if recommendation_action is None and ask_no is not None:
+        fair_no = Decimal("1.0000") - fair_yes_dollars
+        edge_no = fair_no - ask_no
+        if edge_no >= min_edge:
+            recommendation_action = TradeAction.BUY
+            recommendation_side = ContractSide.NO
+            target_yes = quantize_price(Decimal("1.0000") - ask_no)
+            edge_bps = int((edge_no * Decimal("10000")).to_integral_value())
+
+    if recommendation_action is None and bid_yes is not None and fair_yes_dollars >= bid_yes + min_edge:
+        edge_bps = int(((fair_yes_dollars - bid_yes) * Decimal("10000")).to_integral_value())
+
+    return recommendation_action, recommendation_side, target_yes, edge_bps
+
+
+def apply_heuristic_application_to_signal(
+    *,
+    settings: Settings,
+    signal: StrategySignal,
+    market_snapshot: dict[str, Any],
+    min_edge_bps: int,
+    spread_limit_bps: int,
+) -> StrategySignal:
+    application = dict(signal.heuristic_application or {})
+    adjusted_fair_raw = application.get("adjusted_fair_yes_dollars")
+    adjusted_fair = quantize_price(adjusted_fair_raw) if adjusted_fair_raw not in (None, "") else signal.fair_yes_dollars
+    recommendation_action, recommendation_side, target_yes, edge_bps = _trade_recommendation(
+        fair_yes_dollars=adjusted_fair,
+        market_snapshot=market_snapshot,
+        min_edge_bps=min_edge_bps,
+    )
+    summary = base_strategy_summary(signal.summary)
+    if adjusted_fair != signal.fair_yes_dollars:
+        adjust_bps = int(application.get("fair_yes_adjust_bps") or 0)
+        summary = f"{summary}. Historical heuristics adjusted fair yes by {adjust_bps:+d}bps"
+    if recommendation_action is not None and recommendation_side is not None and target_yes is not None:
+        summary = (
+            f"{summary}. Recommend {recommendation_action.value} {recommendation_side.value} "
+            f"at yes price {target_yes} with edge {edge_bps} bps."
+        )
+    else:
+        no_trade_reason, no_trade_text = non_trade_market_reason(
+            market_snapshot,
+            spread_limit_bps=spread_limit_bps,
+        )
+        if no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
+            summary = f"{summary}. {no_trade_text}"
+        elif no_trade_reason == StandDownReason.SPREAD_TOO_WIDE:
+            summary = f"{summary}. Market spread is too wide for the base strategy."
+        else:
+            summary = f"{summary}. {NO_TRADE_SUMMARY_SENTENCE}"
+    return StrategySignal(
+        fair_yes_dollars=adjusted_fair,
+        confidence=signal.confidence,
+        edge_bps=edge_bps,
+        recommended_action=recommendation_action,
+        recommended_side=recommendation_side,
+        target_yes_price_dollars=target_yes,
+        summary=summary,
+        weather=signal.weather,
+        resolution_state=signal.resolution_state,
+        strategy_mode=signal.strategy_mode,
+        heuristic_application=application,
+    )
+
+
 def evaluate_trade_eligibility(
     *,
     settings: Settings,
@@ -130,22 +233,40 @@ def evaluate_trade_eligibility(
     market_observed_at: datetime | None,
     research_freshness: ResearchFreshness,
     thresholds: Any,
+    decision_time: datetime | None = None,
+    market_stale_after_seconds: int | None = None,
 ) -> TradeEligibilityVerdict:
     reasons: list[str] = []
     stand_down_reason: StandDownReason | None = None
-    now = datetime.now(UTC)
-    market_seen_at = _as_utc(market_observed_at)
-    market_stale = market_seen_at is None or (now - market_seen_at).total_seconds() > settings.risk_stale_market_seconds
+    market_stale = is_market_stale(
+        observed_at=market_observed_at,
+        stale_after_seconds=market_stale_after_seconds or settings.risk_stale_market_seconds,
+        reference_time=decision_time,
+    )
     research_stale = bool(research_freshness.stale)
     spread_bps = market_spread_bps(market_snapshot)
     remaining_payout: Decimal | None = None
-    edge_after_quality_buffer_bps = signal.edge_bps - settings.strategy_quality_edge_buffer_bps
+    quality_buffer_bps = getattr(thresholds, "strategy_quality_edge_buffer_bps", settings.strategy_quality_edge_buffer_bps)
+    minimum_remaining_payout_bps = getattr(
+        thresholds,
+        "strategy_min_remaining_payout_bps",
+        settings.strategy_min_remaining_payout_bps,
+    )
+    edge_after_quality_buffer_bps = signal.edge_bps - quality_buffer_bps
     no_trade_reason, no_trade_text = non_trade_market_reason(
         market_snapshot,
         spread_limit_bps=thresholds.trigger_max_spread_bps,
     )
+    heuristic_application = dict(signal.heuristic_application or {})
+    forced_strategy_mode = heuristic_application.get("recommended_strategy_mode")
+    forced_stand_down_value = heuristic_application.get("force_stand_down_reason")
 
     strategy_mode = signal.strategy_mode
+    if isinstance(forced_strategy_mode, str) and forced_strategy_mode:
+        try:
+            strategy_mode = StrategyMode(forced_strategy_mode)
+        except ValueError:
+            strategy_mode = signal.strategy_mode
     if signal.resolution_state != WeatherResolutionState.UNRESOLVED:
         strategy_mode = StrategyMode.RESOLVED_CLEANUP_CANDIDATE
     elif signal.recommended_action is None:
@@ -160,15 +281,24 @@ def evaluate_trade_eligibility(
     elif signal.resolution_state != WeatherResolutionState.UNRESOLVED:
         reasons.append("Contract is already resolved by observed weather state.")
         stand_down_reason = StandDownReason.RESOLVED_CONTRACT
+    elif isinstance(forced_stand_down_value, str) and forced_stand_down_value:
+        try:
+            stand_down_reason = StandDownReason(forced_stand_down_value)
+        except ValueError:
+            stand_down_reason = None
+        if stand_down_reason is not None:
+            reasons.append(
+                "Historical heuristic policy forced an early stand-down for this regime before order generation."
+            )
     elif signal.recommended_action is None or signal.recommended_side is None or signal.target_yes_price_dollars is None:
         reasons.append(no_trade_text)
         stand_down_reason = no_trade_reason
     else:
         remaining_payout = remaining_payout_dollars(signal.recommended_side, signal.target_yes_price_dollars)
-        if remaining_payout <= (Decimal(settings.strategy_min_remaining_payout_bps) / Decimal("10000")):
+        if remaining_payout <= (Decimal(minimum_remaining_payout_bps) / Decimal("10000")):
             reasons.append(
                 f"Remaining payout {remaining_payout} is below configured minimum of "
-                f"{Decimal(settings.strategy_min_remaining_payout_bps) / Decimal('10000'):.4f}."
+                f"{Decimal(minimum_remaining_payout_bps) / Decimal('10000'):.4f}."
             )
             stand_down_reason = StandDownReason.INSUFFICIENT_REMAINING_PAYOUT
         elif no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
@@ -222,36 +352,12 @@ class WeatherSignalEngine:
         min_edge_bps: int | None = None,
     ) -> StrategySignal:
         weather = score_weather_market(mapping, weather_bundle.get("forecast", {}), weather_bundle.get("observation", {}))
-        ask_yes = self._market_price(market_snapshot, "yes_ask_dollars")
-        bid_yes = self._market_price(market_snapshot, "yes_bid_dollars")
-        ask_no = self._market_price(market_snapshot, "no_ask_dollars")
         effective_min_edge_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
-        min_edge = Decimal(effective_min_edge_bps) / Decimal("10000")
-
-        recommendation_action = None
-        recommendation_side = None
-        target_yes = None
-        edge_bps = 0
-
-        if ask_yes is not None:
-            edge_yes = weather.fair_yes_dollars - ask_yes
-            if edge_yes >= min_edge:
-                recommendation_action = TradeAction.BUY
-                recommendation_side = ContractSide.YES
-                target_yes = ask_yes
-                edge_bps = int((edge_yes * Decimal("10000")).to_integral_value())
-
-        if recommendation_action is None and ask_no is not None:
-            fair_no = Decimal("1.0000") - weather.fair_yes_dollars
-            edge_no = fair_no - ask_no
-            if edge_no >= min_edge:
-                recommendation_action = TradeAction.BUY
-                recommendation_side = ContractSide.NO
-                target_yes = quantize_price(Decimal("1.0000") - ask_no)
-                edge_bps = int((edge_no * Decimal("10000")).to_integral_value())
-
-        if recommendation_action is None and bid_yes is not None and weather.fair_yes_dollars >= bid_yes + min_edge:
-            edge_bps = int(((weather.fair_yes_dollars - bid_yes) * Decimal("10000")).to_integral_value())
+        recommendation_action, recommendation_side, target_yes, edge_bps = _trade_recommendation(
+            fair_yes_dollars=weather.fair_yes_dollars,
+            market_snapshot=market_snapshot,
+            min_edge_bps=effective_min_edge_bps,
+        )
 
         summary = weather.summary
         if recommendation_action is not None and target_yes is not None:

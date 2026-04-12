@@ -137,12 +137,37 @@ kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026
 Historical replay rooms are stored with `room_origin = historical_replay`. They reuse the room/export machinery, but the main control-room lists and live/shadow learning surfaces keep filtering to `shadow` and `live` by default so operator views stay focused.
 
 Historical status now reports replayable market-days, exact checkpoint-capture coverage, missing checkpoint reasons, settlement-backfill progress, and whether the Gemini export is only draft-ready or truly split-ready for training.
+Historical status should be interpreted in layers:
+
+- `source_replay_coverage` tells you what the current strict-asof sources can support
+- `checkpoint_archive_coverage` tells you how much coverage came from scheduled checkpoint captures specifically
+- `replay_corpus` tells you what has actually been materialized and is safe to use for readiness or intelligence
+
+If `source_replay_coverage` is ahead of `replay_corpus`, run the historical repair refresh path before trusting the dashboard or the intelligence outputs.
 
 Deploy findings from April 12, 2026:
 
 - `historical-archive checkpoint-capture --once` returning `captured_checkpoint_count = 0` is expected outside the due checkpoint windows; it means nothing was due, not that the job failed
 - `historical-backfill settlements` is now part of the operational repair path for closed markets with missing labels; the first live sweep backfilled labels immediately and materially reduced the `possible_ingestion_gap` backlog
 - historical replay readiness is still constrained by missing checkpoint-weather coverage, so the right next action is continued checkpoint capture, not lowering training-readiness thresholds
+- historical replay repair is also now a normal maintenance tool after replay-logic changes; source tables can be ahead of the materialized replay corpus until `historical-repair refresh` is run
+- after the replay staleness fix, useful historical indicators should show real reasons like `spread_too_wide`, `resolved_contract`, or `book_effectively_broken` instead of collapsing into blanket `market_stale`
+
+Historical intelligence and heuristic-pack workflow:
+
+```bash
+kalshi-bot-cli historical-intelligence status
+kalshi-bot-cli historical-intelligence run --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-intelligence explain --series KXHIGHNY
+kalshi-bot-cli heuristic-pack status
+```
+
+Repair stale replay rows before trusting those indicators:
+
+```bash
+kalshi-bot-cli historical-repair audit --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI --verbose
+kalshi-bot-cli historical-repair refresh --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+```
 
 The self-improvement loop now respects corpus readiness gates. If the corpus is too small, too concentrated, or too weakly labeled, critique and evaluation commands will stop early instead of generating noisy candidates.
 
