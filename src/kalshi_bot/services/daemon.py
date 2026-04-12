@@ -15,6 +15,7 @@ from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.historical_training import HistoricalTrainingService
 from kalshi_bot.services.historical_intelligence import HistoricalIntelligenceService
+from kalshi_bot.services.historical_pipeline import HistoricalPipelineService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
@@ -42,6 +43,7 @@ class DaemonService:
         training_corpus_service: TrainingCorpusService | None = None,
         historical_training_service: HistoricalTrainingService | None = None,
         historical_intelligence_service: HistoricalIntelligenceService | None = None,
+        historical_pipeline_service: HistoricalPipelineService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -57,6 +59,7 @@ class DaemonService:
         self.training_corpus_service = training_corpus_service
         self.historical_training_service = historical_training_service
         self.historical_intelligence_service = historical_intelligence_service
+        self.historical_pipeline_service = historical_pipeline_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
 
     async def reconcile_once(self) -> dict[str, Any]:
@@ -137,9 +140,13 @@ class DaemonService:
             settlement_follow_up = await self._maybe_run_settlement_follow_up()
             if settlement_follow_up is not None:
                 payload["settlement_follow_up"] = settlement_follow_up
-            historical_intelligence = await self._maybe_run_historical_intelligence()
-            if historical_intelligence is not None:
-                payload["historical_intelligence"] = historical_intelligence
+            historical_pipeline = await self._maybe_run_historical_pipeline()
+            if historical_pipeline is not None:
+                payload["historical_pipeline"] = historical_pipeline
+            elif self.historical_pipeline_service is None:
+                historical_intelligence = await self._maybe_run_historical_intelligence()
+                if historical_intelligence is not None:
+                    payload["historical_intelligence"] = historical_intelligence
         rollout_result = await self.self_improve_service.monitor_rollouts()
         if rollout_result.status == "canary_running":
             canary = rollout_result.payload
@@ -312,6 +319,28 @@ class DaemonService:
             repo = PlatformRepository(session)
             await repo.set_checkpoint(
                 f"daemon_historical_intelligence:{self.settings.app_color}",
+                None,
+                {
+                    "ran_at": now.isoformat(),
+                    "result": result,
+                },
+            )
+            await session.commit()
+        return result
+
+    async def _maybe_run_historical_pipeline(self) -> dict[str, Any] | None:
+        if self.historical_pipeline_service is None:
+            return None
+        last_run_at = await self._checkpoint_time(f"daemon_historical_pipeline:{self.settings.app_color}")
+        now = datetime.now(UTC)
+        min_interval = timedelta(seconds=max(3600, self.settings.historical_pipeline_daily_run_seconds))
+        if last_run_at is not None and now - last_run_at < min_interval:
+            return None
+        result = await self.historical_pipeline_service.daily()
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.set_checkpoint(
+                f"daemon_historical_pipeline:{self.settings.app_color}",
                 None,
                 {
                     "ran_at": now.isoformat(),

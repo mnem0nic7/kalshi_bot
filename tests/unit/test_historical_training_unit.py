@@ -101,6 +101,42 @@ def test_historical_split_keeps_market_day_together() -> None:
     assert split_by_room["room-a"] == split_by_room["room-b"]
 
 
+def test_historical_market_days_for_coverage_counts_only_matching_coverage() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    bundles = [
+        SimpleNamespace(
+            room={"id": "room-full-1"},
+            coverage_class=HistoricalTrainingService.COVERAGE_FULL,
+            historical_provenance={"local_market_day": "2026-04-10", "coverage_class": HistoricalTrainingService.COVERAGE_FULL},
+        ),
+        SimpleNamespace(
+            room={"id": "room-full-2"},
+            coverage_class=HistoricalTrainingService.COVERAGE_FULL,
+            historical_provenance={"local_market_day": "2026-04-10", "coverage_class": HistoricalTrainingService.COVERAGE_FULL},
+        ),
+        SimpleNamespace(
+            room={"id": "room-late"},
+            coverage_class=HistoricalTrainingService.COVERAGE_LATE_ONLY,
+            historical_provenance={"local_market_day": "2026-04-11", "coverage_class": HistoricalTrainingService.COVERAGE_LATE_ONLY},
+        ),
+    ]
+
+    all_full_days = HistoricalTrainingService._historical_market_days_for_coverage(
+        service,
+        bundles,
+        coverage_class=HistoricalTrainingService.COVERAGE_FULL,
+    )
+    holdout_full_days = HistoricalTrainingService._historical_market_days_for_coverage(
+        service,
+        bundles,
+        coverage_class=HistoricalTrainingService.COVERAGE_FULL,
+        room_ids={"room-full-2", "room-late"},
+    )
+
+    assert all_full_days == {"2026-04-10"}
+    assert holdout_full_days == {"2026-04-10"}
+
+
 def test_coverage_class_detects_full_and_late_only() -> None:
     service = object.__new__(HistoricalTrainingService)
 
@@ -123,6 +159,38 @@ def test_coverage_class_detects_full_and_late_only() -> None:
 
     assert full == HistoricalTrainingService.COVERAGE_FULL
     assert late_only == HistoricalTrainingService.COVERAGE_LATE_ONLY
+
+
+def test_coverage_class_detects_partial_and_outcome_only() -> None:
+    service = object.__new__(HistoricalTrainingService)
+
+    partial = HistoricalTrainingService._coverage_class(
+        service,
+        [
+            HistoricalCheckpointSelection("c1", datetime(2026, 4, 10, 13, tzinfo=UTC), object(), object(), "captured_market_snapshot", "archived_weather_bundle", []),
+            HistoricalCheckpointSelection("c2", datetime(2026, 4, 10, 17, tzinfo=UTC), None, None, None, None, ["weather_snapshot_missing"]),
+            HistoricalCheckpointSelection("c3", datetime(2026, 4, 10, 21, tzinfo=UTC), object(), object(), "reconstructed_market_checkpoint", "archived_weather_bundle", []),
+        ],
+    )
+    outcome_only = HistoricalTrainingService._coverage_class(
+        service,
+        [
+            HistoricalCheckpointSelection("c1", datetime(2026, 4, 10, 13, tzinfo=UTC), None, None, None, None, ["market_snapshot_missing"]),
+            HistoricalCheckpointSelection("c2", datetime(2026, 4, 10, 17, tzinfo=UTC), None, None, None, None, ["weather_snapshot_missing"]),
+            HistoricalCheckpointSelection("c3", datetime(2026, 4, 10, 21, tzinfo=UTC), None, None, None, None, ["weather_snapshot_missing"]),
+        ],
+    )
+    checkpoint_none = HistoricalTrainingService._coverage_class(
+        service,
+        [
+            HistoricalCheckpointSelection("c1", datetime(2026, 4, 10, 13, tzinfo=UTC), None, None, None, None, ["market_snapshot_missing"]),
+        ],
+        use_outcome_only=False,
+    )
+
+    assert partial == HistoricalTrainingService.COVERAGE_PARTIAL
+    assert outcome_only == HistoricalTrainingService.COVERAGE_OUTCOME_ONLY
+    assert checkpoint_none == HistoricalTrainingService.COVERAGE_NONE
 
 
 def test_checkpoint_capture_due_and_metadata_validation() -> None:
@@ -238,6 +306,65 @@ def test_gemini_build_readiness_requires_multiple_market_days_and_splits() -> No
 
     assert training_ready is False
     assert draft_only is True
+
+
+def test_confidence_story_reports_execution_only_and_directional_states() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.settings = SimpleNamespace(
+        historical_execution_confidence_min_market_days=60,
+        historical_directional_confidence_min_full_market_days=30,
+        historical_directional_confidence_min_holdout_market_days=7,
+    )
+
+    insufficient = HistoricalTrainingService._confidence_story(
+        service,
+        latest_run_payload=None,
+        historical_build_readiness={
+            "distinct_full_coverage_market_days": 2,
+            "holdout_full_coverage_market_days": 0,
+        },
+        source_replay_coverage={
+            "full_checkpoint_coverage_count": 2,
+            "late_only_coverage_count": 10,
+            "partial_checkpoint_coverage_count": 5,
+            "outcome_only_coverage_count": 20,
+            "no_replayable_coverage_count": 0,
+        },
+    )
+    execution_only = HistoricalTrainingService._confidence_story(
+        service,
+        latest_run_payload=None,
+        historical_build_readiness={
+            "distinct_full_coverage_market_days": 12,
+            "holdout_full_coverage_market_days": 3,
+        },
+        source_replay_coverage={
+            "full_checkpoint_coverage_count": 12,
+            "late_only_coverage_count": 30,
+            "partial_checkpoint_coverage_count": 20,
+            "outcome_only_coverage_count": 5,
+            "no_replayable_coverage_count": 0,
+        },
+    )
+    directional = HistoricalTrainingService._confidence_story(
+        service,
+        latest_run_payload=None,
+        historical_build_readiness={
+            "distinct_full_coverage_market_days": 35,
+            "holdout_full_coverage_market_days": 8,
+        },
+        source_replay_coverage={
+            "full_checkpoint_coverage_count": 35,
+            "late_only_coverage_count": 20,
+            "partial_checkpoint_coverage_count": 10,
+            "outcome_only_coverage_count": 4,
+            "no_replayable_coverage_count": 0,
+        },
+    )
+
+    assert insufficient["confidence_state"] == "insufficient_support"
+    assert execution_only["confidence_state"] == "execution_confident_only"
+    assert directional["confidence_state"] == "directional_confident"
 
 
 def test_gemini_export_manifest_contains_boundaries_and_audit_stats(tmp_path) -> None:

@@ -36,6 +36,7 @@ from kalshi_bot.db.models import (
     HistoricalIntelligenceRunRecord,
     HistoricalImportRunRecord,
     HistoricalMarketSnapshotRecord,
+    HistoricalPipelineRunRecord,
     HistoricalReplayRunRecord,
     HistoricalSettlementLabelRecord,
     HistoricalWeatherSnapshotRecord,
@@ -1121,6 +1122,61 @@ class PlatformRepository:
             select(HistoricalIntelligenceRunRecord)
             .order_by(HistoricalIntelligenceRunRecord.started_at.desc())
             .limit(limit)
+        )
+        return list(result.scalars())
+
+    async def create_historical_pipeline_run(
+        self,
+        *,
+        pipeline_kind: str,
+        date_from: str,
+        date_to: str,
+        rolling_days: int,
+        payload: dict[str, Any],
+    ) -> HistoricalPipelineRunRecord:
+        record = HistoricalPipelineRunRecord(
+            pipeline_kind=pipeline_kind,
+            date_from=date_from,
+            date_to=date_to,
+            rolling_days=rolling_days,
+            payload=payload,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def complete_historical_pipeline_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        payload: dict[str, Any],
+        error_text: str | None = None,
+    ) -> HistoricalPipelineRunRecord:
+        record = await self.session.get(HistoricalPipelineRunRecord, run_id)
+        if record is None:
+            raise KeyError(f"Historical pipeline run {run_id} not found")
+        record.status = status
+        record.finished_at = datetime.now(UTC)
+        record.payload = payload
+        record.error_text = error_text
+        await self.session.flush()
+        return record
+
+    async def get_historical_pipeline_run(self, run_id: str) -> HistoricalPipelineRunRecord | None:
+        return await self.session.get(HistoricalPipelineRunRecord, run_id)
+
+    async def list_historical_pipeline_runs(
+        self,
+        *,
+        pipeline_kind: str | None = None,
+        limit: int = 20,
+    ) -> list[HistoricalPipelineRunRecord]:
+        stmt = select(HistoricalPipelineRunRecord)
+        if pipeline_kind is not None:
+            stmt = stmt.where(HistoricalPipelineRunRecord.pipeline_kind == pipeline_kind)
+        result = await self.session.execute(
+            stmt.order_by(HistoricalPipelineRunRecord.started_at.desc()).limit(limit)
         )
         return list(result.scalars())
 

@@ -96,6 +96,15 @@ class FakeHistoricalTrainingService:
         return {"backfilled_count": 1, "date_from": str(date_from), "date_to": str(date_to)}
 
 
+class FakeHistoricalPipelineService:
+    def __init__(self) -> None:
+        self.daily_calls = 0
+
+    async def daily(self):
+        self.daily_calls += 1
+        return {"status": "completed", "pipeline_kind": "daily"}
+
+
 @pytest.mark.asyncio
 async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> None:
     settings = Settings(
@@ -250,5 +259,45 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
     assert historical_training.backfill_calls == 1
     assert followup_checkpoint.payload["summary"]["status_counts"]["awaiting_settlement"] == 1
     assert followup_checkpoint.payload["settlement_backfill"]["backfilled_count"] == 1
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_runs_historical_pipeline_when_available(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-pipeline.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        historical_pipeline_daily_run_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory({})
+    pipeline = FakeHistoricalPipelineService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        FakeHistoricalTrainingService(),  # type: ignore[arg-type]
+        None,
+        pipeline,  # type: ignore[arg-type]
+    )
+
+    payload = await daemon.heartbeat_once()
+
+    assert pipeline.daily_calls == 1
+    assert payload["historical_pipeline"]["pipeline_kind"] == "daily"
 
     await engine.dispose()

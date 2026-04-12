@@ -88,6 +88,7 @@ FAQ_SECTIONS = [
                 "answer": [
                     "Historical replay imports settled weather market-days, captured market snapshots, reconstructed checkpoint snapshots from Kalshi candlesticks, and point-in-time weather bundles from the bot archive plus captured raw events. The daemon now also writes dedicated checkpoint weather captures on schedule so future settled days can become fully replayable without depending on room traffic.",
                     "Those replayed rooms are marked historical_replay, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files. If there are not enough distinct full-coverage market-days yet, the Gemini export is marked draft-only instead of pretending it is training-ready.",
+                    "The default operating model is now a rolling one-year pipeline: bootstrap the last 365 settled days ending yesterday, then run a daily incremental refresh that only processes newly settled or newly replayable market-days before rerunning intelligence and confidence.",
                 ],
                 "read_more": ["docs/training.md", "docs/faq.md"],
             },
@@ -96,6 +97,7 @@ FAQ_SECTIONS = [
                 "answer": [
                     "Read the historical status in three layers: source replay coverage for what the current strict-asof sources could replay, checkpoint archive coverage for dedicated scheduled checkpoint captures only, and replay corpus for what has actually been materialized into historical_replay rooms.",
                     "Healthy historical intelligence should mostly show real trade-quality reasons like spread_too_wide, resolved_contract, book_effectively_broken, or insufficient_remaining_payout rather than collapsing into blanket market_stale results.",
+                    "The confidence state should also track the real support window: insufficient_support means neither lane is ready, execution_confident_only means execution heuristics have enough support but directional rewrites do not, and directional_confident means both execution and full-checkpoint directional support are finally strong enough to compare honestly.",
                 ],
                 "read_more": ["docs/training.md", "docs/operations.md", "docs/faq.md"],
             },

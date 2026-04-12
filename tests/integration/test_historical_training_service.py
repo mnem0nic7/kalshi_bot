@@ -156,6 +156,7 @@ series_templates:
         assert body["settlement_backfilled_count"] == 1
         assert "checkpoint_coverage_counts" in body
         assert "historical_build_readiness" in body
+        assert "confidence_state" in body
 
         training_status = client.get("/api/training/status")
         assert training_status.status_code == 200
@@ -251,7 +252,13 @@ series_templates:
         assert historical_status.status_code == 200
         assert historical_status.json()["replayed_checkpoint_count"] == 1
         assert "full_checkpoint_coverage_count" in historical_status.json()
+        assert "outcome_only_coverage_count" in historical_status.json()
         assert "draft_training_ready" in historical_status.json()
+        assert "confidence_scorecard" in historical_status.json()
+
+        pipeline_status = client.get("/api/historical/pipeline/status")
+        assert pipeline_status.status_code == 200
+        assert "rolling_window" in pipeline_status.json()
 
         status_response = client.get("/api/status")
         assert status_response.status_code == 200

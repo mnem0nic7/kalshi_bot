@@ -15,6 +15,13 @@ Historical replay uses the same canonical room bundle shape, but marks rows with
 
 Historical intelligence builds on top of those replayed rows. It consumes quality-cleaned historical replay bundles, computes execution and directional intelligence, and can stage versioned runtime heuristic packs when the support thresholds are honestly met.
 
+The historical program is now meant to run as a rolling one-year loop, not as an occasional manual export. The default window is the past `365` settled days ending yesterday, and the pipeline keeps strict tier boundaries:
+
+- `full_checkpoint_coverage`: eligible for directional replay, directional heuristics, decision-eval, and Gemini readiness
+- `late_only_coverage` and `partial_checkpoint_coverage`: eligible for execution-quality and outcome analysis only
+- `outcome_only_coverage`: settlement and PnL reference only, never directional replay
+- `no_replayable_coverage`: not usable for replay-driven learning
+
 ## Historical Replay
 
 Historical replay is strict as-of, weather-only, and structured-only.
@@ -40,6 +47,12 @@ The historical status surfaces now separate three different truths:
 - `replay_corpus`: what has actually been rebuilt into `historical_replay` rooms and is safe to use for readiness
 
 Historical training readiness should be read from the replay corpus, not from source potential alone.
+
+The confidence loop is separate from raw readiness:
+
+- `insufficient_support`: not enough rolling-year support yet to trust either execution or directional heuristic changes
+- `execution_confident_only`: enough replayable market-days to tune execution-quality heuristics, but not enough full-checkpoint support to trust directional rewrites
+- `directional_confident`: enough execution support plus enough full-checkpoint market-days and holdout days to judge directional changes honestly
 
 Deploy findings from April 12, 2026:
 
@@ -118,6 +131,14 @@ Inspect historical corpus status:
 
 ```bash
 kalshi-bot-cli historical-status --verbose
+```
+
+Run the rolling one-year historical pipeline:
+
+```bash
+kalshi-bot-cli historical-pipeline bootstrap --days 365 --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+kalshi-bot-cli historical-pipeline daily --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+kalshi-bot-cli historical-pipeline status
 ```
 
 Backfill missing checkpoint coverage before replay:

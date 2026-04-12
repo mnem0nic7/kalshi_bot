@@ -386,6 +386,20 @@ class HistoricalIntelligenceRunRecord(Base, IdMixin, TimestampMixin):
     error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
 
+class HistoricalPipelineRunRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "historical_pipeline_runs"
+
+    pipeline_kind: Mapped[str] = mapped_column(String(32), default="daily", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    date_from: Mapped[str] = mapped_column(String(16), index=True)
+    date_to: Mapped[str] = mapped_column(String(16), index=True)
+    rolling_days: Mapped[int] = mapped_column(Integer, default=365)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+
 class HeuristicPackRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "heuristic_packs"
     __table_args__ = (UniqueConstraint("version", name="uq_heuristic_packs_version"),)

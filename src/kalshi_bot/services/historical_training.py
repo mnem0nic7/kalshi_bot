@@ -142,6 +142,7 @@ class HistoricalTrainingService:
     COVERAGE_FULL = "full_checkpoint_coverage"
     COVERAGE_LATE_ONLY = "late_only_coverage"
     COVERAGE_PARTIAL = "partial_checkpoint_coverage"
+    COVERAGE_OUTCOME_ONLY = "outcome_only_coverage"
     COVERAGE_NONE = "no_replayable_coverage"
 
     def __init__(
@@ -980,7 +981,39 @@ class HistoricalTrainingService:
         else:
             raise ValueError(f"Unsupported historical build mode: {request.mode}")
 
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            latest_intelligence_runs = await repo.list_historical_intelligence_runs(limit=1)
+            await session.commit()
+        latest_intelligence_payload = latest_intelligence_runs[0].payload if latest_intelligence_runs else None
+        confidence = self._confidence_story(
+            latest_run_payload=latest_intelligence_payload,
+            historical_build_readiness={
+                "distinct_full_coverage_market_days": len(
+                    self._historical_market_days_for_coverage(
+                        selected,
+                        coverage_class=self.COVERAGE_FULL,
+                    )
+                ),
+                "holdout_full_coverage_market_days": len(
+                    self._historical_market_days_for_coverage(
+                        selected,
+                        coverage_class=self.COVERAGE_FULL,
+                        room_ids=set(split.holdout),
+                    )
+                ),
+            },
+            source_replay_coverage={
+                "full_checkpoint_coverage_count": sum(1 for bundle in selected if (bundle.coverage_class or (bundle.historical_provenance or {}).get("coverage_class")) == self.COVERAGE_FULL),
+                "late_only_coverage_count": sum(1 for bundle in selected if (bundle.coverage_class or (bundle.historical_provenance or {}).get("coverage_class")) == self.COVERAGE_LATE_ONLY),
+                "partial_checkpoint_coverage_count": sum(1 for bundle in selected if (bundle.coverage_class or (bundle.historical_provenance or {}).get("coverage_class")) == self.COVERAGE_PARTIAL),
+                "outcome_only_coverage_count": sum(1 for bundle in selected if (bundle.coverage_class or (bundle.historical_provenance or {}).get("coverage_class")) == self.COVERAGE_OUTCOME_ONLY),
+                "no_replayable_coverage_count": sum(1 for bundle in selected if (bundle.coverage_class or (bundle.historical_provenance or {}).get("coverage_class")) == self.COVERAGE_NONE),
+            },
+        )
         label_stats = self._historical_label_stats(selected, split, draft_only=draft_only, training_ready=training_ready)
+        label_stats["confidence_state"] = confidence["confidence_state"]
+        label_stats["confidence_scorecard"] = confidence["confidence_scorecard"]
         build_version = f"historical-{request.mode}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -1003,6 +1036,8 @@ class HistoricalTrainingService:
                     },
                     "draft_only": draft_only,
                     "training_ready": training_ready,
+                    "confidence_state": confidence["confidence_state"],
+                    "confidence_scorecard": confidence["confidence_scorecard"],
                     "output": output,
                 },
                 completed_at=datetime.now(UTC),
@@ -1150,6 +1185,8 @@ class HistoricalTrainingService:
             settlement_labels = await repo.list_historical_settlement_labels(limit=5000)
             replay_runs = await repo.list_historical_replay_runs(limit=5000)
             historical_builds = await repo.list_training_dataset_builds(limit=1000, mode_prefix="historical-")
+            intelligence_runs = await repo.list_historical_intelligence_runs(limit=10)
+            pipeline_runs = await repo.list_historical_pipeline_runs(limit=10)
             await session.commit()
 
         replay_room_ids = [run.room_id for run in replay_runs if run.room_id]
@@ -1196,11 +1233,19 @@ class HistoricalTrainingService:
         historical_build_readiness = {
             "training_ready": training_ready,
             "draft_only": draft_only,
-            "distinct_full_coverage_market_days": len({
-                (bundle.historical_provenance or {}).get("local_market_day")
-                for bundle in clean_trainable
-                if (bundle.historical_provenance or {}).get("local_market_day")
-            }),
+            "distinct_full_coverage_market_days": len(
+                self._historical_market_days_for_coverage(
+                    clean_trainable,
+                    coverage_class=self.COVERAGE_FULL,
+                )
+            ),
+            "holdout_full_coverage_market_days": len(
+                self._historical_market_days_for_coverage(
+                    clean_trainable,
+                    coverage_class=self.COVERAGE_FULL,
+                    room_ids=set(readiness_split.holdout),
+                )
+            ),
             "split_counts": {
                 "train": len(readiness_split.train),
                 "validation": len(readiness_split.validation),
@@ -1218,6 +1263,13 @@ class HistoricalTrainingService:
             verbose=verbose,
         )
         stale_build_count = sum(1 for build in historical_builds if build.status == "stale")
+        latest_intelligence_payload = intelligence_runs[0].payload if intelligence_runs else None
+        confidence = self._confidence_story(
+            latest_run_payload=latest_intelligence_payload,
+            historical_build_readiness=historical_build_readiness,
+            source_replay_coverage=public_coverage,
+        )
+        latest_pipeline_payload = pipeline_runs[0].payload if pipeline_runs else None
         return {
             "imported_market_days": len({label.local_market_day for label in settlement_labels}),
             "imported_market_count": len(settlement_labels),
@@ -1226,6 +1278,7 @@ class HistoricalTrainingService:
             "full_checkpoint_coverage_count": coverage["full_checkpoint_coverage_count"],
             "late_only_coverage_count": coverage["late_only_coverage_count"],
             "partial_checkpoint_coverage_count": coverage["partial_checkpoint_coverage_count"],
+            "outcome_only_coverage_count": coverage["outcome_only_coverage_count"],
             "clean_historical_trainable_count": len(clean_trainable),
             "settlement_mismatch_count": sum(1 for label in settlement_labels if label.crosscheck_status == self.SETTLEMENT_MISMATCH),
             "source_replay_coverage": public_coverage,
@@ -1241,6 +1294,8 @@ class HistoricalTrainingService:
             "training_ready": training_ready,
             "historical_dataset_readiness": historical_build_readiness,
             "historical_build_readiness": historical_build_readiness,
+            "confidence_state": confidence["confidence_state"],
+            "confidence_scorecard": confidence["confidence_scorecard"],
             "unsettled_backlog_by_status": dict(settlement_focus.get("status_counts") or {}),
             "possible_ingestion_gap_count": int((settlement_focus.get("status_counts") or {}).get("possible_ingestion_gap", 0)),
             "settlement_backfilled_count": settlement_backfilled_count,
@@ -1248,6 +1303,20 @@ class HistoricalTrainingService:
             "market_day_coverage": public_coverage.get("market_day_coverage", []),
             "checkpoint_market_day_coverage": checkpoint_capture.get("market_day_coverage", []),
             "replay_audit": replay_audit,
+            "recent_pipeline_runs": [
+                {
+                    "id": run.id,
+                    "pipeline_kind": run.pipeline_kind,
+                    "status": run.status,
+                    "date_from": run.date_from,
+                    "date_to": run.date_to,
+                    "rolling_days": run.rolling_days,
+                    "started_at": run.started_at.isoformat(),
+                    "finished_at": run.finished_at.isoformat() if run.finished_at is not None else None,
+                    "payload": run.payload,
+                }
+                for run in pipeline_runs
+            ],
             "recent_import_runs": [
                 {
                     "id": run.id,
@@ -1259,6 +1328,8 @@ class HistoricalTrainingService:
                 }
                 for run in import_runs
             ],
+            "latest_intelligence_run": latest_intelligence_payload,
+            "latest_pipeline_run": latest_pipeline_payload,
         }
 
     async def _mark_historical_builds_stale(
@@ -1373,6 +1444,7 @@ class HistoricalTrainingService:
                 self.COVERAGE_FULL: coverage_counts.get(self.COVERAGE_FULL, 0),
                 self.COVERAGE_LATE_ONLY: coverage_counts.get(self.COVERAGE_LATE_ONLY, 0),
                 self.COVERAGE_PARTIAL: coverage_counts.get(self.COVERAGE_PARTIAL, 0),
+                self.COVERAGE_OUTCOME_ONLY: coverage_counts.get(self.COVERAGE_OUTCOME_ONLY, 0),
                 self.COVERAGE_NONE: coverage_counts.get(self.COVERAGE_NONE, 0),
             },
             "stale_replay_count": int((replay_audit.get("issue_counts") or {}).get("stale_replay", 0)),
@@ -2424,6 +2496,7 @@ class HistoricalTrainingService:
         full_count = sum(1 for row in coverage_rows if row["coverage_class"] == self.COVERAGE_FULL)
         late_only_count = sum(1 for row in coverage_rows if row["coverage_class"] == self.COVERAGE_LATE_ONLY)
         partial_count = sum(1 for row in coverage_rows if row["coverage_class"] == self.COVERAGE_PARTIAL)
+        outcome_only_count = sum(1 for row in coverage_rows if row["coverage_class"] == self.COVERAGE_OUTCOME_ONLY)
         replayable_count = sum(1 for row in coverage_rows if row["replayable"])
         source_coverage_gaps = {
             "missing_market_snapshot_count": missing_reason_counts.get("market_snapshot_missing", 0),
@@ -2435,6 +2508,7 @@ class HistoricalTrainingService:
             "full_checkpoint_coverage_count": full_count,
             "late_only_coverage_count": late_only_count,
             "partial_checkpoint_coverage_count": partial_count,
+            "outcome_only_coverage_count": outcome_only_count,
             "no_replayable_coverage_count": sum(1 for row in coverage_rows if row["coverage_class"] == self.COVERAGE_NONE),
             "missing_checkpoint_reason_counts": dict(missing_reason_counts),
             "source_coverage_gaps": source_coverage_gaps,
@@ -2504,7 +2578,7 @@ class HistoricalTrainingService:
                         "archive_path": (archive.archive_path if archive is not None else None),
                     }
                 )
-            coverage_class = self._coverage_class(selections)
+            coverage_class = self._coverage_class(selections, use_outcome_only=False)
             coverage_counts[coverage_class] += 1
             rows.append(
                 {
@@ -2520,6 +2594,7 @@ class HistoricalTrainingService:
                 self.COVERAGE_FULL: coverage_counts.get(self.COVERAGE_FULL, 0),
                 self.COVERAGE_LATE_ONLY: coverage_counts.get(self.COVERAGE_LATE_ONLY, 0),
                 self.COVERAGE_PARTIAL: coverage_counts.get(self.COVERAGE_PARTIAL, 0),
+                self.COVERAGE_OUTCOME_ONLY: coverage_counts.get(self.COVERAGE_OUTCOME_ONLY, 0),
                 self.COVERAGE_NONE: coverage_counts.get(self.COVERAGE_NONE, 0),
             },
             "checkpoint_capture_gaps": {
@@ -2626,7 +2701,7 @@ class HistoricalTrainingService:
                 return match
         return None
 
-    def _coverage_class(self, selections: list[HistoricalCheckpointSelection]) -> str:
+    def _coverage_class(self, selections: list[HistoricalCheckpointSelection], *, use_outcome_only: bool = True) -> str:
         if not selections:
             return self.COVERAGE_NONE
         replayable_flags = [selection.replayable for selection in selections]
@@ -2636,6 +2711,8 @@ class HistoricalTrainingService:
             return self.COVERAGE_LATE_ONLY
         if any(replayable_flags):
             return self.COVERAGE_PARTIAL
+        if use_outcome_only:
+            return self.COVERAGE_OUTCOME_ONLY
         return self.COVERAGE_NONE
 
     async def _hydrate_historical_bundle_coverage(self, bundles: list[Any]) -> list[Any]:
@@ -2791,6 +2868,87 @@ class HistoricalTrainingService:
         training_ready = len(local_days) >= 3 and bool(split.validation) and bool(split.holdout)
         return training_ready, not training_ready
 
+    def _confidence_story(
+        self,
+        *,
+        latest_run_payload: dict[str, Any] | None,
+        historical_build_readiness: dict[str, Any],
+        source_replay_coverage: dict[str, Any],
+    ) -> dict[str, Any]:
+        if latest_run_payload:
+            scorecard = dict(latest_run_payload.get("confidence_scorecard") or {})
+            confidence_state = str(
+                latest_run_payload.get("confidence_state")
+                or scorecard.get("confidence_state")
+                or "insufficient_support"
+            )
+            if scorecard:
+                scorecard.setdefault("confidence_state", confidence_state)
+                return {
+                    "confidence_state": confidence_state,
+                    "confidence_scorecard": scorecard,
+                }
+
+        support_counts = {
+            self.COVERAGE_FULL: int(source_replay_coverage.get("full_checkpoint_coverage_count", 0)),
+            self.COVERAGE_LATE_ONLY: int(source_replay_coverage.get("late_only_coverage_count", 0)),
+            self.COVERAGE_PARTIAL: int(source_replay_coverage.get("partial_checkpoint_coverage_count", 0)),
+            self.COVERAGE_OUTCOME_ONLY: int(source_replay_coverage.get("outcome_only_coverage_count", 0)),
+            self.COVERAGE_NONE: int(source_replay_coverage.get("no_replayable_coverage_count", 0)),
+        }
+        execution_market_days = (
+            support_counts[self.COVERAGE_FULL]
+            + support_counts[self.COVERAGE_LATE_ONLY]
+            + support_counts[self.COVERAGE_PARTIAL]
+        )
+        full_market_days = int(historical_build_readiness.get("distinct_full_coverage_market_days", 0))
+        holdout_market_days = int(historical_build_readiness.get("holdout_full_coverage_market_days", 0))
+        execution_confident = execution_market_days >= self.settings.historical_execution_confidence_min_market_days
+        directional_confident = (
+            execution_confident
+            and
+            full_market_days >= self.settings.historical_directional_confidence_min_full_market_days
+            and holdout_market_days >= self.settings.historical_directional_confidence_min_holdout_market_days
+        )
+        confidence_state = (
+            "directional_confident"
+            if directional_confident
+            else "execution_confident_only"
+            if execution_confident
+            else "insufficient_support"
+        )
+        return {
+            "confidence_state": confidence_state,
+            "confidence_scorecard": {
+                "confidence_state": confidence_state,
+                "support_counts_by_coverage_class": support_counts,
+                "distinct_full_market_days": full_market_days,
+                "distinct_execution_market_days": execution_market_days,
+                "full_coverage_holdout_market_days": holdout_market_days,
+                "execution_confident": execution_confident,
+                "directional_confident": directional_confident,
+                "execution_confidence_threshold_market_days": self.settings.historical_execution_confidence_min_market_days,
+                "directional_confidence_threshold_market_days": self.settings.historical_directional_confidence_min_full_market_days,
+                "directional_confidence_threshold_holdout_market_days": self.settings.historical_directional_confidence_min_holdout_market_days,
+            },
+        }
+
+    def _historical_market_days_for_coverage(
+        self,
+        bundles: list[Any],
+        *,
+        coverage_class: str,
+        room_ids: set[str] | None = None,
+    ) -> set[str]:
+        selected_room_ids = room_ids or set()
+        return {
+            str((bundle.historical_provenance or {}).get("local_market_day") or "")
+            for bundle in bundles
+            if (bundle.coverage_class or (bundle.historical_provenance or {}).get("coverage_class")) == coverage_class
+            and (not selected_room_ids or bundle.room["id"] in selected_room_ids)
+            and (bundle.historical_provenance or {}).get("local_market_day")
+        }
+
     def _split_historical_bundles(self, bundles: list[Any]) -> HistoricalBuildSplit:
         grouped: dict[str, list[str]] = defaultdict(list)
         for bundle in bundles:
@@ -2845,7 +3003,7 @@ class HistoricalTrainingService:
                 continue
             if mode == "outcome-eval" and not late_only_ok and coverage_class not in {self.COVERAGE_FULL}:
                 continue
-            if coverage_class == self.COVERAGE_NONE:
+            if coverage_class in {self.COVERAGE_NONE, self.COVERAGE_OUTCOME_ONLY}:
                 continue
             selected.append(bundle)
         return selected

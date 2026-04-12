@@ -72,6 +72,8 @@ Historical replay imports settled weather market-days, captured market snapshots
 
 Those replayed rooms are marked `historical_replay`, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files. If we do not have enough distinct full-coverage market-days yet, the Gemini export is marked draft-only instead of pretending it is ready to tune on.
 
+The default operational mode is now a rolling one-year historical pipeline. `historical-pipeline bootstrap` builds the last `365` settled days ending yesterday, and `historical-pipeline daily` only processes newly settled or newly replayable days before rerunning rolling-year intelligence and confidence refresh.
+
 ## How do I tell whether the historical checks are healthy?
 
 Read the historical status in three layers:
@@ -83,6 +85,12 @@ Read the historical status in three layers:
 If source coverage is ahead of replay corpus materialization, run the historical repair refresh path before trusting the dashboard or the intelligence output.
 
 Healthy indicators should also look plausible. After the replay-time staleness fix, the historical intelligence output should mostly surface real trade-quality reasons like `spread_too_wide`, `resolved_contract`, `book_effectively_broken`, or `insufficient_remaining_payout` instead of collapsing into blanket `market_stale`.
+
+The confidence state should also make sense:
+
+- `insufficient_support` means the rolling-year corpus is still too small for trustworthy heuristic changes
+- `execution_confident_only` means execution-quality tuning has enough support, but directional rewrites do not
+- `directional_confident` means both execution support and full-checkpoint directional support are finally strong enough to compare directional changes honestly
 
 ## What is settlement backfill?
 

@@ -205,6 +205,30 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(await container.historical_training_service.get_status(verbose=args.verbose), indent=2))
             return 0
 
+        if args.command == "historical-pipeline":
+            if args.historical_pipeline_command == "status":
+                print(json.dumps(await container.historical_pipeline_service.status(), indent=2))
+                return 0
+            if args.historical_pipeline_command == "bootstrap":
+                print(
+                    json.dumps(
+                        await container.historical_pipeline_service.bootstrap(
+                            days=args.days,
+                            series=args.series or None,
+                        ),
+                        indent=2,
+                    )
+                )
+                return 0
+            if args.historical_pipeline_command == "daily":
+                print(
+                    json.dumps(
+                        await container.historical_pipeline_service.daily(series=args.series or None),
+                        indent=2,
+                    )
+                )
+                return 0
+
         if args.command == "historical-intelligence":
             if args.historical_intelligence_command == "status":
                 print(json.dumps(await container.historical_intelligence_service.get_status(), indent=2))
@@ -665,6 +689,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     historical_status = subparsers.add_parser("historical-status")
     historical_status.add_argument("--verbose", action="store_true")
+
+    historical_pipeline = subparsers.add_parser("historical-pipeline")
+    historical_pipeline_subparsers = historical_pipeline.add_subparsers(
+        dest="historical_pipeline_command",
+        required=True,
+    )
+    historical_pipeline_subparsers.add_parser("status")
+    historical_pipeline_bootstrap = historical_pipeline_subparsers.add_parser("bootstrap")
+    historical_pipeline_bootstrap.add_argument("--days", type=int, default=None)
+    historical_pipeline_bootstrap.add_argument("--series", nargs="*", default=None)
+    historical_pipeline_daily = historical_pipeline_subparsers.add_parser("daily")
+    historical_pipeline_daily.add_argument("--series", nargs="*", default=None)
 
     historical_intelligence = subparsers.add_parser("historical-intelligence")
     historical_intelligence_subparsers = historical_intelligence.add_subparsers(

@@ -108,11 +108,21 @@ class HistoricalIntelligenceService:
             patch_suggestions = await repo.list_heuristic_patch_suggestions(limit=10)
             await session.commit()
         latest_run = recent_runs[0].payload if recent_runs else None
+        fallback_confidence = self.historical_training_service._confidence_story(  # noqa: SLF001
+            latest_run_payload=latest_run,
+            historical_build_readiness={
+                "distinct_full_coverage_market_days": 0,
+                "split_counts": {"holdout": 0},
+            },
+            source_replay_coverage={},
+        )
         return {
             "active_pack_version": active_pack.version,
             "candidate_pack_version": candidate_pack.version if candidate_pack is not None else None,
             "intelligence_window_days": self.settings.historical_intelligence_window_days,
             "latest_run": latest_run,
+            "confidence_state": (latest_run or {}).get("confidence_state") or fallback_confidence["confidence_state"],
+            "confidence_scorecard": (latest_run or {}).get("confidence_scorecard") or fallback_confidence["confidence_scorecard"],
             "heuristics": self.heuristic_service.status_payload(
                 control=control,
                 active_pack=active_pack,
@@ -227,7 +237,8 @@ class HistoricalIntelligenceService:
                 origins=request.origins,
             )
             intelligence = self._build_intelligence(bundles)
-            sufficiency = self._support_diagnostics(intelligence)
+            split = self.historical_training_service._split_historical_bundles(bundles)  # noqa: SLF001
+            sufficiency = self._support_diagnostics(intelligence, bundles=bundles, split=split)
             candidate_pack: HistoricalHeuristicPack | None = None
             candidate_evaluation: dict[str, Any] | None = None
             promoted_pack_version: str | None = None
@@ -308,6 +319,8 @@ class HistoricalIntelligenceService:
                 "execution_intelligence": intelligence["execution_intelligence"],
                 "directional_intelligence": intelligence["directional_intelligence"],
                 "rule_synthesis_candidates": intelligence["rule_synthesis_candidates"],
+                "confidence_scorecard": sufficiency["confidence_scorecard"],
+                "confidence_state": sufficiency["confidence_state"],
                 "candidate_pack_version": candidate_pack.version if candidate_pack is not None else None,
                 "promoted_pack_version": promoted_pack_version,
                 "evaluation": candidate_evaluation,
@@ -376,9 +389,12 @@ class HistoricalIntelligenceService:
         calibration_rollups: dict[tuple[str, str, str, str, str], list[int]] = defaultdict(list)
         spread_rollups: dict[str, list[IntelligenceFeatureRow]] = defaultdict(list)
         payout_rollups: dict[str, list[IntelligenceFeatureRow]] = defaultdict(list)
+        freshness_rollups: dict[str, list[IntelligenceFeatureRow]] = defaultdict(list)
+        liquidity_rollups: dict[str, list[IntelligenceFeatureRow]] = defaultdict(list)
         stand_down_rollups: dict[str, list[IntelligenceFeatureRow]] = defaultdict(list)
         regime_rollups: dict[str, list[IntelligenceFeatureRow]] = defaultdict(list)
         recurrence_rollups: dict[str, Counter[str]] = defaultdict(Counter)
+        brier_rollups: dict[tuple[str, str, str], list[float]] = defaultdict(list)
 
         for row in rows:
             if row.calibration_error_bps is not None and row.coverage_class == HistoricalTrainingService.COVERAGE_FULL:
@@ -391,8 +407,14 @@ class HistoricalIntelligenceService:
                         row.forecast_delta_bucket,
                     )
                 ].append(row.calibration_error_bps)
+            if row.settlement_yes_dollars is not None and row.coverage_class == HistoricalTrainingService.COVERAGE_FULL:
+                brier_rollups[(row.city_bucket, row.threshold_bucket, row.daypart)].append(
+                    float((row.fair_yes_dollars - row.settlement_yes_dollars) ** 2)
+                )
             spread_rollups[row.spread_regime].append(row)
             payout_rollups[row.payout_bucket].append(row)
+            freshness_rollups[row.quote_freshness].append(row)
+            liquidity_rollups[row.liquidity_regime].append(row)
             if row.stand_down_reason:
                 stand_down_rollups[row.stand_down_reason].append(row)
             regime_rollups[f"{row.daypart}:{row.spread_regime}:{row.coverage_class}"].append(row)
@@ -409,6 +431,14 @@ class HistoricalIntelligenceService:
             "payout_buckets": {
                 bucket: self._execution_regime_summary(items)
                 for bucket, items in payout_rollups.items()
+            },
+            "freshness_regimes": {
+                regime: self._execution_regime_summary(items)
+                for regime, items in freshness_rollups.items()
+            },
+            "liquidity_regimes": {
+                regime: self._execution_regime_summary(items)
+                for regime, items in liquidity_rollups.items()
             },
             "stand_down_reasons": {
                 reason: self._stand_down_summary(items)
@@ -441,6 +471,17 @@ class HistoricalIntelligenceService:
                 }
             )
         directional_entries.sort(key=lambda item: (-item["support_count"], abs(item["mean_error_bps"])))
+        brier_entries = [
+            {
+                "city_bucket": city_bucket,
+                "threshold_bucket": threshold_bucket,
+                "daypart": daypart,
+                "support_count": len(values),
+                "mean_brier_error": (sum(values) / len(values)) if values else 0.0,
+            }
+            for (city_bucket, threshold_bucket, daypart), values in brier_rollups.items()
+        ]
+        brier_entries.sort(key=lambda item: (-item["support_count"], item["mean_brier_error"]))
         rule_synthesis_candidates = self._rule_synthesis_candidates(rows)
 
         return {
@@ -449,6 +490,7 @@ class HistoricalIntelligenceService:
             "execution_intelligence": execution_intelligence,
             "directional_intelligence": {
                 "calibration_entries": directional_entries[:50],
+                "brier_scorecard": brier_entries[:50],
                 "full_coverage_row_count": sum(
                     1 for row in rows if row.coverage_class == HistoricalTrainingService.COVERAGE_FULL
                 ),
@@ -456,20 +498,89 @@ class HistoricalIntelligenceService:
             "rule_synthesis_candidates": rule_synthesis_candidates,
         }
 
-    def _support_diagnostics(self, intelligence: dict[str, Any]) -> dict[str, Any]:
+    def _support_diagnostics(
+        self,
+        intelligence: dict[str, Any],
+        *,
+        bundles: list[Any],
+        split,
+    ) -> dict[str, Any]:
         rows: list[IntelligenceFeatureRow] = intelligence["rows"]
         distinct_full_market_days = {
             row.local_market_day for row in rows
             if row.local_market_day and row.coverage_class == HistoricalTrainingService.COVERAGE_FULL
         }
-        distinct_execution_market_days = {row.local_market_day for row in rows if row.local_market_day}
+        distinct_execution_market_days = {
+            row.local_market_day
+            for row in rows
+            if row.local_market_day and row.coverage_class in {
+                HistoricalTrainingService.COVERAGE_FULL,
+                HistoricalTrainingService.COVERAGE_LATE_ONLY,
+                HistoricalTrainingService.COVERAGE_PARTIAL,
+            }
+        }
+        holdout_ids = set(split.holdout or [])
+        holdout_full_market_days = {
+            str((bundle.historical_provenance or {}).get("local_market_day") or "")
+            for bundle in bundles
+            if bundle.room["id"] in holdout_ids
+            and (bundle.coverage_class or (bundle.historical_provenance or {}).get("coverage_class")) == HistoricalTrainingService.COVERAGE_FULL
+            and (bundle.historical_provenance or {}).get("local_market_day")
+        }
+        coverage_counts = Counter(
+            row.coverage_class or HistoricalTrainingService.COVERAGE_NONE
+            for row in rows
+        )
+        execution_confident = (
+            len(distinct_execution_market_days) >= self.settings.historical_execution_confidence_min_market_days
+        )
+        directional_confident = (
+            execution_confident
+            and
+            len(distinct_full_market_days) >= self.settings.historical_directional_confidence_min_full_market_days
+            and len(holdout_full_market_days) >= self.settings.historical_directional_confidence_min_holdout_market_days
+        )
+        confidence_state = (
+            "directional_confident"
+            if directional_confident
+            else "execution_confident_only"
+            if execution_confident
+            else "insufficient_support"
+        )
+        confidence_scorecard = {
+            "confidence_state": confidence_state,
+            "support_counts_by_coverage_class": {
+                HistoricalTrainingService.COVERAGE_FULL: coverage_counts.get(HistoricalTrainingService.COVERAGE_FULL, 0),
+                HistoricalTrainingService.COVERAGE_LATE_ONLY: coverage_counts.get(HistoricalTrainingService.COVERAGE_LATE_ONLY, 0),
+                HistoricalTrainingService.COVERAGE_PARTIAL: coverage_counts.get(HistoricalTrainingService.COVERAGE_PARTIAL, 0),
+                HistoricalTrainingService.COVERAGE_OUTCOME_ONLY: 0,
+                HistoricalTrainingService.COVERAGE_NONE: coverage_counts.get(HistoricalTrainingService.COVERAGE_NONE, 0),
+            },
+            "distinct_full_market_days": len(distinct_full_market_days),
+            "distinct_execution_market_days": len(distinct_execution_market_days),
+            "full_coverage_holdout_market_days": len(holdout_full_market_days),
+            "execution_confident": execution_confident,
+            "directional_confident": directional_confident,
+            "execution_confidence_threshold_market_days": self.settings.historical_execution_confidence_min_market_days,
+            "directional_confidence_threshold_market_days": self.settings.historical_directional_confidence_min_full_market_days,
+            "directional_confidence_threshold_holdout_market_days": self.settings.historical_directional_confidence_min_holdout_market_days,
+            "learning_lane_support": {
+                "directional_market_days": len(distinct_full_market_days),
+                "execution_market_days": len(distinct_execution_market_days),
+            },
+        }
         return {
             "row_count": len(rows),
             "distinct_full_market_days": len(distinct_full_market_days),
             "distinct_execution_market_days": len(distinct_execution_market_days),
+            "full_coverage_holdout_market_days": len(holdout_full_market_days),
             "min_directional_support_met": len(distinct_full_market_days) >= self.settings.historical_intelligence_min_full_market_days,
             "min_segment_support": self.settings.historical_intelligence_min_segment_support,
             "directional_candidate_allowed": len(distinct_full_market_days) >= self.settings.historical_intelligence_min_full_market_days,
+            "execution_confident": execution_confident,
+            "directional_confident": directional_confident,
+            "confidence_state": confidence_state,
+            "confidence_scorecard": confidence_scorecard,
         }
 
     async def _build_candidate_pack(
@@ -602,16 +713,17 @@ class HistoricalIntelligenceService:
             and candidate_scorecard["stale_data_mismatch_regressions"] <= baseline_scorecard["stale_data_mismatch_regressions"]
             and candidate_scorecard["missed_stand_down_regressions"] <= baseline_scorecard["missed_stand_down_regressions"]
             and candidate_scorecard["resolved_case_regressions"] <= baseline_scorecard["resolved_case_regressions"]
-            and composite_improvement >= self.settings.historical_intelligence_min_composite_improvement
-            and (
-                (not directional_change_requested)
-                or candidate_pack.metadata.get("sufficiency", {}).get("min_directional_support_met", False)
-            )
+                    and composite_improvement >= self.settings.historical_intelligence_min_composite_improvement
+                    and (
+                        (not directional_change_requested)
+                        or candidate_pack.metadata.get("sufficiency", {}).get("directional_confident", False)
+                    )
         )
         return {
             "promotable": promotable,
             "composite_improvement": composite_improvement,
             "directional_change_requested": directional_change_requested,
+            "confidence_state": candidate_pack.metadata.get("sufficiency", {}).get("confidence_state"),
             "baseline": baseline_scorecard,
             "candidate": candidate_scorecard,
             "holdout_room_count": len(evaluation_bundles),
@@ -963,8 +1075,8 @@ class HistoricalIntelligenceService:
         blocker_text = ", ".join(f"{name}={count}" for name, count in top_blockers) or "no dominant stand-down blocker"
         rule_text = f"{len(policy_graph)} policy rules staged" if policy_graph else "no policy routing changes staged"
         directional_text = (
-            "Directional calibration updates are supported by full-checkpoint market-days."
-            if sufficiency["min_directional_support_met"]
+            "Directional calibration updates are supported by the current full-checkpoint confidence window."
+            if sufficiency["directional_confident"]
             else "Directional calibration remains conservative because full-checkpoint support is still thin."
         )
         return (
@@ -972,7 +1084,8 @@ class HistoricalIntelligenceService:
             f"Primary spread regimes: {spread_text}. "
             f"Primary blockers: {blocker_text}. "
             f"Threshold bias now favors edge buffer {thresholds.strategy_quality_edge_buffer_bps}bps and minimum remaining payout "
-            f"{thresholds.strategy_min_remaining_payout_bps}bps. {rule_text}. {directional_text}"
+            f"{thresholds.strategy_min_remaining_payout_bps}bps. {rule_text}. "
+            f"Confidence state is {sufficiency['confidence_state']}. {directional_text}"
         )
 
     def _base_thresholds(self) -> RuntimeThresholds:

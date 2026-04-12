@@ -126,12 +126,18 @@ class Settings(BaseSettings):
     historical_weather_archive_path: str = "data/historical_weather"
     historical_checkpoint_capture_grace_seconds: int = 900
     active_heuristic_pack_version: str = "historical-baseline-v1"
-    historical_intelligence_window_days: int = 30
+    historical_intelligence_window_days: int = 365
     historical_intelligence_min_full_market_days: int = 3
     historical_intelligence_min_segment_support: int = 5
     historical_intelligence_min_composite_improvement: float = 0.02
     historical_intelligence_auto_promote: bool = True
     historical_intelligence_daily_run_seconds: int = 86400
+    historical_pipeline_bootstrap_days: int = 365
+    historical_pipeline_daily_run_seconds: int = 86400
+    historical_pipeline_incremental_days: int = 7
+    historical_execution_confidence_min_market_days: int = 60
+    historical_directional_confidence_min_full_market_days: int = 30
+    historical_directional_confidence_min_holdout_market_days: int = 7
 
     def model_post_init(self, __context: object) -> None:
         if self.database_url:

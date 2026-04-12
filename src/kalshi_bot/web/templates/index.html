@@ -103,6 +103,8 @@
       <span>source replayable market-days · {{ historical_status.source_replay_coverage.replayable_market_day_count }}</span>
       <span>source full coverage days · {{ historical_status.source_replay_coverage.full_checkpoint_coverage_count }}</span>
       <span>source late-only days · {{ historical_status.source_replay_coverage.late_only_coverage_count }}</span>
+      <span>source partial days · {{ historical_status.source_replay_coverage.partial_checkpoint_coverage_count }}</span>
+      <span>source outcome-only days · {{ historical_status.source_replay_coverage.outcome_only_coverage_count }}</span>
       <span>checkpoint-archive full · {{ historical_status.checkpoint_archive_coverage.checkpoint_coverage_counts.full_checkpoint_coverage }}</span>
       <span>checkpoint-archive late-only · {{ historical_status.checkpoint_archive_coverage.checkpoint_coverage_counts.late_only_coverage }}</span>
       <span>imported markets · {{ historical_status.imported_market_count }}</span>
@@ -115,10 +117,14 @@
       <span>possible ingestion gaps · {{ historical_status.possible_ingestion_gap_count }}</span>
       <span>refresh needed · {{ historical_status.refresh_needed }}</span>
       <span>stale builds · {{ historical_status.stale_build_count }}</span>
+      <span>confidence state · {{ historical_status.confidence_state }}</span>
       <span>Gemini training ready · {{ historical_status.training_ready }}</span>
       <span>draft only · {{ historical_status.draft_training_ready }}</span>
       {% if historical_status.origin_room_counts %}
       <span>origins · {{ historical_status.origin_room_counts }}</span>
+      {% endif %}
+      {% if historical_status.latest_pipeline_run %}
+      <span>latest pipeline · {{ historical_status.latest_pipeline_run.pipeline_kind }} · {{ historical_status.latest_pipeline_run.status }}</span>
       {% endif %}
     </div>
     <div class="room-card">
@@ -126,6 +132,7 @@
       <span>active pack · {{ heuristic_status.active_pack_version }}</span>
       <span>candidate pack · {{ heuristic_status.candidate_pack_version or "none" }}</span>
       <span>window days · {{ heuristic_status.intelligence_window_days }}</span>
+      <span>confidence state · {{ heuristic_status.confidence_state }}</span>
       {% if heuristic_status.latest_run %}
       <span>latest run · {{ heuristic_status.latest_run.status }}</span>
       <span>latest rows · {{ heuristic_status.latest_run.row_count }}</span>
@@ -165,6 +172,7 @@
       <span>training ready · {{ historical_status.historical_build_readiness.training_ready }}</span>
       <span>draft only · {{ historical_status.historical_build_readiness.draft_only }}</span>
       <span>full coverage market-days · {{ historical_status.historical_build_readiness.distinct_full_coverage_market_days }}</span>
+      <span>holdout full market-days · {{ historical_status.historical_build_readiness.holdout_full_coverage_market_days }}</span>
       <span>clean trainable · {{ historical_status.historical_build_readiness.clean_trainable_count }}</span>
       <span>settlement mismatches · {{ historical_status.historical_build_readiness.settlement_mismatch_count }}</span>
       <span>train split rooms · {{ historical_status.historical_build_readiness.split_counts.train }}</span>
@@ -180,6 +188,14 @@
       <span>{{ run.status }} · {{ run.source }} · {{ run.started_at }}</span>
       {% else %}
       <span>No historical imports recorded yet.</span>
+      {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Historical Pipeline Runs</strong>
+      {% for run in historical_status.recent_pipeline_runs %}
+      <span>{{ run.pipeline_kind }} · {{ run.status }} · {{ run.started_at }}</span>
+      {% else %}
+      <span>No historical pipeline runs recorded yet.</span>
       {% endfor %}
     </div>
   </div>

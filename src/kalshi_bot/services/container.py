@@ -16,6 +16,7 @@ from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
 from kalshi_bot.services.historical_intelligence import HistoricalIntelligenceService
+from kalshi_bot.services.historical_pipeline import HistoricalPipelineService
 from kalshi_bot.services.historical_training import HistoricalTrainingService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.auto_trigger import AutoTriggerService
@@ -61,6 +62,7 @@ class AppContainer:
     historical_training_service: HistoricalTrainingService
     historical_heuristic_service: HistoricalHeuristicService
     historical_intelligence_service: HistoricalIntelligenceService
+    historical_pipeline_service: HistoricalPipelineService
     shadow_training_service: ShadowTrainingService
     shadow_campaign_service: ShadowCampaignService
     self_improve_service: SelfImproveService
@@ -134,6 +136,12 @@ class AppContainer:
             training_export_service,
             historical_training_service,
         )
+        historical_pipeline_service = HistoricalPipelineService(
+            settings,
+            session_factory,
+            historical_training_service,
+            historical_intelligence_service,
+        )
         self_improve_service = SelfImproveService(
             settings,
             session_factory,
@@ -189,6 +197,7 @@ class AppContainer:
             training_corpus_service,
             historical_training_service,
             historical_intelligence_service,
+            historical_pipeline_service,
         )
         container = cls(
             settings=settings,
@@ -215,6 +224,7 @@ class AppContainer:
             historical_training_service=historical_training_service,
             historical_heuristic_service=historical_heuristic_service,
             historical_intelligence_service=historical_intelligence_service,
+            historical_pipeline_service=historical_pipeline_service,
             shadow_training_service=shadow_training_service,
             shadow_campaign_service=shadow_campaign_service,
             self_improve_service=self_improve_service,
