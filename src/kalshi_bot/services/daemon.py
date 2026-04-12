@@ -13,6 +13,7 @@ from kalshi_bot.core.schemas import ShadowCampaignRequest
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.services.discovery import DiscoveryService
+from kalshi_bot.services.historical_training import HistoricalTrainingService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
@@ -38,6 +39,7 @@ class DaemonService:
         shadow_campaign_service: ShadowCampaignService | None,
         self_improve_service: SelfImproveService,
         training_corpus_service: TrainingCorpusService | None = None,
+        historical_training_service: HistoricalTrainingService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -51,6 +53,7 @@ class DaemonService:
         self.shadow_campaign_service = shadow_campaign_service
         self.self_improve_service = self_improve_service
         self.training_corpus_service = training_corpus_service
+        self.historical_training_service = historical_training_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
 
     async def reconcile_once(self) -> dict[str, Any]:
@@ -125,6 +128,9 @@ class DaemonService:
                 )
             )
         if self.settings.app_color == payload.get("active_color"):
+            checkpoint_capture = await self._maybe_capture_checkpoint_archives()
+            if checkpoint_capture is not None:
+                payload["checkpoint_capture"] = checkpoint_capture
             settlement_follow_up = await self._maybe_run_settlement_follow_up()
             if settlement_follow_up is not None:
                 payload["settlement_follow_up"] = settlement_follow_up
@@ -231,6 +237,14 @@ class DaemonService:
         if last_follow_up_at is not None and now - last_follow_up_at < min_interval:
             return summary
 
+        settlement_backfill = None
+        if self.historical_training_service is not None:
+            settlement_backfill = await self.historical_training_service.backfill_settlements(
+                date_from=(now - timedelta(days=self.settings.training_window_days)).date(),
+                date_to=now.date(),
+            )
+            summary = await self.training_corpus_service.get_settlement_focus_summary()
+
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             await repo.log_ops_event(
@@ -241,6 +255,7 @@ class DaemonService:
                     "app_color": self.settings.app_color,
                     "unsettled_count": summary.get("unsettled_count"),
                     "status_counts": summary.get("status_counts"),
+                    "settlement_backfill": settlement_backfill,
                 },
             )
             await repo.set_checkpoint(
@@ -249,11 +264,25 @@ class DaemonService:
                 {
                     "followed_at": now.isoformat(),
                     "summary": summary,
+                    "settlement_backfill": settlement_backfill,
                 },
             )
             await session.commit()
         await self.reconcile_once()
+        if settlement_backfill is not None:
+            summary["settlement_backfill"] = settlement_backfill
         return summary
+
+    async def _maybe_capture_checkpoint_archives(self) -> dict[str, Any] | None:
+        if self.historical_training_service is None:
+            return None
+        result = await self.historical_training_service.capture_checkpoint_archives_once(
+            due_only=True,
+            source_kind="daemon_checkpoint_capture",
+        )
+        if result.get("captured_checkpoint_count", 0) <= 0:
+            return None
+        return result
 
     async def _checkpoint_time(self, stream_name: str) -> datetime | None:
         async with self.session_factory() as session:

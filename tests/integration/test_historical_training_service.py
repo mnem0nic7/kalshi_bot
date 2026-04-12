@@ -78,6 +78,92 @@ def test_historical_status_api_and_build_route(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
     get_settings.cache_clear()
 
+
+def test_historical_settlement_backfill_updates_api_status(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    output_path = tmp_path / "historical_build.jsonl"
+    map_path.write_text(
+        """
+series_templates:
+  - series_ticker: KXHIGHNY
+    display_name: NYC Daily High Temperature
+    station_id: KNYC
+    daily_summary_station_id: USW00094728
+    location_name: New York City
+    timezone_name: America/New_York
+    latitude: 40.7146
+    longitude: -74.0071
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "historical-backfill-api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> None:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                control = await repo.get_deployment_control()
+                room = await repo.create_room(
+                    RoomCreate(name="Shadow Settlement Gap", market_ticker="KXHIGHNY-26APR10-T68"),
+                    active_color=container.settings.app_color,
+                    shadow_mode=True,
+                    kill_switch_enabled=control.kill_switch_enabled,
+                    kalshi_env=container.settings.kalshi_env,
+                    room_origin=RoomOrigin.SHADOW.value,
+                )
+                await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+                await session.commit()
+
+        asyncio.run(seed())
+
+        async def fake_fetch_market_for_backfill(market_ticker: str) -> dict:
+            return {
+                "market": {
+                    "ticker": market_ticker,
+                    "result": "yes",
+                    "settlement_value_dollars": "1.0000",
+                    "close_time": "2026-04-10T23:59:59+00:00",
+                    "settlement_ts": "2026-04-11T00:30:00+00:00",
+                }
+            }
+
+        async def fake_daily_summary_crosscheck(mapping, local_day: str, *, kalshi_result: str | None):
+            return {"status": "match", "daily_high_f": Decimal("81.00"), "result": "yes"}
+
+        container.historical_training_service._fetch_market_for_backfill = fake_fetch_market_for_backfill  # type: ignore[method-assign]
+        container.historical_training_service._daily_summary_crosscheck = fake_daily_summary_crosscheck  # type: ignore[method-assign]
+
+        result = asyncio.run(
+            container.historical_training_service.backfill_settlements(
+                date_from=datetime(2026, 4, 10, tzinfo=UTC).date(),
+                date_to=datetime(2026, 4, 10, tzinfo=UTC).date(),
+            )
+        )
+        assert result["backfilled_count"] == 1
+
+        historical_status = client.get("/api/historical/status")
+        assert historical_status.status_code == 200
+        body = historical_status.json()
+        assert body["settlement_backfilled_count"] == 1
+        assert "checkpoint_coverage_counts" in body
+        assert "historical_build_readiness" in body
+
+        training_status = client.get("/api/training/status")
+        assert training_status.status_code == 200
+        training_body = training_status.json()
+        assert training_body["unsettled_complete_room_count"] == 0
+
+    get_settings.cache_clear()
+
     app = create_app()
     with TestClient(app) as client:
         container = client.app.state.container

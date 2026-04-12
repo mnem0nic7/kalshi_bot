@@ -86,10 +86,18 @@ FAQ_SECTIONS = [
             {
                 "question": "How does historical replay training work?",
                 "answer": [
-                    "Historical replay imports settled weather market-days, captured market snapshots, reconstructed checkpoint snapshots from Kalshi candlesticks, and point-in-time weather bundles from the bot archive plus captured raw events.",
+                    "Historical replay imports settled weather market-days, captured market snapshots, reconstructed checkpoint snapshots from Kalshi candlesticks, and point-in-time weather bundles from the bot archive plus captured raw events. The daemon now also writes dedicated checkpoint weather captures on schedule so future settled days can become fully replayable without depending on room traffic.",
                     "Those replayed rooms are marked historical_replay, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files. If there are not enough distinct full-coverage market-days yet, the Gemini export is marked draft-only instead of pretending it is training-ready.",
                 ],
                 "read_more": ["docs/training.md", "docs/faq.md"],
+            },
+            {
+                "question": "What is settlement backfill?",
+                "answer": [
+                    "Settlement backfill is the direct repair path for closed shadow or live room markets that still have no settlement label. Instead of waiting only for passive reconcile events, the bot can fetch the final market outcome from Kalshi and persist it as a labeled settlement.",
+                    "That helps clear possible ingestion gaps from the maturity backlog and moves older rooms into outcome-aware training slices faster.",
+                ],
+                "read_more": ["docs/training.md", "docs/operations.md", "docs/faq.md"],
             },
             {
                 "question": "Why might self-improvement still be blocked?",

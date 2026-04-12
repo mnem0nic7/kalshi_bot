@@ -120,6 +120,9 @@ kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-0
 kalshi-bot-cli historical-backfill market --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli historical-backfill weather-archive --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli historical-archive capture --once --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-archive checkpoint-capture --once --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-archive checkpoint-status --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI --verbose
+kalshi-bot-cli historical-backfill settlements --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli historical-replay weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli training-build historical --mode bundles --date-from 2026-03-01 --date-to 2026-03-31
 kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026-03-01 --date-to 2026-03-31 --output data/training/gemini_weather
@@ -127,7 +130,7 @@ kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026
 
 Historical replay rooms are stored with `room_origin = historical_replay`. They reuse the room/export machinery, but the main control-room lists and live/shadow learning surfaces keep filtering to `shadow` and `live` by default so operator views stay focused.
 
-Historical status now reports replayable market-days, full-vs-late checkpoint coverage, missing checkpoint reasons, and whether the Gemini export is only draft-ready or truly split-ready for training.
+Historical status now reports replayable market-days, exact checkpoint-capture coverage, missing checkpoint reasons, settlement-backfill progress, and whether the Gemini export is only draft-ready or truly split-ready for training.
 
 The self-improvement loop now respects corpus readiness gates. If the corpus is too small, too concentrated, or too weakly labeled, critique and evaluation commands will stop early instead of generating noisy candidates.
 

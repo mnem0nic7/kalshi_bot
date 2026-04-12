@@ -82,6 +82,20 @@ class FakeTrainingCorpusService:
         }
 
 
+class FakeHistoricalTrainingService:
+    def __init__(self) -> None:
+        self.capture_calls = 0
+        self.backfill_calls = 0
+
+    async def capture_checkpoint_archives_once(self, *, due_only=True, source_kind="daemon_checkpoint_capture", series=None, reference_time=None):
+        self.capture_calls += 1
+        return {"captured_checkpoint_count": 1, "source_kind": source_kind}
+
+    async def backfill_settlements(self, *, date_from, date_to, series=None):
+        self.backfill_calls += 1
+        return {"backfilled_count": 1, "date_from": str(date_from), "date_to": str(date_to)}
+
+
 @pytest.mark.asyncio
 async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> None:
     settings = Settings(
@@ -147,6 +161,43 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_daemon_heartbeat_runs_checkpoint_capture_without_rooms(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-checkpoint.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory({})
+    historical_training = FakeHistoricalTrainingService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        historical_training,  # type: ignore[arg-type]
+    )
+
+    payload = await daemon.heartbeat_once()
+
+    assert historical_training.capture_calls == 1
+    assert payload["checkpoint_capture"]["captured_checkpoint_count"] == 1
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-followup.db",
@@ -169,6 +220,7 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
             return await super().reconcile(repo, subaccount=subaccount)
 
     reconcile_service = CountingReconciliationService()
+    historical_training = FakeHistoricalTrainingService()
     daemon = DaemonService(
         settings,
         session_factory,
@@ -182,6 +234,7 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
         None,
         FakeSelfImproveService(),  # type: ignore[arg-type]
         FakeTrainingCorpusService(status_counts={"awaiting_settlement": 1}),  # type: ignore[arg-type]
+        historical_training,  # type: ignore[arg-type]
     )
 
     result = await daemon.run(max_messages=1)
@@ -194,6 +247,8 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
 
     assert result["completed"] == "stream"
     assert reconcile_service.calls == 1
+    assert historical_training.backfill_calls == 1
     assert followup_checkpoint.payload["summary"]["status_counts"]["awaiting_settlement"] == 1
+    assert followup_checkpoint.payload["settlement_backfill"]["backfilled_count"] == 1
 
     await engine.dispose()

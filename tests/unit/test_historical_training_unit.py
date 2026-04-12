@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
+import asyncio
 
 import pytest
 
@@ -122,6 +123,66 @@ def test_coverage_class_detects_full_and_late_only() -> None:
 
     assert full == HistoricalTrainingService.COVERAGE_FULL
     assert late_only == HistoricalTrainingService.COVERAGE_LATE_ONLY
+
+
+def test_checkpoint_capture_due_and_metadata_validation() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.settings = SimpleNamespace(historical_checkpoint_capture_grace_seconds=900)
+    checkpoint_ts = datetime(2026, 4, 10, 13, 0, tzinfo=UTC)
+
+    assert HistoricalTrainingService._checkpoint_capture_due(service, checkpoint_ts, now=checkpoint_ts) is True
+    assert HistoricalTrainingService._checkpoint_capture_due(
+        service,
+        checkpoint_ts,
+        now=datetime(2026, 4, 10, 13, 10, tzinfo=UTC),
+    ) is True
+    assert HistoricalTrainingService._checkpoint_capture_due(
+        service,
+        checkpoint_ts,
+        now=datetime(2026, 4, 10, 13, 16, tzinfo=UTC),
+    ) is False
+
+    assert HistoricalTrainingService._checkpoint_archive_metadata_valid(
+        {
+            "observation_ts": datetime(2026, 4, 10, 12, 55, tzinfo=UTC),
+            "forecast_updated_ts": datetime(2026, 4, 10, 12, 40, tzinfo=UTC),
+            "asof_ts": datetime(2026, 4, 10, 12, 55, tzinfo=UTC),
+        },
+        checkpoint_ts,
+    ) is True
+    assert HistoricalTrainingService._checkpoint_archive_metadata_valid(
+        {
+            "observation_ts": datetime(2026, 4, 10, 13, 1, tzinfo=UTC),
+            "forecast_updated_ts": datetime(2026, 4, 10, 12, 40, tzinfo=UTC),
+            "asof_ts": datetime(2026, 4, 10, 13, 1, tzinfo=UTC),
+        },
+        checkpoint_ts,
+    ) is False
+
+
+def test_select_weather_snapshot_prefers_checkpoint_archives() -> None:
+    service = object.__new__(HistoricalTrainingService)
+
+    class _Repo:
+        async def list_historical_weather_snapshots(self, **kwargs):
+            return [
+                SimpleNamespace(source_kind=HistoricalTrainingService.CAPTURED_WEATHER_SOURCE, source_id="captured"),
+                SimpleNamespace(source_kind=HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE, source_id="archived"),
+                SimpleNamespace(source_kind=HistoricalTrainingService.CHECKPOINT_CAPTURED_WEATHER_SOURCE, source_id="checkpoint"),
+            ]
+
+    result = asyncio.run(
+        HistoricalTrainingService._select_weather_snapshot(
+            service,
+            _Repo(),
+            station_id="KNYC",
+            local_market_day="2026-04-10",
+            checkpoint_ts=datetime(2026, 4, 10, 13, 0, tzinfo=UTC),
+        )
+    )
+
+    assert result is not None
+    assert result.source_kind == HistoricalTrainingService.CHECKPOINT_CAPTURED_WEATHER_SOURCE
 
 
 def test_gemini_build_readiness_requires_multiple_market_days_and_splits() -> None:

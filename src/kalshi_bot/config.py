@@ -123,6 +123,7 @@ class Settings(BaseSettings):
     historical_import_max_pages: int = 25
     historical_replay_market_snapshot_lookback_hours: int = 36
     historical_weather_archive_path: str = "data/historical_weather"
+    historical_checkpoint_capture_grace_seconds: int = 900
 
     def model_post_init(self, __context: object) -> None:
         if self.database_url:

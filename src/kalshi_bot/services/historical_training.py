@@ -121,6 +121,7 @@ class HistoricalTrainingService:
         ("midday_1300", 13),
         ("late_1700", 17),
     )
+    CHECKPOINT_CAPTURED_WEATHER_SOURCE = "checkpoint_archived_weather_bundle"
     CAPTURED_MARKET_SOURCE = "captured_market_snapshot"
     RECONSTRUCTED_MARKET_SOURCE = "reconstructed_market_checkpoint"
     CAPTURED_WEATHER_SOURCE = "captured_weather_bundle"
@@ -130,6 +131,7 @@ class HistoricalTrainingService:
     SETTLEMENT_MATCH = "match"
     SETTLEMENT_MISMATCH = "mismatch"
     SETTLEMENT_MISSING = "missing"
+    SETTLEMENT_BACKFILL_SOURCE = "kalshi_settlement_backfill"
     NCEI_DAILY_SUMMARY_URL = "https://www.ncei.noaa.gov/access/services/data/v1"
     COVERAGE_FULL = "full_checkpoint_coverage"
     COVERAGE_LATE_ONLY = "late_only_coverage"
@@ -537,6 +539,373 @@ class HistoricalTrainingService:
             "samples": samples,
         }
 
+    async def capture_checkpoint_archives_once(
+        self,
+        *,
+        series: list[str] | None = None,
+        reference_time: datetime | None = None,
+        due_only: bool = True,
+        source_kind: str = "manual_checkpoint_capture_once",
+    ) -> dict[str, Any]:
+        templates = self._selected_templates(series)
+        now = _as_utc(reference_time) or datetime.now(UTC)
+        captured = 0
+        skipped_existing = 0
+        skipped_not_due = 0
+        skipped_future_source = 0
+        skipped_missing_metadata = 0
+        samples: list[dict[str, Any]] = []
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            for template in templates:
+                local_market_day = now.astimezone(ZoneInfo(template.timezone_name or "UTC")).date().isoformat()
+                market = await self._find_market_for_template_day(template, local_market_day=local_market_day)
+                mapping = self._checkpoint_mapping(template, market=market)
+                checkpoints = self._checkpoint_times(mapping, local_market_day=local_market_day, market_payload=market or {})
+                for checkpoint_label, checkpoint_ts in checkpoints:
+                    if due_only and not self._checkpoint_capture_due(checkpoint_ts, now=now):
+                        skipped_not_due += 1
+                        continue
+                    existing = await repo.get_historical_checkpoint_archive(
+                        series_ticker=template.series_ticker,
+                        local_market_day=local_market_day,
+                        checkpoint_label=checkpoint_label,
+                    )
+                    if existing is not None:
+                        skipped_existing += 1
+                        continue
+                    weather_bundle = await self.research_coordinator.weather.build_market_snapshot(mapping)
+                    archive_meta = weather_bundle_archive_metadata(weather_bundle, captured_at=checkpoint_ts)
+                    if archive_meta is None:
+                        skipped_missing_metadata += 1
+                        continue
+                    if not self._checkpoint_archive_metadata_valid(archive_meta, checkpoint_ts):
+                        skipped_future_source += 1
+                        continue
+                    source_id = f"checkpoint:{template.series_ticker}:{local_market_day}:{checkpoint_label}"
+                    archive_record = append_weather_bundle_archive(
+                        self.settings,
+                        weather_bundle,
+                        source_id=source_id,
+                        archive_source=source_kind,
+                        captured_at=checkpoint_ts,
+                    )
+                    await repo.upsert_historical_weather_snapshot(
+                        station_id=template.station_id,
+                        series_ticker=template.series_ticker,
+                        local_market_day=local_market_day,
+                        asof_ts=checkpoint_ts,
+                        source_kind=self.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
+                        source_id=source_id,
+                        source_hash=_hash_payload(weather_bundle),
+                        observation_ts=archive_meta["observation_ts"],
+                        forecast_updated_ts=archive_meta["forecast_updated_ts"],
+                        forecast_high_f=archive_meta["forecast_high_f"],
+                        current_temp_f=archive_meta["current_temp_f"],
+                        payload={
+                            **weather_bundle,
+                            "_checkpoint_archive": {
+                                "checkpoint_label": checkpoint_label,
+                                "checkpoint_ts": checkpoint_ts.isoformat(),
+                                "captured_at": now.isoformat(),
+                                "archive_source": source_kind,
+                            },
+                            "_archive": {
+                                "archive_path": archive_record["archive_path"] if archive_record is not None else None,
+                                "archive_source": source_kind,
+                                "source_id": source_id,
+                                "captured_at": checkpoint_ts.isoformat(),
+                            },
+                        },
+                    )
+                    await repo.upsert_historical_checkpoint_archive(
+                        series_ticker=template.series_ticker,
+                        market_ticker=(str(market.get("ticker")) if isinstance(market, dict) and market.get("ticker") else None),
+                        station_id=template.station_id,
+                        local_market_day=local_market_day,
+                        checkpoint_label=checkpoint_label,
+                        checkpoint_ts=checkpoint_ts,
+                        captured_at=now,
+                        source_kind=source_kind,
+                        source_id=source_id,
+                        source_hash=_hash_payload(weather_bundle),
+                        observation_ts=archive_meta["observation_ts"],
+                        forecast_updated_ts=archive_meta["forecast_updated_ts"],
+                        archive_path=(archive_record["archive_path"] if archive_record is not None else None),
+                        payload={
+                            "series_ticker": template.series_ticker,
+                            "market_ticker": (str(market.get("ticker")) if isinstance(market, dict) and market.get("ticker") else None),
+                            "station_id": template.station_id,
+                            "local_market_day": local_market_day,
+                            "checkpoint_label": checkpoint_label,
+                            "checkpoint_ts": checkpoint_ts.isoformat(),
+                            "captured_at": now.isoformat(),
+                            "weather_source_kind": self.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
+                            "archive_source": source_kind,
+                        },
+                    )
+                    await repo.log_weather_event(template.station_id, "historical_checkpoint_capture", weather_bundle)
+                    captured += 1
+                    if len(samples) < 10:
+                        samples.append(
+                            {
+                                "series_ticker": template.series_ticker,
+                                "market_ticker": (str(market.get("ticker")) if isinstance(market, dict) and market.get("ticker") else None),
+                                "local_market_day": local_market_day,
+                                "checkpoint_label": checkpoint_label,
+                                "checkpoint_ts": checkpoint_ts.isoformat(),
+                                "archive_path": archive_record["archive_path"] if archive_record is not None else None,
+                            }
+                        )
+            await session.commit()
+        return {
+            "status": "completed",
+            "series": [template.series_ticker for template in templates],
+            "captured_checkpoint_count": captured,
+            "skipped_existing_count": skipped_existing,
+            "skipped_not_due_count": skipped_not_due,
+            "skipped_future_source_count": skipped_future_source,
+            "skipped_missing_metadata_count": skipped_missing_metadata,
+            "samples": samples,
+        }
+
+    async def checkpoint_capture_status(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+        verbose: bool = False,
+    ) -> dict[str, Any]:
+        templates = self._selected_templates(series)
+        template_by_series = {template.series_ticker: template for template in templates}
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            settlement_labels = await repo.list_historical_settlement_labels(
+                series_tickers=[template.series_ticker for template in templates],
+                date_from=date_from.isoformat(),
+                date_to=date_to.isoformat(),
+                limit=5000,
+            )
+            archives = await repo.list_historical_checkpoint_archives(
+                series_tickers=[template.series_ticker for template in templates],
+                date_from=date_from.isoformat(),
+                date_to=date_to.isoformat(),
+                limit=5000,
+            )
+            await session.commit()
+
+        archive_index = {
+            (record.series_ticker, record.local_market_day, record.checkpoint_label): record
+            for record in archives
+        }
+        rows: list[dict[str, Any]] = []
+        gap_counts: Counter[str] = Counter()
+        gap_samples: list[dict[str, Any]] = []
+        covered_days = 0
+        late_only_days = 0
+        none_days = 0
+
+        for label in settlement_labels:
+            template = template_by_series.get(label.series_ticker or "")
+            mapping = self._mapping_for_market(label.market_ticker, (label.payload or {}).get("market"))
+            if template is None or mapping is None:
+                continue
+            checkpoints = self._checkpoint_times(mapping, local_market_day=label.local_market_day, market_payload=(label.payload or {}).get("market", {}))
+            checkpoint_rows: list[dict[str, Any]] = []
+            replayable_flags: list[bool] = []
+            for checkpoint_label, checkpoint_ts in checkpoints:
+                record = archive_index.get((template.series_ticker, label.local_market_day, checkpoint_label))
+                replayable = record is not None
+                replayable_flags.append(replayable)
+                if not replayable:
+                    gap_counts["checkpoint_archive_missing"] += 1
+                    if len(gap_samples) < 10:
+                        gap_samples.append(
+                            {
+                                "series_ticker": template.series_ticker,
+                                "market_ticker": label.market_ticker,
+                                "local_market_day": label.local_market_day,
+                                "checkpoint_label": checkpoint_label,
+                                "gap": "checkpoint_archive_missing",
+                            }
+                        )
+                checkpoint_rows.append(
+                    {
+                        "checkpoint_label": checkpoint_label,
+                        "checkpoint_ts": checkpoint_ts.isoformat(),
+                        "captured": replayable,
+                        "source_kind": (record.source_kind if record is not None else None),
+                        "captured_at": (record.captured_at.isoformat() if record is not None else None),
+                    }
+                )
+            coverage_class = self._coverage_class(
+                [
+                    HistoricalCheckpointSelection(
+                        checkpoint_label=checkpoint_row["checkpoint_label"],
+                        checkpoint_ts=datetime.fromisoformat(checkpoint_row["checkpoint_ts"]),
+                        market_snapshot=object() if captured else None,
+                        weather_snapshot=object() if captured else None,
+                        market_source_kind=None,
+                        weather_source_kind=self.CHECKPOINT_CAPTURED_WEATHER_SOURCE if captured else None,
+                        missing_reasons=[] if captured else ["checkpoint_archive_missing"],
+                    )
+                    for checkpoint_row, captured in zip(checkpoint_rows, replayable_flags, strict=False)
+                ]
+            )
+            if coverage_class == self.COVERAGE_FULL:
+                covered_days += 1
+            elif coverage_class == self.COVERAGE_LATE_ONLY:
+                late_only_days += 1
+            else:
+                none_days += 1
+            rows.append(
+                {
+                    "series_ticker": template.series_ticker,
+                    "market_ticker": label.market_ticker,
+                    "local_market_day": label.local_market_day,
+                    "coverage_class": coverage_class,
+                    "checkpoints": checkpoint_rows,
+                }
+            )
+
+        return {
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "series": [template.series_ticker for template in templates],
+            "checkpoint_coverage_counts": {
+                self.COVERAGE_FULL: covered_days,
+                self.COVERAGE_LATE_ONLY: late_only_days,
+                self.COVERAGE_NONE: none_days,
+            },
+            "checkpoint_capture_gaps": {
+                "reason_counts": dict(gap_counts),
+                "samples": gap_samples,
+            },
+            "market_day_coverage": rows if verbose else rows[:12],
+        }
+
+    async def backfill_settlements(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+    ) -> dict[str, Any]:
+        backlog_summary = await self.training_corpus_service.get_settlement_focus_summary(limit=5000)
+        backlog = backlog_summary.get("backlog") or []
+        allowed_series = {item.upper() for item in (series or [])}
+        now = datetime.now(UTC)
+        targeted: list[dict[str, Any]] = []
+        for item in backlog:
+            market_ticker = str(item.get("market_ticker") or "")
+            local_market_day = self._market_day_from_ticker_or_close(
+                market_ticker,
+                _parse_iso(item.get("close_at")),
+            )
+            if local_market_day is None or not (date_from.isoformat() <= local_market_day <= date_to.isoformat()):
+                continue
+            if allowed_series and self._series_from_market_ticker(market_ticker) not in allowed_series:
+                continue
+            if str(item.get("status") or "") not in {"awaiting_settlement", "possible_ingestion_gap"}:
+                continue
+            targeted.append(item)
+
+        seen_markets: set[str] = set()
+        backfilled = 0
+        already_labeled = 0
+        not_settled = 0
+        fetch_errors = 0
+        samples: list[dict[str, Any]] = []
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            for item in targeted:
+                market_ticker = str(item.get("market_ticker") or "")
+                if not market_ticker or market_ticker in seen_markets:
+                    continue
+                seen_markets.add(market_ticker)
+                existing = await repo.get_historical_settlement_label(market_ticker)
+                if existing is not None and existing.settlement_value_dollars is not None:
+                    already_labeled += 1
+                    continue
+                try:
+                    market_response = await self._fetch_market_for_backfill(market_ticker)
+                except Exception:
+                    fetch_errors += 1
+                    continue
+                market = _market_payload(market_response)
+                settlement_value = self._market_settlement_value(market)
+                kalshi_result = str(market.get("result") or "").strip().lower() or None
+                close_ts = self._market_timestamp(market, "close_time", "close_ts")
+                if settlement_value is None or kalshi_result not in {"yes", "no"}:
+                    if close_ts is None or close_ts <= now:
+                        not_settled += 1
+                    continue
+                mapping = self._mapping_for_market(market_ticker, market)
+                template = self._template_for_market_ticker(market_ticker)
+                local_market_day = self._market_day_from_ticker_or_close(market_ticker, close_ts)
+                if local_market_day is None:
+                    not_settled += 1
+                    continue
+                series_ticker = (
+                    mapping.series_ticker
+                    if mapping is not None and mapping.series_ticker
+                    else (template.series_ticker if template is not None else self._series_from_market_ticker(market_ticker))
+                )
+                if not series_ticker:
+                    not_settled += 1
+                    continue
+                crosscheck = {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+                if mapping is not None and mapping.threshold_f is not None:
+                    try:
+                        crosscheck = await self._daily_summary_crosscheck(mapping, local_market_day, kalshi_result=kalshi_result)
+                    except Exception:
+                        crosscheck = {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+                await repo.upsert_historical_settlement_label(
+                    market_ticker=market_ticker,
+                    series_ticker=series_ticker,
+                    local_market_day=local_market_day,
+                    source_kind=self.SETTLEMENT_BACKFILL_SOURCE,
+                    kalshi_result=kalshi_result,
+                    settlement_value_dollars=settlement_value,
+                    settlement_ts=self._market_timestamp(market, "settlement_ts", "settlement_time"),
+                    crosscheck_status=crosscheck["status"],
+                    crosscheck_high_f=crosscheck["daily_high_f"],
+                    crosscheck_result=crosscheck["result"],
+                    payload=_json_safe(
+                        {
+                            "market": market,
+                            "crosscheck": crosscheck,
+                            "backfilled_at": now.isoformat(),
+                            "backfill_reason": "room_settlement_backfill",
+                        }
+                    ),
+                )
+                backfilled += 1
+                if len(samples) < 10:
+                    samples.append(
+                        {
+                            "market_ticker": market_ticker,
+                            "local_market_day": local_market_day,
+                            "source_kind": self.SETTLEMENT_BACKFILL_SOURCE,
+                            "crosscheck_status": crosscheck["status"],
+                        }
+                    )
+            await session.commit()
+        return {
+            "status": "completed",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "series": sorted(allowed_series),
+            "target_market_count": len(seen_markets),
+            "backfilled_count": backfilled,
+            "already_labeled_count": already_labeled,
+            "not_settled_count": not_settled,
+            "fetch_error_count": fetch_errors,
+            "samples": samples,
+        }
+
     async def build_historical_dataset(self, request: HistoricalTrainingBuildRequest) -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -661,9 +1030,42 @@ class HistoricalTrainingService:
             and (bundle.coverage_class or (bundle.historical_provenance or {}).get("coverage_class")) == self.COVERAGE_FULL
         ]
         coverage = await self._coverage_status(settlement_labels, verbose=verbose)
+        checkpoint_capture = await self._checkpoint_capture_status(settlement_labels, verbose=verbose)
+        settlement_focus = await self.training_corpus_service.get_settlement_focus_summary(limit=200)
         origin_counts = Counter(bundle.room_origin or bundle.room.get("room_origin") for bundle in replay_bundles)
         readiness_split = self._split_historical_bundles(clean_trainable)
         training_ready, draft_only = self._build_training_readiness(clean_trainable, split=readiness_split, mode="gemini-finetune")
+        live_shadow_bundles = await self.training_export_service.export_room_bundles(
+            limit=self.settings.training_status_room_limit,
+            include_non_complete=False,
+            origins=[RoomOrigin.SHADOW.value, RoomOrigin.LIVE.value],
+        )
+        settlement_backfilled_count = sum(
+            1
+            for bundle in live_shadow_bundles
+            if (
+                bundle.settlement_label is not None
+                and str((bundle.settlement_label or {}).get("source_kind") or "") == self.SETTLEMENT_BACKFILL_SOURCE
+            )
+        )
+        historical_build_readiness = {
+            "training_ready": training_ready,
+            "draft_only": draft_only,
+            "distinct_full_coverage_market_days": len({
+                (bundle.historical_provenance or {}).get("local_market_day")
+                for bundle in clean_trainable
+                if (bundle.historical_provenance or {}).get("local_market_day")
+            }),
+            "split_counts": {
+                "train": len(readiness_split.train),
+                "validation": len(readiness_split.validation),
+                "holdout": len(readiness_split.holdout),
+            },
+            "settlement_mismatch_count": sum(
+                1 for label in settlement_labels if label.crosscheck_status == self.SETTLEMENT_MISMATCH
+            ),
+            "clean_trainable_count": len(clean_trainable),
+        }
         return {
             "imported_market_days": len({label.local_market_day for label in settlement_labels}),
             "imported_market_count": len(settlement_labels),
@@ -676,24 +1078,18 @@ class HistoricalTrainingService:
             "settlement_mismatch_count": sum(1 for label in settlement_labels if label.crosscheck_status == self.SETTLEMENT_MISMATCH),
             "source_coverage_gaps": coverage["source_coverage_gaps"],
             "missing_checkpoint_reason_counts": coverage["missing_checkpoint_reason_counts"],
+            "checkpoint_coverage_counts": checkpoint_capture["checkpoint_coverage_counts"],
+            "checkpoint_capture_gaps": checkpoint_capture["checkpoint_capture_gaps"],
             "draft_training_ready": draft_only,
             "training_ready": training_ready,
-            "historical_dataset_readiness": {
-                "training_ready": training_ready,
-                "draft_only": draft_only,
-                "distinct_full_coverage_market_days": len({
-                    (bundle.historical_provenance or {}).get("local_market_day")
-                    for bundle in clean_trainable
-                    if (bundle.historical_provenance or {}).get("local_market_day")
-                }),
-                "split_counts": {
-                    "train": len(readiness_split.train),
-                    "validation": len(readiness_split.validation),
-                    "holdout": len(readiness_split.holdout),
-                },
-            },
+            "historical_dataset_readiness": historical_build_readiness,
+            "historical_build_readiness": historical_build_readiness,
+            "unsettled_backlog_by_status": dict(settlement_focus.get("status_counts") or {}),
+            "possible_ingestion_gap_count": int((settlement_focus.get("status_counts") or {}).get("possible_ingestion_gap", 0)),
+            "settlement_backfilled_count": settlement_backfilled_count,
             "origin_room_counts": dict(origin_counts),
             "market_day_coverage": coverage.get("market_day_coverage", []),
+            "checkpoint_market_day_coverage": checkpoint_capture.get("market_day_coverage", []),
             "recent_import_runs": [
                 {
                     "id": run.id,
@@ -1585,6 +1981,93 @@ class HistoricalTrainingService:
             "market_day_coverage": coverage_rows if verbose else coverage_rows[:12],
         }
 
+    async def _checkpoint_capture_status(self, settlement_labels: list[Any], *, verbose: bool) -> dict[str, Any]:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            archives = await repo.list_historical_checkpoint_archives(limit=5000)
+            await session.commit()
+
+        archive_index = {
+            (record.series_ticker, record.local_market_day, record.checkpoint_label): record
+            for record in archives
+        }
+        gap_counts: Counter[str] = Counter()
+        gap_samples: list[dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
+        coverage_counts = Counter()
+
+        for label in settlement_labels:
+            mapping = self._mapping_for_market(label.market_ticker, (label.payload or {}).get("market"))
+            if mapping is None or not mapping.supports_structured_weather or not mapping.series_ticker:
+                continue
+            checkpoints = self._checkpoint_times(
+                mapping,
+                local_market_day=label.local_market_day,
+                market_payload=(label.payload or {}).get("market", {}),
+            )
+            selections: list[HistoricalCheckpointSelection] = []
+            checkpoint_rows: list[dict[str, Any]] = []
+            for checkpoint_label, checkpoint_ts in checkpoints:
+                archive = archive_index.get((mapping.series_ticker, label.local_market_day, checkpoint_label))
+                captured = archive is not None
+                if not captured:
+                    gap_counts["checkpoint_archive_missing"] += 1
+                    if len(gap_samples) < 10:
+                        gap_samples.append(
+                            {
+                                "series_ticker": mapping.series_ticker,
+                                "market_ticker": label.market_ticker,
+                                "local_market_day": label.local_market_day,
+                                "checkpoint_label": checkpoint_label,
+                                "gap": "checkpoint_archive_missing",
+                            }
+                        )
+                selections.append(
+                    HistoricalCheckpointSelection(
+                        checkpoint_label=checkpoint_label,
+                        checkpoint_ts=checkpoint_ts,
+                        market_snapshot=(archive if captured else None),
+                        weather_snapshot=(archive if captured else None),
+                        market_source_kind=None,
+                        weather_source_kind=(self.CHECKPOINT_CAPTURED_WEATHER_SOURCE if captured else None),
+                        missing_reasons=[] if captured else ["checkpoint_archive_missing"],
+                    )
+                )
+                checkpoint_rows.append(
+                    {
+                        "checkpoint_label": checkpoint_label,
+                        "checkpoint_ts": checkpoint_ts.isoformat(),
+                        "captured": captured,
+                        "source_kind": (archive.source_kind if archive is not None else None),
+                        "captured_at": (archive.captured_at.isoformat() if archive is not None else None),
+                        "archive_path": (archive.archive_path if archive is not None else None),
+                    }
+                )
+            coverage_class = self._coverage_class(selections)
+            coverage_counts[coverage_class] += 1
+            rows.append(
+                {
+                    "series_ticker": mapping.series_ticker,
+                    "market_ticker": label.market_ticker,
+                    "local_market_day": label.local_market_day,
+                    "coverage_class": coverage_class,
+                    "checkpoints": checkpoint_rows,
+                }
+            )
+        return {
+            "checkpoint_coverage_counts": {
+                self.COVERAGE_FULL: coverage_counts.get(self.COVERAGE_FULL, 0),
+                self.COVERAGE_LATE_ONLY: coverage_counts.get(self.COVERAGE_LATE_ONLY, 0),
+                self.COVERAGE_PARTIAL: coverage_counts.get(self.COVERAGE_PARTIAL, 0),
+                self.COVERAGE_NONE: coverage_counts.get(self.COVERAGE_NONE, 0),
+            },
+            "checkpoint_capture_gaps": {
+                "reason_counts": dict(gap_counts),
+                "samples": gap_samples,
+            },
+            "market_day_coverage": rows if verbose else rows[:12],
+        }
+
     async def _resolve_market_day_selections(self, repo: PlatformRepository, *, label: Any, mapping: WeatherMarketMapping) -> list[HistoricalCheckpointSelection]:
         selections: list[HistoricalCheckpointSelection] = []
         for checkpoint_label, checkpoint_ts in self._checkpoint_times(
@@ -1659,7 +2142,12 @@ class HistoricalTrainingService:
             before_asof=checkpoint_ts,
             limit=100,
         )
-        for source_kind in (self.ARCHIVED_WEATHER_SOURCE, self.LEGACY_ARCHIVED_WEATHER_SOURCE, self.CAPTURED_WEATHER_SOURCE):
+        for source_kind in (
+            self.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
+            self.ARCHIVED_WEATHER_SOURCE,
+            self.LEGACY_ARCHIVED_WEATHER_SOURCE,
+            self.CAPTURED_WEATHER_SOURCE,
+        ):
             match = next((record for record in snapshots if record.source_kind == source_kind), None)
             if match is not None:
                 return match
@@ -2121,6 +2609,12 @@ class HistoricalTrainingService:
             return mapping
         return self.weather_directory.resolve_market(market_ticker, market_payload or {})
 
+    def _template_for_market_ticker(self, market_ticker: str) -> WeatherSeriesTemplate | None:
+        for template in self.weather_directory.templates():
+            if template.supports_market_ticker(market_ticker):
+                return template
+        return None
+
     def _market_local_day(self, mapping: WeatherMarketMapping, market: dict[str, Any]) -> str:
         ticker = str(market.get("ticker") or mapping.market_ticker)
         parts = ticker.split("-")
@@ -2167,6 +2661,114 @@ class HistoricalTrainingService:
             (f"checkpoint_{index+1}", checkpoint)
             for index, checkpoint in enumerate(sorted(deduped.values()))
         ]
+
+    async def _find_market_for_template_day(
+        self,
+        template: WeatherSeriesTemplate,
+        *,
+        local_market_day: str,
+    ) -> dict[str, Any] | None:
+        start_local = datetime.fromisoformat(local_market_day)
+        zone = ZoneInfo(template.timezone_name or "UTC")
+        start_ts = int(datetime.combine(start_local.date(), time.min, tzinfo=zone).astimezone(UTC).timestamp())
+        end_ts = int(datetime.combine(start_local.date() + timedelta(days=1), time.min, tzinfo=zone).astimezone(UTC).timestamp())
+        cursor: str | None = None
+        while True:
+            response = await self.kalshi.list_markets(
+                series_ticker=template.series_ticker,
+                min_close_ts=start_ts,
+                max_close_ts=end_ts,
+                limit=self.settings.historical_import_page_size,
+                cursor=cursor,
+            )
+            page = response.get("markets") or []
+            for market in page:
+                resolved = template.resolve_market(market)
+                if resolved is None:
+                    continue
+                if self._market_local_day(resolved, market) == local_market_day:
+                    return market
+            cursor = response.get("cursor")
+            if not cursor or not page:
+                break
+        return None
+
+    def _checkpoint_mapping(self, template: WeatherSeriesTemplate, *, market: dict[str, Any] | None) -> WeatherMarketMapping:
+        if market is not None:
+            resolved = template.resolve_market(market)
+            if resolved is not None:
+                return resolved
+        return WeatherMarketMapping(
+            market_ticker=template.series_ticker,
+            market_type="weather",
+            display_name=template.display_name,
+            description=template.description,
+            research_queries=list(template.research_queries),
+            research_urls=list(template.research_urls),
+            station_id=template.station_id,
+            daily_summary_station_id=template.daily_summary_station_id,
+            location_name=template.location_name,
+            timezone_name=template.timezone_name,
+            latitude=template.latitude,
+            longitude=template.longitude,
+            threshold_f=0,
+            operator=">",
+            metric=template.metric,
+            settlement_source=template.settlement_source,
+            series_ticker=template.series_ticker,
+        )
+
+    def _checkpoint_capture_due(self, checkpoint_ts: datetime, *, now: datetime) -> bool:
+        grace = timedelta(seconds=max(60, self.settings.historical_checkpoint_capture_grace_seconds))
+        return checkpoint_ts <= now <= checkpoint_ts + grace
+
+    @staticmethod
+    def _checkpoint_archive_metadata_valid(metadata: dict[str, Any], checkpoint_ts: datetime) -> bool:
+        observation_ts = _as_utc(metadata.get("observation_ts"))
+        forecast_updated_ts = _as_utc(metadata.get("forecast_updated_ts"))
+        asof_ts = _as_utc(metadata.get("asof_ts"))
+        if observation_ts is None and forecast_updated_ts is None and asof_ts is None:
+            return False
+        for candidate in (observation_ts, forecast_updated_ts, asof_ts):
+            if candidate is not None and candidate > checkpoint_ts:
+                return False
+        return True
+
+    async def _fetch_market_for_backfill(self, market_ticker: str) -> dict[str, Any]:
+        try:
+            return await self.kalshi.get_market(market_ticker)
+        except httpx.HTTPStatusError:
+            cursor: str | None = None
+            pages = 0
+            while pages < self.settings.historical_import_max_pages:
+                response = await self.kalshi.list_historical_markets(
+                    limit=self.settings.historical_import_page_size,
+                    cursor=cursor,
+                )
+                page = response.get("markets") or []
+                for market in page:
+                    if str(market.get("ticker") or "") == market_ticker:
+                        return {"market": market}
+                cursor = response.get("cursor")
+                pages += 1
+                if not cursor or not page:
+                    break
+            raise
+
+    def _market_day_from_ticker_or_close(self, market_ticker: str, close_at: datetime | None) -> str | None:
+        parts = market_ticker.split("-")
+        if len(parts) >= 3 and len(parts[1]) == 7:
+            try:
+                return datetime.strptime(parts[1], "%y%b%d").date().isoformat()
+            except ValueError:
+                pass
+        if close_at is not None:
+            return close_at.astimezone(UTC).date().isoformat()
+        return None
+
+    @staticmethod
+    def _series_from_market_ticker(market_ticker: str) -> str:
+        return str(market_ticker.split("-")[0] if market_ticker else "").upper()
 
     def _timezone_name(self, mapping: WeatherMarketMapping) -> str:
         if mapping.timezone_name:

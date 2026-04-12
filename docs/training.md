@@ -27,6 +27,7 @@ For each settled market-day we:
 - rebuild dossier, signal, eligibility, strategy audit, and dry-run risk at that checkpoint
 
 If a checkpoint is missing a captured market snapshot or weather bundle, it is skipped rather than fabricated. That keeps the historical corpus traceable and leakage-resistant.
+Going forward, the daemon also captures dedicated checkpoint weather bundles on schedule so future settled days can become full-coverage historical replay days without depending on room traffic.
 
 ## What Gets Captured
 
@@ -113,6 +114,20 @@ kalshi-bot-cli historical-backfill weather-archive \
   --series KXHIGHNY KXHIGHCHI KXHIGHMIA
 
 kalshi-bot-cli historical-archive capture --once \
+  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+
+kalshi-bot-cli historical-archive checkpoint-capture --once \
+  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+
+kalshi-bot-cli historical-archive checkpoint-status \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
+  --series KXHIGHNY KXHIGHCHI KXHIGHMIA \
+  --verbose
+
+kalshi-bot-cli historical-backfill settlements \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
   --series KXHIGHNY KXHIGHCHI KXHIGHMIA
 ```
 

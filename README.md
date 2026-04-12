@@ -77,7 +77,10 @@ kalshi-bot-cli historical-status --verbose
 kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli historical-backfill market --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli historical-backfill weather-archive --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-backfill settlements --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli historical-archive capture --once --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-archive checkpoint-capture --once --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-archive checkpoint-status --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI --verbose
 kalshi-bot-cli historical-replay weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
 kalshi-bot-cli training-build historical --mode bundles --date-from 2026-03-01 --date-to 2026-03-31 --output data/training/historical_bundles.jsonl
 kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026-03-01 --date-to 2026-03-31 --output data/training/gemini_weather
@@ -103,7 +106,7 @@ kalshi-bot-cli promote green
 `discover --json` now expands any configured `series_templates` into the currently active greater/less daily temperature markets, and the control room uses the same live discovery path.
 
 The control room also supports one-click `Run Shadow Room` actions from the market cards, plus a dedicated training panel for corpus status, research audit issues, dataset builds, and one-click shadow campaigns.
-It now also shows a historical corpus panel with replayable market-days, full-vs-late checkpoint coverage, missing checkpoint reasons, and whether Gemini fine-tuning is only draft-ready or actually training-ready.
+It now also shows a historical corpus panel with replayable market-days, exact checkpoint-capture coverage, missing checkpoint reasons, settlement-backfill progress, and whether Gemini fine-tuning is only draft-ready or actually training-ready.
 
 ## GitHub Actions smoke workflows
 

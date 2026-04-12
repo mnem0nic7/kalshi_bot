@@ -233,8 +233,36 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2))
             return 0
 
+        if args.command == "historical-backfill" and args.historical_backfill_kind == "settlements":
+            result = await container.historical_training_service.backfill_settlements(
+                date_from=date.fromisoformat(args.date_from),
+                date_to=date.fromisoformat(args.date_to),
+                series=args.series or None,
+            )
+            print(json.dumps(result, indent=2))
+            return 0
+
         if args.command == "historical-archive" and args.historical_archive_command == "capture":
             result = await container.historical_training_service.capture_weather_archives_once(series=args.series or None)
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.command == "historical-archive" and args.historical_archive_command == "checkpoint-capture":
+            result = await container.historical_training_service.capture_checkpoint_archives_once(
+                series=args.series or None,
+                due_only=bool(args.once),
+                source_kind="manual_checkpoint_capture_once",
+            )
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.command == "historical-archive" and args.historical_archive_command == "checkpoint-status":
+            result = await container.historical_training_service.checkpoint_capture_status(
+                date_from=date.fromisoformat(args.date_from),
+                date_to=date.fromisoformat(args.date_to),
+                series=args.series or None,
+                verbose=args.verbose,
+            )
             print(json.dumps(result, indent=2))
             return 0
 
@@ -570,12 +598,24 @@ def build_parser() -> argparse.ArgumentParser:
     historical_backfill_weather.add_argument("--date-from", required=True)
     historical_backfill_weather.add_argument("--date-to", required=True)
     historical_backfill_weather.add_argument("--series", nargs="*", default=None)
+    historical_backfill_settlements = historical_backfill_subparsers.add_parser("settlements")
+    historical_backfill_settlements.add_argument("--date-from", required=True)
+    historical_backfill_settlements.add_argument("--date-to", required=True)
+    historical_backfill_settlements.add_argument("--series", nargs="*", default=None)
 
     historical_archive = subparsers.add_parser("historical-archive")
     historical_archive_subparsers = historical_archive.add_subparsers(dest="historical_archive_command", required=True)
     historical_archive_capture = historical_archive_subparsers.add_parser("capture")
     historical_archive_capture.add_argument("--once", action="store_true")
     historical_archive_capture.add_argument("--series", nargs="*", default=None)
+    historical_archive_checkpoint_capture = historical_archive_subparsers.add_parser("checkpoint-capture")
+    historical_archive_checkpoint_capture.add_argument("--once", action="store_true")
+    historical_archive_checkpoint_capture.add_argument("--series", nargs="*", default=None)
+    historical_archive_checkpoint_status = historical_archive_subparsers.add_parser("checkpoint-status")
+    historical_archive_checkpoint_status.add_argument("--date-from", required=True)
+    historical_archive_checkpoint_status.add_argument("--date-to", required=True)
+    historical_archive_checkpoint_status.add_argument("--series", nargs="*", default=None)
+    historical_archive_checkpoint_status.add_argument("--verbose", action="store_true")
 
     historical_replay = subparsers.add_parser("historical-replay")
     historical_replay.add_argument("historical_kind", choices=["weather"])

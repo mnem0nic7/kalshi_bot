@@ -462,6 +462,28 @@ class HistoricalWeatherSnapshotRecord(Base, IdMixin, TimestampMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class HistoricalCheckpointArchiveRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "historical_checkpoint_archives"
+    __table_args__ = (
+        UniqueConstraint("series_ticker", "local_market_day", "checkpoint_label", name="uq_historical_checkpoint_archive_slot"),
+    )
+
+    series_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    market_ticker: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    station_id: Mapped[str] = mapped_column(String(32), index=True)
+    local_market_day: Mapped[str] = mapped_column(String(16), index=True)
+    checkpoint_label: Mapped[str] = mapped_column(String(32), index=True)
+    checkpoint_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source_kind: Mapped[str] = mapped_column(String(64), index=True)
+    source_id: Mapped[str] = mapped_column(String(255), index=True)
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    observation_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    forecast_updated_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    archive_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class HistoricalSettlementLabelRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "historical_settlement_labels"
     __table_args__ = (UniqueConstraint("market_ticker", name="uq_historical_settlement_labels_market_ticker"),)

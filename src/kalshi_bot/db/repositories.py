@@ -31,6 +31,7 @@ from kalshi_bot.db.models import (
     DeploymentControl,
     EvaluationRunRecord,
     FillRecord,
+    HistoricalCheckpointArchiveRecord,
     HistoricalImportRunRecord,
     HistoricalMarketSnapshotRecord,
     HistoricalReplayRunRecord,
@@ -1515,6 +1516,107 @@ class PlatformRepository:
             limit=1,
         )
         return records[0] if records else None
+
+    async def upsert_historical_checkpoint_archive(
+        self,
+        *,
+        series_ticker: str,
+        market_ticker: str | None,
+        station_id: str,
+        local_market_day: str,
+        checkpoint_label: str,
+        checkpoint_ts: datetime,
+        captured_at: datetime,
+        source_kind: str,
+        source_id: str,
+        source_hash: str | None,
+        observation_ts: datetime | None,
+        forecast_updated_ts: datetime | None,
+        archive_path: str | None,
+        payload: dict[str, Any],
+    ) -> HistoricalCheckpointArchiveRecord:
+        stmt = select(HistoricalCheckpointArchiveRecord).where(
+            HistoricalCheckpointArchiveRecord.series_ticker == series_ticker,
+            HistoricalCheckpointArchiveRecord.local_market_day == local_market_day,
+            HistoricalCheckpointArchiveRecord.checkpoint_label == checkpoint_label,
+        )
+        record = (await self.session.execute(stmt)).scalar_one_or_none()
+        if record is None:
+            record = HistoricalCheckpointArchiveRecord(
+                series_ticker=series_ticker,
+                market_ticker=market_ticker,
+                station_id=station_id,
+                local_market_day=local_market_day,
+                checkpoint_label=checkpoint_label,
+                checkpoint_ts=checkpoint_ts,
+                captured_at=captured_at,
+                source_kind=source_kind,
+                source_id=source_id,
+                source_hash=source_hash,
+                observation_ts=observation_ts,
+                forecast_updated_ts=forecast_updated_ts,
+                archive_path=archive_path,
+                payload=payload,
+            )
+            self.session.add(record)
+        else:
+            record.market_ticker = market_ticker
+            record.station_id = station_id
+            record.checkpoint_ts = checkpoint_ts
+            record.captured_at = captured_at
+            record.source_kind = source_kind
+            record.source_id = source_id
+            record.source_hash = source_hash
+            record.observation_ts = observation_ts
+            record.forecast_updated_ts = forecast_updated_ts
+            record.archive_path = archive_path
+            record.payload = payload
+        await self.session.flush()
+        return record
+
+    async def get_historical_checkpoint_archive(
+        self,
+        *,
+        series_ticker: str,
+        local_market_day: str,
+        checkpoint_label: str,
+    ) -> HistoricalCheckpointArchiveRecord | None:
+        stmt = select(HistoricalCheckpointArchiveRecord).where(
+            HistoricalCheckpointArchiveRecord.series_ticker == series_ticker,
+            HistoricalCheckpointArchiveRecord.local_market_day == local_market_day,
+            HistoricalCheckpointArchiveRecord.checkpoint_label == checkpoint_label,
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_historical_checkpoint_archives(
+        self,
+        *,
+        series_tickers: list[str] | None = None,
+        local_market_day: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        checkpoint_label: str | None = None,
+        limit: int = 1000,
+    ) -> list[HistoricalCheckpointArchiveRecord]:
+        stmt = select(HistoricalCheckpointArchiveRecord)
+        if series_tickers:
+            stmt = stmt.where(HistoricalCheckpointArchiveRecord.series_ticker.in_(series_tickers))
+        if local_market_day is not None:
+            stmt = stmt.where(HistoricalCheckpointArchiveRecord.local_market_day == local_market_day)
+        if date_from is not None:
+            stmt = stmt.where(HistoricalCheckpointArchiveRecord.local_market_day >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(HistoricalCheckpointArchiveRecord.local_market_day <= date_to)
+        if checkpoint_label is not None:
+            stmt = stmt.where(HistoricalCheckpointArchiveRecord.checkpoint_label == checkpoint_label)
+        result = await self.session.execute(
+            stmt.order_by(
+                HistoricalCheckpointArchiveRecord.local_market_day.asc(),
+                HistoricalCheckpointArchiveRecord.series_ticker.asc(),
+                HistoricalCheckpointArchiveRecord.checkpoint_ts.asc(),
+            ).limit(limit)
+        )
+        return list(result.scalars())
 
     async def upsert_historical_settlement_label(
         self,

@@ -68,9 +68,15 @@ Read more: `docs/training.md`
 
 ## How does historical replay training work?
 
-Historical replay imports settled weather market-days, captured market snapshots, reconstructed checkpoint snapshots from Kalshi candlesticks, and point-in-time weather bundles from the bot’s archive plus captured raw events. It then rebuilds synthetic rooms using only data that existed at each replay checkpoint.
+Historical replay imports settled weather market-days, captured market snapshots, reconstructed checkpoint snapshots from Kalshi candlesticks, and point-in-time weather bundles from the bot’s archive plus captured raw events. The daemon now also writes dedicated checkpoint weather captures on schedule so future settled days can become fully replayable without depending on room traffic.
 
 Those replayed rooms are marked `historical_replay`, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files. If we do not have enough distinct full-coverage market-days yet, the Gemini export is marked draft-only instead of pretending it is ready to tune on.
+
+## What is settlement backfill?
+
+Settlement backfill is the direct repair path for closed shadow/live room markets that still have no settlement label. Instead of waiting only for passive reconcile events, the bot can fetch the final market outcome directly from Kalshi, persist it as a labeled settlement, and clear rooms out of the `possible_ingestion_gap` backlog.
+
+That makes the maturity dashboard more honest and helps move old rooms into outcome-aware training slices faster.
 
 Read more: `docs/training.md`
 
