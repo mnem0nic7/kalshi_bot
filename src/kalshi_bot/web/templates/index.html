@@ -3,6 +3,7 @@
 <section class="panel">
   <h1>Control Room</h1>
   <p>Active color: <strong>{{ control.active_color }}</strong> | Kill switch: <strong>{{ control.kill_switch_enabled }}</strong></p>
+  <p>Need the operator walkthrough? Open the <a href="/faq">FAQ</a>.</p>
   <div class="actions">
     <button onclick="toggleKill(true)">Enable Kill Switch</button>
     <button onclick="toggleKill(false)">Disable Kill Switch</button>
@@ -50,6 +51,11 @@
   <p>
     Unsettled complete rooms: <strong>{{ training_status.unsettled_complete_room_count }}</strong>
     | Oldest unsettled age: <strong>{{ training_status.oldest_unsettled_room_age_seconds if training_status.oldest_unsettled_room_age_seconds is not none else "n/a" }}</strong>s
+    | Near settlement: <strong>{{ training_status.unsettled_near_settlement_count }}</strong>
+  </p>
+  <p>
+    Settled velocity 24h: <strong>{{ training_status.settled_label_velocity["24h"] }}</strong>
+    | Settled velocity 7d: <strong>{{ training_status.settled_label_velocity["7d"] }}</strong>
   </p>
   <p>
     Ready for SFT: <strong>{{ training_status.readiness.ready_for_sft_export }}</strong>
@@ -86,6 +92,8 @@
       <span>missed stand-down · {{ training_status.quality_debt_summary.missed_stand_down_count }}</span>
       <span>weak resolved trade · {{ training_status.quality_debt_summary.weak_resolved_trade_count }}</span>
       <span>cleaned trainable · {{ training_status.quality_debt_summary.cleaned_trainable_room_count }}</span>
+      <span>recent stale mismatch · {{ training_status.quality_debt_summary.recent_stale_mismatch_count }}</span>
+      <span>recent missed stand-down · {{ training_status.quality_debt_summary.recent_missed_stand_down_count }}</span>
     </div>
     <div class="room-card">
       <strong>Top Exclusion Reasons</strong>
@@ -93,6 +101,58 @@
       <span>{{ reason }} · {{ count }}</span>
       {% else %}
       <span>No current quality exclusions.</span>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="metric-grid">
+    <div class="room-card">
+      <strong>Settlement Maturity</strong>
+      {% for status_name, count in training_status.settlement_maturity.status_counts.items() %}
+      <span>{{ status_name }} · {{ count }}</span>
+      {% else %}
+      <span>No unsettled backlog.</span>
+      {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Recent Exclusion Memory</strong>
+      {% for item in training_status.recent_exclusion_memory.by_market %}
+      <span>{{ item.market_ticker }} · {{ item.count }} · {{ item.reasons }}</span>
+      {% else %}
+      <span>No repeat exclusion markets in the current lookback window.</span>
+      {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Top Blockers</strong>
+      {% for blocker in training_status.top_blockers %}
+      <span>{{ blocker }}</span>
+      {% else %}
+      <span>No blockers reported.</span>
+      {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Next Actions</strong>
+      {% for action in training_status.next_actions %}
+      <span>{{ action }}</span>
+      {% else %}
+      <span>No action needed.</span>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="room-list">
+    <div class="room-card">
+      <strong>Unsettled Backlog</strong>
+      {% for item in training_status.settlement_maturity.backlog %}
+      <span>{{ item.market_ticker }} · {{ item.status }} · room age {{ item.age_seconds if item.age_seconds is not none else "n/a" }}s</span>
+      {% else %}
+      <span>No unsettled rooms in the current window.</span>
+      {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Backlog By Market</strong>
+      {% for market_ticker, count in training_status.unsettled_backlog_by_market.items() %}
+      <span>{{ market_ticker }} · {{ count }}</span>
+      {% else %}
+      <span>No unsettled backlog by market.</span>
       {% endfor %}
     </div>
   </div>

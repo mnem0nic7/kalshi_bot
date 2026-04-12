@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <h1>FAQ</h1>
+  <p>This is the plain-English operator guide for the control room, training corpus, and safety rails. It is meant to answer “how does this all work?” without making you read the code first.</p>
+</section>
+
+{% for section in faq_sections %}
+<section class="panel faq-section">
+  <h2>{{ section["title"] }}</h2>
+  {% for item in section["items"] %}
+  <article class="faq-item">
+    <h3>{{ item["question"] }}</h3>
+    {% for paragraph in item["answer"] %}
+    <p>{{ paragraph }}</p>
+    {% endfor %}
+    {% if item["read_more"] %}
+    <div class="faq-read-more">
+      Read more:
+      {% for doc_path in item["read_more"] %}
+      <code>{{ doc_path }}</code>{% if not loop.last %} · {% endif %}
+      {% endfor %}
+    </div>
+    {% endif %}
+  </article>
+  {% endfor %}
+</section>
+{% endfor %}
+{% endblock %}

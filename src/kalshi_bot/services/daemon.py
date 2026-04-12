@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -18,6 +19,7 @@ from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.streaming import MarketStreamService
+from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -35,6 +37,7 @@ class DaemonService:
         shadow_training_service: ShadowTrainingService,
         shadow_campaign_service: ShadowCampaignService | None,
         self_improve_service: SelfImproveService,
+        training_corpus_service: TrainingCorpusService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -47,6 +50,7 @@ class DaemonService:
         self.shadow_training_service = shadow_training_service
         self.shadow_campaign_service = shadow_campaign_service
         self.self_improve_service = self_improve_service
+        self.training_corpus_service = training_corpus_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
 
     async def reconcile_once(self) -> dict[str, Any]:
@@ -120,6 +124,10 @@ class DaemonService:
                     reason="daemon_shadow_campaign",
                 )
             )
+        if self.settings.app_color == payload.get("active_color"):
+            settlement_follow_up = await self._maybe_run_settlement_follow_up()
+            if settlement_follow_up is not None:
+                payload["settlement_follow_up"] = settlement_follow_up
         rollout_result = await self.self_improve_service.monitor_rollouts()
         if rollout_result.status == "canary_running":
             canary = rollout_result.payload
@@ -204,8 +212,67 @@ class DaemonService:
             await asyncio.sleep(self.settings.daemon_heartbeat_interval_seconds)
             await self.heartbeat_once()
 
+    async def _maybe_run_settlement_follow_up(self) -> dict[str, Any] | None:
+        if self.training_corpus_service is None:
+            return None
+        summary = await self.training_corpus_service.get_settlement_focus_summary()
+        actionable = int(summary.get("status_counts", {}).get("awaiting_settlement", 0)) + int(
+            summary.get("status_counts", {}).get("possible_ingestion_gap", 0)
+        )
+        if actionable <= 0:
+            return summary
+
+        last_reconcile_at = await self._checkpoint_time(f"daemon_reconcile:{self.settings.app_color}")
+        last_follow_up_at = await self._checkpoint_time(f"daemon_settlement_followup:{self.settings.app_color}")
+        min_interval = timedelta(seconds=max(30, min(self.settings.daemon_reconcile_interval_seconds, 120)))
+        now = datetime.now(UTC)
+        if last_reconcile_at is not None and now - last_reconcile_at < min_interval:
+            return summary
+        if last_follow_up_at is not None and now - last_follow_up_at < min_interval:
+            return summary
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.log_ops_event(
+                severity="info",
+                summary="Settlement follow-up reconcile triggered",
+                source="daemon",
+                payload={
+                    "app_color": self.settings.app_color,
+                    "unsettled_count": summary.get("unsettled_count"),
+                    "status_counts": summary.get("status_counts"),
+                },
+            )
+            await repo.set_checkpoint(
+                f"daemon_settlement_followup:{self.settings.app_color}",
+                None,
+                {
+                    "followed_at": now.isoformat(),
+                    "summary": summary,
+                },
+            )
+            await session.commit()
+        await self.reconcile_once()
+        return summary
+
+    async def _checkpoint_time(self, stream_name: str) -> datetime | None:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            checkpoint = await repo.get_checkpoint(stream_name)
+            await session.commit()
+        if checkpoint is None or not isinstance(checkpoint.payload, dict):
+            return None
+        timestamp = checkpoint.payload.get("reconciled_at") or checkpoint.payload.get("followed_at")
+        if not isinstance(timestamp, str) or not timestamp:
+            return None
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
     @staticmethod
     def _now_iso() -> str:
-        from datetime import UTC, datetime
-
         return datetime.now(UTC).isoformat()

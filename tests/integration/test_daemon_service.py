@@ -66,6 +66,22 @@ class FakeSelfImproveService:
         return SelfImproveResult(status="idle", payload={})
 
 
+class FakeTrainingCorpusService:
+    def __init__(self, *, status_counts: dict[str, int] | None = None) -> None:
+        self.status_counts = status_counts or {}
+
+    async def get_settlement_focus_summary(self, *, limit: int = 10):
+        return {
+            "unsettled_count": sum(self.status_counts.values()),
+            "near_settlement_count": 0,
+            "status_counts": self.status_counts,
+            "backlog_by_market": {},
+            "backlog_by_day": {},
+            "settled_label_velocity": {"24h": 0, "7d": 0},
+            "backlog": [],
+        }
+
+
 @pytest.mark.asyncio
 async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> None:
     settings = Settings(
@@ -103,6 +119,7 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
         FakeShadowTrainingService(),  # type: ignore[arg-type]
         None,
         FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
     )
 
     result = await daemon.run(max_messages=3)
@@ -125,5 +142,58 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
     assert heartbeat_checkpoint.payload["app_color"] == "blue"
     assert "heartbeat_at" in heartbeat_checkpoint.payload
     assert "reconciled_at" in reconcile_checkpoint.payload
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-followup.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory({})
+    stream_service = FakeStreamService()
+
+    class CountingReconciliationService(FakeReconciliationService):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def reconcile(self, repo, *, subaccount=0):
+            self.calls += 1
+            return await super().reconcile(repo, subaccount=subaccount)
+
+    reconcile_service = CountingReconciliationService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        stream_service,  # type: ignore[arg-type]
+        reconcile_service,  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(status_counts={"awaiting_settlement": 1}),  # type: ignore[arg-type]
+    )
+
+    result = await daemon.run(max_messages=1)
+
+    async with session_factory() as session:
+        followup_checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_settlement_followup:blue"))
+        ).scalar_one()
+        await session.commit()
+
+    assert result["completed"] == "stream"
+    assert reconcile_service.calls == 1
+    assert followup_checkpoint.payload["summary"]["status_counts"]["awaiting_settlement"] == 1
 
     await engine.dispose()

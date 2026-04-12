@@ -9,7 +9,13 @@
   </head>
   <body>
     <header class="shell-header">
-      <a href="/" class="brand">Kalshi Bot Control Room</a>
+      <div class="header-nav">
+        <a href="/" class="brand">Kalshi Bot Control Room</a>
+        <nav class="header-links" aria-label="Primary">
+          <a href="/">Control Room</a>
+          <a href="/faq">FAQ</a>
+        </nav>
+      </div>
       <div class="header-meta">
         <span>Color: {{ settings.app_color if settings else room.active_color }}</span>
       </div>

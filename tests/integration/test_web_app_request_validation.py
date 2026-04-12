@@ -147,3 +147,27 @@ def test_training_status_and_research_audit_endpoints_return_payloads(tmp_path, 
     assert audit_response.status_code == 200
     assert audit_response.json()["issues"][0]["market_ticker"] == "WX-TEST"
     get_settings.cache_clear()
+
+
+def test_faq_page_and_header_link_render(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        index_response = client.get("/")
+        faq_response = client.get("/faq")
+
+    assert index_response.status_code == 200
+    assert 'href="/faq"' in index_response.text
+    assert faq_response.status_code == 200
+    assert "What is a room?" in faq_response.text
+    assert "Shadow mode" in faq_response.text
+    get_settings.cache_clear()

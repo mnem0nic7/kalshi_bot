@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -206,6 +207,7 @@ async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_p
     assert status["room_count"] == 2
     assert status["unsettled_complete_room_count"] == 0
     assert status["oldest_unsettled_room_age_seconds"] is None
+    assert status["settled_label_velocity"]["24h"] == 2
     assert status["readiness"]["ready_for_sft_export"] is True
     assert status["readiness"]["ready_for_critique"] is True
     assert status["readiness"]["ready_for_evaluation"] is True
@@ -283,6 +285,13 @@ async def test_training_status_separates_active_and_legacy_failure_noise(tmp_pat
             kalshi_env=settings.kalshi_env,
         )
         await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+        await repo.save_artifact(
+            room_id=room.id,
+            artifact_type="market_snapshot",
+            source="test",
+            title="market snapshot",
+            payload={"market": {"ticker": "KXHIGHNY-26APR12-T70", "close_ts": int((datetime.now(UTC) - timedelta(hours=3)).timestamp())}},
+        )
         active_run = await repo.create_research_run(
             market_ticker="KXHIGHNY-26APR12-T70",
             trigger_reason="test_active_failure",
@@ -293,6 +302,38 @@ async def test_training_status_separates_active_and_legacy_failure_noise(tmp_pat
             trigger_reason="test_legacy_failure",
         )
         await repo.complete_research_run(legacy_run.id, status="failed", error_text="404 market not found")
+        stale_audit = StrategyAuditResult(
+            room_id=room.id,
+            market_ticker="KXHIGHNY-26APR12-T70",
+            thesis_correctness="correct",
+            trade_quality="weak_trade",
+            block_correctness="correct_block",
+            stale_data_mismatch=True,
+            audit_source="live_forward",
+            audit_version="weather-quality-v1",
+            trainable_default=False,
+            exclude_reason="stale_data_mismatch",
+            quality_warnings=["stale_data_mismatch", "weak_trade"],
+        )
+        await repo.upsert_room_strategy_audit(
+            room_id=stale_audit.room_id,
+            market_ticker=stale_audit.market_ticker,
+            audit_source=stale_audit.audit_source or "live_forward",
+            audit_version=stale_audit.audit_version or "weather-quality-v1",
+            thesis_correctness=stale_audit.thesis_correctness,
+            trade_quality=stale_audit.trade_quality,
+            block_correctness=stale_audit.block_correctness,
+            missed_stand_down=stale_audit.missed_stand_down,
+            stale_data_mismatch=stale_audit.stale_data_mismatch,
+            effective_freshness_agreement=stale_audit.effective_freshness_agreement,
+            resolution_state=stale_audit.resolution_state,
+            eligibility_passed=stale_audit.eligibility_passed,
+            stand_down_reason=stale_audit.stand_down_reason,
+            trainable_default=stale_audit.trainable_default,
+            exclude_reason=stale_audit.exclude_reason,
+            quality_warnings=stale_audit.quality_warnings,
+            payload=stale_audit.model_dump(mode="json"),
+        )
         await session.commit()
 
     status = await corpus_service.get_status(persist_readiness=False)
@@ -305,6 +346,10 @@ async def test_training_status_separates_active_and_legacy_failure_noise(tmp_pat
     assert status["failed_research_reasons"] == {"market lookup failures": 1}
     assert status["campaign_settings"]["rooms_per_run"] == settings.training_campaign_rooms_per_run
     assert status["campaign_settings"]["daemon_reconcile_interval_seconds"] == settings.daemon_reconcile_interval_seconds
+    assert status["recent_exclusion_memory"]["by_market"][0]["market_ticker"] == "KXHIGHNY-26APR12-T70"
+    assert status["quality_debt_summary"]["recent_stale_mismatch_count"] == 1
+    assert status["settlement_maturity"]["status_counts"]["possible_ingestion_gap"] == 1
+    assert status["unsettled_backlog_by_market"] == {"KXHIGHNY-26APR12-T70": 1}
 
     await engine.dispose()
 

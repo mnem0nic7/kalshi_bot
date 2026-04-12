@@ -35,6 +35,10 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 STRATEGY_AUDIT_VERSION = "weather-quality-v1"
+RECENT_QUALITY_WINDOW_HOURS = 24
+SETTLEMENT_NEAR_SECONDS = 6 * 60 * 60
+SETTLEMENT_GAP_GRACE_SECONDS = 2 * 60 * 60
+SETTLEMENT_BACKLOG_PREVIEW_LIMIT = 10
 
 
 class TrainingCorpusService:
@@ -53,6 +57,7 @@ class TrainingCorpusService:
         self.weather_directory = weather_directory
 
     async def get_status(self, *, persist_readiness: bool = False) -> dict[str, Any]:
+        now = datetime.now(UTC)
         request = TrainingBuildRequest(
             mode="room-bundles",
             limit=self.settings.training_status_room_limit,
@@ -75,6 +80,11 @@ class TrainingCorpusService:
             failed_runs = await repo.list_research_runs(status="failed", limit=200)
             builds = await repo.list_training_dataset_builds(limit=10)
             latest_snapshot = await repo.get_latest_training_readiness()
+            settlement_events = await repo.list_exchange_events(
+                stream_name="reconcile",
+                event_type="settlements",
+                limit=200,
+            )
             await session.commit()
 
         complete_by_market = Counter(bundle.room["market_ticker"] for bundle in bundles)
@@ -117,12 +127,44 @@ class TrainingCorpusService:
             ),
             "cleaned_trainable_room_count": len(trainable_bundles),
         }
+        recent_quality_debt = self._recent_quality_debt(
+            bundles,
+            window_hours=RECENT_QUALITY_WINDOW_HOURS,
+            now=now,
+        )
+        quality_debt_summary.update(recent_quality_debt)
+        quality_debt_summary["recent_window_hours"] = RECENT_QUALITY_WINDOW_HOURS
+        quality_debt_summary["cleaned_trainable_share_by_day"] = self._cleaned_trainable_share_by_day(bundles)
         audit_progress = {
             "audited_room_count": audited_room_count,
             "forward_audit_count": forward_audit_count,
             "backfilled_audit_count": backfilled_audit_count,
             "pending_backfill_room_count": max(0, len(bundles) - audited_room_count),
         }
+        recent_exclusion_memory = self._recent_exclusion_memory(
+            bundles,
+            window_hours=self.settings.training_campaign_lookback_hours,
+            now=now,
+        )
+        settlement_maturity = self._settlement_focus_summary_from_bundles(
+            bundles,
+            settlement_events=settlement_events,
+            now=now,
+            limit=SETTLEMENT_BACKLOG_PREVIEW_LIMIT,
+        )
+        top_blockers = self._top_blockers(
+            readiness=readiness,
+            quality_debt_summary=quality_debt_summary,
+            settlement_maturity=settlement_maturity,
+            recent_exclusion_memory=recent_exclusion_memory,
+        )
+        next_actions = self._next_actions(
+            readiness=readiness,
+            unsettled_count=unsettled_count,
+            settlement_maturity=settlement_maturity,
+            quality_debt_summary=quality_debt_summary,
+            recent_exclusion_memory=recent_exclusion_memory,
+        )
 
         return {
             "window_days": request.days,
@@ -134,7 +176,11 @@ class TrainingCorpusService:
             "good_research_room_count": good_research_count,
             "unsettled_complete_room_count": unsettled_count,
             "oldest_unsettled_room_age_seconds": oldest_unsettled_age_seconds,
+            "unsettled_near_settlement_count": settlement_maturity["near_settlement_count"],
+            "unsettled_backlog_by_market": settlement_maturity["backlog_by_market"],
+            "unsettled_backlog_by_day": settlement_maturity["backlog_by_day"],
             "settled_label_coverage": round(settled_count / len(bundles), 4) if bundles else 0.0,
+            "settled_label_velocity": settlement_maturity["settled_label_velocity"],
             "trade_positive_coverage": round(trade_positive_count / len(bundles), 4) if bundles else 0.0,
             "failed_research_reasons": dict(active_failed_reason_counts.most_common()),
             "active_failed_research_reasons": dict(active_failed_reason_counts.most_common()),
@@ -148,9 +194,13 @@ class TrainingCorpusService:
             "quality_debt_summary": quality_debt_summary,
             "strategy_audit_progress": audit_progress,
             "quality_exclusion_reasons": dict(exclusion_reason_counts.most_common()),
+            "recent_exclusion_memory": recent_exclusion_memory,
+            "settlement_maturity": settlement_maturity,
             "readiness": readiness.model_dump(mode="json"),
             "last_readiness_snapshot": latest_snapshot.payload if latest_snapshot is not None else None,
             "top_missing_data": readiness.missing_indicators,
+            "top_blockers": top_blockers,
+            "next_actions": next_actions,
         }
 
     async def build_dataset(self, request: TrainingBuildRequest) -> dict[str, Any]:
@@ -243,6 +293,30 @@ class TrainingCorpusService:
                 await repo.create_training_readiness_snapshot(readiness)
                 await session.commit()
         return readiness
+
+    async def get_settlement_focus_summary(self, *, limit: int = SETTLEMENT_BACKLOG_PREVIEW_LIMIT) -> dict[str, Any]:
+        request = TrainingBuildRequest(
+            mode="room-bundles",
+            limit=self.settings.training_status_room_limit,
+            days=self.settings.training_window_days,
+            good_research_only=False,
+            quality_cleaned_only=False,
+        )
+        bundles = await self._selected_bundles(request)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            settlement_events = await repo.list_exchange_events(
+                stream_name="reconcile",
+                event_type="settlements",
+                limit=200,
+            )
+            await session.commit()
+        return self._settlement_focus_summary_from_bundles(
+            bundles,
+            settlement_events=settlement_events,
+            now=datetime.now(UTC),
+            limit=limit,
+        )
 
     async def research_audit(self, *, limit: int = 100) -> list[ResearchAuditIssue]:
         discoveries = await self.discovery_service.discover_configured_markets()
@@ -963,6 +1037,284 @@ class TrainingCorpusService:
             "max_recent_per_market": self.settings.training_campaign_max_recent_per_market,
             "daemon_reconcile_interval_seconds": self.settings.daemon_reconcile_interval_seconds,
         }
+
+    def _recent_quality_debt(
+        self,
+        bundles: list[TrainingRoomBundle],
+        *,
+        window_hours: int,
+        now: datetime,
+    ) -> dict[str, int]:
+        cutoff = now - timedelta(hours=window_hours)
+        recent_audits = [
+            self._bundle_strategy_audit(bundle)
+            for bundle in bundles
+            if (created_at := self._room_created_at(bundle)) is not None and created_at >= cutoff
+        ]
+        return {
+            "recent_stale_mismatch_count": sum(1 for audit in recent_audits if audit.stale_data_mismatch),
+            "recent_missed_stand_down_count": sum(1 for audit in recent_audits if audit.missed_stand_down),
+            "recent_weak_resolved_trade_count": sum(
+                1
+                for audit in recent_audits
+                if audit.trade_quality == "weak_trade"
+                and audit.resolution_state in {WeatherResolutionState.LOCKED_NO.value, WeatherResolutionState.LOCKED_YES.value}
+            ),
+        }
+
+    def _cleaned_trainable_share_by_day(self, bundles: list[TrainingRoomBundle]) -> dict[str, dict[str, float | int]]:
+        by_day: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "trainable": 0})
+        for bundle in bundles:
+            created_at = self._room_created_at(bundle)
+            if created_at is None:
+                continue
+            day = created_at.date().isoformat()
+            by_day[day]["total"] += 1
+            if bundle.trainable_default is not False:
+                by_day[day]["trainable"] += 1
+        summary: dict[str, dict[str, float | int]] = {}
+        for day, counts in sorted(by_day.items()):
+            total = counts["total"]
+            trainable = counts["trainable"]
+            summary[day] = {
+                "total": total,
+                "trainable": trainable,
+                "share": round(trainable / total, 4) if total else 0.0,
+            }
+        return summary
+
+    def _recent_exclusion_memory(
+        self,
+        bundles: list[TrainingRoomBundle],
+        *,
+        window_hours: int,
+        now: datetime,
+    ) -> dict[str, Any]:
+        cutoff = now - timedelta(hours=window_hours)
+        by_market: dict[str, Counter[str]] = defaultdict(Counter)
+        for bundle in bundles:
+            if not bundle.exclude_reason:
+                continue
+            created_at = self._room_created_at(bundle)
+            if created_at is None or created_at < cutoff:
+                continue
+            by_market[bundle.room["market_ticker"]][bundle.exclude_reason] += 1
+
+        ranked_markets = sorted(
+            by_market.items(),
+            key=lambda item: (-sum(item[1].values()), item[0]),
+        )
+        return {
+            "window_hours": window_hours,
+            "by_reason": dict(
+                Counter(
+                    reason
+                    for reason_counts in by_market.values()
+                    for reason, count in reason_counts.items()
+                    for _ in range(count)
+                ).most_common()
+            ),
+            "by_market": [
+                {
+                    "market_ticker": market_ticker,
+                    "count": sum(reason_counts.values()),
+                    "reasons": dict(reason_counts.most_common()),
+                }
+                for market_ticker, reason_counts in ranked_markets[:5]
+            ],
+        }
+
+    def _settlement_focus_summary_from_bundles(
+        self,
+        bundles: list[TrainingRoomBundle],
+        *,
+        settlement_events: list[Any],
+        now: datetime,
+        limit: int,
+    ) -> dict[str, Any]:
+        backlog: list[dict[str, Any]] = []
+        backlog_by_market = Counter()
+        backlog_by_day = Counter()
+        status_counts = Counter()
+
+        for bundle in bundles:
+            if bundle.outcome.settlement_seen:
+                continue
+            created_at = self._room_created_at(bundle)
+            close_at = self._bundle_close_at(bundle)
+            status = self._settlement_backlog_status(close_at, now=now)
+            entry = {
+                "room_id": bundle.room["id"],
+                "market_ticker": bundle.room["market_ticker"],
+                "created_at": created_at.isoformat() if created_at is not None else None,
+                "age_seconds": int((now - created_at).total_seconds()) if created_at is not None else None,
+                "close_at": close_at.isoformat() if close_at is not None else None,
+                "status": status,
+                "blocked_by": bundle.outcome.blocked_by,
+                "exclude_reason": bundle.exclude_reason,
+            }
+            backlog.append(entry)
+            backlog_by_market[entry["market_ticker"]] += 1
+            backlog_day = (close_at or created_at)
+            if backlog_day is not None:
+                backlog_by_day[backlog_day.date().isoformat()] += 1
+            status_counts[status] += 1
+
+        backlog.sort(
+            key=lambda item: (
+                -(item["age_seconds"] or -1),
+                item["close_at"] or "9999-12-31T23:59:59+00:00",
+                item["market_ticker"],
+            )
+        )
+        near_settlement_count = sum(
+            1 for entry in backlog if entry["status"] in {"near_settlement", "awaiting_settlement"}
+        )
+
+        settled_markets_by_window: dict[str, set[str]] = {"24h": set(), "7d": set()}
+        for event in settlement_events:
+            created_at = getattr(event, "created_at", None)
+            if created_at is None:
+                continue
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            else:
+                created_at = created_at.astimezone(UTC)
+            event_payload = getattr(event, "payload", {}) or {}
+            settlements = event_payload.get("settlements")
+            if not isinstance(settlements, list):
+                continue
+            if created_at >= now - timedelta(hours=24):
+                settled_markets_by_window["24h"].update(
+                    str(settlement.get("market_ticker") or settlement.get("ticker"))
+                    for settlement in settlements
+                    if isinstance(settlement, dict) and (settlement.get("market_ticker") or settlement.get("ticker"))
+                )
+            if created_at >= now - timedelta(days=7):
+                settled_markets_by_window["7d"].update(
+                    str(settlement.get("market_ticker") or settlement.get("ticker"))
+                    for settlement in settlements
+                    if isinstance(settlement, dict) and (settlement.get("market_ticker") or settlement.get("ticker"))
+                )
+
+        settled_label_velocity = {
+            window: sum(
+                1
+                for bundle in bundles
+                if bundle.outcome.settlement_seen and bundle.room["market_ticker"] in markets
+            )
+            for window, markets in settled_markets_by_window.items()
+        }
+
+        return {
+            "unsettled_count": len(backlog),
+            "near_settlement_count": near_settlement_count,
+            "status_counts": dict(status_counts.most_common()),
+            "backlog_by_market": dict(backlog_by_market.most_common()),
+            "backlog_by_day": dict(sorted(backlog_by_day.items())),
+            "settled_label_velocity": settled_label_velocity,
+            "backlog": backlog[:limit],
+        }
+
+    @staticmethod
+    def _bundle_close_at(bundle: TrainingRoomBundle) -> datetime | None:
+        close_ts = None
+        market = (bundle.market_snapshot or {}).get("market", bundle.market_snapshot or {})
+        if isinstance(market, dict):
+            close_ts = market.get("close_ts")
+        if close_ts in (None, "") and isinstance(bundle.campaign, dict):
+            close_ts = bundle.campaign.get("close_ts")
+            if close_ts in (None, ""):
+                payload = bundle.campaign.get("payload") or {}
+                if isinstance(payload, dict):
+                    close_ts = payload.get("close_ts")
+        if close_ts in (None, ""):
+            return TrainingCorpusService._ticker_close_at(bundle.room.get("market_ticker"))
+        try:
+            return datetime.fromtimestamp(int(close_ts), tz=UTC)
+        except (TypeError, ValueError, OSError):
+            return TrainingCorpusService._ticker_close_at(bundle.room.get("market_ticker"))
+
+    @staticmethod
+    def _ticker_close_at(market_ticker: Any) -> datetime | None:
+        if not isinstance(market_ticker, str):
+            return None
+        parts = market_ticker.split("-")
+        if len(parts) < 3:
+            return None
+        date_token = parts[1]
+        if len(date_token) != 7:
+            return None
+        normalized = f"{date_token[:2]}{date_token[2:5].title()}{date_token[5:]}"
+        try:
+            parsed = datetime.strptime(normalized, "%y%b%d")
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=UTC, hour=23, minute=59, second=59)
+
+    @staticmethod
+    def _settlement_backlog_status(close_at: datetime | None, *, now: datetime) -> str:
+        if close_at is None:
+            return "missing_close_metadata"
+        seconds_to_close = int((close_at - now).total_seconds())
+        if seconds_to_close > SETTLEMENT_NEAR_SECONDS:
+            return "awaiting_close"
+        if seconds_to_close > 0:
+            return "near_settlement"
+        if abs(seconds_to_close) <= SETTLEMENT_GAP_GRACE_SECONDS:
+            return "awaiting_settlement"
+        return "possible_ingestion_gap"
+
+    @staticmethod
+    def _top_blockers(
+        *,
+        readiness: TrainingReadiness,
+        quality_debt_summary: dict[str, Any],
+        settlement_maturity: dict[str, Any],
+        recent_exclusion_memory: dict[str, Any],
+    ) -> list[str]:
+        blockers = list(readiness.missing_indicators)
+        if quality_debt_summary.get("recent_stale_mismatch_count"):
+            blockers.append(f"{quality_debt_summary['recent_stale_mismatch_count']} recent stale-data mismatches")
+        if settlement_maturity.get("status_counts", {}).get("possible_ingestion_gap"):
+            blockers.append(
+                f"{settlement_maturity['status_counts']['possible_ingestion_gap']} unsettled rooms look like ingestion gaps"
+            )
+        top_market = ((recent_exclusion_memory.get("by_market") or [None])[0]) or None
+        if top_market is not None:
+            blockers.append(f"repeat exclusions on {top_market['market_ticker']}")
+        deduped: list[str] = []
+        for blocker in blockers:
+            if blocker not in deduped:
+                deduped.append(blocker)
+        return deduped[:5]
+
+    @staticmethod
+    def _next_actions(
+        *,
+        readiness: TrainingReadiness,
+        unsettled_count: int,
+        settlement_maturity: dict[str, Any],
+        quality_debt_summary: dict[str, Any],
+        recent_exclusion_memory: dict[str, Any],
+    ) -> list[str]:
+        actions: list[str] = []
+        if "not enough settled rooms" in readiness.missing_indicators and unsettled_count:
+            actions.append(
+                f"Keep the daemon and reconciliation running; {unsettled_count} complete rooms are still waiting on settlement labels."
+            )
+        near_settlement_count = int(settlement_maturity.get("near_settlement_count") or 0)
+        if near_settlement_count:
+            actions.append(f"Watch the {near_settlement_count} rooms nearest settlement for the next label wave.")
+        if quality_debt_summary.get("recent_stale_mismatch_count"):
+            actions.append("Review recent stale-data mismatches and keep repeat offenders out of the clean corpus slice.")
+        repeat_markets = recent_exclusion_memory.get("by_market") or []
+        if repeat_markets:
+            top_markets = ", ".join(item["market_ticker"] for item in repeat_markets[:3])
+            actions.append(f"Temporarily deprioritize repeat-exclusion markets: {top_markets}.")
+        if not actions:
+            actions.append("Corpus looks healthy; keep collecting unresolved structured weather rooms.")
+        return actions[:4]
 
     @staticmethod
     def _rate(matches: list[float], *, total: int) -> float:

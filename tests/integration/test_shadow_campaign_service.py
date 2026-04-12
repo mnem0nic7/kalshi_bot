@@ -7,7 +7,7 @@ import pytest
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import RoomStage
-from kalshi_bot.core.schemas import ShadowCampaignRequest, RoomCreate
+from kalshi_bot.core.schemas import ShadowCampaignRequest, RoomCreate, StrategyAuditResult
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.agent_packs import AgentPackService
@@ -236,5 +236,119 @@ async def test_shadow_campaign_service_prefers_soon_to_settle_markets_and_record
     assert results[0].market_ticker == "WX-SOON"
     assert campaigns[0].payload["market_ticker"] == "WX-SOON"
     assert campaigns[0].payload["settlement_urgency_bucket"] == "closing_soon"
+    assert campaigns[0].payload["close_ts"] == discoveries[0].close_ts
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shadow_campaign_service_deprioritizes_repeat_exclusion_markets(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/shadow-campaign-exclusions.db",
+        app_shadow_mode=True,
+        app_enable_kill_switch=True,
+        training_campaign_cooldown_seconds=0,
+        training_campaign_max_recent_per_market=10,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    mappings = [
+        WeatherMarketMapping(
+            market_ticker="WX-CLEAN",
+            market_type="weather",
+            station_id="KNYC",
+            location_name="NYC",
+            latitude=40.0,
+            longitude=-73.0,
+            threshold_f=80,
+        ),
+        WeatherMarketMapping(
+            market_ticker="WX-EXCLUDED",
+            market_type="weather",
+            station_id="KORD",
+            location_name="Chicago",
+            latitude=41.0,
+            longitude=-87.0,
+            threshold_f=80,
+        ),
+    ]
+    discoveries = [
+        _discovery(mappings[0], bid="0.54", ask="0.56", no_ask="0.45"),
+        _discovery(mappings[1], bid="0.54", ask="0.56", no_ask="0.45"),
+    ]
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue")
+        excluded_room = await repo.create_room(
+            RoomCreate(name="excluded", market_ticker="WX-EXCLUDED"),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=True,
+            kalshi_env=settings.kalshi_env,
+        )
+        await repo.update_room_stage(excluded_room.id, RoomStage.COMPLETE)
+        excluded_audit = StrategyAuditResult(
+            room_id=excluded_room.id,
+            market_ticker="WX-EXCLUDED",
+            thesis_correctness="correct",
+            trade_quality="weak_trade",
+            block_correctness="correct_block",
+            audit_source="live_forward",
+            audit_version="weather-quality-v1",
+            trainable_default=False,
+            exclude_reason="stale_data_mismatch",
+            quality_warnings=["stale_data_mismatch"],
+        )
+        await repo.upsert_room_strategy_audit(
+            room_id=excluded_audit.room_id,
+            market_ticker=excluded_audit.market_ticker,
+            audit_source=excluded_audit.audit_source or "live_forward",
+            audit_version=excluded_audit.audit_version or "weather-quality-v1",
+            thesis_correctness=excluded_audit.thesis_correctness,
+            trade_quality=excluded_audit.trade_quality,
+            block_correctness=excluded_audit.block_correctness,
+            missed_stand_down=excluded_audit.missed_stand_down,
+            stale_data_mismatch=excluded_audit.stale_data_mismatch,
+            effective_freshness_agreement=excluded_audit.effective_freshness_agreement,
+            resolution_state=excluded_audit.resolution_state,
+            eligibility_passed=excluded_audit.eligibility_passed,
+            stand_down_reason=excluded_audit.stand_down_reason,
+            trainable_default=excluded_audit.trainable_default,
+            exclude_reason=excluded_audit.exclude_reason,
+            quality_warnings=excluded_audit.quality_warnings,
+            payload=excluded_audit.model_dump(mode="json"),
+        )
+        await session.commit()
+
+    supervisor = FakeSupervisor()
+    shadow_service = ShadowTrainingService(
+        settings,
+        session_factory,
+        FakeDiscoveryService(discoveries),  # type: ignore[arg-type]
+        AgentPackService(settings),
+        supervisor,
+    )
+    campaign_service = ShadowCampaignService(
+        settings,
+        session_factory,
+        FakeDiscoveryService(discoveries),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        shadow_service,
+    )
+
+    results = await campaign_service.run(ShadowCampaignRequest(limit=1, reason="exclusion_memory"))
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        campaigns = await repo.list_room_campaigns(limit=10)
+        await session.commit()
+
+    assert len(results) == 1
+    assert results[0].market_ticker == "WX-CLEAN"
+    assert campaigns[0].payload["market_ticker"] == "WX-CLEAN"
+    assert campaigns[0].payload["recent_exclusion_count"] == 0
 
     await engine.dispose()

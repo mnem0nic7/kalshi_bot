@@ -10,6 +10,7 @@ Multi-agent Kalshi weather trading platform with a visible control room, determi
 
 For training prep and dataset exports, use [docs/training.md](docs/training.md).
 For Gemini runtime routing, agent packs, and daily self-improvement operations, use [docs/self_improve.md](docs/self_improve.md).
+For the plain-English operator walkthrough, use [docs/faq.md](docs/faq.md) or open `/faq` in the control room.
 
 ## Quick start
 

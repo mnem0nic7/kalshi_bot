@@ -14,11 +14,34 @@ body {
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.header-nav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
 .brand {
   color: #f9d77e;
   text-decoration: none;
   font-weight: 700;
   letter-spacing: 0.04em;
+}
+
+.header-links {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.header-links a {
+  color: #dfe8f5;
+  text-decoration: none;
+  font-size: 0.95rem;
+}
+
+.header-links a:hover {
+  color: #f9d77e;
 }
 
 .shell-main {
@@ -35,6 +58,10 @@ body {
   border-radius: 16px;
   padding: 1rem;
   backdrop-filter: blur(12px);
+}
+
+.panel a {
+  color: #f9d77e;
 }
 
 .room-grid {
@@ -130,6 +157,45 @@ textarea {
 .transcript {
   display: grid;
   gap: 0.75rem;
+}
+
+.faq-section {
+  display: grid;
+  gap: 1rem;
+}
+
+.faq-item {
+  display: grid;
+  gap: 0.6rem;
+  padding: 1rem;
+  border-radius: 14px;
+  background: rgba(6, 13, 24, 0.45);
+}
+
+.faq-item h3,
+.faq-section h2 {
+  margin: 0;
+}
+
+.faq-item p,
+.faq-item ul {
+  margin: 0;
+  color: #d9e2ef;
+}
+
+.faq-item ul {
+  padding-left: 1.2rem;
+}
+
+.faq-read-more {
+  font-size: 0.95rem;
+  color: #b7c4d7;
+}
+
+.metric-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
 @media (max-width: 700px) {

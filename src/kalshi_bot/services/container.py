@@ -154,6 +154,7 @@ class AppContainer:
             shadow_training_service,
             shadow_campaign_service,
             self_improve_service,
+            training_corpus_service,
         )
         container = cls(
             settings=settings,

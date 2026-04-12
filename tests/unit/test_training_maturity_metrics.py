@@ -80,3 +80,44 @@ def test_training_corpus_partitions_active_and_legacy_failure_counts() -> None:
         "market lookup failures": 1,
         "weather source failures": 1,
     }
+
+
+def test_training_corpus_settlement_backlog_statuses() -> None:
+    now = datetime(2026, 4, 12, 12, 0, tzinfo=UTC)
+
+    assert TrainingCorpusService._settlement_backlog_status(None, now=now) == "missing_close_metadata"
+    assert (
+        TrainingCorpusService._settlement_backlog_status(
+            now + timedelta(hours=8),
+            now=now,
+        )
+        == "awaiting_close"
+    )
+    assert (
+        TrainingCorpusService._settlement_backlog_status(
+            now + timedelta(hours=2),
+            now=now,
+        )
+        == "near_settlement"
+    )
+    assert (
+        TrainingCorpusService._settlement_backlog_status(
+            now - timedelta(minutes=30),
+            now=now,
+        )
+        == "awaiting_settlement"
+    )
+    assert (
+        TrainingCorpusService._settlement_backlog_status(
+            now - timedelta(hours=3),
+            now=now,
+        )
+        == "possible_ingestion_gap"
+    )
+
+
+def test_training_corpus_ticker_close_at_fallback() -> None:
+    close_at = TrainingCorpusService._ticker_close_at("KXHIGHNY-26APR12-T70")
+
+    assert close_at is not None
+    assert close_at == datetime(2026, 4, 12, 23, 59, 59, tzinfo=UTC)

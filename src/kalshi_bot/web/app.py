@@ -28,6 +28,7 @@ from kalshi_bot.core.schemas import (
 )
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.container import AppContainer
+from kalshi_bot.web.faq_content import FAQ_SECTIONS
 from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
 
 templates = Jinja2Templates(directory="src/kalshi_bot/web/templates")
@@ -719,6 +720,18 @@ def create_app() -> FastAPI:
     @app.get("/metrics")
     async def metrics() -> PlainTextResponse:
         return PlainTextResponse(generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
+
+    @app.get("/faq", response_class=HTMLResponse)
+    async def faq(request: Request) -> HTMLResponse:
+        app_container = container(request)
+        return templates.TemplateResponse(
+            request,
+            "faq.html",
+            {
+                "faq_sections": FAQ_SECTIONS,
+                "settings": app_container.settings,
+            },
+        )
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:

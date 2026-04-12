@@ -25,6 +25,8 @@ class ShadowCampaignCandidate:
     difficulty_bucket: str
     outcome_bucket: str
     settlement_urgency_bucket: str
+    dossier_priority: int
+    recent_exclusion_count: int
     recent_count: int
     payload: dict[str, Any]
 
@@ -52,6 +54,11 @@ class ShadowCampaignService:
             repo = PlatformRepository(session)
             campaigns = await repo.list_room_campaigns(limit=1000)
             failed_runs = await repo.list_research_runs(status="failed", limit=500)
+            recent_audits = await repo.list_room_strategy_audits(
+                limit=1000,
+                since=lookback_cutoff,
+                trainable_default=False,
+            )
             recent_dossiers = {
                 record.market_ticker: record.payload
                 for record in await repo.list_research_dossiers(limit=500)
@@ -74,6 +81,12 @@ class ShadowCampaignService:
             if record.payload.get("market_ticker")
         }
         failure_count = Counter(run.market_ticker for run in failed_runs)
+        recent_exclusion_count = Counter(audit.market_ticker for audit in recent_audits if audit.exclude_reason)
+        recent_exclusion_reasons: dict[str, Counter[str]] = {}
+        for audit in recent_audits:
+            if not audit.exclude_reason:
+                continue
+            recent_exclusion_reasons.setdefault(audit.market_ticker, Counter())[audit.exclude_reason] += 1
 
         candidates: list[ShadowCampaignCandidate] = []
         for discovery in discoveries:
@@ -82,12 +95,15 @@ class ShadowCampaignService:
                 continue
             if discovery.status not in {"active", "open"}:
                 continue
+            if not discovery.can_trade:
+                continue
             if active_rooms.get(mapping.market_ticker) is not None:
                 continue
             if failure_count[mapping.market_ticker] >= 3 and mapping.market_ticker not in recent_dossiers:
                 continue
             dossier_payload = recent_dossiers.get(mapping.market_ticker)
             signal = None
+            dossier_priority = 1
             if dossier_payload is not None:
                 try:
                     dossier_model = ResearchDossier.model_validate(dossier_payload)
@@ -97,6 +113,7 @@ class ShadowCampaignService:
                     signal = self.research_coordinator.build_signal_from_dossier(dossier_model, discovery.raw)
                     if signal.resolution_state != WeatherResolutionState.UNRESOLVED:
                         continue
+                    dossier_priority = 0
                 except Exception:
                     signal = None
             last_seen = market_last_seen.get(mapping.market_ticker)
@@ -111,6 +128,11 @@ class ShadowCampaignService:
                     recent_count=market_recent_count[mapping.market_ticker],
                     now=now,
                     signal=signal,
+                    dossier_priority=dossier_priority,
+                    recent_exclusion_count=recent_exclusion_count[mapping.market_ticker],
+                    recent_exclusion_reasons=dict(
+                        recent_exclusion_reasons.get(mapping.market_ticker, Counter()).most_common()
+                    ),
                 )
             )
 
@@ -156,6 +178,8 @@ class ShadowCampaignService:
             remaining.sort(
                 key=lambda item: (
                     item.recent_count,
+                    item.recent_exclusion_count,
+                    item.dossier_priority,
                     self._urgency_rank(item.settlement_urgency_bucket),
                     selected_city[item.city_bucket],
                     selected_regime[item.market_regime_bucket],
@@ -179,6 +203,9 @@ class ShadowCampaignService:
         recent_count: int,
         now: datetime,
         signal: Any = None,
+        dossier_priority: int = 1,
+        recent_exclusion_count: int = 0,
+        recent_exclusion_reasons: dict[str, int] | None = None,
     ) -> ShadowCampaignCandidate:
         mapping = discovery.mapping
         fair_yes = self._decimal_or_none(((dossier or {}).get("trader_context") or {}).get("fair_yes_dollars"))
@@ -205,6 +232,10 @@ class ShadowCampaignService:
             "can_trade": discovery.can_trade,
             "notes": discovery.notes,
             "recent_count": recent_count,
+            "close_ts": discovery.close_ts,
+            "has_fresh_dossier": dossier_priority == 0,
+            "recent_exclusion_count": recent_exclusion_count,
+            "recent_exclusion_reasons": recent_exclusion_reasons or {},
         }
         return ShadowCampaignCandidate(
             market_ticker=mapping.market_ticker,
@@ -213,6 +244,8 @@ class ShadowCampaignService:
             difficulty_bucket=difficulty_bucket,
             outcome_bucket=outcome_bucket,
             settlement_urgency_bucket=settlement_urgency_bucket,
+            dossier_priority=dossier_priority,
+            recent_exclusion_count=recent_exclusion_count,
             recent_count=recent_count,
             payload=payload,
         )
