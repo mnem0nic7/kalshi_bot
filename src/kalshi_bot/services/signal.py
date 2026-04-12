@@ -12,6 +12,8 @@ from kalshi_bot.core.schemas import ResearchFreshness, TradeEligibilityVerdict
 from kalshi_bot.weather.models import WeatherMarketMapping
 from kalshi_bot.weather.scoring import WeatherSignalSnapshot, score_weather_market
 
+NO_TRADE_SUMMARY_SENTENCE = "No taker trade clears the configured edge threshold."
+
 
 @dataclass(slots=True)
 class StrategySignal:
@@ -46,6 +48,74 @@ def market_spread_bps(market_snapshot: dict[str, Any]) -> int | None:
     return int(((yes_ask - yes_bid) * Decimal("10000")).to_integral_value())
 
 
+def market_quotes(market_snapshot: dict[str, Any]) -> dict[str, Decimal | None]:
+    market = market_snapshot.get("market", market_snapshot)
+    return {
+        "yes_bid": quantize_price(market.get("yes_bid_dollars")) if market.get("yes_bid_dollars") is not None else None,
+        "yes_ask": quantize_price(market.get("yes_ask_dollars")) if market.get("yes_ask_dollars") is not None else None,
+        "no_ask": quantize_price(market.get("no_ask_dollars")) if market.get("no_ask_dollars") is not None else None,
+    }
+
+
+def base_strategy_summary(summary: str) -> str:
+    cleaned = summary.strip()
+    for marker in (
+        " Recommend ",
+        f" {NO_TRADE_SUMMARY_SENTENCE}",
+        " Market spread is too wide for the base strategy.",
+        " Order book is effectively broken",
+        " No actionable edge remains after applying the quality buffer to current quotes.",
+        " Stand down:",
+    ):
+        marker_index = cleaned.find(marker)
+        if marker_index != -1:
+            cleaned = cleaned[:marker_index].rstrip(" .")
+    return cleaned.rstrip(".")
+
+
+def non_trade_market_reason(
+    market_snapshot: dict[str, Any],
+    *,
+    spread_limit_bps: int,
+) -> tuple[StandDownReason, str]:
+    quotes = market_quotes(market_snapshot)
+    yes_bid = quotes["yes_bid"]
+    yes_ask = quotes["yes_ask"]
+    no_ask = quotes["no_ask"]
+    spread_bps = market_spread_bps(market_snapshot)
+
+    if yes_ask is None or no_ask is None:
+        return (
+            StandDownReason.BOOK_EFFECTIVELY_BROKEN,
+            "Order book is effectively broken because one or more taker quotes are missing.",
+        )
+
+    if (
+        (yes_ask >= Decimal("0.9900") and no_ask >= Decimal("0.9400"))
+        or (no_ask >= Decimal("0.9900") and yes_ask >= Decimal("0.9400"))
+        or (spread_bps is not None and spread_bps >= 9000)
+        or (yes_bid is not None and yes_bid <= Decimal("0.0100") and yes_ask >= Decimal("0.9900") and no_ask >= Decimal("0.9400"))
+    ):
+        return (
+            StandDownReason.BOOK_EFFECTIVELY_BROKEN,
+            (
+                f"Order book is effectively broken at current quotes "
+                f"(yes bid {yes_bid or 'n/a'}, yes ask {yes_ask}, no ask {no_ask})."
+            ),
+        )
+
+    if spread_bps is not None and spread_bps > spread_limit_bps:
+        return (
+            StandDownReason.SPREAD_TOO_WIDE,
+            f"Market spread {spread_bps}bps is too wide for the base strategy.",
+        )
+
+    return (
+        StandDownReason.NO_ACTIONABLE_EDGE,
+        "No actionable edge remains after applying the quality buffer to current quotes.",
+    )
+
+
 def remaining_payout_dollars(side: ContractSide, yes_price_dollars: Decimal) -> Decimal:
     if side == ContractSide.YES:
         return quantize_price(Decimal("1.0000") - yes_price_dollars)
@@ -70,6 +140,10 @@ def evaluate_trade_eligibility(
     spread_bps = market_spread_bps(market_snapshot)
     remaining_payout: Decimal | None = None
     edge_after_quality_buffer_bps = signal.edge_bps - settings.strategy_quality_edge_buffer_bps
+    no_trade_reason, no_trade_text = non_trade_market_reason(
+        market_snapshot,
+        spread_limit_bps=thresholds.trigger_max_spread_bps,
+    )
 
     strategy_mode = signal.strategy_mode
     if signal.resolution_state != WeatherResolutionState.UNRESOLVED:
@@ -87,8 +161,8 @@ def evaluate_trade_eligibility(
         reasons.append("Contract is already resolved by observed weather state.")
         stand_down_reason = StandDownReason.RESOLVED_CONTRACT
     elif signal.recommended_action is None or signal.recommended_side is None or signal.target_yes_price_dollars is None:
-        reasons.append("Signal did not produce an actionable order after weather pricing.")
-        stand_down_reason = StandDownReason.INSUFFICIENT_EDGE_QUALITY
+        reasons.append(no_trade_text)
+        stand_down_reason = no_trade_reason
     else:
         remaining_payout = remaining_payout_dollars(signal.recommended_side, signal.target_yes_price_dollars)
         if remaining_payout <= (Decimal(settings.strategy_min_remaining_payout_bps) / Decimal("10000")):
@@ -97,6 +171,9 @@ def evaluate_trade_eligibility(
                 f"{Decimal(settings.strategy_min_remaining_payout_bps) / Decimal('10000'):.4f}."
             )
             stand_down_reason = StandDownReason.INSUFFICIENT_REMAINING_PAYOUT
+        elif no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
+            reasons.append(no_trade_text)
+            stand_down_reason = no_trade_reason
         elif spread_bps is not None and spread_bps > thresholds.trigger_max_spread_bps:
             reasons.append(
                 f"Market spread {spread_bps}bps exceeds configured maximum of {thresholds.trigger_max_spread_bps}bps."
@@ -104,10 +181,10 @@ def evaluate_trade_eligibility(
             stand_down_reason = StandDownReason.SPREAD_TOO_WIDE
         elif edge_after_quality_buffer_bps < thresholds.risk_min_edge_bps:
             reasons.append(
-                f"Edge after quality buffer is {edge_after_quality_buffer_bps}bps, below the configured minimum "
-                f"of {thresholds.risk_min_edge_bps}bps."
+                f"No actionable edge remains after the quality buffer: {edge_after_quality_buffer_bps}bps versus "
+                f"required {thresholds.risk_min_edge_bps}bps."
             )
-            stand_down_reason = StandDownReason.INSUFFICIENT_EDGE_QUALITY
+            stand_down_reason = StandDownReason.NO_ACTIONABLE_EDGE
 
     if stand_down_reason is not None and strategy_mode == StrategyMode.DIRECTIONAL_UNRESOLVED:
         strategy_mode = StrategyMode.LATE_DAY_AVOID
@@ -183,7 +260,16 @@ class WeatherSignalEngine:
                 f"at yes price {target_yes} with edge {edge_bps} bps."
             )
         else:
-            summary = f"{summary} No taker trade clears the configured edge threshold."
+            no_trade_reason, no_trade_text = non_trade_market_reason(
+                market_snapshot,
+                spread_limit_bps=self.settings.trigger_max_spread_bps,
+            )
+            if no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
+                summary = f"{summary} {no_trade_text}"
+            elif no_trade_reason == StandDownReason.SPREAD_TOO_WIDE:
+                summary = f"{summary} Market spread is too wide for the base strategy."
+            else:
+                summary = f"{summary} {NO_TRADE_SUMMARY_SENTENCE}"
 
         return StrategySignal(
             fair_yes_dollars=weather.fair_yes_dollars,

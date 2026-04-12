@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import AgentRole, ContractSide, StrategyMode, TradeAction, WeatherResolutionState
+from kalshi_bot.core.enums import AgentRole, ContractSide, StandDownReason, StrategyMode, TradeAction, WeatherResolutionState
 from kalshi_bot.core.fixed_point import as_decimal, quantize_price
 from kalshi_bot.core.schemas import (
     ResearchClaim,
@@ -31,7 +31,7 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.services.agent_packs import AgentPackService
-from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine
+from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine, base_strategy_summary, non_trade_market_reason
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
 from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
@@ -402,12 +402,21 @@ class ResearchCoordinator:
         elif bid_yes is not None and fair_yes - bid_yes >= min_edge:
             edge_bps = int(((fair_yes - bid_yes) * Decimal("10000")).to_integral_value())
 
-        summary = dossier.trader_context.thesis
+        summary = base_strategy_summary(dossier.trader_context.thesis)
         if recommendation_action is None or recommendation_side is None or target_yes is None:
-            summary = f"{summary} No taker trade clears the configured edge threshold."
+            no_trade_reason, no_trade_text = non_trade_market_reason(
+                market_response,
+                spread_limit_bps=self.settings.trigger_max_spread_bps,
+            )
+            if no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
+                summary = f"{summary}. {no_trade_text}"
+            elif no_trade_reason == StandDownReason.SPREAD_TOO_WIDE:
+                summary = f"{summary}. Market spread is too wide for the base strategy."
+            else:
+                summary = f"{summary}. No taker trade clears the configured edge threshold."
         else:
             summary = (
-                f"{summary} Recommend {recommendation_action.value} {recommendation_side.value} at yes price {target_yes} "
+                f"{summary}. Recommend {recommendation_action.value} {recommendation_side.value} at yes price {target_yes} "
                 f"with edge {edge_bps} bps."
             )
         return StrategySignal(

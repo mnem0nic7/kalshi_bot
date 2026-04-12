@@ -291,6 +291,8 @@
     const decision = ((state.snapshot || {}).analytics || {}).decision || {};
     const cards = [
       buildMetricCard("Trade Proposed", decision.trade_proposed ? "Yes" : "No"),
+      buildMetricCard("Blocked By", formatStage(decision.blocked_by || "n/a")),
+      buildMetricCard("Stand Down", formatStage(decision.stand_down_reason || "n/a")),
       buildMetricCard("Orders", formatInteger(decision.order_count || 0)),
       buildMetricCard("Fills", formatInteger(decision.fill_count || 0)),
       buildMetricCard("Latest Order", formatStage(decision.latest_order_status || "n/a")),

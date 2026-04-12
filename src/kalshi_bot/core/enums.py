@@ -68,8 +68,10 @@ class StandDownReason(StrEnum):
     RESEARCH_STALE = "research_stale"
     MARKET_STALE = "market_stale"
     RESOLVED_CONTRACT = "resolved_contract"
+    NO_ACTIONABLE_EDGE = "no_actionable_edge"
     INSUFFICIENT_EDGE_QUALITY = "insufficient_edge_quality"
     SPREAD_TOO_WIDE = "spread_too_wide"
+    BOOK_EFFECTIVELY_BROKEN = "book_effectively_broken"
     INSUFFICIENT_REMAINING_PAYOUT = "insufficient_remaining_payout"
 
 

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, StandDownReason, StrategyMode, TradeAction, WeatherResolutionState
 from kalshi_bot.core.schemas import ResearchFreshness
-from kalshi_bot.services.signal import StrategySignal, evaluate_trade_eligibility
+from kalshi_bot.services.signal import StrategySignal, base_strategy_summary, evaluate_trade_eligibility
 from kalshi_bot.weather.scoring import WeatherSignalSnapshot
 
 
@@ -145,3 +145,106 @@ def test_trade_eligibility_blocks_wide_spread() -> None:
 
     assert verdict.eligible is False
     assert verdict.stand_down_reason == StandDownReason.SPREAD_TOO_WIDE
+
+
+def test_trade_eligibility_labels_broken_book_when_no_trade_quotes_are_extreme() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.6391"),
+        confidence=0.75,
+        edge_bps=0,
+        recommended_action=None,
+        recommended_side=None,
+        target_yes_price_dollars=None,
+        summary="broken book",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+    )
+    market_snapshot = {"market": {"yes_bid_dollars": "0.0400", "yes_ask_dollars": "1.0000", "no_ask_dollars": "0.9600"}}
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot=market_snapshot,
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.eligible is False
+    assert verdict.stand_down_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN
+
+
+def test_trade_eligibility_labels_wide_spread_when_no_trade_book_is_bad_but_not_broken() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.5200"),
+        confidence=0.75,
+        edge_bps=0,
+        recommended_action=None,
+        recommended_side=None,
+        target_yes_price_dollars=None,
+        summary="wide spread no trade",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+    )
+    market_snapshot = {"market": {"yes_bid_dollars": "0.2000", "yes_ask_dollars": "0.4500", "no_ask_dollars": "0.8000"}}
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot=market_snapshot,
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.eligible is False
+    assert verdict.stand_down_reason == StandDownReason.SPREAD_TOO_WIDE
+
+
+def test_trade_eligibility_labels_no_actionable_edge_when_book_is_normal_but_edge_isnt() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.5100"),
+        confidence=0.6,
+        edge_bps=0,
+        recommended_action=None,
+        recommended_side=None,
+        target_yes_price_dollars=None,
+        summary="no edge",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+    )
+    market_snapshot = {"market": {"yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5200", "no_ask_dollars": "0.4900"}}
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot=market_snapshot,
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.eligible is False
+    assert verdict.stand_down_reason == StandDownReason.NO_ACTIONABLE_EDGE
+
+
+def test_base_strategy_summary_strips_old_trade_suffixes() -> None:
+    summary = (
+        "Forecast high 86.0F versus threshold 84.0F implies fair yes near 0.6391 with confidence 0.77. "
+        "No taker trade clears the configured edge threshold. Stand down: Something else."
+    )
+
+    assert base_strategy_summary(summary) == (
+        "Forecast high 86.0F versus threshold 84.0F implies fair yes near 0.6391 with confidence 0.77"
+    )
+
+    broken_book_summary = (
+        "Forecast high 86.0F versus threshold 84.0F implies fair yes near 0.6391 with confidence 0.77. "
+        "Order book is effectively broken at current quotes (yes bid 0.0400, yes ask 1.0000, no ask 0.9600)."
+    )
+    assert base_strategy_summary(broken_book_summary) == (
+        "Forecast high 86.0F versus threshold 84.0F implies fair yes near 0.6391 with confidence 0.77"
+    )
