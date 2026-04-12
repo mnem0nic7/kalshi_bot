@@ -19,6 +19,7 @@ from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.execution import ExecutionService
+from kalshi_bot.services.historical_archive import append_weather_bundle_archive, weather_bundle_archive_metadata
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
@@ -137,6 +138,35 @@ class WorkflowSupervisor:
                 await repo.log_exchange_event("rest_market", "market_snapshot", market_response, market_ticker=room.market_ticker)
                 if mapping is not None and mapping.station_id is not None and weather_bundle is not None:
                     await repo.log_weather_event(mapping.station_id, "weather_bundle", weather_bundle)
+                    archive_record = append_weather_bundle_archive(
+                        self.settings,
+                        weather_bundle,
+                        source_id=f"room:{room.id}",
+                        archive_source="room_supervisor",
+                    )
+                    archive_meta = weather_bundle_archive_metadata(weather_bundle)
+                    if archive_meta is not None:
+                        await repo.upsert_historical_weather_snapshot(
+                            station_id=archive_meta["station_id"],
+                            series_ticker=archive_meta["series_ticker"],
+                            local_market_day=archive_meta["local_market_day"],
+                            asof_ts=archive_meta["asof_ts"],
+                            source_kind="archived_weather_bundle",
+                            source_id=f"room:{room.id}",
+                            source_hash=None,
+                            observation_ts=archive_meta["observation_ts"],
+                            forecast_updated_ts=archive_meta["forecast_updated_ts"],
+                            forecast_high_f=archive_meta["forecast_high_f"],
+                            current_temp_f=archive_meta["current_temp_f"],
+                            payload={
+                                **weather_bundle,
+                                "_archive": {
+                                    "archive_path": archive_record["archive_path"] if archive_record is not None else None,
+                                    "archive_source": "room_supervisor",
+                                    "source_id": f"room:{room.id}",
+                                },
+                            },
+                        )
                 market_state = await repo.upsert_market_state(
                     room.market_ticker,
                     snapshot=market,

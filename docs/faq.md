@@ -68,9 +68,9 @@ Read more: `docs/training.md`
 
 ## How does historical replay training work?
 
-Historical replay imports settled weather market-days, captured market snapshots, and point-in-time weather bundles, then rebuilds synthetic rooms using only data that existed at each replay checkpoint.
+Historical replay imports settled weather market-days, captured market snapshots, reconstructed checkpoint snapshots from Kalshi candlesticks, and point-in-time weather bundles from the bot’s archive plus captured raw events. It then rebuilds synthetic rooms using only data that existed at each replay checkpoint.
 
-Those replayed rooms are marked `historical_replay`, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files.
+Those replayed rooms are marked `historical_replay`, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files. If we do not have enough distinct full-coverage market-days yet, the Gemini export is marked draft-only instead of pretending it is ready to tune on.
 
 Read more: `docs/training.md`
 

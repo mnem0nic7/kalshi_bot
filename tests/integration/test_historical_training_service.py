@@ -164,6 +164,8 @@ def test_historical_status_api_and_build_route(tmp_path, monkeypatch) -> None:
         historical_status = client.get("/api/historical/status")
         assert historical_status.status_code == 200
         assert historical_status.json()["replayed_checkpoint_count"] == 1
+        assert "full_checkpoint_coverage_count" in historical_status.json()
+        assert "draft_training_ready" in historical_status.json()
 
         status_response = client.get("/api/status")
         assert status_response.status_code == 200
@@ -190,10 +192,13 @@ def test_historical_status_api_and_build_route(tmp_path, monkeypatch) -> None:
         assert build_response.status_code == 200
         payload = build_response.json()
         assert payload["build"]["room_count"] == 1
+        assert payload["build"]["draft_only"] is False
+        assert payload["build"]["training_ready"] is True
         lines = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         assert lines[0]["room_origin"] == "historical_replay"
         assert lines[0]["historical_provenance"]["local_market_day"] == "2026-04-10"
         assert lines[0]["settlement_label"]["crosscheck_status"] == "match"
+        assert lines[0]["draft_only"] is False
         assert historical_room_id == lines[0]["room"]["id"]
 
     get_settings.cache_clear()

@@ -362,6 +362,10 @@ class TrainingRoomBundle(BaseModel):
     fills: list[dict[str, Any]] = Field(default_factory=list)
     memory_note: dict[str, Any] | None = None
     historical_provenance: dict[str, Any] | None = None
+    market_source_kind: str | None = None
+    weather_source_kind: str | None = None
+    coverage_class: str | None = None
+    draft_only: bool = False
     replay_checkpoint_ts: datetime | None = None
     settlement: dict[str, Any] | None = None
     settlement_label: dict[str, Any] | None = None
@@ -484,6 +488,9 @@ class HistoricalTrainingBuildRequest(BaseModel):
     series: list[str] = Field(default_factory=list)
     quality_cleaned_only: bool = True
     include_pathology_examples: bool = False
+    require_full_checkpoints: bool = True
+    late_only_ok: bool = False
+    origins: list[str] = Field(default_factory=lambda: [RoomOrigin.HISTORICAL_REPLAY.value])
     output: str | None = None
 
 
@@ -510,7 +517,10 @@ class HistoricalProvenance(BaseModel):
     timezone_name: str
     market_snapshot_source_id: str | None = None
     weather_snapshot_source_id: str | None = None
+    market_source_kind: str | None = None
+    weather_source_kind: str | None = None
     settlement_label_id: str | None = None
+    coverage_class: str | None = None
     source_coverage: dict[str, Any] = Field(default_factory=dict)
 
 

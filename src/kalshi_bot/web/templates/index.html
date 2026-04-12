@@ -100,10 +100,15 @@
     <div class="room-card">
       <strong>Historical Corpus</strong>
       <span>imported market-days · {{ historical_status.imported_market_days }}</span>
+      <span>replayable market-days · {{ historical_status.replayable_market_day_count }}</span>
+      <span>full coverage days · {{ historical_status.full_checkpoint_coverage_count }}</span>
+      <span>late-only days · {{ historical_status.late_only_coverage_count }}</span>
       <span>imported markets · {{ historical_status.imported_market_count }}</span>
       <span>replayed checkpoints · {{ historical_status.replayed_checkpoint_count }}</span>
       <span>clean trainable · {{ historical_status.clean_historical_trainable_count }}</span>
       <span>settlement mismatches · {{ historical_status.settlement_mismatch_count }}</span>
+      <span>Gemini training ready · {{ historical_status.training_ready }}</span>
+      <span>draft only · {{ historical_status.draft_training_ready }}</span>
       {% if historical_status.origin_room_counts %}
       <span>origins · {{ historical_status.origin_room_counts }}</span>
       {% endif %}
@@ -122,11 +127,23 @@
       <strong>Historical Coverage Gaps</strong>
       <span>missing market snapshots · {{ historical_status.source_coverage_gaps.missing_market_snapshot_count }}</span>
       <span>missing weather snapshots · {{ historical_status.source_coverage_gaps.missing_weather_snapshot_count }}</span>
+      {% for reason, count in historical_status.missing_checkpoint_reason_counts.items() %}
+      <span>{{ reason }} · {{ count }}</span>
+      {% endfor %}
       {% for sample in historical_status.source_coverage_gaps.samples %}
       <span>{{ sample.market_ticker }} · {{ sample.checkpoint_label }} · {{ sample.gap }}</span>
       {% else %}
       <span>No historical coverage gaps sampled.</span>
       {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Historical Readiness</strong>
+      <span>training ready · {{ historical_status.historical_dataset_readiness.training_ready }}</span>
+      <span>draft only · {{ historical_status.historical_dataset_readiness.draft_only }}</span>
+      <span>full coverage market-days · {{ historical_status.historical_dataset_readiness.distinct_full_coverage_market_days }}</span>
+      <span>train split rooms · {{ historical_status.historical_dataset_readiness.split_counts.train }}</span>
+      <span>validation split rooms · {{ historical_status.historical_dataset_readiness.split_counts.validation }}</span>
+      <span>holdout split rooms · {{ historical_status.historical_dataset_readiness.split_counts.holdout }}</span>
     </div>
     <div class="room-card">
       <strong>Historical Import Runs</strong>
@@ -152,6 +169,14 @@
       <span>{{ item.market_ticker }} · {{ item.count }} · {{ item.reasons }}</span>
       {% else %}
       <span>No repeat exclusion markets in the current lookback window.</span>
+      {% endfor %}
+    </div>
+    <div class="room-card">
+      <strong>Historical Coverage Samples</strong>
+      {% for day in historical_status.market_day_coverage %}
+      <span>{{ day.market_ticker }} · {{ day.local_market_day }} · {{ day.coverage_class }}</span>
+      {% else %}
+      <span>No historical market-day coverage sampled yet.</span>
       {% endfor %}
     </div>
     <div class="room-card">

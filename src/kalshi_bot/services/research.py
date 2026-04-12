@@ -31,6 +31,7 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.services.agent_packs import AgentPackService
+from kalshi_bot.services.historical_archive import append_weather_bundle_archive, weather_bundle_archive_metadata
 from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine, base_strategy_summary, non_trade_market_reason
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
@@ -204,6 +205,37 @@ class ResearchCoordinator:
                 if mapping is not None and mapping.supports_structured_weather:
                     weather_bundle = await self.weather.build_market_snapshot(mapping)
                     await repo.log_weather_event(mapping.station_id, "research_weather_bundle", weather_bundle)
+                    archive_record = append_weather_bundle_archive(
+                        self.settings,
+                        weather_bundle,
+                        source_id=f"research:{run.id}",
+                        archive_source="research_refresh",
+                    )
+                    archive_meta = weather_bundle_archive_metadata(weather_bundle)
+                    if archive_meta is not None:
+                        await repo.upsert_historical_weather_snapshot(
+                            station_id=archive_meta["station_id"],
+                            series_ticker=archive_meta["series_ticker"],
+                            local_market_day=archive_meta["local_market_day"],
+                            asof_ts=archive_meta["asof_ts"],
+                            source_kind="archived_weather_bundle",
+                            source_id=f"research:{run.id}",
+                            source_hash=hashlib.sha1(
+                                json.dumps(weather_bundle, sort_keys=True, default=str).encode("utf-8")
+                            ).hexdigest()[:24],
+                            observation_ts=archive_meta["observation_ts"],
+                            forecast_updated_ts=archive_meta["forecast_updated_ts"],
+                            forecast_high_f=archive_meta["forecast_high_f"],
+                            current_temp_f=archive_meta["current_temp_f"],
+                            payload={
+                                **weather_bundle,
+                                "_archive": {
+                                    "archive_path": archive_record["archive_path"] if archive_record is not None else None,
+                                    "archive_source": "research_refresh",
+                                    "source_id": f"research:{run.id}",
+                                },
+                            },
+                        )
                     weather_signal = self.signal_engine.evaluate(
                         mapping,
                         market_response,

@@ -96,7 +96,24 @@ kalshi-bot-cli historical-replay weather \
 Inspect historical corpus status:
 
 ```bash
-kalshi-bot-cli historical-status
+kalshi-bot-cli historical-status --verbose
+```
+
+Backfill missing checkpoint coverage before replay:
+
+```bash
+kalshi-bot-cli historical-backfill market \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
+  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+
+kalshi-bot-cli historical-backfill weather-archive \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31 \
+  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+
+kalshi-bot-cli historical-archive capture --once \
+  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
 ```
 
 Export complete room bundles:
@@ -204,6 +221,8 @@ The split is chronological by local settlement day:
 - newest `15%` holdout
 
 All checkpoints from the same market-day stay together in one split.
+
+Gemini exports are historical-first by default and require full checkpoint coverage. If there are fewer than `3` distinct local market-days or no viable validation/holdout day, the build still succeeds but is marked `draft_only` in the manifest instead of pretending to be training-ready.
 
 Include non-complete rooms if you want failure or partial-workflow examples:
 

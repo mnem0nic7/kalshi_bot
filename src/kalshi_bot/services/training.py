@@ -89,6 +89,21 @@ class TrainingExportService:
                 if historical_replay is not None
                 else None
             ),
+            market_source_kind=(
+                ((historical_replay.payload or {}).get("historical_provenance") or {}).get("market_source_kind")
+                if historical_replay is not None
+                else None
+            ),
+            weather_source_kind=(
+                ((historical_replay.payload or {}).get("historical_provenance") or {}).get("weather_source_kind")
+                if historical_replay is not None
+                else None
+            ),
+            coverage_class=(
+                ((historical_replay.payload or {}).get("historical_provenance") or {}).get("coverage_class")
+                if historical_replay is not None
+                else None
+            ),
             replay_checkpoint_ts=(historical_replay.checkpoint_ts if historical_replay is not None else None),
             settlement=settlement,
             settlement_label=(self._settlement_label_dict(settlement_label) if settlement_label is not None else None),

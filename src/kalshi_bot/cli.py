@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 
 from kalshi_bot.config import get_settings
+from kalshi_bot.core.enums import RoomOrigin
 from kalshi_bot.core.schemas import HistoricalTrainingBuildRequest, RoomCreate, ShadowCampaignRequest, TrainingBuildRequest
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
@@ -169,6 +170,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     series=args.series or [],
                     quality_cleaned_only=args.quality_cleaned_only,
                     include_pathology_examples=args.include_pathology_examples,
+                    require_full_checkpoints=args.require_full_checkpoints,
+                    late_only_ok=args.late_only_ok,
+                    origins=args.origins or [RoomOrigin.HISTORICAL_REPLAY.value],
                     output=args.output,
                 )
                 print(json.dumps(await container.historical_training_service.build_historical_dataset(request), indent=2))
@@ -190,7 +194,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "historical-status":
-            print(json.dumps(await container.historical_training_service.get_status(), indent=2))
+            print(json.dumps(await container.historical_training_service.get_status(verbose=args.verbose), indent=2))
             return 0
 
         if args.command == "historical-import" and args.historical_kind == "weather":
@@ -208,6 +212,29 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 date_to=date.fromisoformat(args.date_to),
                 series=args.series or None,
             )
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.command == "historical-backfill" and args.historical_backfill_kind == "market":
+            result = await container.historical_training_service.backfill_market_checkpoints(
+                date_from=date.fromisoformat(args.date_from),
+                date_to=date.fromisoformat(args.date_to),
+                series=args.series or None,
+            )
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.command == "historical-backfill" and args.historical_backfill_kind == "weather-archive":
+            result = await container.historical_training_service.backfill_weather_archives(
+                date_from=date.fromisoformat(args.date_from),
+                date_to=date.fromisoformat(args.date_to),
+                series=args.series or None,
+            )
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.command == "historical-archive" and args.historical_archive_command == "capture":
+            result = await container.historical_training_service.capture_weather_archives_once(series=args.series or None)
             print(json.dumps(result, indent=2))
             return 0
 
@@ -512,18 +539,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     training_build.add_argument("--market-ticker", default=None)
     training_build.add_argument("--include-pathology-examples", action="store_true")
+    training_build.add_argument(
+        "--require-full-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    training_build.add_argument("--late-only-ok", action="store_true")
+    training_build.add_argument("--origins", nargs="*", default=None)
     training_build.add_argument("--output", default=None)
 
     training_build_list = subparsers.add_parser("training-build-list")
     training_build_list.add_argument("--limit", type=int, default=20)
 
     historical_status = subparsers.add_parser("historical-status")
+    historical_status.add_argument("--verbose", action="store_true")
 
     historical_import = subparsers.add_parser("historical-import")
     historical_import.add_argument("historical_kind", choices=["weather"])
     historical_import.add_argument("--date-from", required=True)
     historical_import.add_argument("--date-to", required=True)
     historical_import.add_argument("--series", nargs="*", default=None)
+
+    historical_backfill = subparsers.add_parser("historical-backfill")
+    historical_backfill_subparsers = historical_backfill.add_subparsers(dest="historical_backfill_kind", required=True)
+    historical_backfill_market = historical_backfill_subparsers.add_parser("market")
+    historical_backfill_market.add_argument("--date-from", required=True)
+    historical_backfill_market.add_argument("--date-to", required=True)
+    historical_backfill_market.add_argument("--series", nargs="*", default=None)
+    historical_backfill_weather = historical_backfill_subparsers.add_parser("weather-archive")
+    historical_backfill_weather.add_argument("--date-from", required=True)
+    historical_backfill_weather.add_argument("--date-to", required=True)
+    historical_backfill_weather.add_argument("--series", nargs="*", default=None)
+
+    historical_archive = subparsers.add_parser("historical-archive")
+    historical_archive_subparsers = historical_archive.add_subparsers(dest="historical_archive_command", required=True)
+    historical_archive_capture = historical_archive_subparsers.add_parser("capture")
+    historical_archive_capture.add_argument("--once", action="store_true")
+    historical_archive_capture.add_argument("--series", nargs="*", default=None)
 
     historical_replay = subparsers.add_parser("historical-replay")
     historical_replay.add_argument("historical_kind", choices=["weather"])

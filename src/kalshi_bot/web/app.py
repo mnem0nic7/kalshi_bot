@@ -646,9 +646,9 @@ def create_app() -> FastAPI:
         return JSONResponse(await app_container.training_corpus_service.build_dataset(payload))
 
     @app.get("/api/historical/status")
-    async def historical_status(request: Request) -> JSONResponse:
+    async def historical_status(request: Request, verbose: bool = False) -> JSONResponse:
         app_container = container(request)
-        return JSONResponse(await app_container.historical_training_service.get_status())
+        return JSONResponse(await app_container.historical_training_service.get_status(verbose=verbose))
 
     @app.post("/api/historical/import")
     async def historical_import(request: Request) -> JSONResponse:

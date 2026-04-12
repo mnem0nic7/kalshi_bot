@@ -8,7 +8,12 @@ import pytest
 
 from decimal import Decimal
 
-from kalshi_bot.services.historical_training import HistoricalBuildSplit, HistoricalTrainingService, _json_safe
+from kalshi_bot.services.historical_training import (
+    HistoricalBuildSplit,
+    HistoricalCheckpointSelection,
+    HistoricalTrainingService,
+    _json_safe,
+)
 from kalshi_bot.weather.mapping import WeatherSeriesTemplate
 from kalshi_bot.weather.models import WeatherMarketMapping
 
@@ -95,6 +100,49 @@ def test_historical_split_keeps_market_day_together() -> None:
     assert split_by_room["room-a"] == split_by_room["room-b"]
 
 
+def test_coverage_class_detects_full_and_late_only() -> None:
+    service = object.__new__(HistoricalTrainingService)
+
+    full = HistoricalTrainingService._coverage_class(
+        service,
+        [
+            HistoricalCheckpointSelection("c1", datetime(2026, 4, 10, 13, tzinfo=UTC), object(), object(), "captured_market_snapshot", "archived_weather_bundle", []),
+            HistoricalCheckpointSelection("c2", datetime(2026, 4, 10, 17, tzinfo=UTC), object(), object(), "captured_market_snapshot", "archived_weather_bundle", []),
+            HistoricalCheckpointSelection("c3", datetime(2026, 4, 10, 21, tzinfo=UTC), object(), object(), "captured_market_snapshot", "archived_weather_bundle", []),
+        ],
+    )
+    late_only = HistoricalTrainingService._coverage_class(
+        service,
+        [
+            HistoricalCheckpointSelection("c1", datetime(2026, 4, 10, 13, tzinfo=UTC), None, None, None, None, ["market_snapshot_missing"]),
+            HistoricalCheckpointSelection("c2", datetime(2026, 4, 10, 17, tzinfo=UTC), None, None, None, None, ["weather_snapshot_missing"]),
+            HistoricalCheckpointSelection("c3", datetime(2026, 4, 10, 21, tzinfo=UTC), object(), object(), "reconstructed_market_checkpoint", "archived_weather_bundle", []),
+        ],
+    )
+
+    assert full == HistoricalTrainingService.COVERAGE_FULL
+    assert late_only == HistoricalTrainingService.COVERAGE_LATE_ONLY
+
+
+def test_gemini_build_readiness_requires_multiple_market_days_and_splits() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    split = HistoricalBuildSplit(train=["room-a"], validation=[], holdout=[])
+    bundles = [
+        SimpleNamespace(historical_provenance={"local_market_day": "2026-04-10"}),
+        SimpleNamespace(historical_provenance={"local_market_day": "2026-04-10"}),
+    ]
+
+    training_ready, draft_only = HistoricalTrainingService._build_training_readiness(
+        service,
+        bundles,
+        split=split,
+        mode="gemini-finetune",
+    )
+
+    assert training_ready is False
+    assert draft_only is True
+
+
 def test_gemini_export_manifest_contains_boundaries_and_audit_stats(tmp_path) -> None:
     service = object.__new__(HistoricalTrainingService)
     output_dir = tmp_path / "gemini"
@@ -144,11 +192,15 @@ def test_gemini_export_manifest_contains_boundaries_and_audit_stats(tmp_path) ->
         records,
         bundles=bundles,
         split=split,
+        draft_only=True,
+        training_ready=False,
     )
 
     assert paths is not None
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["format_target"] == "gemini_vertex_chat_jsonl"
+    assert manifest["draft_only"] is True
+    assert manifest["training_ready"] is False
     assert manifest["split_boundaries"]["train_room_ids"] == ["room-a"]
     assert manifest["audit_stats"]["settlement_mismatch_count"] == 1
     assert manifest["audit_stats"]["exclusion_counts"]["stale_data_mismatch"] == 1
