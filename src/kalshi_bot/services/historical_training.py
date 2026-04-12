@@ -65,6 +65,20 @@ def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return _as_utc(value).isoformat() if _as_utc(value) is not None else None
+    return value
+
+
 def _market_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload.get("market", payload)
 
@@ -500,10 +514,10 @@ class HistoricalTrainingService:
                     crosscheck_status=crosscheck["status"],
                     crosscheck_high_f=crosscheck["daily_high_f"],
                     crosscheck_result=crosscheck["result"],
-                    payload={
+                    payload=_json_safe({
                         "market": market,
                         "crosscheck": crosscheck,
-                    },
+                    }),
                 )
             await session.commit()
         return {
@@ -1137,12 +1151,15 @@ class HistoricalTrainingService:
                 series_ticker=template.series_ticker,
                 min_close_ts=min_close_ts,
                 max_close_ts=max_close_ts,
-                status="settled,determined,closed",
                 limit=self.settings.historical_import_page_size,
                 cursor=cursor,
             )
             page = response.get("markets", [])
-            markets.extend(page)
+            for market in page:
+                status = str(market.get("status") or "").lower()
+                result = str(market.get("result") or "").lower()
+                if status in {"settled", "determined", "closed"} or result in {"yes", "no"}:
+                    markets.append(market)
             cursor = response.get("cursor")
             if not cursor or not page:
                 break

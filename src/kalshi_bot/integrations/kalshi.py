@@ -98,10 +98,19 @@ class KalshiClient:
         write: bool = False,
     ) -> dict[str, Any]:
         headers = self._auth_headers(method, path, write=write)
+        filtered_params = (
+            {
+                key: value
+                for key, value in params.items()
+                if value is not None and value != ""
+            }
+            if params is not None
+            else None
+        )
         response = await self.client.request(
             method=method,
             url=f"{self.settings.kalshi_rest_base_url}{path}",
-            params=params,
+            params=filtered_params,
             json=json,
             headers=headers,
         )
