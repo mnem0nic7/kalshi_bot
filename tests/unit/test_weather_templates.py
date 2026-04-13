@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherSeriesTemplate
 
@@ -70,3 +72,46 @@ def test_weather_directory_supports_and_resolves_series_template_market() -> Non
     assert resolved is not None
     assert resolved.market_ticker == "KXHIGHCHI-26APR11-T58"
     assert resolved.station_id == "KMDW"
+
+
+def test_example_weather_market_map_covers_all_current_high_temp_series() -> None:
+    directory = WeatherMarketDirectory.from_file(Path("docs/examples/weather_markets.example.yaml"))
+    series = {template.series_ticker for template in directory.templates()}
+
+    assert series == {
+        "KXHIGHAUS",
+        "KXHIGHCHI",
+        "KXHIGHDEN",
+        "KXHIGHLAX",
+        "KXHIGHMIA",
+        "KXHIGHNY",
+        "KXHIGHPHIL",
+        "KXHIGHTATL",
+        "KXHIGHTBOS",
+        "KXHIGHTDAL",
+        "KXHIGHTDC",
+        "KXHIGHTHOU",
+        "KXHIGHTLV",
+        "KXHIGHTMIN",
+        "KXHIGHTNOLA",
+        "KXHIGHTOKC",
+        "KXHIGHTPHX",
+        "KXHIGHTSATX",
+        "KXHIGHTSEA",
+        "KXHIGHTSFO",
+    }
+
+    resolved = directory.resolve_market(
+        "KXHIGHTSEA-26APR11-T58",
+        {
+            "ticker": "KXHIGHTSEA-26APR11-T58",
+            "title": "Will the maximum temperature be >58 on Apr 11, 2026?",
+            "subtitle": "59 or above",
+            "strike_type": "greater",
+            "floor_strike": 58,
+        },
+    )
+
+    assert resolved is not None
+    assert resolved.station_id == "KSEA"
+    assert resolved.daily_summary_station_id == "USW00024233"

@@ -127,16 +127,18 @@ kalshi-bot-cli training-build-list
 
 Historical replay and import loop:
 
+Leave `--series` unset here to process every configured city template.
+
 ```bash
 kalshi-bot-cli historical-status --verbose
-kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-backfill market --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-backfill weather-archive --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-archive capture --once --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-archive checkpoint-capture --once --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-archive checkpoint-status --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI --verbose
-kalshi-bot-cli historical-backfill settlements --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-replay weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-backfill market --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-backfill weather-archive --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-archive capture --once
+kalshi-bot-cli historical-archive checkpoint-capture --once
+kalshi-bot-cli historical-archive checkpoint-status --date-from 2026-03-01 --date-to 2026-03-31 --verbose
+kalshi-bot-cli historical-backfill settlements --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-replay weather --date-from 2026-03-01 --date-to 2026-03-31
 kalshi-bot-cli training-build historical --mode bundles --date-from 2026-03-01 --date-to 2026-03-31
 kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026-03-01 --date-to 2026-03-31 --output data/training/gemini_weather
 ```
@@ -181,8 +183,8 @@ kalshi-bot-cli heuristic-pack status
 Repair stale replay rows before trusting those indicators:
 
 ```bash
-kalshi-bot-cli historical-repair audit --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI --verbose
-kalshi-bot-cli historical-repair refresh --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-repair audit --date-from 2026-03-01 --date-to 2026-03-31 --verbose
+kalshi-bot-cli historical-repair refresh --date-from 2026-03-01 --date-to 2026-03-31
 ```
 
 The self-improvement loop now respects corpus readiness gates. If the corpus is too small, too concentrated, or too weakly labeled, critique and evaluation commands will stop early instead of generating noisy candidates.

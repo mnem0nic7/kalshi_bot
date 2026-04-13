@@ -20,7 +20,7 @@ For strict as-of historical replay and Gemini-first fine-tune exports, use [docs
 3. Set `LIVE_KALSHI_API_KEY` and `DEMO_KALSHI_API_KEY` in `.env`.
 4. Set the live/demo PEM host paths for Docker with `LIVE_KALSHI_KEY_PATH_HOST` and `DEMO_KALSHI_KEY_PATH_HOST`, or use the default local filenames.
 5. If you run the app outside Docker, point `LIVE_KALSHI_READ_PRIVATE_KEY_PATH` / `DEMO_KALSHI_READ_PRIVATE_KEY_PATH` at the local PEM files, or keep the default local key file path fallback.
-6. Review `docs/examples/weather_markets.example.yaml`. It now uses `series_templates`, so the app can discover current daily temperature contracts automatically for the configured locations.
+6. Review `docs/examples/weather_markets.example.yaml`. It now uses `series_templates`, so the app can discover current daily temperature contracts automatically for every configured city.
 7. Start Postgres:
 
 ```bash
@@ -74,16 +74,16 @@ kalshi-bot-cli research-audit --limit 20
 kalshi-bot-cli training-status
 kalshi-bot-cli training-build --mode room-bundles --good-research-only
 kalshi-bot-cli historical-status --verbose
-kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-backfill market --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-backfill weather-archive --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-backfill settlements --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-archive capture --once --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-archive checkpoint-capture --once --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-archive checkpoint-status --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI --verbose
-kalshi-bot-cli historical-replay weather --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-repair audit --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
-kalshi-bot-cli historical-repair refresh --date-from 2026-03-01 --date-to 2026-03-31 --series KXHIGHNY KXHIGHCHI
+kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-backfill market --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-backfill weather-archive --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-backfill settlements --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-archive capture --once
+kalshi-bot-cli historical-archive checkpoint-capture --once
+kalshi-bot-cli historical-archive checkpoint-status --date-from 2026-03-01 --date-to 2026-03-31 --verbose
+kalshi-bot-cli historical-replay weather --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-repair audit --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-repair refresh --date-from 2026-03-01 --date-to 2026-03-31
 kalshi-bot-cli historical-intelligence status
 kalshi-bot-cli historical-intelligence run --date-from 2026-03-01 --date-to 2026-03-31
 kalshi-bot-cli historical-intelligence explain --series KXHIGHNY

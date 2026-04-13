@@ -138,8 +138,7 @@ Import settled historical weather market-days plus captured sources:
 ```bash
 kalshi-bot-cli historical-import weather \
   --date-from 2026-03-01 \
-  --date-to 2026-03-31 \
-  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+  --date-to 2026-03-31
 ```
 
 Replay historical checkpoints into room-shaped records:
@@ -147,8 +146,7 @@ Replay historical checkpoints into room-shaped records:
 ```bash
 kalshi-bot-cli historical-replay weather \
   --date-from 2026-03-01 \
-  --date-to 2026-03-31 \
-  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+  --date-to 2026-03-31
 ```
 
 Inspect historical corpus status:
@@ -157,12 +155,14 @@ Inspect historical corpus status:
 kalshi-bot-cli historical-status --verbose
 ```
 
+Leave `--series` unset in the historical commands below to run across every configured city template. Add `--series ...` only when you intentionally want a narrower slice.
+
 Run the rolling one-year historical pipeline:
 
 ```bash
-kalshi-bot-cli historical-pipeline bootstrap --days 365 --chunk-days 14 --series KXHIGHNY KXHIGHCHI KXHIGHMIA
-kalshi-bot-cli historical-pipeline resume --series KXHIGHNY KXHIGHCHI KXHIGHMIA
-kalshi-bot-cli historical-pipeline daily --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+kalshi-bot-cli historical-pipeline bootstrap --days 365 --chunk-days 14
+kalshi-bot-cli historical-pipeline resume
+kalshi-bot-cli historical-pipeline daily
 kalshi-bot-cli historical-pipeline status --verbose
 ```
 
@@ -171,30 +171,24 @@ Backfill missing checkpoint coverage before replay:
 ```bash
 kalshi-bot-cli historical-backfill market \
   --date-from 2026-03-01 \
-  --date-to 2026-03-31 \
-  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+  --date-to 2026-03-31
 
 kalshi-bot-cli historical-backfill weather-archive \
   --date-from 2026-03-01 \
-  --date-to 2026-03-31 \
-  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+  --date-to 2026-03-31
 
-kalshi-bot-cli historical-archive capture --once \
-  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+kalshi-bot-cli historical-archive capture --once
 
-kalshi-bot-cli historical-archive checkpoint-capture --once \
-  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+kalshi-bot-cli historical-archive checkpoint-capture --once
 
 kalshi-bot-cli historical-archive checkpoint-status \
   --date-from 2026-03-01 \
   --date-to 2026-03-31 \
-  --series KXHIGHNY KXHIGHCHI KXHIGHMIA \
   --verbose
 
 kalshi-bot-cli historical-backfill settlements \
   --date-from 2026-03-01 \
-  --date-to 2026-03-31 \
-  --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+  --date-to 2026-03-31
 ```
 
 Export complete room bundles:
@@ -284,13 +278,11 @@ Repair stale historical replay rows when source selection or replay logic change
 kalshi-bot-cli historical-repair audit \
   --date-from 2026-03-01 \
   --date-to 2026-03-31 \
-  --series KXHIGHNY KXHIGHCHI \
   --verbose
 
 kalshi-bot-cli historical-repair refresh \
   --date-from 2026-03-01 \
-  --date-to 2026-03-31 \
-  --series KXHIGHNY KXHIGHCHI
+  --date-to 2026-03-31
 ```
 
 Run historical intelligence and inspect the active heuristic state:

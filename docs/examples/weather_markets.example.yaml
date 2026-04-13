@@ -1,4 +1,16 @@
 series_templates:
+  - series_ticker: KXHIGHAUS
+    display_name: Austin Daily High Temperature
+    location_name: Austin
+    station_id: KAUS
+    daily_summary_station_id: USW00013904
+    timezone_name: America/Chicago
+    latitude: 30.183
+    longitude: -97.680
+    settlement_source: NWS Climatological Report (Daily) for Austin Bergstrom
+    research_queries:
+      - Austin high temperature forecast today site:weather.gov
+      - Austin Bergstrom daily high temperature forecast site:weather.gov
   - series_ticker: KXHIGHNY
     display_name: NYC Daily High Temperature
     location_name: New York City
@@ -23,15 +35,207 @@ series_templates:
     research_queries:
       - Chicago Midway daily high temperature forecast site:weather.gov
       - Chicago high temperature forecast today site:weather.gov
+  - series_ticker: KXHIGHDEN
+    display_name: Denver Daily High Temperature
+    location_name: Denver
+    station_id: KDEN
+    daily_summary_station_id: USW00003017
+    timezone_name: America/Denver
+    latitude: 39.847
+    longitude: -104.656
+    settlement_source: NWS Climatological Report (Daily) for Denver International Airport
+    research_queries:
+      - Denver high temperature forecast today site:weather.gov
+      - Denver International Airport daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHLAX
+    display_name: Los Angeles Daily High Temperature
+    location_name: Los Angeles
+    station_id: KLAX
+    daily_summary_station_id: USW00023174
+    timezone_name: America/Los_Angeles
+    latitude: 33.938
+    longitude: -118.389
+    settlement_source: NWS Climatological Report (Daily) for Los Angeles Airport
+    research_queries:
+      - Los Angeles high temperature forecast today site:weather.gov
+      - Los Angeles Airport daily high temperature forecast site:weather.gov
   - series_ticker: KXHIGHMIA
     display_name: Miami Daily High Temperature
     location_name: Miami
     station_id: KMIA
     daily_summary_station_id: USW00012839
     timezone_name: America/New_York
-    latitude: 25.7959
-    longitude: -80.2870
+    latitude: 25.791
+    longitude: -80.316
     settlement_source: NWS Climatological Report (Daily) for Miami International Airport
     research_queries:
       - Miami International Airport daily high temperature forecast site:weather.gov
       - Miami high temperature forecast today site:weather.gov
+  - series_ticker: KXHIGHPHIL
+    display_name: Philadelphia Daily High Temperature
+    location_name: Philadelphia
+    station_id: KPHL
+    daily_summary_station_id: USW00013739
+    timezone_name: America/New_York
+    latitude: 39.868
+    longitude: -75.231
+    settlement_source: NWS Climatological Report (Daily) for Philadelphia International Airport
+    research_queries:
+      - Philadelphia high temperature forecast today site:weather.gov
+      - Philadelphia International Airport daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTATL
+    display_name: Atlanta Daily High Temperature
+    location_name: Atlanta
+    station_id: KATL
+    daily_summary_station_id: USW00013874
+    timezone_name: America/New_York
+    latitude: 33.630
+    longitude: -84.442
+    settlement_source: NWS Climatological Report (Daily) for Atlanta
+    research_queries:
+      - Atlanta high temperature forecast today site:weather.gov
+      - Atlanta Hartsfield daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTBOS
+    display_name: Boston Daily High Temperature
+    location_name: Boston
+    station_id: KBOS
+    daily_summary_station_id: USW00014739
+    timezone_name: America/New_York
+    latitude: 42.361
+    longitude: -71.010
+    settlement_source: NWS Climatological Report (Daily) for Boston
+    research_queries:
+      - Boston high temperature forecast today site:weather.gov
+      - Boston Logan daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTDAL
+    display_name: Dallas Daily High Temperature
+    location_name: Dallas
+    station_id: KDAL
+    daily_summary_station_id: USW00013960
+    timezone_name: America/Chicago
+    latitude: 32.852
+    longitude: -96.856
+    settlement_source: NWS Climatological Report (Daily) for Dallas
+    research_queries:
+      - Dallas high temperature forecast today site:weather.gov
+      - Dallas Love Field daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTDC
+    display_name: Washington DC Daily High Temperature
+    location_name: Washington DC
+    station_id: KDCA
+    daily_summary_station_id: USW00013743
+    timezone_name: America/New_York
+    latitude: 38.848
+    longitude: -77.034
+    settlement_source: NWS Climatological Report (Daily) for Washington DC
+    research_queries:
+      - Washington DC high temperature forecast today site:weather.gov
+      - Reagan National daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTHOU
+    display_name: Houston Daily High Temperature
+    location_name: Houston
+    station_id: KHOU
+    daily_summary_station_id: USW00012918
+    timezone_name: America/Chicago
+    latitude: 29.638
+    longitude: -95.282
+    settlement_source: NWS Climatological Report (Daily) for Houston
+    research_queries:
+      - Houston high temperature forecast today site:weather.gov
+      - Houston Hobby daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTLV
+    display_name: Las Vegas Daily High Temperature
+    location_name: Las Vegas
+    station_id: KLAS
+    daily_summary_station_id: USW00023169
+    timezone_name: America/Los_Angeles
+    latitude: 36.072
+    longitude: -115.163
+    settlement_source: NWS Climatological Report (Daily) for Las Vegas
+    research_queries:
+      - Las Vegas high temperature forecast today site:weather.gov
+      - Las Vegas airport daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTMIN
+    display_name: Minneapolis Daily High Temperature
+    location_name: Minneapolis
+    station_id: KMSP
+    daily_summary_station_id: USW00014922
+    timezone_name: America/Chicago
+    latitude: 44.883
+    longitude: -93.229
+    settlement_source: NWS Climatological Report (Daily) for Minneapolis
+    research_queries:
+      - Minneapolis high temperature forecast today site:weather.gov
+      - Minneapolis St Paul daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTNOLA
+    display_name: New Orleans Daily High Temperature
+    location_name: New Orleans
+    station_id: KMSY
+    daily_summary_station_id: USW00012916
+    timezone_name: America/Chicago
+    latitude: 29.998
+    longitude: -90.278
+    settlement_source: NWS Climatological Report (Daily) for New Orleans
+    research_queries:
+      - New Orleans high temperature forecast today site:weather.gov
+      - New Orleans airport daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTOKC
+    display_name: Oklahoma City Daily High Temperature
+    location_name: Oklahoma City
+    station_id: KOKC
+    daily_summary_station_id: USW00013967
+    timezone_name: America/Chicago
+    latitude: 35.389
+    longitude: -97.601
+    settlement_source: NWS Climatological Report (Daily) for Oklahoma City
+    research_queries:
+      - Oklahoma City high temperature forecast today site:weather.gov
+      - Oklahoma City airport daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTPHX
+    display_name: Phoenix Daily High Temperature
+    location_name: Phoenix
+    station_id: KPHX
+    daily_summary_station_id: USW00023183
+    timezone_name: America/Phoenix
+    latitude: 33.428
+    longitude: -112.004
+    settlement_source: NWS Climatological Report (Daily) for Phoenix
+    research_queries:
+      - Phoenix high temperature forecast today site:weather.gov
+      - Phoenix Sky Harbor daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTSATX
+    display_name: San Antonio Daily High Temperature
+    location_name: San Antonio
+    station_id: KSAT
+    daily_summary_station_id: USW00012921
+    timezone_name: America/Chicago
+    latitude: 29.544
+    longitude: -98.484
+    settlement_source: NWS Climatological Report (Daily) for San Antonio
+    research_queries:
+      - San Antonio high temperature forecast today site:weather.gov
+      - San Antonio airport daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTSEA
+    display_name: Seattle Daily High Temperature
+    location_name: Seattle
+    station_id: KSEA
+    daily_summary_station_id: USW00024233
+    timezone_name: America/Los_Angeles
+    latitude: 47.444
+    longitude: -122.314
+    settlement_source: NWS Climatological Report (Daily) for Seattle
+    research_queries:
+      - Seattle high temperature forecast today site:weather.gov
+      - Seattle Tacoma daily high temperature forecast site:weather.gov
+  - series_ticker: KXHIGHTSFO
+    display_name: San Francisco Daily High Temperature
+    location_name: San Francisco
+    station_id: KSFO
+    daily_summary_station_id: USW00023234
+    timezone_name: America/Los_Angeles
+    latitude: 37.620
+    longitude: -122.365
+    settlement_source: NWS Climatological Report (Daily) for San Francisco
+    research_queries:
+      - San Francisco high temperature forecast today site:weather.gov
+      - San Francisco airport daily high temperature forecast site:weather.gov

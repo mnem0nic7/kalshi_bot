@@ -215,6 +215,37 @@ def _research_market_view(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _series_filter_options(
+    market_views: list[dict[str, Any]],
+    *,
+    templates: list[Any],
+) -> list[dict[str, str]]:
+    label_by_series: dict[str, str] = {}
+    for template in templates:
+        series_ticker = str(getattr(template, "series_ticker", "") or "").strip()
+        if not series_ticker:
+            continue
+        label = str(
+            getattr(template, "location_name", None)
+            or getattr(template, "display_name", None)
+            or series_ticker
+        ).strip()
+        label_by_series[series_ticker] = label
+
+    for item in market_views:
+        series_ticker = str(item.get("series_ticker") or "").strip()
+        if not series_ticker or series_ticker in label_by_series:
+            continue
+        label_by_series[series_ticker] = str(item.get("label") or series_ticker).strip()
+
+    options = [{"id": "all", "label": "All Series"}]
+    options.extend(
+        {"id": series_ticker, "label": label_by_series[series_ticker]}
+        for series_ticker in sorted(label_by_series, key=lambda item: (label_by_series[item].lower(), item))
+    )
+    return options
+
+
 def _recent_room_outcomes(room_views: list[dict[str, Any]], *, now: datetime) -> dict[str, Any]:
     window_start = now - timedelta(hours=SUMMARY_ROOM_WINDOW_HOURS)
     recent = []
@@ -600,6 +631,10 @@ async def _build_research_tab(container: AppContainer) -> dict[str, Any]:
             "tracked": len(market_views),
             "average_confidence": round(sum(confidences) / len(confidences), 2) if confidences else None,
         },
+        "series_filters": _series_filter_options(
+            market_views,
+            templates=container.weather_directory.templates(),
+        ),
         "markets": market_views,
     }
 

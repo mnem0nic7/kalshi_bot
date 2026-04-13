@@ -948,12 +948,14 @@
       statusPills.append(pill);
     });
     const seriesPills = element("div", "filter-pills");
-    [
-      { id: "all", label: "All Series" },
-      { id: "KXHIGHNY", label: "NY" },
-      { id: "KXHIGHCHI", label: "CHI" },
-      { id: "KXHIGHMIA", label: "MIA" },
-    ].forEach((item) => {
+    const seriesOptions = Array.isArray(payload.series_filters) && payload.series_filters.length
+      ? payload.series_filters
+      : [{ id: "all", label: "All Series" }];
+    const allowedSeries = new Set(seriesOptions.map((item) => item.id));
+    if (!allowedSeries.has(state.researchFilters.series)) {
+      state.researchFilters.series = "all";
+    }
+    seriesOptions.forEach((item) => {
       const pill = button(item.label, ["button-secondary", "pill-button"].concat(state.researchFilters.series === item.id ? ["is-active"] : []));
       pill.addEventListener("click", () => {
         state.researchFilters.series = item.id;
