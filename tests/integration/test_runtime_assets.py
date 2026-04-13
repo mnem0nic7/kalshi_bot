@@ -29,3 +29,13 @@ def test_runtime_scripts_rebuild_migrate_image_before_using_it() -> None:
     assert 'docker compose -f "${compose_file}" build migrate >/dev/null' in start_stack
     assert "run_migrate" in start_stack
     assert 'docker compose -f "${compose_file}" build migrate >/dev/null' in watchdog
+
+
+def test_runtime_scripts_refresh_nginx_after_app_recreate() -> None:
+    start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
+    restart_color = Path("infra/scripts/restart-color.sh").read_text(encoding="utf-8")
+
+    assert 'wait_for_service_health app_blue 180' in start_stack
+    assert 'wait_for_service_health app_green 180' in start_stack
+    assert 'docker compose -f "${compose_file}" up -d --force-recreate nginx' in start_stack
+    assert 'docker compose -f "${compose_file}" up -d --no-deps --force-recreate nginx' in restart_color
