@@ -137,7 +137,12 @@ series_templates:
             }
 
         async def fake_daily_summary_crosscheck(mapping, local_day: str, *, kalshi_result: str | None):
-            return {"status": "match", "daily_high_f": Decimal("81.00"), "result": "yes"}
+            return {
+                "status": "match",
+                "daily_high_f": Decimal("81.00"),
+                "result": "yes",
+                "mismatch_reason": None,
+            }
 
         container.historical_training_service._fetch_market_for_backfill = fake_fetch_market_for_backfill  # type: ignore[method-assign]
         container.historical_training_service._daily_summary_crosscheck = fake_daily_summary_crosscheck  # type: ignore[method-assign]
@@ -164,6 +169,195 @@ series_templates:
         assert training_body["unsettled_complete_room_count"] == 0
 
     get_settings.cache_clear()
+
+
+def test_historical_settlement_refresh_reclassifies_threshold_edge_mismatches(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text(
+        """
+series_templates:
+  - series_ticker: KXHIGHMIA
+    display_name: Miami Daily High Temperature
+    station_id: KMIA
+    daily_summary_station_id: USW00012839
+    location_name: Miami
+    timezone_name: America/New_York
+    latitude: 25.7617
+    longitude: -80.1918
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "historical-crosscheck-refresh.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> None:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                await repo.upsert_historical_settlement_label(
+                    market_ticker="KXHIGHMIA-26APR08-T83",
+                    series_ticker="KXHIGHMIA",
+                    local_market_day="2026-04-08",
+                    source_kind="kalshi_primary",
+                    kalshi_result="no",
+                    settlement_value_dollars=Decimal("0.0000"),
+                    settlement_ts=datetime(2026, 4, 9, 0, 30, tzinfo=UTC),
+                    crosscheck_status="mismatch",
+                    crosscheck_high_f=Decimal("83.00"),
+                    crosscheck_result="yes",
+                    payload={
+                        "market": {
+                            "ticker": "KXHIGHMIA-26APR08-T83",
+                            "strike_type": "greater",
+                            "floor_strike": 83,
+                            "close_time": "2026-04-08T23:59:59+00:00",
+                            "result": "no",
+                        },
+                        "crosscheck": {
+                            "status": "mismatch",
+                            "daily_high_f": "83.00",
+                            "result": "yes",
+                            "mismatch_reason": "daily_summary_disagreement",
+                        },
+                    },
+                )
+                await session.commit()
+
+        asyncio.run(seed())
+
+        async def fake_daily_summary_crosscheck(mapping, local_day: str, *, kalshi_result: str | None):
+            return {
+                "status": "match",
+                "daily_high_f": Decimal("83.00"),
+                "result": "no",
+                "mismatch_reason": None,
+            }
+
+        container.historical_training_service._daily_summary_crosscheck = fake_daily_summary_crosscheck  # type: ignore[method-assign]
+
+        result = asyncio.run(
+            container.historical_training_service.backfill_settlements(
+                date_from=datetime(2026, 4, 8, tzinfo=UTC).date(),
+                date_to=datetime(2026, 4, 8, tzinfo=UTC).date(),
+                series=["KXHIGHMIA"],
+            )
+        )
+
+        assert result["settlement_label_refresh_count"] == 1
+        assert result["settlement_label_changed_count"] == 1
+
+        historical_status = client.get("/api/historical/status")
+        assert historical_status.status_code == 200
+        body = historical_status.json()
+        assert body["settlement_mismatch_count"] == 0
+        assert body["settlement_mismatch_breakdown"]["threshold_edge_strictness"] == 0
+
+    get_settings.cache_clear()
+
+
+def test_historical_weather_archive_backfill_promotes_recoverable_checkpoint_archives(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text(
+        """
+series_templates:
+  - series_ticker: KXHIGHNY
+    display_name: NYC Daily High Temperature
+    station_id: KNYC
+    daily_summary_station_id: USW00094728
+    location_name: New York City
+    timezone_name: America/New_York
+    latitude: 40.7146
+    longitude: -74.0071
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "historical-archive-promotion.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> None:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                await repo.upsert_historical_settlement_label(
+                    market_ticker="KXHIGHNY-26APR10-T68",
+                    series_ticker="KXHIGHNY",
+                    local_market_day="2026-04-10",
+                    source_kind="kalshi_primary",
+                    kalshi_result="yes",
+                    settlement_value_dollars=Decimal("1.0000"),
+                    settlement_ts=datetime(2026, 4, 11, 0, 30, tzinfo=UTC),
+                    crosscheck_status="match",
+                    crosscheck_high_f=Decimal("81.00"),
+                    crosscheck_result="yes",
+                    payload={
+                        "market": {
+                            "ticker": "KXHIGHNY-26APR10-T68",
+                            "strike_type": "greater",
+                            "floor_strike": 68,
+                            "close_time": "2026-04-10T23:59:59+00:00",
+                            "result": "yes",
+                        },
+                        "crosscheck": {
+                            "status": "match",
+                            "daily_high_f": "81.00",
+                            "result": "yes",
+                            "mismatch_reason": None,
+                        },
+                    },
+                )
+                weather_asof = datetime(2026, 4, 10, 12, 55, tzinfo=UTC)
+                await repo.upsert_historical_weather_snapshot(
+                    station_id="KNYC",
+                    series_ticker="KXHIGHNY",
+                    local_market_day="2026-04-10",
+                    asof_ts=weather_asof,
+                    source_kind="archived_weather_bundle",
+                    source_id="weather-source-1",
+                    source_hash="weather-hash-1",
+                    observation_ts=weather_asof,
+                    forecast_updated_ts=weather_asof - timedelta(minutes=20),
+                    forecast_high_f=Decimal("81.00"),
+                    current_temp_f=Decimal("70.00"),
+                    payload={"_archive": {"archive_path": "data/historical_weather/test.json"}},
+                )
+                await session.commit()
+
+        asyncio.run(seed())
+
+        result = asyncio.run(
+            container.historical_training_service.backfill_weather_archives(
+                date_from=datetime(2026, 4, 10, tzinfo=UTC).date(),
+                date_to=datetime(2026, 4, 10, tzinfo=UTC).date(),
+                series=["KXHIGHNY"],
+            )
+        )
+
+        assert result["checkpoint_archive_promotion_count"] >= 2
+
+        historical_status = client.get("/api/historical/status")
+        assert historical_status.status_code == 200
+        body = historical_status.json()
+        assert body["checkpoint_archive_promotion_count"] >= 2
+        assert body["coverage_repair_summary"]["checkpoint_archive_promotion_count"] >= 2
+
+    get_settings.cache_clear()
+    output_path = tmp_path / "historical_bundles.jsonl"
 
     app = create_app()
     with TestClient(app) as client:
@@ -259,6 +453,9 @@ series_templates:
         assert "promotable_market_day_counts" in historical_status.json()
         assert "confidence_progress" in historical_status.json()
         assert "bootstrap_progress" in historical_status.json()
+        assert "settlement_mismatch_breakdown" in historical_status.json()
+        assert "coverage_repair_summary" in historical_status.json()
+        assert "replay_refresh_counts_by_cause" in historical_status.json()
 
         pipeline_status = client.get("/api/historical/pipeline/status?verbose=true")
         assert pipeline_status.status_code == 200
@@ -531,17 +728,20 @@ series_templates:
                                     "weather_snapshot_source_id": selection.weather_snapshot.id,
                                     "market_source_kind": selection.market_source_kind,
                                     "weather_source_kind": selection.weather_source_kind,
-                                        "settlement_label_id": label.id,
-                                        "coverage_class": coverage_class,
-                                        "replay_logic_version": container.historical_training_service.replay_logic_version(),
-                                        "source_coverage": {
-                                            "market_snapshot": True,
-                                            "weather_snapshot": True,
-                                            "settlement_label": True,
-                                        },
-                                    }
+                                    "settlement_label_id": label.id,
+                                    "settlement_crosscheck_status": label.crosscheck_status,
+                                    "settlement_mismatch_reason": container.historical_training_service._crosscheck_mismatch_reason_from_label(label),
+                                    "settlement_label_signature": container.historical_training_service._settlement_label_signature(label),
+                                    "coverage_class": coverage_class,
+                                    "replay_logic_version": container.historical_training_service.replay_logic_version(),
+                                    "source_coverage": {
+                                        "market_snapshot": True,
+                                        "weather_snapshot": True,
+                                        "settlement_label": True,
+                                    },
                                 },
-                            )
+                            },
+                        )
                         created += 1
                 await session.commit()
             return {

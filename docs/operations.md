@@ -145,6 +145,14 @@ Historical status should be interpreted in layers:
 
 If `source_replay_coverage` is ahead of `replay_corpus`, run the historical repair refresh path before trusting the dashboard or the intelligence outputs.
 
+Settlement status also has to be read more carefully now:
+
+- `settlement_mismatch_breakdown.threshold_edge_strictness` means an exact-threshold strictness case and should usually disappear after the corrected crosscheck refresh
+- `settlement_mismatch_breakdown.daily_summary_disagreement` means a real Kalshi vs NOAA/NCEI disagreement and should stay quarantined
+- `settlement_mismatch_breakdown.crosscheck_missing` means no usable daily-summary crosscheck was available
+
+Weather-archive backfill now has a second repair job besides writing raw archives: it promotes already-valid as-of weather bundles into checkpoint-archive records for the exact checkpoint slot when that evidence is recoverable without using future data.
+
 Deploy findings from April 12, 2026:
 
 - `historical-archive checkpoint-capture --once` returning `captured_checkpoint_count = 0` is expected outside the due checkpoint windows; it means nothing was due, not that the job failed
@@ -152,6 +160,7 @@ Deploy findings from April 12, 2026:
 - historical replay readiness is still constrained by missing checkpoint-weather coverage, so the right next action is continued checkpoint capture, not lowering training-readiness thresholds
 - historical replay repair is also now a normal maintenance tool after replay-logic changes; source tables can be ahead of the materialized replay corpus until `historical-repair refresh` is run
 - after the replay staleness fix, useful historical indicators should show real reasons like `spread_too_wide`, `resolved_contract`, or `book_effectively_broken` instead of collapsing into blanket `market_stale`
+- settlement crosscheck semantics now honor strict `>` and `<` operators, so exact-threshold false mismatches should be refreshed away instead of treated as real data disagreements
 
 Historical intelligence and heuristic-pack workflow:
 

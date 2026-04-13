@@ -92,6 +92,14 @@ Historical status now also shows the coverage backlog and confidence progress di
 - how far are we from the `60` execution-day threshold, the `30` full-checkpoint directional-day threshold, and the `7` full-checkpoint holdout-day threshold?
 - are we blocked by lack of execution support, lack of full-checkpoint support, or lack of holdout support?
 
+Settlement mismatch reporting is now more specific too:
+
+- `threshold_edge_strictness` means the disagreement was caused by exact-threshold handling on a strict `>` or `<` contract
+- `daily_summary_disagreement` means Kalshi and NOAA/NCEI still disagree after using the correct operator semantics
+- `crosscheck_missing` means the daily-summary crosscheck was not available
+
+Weather archive repair now also promotes already-valid as-of weather bundles into checkpoint-archive records for the exact checkpoint slot when that can be done without using future data. That helps checkpoint coverage catch up to source replayability without inventing history.
+
 The confidence state should also make sense:
 
 - `insufficient_support` means the rolling-year corpus is still too small for trustworthy heuristic changes
@@ -114,6 +122,7 @@ Three things mattered:
 - `historical-archive checkpoint-capture --once` returning zero captures is normal when no checkpoint slot is currently due. That is a scheduling outcome, not a job failure.
 - Settlement backfill is now a normal repair tool for maturity. The first live sweep immediately reduced the likely-ingestion-gap backlog, while historical Gemini readiness correctly stayed blocked because full checkpoint coverage still is not there yet.
 - Historical replay repair is now part of normal maintenance after replay-logic changes. Derived replay rooms are safe to purge and rebuild; the raw historical sources stay immutable.
+- Settlement crosscheck refresh is also part of normal historical maintenance now. If the strictness rules or mismatch classification change, the rolling replay corpus and overlapping historical builds should be refreshed so readiness stays tied to current truth.
 - Historical intelligence got much more honest once replay checks started using checkpoint-time staleness and refreshed replay rows. That is why the dashboard should now be read as real indicator quality, not just raw counts.
 
 Read more: `docs/operations.md`, `docs/training.md`

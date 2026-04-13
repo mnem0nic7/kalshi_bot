@@ -123,6 +123,10 @@ class HistoricalIntelligenceService:
             "confidence_scorecard": (latest_run or {}).get("confidence_scorecard") or fallback_confidence["confidence_scorecard"],
             "confidence_progress": historical_status.get("confidence_progress") or fallback_confidence["confidence_progress"],
             "historical_build_readiness": historical_status.get("historical_build_readiness"),
+            "settlement_mismatch_breakdown": historical_status.get("settlement_mismatch_breakdown") or {},
+            "coverage_repair_summary": historical_status.get("coverage_repair_summary") or {},
+            "checkpoint_archive_promotion_count": historical_status.get("checkpoint_archive_promotion_count") or 0,
+            "replay_refresh_counts_by_cause": historical_status.get("replay_refresh_counts_by_cause") or {},
             "heuristics": self.heuristic_service.status_payload(
                 control=control,
                 active_pack=active_pack,

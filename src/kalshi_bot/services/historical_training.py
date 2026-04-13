@@ -126,8 +126,9 @@ class HistoricalTrainingService:
         ("midday_1300", 13),
         ("late_1700", 17),
     )
-    REPLAY_LOGIC_VERSION = "historical_replay_2026_04_12_decision_time_v1"
+    REPLAY_LOGIC_VERSION = "historical_replay_2026_04_13_support_repair_v1"
     CHECKPOINT_CAPTURED_WEATHER_SOURCE = "checkpoint_archived_weather_bundle"
+    PROMOTED_CHECKPOINT_ARCHIVE_SOURCE = "coverage_repair_checkpoint_promotion"
     CAPTURED_MARKET_SOURCE = "captured_market_snapshot"
     RECONSTRUCTED_MARKET_SOURCE = "reconstructed_market_checkpoint"
     CAPTURED_WEATHER_SOURCE = "captured_weather_bundle"
@@ -138,6 +139,9 @@ class HistoricalTrainingService:
     SETTLEMENT_MISMATCH = "mismatch"
     SETTLEMENT_MISSING = "missing"
     SETTLEMENT_BACKFILL_SOURCE = "kalshi_settlement_backfill"
+    SETTLEMENT_MISMATCH_REASON_THRESHOLD_EDGE = "threshold_edge_strictness"
+    SETTLEMENT_MISMATCH_REASON_DISAGREEMENT = "daily_summary_disagreement"
+    SETTLEMENT_MISMATCH_REASON_MISSING = "crosscheck_missing"
     NCEI_DAILY_SUMMARY_URL = "https://www.ncei.noaa.gov/access/services/data/v1"
     COVERAGE_FULL = "full_checkpoint_coverage"
     COVERAGE_LATE_ONLY = "late_only_coverage"
@@ -473,6 +477,11 @@ class HistoricalTrainingService:
                     }
                 )
         imported = await self._import_file_weather_archives(date_from=date_from, date_to=date_to, templates=templates)
+        checkpoint_promotions = await self._promote_checkpoint_archives_from_existing_weather(
+            date_from=date_from,
+            date_to=date_to,
+            series=[template.series_ticker for template in templates],
+        )
         return {
             "status": "completed",
             "date_from": date_from.isoformat(),
@@ -480,6 +489,130 @@ class HistoricalTrainingService:
             "series": [template.series_ticker for template in templates],
             "archived_event_count": archived,
             "imported_snapshot_count": imported,
+            "checkpoint_archive_promotion_count": checkpoint_promotions["checkpoint_archive_promotion_count"],
+            "checkpoint_archive_promotions": checkpoint_promotions,
+            "samples": samples,
+        }
+
+    async def _promote_checkpoint_archives_from_existing_weather(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+    ) -> dict[str, Any]:
+        templates = self._selected_templates(series)
+        series_tickers = [template.series_ticker for template in templates]
+        promoted = 0
+        skipped_existing = 0
+        skipped_missing_weather = 0
+        skipped_invalid_source = 0
+        samples: list[dict[str, Any]] = []
+        now = datetime.now(UTC)
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            settlement_labels = await repo.list_historical_settlement_labels(
+                series_tickers=series_tickers or None,
+                date_from=date_from.isoformat(),
+                date_to=date_to.isoformat(),
+                limit=5000,
+            )
+            for label in settlement_labels:
+                mapping = self._mapping_for_market(label.market_ticker, (label.payload or {}).get("market"))
+                if mapping is None or not mapping.supports_structured_weather or not mapping.series_ticker:
+                    continue
+                checkpoints = self._checkpoint_times(
+                    mapping,
+                    local_market_day=label.local_market_day,
+                    market_payload=(label.payload or {}).get("market", {}),
+                )
+                for checkpoint_label, checkpoint_ts in checkpoints:
+                    existing = await repo.get_historical_checkpoint_archive(
+                        series_ticker=mapping.series_ticker,
+                        local_market_day=label.local_market_day,
+                        checkpoint_label=checkpoint_label,
+                    )
+                    if existing is not None:
+                        skipped_existing += 1
+                        continue
+                    weather_snapshot = await self._select_weather_snapshot(
+                        repo,
+                        station_id=mapping.station_id,
+                        series_ticker=mapping.series_ticker,
+                        local_market_day=label.local_market_day,
+                        checkpoint_label=checkpoint_label,
+                        checkpoint_ts=checkpoint_ts,
+                    )
+                    if weather_snapshot is None:
+                        skipped_missing_weather += 1
+                        continue
+                    weather_metadata = self._weather_snapshot_checkpoint_metadata(weather_snapshot)
+                    if not self._checkpoint_archive_metadata_valid(weather_metadata, checkpoint_ts):
+                        skipped_invalid_source += 1
+                        continue
+                    weather_payload = dict(weather_snapshot.payload or {})
+                    weather_source_id = str(getattr(weather_snapshot, "source_id", "") or "")
+                    weather_source_kind = str(getattr(weather_snapshot, "source_kind", "") or "")
+                    archive_path = str(((weather_payload.get("_archive") or {}).get("archive_path") or "")) or None
+                    source_id = f"promoted:{mapping.series_ticker}:{label.local_market_day}:{checkpoint_label}:{weather_snapshot.id}"
+                    await repo.upsert_historical_checkpoint_archive(
+                        series_ticker=mapping.series_ticker,
+                        market_ticker=label.market_ticker,
+                        station_id=mapping.station_id,
+                        local_market_day=label.local_market_day,
+                        checkpoint_label=checkpoint_label,
+                        checkpoint_ts=checkpoint_ts,
+                        captured_at=now,
+                        source_kind=self.PROMOTED_CHECKPOINT_ARCHIVE_SOURCE,
+                        source_id=source_id,
+                        source_hash=getattr(weather_snapshot, "source_hash", None),
+                        observation_ts=getattr(weather_snapshot, "observation_ts", None),
+                        forecast_updated_ts=getattr(weather_snapshot, "forecast_updated_ts", None),
+                        archive_path=archive_path,
+                        payload={
+                            "series_ticker": mapping.series_ticker,
+                            "market_ticker": label.market_ticker,
+                            "station_id": mapping.station_id,
+                            "local_market_day": label.local_market_day,
+                            "checkpoint_label": checkpoint_label,
+                            "checkpoint_ts": checkpoint_ts.isoformat(),
+                            "captured_at": now.isoformat(),
+                            "archive_source": self.PROMOTED_CHECKPOINT_ARCHIVE_SOURCE,
+                            "weather_source_kind": weather_source_kind,
+                            "weather_source_id": weather_source_id,
+                            "weather_snapshot_id": getattr(weather_snapshot, "id", None),
+                            "promoted_from_source": {
+                                "weather_source_kind": weather_source_kind,
+                                "weather_source_id": weather_source_id,
+                                "weather_snapshot_id": getattr(weather_snapshot, "id", None),
+                                "weather_asof_ts": self._dt_to_iso(getattr(weather_snapshot, "asof_ts", None)),
+                            },
+                        },
+                    )
+                    promoted += 1
+                    if len(samples) < 10:
+                        samples.append(
+                            {
+                                "series_ticker": mapping.series_ticker,
+                                "market_ticker": label.market_ticker,
+                                "local_market_day": label.local_market_day,
+                                "checkpoint_label": checkpoint_label,
+                                "weather_source_kind": weather_source_kind,
+                                "weather_source_id": weather_source_id,
+                            }
+                        )
+            await session.commit()
+
+        return {
+            "status": "completed",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "series": series_tickers,
+            "checkpoint_archive_promotion_count": promoted,
+            "skipped_existing_count": skipped_existing,
+            "skipped_missing_weather_count": skipped_missing_weather,
+            "skipped_invalid_source_count": skipped_invalid_source,
             "samples": samples,
         }
 
@@ -663,6 +796,7 @@ class HistoricalTrainingService:
                             "checkpoint_ts": checkpoint_ts.isoformat(),
                             "captured_at": now.isoformat(),
                             "weather_source_kind": self.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
+                            "weather_source_id": source_id,
                             "archive_source": source_kind,
                         },
                     )
@@ -814,6 +948,154 @@ class HistoricalTrainingService:
         date_to: date,
         series: list[str] | None = None,
     ) -> dict[str, Any]:
+        historical_refresh = await self._refresh_historical_settlement_crosschecks(
+            date_from=date_from,
+            date_to=date_to,
+            series=series,
+        )
+        room_backfill = await self._backfill_room_settlements(
+            date_from=date_from,
+            date_to=date_to,
+            series=series,
+        )
+        return {
+            "status": "completed",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "series": historical_refresh["series"],
+            "settlement_label_refresh_count": historical_refresh["refreshed_count"],
+            "settlement_label_changed_count": historical_refresh["changed_count"],
+            "settlement_mismatch_breakdown": historical_refresh["settlement_mismatch_breakdown"],
+            "historical_crosscheck_refresh": historical_refresh,
+            "room_settlement_backfill": room_backfill,
+            "target_market_count": room_backfill["target_market_count"],
+            "backfilled_count": room_backfill["backfilled_count"],
+            "already_labeled_count": room_backfill["already_labeled_count"],
+            "not_settled_count": room_backfill["not_settled_count"],
+            "fetch_error_count": room_backfill["fetch_error_count"],
+            "samples": room_backfill["samples"],
+            "refresh_samples": historical_refresh["samples"],
+        }
+
+    async def _refresh_historical_settlement_crosschecks(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+    ) -> dict[str, Any]:
+        templates = self._selected_templates(series)
+        series_tickers = [template.series_ticker for template in templates]
+        refreshed = 0
+        changed = 0
+        samples: list[dict[str, Any]] = []
+        mismatch_breakdown: Counter[str] = Counter()
+        now = datetime.now(UTC)
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            labels = await repo.list_historical_settlement_labels(
+                series_tickers=series_tickers or None,
+                date_from=date_from.isoformat(),
+                date_to=date_to.isoformat(),
+                limit=5000,
+            )
+            for label in labels:
+                payload = dict(label.payload or {})
+                market_payload = dict(payload.get("market") or {})
+                mapping = self._mapping_for_market(label.market_ticker, market_payload)
+                if mapping is None or not mapping.supports_structured_weather or mapping.threshold_f is None:
+                    crosscheck = {
+                        "status": self.SETTLEMENT_MISSING,
+                        "daily_high_f": None,
+                        "result": None,
+                        "mismatch_reason": self.SETTLEMENT_MISMATCH_REASON_MISSING,
+                    }
+                else:
+                    try:
+                        crosscheck = await self._daily_summary_crosscheck(
+                            mapping,
+                            label.local_market_day,
+                            kalshi_result=label.kalshi_result,
+                        )
+                    except Exception:
+                        crosscheck = {
+                            "status": self.SETTLEMENT_MISSING,
+                            "daily_high_f": None,
+                            "result": None,
+                            "mismatch_reason": self.SETTLEMENT_MISMATCH_REASON_MISSING,
+                        }
+                previous_reason = self._crosscheck_mismatch_reason_from_label(label)
+                if (
+                    label.crosscheck_status != crosscheck["status"]
+                    or label.crosscheck_result != crosscheck["result"]
+                    or label.crosscheck_high_f != crosscheck["daily_high_f"]
+                    or previous_reason != crosscheck.get("mismatch_reason")
+                ):
+                    changed += 1
+                    if len(samples) < 10:
+                        samples.append(
+                            {
+                                "market_ticker": label.market_ticker,
+                                "local_market_day": label.local_market_day,
+                                "previous_status": label.crosscheck_status,
+                                "new_status": crosscheck["status"],
+                                "previous_mismatch_reason": previous_reason,
+                                "new_mismatch_reason": crosscheck.get("mismatch_reason"),
+                            }
+                        )
+                payload["crosscheck"] = {
+                    **crosscheck,
+                    "refreshed_at": now.isoformat(),
+                }
+                await repo.upsert_historical_settlement_label(
+                    market_ticker=label.market_ticker,
+                    series_ticker=label.series_ticker,
+                    local_market_day=label.local_market_day,
+                    source_kind=label.source_kind,
+                    kalshi_result=label.kalshi_result,
+                    settlement_value_dollars=label.settlement_value_dollars,
+                    settlement_ts=label.settlement_ts,
+                    crosscheck_status=crosscheck["status"],
+                    crosscheck_high_f=crosscheck["daily_high_f"],
+                    crosscheck_result=crosscheck["result"],
+                    payload=_json_safe(payload),
+                )
+                refreshed += 1
+                mismatch_key = (
+                    crosscheck.get("mismatch_reason")
+                    or (
+                        self.SETTLEMENT_MISMATCH_REASON_DISAGREEMENT
+                        if crosscheck["status"] == self.SETTLEMENT_MISMATCH
+                        else (
+                            self.SETTLEMENT_MISMATCH_REASON_MISSING
+                            if crosscheck["status"] == self.SETTLEMENT_MISSING
+                            else None
+                        )
+                    )
+                )
+                if mismatch_key:
+                    mismatch_breakdown[str(mismatch_key)] += 1
+            await session.commit()
+
+        return {
+            "status": "completed",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "series": series_tickers,
+            "refreshed_count": refreshed,
+            "changed_count": changed,
+            "settlement_mismatch_breakdown": dict(mismatch_breakdown),
+            "samples": samples,
+        }
+
+    async def _backfill_room_settlements(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+    ) -> dict[str, Any]:
         backlog_summary = await self.training_corpus_service.get_settlement_focus_summary(limit=5000)
         backlog = backlog_summary.get("backlog") or []
         allowed_series = {item.upper() for item in (series or [])}
@@ -877,12 +1159,22 @@ class HistoricalTrainingService:
                 if not series_ticker:
                     not_settled += 1
                     continue
-                crosscheck = {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+                crosscheck = {
+                    "status": self.SETTLEMENT_MISSING,
+                    "daily_high_f": None,
+                    "result": None,
+                    "mismatch_reason": self.SETTLEMENT_MISMATCH_REASON_MISSING,
+                }
                 if mapping is not None and mapping.threshold_f is not None:
                     try:
                         crosscheck = await self._daily_summary_crosscheck(mapping, local_market_day, kalshi_result=kalshi_result)
                     except Exception:
-                        crosscheck = {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+                        crosscheck = {
+                            "status": self.SETTLEMENT_MISSING,
+                            "daily_high_f": None,
+                            "result": None,
+                            "mismatch_reason": self.SETTLEMENT_MISMATCH_REASON_MISSING,
+                        }
                 await repo.upsert_historical_settlement_label(
                     market_ticker=market_ticker,
                     series_ticker=series_ticker,
@@ -1223,6 +1515,13 @@ class HistoricalTrainingService:
             settlement_labels=settlement_labels,
             verbose=verbose,
         )
+        settlement_mismatch_breakdown = self._settlement_mismatch_breakdown(settlement_labels)
+        coverage_repair_summary = self._coverage_repair_summary(
+            coverage_backlog=coverage_backlog,
+            checkpoint_rows=checkpoint_capture["all_market_day_coverage"],
+        )
+        public_coverage_backlog = dict(coverage_backlog)
+        public_coverage_backlog.pop("all_samples", None)
         settlement_focus = await self.training_corpus_service.get_settlement_focus_summary(limit=200)
         origin_counts = Counter(bundle.room_origin or bundle.room.get("room_origin") for bundle in replay_bundles)
         readiness_split = self._split_historical_bundles(clean_trainable)
@@ -1292,13 +1591,17 @@ class HistoricalTrainingService:
             "outcome_only_coverage_count": coverage["outcome_only_coverage_count"],
             "clean_historical_trainable_count": len(clean_trainable),
             "settlement_mismatch_count": sum(1 for label in settlement_labels if label.crosscheck_status == self.SETTLEMENT_MISMATCH),
+            "settlement_mismatch_breakdown": settlement_mismatch_breakdown,
             "source_replay_coverage": public_coverage,
             "checkpoint_archive_coverage": public_checkpoint_capture,
             "replay_corpus": replay_corpus,
             "refresh_needed": replay_audit["refresh_needed"],
             "stale_build_count": stale_build_count,
-            "coverage_backlog": coverage_backlog,
-            "promotable_market_day_counts": coverage_backlog["promotable_market_day_counts"],
+            "coverage_backlog": public_coverage_backlog,
+            "promotable_market_day_counts": public_coverage_backlog["promotable_market_day_counts"],
+            "checkpoint_archive_promotion_count": coverage_repair_summary["checkpoint_archive_promotion_count"],
+            "coverage_repair_summary": coverage_repair_summary,
+            "replay_refresh_counts_by_cause": replay_audit.get("refresh_counts_by_cause") or {},
             "source_coverage_gaps": public_coverage["source_coverage_gaps"],
             "missing_checkpoint_reason_counts": public_coverage["missing_checkpoint_reason_counts"],
             "checkpoint_coverage_counts": public_checkpoint_capture["checkpoint_coverage_counts"],
@@ -1384,6 +1687,7 @@ class HistoricalTrainingService:
                                 "affected_market_days": audit.get("affected_market_days") or [],
                                 "affected_checkpoints": audit.get("affected_checkpoints") or [],
                                 "replay_issue_counts": audit.get("issue_counts") or {},
+                                "refresh_counts_by_cause": audit.get("refresh_counts_by_cause") or {},
                             }
                         },
                     )
@@ -1555,6 +1859,7 @@ class HistoricalTrainingService:
             "reason_counts": dict(checkpoint_reason_counts),
             "market_day_reason_counts": dict(market_day_reason_counts),
             "samples": backlog_rows if verbose else backlog_rows[:12],
+            "all_samples": backlog_rows,
             "promotable_market_day_counts": {
                 "already_full_checkpoint_coverage": promotable_market_day_counts.get("already_full_checkpoint_coverage", 0),
                 "promotable_to_full_checkpoint_coverage": promotable_market_day_counts.get("promotable_to_full_checkpoint_coverage", 0),
@@ -1564,6 +1869,53 @@ class HistoricalTrainingService:
                     0,
                 ),
             },
+        }
+
+    def _coverage_repair_summary(
+        self,
+        *,
+        coverage_backlog: dict[str, Any],
+        checkpoint_rows: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        promoted_checkpoint_archives = 0
+        recoverable_weather_gap_market_days = 0
+        permanent_weather_gap_market_days = 0
+        recoverable_checkpoint_archive_gap_market_days = 0
+        permanent_checkpoint_archive_gap_market_days = 0
+
+        for row in checkpoint_rows:
+            for checkpoint in row.get("checkpoints") or []:
+                if checkpoint.get("source_kind") == self.PROMOTED_CHECKPOINT_ARCHIVE_SOURCE:
+                    promoted_checkpoint_archives += 1
+
+        for sample in coverage_backlog.get("all_samples") or []:
+            promotable_status = str(sample.get("promotable_status") or "")
+            day_reasons = set(sample.get("day_reasons") or [])
+            recoverable = promotable_status != "permanently_outcome_only_with_current_sources"
+            if "weather_snapshot_missing" in day_reasons:
+                if recoverable:
+                    recoverable_weather_gap_market_days += 1
+                else:
+                    permanent_weather_gap_market_days += 1
+            if "checkpoint_archive_missing" in day_reasons:
+                if recoverable:
+                    recoverable_checkpoint_archive_gap_market_days += 1
+                else:
+                    permanent_checkpoint_archive_gap_market_days += 1
+
+        return {
+            "checkpoint_archive_promotion_count": promoted_checkpoint_archives,
+            "recoverable_market_day_count": int(
+                (coverage_backlog.get("promotable_market_day_counts") or {}).get("promotable_to_full_checkpoint_coverage", 0)
+                + (coverage_backlog.get("promotable_market_day_counts") or {}).get("promotable_to_partial_or_late_only", 0)
+            ),
+            "permanent_outcome_only_market_day_count": int(
+                (coverage_backlog.get("promotable_market_day_counts") or {}).get("permanently_outcome_only_with_current_sources", 0)
+            ),
+            "recoverable_weather_gap_market_day_count": recoverable_weather_gap_market_days,
+            "permanent_weather_gap_market_day_count": permanent_weather_gap_market_days,
+            "recoverable_checkpoint_archive_gap_market_day_count": recoverable_checkpoint_archive_gap_market_days,
+            "permanent_checkpoint_archive_gap_market_day_count": permanent_checkpoint_archive_gap_market_days,
         }
 
     def _build_replay_audit(
@@ -1589,6 +1941,9 @@ class HistoricalTrainingService:
                     "weather_source_kind": checkpoint.get("weather_source_kind"),
                     "market_snapshot_id": checkpoint.get("market_snapshot_id"),
                     "weather_snapshot_id": checkpoint.get("weather_snapshot_id"),
+                    "settlement_crosscheck_status": row.get("settlement_crosscheck_status"),
+                    "settlement_mismatch_reason": row.get("settlement_mismatch_reason"),
+                    "settlement_label_signature": row.get("settlement_label_signature"),
                     "missing_reasons": list(checkpoint.get("missing_reasons") or []),
                 }
         replay_index = {
@@ -1606,14 +1961,30 @@ class HistoricalTrainingService:
             for run in replay_runs
         }
         counts: Counter[str] = Counter()
+        refresh_cause_counts: Counter[str] = Counter()
         affected_room_ids: set[str] = set()
         affected_run_ids: set[str] = set()
         affected_market_days: set[tuple[str, str]] = set()
         affected_checkpoints: list[dict[str, Any]] = []
         issues: list[dict[str, Any]] = []
 
+        def _refresh_causes(classification: str, reasons: list[str]) -> list[str]:
+            causes: set[str] = set()
+            if classification in {"missing_replay", "orphan_replay"}:
+                causes.add("coverage_repair")
+            for reason in reasons:
+                if reason.startswith("settlement_"):
+                    causes.add("settlement_repair")
+                elif reason == "replay_logic_version_changed":
+                    causes.add("replay_logic_change")
+                else:
+                    causes.add("coverage_repair")
+            return sorted(causes)
+
         def _record_issue(classification: str, source: dict[str, Any] | None, replay: dict[str, Any] | None, reasons: list[str]) -> None:
             counts[classification] += 1
+            refresh_causes = _refresh_causes(classification, reasons)
+            refresh_cause_counts.update(refresh_causes)
             market_ticker = str((source or replay or {}).get("market_ticker") or "")
             local_market_day = str((source or replay or {}).get("local_market_day") or "")
             checkpoint_ts = str((source or replay or {}).get("checkpoint_ts") or "")
@@ -1631,6 +2002,7 @@ class HistoricalTrainingService:
                     "checkpoint_label": checkpoint_label,
                     "checkpoint_ts": checkpoint_ts,
                     "classification": classification,
+                    "refresh_causes": refresh_causes,
                 }
             )
             issues.append(
@@ -1651,6 +2023,11 @@ class HistoricalTrainingService:
                     "source_weather_snapshot_id": (source or {}).get("weather_snapshot_id"),
                     "replay_market_snapshot_id": (replay or {}).get("market_snapshot_source_id"),
                     "replay_weather_snapshot_id": (replay or {}).get("weather_snapshot_source_id"),
+                    "source_settlement_crosscheck_status": (source or {}).get("settlement_crosscheck_status"),
+                    "source_settlement_mismatch_reason": (source or {}).get("settlement_mismatch_reason"),
+                    "replay_settlement_crosscheck_status": (replay or {}).get("settlement_crosscheck_status"),
+                    "replay_settlement_mismatch_reason": (replay or {}).get("settlement_mismatch_reason"),
+                    "refresh_causes": refresh_causes,
                     "reasons": reasons,
                     "missing_reasons": (source or {}).get("missing_reasons") or [],
                 }
@@ -1674,6 +2051,9 @@ class HistoricalTrainingService:
                     ("weather_source_kind", "weather_source_kind"),
                     ("market_snapshot_id", "market_snapshot_source_id"),
                     ("weather_snapshot_id", "weather_snapshot_source_id"),
+                    ("settlement_crosscheck_status", "settlement_crosscheck_status"),
+                    ("settlement_mismatch_reason", "settlement_mismatch_reason"),
+                    ("settlement_label_signature", "settlement_label_signature"),
                 ):
                     source_value = source.get(field_name)
                     replay_value = replay.get(replay_field)
@@ -1691,6 +2071,11 @@ class HistoricalTrainingService:
         return {
             "refresh_needed": bool(issues),
             "issue_counts": dict(counts),
+            "refresh_counts_by_cause": {
+                "coverage_repair": refresh_cause_counts.get("coverage_repair", 0),
+                "settlement_repair": refresh_cause_counts.get("settlement_repair", 0),
+                "replay_logic_change": refresh_cause_counts.get("replay_logic_change", 0),
+            },
             "affected_room_ids": sorted(affected_room_ids),
             "affected_run_ids": sorted(affected_run_ids),
             "affected_market_days": [
@@ -1704,6 +2089,47 @@ class HistoricalTrainingService:
     @staticmethod
     def _historical_provenance_from_run(run: Any) -> dict[str, Any]:
         return dict((run.payload or {}).get("historical_provenance") or {})
+
+    def _crosscheck_mismatch_reason_from_label(self, label: Any) -> str | None:
+        payload = dict(label.payload or {})
+        crosscheck = dict(payload.get("crosscheck") or {})
+        mismatch_reason = crosscheck.get("mismatch_reason")
+        if mismatch_reason:
+            return str(mismatch_reason)
+        if label.crosscheck_status == self.SETTLEMENT_MISMATCH:
+            return self.SETTLEMENT_MISMATCH_REASON_DISAGREEMENT
+        if label.crosscheck_status == self.SETTLEMENT_MISSING:
+            return self.SETTLEMENT_MISMATCH_REASON_MISSING
+        return None
+
+    def _settlement_label_signature(self, label: Any) -> str:
+        return json.dumps(
+            {
+                "crosscheck_status": label.crosscheck_status,
+                "crosscheck_result": label.crosscheck_result,
+                "crosscheck_high_f": str(label.crosscheck_high_f) if label.crosscheck_high_f is not None else None,
+                "mismatch_reason": self._crosscheck_mismatch_reason_from_label(label),
+                "kalshi_result": label.kalshi_result,
+                "settlement_value_dollars": (
+                    str(label.settlement_value_dollars)
+                    if label.settlement_value_dollars is not None
+                    else None
+                ),
+            },
+            sort_keys=True,
+        )
+
+    def _settlement_mismatch_breakdown(self, settlement_labels: list[Any]) -> dict[str, int]:
+        counts: Counter[str] = Counter()
+        for label in settlement_labels:
+            mismatch_reason = self._crosscheck_mismatch_reason_from_label(label)
+            if mismatch_reason is not None:
+                counts[mismatch_reason] += 1
+        return {
+            self.SETTLEMENT_MISMATCH_REASON_THRESHOLD_EDGE: counts.get(self.SETTLEMENT_MISMATCH_REASON_THRESHOLD_EDGE, 0),
+            self.SETTLEMENT_MISMATCH_REASON_DISAGREEMENT: counts.get(self.SETTLEMENT_MISMATCH_REASON_DISAGREEMENT, 0),
+            self.SETTLEMENT_MISMATCH_REASON_MISSING: counts.get(self.SETTLEMENT_MISMATCH_REASON_MISSING, 0),
+        }
 
     async def _import_market_definitions(
         self,
@@ -2142,6 +2568,9 @@ class HistoricalTrainingService:
                         "market_source_kind": market_source_kind,
                         "weather_source_kind": weather_source_kind,
                         "settlement_label_id": settlement_label.id,
+                        "settlement_crosscheck_status": settlement_label.crosscheck_status,
+                        "settlement_mismatch_reason": self._crosscheck_mismatch_reason_from_label(settlement_label),
+                        "settlement_label_signature": self._settlement_label_signature(settlement_label),
                         "coverage_class": coverage_class,
                         "replay_logic_version": self.replay_logic_version(),
                         "source_coverage": {
@@ -2417,6 +2846,9 @@ class HistoricalTrainingService:
                         "market_source_kind": market_source_kind,
                         "weather_source_kind": weather_source_kind,
                         "settlement_label_id": settlement_label.id,
+                        "settlement_crosscheck_status": settlement_label.crosscheck_status,
+                        "settlement_mismatch_reason": self._crosscheck_mismatch_reason_from_label(settlement_label),
+                        "settlement_label_signature": self._settlement_label_signature(settlement_label),
                         "coverage_class": coverage_class,
                         "replay_logic_version": self.replay_logic_version(),
                         "source_coverage": {
@@ -2527,7 +2959,12 @@ class HistoricalTrainingService:
     ) -> dict[str, Any]:
         station = mapping.daily_summary_station_id or mapping.station_id
         if not station or mapping.threshold_f is None:
-            return {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+            return {
+                "status": self.SETTLEMENT_MISSING,
+                "daily_high_f": None,
+                "result": None,
+                "mismatch_reason": self.SETTLEMENT_MISMATCH_REASON_MISSING,
+            }
         params = {
             "dataset": "daily-summaries",
             "stations": station,
@@ -2541,19 +2978,37 @@ class HistoricalTrainingService:
         response.raise_for_status()
         rows = response.json()
         if not isinstance(rows, list) or not rows:
-            return {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+            return {
+                "status": self.SETTLEMENT_MISSING,
+                "daily_high_f": None,
+                "result": None,
+                "mismatch_reason": self.SETTLEMENT_MISMATCH_REASON_MISSING,
+            }
         value = rows[0].get("TMAX")
         if value in (None, ""):
-            return {"status": self.SETTLEMENT_MISSING, "daily_high_f": None, "result": None}
+            return {
+                "status": self.SETTLEMENT_MISSING,
+                "daily_high_f": None,
+                "result": None,
+                "mismatch_reason": self.SETTLEMENT_MISMATCH_REASON_MISSING,
+            }
         high_f = Decimal(str(value)).quantize(Decimal("0.01"))
         result = self._settlement_result_from_high(mapping, high_f)
         kalshi_result_normalized = str(kalshi_result or "").strip().lower() or None
-        status = (
-            self.SETTLEMENT_MATCH
-            if kalshi_result_normalized in (None, result)
-            else self.SETTLEMENT_MISMATCH
-        )
-        return {"status": status, "daily_high_f": high_f, "result": result}
+        mismatch_reason: str | None = None
+        if kalshi_result_normalized not in (None, result):
+            threshold = Decimal(str(mapping.threshold_f)).quantize(Decimal("0.01"))
+            if high_f == threshold and mapping.operator in (">", "<"):
+                mismatch_reason = self.SETTLEMENT_MISMATCH_REASON_THRESHOLD_EDGE
+            else:
+                mismatch_reason = self.SETTLEMENT_MISMATCH_REASON_DISAGREEMENT
+        status = self.SETTLEMENT_MATCH if mismatch_reason is None else self.SETTLEMENT_MISMATCH
+        return {
+            "status": status,
+            "daily_high_f": high_f,
+            "result": result,
+            "mismatch_reason": mismatch_reason,
+        }
 
     async def _coverage_status(self, settlement_labels: list[Any], *, verbose: bool) -> dict[str, Any]:
         missing_reason_counts: Counter[str] = Counter()
@@ -2601,6 +3056,9 @@ class HistoricalTrainingService:
                         "local_market_day": label.local_market_day,
                         "coverage_class": coverage_class,
                         "replayable": replayable,
+                        "settlement_crosscheck_status": label.crosscheck_status,
+                        "settlement_mismatch_reason": self._crosscheck_mismatch_reason_from_label(label),
+                        "settlement_label_signature": self._settlement_label_signature(label),
                         "checkpoints": checkpoint_rows,
                     }
                 )
@@ -2734,7 +3192,9 @@ class HistoricalTrainingService:
             weather_snapshot = await self._select_weather_snapshot(
                 repo,
                 station_id=mapping.station_id,
+                series_ticker=mapping.series_ticker,
                 local_market_day=label.local_market_day,
+                checkpoint_label=checkpoint_label,
                 checkpoint_ts=checkpoint_ts,
             )
             missing_reasons: list[str] = []
@@ -2795,9 +3255,36 @@ class HistoricalTrainingService:
         repo: PlatformRepository,
         *,
         station_id: str,
+        series_ticker: str | None,
         local_market_day: str,
+        checkpoint_label: str,
         checkpoint_ts: datetime,
     ):
+        if series_ticker:
+            archive = await repo.get_historical_checkpoint_archive(
+                series_ticker=series_ticker,
+                local_market_day=local_market_day,
+                checkpoint_label=checkpoint_label,
+            )
+            if archive is not None:
+                archive_payload = dict(archive.payload or {})
+                weather_source_kind = str(
+                    archive_payload.get("weather_source_kind")
+                    or self.CHECKPOINT_CAPTURED_WEATHER_SOURCE
+                )
+                weather_source_id = str(
+                    archive_payload.get("weather_source_id")
+                    or archive.source_id
+                    or ""
+                )
+                if weather_source_id:
+                    archive_snapshot = await repo.get_historical_weather_snapshot_by_source(
+                        station_id=station_id,
+                        source_kind=weather_source_kind,
+                        source_id=weather_source_id,
+                    )
+                    if archive_snapshot is not None:
+                        return archive_snapshot
         snapshots = await repo.list_historical_weather_snapshots(
             station_id=station_id,
             local_market_day=local_market_day,
@@ -2814,6 +3301,14 @@ class HistoricalTrainingService:
             if match is not None:
                 return match
         return None
+
+    @staticmethod
+    def _weather_snapshot_checkpoint_metadata(snapshot: Any) -> dict[str, Any]:
+        return {
+            "observation_ts": getattr(snapshot, "observation_ts", None),
+            "forecast_updated_ts": getattr(snapshot, "forecast_updated_ts", None),
+            "asof_ts": getattr(snapshot, "asof_ts", None),
+        }
 
     def _coverage_class(self, selections: list[HistoricalCheckpointSelection], *, use_outcome_only: bool = True) -> str:
         if not selections:
@@ -3632,8 +4127,12 @@ class HistoricalTrainingService:
     @staticmethod
     def _settlement_result_from_high(mapping: WeatherMarketMapping, high_f: Decimal) -> str:
         threshold = Decimal(str(mapping.threshold_f))
-        if mapping.operator in (">", ">="):
+        if mapping.operator == ">":
+            return "yes" if high_f > threshold else "no"
+        if mapping.operator == ">=":
             return "yes" if high_f >= threshold else "no"
+        if mapping.operator == "<":
+            return "yes" if high_f < threshold else "no"
         return "yes" if high_f <= threshold else "no"
 
     @staticmethod

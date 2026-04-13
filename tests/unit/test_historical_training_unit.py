@@ -77,6 +77,76 @@ async def test_daily_summary_crosscheck_detects_mismatch() -> None:
     assert result["status"] == HistoricalTrainingService.SETTLEMENT_MISMATCH
     assert str(result["daily_high_f"]) == "82.00"
     assert result["result"] == "yes"
+    assert result["mismatch_reason"] == HistoricalTrainingService.SETTLEMENT_MISMATCH_REASON_DISAGREEMENT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operator", "kalshi_result"),
+    [
+        (">", "no"),
+        ("<", "no"),
+    ],
+)
+async def test_daily_summary_crosscheck_treats_strict_threshold_equality_as_no(operator: str, kalshi_result: str) -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.client = _DummyClient([{"TMAX": "80"}])
+
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHNY-26APR13-T80",
+        market_type="weather",
+        station_id="KNYC",
+        daily_summary_station_id="USW00094728",
+        location_name="New York City",
+        latitude=40.7146,
+        longitude=-74.0071,
+        threshold_f=80,
+        operator=operator,
+        settlement_source="NWS daily summary",
+        series_ticker="KXHIGHNY",
+    )
+
+    result = await HistoricalTrainingService._daily_summary_crosscheck(
+        service,
+        mapping,
+        "2026-04-13",
+        kalshi_result=kalshi_result,
+    )
+
+    assert result["status"] == HistoricalTrainingService.SETTLEMENT_MATCH
+    assert result["result"] == "no"
+    assert result["mismatch_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_daily_summary_crosscheck_classifies_threshold_edge_strictness() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.client = _DummyClient([{"TMAX": "80"}])
+
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHNY-26APR13-T80",
+        market_type="weather",
+        station_id="KNYC",
+        daily_summary_station_id="USW00094728",
+        location_name="New York City",
+        latitude=40.7146,
+        longitude=-74.0071,
+        threshold_f=80,
+        operator=">",
+        settlement_source="NWS daily summary",
+        series_ticker="KXHIGHNY",
+    )
+
+    result = await HistoricalTrainingService._daily_summary_crosscheck(
+        service,
+        mapping,
+        "2026-04-13",
+        kalshi_result="yes",
+    )
+
+    assert result["status"] == HistoricalTrainingService.SETTLEMENT_MISMATCH
+    assert result["result"] == "no"
+    assert result["mismatch_reason"] == HistoricalTrainingService.SETTLEMENT_MISMATCH_REASON_THRESHOLD_EDGE
 
 
 def test_historical_split_keeps_market_day_together() -> None:
@@ -239,6 +309,21 @@ def test_select_weather_snapshot_prefers_checkpoint_archives() -> None:
     service = object.__new__(HistoricalTrainingService)
 
     class _Repo:
+        async def get_historical_checkpoint_archive(self, **kwargs):
+            return SimpleNamespace(
+                source_id="checkpoint",
+                payload={
+                    "weather_source_kind": HistoricalTrainingService.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
+                    "weather_source_id": "checkpoint",
+                },
+            )
+
+        async def get_historical_weather_snapshot_by_source(self, **kwargs):
+            return SimpleNamespace(
+                source_kind=HistoricalTrainingService.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
+                source_id="checkpoint",
+            )
+
         async def list_historical_weather_snapshots(self, **kwargs):
             return [
                 SimpleNamespace(source_kind=HistoricalTrainingService.CAPTURED_WEATHER_SOURCE, source_id="captured"),
@@ -251,13 +336,47 @@ def test_select_weather_snapshot_prefers_checkpoint_archives() -> None:
             service,
             _Repo(),
             station_id="KNYC",
+            series_ticker="KXHIGHNY",
             local_market_day="2026-04-10",
+            checkpoint_label="open_0900",
             checkpoint_ts=datetime(2026, 4, 10, 13, 0, tzinfo=UTC),
         )
     )
 
     assert result is not None
     assert result.source_kind == HistoricalTrainingService.CHECKPOINT_CAPTURED_WEATHER_SOURCE
+
+
+def test_select_weather_snapshot_falls_back_to_asof_sources_when_archive_missing() -> None:
+    service = object.__new__(HistoricalTrainingService)
+
+    class _Repo:
+        async def get_historical_checkpoint_archive(self, **kwargs):
+            return None
+
+        async def get_historical_weather_snapshot_by_source(self, **kwargs):
+            return None
+
+        async def list_historical_weather_snapshots(self, **kwargs):
+            return [
+                SimpleNamespace(source_kind=HistoricalTrainingService.CAPTURED_WEATHER_SOURCE, source_id="captured"),
+                SimpleNamespace(source_kind=HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE, source_id="archived"),
+            ]
+
+    result = asyncio.run(
+        HistoricalTrainingService._select_weather_snapshot(
+            service,
+            _Repo(),
+            station_id="KNYC",
+            series_ticker="KXHIGHNY",
+            local_market_day="2026-04-10",
+            checkpoint_label="open_0900",
+            checkpoint_ts=datetime(2026, 4, 10, 13, 0, tzinfo=UTC),
+        )
+    )
+
+    assert result is not None
+    assert result.source_kind == HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE
 
 
 def test_coverage_backlog_distinguishes_promotable_and_permanent_outcome_only() -> None:
@@ -331,6 +450,47 @@ def test_coverage_backlog_distinguishes_promotable_and_permanent_outcome_only() 
     assert backlog["market_day_reason_counts"]["settlement_crosscheck_missing"] == 1
     assert backlog["promotable_market_day_counts"]["promotable_to_full_checkpoint_coverage"] == 1
     assert backlog["promotable_market_day_counts"]["permanently_outcome_only_with_current_sources"] == 1
+
+
+def test_coverage_repair_summary_counts_promoted_and_recoverable_gaps() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    backlog = {
+        "all_samples": [
+            {
+                "promotable_status": "promotable_to_full_checkpoint_coverage",
+                "day_reasons": ["weather_snapshot_missing", "checkpoint_archive_missing"],
+            },
+            {
+                "promotable_status": "permanently_outcome_only_with_current_sources",
+                "day_reasons": ["weather_snapshot_missing", "checkpoint_archive_missing"],
+            },
+        ],
+        "promotable_market_day_counts": {
+            "promotable_to_full_checkpoint_coverage": 1,
+            "promotable_to_partial_or_late_only": 2,
+            "permanently_outcome_only_with_current_sources": 1,
+        },
+    }
+    checkpoint_rows = [
+        {
+            "checkpoints": [
+                {"source_kind": HistoricalTrainingService.PROMOTED_CHECKPOINT_ARCHIVE_SOURCE},
+                {"source_kind": "manual_checkpoint_capture_once"},
+            ]
+        }
+    ]
+
+    summary = HistoricalTrainingService._coverage_repair_summary(
+        service,
+        coverage_backlog=backlog,
+        checkpoint_rows=checkpoint_rows,
+    )
+
+    assert summary["checkpoint_archive_promotion_count"] == 1
+    assert summary["recoverable_market_day_count"] == 3
+    assert summary["permanent_outcome_only_market_day_count"] == 1
+    assert summary["recoverable_weather_gap_market_day_count"] == 1
+    assert summary["permanent_weather_gap_market_day_count"] == 1
 
 
 def test_confidence_progress_exposes_support_blockers() -> None:
@@ -550,6 +710,9 @@ def test_replay_audit_detects_missing_stale_and_orphan_replays() -> None:
             "series_ticker": "KXHIGHNY",
             "local_market_day": "2026-04-11",
             "coverage_class": HistoricalTrainingService.COVERAGE_FULL,
+            "settlement_crosscheck_status": HistoricalTrainingService.SETTLEMENT_MATCH,
+            "settlement_mismatch_reason": None,
+            "settlement_label_signature": '{"crosscheck_high_f":"81.00","crosscheck_result":"yes","crosscheck_status":"match","kalshi_result":"yes","mismatch_reason":null,"settlement_value_dollars":"1.0000"}',
             "checkpoints": [
                 {
                     "checkpoint_label": "open_0900",
@@ -568,6 +731,9 @@ def test_replay_audit_detects_missing_stale_and_orphan_replays() -> None:
             "series_ticker": "KXHIGHNY",
             "local_market_day": "2026-04-11",
             "coverage_class": HistoricalTrainingService.COVERAGE_FULL,
+            "settlement_crosscheck_status": HistoricalTrainingService.SETTLEMENT_MATCH,
+            "settlement_mismatch_reason": None,
+            "settlement_label_signature": '{"crosscheck_high_f":"82.00","crosscheck_result":"yes","crosscheck_status":"match","kalshi_result":"yes","mismatch_reason":null,"settlement_value_dollars":"1.0000"}',
             "checkpoints": [
                 {
                     "checkpoint_label": "midday_1300",
@@ -586,6 +752,9 @@ def test_replay_audit_detects_missing_stale_and_orphan_replays() -> None:
             "series_ticker": "KXHIGHNY",
             "local_market_day": "2026-04-11",
             "coverage_class": HistoricalTrainingService.COVERAGE_NONE,
+            "settlement_crosscheck_status": HistoricalTrainingService.SETTLEMENT_MISSING,
+            "settlement_mismatch_reason": HistoricalTrainingService.SETTLEMENT_MISMATCH_REASON_MISSING,
+            "settlement_label_signature": '{"crosscheck_high_f":null,"crosscheck_result":null,"crosscheck_status":"missing","kalshi_result":"no","mismatch_reason":"crosscheck_missing","settlement_value_dollars":"0.0000"}',
             "checkpoints": [
                 {
                     "checkpoint_label": "late_1700",
@@ -617,6 +786,9 @@ def test_replay_audit_detects_missing_stale_and_orphan_replays() -> None:
                     "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
                     "market_snapshot_source_id": "stale-market-source",
                     "weather_snapshot_source_id": "weather-source-1",
+                    "settlement_crosscheck_status": HistoricalTrainingService.SETTLEMENT_MATCH,
+                    "settlement_mismatch_reason": None,
+                    "settlement_label_signature": '{"crosscheck_high_f":"81.00","crosscheck_result":"yes","crosscheck_status":"match","kalshi_result":"yes","mismatch_reason":null,"settlement_value_dollars":"1.0000"}',
                 }
             },
         ),
@@ -636,6 +808,9 @@ def test_replay_audit_detects_missing_stale_and_orphan_replays() -> None:
                     "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
                     "market_snapshot_source_id": "market-source-orphan",
                     "weather_snapshot_source_id": "weather-source-orphan",
+                    "settlement_crosscheck_status": HistoricalTrainingService.SETTLEMENT_MISSING,
+                    "settlement_mismatch_reason": HistoricalTrainingService.SETTLEMENT_MISMATCH_REASON_MISSING,
+                    "settlement_label_signature": '{"crosscheck_high_f":null,"crosscheck_result":null,"crosscheck_status":"missing","kalshi_result":"no","mismatch_reason":"crosscheck_missing","settlement_value_dollars":"0.0000"}',
                 }
             },
         ),
@@ -652,6 +827,7 @@ def test_replay_audit_detects_missing_stale_and_orphan_replays() -> None:
     assert audit["issue_counts"]["stale_replay"] == 1
     assert audit["issue_counts"]["missing_replay"] == 1
     assert audit["issue_counts"]["orphan_replay"] == 1
+    assert audit["refresh_counts_by_cause"]["coverage_repair"] == 3
     assert sorted(audit["affected_room_ids"]) == ["room-orphan", "room-stale"]
 
 
@@ -669,6 +845,9 @@ def test_replay_audit_flags_logic_version_mismatch_as_stale() -> None:
             "series_ticker": "KXHIGHNY",
             "local_market_day": "2026-04-11",
             "coverage_class": HistoricalTrainingService.COVERAGE_FULL,
+            "settlement_crosscheck_status": HistoricalTrainingService.SETTLEMENT_MATCH,
+            "settlement_mismatch_reason": None,
+            "settlement_label_signature": '{"crosscheck_high_f":"81.00","crosscheck_result":"yes","crosscheck_status":"match","kalshi_result":"yes","mismatch_reason":null,"settlement_value_dollars":"1.0000"}',
             "checkpoints": [
                 {
                     "checkpoint_label": "open_0900",
@@ -701,6 +880,9 @@ def test_replay_audit_flags_logic_version_mismatch_as_stale() -> None:
                     "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
                     "market_snapshot_source_id": "market-source-1",
                     "weather_snapshot_source_id": "weather-source-1",
+                    "settlement_crosscheck_status": HistoricalTrainingService.SETTLEMENT_MATCH,
+                    "settlement_mismatch_reason": None,
+                    "settlement_label_signature": '{"crosscheck_high_f":"81.00","crosscheck_result":"yes","crosscheck_status":"match","kalshi_result":"yes","mismatch_reason":null,"settlement_value_dollars":"1.0000"}',
                 }
             },
         )
@@ -716,6 +898,71 @@ def test_replay_audit_flags_logic_version_mismatch_as_stale() -> None:
     assert audit["refresh_needed"] is True
     assert audit["issue_counts"]["stale_replay"] == 1
     assert audit["issues"][0]["reasons"] == ["replay_logic_version_changed"]
+    assert audit["refresh_counts_by_cause"]["replay_logic_change"] == 1
+
+
+def test_replay_audit_flags_settlement_signature_change_as_settlement_repair() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    coverage_rows = [
+        {
+            "market_ticker": "KXHIGHNY-26APR11-T61",
+            "series_ticker": "KXHIGHNY",
+            "local_market_day": "2026-04-11",
+            "coverage_class": HistoricalTrainingService.COVERAGE_FULL,
+            "settlement_crosscheck_status": HistoricalTrainingService.SETTLEMENT_MATCH,
+            "settlement_mismatch_reason": None,
+            "settlement_label_signature": "new-signature",
+            "checkpoints": [
+                {
+                    "checkpoint_label": "open_0900",
+                    "checkpoint_ts": "2026-04-11T13:00:00+00:00",
+                    "replayable": True,
+                    "market_source_kind": HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+                    "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
+                    "market_snapshot_id": "market-source-1",
+                    "weather_snapshot_id": "weather-source-1",
+                    "missing_reasons": [],
+                }
+            ],
+        }
+    ]
+    replay_runs = [
+        SimpleNamespace(
+            id="run-settlement",
+            room_id="room-settlement",
+            status="completed",
+            market_ticker="KXHIGHNY-26APR11-T61",
+            series_ticker="KXHIGHNY",
+            local_market_day="2026-04-11",
+            checkpoint_label="open_0900",
+            checkpoint_ts=datetime(2026, 4, 11, 13, 0, tzinfo=UTC),
+            payload={
+                "historical_provenance": {
+                    "coverage_class": HistoricalTrainingService.COVERAGE_FULL,
+                    "replay_logic_version": HistoricalTrainingService.replay_logic_version(),
+                    "market_source_kind": HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+                    "weather_source_kind": HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE,
+                    "market_snapshot_source_id": "market-source-1",
+                    "weather_snapshot_source_id": "weather-source-1",
+                    "settlement_crosscheck_status": HistoricalTrainingService.SETTLEMENT_MISMATCH,
+                    "settlement_mismatch_reason": HistoricalTrainingService.SETTLEMENT_MISMATCH_REASON_THRESHOLD_EDGE,
+                    "settlement_label_signature": "old-signature",
+                }
+            },
+        )
+    ]
+
+    audit = HistoricalTrainingService._build_replay_audit(
+        service,
+        coverage_rows=coverage_rows,
+        replay_runs=replay_runs,
+        verbose=True,
+    )
+
+    assert audit["refresh_needed"] is True
+    assert audit["issue_counts"]["stale_replay"] == 1
+    assert "settlement_label_signature_changed" in audit["issues"][0]["reasons"]
+    assert audit["refresh_counts_by_cause"]["settlement_repair"] == 1
 
 
 @pytest.mark.asyncio

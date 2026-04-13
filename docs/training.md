@@ -69,6 +69,14 @@ Coverage backlog is now split into what is recoverable versus what is currently 
 - `promotable_to_partial_or_late_only`: the day is currently `outcome_only`, but at least one side of the checkpoint evidence already exists
 - `permanently_outcome_only_with_current_sources`: the day still has settlement and PnL value, but there is no current replay-source coverage to lift it without new archives
 
+Historical settlement crosschecks now respect strict market operators. That means `>` and `<` no longer behave like inclusive comparisons at the exact threshold, which removes the false mismatch cluster we saw on exact-threshold days. Historical status now breaks crosschecks out as:
+
+- `threshold_edge_strictness`: a strict threshold edge case that should not be treated like a random data disagreement
+- `daily_summary_disagreement`: a real Kalshi versus NOAA/NCEI disagreement that should stay quarantined
+- `crosscheck_missing`: no usable NOAA/NCEI crosscheck was available
+
+Historical weather backfill now also promotes recoverable as-of weather evidence into checkpoint-archive records when the source bundle is already valid for that checkpoint. That does not fabricate missing history; it just upgrades already-valid weather evidence into the dedicated checkpoint path so replay support and checkpoint-archive coverage stay aligned.
+
 Deploy findings from April 12, 2026:
 
 - the new checkpoint archive path is healthy, but a manual `historical-archive checkpoint-capture --once` may correctly return zero captures when no checkpoint slot is currently due
@@ -76,6 +84,7 @@ Deploy findings from April 12, 2026:
 - the current blocker for historical Gemini fine-tuning is still missing full-checkpoint weather coverage, so exports should remain `draft_only` until distinct full-coverage market-days accumulate naturally
 - historical replay repair is now part of the normal maintenance path when replay logic changes; stale derived replay rooms should be refreshed rather than trusted
 - historical intelligence indicators are only trustworthy after replay refresh, because stale replay rooms can otherwise collapse into misleading blanket stand-down reasons like `market_stale`
+- settlement refresh is now also part of replay maintenance; when crosscheck semantics or mismatch classification change, the rolling replay corpus and overlapping historical builds should be refreshed so readiness stays tied to current truth
 
 ## What Gets Captured
 

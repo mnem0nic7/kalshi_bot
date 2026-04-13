@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     llm_local_model: str = "llama3.1:8b"
     gemini_api_key: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("GEMINI_API_KEY", "GEMINI_KEY"),
+        validation_alias=AliasChoices("GEMINI_KEY", "GEMINI_API_KEY"),
     )
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     gemini_model_researcher: str = "gemini-2.5-flash"

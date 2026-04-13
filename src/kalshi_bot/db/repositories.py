@@ -1848,6 +1848,20 @@ class PlatformRepository:
         )
         return records[0] if records else None
 
+    async def get_historical_weather_snapshot_by_source(
+        self,
+        *,
+        station_id: str,
+        source_kind: str,
+        source_id: str,
+    ) -> HistoricalWeatherSnapshotRecord | None:
+        stmt = select(HistoricalWeatherSnapshotRecord).where(
+            HistoricalWeatherSnapshotRecord.station_id == station_id,
+            HistoricalWeatherSnapshotRecord.source_kind == source_kind,
+            HistoricalWeatherSnapshotRecord.source_id == source_id,
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def upsert_historical_checkpoint_archive(
         self,
         *,

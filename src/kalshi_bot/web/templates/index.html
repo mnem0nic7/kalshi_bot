@@ -113,7 +113,9 @@
       <span>materialized replay market-days · {{ historical_status.replay_corpus.market_day_count }}</span>
       <span>clean trainable · {{ historical_status.clean_historical_trainable_count }}</span>
       <span>settlement mismatches · {{ historical_status.settlement_mismatch_count }}</span>
+      <span>mismatch breakdown · {{ historical_status.settlement_mismatch_breakdown }}</span>
       <span>settlement backfilled · {{ historical_status.settlement_backfilled_count }}</span>
+      <span>checkpoint promotions · {{ historical_status.checkpoint_archive_promotion_count }}</span>
       <span>possible ingestion gaps · {{ historical_status.possible_ingestion_gap_count }}</span>
       <span>refresh needed · {{ historical_status.refresh_needed }}</span>
       <span>stale builds · {{ historical_status.stale_build_count }}</span>
@@ -173,6 +175,7 @@
       {% for reason, count in historical_status.checkpoint_archive_coverage.checkpoint_capture_gaps.reason_counts.items() %}
       <span>{{ reason }} · {{ count }}</span>
       {% endfor %}
+      <span>coverage repair summary · {{ historical_status.coverage_repair_summary }}</span>
       {% for sample in historical_status.coverage_backlog.samples %}
       <span>{{ sample.market_ticker }} · {{ sample.local_market_day }} · {{ sample.promotable_status }} · {{ sample.day_reasons }}</span>
       {% else %}
@@ -193,6 +196,7 @@
       <span>stale replay checkpoints · {{ historical_status.replay_corpus.stale_replay_count }}</span>
       <span>missing replay checkpoints · {{ historical_status.replay_corpus.missing_replay_count }}</span>
       <span>orphan replay checkpoints · {{ historical_status.replay_corpus.orphan_replay_count }}</span>
+      <span>refresh causes · {{ historical_status.replay_refresh_counts_by_cause }}</span>
       <span>execution support · {{ historical_status.confidence_progress.execution_support.current }} / {{ historical_status.confidence_progress.execution_support.target }}</span>
       <span>directional support · {{ historical_status.confidence_progress.directional_support.current }} / {{ historical_status.confidence_progress.directional_support.target }}</span>
       <span>holdout support · {{ historical_status.confidence_progress.holdout_support.current }} / {{ historical_status.confidence_progress.holdout_support.target }}</span>
