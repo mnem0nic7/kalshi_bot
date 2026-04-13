@@ -40,6 +40,8 @@ Going forward, the daemon also captures dedicated checkpoint weather bundles on 
 
 Historical replay now uses checkpoint-time decision logic instead of wall-clock time. That matters because historical staleness and eligibility should be evaluated at the replay checkpoint, not at the moment the replay job happens to run.
 
+The rolling one-year bootstrap is now chunked and resumable by default. The standard shape is `--chunk-days 14`, which lets us advance a long backfill in recoverable slices. If a bootstrap is interrupted, `historical-pipeline resume` continues from the persisted chunk cursor instead of repeating completed chunks.
+
 The historical status surfaces now separate three different truths:
 
 - `source_replay_coverage`: what the current strict-asof source tables could replay
@@ -53,6 +55,19 @@ The confidence loop is separate from raw readiness:
 - `insufficient_support`: not enough rolling-year support yet to trust either execution or directional heuristic changes
 - `execution_confident_only`: enough replayable market-days to tune execution-quality heuristics, but not enough full-checkpoint support to trust directional rewrites
 - `directional_confident`: enough execution support plus enough full-checkpoint market-days and holdout days to judge directional changes honestly
+
+Historical status now also reports progress-to-threshold metrics directly:
+
+- execution support progress toward `60` distinct execution-usable market-days
+- directional support progress toward `30` distinct full-checkpoint market-days
+- holdout support progress toward `7` full-checkpoint holdout market-days
+- explicit blocker labels such as `lack_of_execution_support`, `lack_of_full_coverage_support`, and `lack_of_holdout_support`
+
+Coverage backlog is now split into what is recoverable versus what is currently outcome-only:
+
+- `promotable_to_full_checkpoint_coverage`: the day is already `late_only` or `partial`, so more checkpoint sources can lift it into full directional coverage
+- `promotable_to_partial_or_late_only`: the day is currently `outcome_only`, but at least one side of the checkpoint evidence already exists
+- `permanently_outcome_only_with_current_sources`: the day still has settlement and PnL value, but there is no current replay-source coverage to lift it without new archives
 
 Deploy findings from April 12, 2026:
 
@@ -136,9 +151,10 @@ kalshi-bot-cli historical-status --verbose
 Run the rolling one-year historical pipeline:
 
 ```bash
-kalshi-bot-cli historical-pipeline bootstrap --days 365 --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+kalshi-bot-cli historical-pipeline bootstrap --days 365 --chunk-days 14 --series KXHIGHNY KXHIGHCHI KXHIGHMIA
+kalshi-bot-cli historical-pipeline resume --series KXHIGHNY KXHIGHCHI KXHIGHMIA
 kalshi-bot-cli historical-pipeline daily --series KXHIGHNY KXHIGHCHI KXHIGHMIA
-kalshi-bot-cli historical-pipeline status
+kalshi-bot-cli historical-pipeline status --verbose
 ```
 
 Backfill missing checkpoint coverage before replay:

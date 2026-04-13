@@ -260,6 +260,110 @@ def test_select_weather_snapshot_prefers_checkpoint_archives() -> None:
     assert result.source_kind == HistoricalTrainingService.CHECKPOINT_CAPTURED_WEATHER_SOURCE
 
 
+def test_coverage_backlog_distinguishes_promotable_and_permanent_outcome_only() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    coverage_rows = [
+        {
+            "market_ticker": "KXHIGHNY-26APR10-T80",
+            "series_ticker": "KXHIGHNY",
+            "local_market_day": "2026-04-10",
+            "coverage_class": HistoricalTrainingService.COVERAGE_PARTIAL,
+            "checkpoints": [
+                {
+                    "market_snapshot_id": "market-1",
+                    "market_source_kind": "captured_market_snapshot",
+                    "weather_snapshot_id": None,
+                    "weather_source_kind": None,
+                    "missing_reasons": ["weather_snapshot_missing"],
+                }
+            ],
+        },
+        {
+            "market_ticker": "KXHIGHNY-26APR11-T80",
+            "series_ticker": "KXHIGHNY",
+            "local_market_day": "2026-04-11",
+            "coverage_class": HistoricalTrainingService.COVERAGE_OUTCOME_ONLY,
+            "checkpoints": [
+                {
+                    "market_snapshot_id": None,
+                    "market_source_kind": None,
+                    "weather_snapshot_id": None,
+                    "weather_source_kind": None,
+                    "missing_reasons": ["market_snapshot_missing", "weather_snapshot_missing"],
+                }
+            ],
+        },
+    ]
+    checkpoint_rows = [
+        {
+            "market_ticker": "KXHIGHNY-26APR10-T80",
+            "local_market_day": "2026-04-10",
+            "checkpoints": [{"captured": False}],
+        },
+        {
+            "market_ticker": "KXHIGHNY-26APR11-T80",
+            "local_market_day": "2026-04-11",
+            "checkpoints": [{"captured": False}],
+        },
+    ]
+    settlement_labels = [
+        SimpleNamespace(
+            market_ticker="KXHIGHNY-26APR10-T80",
+            local_market_day="2026-04-10",
+            crosscheck_status=HistoricalTrainingService.SETTLEMENT_MATCH,
+        ),
+        SimpleNamespace(
+            market_ticker="KXHIGHNY-26APR11-T80",
+            local_market_day="2026-04-11",
+            crosscheck_status=HistoricalTrainingService.SETTLEMENT_MISSING,
+        ),
+    ]
+
+    backlog = HistoricalTrainingService._coverage_backlog(
+        service,
+        coverage_rows=coverage_rows,
+        checkpoint_rows=checkpoint_rows,
+        settlement_labels=settlement_labels,
+        verbose=True,
+    )
+
+    assert backlog["reason_counts"]["weather_snapshot_missing"] == 2
+    assert backlog["market_day_reason_counts"]["settlement_crosscheck_missing"] == 1
+    assert backlog["promotable_market_day_counts"]["promotable_to_full_checkpoint_coverage"] == 1
+    assert backlog["promotable_market_day_counts"]["permanently_outcome_only_with_current_sources"] == 1
+
+
+def test_confidence_progress_exposes_support_blockers() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.settings = SimpleNamespace(
+        historical_execution_confidence_min_market_days=60,
+        historical_directional_confidence_min_full_market_days=30,
+        historical_directional_confidence_min_holdout_market_days=7,
+    )
+
+    progress = HistoricalTrainingService._confidence_progress(
+        service,
+        {
+            "confidence_state": "insufficient_support",
+            "distinct_execution_market_days": 12,
+            "distinct_full_market_days": 2,
+            "full_coverage_holdout_market_days": 1,
+            "execution_confidence_threshold_market_days": 60,
+            "directional_confidence_threshold_market_days": 30,
+            "directional_confidence_threshold_holdout_market_days": 7,
+        },
+    )
+
+    assert progress["execution_support"]["remaining"] == 48
+    assert progress["directional_support"]["remaining"] == 28
+    assert progress["holdout_support"]["remaining"] == 6
+    assert progress["promotion_blockers"] == [
+        "lack_of_execution_support",
+        "lack_of_full_coverage_support",
+        "lack_of_holdout_support",
+    ]
+
+
 def test_select_market_snapshot_rejects_stale_captured_and_uses_fresh_reconstructed() -> None:
     service = object.__new__(HistoricalTrainingService)
     service.settings = SimpleNamespace(risk_stale_market_seconds=300, historical_replay_market_stale_seconds=900)

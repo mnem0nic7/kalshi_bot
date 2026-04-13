@@ -207,7 +207,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "historical-pipeline":
             if args.historical_pipeline_command == "status":
-                print(json.dumps(await container.historical_pipeline_service.status(), indent=2))
+                print(json.dumps(await container.historical_pipeline_service.status(verbose=args.verbose), indent=2))
                 return 0
             if args.historical_pipeline_command == "bootstrap":
                 print(
@@ -215,7 +215,16 @@ async def _run_cli(args: argparse.Namespace) -> int:
                         await container.historical_pipeline_service.bootstrap(
                             days=args.days,
                             series=args.series or None,
+                            chunk_days=args.chunk_days,
                         ),
+                        indent=2,
+                    )
+                )
+                return 0
+            if args.historical_pipeline_command == "resume":
+                print(
+                    json.dumps(
+                        await container.historical_pipeline_service.resume(series=args.series or None),
                         indent=2,
                     )
                 )
@@ -695,10 +704,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="historical_pipeline_command",
         required=True,
     )
-    historical_pipeline_subparsers.add_parser("status")
+    historical_pipeline_status = historical_pipeline_subparsers.add_parser("status")
+    historical_pipeline_status.add_argument("--verbose", action="store_true")
     historical_pipeline_bootstrap = historical_pipeline_subparsers.add_parser("bootstrap")
     historical_pipeline_bootstrap.add_argument("--days", type=int, default=None)
+    historical_pipeline_bootstrap.add_argument("--chunk-days", type=int, default=None)
     historical_pipeline_bootstrap.add_argument("--series", nargs="*", default=None)
+    historical_pipeline_resume = historical_pipeline_subparsers.add_parser("resume")
+    historical_pipeline_resume.add_argument("--series", nargs="*", default=None)
     historical_pipeline_daily = historical_pipeline_subparsers.add_parser("daily")
     historical_pipeline_daily.add_argument("--series", nargs="*", default=None)
 

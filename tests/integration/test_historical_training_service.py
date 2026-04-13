@@ -255,10 +255,15 @@ series_templates:
         assert "outcome_only_coverage_count" in historical_status.json()
         assert "draft_training_ready" in historical_status.json()
         assert "confidence_scorecard" in historical_status.json()
+        assert "coverage_backlog" in historical_status.json()
+        assert "promotable_market_day_counts" in historical_status.json()
+        assert "confidence_progress" in historical_status.json()
+        assert "bootstrap_progress" in historical_status.json()
 
-        pipeline_status = client.get("/api/historical/pipeline/status")
+        pipeline_status = client.get("/api/historical/pipeline/status?verbose=true")
         assert pipeline_status.status_code == 200
         assert "rolling_window" in pipeline_status.json()
+        assert "bootstrap_progress" in pipeline_status.json()
 
         status_response = client.get("/api/status")
         assert status_response.status_code == 200

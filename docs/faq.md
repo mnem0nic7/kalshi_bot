@@ -72,7 +72,7 @@ Historical replay imports settled weather market-days, captured market snapshots
 
 Those replayed rooms are marked `historical_replay`, kept out of live operator views by default, and exported into bundles, eval slices, or Gemini-first fine-tune files. If we do not have enough distinct full-coverage market-days yet, the Gemini export is marked draft-only instead of pretending it is ready to tune on.
 
-The default operational mode is now a rolling one-year historical pipeline. `historical-pipeline bootstrap` builds the last `365` settled days ending yesterday, and `historical-pipeline daily` only processes newly settled or newly replayable days before rerunning rolling-year intelligence and confidence refresh.
+The default operational mode is now a rolling one-year historical pipeline. `historical-pipeline bootstrap` builds the last `365` settled days ending yesterday, but it now runs in resumable chunks, typically `14` days at a time. `historical-pipeline resume` continues from the persisted chunk cursor, and `historical-pipeline daily` only processes newly settled or newly replayable days before rerunning rolling-year intelligence and confidence refresh.
 
 ## How do I tell whether the historical checks are healthy?
 
@@ -85,6 +85,12 @@ Read the historical status in three layers:
 If source coverage is ahead of replay corpus materialization, run the historical repair refresh path before trusting the dashboard or the intelligence output.
 
 Healthy indicators should also look plausible. After the replay-time staleness fix, the historical intelligence output should mostly surface real trade-quality reasons like `spread_too_wide`, `resolved_contract`, `book_effectively_broken`, or `insufficient_remaining_payout` instead of collapsing into blanket `market_stale`.
+
+Historical status now also shows the coverage backlog and confidence progress directly. The useful questions are:
+
+- is a day `promotable_to_full_checkpoint_coverage`, only `promotable_to_partial_or_late_only`, or effectively `permanently_outcome_only_with_current_sources`?
+- how far are we from the `60` execution-day threshold, the `30` full-checkpoint directional-day threshold, and the `7` full-checkpoint holdout-day threshold?
+- are we blocked by lack of execution support, lack of full-checkpoint support, or lack of holdout support?
 
 The confidence state should also make sense:
 

@@ -133,6 +133,7 @@ class Settings(BaseSettings):
     historical_intelligence_auto_promote: bool = True
     historical_intelligence_daily_run_seconds: int = 86400
     historical_pipeline_bootstrap_days: int = 365
+    historical_pipeline_chunk_days: int = 14
     historical_pipeline_daily_run_seconds: int = 86400
     historical_pipeline_incremental_days: int = 7
     historical_execution_confidence_min_market_days: int = 60

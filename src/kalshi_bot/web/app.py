@@ -661,9 +661,9 @@ def create_app() -> FastAPI:
         return JSONResponse(await app_container.historical_training_service.get_status(verbose=verbose))
 
     @app.get("/api/historical/pipeline/status")
-    async def historical_pipeline_status(request: Request) -> JSONResponse:
+    async def historical_pipeline_status(request: Request, verbose: bool = False) -> JSONResponse:
         app_container = container(request)
-        return JSONResponse(await app_container.historical_pipeline_service.status())
+        return JSONResponse(await app_container.historical_pipeline_service.status(verbose=verbose))
 
     @app.get("/api/historical/intelligence/status")
     async def historical_intelligence_status(request: Request) -> JSONResponse:

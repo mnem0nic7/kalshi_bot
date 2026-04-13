@@ -108,13 +108,11 @@ class HistoricalIntelligenceService:
             patch_suggestions = await repo.list_heuristic_patch_suggestions(limit=10)
             await session.commit()
         latest_run = recent_runs[0].payload if recent_runs else None
+        historical_status = await self.historical_training_service.get_status()
         fallback_confidence = self.historical_training_service._confidence_story(  # noqa: SLF001
             latest_run_payload=latest_run,
-            historical_build_readiness={
-                "distinct_full_coverage_market_days": 0,
-                "split_counts": {"holdout": 0},
-            },
-            source_replay_coverage={},
+            historical_build_readiness=historical_status.get("historical_build_readiness") or {},
+            source_replay_coverage=historical_status.get("source_replay_coverage") or {},
         )
         return {
             "active_pack_version": active_pack.version,
@@ -123,6 +121,8 @@ class HistoricalIntelligenceService:
             "latest_run": latest_run,
             "confidence_state": (latest_run or {}).get("confidence_state") or fallback_confidence["confidence_state"],
             "confidence_scorecard": (latest_run or {}).get("confidence_scorecard") or fallback_confidence["confidence_scorecard"],
+            "confidence_progress": historical_status.get("confidence_progress") or fallback_confidence["confidence_progress"],
+            "historical_build_readiness": historical_status.get("historical_build_readiness"),
             "heuristics": self.heuristic_service.status_payload(
                 control=control,
                 active_pack=active_pack,

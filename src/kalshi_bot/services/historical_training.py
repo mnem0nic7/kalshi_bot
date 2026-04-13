@@ -1014,6 +1014,7 @@ class HistoricalTrainingService:
         label_stats = self._historical_label_stats(selected, split, draft_only=draft_only, training_ready=training_ready)
         label_stats["confidence_state"] = confidence["confidence_state"]
         label_stats["confidence_scorecard"] = confidence["confidence_scorecard"]
+        label_stats["confidence_progress"] = confidence["confidence_progress"]
         build_version = f"historical-{request.mode}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -1038,6 +1039,7 @@ class HistoricalTrainingService:
                     "training_ready": training_ready,
                     "confidence_state": confidence["confidence_state"],
                     "confidence_scorecard": confidence["confidence_scorecard"],
+                    "confidence_progress": confidence["confidence_progress"],
                     "output": output,
                 },
                 completed_at=datetime.now(UTC),
@@ -1213,6 +1215,14 @@ class HistoricalTrainingService:
         )
         public_coverage = dict(coverage)
         public_coverage.pop("all_market_day_coverage", None)
+        public_checkpoint_capture = dict(checkpoint_capture)
+        public_checkpoint_capture.pop("all_market_day_coverage", None)
+        coverage_backlog = self._coverage_backlog(
+            coverage_rows=coverage["all_market_day_coverage"],
+            checkpoint_rows=checkpoint_capture["all_market_day_coverage"],
+            settlement_labels=settlement_labels,
+            verbose=verbose,
+        )
         settlement_focus = await self.training_corpus_service.get_settlement_focus_summary(limit=200)
         origin_counts = Counter(bundle.room_origin or bundle.room.get("room_origin") for bundle in replay_bundles)
         readiness_split = self._split_historical_bundles(clean_trainable)
@@ -1270,6 +1280,7 @@ class HistoricalTrainingService:
             source_replay_coverage=public_coverage,
         )
         latest_pipeline_payload = pipeline_runs[0].payload if pipeline_runs else None
+        bootstrap_progress = self._bootstrap_progress_from_pipeline_runs(pipeline_runs)
         return {
             "imported_market_days": len({label.local_market_day for label in settlement_labels}),
             "imported_market_count": len(settlement_labels),
@@ -1282,26 +1293,30 @@ class HistoricalTrainingService:
             "clean_historical_trainable_count": len(clean_trainable),
             "settlement_mismatch_count": sum(1 for label in settlement_labels if label.crosscheck_status == self.SETTLEMENT_MISMATCH),
             "source_replay_coverage": public_coverage,
-            "checkpoint_archive_coverage": checkpoint_capture,
+            "checkpoint_archive_coverage": public_checkpoint_capture,
             "replay_corpus": replay_corpus,
             "refresh_needed": replay_audit["refresh_needed"],
             "stale_build_count": stale_build_count,
+            "coverage_backlog": coverage_backlog,
+            "promotable_market_day_counts": coverage_backlog["promotable_market_day_counts"],
             "source_coverage_gaps": public_coverage["source_coverage_gaps"],
             "missing_checkpoint_reason_counts": public_coverage["missing_checkpoint_reason_counts"],
-            "checkpoint_coverage_counts": checkpoint_capture["checkpoint_coverage_counts"],
-            "checkpoint_capture_gaps": checkpoint_capture["checkpoint_capture_gaps"],
+            "checkpoint_coverage_counts": public_checkpoint_capture["checkpoint_coverage_counts"],
+            "checkpoint_capture_gaps": public_checkpoint_capture["checkpoint_capture_gaps"],
             "draft_training_ready": draft_only,
             "training_ready": training_ready,
             "historical_dataset_readiness": historical_build_readiness,
             "historical_build_readiness": historical_build_readiness,
             "confidence_state": confidence["confidence_state"],
             "confidence_scorecard": confidence["confidence_scorecard"],
+            "confidence_progress": confidence["confidence_progress"],
             "unsettled_backlog_by_status": dict(settlement_focus.get("status_counts") or {}),
             "possible_ingestion_gap_count": int((settlement_focus.get("status_counts") or {}).get("possible_ingestion_gap", 0)),
             "settlement_backfilled_count": settlement_backfilled_count,
             "origin_room_counts": dict(origin_counts),
+            "bootstrap_progress": bootstrap_progress,
             "market_day_coverage": public_coverage.get("market_day_coverage", []),
-            "checkpoint_market_day_coverage": checkpoint_capture.get("market_day_coverage", []),
+            "checkpoint_market_day_coverage": public_checkpoint_capture.get("market_day_coverage", []),
             "replay_audit": replay_audit,
             "recent_pipeline_runs": [
                 {
@@ -1451,6 +1466,104 @@ class HistoricalTrainingService:
             "missing_replay_count": int((replay_audit.get("issue_counts") or {}).get("missing_replay", 0)),
             "orphan_replay_count": int((replay_audit.get("issue_counts") or {}).get("orphan_replay", 0)),
             "market_day_coverage": list(rows.values()) if verbose else list(rows.values())[:12],
+        }
+
+    def _bootstrap_progress_from_pipeline_runs(self, pipeline_runs: list[Any]) -> dict[str, Any] | None:
+        for run in pipeline_runs:
+            payload = run.payload or {}
+            progress = payload.get("bootstrap_progress")
+            if isinstance(progress, dict):
+                return progress
+        return None
+
+    def _coverage_backlog(
+        self,
+        *,
+        coverage_rows: list[dict[str, Any]],
+        checkpoint_rows: list[dict[str, Any]],
+        settlement_labels: list[Any],
+        verbose: bool,
+    ) -> dict[str, Any]:
+        checkpoint_index = {
+            (str(row["market_ticker"]), str(row["local_market_day"])): row
+            for row in checkpoint_rows
+        }
+        settlement_index = {
+            (str(label.market_ticker), str(label.local_market_day)): label
+            for label in settlement_labels
+        }
+        checkpoint_reason_counts: Counter[str] = Counter()
+        market_day_reason_counts: Counter[str] = Counter()
+        promotable_market_day_counts: Counter[str] = Counter()
+        backlog_rows: list[dict[str, Any]] = []
+
+        for row in coverage_rows:
+            key = (str(row["market_ticker"]), str(row["local_market_day"]))
+            archive_row = checkpoint_index.get(key, {})
+            label = settlement_index.get(key)
+            day_reasons: set[str] = set()
+            checkpoint_reason_counter: Counter[str] = Counter()
+            market_source_present = False
+            weather_source_present = False
+
+            for checkpoint in row.get("checkpoints") or []:
+                if checkpoint.get("market_snapshot_id") or checkpoint.get("market_source_kind"):
+                    market_source_present = True
+                if checkpoint.get("weather_snapshot_id") or checkpoint.get("weather_source_kind"):
+                    weather_source_present = True
+                checkpoint_reason_counter.update(checkpoint.get("missing_reasons") or [])
+                day_reasons.update(checkpoint.get("missing_reasons") or [])
+
+            for checkpoint in archive_row.get("checkpoints") or []:
+                if not checkpoint.get("captured"):
+                    checkpoint_reason_counter["checkpoint_archive_missing"] += 1
+                    day_reasons.add("checkpoint_archive_missing")
+
+            if label is not None and label.crosscheck_status == self.SETTLEMENT_MISSING:
+                day_reasons.add("settlement_crosscheck_missing")
+
+            checkpoint_reason_counts.update(checkpoint_reason_counter)
+            market_day_reason_counts.update(day_reasons)
+
+            coverage_class = str(row.get("coverage_class") or self.COVERAGE_NONE)
+            if coverage_class == self.COVERAGE_FULL:
+                promotable_bucket = "already_full_checkpoint_coverage"
+            elif coverage_class in {self.COVERAGE_LATE_ONLY, self.COVERAGE_PARTIAL}:
+                promotable_bucket = "promotable_to_full_checkpoint_coverage"
+            elif market_source_present or weather_source_present:
+                promotable_bucket = "promotable_to_partial_or_late_only"
+            else:
+                promotable_bucket = "permanently_outcome_only_with_current_sources"
+            promotable_market_day_counts[promotable_bucket] += 1
+
+            backlog_rows.append(
+                {
+                    "market_ticker": row["market_ticker"],
+                    "series_ticker": row.get("series_ticker"),
+                    "local_market_day": row["local_market_day"],
+                    "coverage_class": coverage_class,
+                    "promotable_status": promotable_bucket,
+                    "market_source_present": market_source_present,
+                    "weather_source_present": weather_source_present,
+                    "day_reasons": sorted(day_reasons),
+                    "checkpoint_reason_counts": dict(checkpoint_reason_counter),
+                    "crosscheck_missing": bool(label is not None and label.crosscheck_status == self.SETTLEMENT_MISSING),
+                }
+            )
+
+        return {
+            "reason_counts": dict(checkpoint_reason_counts),
+            "market_day_reason_counts": dict(market_day_reason_counts),
+            "samples": backlog_rows if verbose else backlog_rows[:12],
+            "promotable_market_day_counts": {
+                "already_full_checkpoint_coverage": promotable_market_day_counts.get("already_full_checkpoint_coverage", 0),
+                "promotable_to_full_checkpoint_coverage": promotable_market_day_counts.get("promotable_to_full_checkpoint_coverage", 0),
+                "promotable_to_partial_or_late_only": promotable_market_day_counts.get("promotable_to_partial_or_late_only", 0),
+                "permanently_outcome_only_with_current_sources": promotable_market_day_counts.get(
+                    "permanently_outcome_only_with_current_sources",
+                    0,
+                ),
+            },
         }
 
     def _build_replay_audit(
@@ -2602,6 +2715,7 @@ class HistoricalTrainingService:
                 "samples": gap_samples,
             },
             "market_day_coverage": rows if verbose else rows[:12],
+            "all_market_day_coverage": rows,
         }
 
     async def _resolve_market_day_selections(self, repo: PlatformRepository, *, label: Any, mapping: WeatherMarketMapping) -> list[HistoricalCheckpointSelection]:
@@ -2887,6 +3001,7 @@ class HistoricalTrainingService:
                 return {
                     "confidence_state": confidence_state,
                     "confidence_scorecard": scorecard,
+                    "confidence_progress": self._confidence_progress(scorecard),
                 }
 
         support_counts = {
@@ -2931,6 +3046,75 @@ class HistoricalTrainingService:
                 "directional_confidence_threshold_market_days": self.settings.historical_directional_confidence_min_full_market_days,
                 "directional_confidence_threshold_holdout_market_days": self.settings.historical_directional_confidence_min_holdout_market_days,
             },
+            "confidence_progress": self._confidence_progress(
+                {
+                    "confidence_state": confidence_state,
+                    "distinct_execution_market_days": execution_market_days,
+                    "distinct_full_market_days": full_market_days,
+                    "full_coverage_holdout_market_days": holdout_market_days,
+                    "execution_confidence_threshold_market_days": self.settings.historical_execution_confidence_min_market_days,
+                    "directional_confidence_threshold_market_days": self.settings.historical_directional_confidence_min_full_market_days,
+                    "directional_confidence_threshold_holdout_market_days": self.settings.historical_directional_confidence_min_holdout_market_days,
+                }
+            ),
+        }
+
+    def _confidence_progress(self, scorecard: dict[str, Any]) -> dict[str, Any]:
+        def lane(current: int, target: int) -> dict[str, Any]:
+            remaining = max(0, target - current)
+            percent = 1.0 if target <= 0 else min(1.0, current / target)
+            return {
+                "current": current,
+                "target": target,
+                "remaining": remaining,
+                "met": remaining == 0,
+                "progress_ratio": round(percent, 4),
+            }
+
+        execution_lane = lane(
+            int(scorecard.get("distinct_execution_market_days", 0)),
+            int(
+                scorecard.get(
+                    "execution_confidence_threshold_market_days",
+                    self.settings.historical_execution_confidence_min_market_days,
+                )
+            ),
+        )
+        directional_lane = lane(
+            int(scorecard.get("distinct_full_market_days", 0)),
+            int(
+                scorecard.get(
+                    "directional_confidence_threshold_market_days",
+                    self.settings.historical_directional_confidence_min_full_market_days,
+                )
+            ),
+        )
+        holdout_lane = lane(
+            int(scorecard.get("full_coverage_holdout_market_days", 0)),
+            int(
+                scorecard.get(
+                    "directional_confidence_threshold_holdout_market_days",
+                    self.settings.historical_directional_confidence_min_holdout_market_days,
+                )
+            ),
+        )
+        blockers: list[str] = []
+        if not execution_lane["met"]:
+            blockers.append("lack_of_execution_support")
+        if not directional_lane["met"]:
+            blockers.append("lack_of_full_coverage_support")
+        if not holdout_lane["met"]:
+            blockers.append("lack_of_holdout_support")
+        return {
+            "confidence_state": str(scorecard.get("confidence_state") or "insufficient_support"),
+            "execution_support": execution_lane,
+            "directional_support": directional_lane,
+            "holdout_support": holdout_lane,
+            "promotion_blockers": blockers,
+            "execution_candidate_evaluation_allowed": execution_lane["met"],
+            "directional_candidate_evaluation_allowed": execution_lane["met"]
+            and directional_lane["met"]
+            and holdout_lane["met"],
         }
 
     def _historical_market_days_for_coverage(

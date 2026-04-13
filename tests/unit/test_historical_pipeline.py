@@ -16,12 +16,13 @@ class _FakeHistoricalTrainingService:
         self.status_payload = {
             "confidence_state": "execution_confident_only",
             "confidence_scorecard": {"confidence_state": "execution_confident_only"},
-            "historical_build_readiness": {"training_ready": False},
+            "historical_build_readiness": {"training_ready": False, "distinct_full_coverage_market_days": 0},
         }
         self.audit_payload = {
             "refresh_needed": True,
             "affected_market_days": [{"local_market_day": "2026-04-10"}],
         }
+        self.build_requests: list[str] = []
 
     async def import_weather_history(self, *, date_from, date_to, series=None):
         self.calls.append(("import", date_from.isoformat(), date_to.isoformat(), tuple(series or ())))
@@ -51,6 +52,10 @@ class _FakeHistoricalTrainingService:
         self.calls.append(("status", "", "", tuple()))
         return self.status_payload
 
+    async def build_historical_dataset(self, request):
+        self.build_requests.append(request.mode)
+        return {"status": "completed", "build": {"mode": request.mode}}
+
 
 class _FakeHistoricalIntelligenceService:
     def __init__(self) -> None:
@@ -74,6 +79,7 @@ async def test_historical_pipeline_bootstrap_runs_steps_in_order(tmp_path) -> No
     intelligence = _FakeHistoricalIntelligenceService()
     settings = SimpleNamespace(
         historical_pipeline_bootstrap_days=365,
+        historical_pipeline_chunk_days=14,
         historical_pipeline_incremental_days=7,
         historical_intelligence_auto_promote=True,
     )
@@ -92,7 +98,8 @@ async def test_historical_pipeline_bootstrap_runs_steps_in_order(tmp_path) -> No
     result = await service.bootstrap(days=10, series=["KXHIGHNY"])
 
     assert result["status"] == "completed"
-    assert [call[0] for call in training.calls[:6]] == [
+    step_calls = [call[0] for call in training.calls if call[0] not in {"status"}]
+    assert step_calls[:6] == [
         "import",
         "market_backfill",
         "weather_backfill",
@@ -100,11 +107,13 @@ async def test_historical_pipeline_bootstrap_runs_steps_in_order(tmp_path) -> No
         "audit",
         "refresh",
     ]
+    assert training.build_requests == ["outcome-eval"]
     assert intelligence.calls == [
         (expected_start.isoformat(), expected_end.isoformat(), ("historical_replay",), True)
     ]
     status = await service.status()
     assert status["latest_run"]["status"] == "completed"
+    assert status["bootstrap_progress"]["completed_chunk_count"] == 1
     await engine.dispose()
 
 
@@ -112,6 +121,7 @@ def test_historical_pipeline_rolling_window_ends_yesterday() -> None:
     service = HistoricalPipelineService(
         SimpleNamespace(
             historical_pipeline_bootstrap_days=365,
+            historical_pipeline_chunk_days=14,
             historical_pipeline_incremental_days=7,
             historical_intelligence_auto_promote=True,
         ),
@@ -124,3 +134,43 @@ def test_historical_pipeline_rolling_window_ends_yesterday() -> None:
 
     assert start.isoformat() == "2026-04-07"
     assert end.isoformat() == "2026-04-11"
+
+
+@pytest.mark.asyncio
+async def test_historical_pipeline_bootstrap_chunks_and_resume(tmp_path) -> None:
+    training = _FakeHistoricalTrainingService()
+    intelligence = _FakeHistoricalIntelligenceService()
+    settings = SimpleNamespace(
+        historical_pipeline_bootstrap_days=365,
+        historical_pipeline_chunk_days=2,
+        historical_pipeline_incremental_days=7,
+        historical_intelligence_auto_promote=True,
+    )
+    db_settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/pipeline-resume.db")
+    engine = create_engine(db_settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = HistoricalPipelineService(settings, session_factory, training, intelligence)
+
+    original_run_chunk = service._run_chunk
+    seen_chunks: list[tuple[str, str]] = []
+
+    async def flaky_run_chunk(**kwargs):
+        seen_chunks.append((kwargs["chunk_from"].isoformat(), kwargs["chunk_to"].isoformat()))
+        if len(seen_chunks) == 2:
+            raise RuntimeError("boom")
+        return await original_run_chunk(**kwargs)
+
+    service._run_chunk = flaky_run_chunk  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await service.bootstrap(days=4, series=["KXHIGHNY"], chunk_days=2)
+
+    service._run_chunk = original_run_chunk  # type: ignore[method-assign]
+    resumed = await service.resume()
+
+    assert resumed["status"] == "completed"
+    assert resumed["bootstrap_progress"]["completed_chunk_count"] == 2
+    status = await service.status()
+    assert status["bootstrap_progress"]["completed_chunk_count"] == 2
+    await engine.dispose()

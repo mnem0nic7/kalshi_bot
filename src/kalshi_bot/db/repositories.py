@@ -1163,6 +1163,26 @@ class PlatformRepository:
         await self.session.flush()
         return record
 
+    async def update_historical_pipeline_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        payload: dict[str, Any] | None = None,
+        error_text: str | None = None,
+    ) -> HistoricalPipelineRunRecord:
+        record = await self.session.get(HistoricalPipelineRunRecord, run_id)
+        if record is None:
+            raise KeyError(f"Historical pipeline run {run_id} not found")
+        if status is not None:
+            record.status = status
+        if payload is not None:
+            record.payload = payload
+        if error_text is not None:
+            record.error_text = error_text
+        await self.session.flush()
+        return record
+
     async def get_historical_pipeline_run(self, run_id: str) -> HistoricalPipelineRunRecord | None:
         return await self.session.get(HistoricalPipelineRunRecord, run_id)
 
