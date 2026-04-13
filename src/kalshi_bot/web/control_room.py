@@ -308,16 +308,16 @@ async def _recent_room_bundles(container: AppContainer, *, limit: int) -> list[A
     )
 
 
-async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
-    now = datetime.now(UTC)
-    async with container.session_factory() as session:
-        repo = PlatformRepository(session)
-        control = await repo.get_deployment_control()
-        runtime_health = await container.watchdog_service.get_status(repo)
-        positions = await repo.list_positions(limit=POSITION_LIMIT)
-        await session.commit()
-
-    training_status, configured_markets, room_bundles = await _gather_summary_dependencies(container)
+def _summary_payload(
+    *,
+    now: datetime,
+    control: Any,
+    runtime_health: dict[str, Any],
+    positions: list[Any],
+    training_status: dict[str, Any],
+    configured_markets: list[dict[str, Any]],
+    room_bundles: list[Any],
+) -> dict[str, Any]:
     room_views = [_room_view(bundle) for bundle in room_bundles]
     research_views = [_research_market_view(item) for item in configured_markets]
     research_confidences = [item["confidence"] for item in research_views if item["confidence"] is not None]
@@ -370,16 +370,66 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
     }
 
 
-async def _gather_summary_dependencies(container: AppContainer) -> tuple[dict[str, Any], list[dict[str, Any]], list[Any]]:
-    training_status_task = container.training_corpus_service.get_status(persist_readiness=False)
-    configured_markets_task = _configured_markets(container)
-    room_bundles_task = _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT)
-    training_status, configured_markets, room_bundles = await asyncio.gather(
-        training_status_task,
-        configured_markets_task,
-        room_bundles_task,
+def _overview_payload(
+    *,
+    now: datetime,
+    control: Any,
+    runtime_health: dict[str, Any],
+    ops_events: list[Any],
+    positions: list[Any],
+    training_status: dict[str, Any],
+    self_improve_status: dict[str, Any],
+    heuristic_status: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "tab": "overview",
+        "as_of": now.isoformat(),
+        "control": {
+            "active_color": control.active_color,
+            "kill_switch_enabled": control.kill_switch_enabled,
+            "execution_lock_holder": control.execution_lock_holder,
+        },
+        "system_status": _system_status(
+            control={
+                "active_color": control.active_color,
+                "kill_switch_enabled": control.kill_switch_enabled,
+            },
+            runtime_health=runtime_health,
+            now=now,
+        ),
+        "runtime_health": runtime_health,
+        "top_blockers": list(training_status.get("top_blockers") or []),
+        "next_actions": list(training_status.get("next_actions") or []),
+        "ops_events": [_ops_event_view(event) for event in ops_events],
+        "positions_summary": _positions_summary(positions),
+        "self_improve": self_improve_status,
+        "heuristics": heuristic_status,
+    }
+
+
+async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
+    now = datetime.now(UTC)
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session)
+        control = await repo.get_deployment_control()
+        runtime_health = await container.watchdog_service.get_status(repo)
+        positions = await repo.list_positions(limit=POSITION_LIMIT)
+        await session.commit()
+
+    configured_markets, room_bundles = await asyncio.gather(
+        _configured_markets(container),
+        _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT),
     )
-    return training_status, configured_markets, room_bundles
+    training_status = await container.training_corpus_service.get_dashboard_status(bundles=room_bundles)
+    return _summary_payload(
+        now=now,
+        control=control,
+        runtime_health=runtime_health,
+        positions=positions,
+        training_status=training_status,
+        configured_markets=configured_markets,
+        room_bundles=room_bundles,
+    )
 
 
 async def build_control_room_tab(container: AppContainer, tab: str) -> dict[str, Any]:
@@ -397,9 +447,40 @@ async def build_control_room_tab(container: AppContainer, tab: str) -> dict[str,
 
 
 async def build_control_room_bootstrap(container: AppContainer) -> dict[str, Any]:
-    summary, overview = await asyncio.gather(
-        build_control_room_summary(container),
-        _build_overview_tab(container),
+    now = datetime.now(UTC)
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session)
+        control = await repo.get_deployment_control()
+        runtime_health = await container.watchdog_service.get_status(repo)
+        positions = await repo.list_positions(limit=POSITION_LIMIT)
+        ops_events = await repo.list_ops_events(limit=8)
+        await session.commit()
+
+    configured_markets, room_bundles, self_improve_status, heuristic_status = await asyncio.gather(
+        _configured_markets(container),
+        _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT),
+        container.self_improve_service.get_dashboard_status(),
+        container.historical_intelligence_service.get_dashboard_status(),
+    )
+    training_status = await container.training_corpus_service.get_dashboard_status(bundles=room_bundles)
+    summary = _summary_payload(
+        now=now,
+        control=control,
+        runtime_health=runtime_health,
+        positions=positions,
+        training_status=training_status,
+        configured_markets=configured_markets,
+        room_bundles=room_bundles,
+    )
+    overview = _overview_payload(
+        now=now,
+        control=control,
+        runtime_health=runtime_health,
+        ops_events=ops_events,
+        positions=positions[:12],
+        training_status=training_status,
+        self_improve_status=self_improve_status,
+        heuristic_status=heuristic_status,
     )
     return {
         "summary": summary,
@@ -425,35 +506,22 @@ async def _build_overview_tab(container: AppContainer) -> dict[str, Any]:
         ops_events = await repo.list_ops_events(limit=8)
         positions = await repo.list_positions(limit=12)
         await session.commit()
-    training_status, self_improve_status, heuristic_status = await asyncio.gather(
-        container.training_corpus_service.get_status(persist_readiness=False),
-        container.self_improve_service.get_status(),
-        container.historical_intelligence_service.get_status(),
+    room_bundles, self_improve_status, heuristic_status = await asyncio.gather(
+        _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT),
+        container.self_improve_service.get_dashboard_status(),
+        container.historical_intelligence_service.get_dashboard_status(),
     )
-    return {
-        "tab": "overview",
-        "as_of": now.isoformat(),
-        "control": {
-            "active_color": control.active_color,
-            "kill_switch_enabled": control.kill_switch_enabled,
-            "execution_lock_holder": control.execution_lock_holder,
-        },
-        "system_status": _system_status(
-            control={
-                "active_color": control.active_color,
-                "kill_switch_enabled": control.kill_switch_enabled,
-            },
-            runtime_health=runtime_health,
-            now=now,
-        ),
-        "runtime_health": runtime_health,
-        "top_blockers": list(training_status.get("top_blockers") or []),
-        "next_actions": list(training_status.get("next_actions") or []),
-        "ops_events": [_ops_event_view(event) for event in ops_events],
-        "positions_summary": _positions_summary(positions),
-        "self_improve": self_improve_status,
-        "heuristics": heuristic_status,
-    }
+    training_status = await container.training_corpus_service.get_dashboard_status(bundles=room_bundles)
+    return _overview_payload(
+        now=now,
+        control=control,
+        runtime_health=runtime_health,
+        ops_events=ops_events,
+        positions=positions,
+        training_status=training_status,
+        self_improve_status=self_improve_status,
+        heuristic_status=heuristic_status,
+    )
 
 
 async def _build_training_tab(container: AppContainer) -> dict[str, Any]:
@@ -570,8 +638,8 @@ async def _build_operations_tab(container: AppContainer) -> dict[str, Any]:
         runtime_health = await container.watchdog_service.get_status(repo)
         await session.commit()
     self_improve_status, heuristic_status = await asyncio.gather(
-        container.self_improve_service.get_status(),
-        container.historical_intelligence_service.get_status(),
+        container.self_improve_service.get_dashboard_status(),
+        container.historical_intelligence_service.get_dashboard_status(),
     )
     return {
         "tab": "operations",

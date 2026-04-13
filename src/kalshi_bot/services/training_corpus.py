@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import ContractSide, WeatherResolutionState
+from kalshi_bot.core.enums import ContractSide, RoomOrigin, WeatherResolutionState
 from kalshi_bot.core.schemas import (
     ResearchAuditIssue,
     StrategyAuditResult,
@@ -201,6 +201,87 @@ class TrainingCorpusService:
             "readiness": readiness.model_dump(mode="json"),
             "last_readiness_snapshot": latest_snapshot.payload if latest_snapshot is not None else None,
             "top_missing_data": readiness.missing_indicators,
+            "top_blockers": top_blockers,
+            "next_actions": next_actions,
+        }
+
+    async def get_dashboard_status(
+        self,
+        *,
+        room_limit: int = 60,
+        bundles: list[TrainingRoomBundle] | None = None,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        dashboard_bundles = list(bundles or [])
+        if not dashboard_bundles:
+            dashboard_bundles = await self.training_export_service.export_room_bundles(
+                limit=room_limit,
+                include_non_complete=False,
+                origins=[RoomOrigin.SHADOW.value, RoomOrigin.LIVE.value],
+            )
+        dashboard_bundles = await self._attach_strategy_audits(dashboard_bundles, persist_missing=False)
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            settlement_events = await repo.list_exchange_events(
+                stream_name="reconcile",
+                event_type="settlements",
+                limit=200,
+            )
+            await session.commit()
+
+        audits = [self._bundle_strategy_audit(bundle) for bundle in dashboard_bundles]
+        quality_debt_summary = {
+            "stale_mismatch_count": sum(1 for audit in audits if audit.stale_data_mismatch),
+            "missed_stand_down_count": sum(1 for audit in audits if audit.missed_stand_down),
+            "weak_resolved_trade_count": sum(
+                1
+                for audit in audits
+                if audit.trade_quality == "weak_trade"
+                and audit.resolution_state in {WeatherResolutionState.LOCKED_NO.value, WeatherResolutionState.LOCKED_YES.value}
+            ),
+            "cleaned_trainable_room_count": sum(1 for bundle in dashboard_bundles if bundle.trainable_default is not False),
+        }
+        quality_debt_summary.update(
+            self._recent_quality_debt(
+                dashboard_bundles,
+                window_hours=RECENT_QUALITY_WINDOW_HOURS,
+                now=now,
+            )
+        )
+        quality_debt_summary["recent_window_hours"] = RECENT_QUALITY_WINDOW_HOURS
+
+        recent_exclusion_memory = self._recent_exclusion_memory(
+            dashboard_bundles,
+            window_hours=self.settings.training_campaign_lookback_hours,
+            now=now,
+        )
+        settlement_maturity = self._settlement_focus_summary_from_bundles(
+            dashboard_bundles,
+            settlement_events=settlement_events,
+            now=now,
+            limit=SETTLEMENT_BACKLOG_PREVIEW_LIMIT,
+        )
+        readiness = self._readiness_for_bundles(
+            [bundle for bundle in dashboard_bundles if bundle.trainable_default is not False]
+        )
+        top_blockers = self._top_blockers(
+            readiness=readiness,
+            quality_debt_summary=quality_debt_summary,
+            settlement_maturity=settlement_maturity,
+            recent_exclusion_memory=recent_exclusion_memory,
+        )
+        next_actions = self._next_actions(
+            readiness=readiness,
+            unsettled_count=sum(1 for bundle in dashboard_bundles if not bundle.outcome.settlement_seen),
+            settlement_maturity=settlement_maturity,
+            quality_debt_summary=quality_debt_summary,
+            recent_exclusion_memory=recent_exclusion_memory,
+        )
+
+        return {
+            "room_count": len(dashboard_bundles),
+            "quality_debt_summary": quality_debt_summary,
             "top_blockers": top_blockers,
             "next_actions": next_actions,
         }

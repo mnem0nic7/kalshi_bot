@@ -137,6 +137,23 @@ class HistoricalIntelligenceService:
             ),
         }
 
+    async def get_dashboard_status(self) -> dict[str, Any]:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await self.heuristic_service.ensure_initialized(repo)
+            active_pack = await self.heuristic_service.get_active_pack(repo)
+            candidate_pack = await self.heuristic_service.get_candidate_pack(repo)
+            recent_runs = await repo.list_historical_intelligence_runs(limit=1)
+            await session.commit()
+
+        latest_run = recent_runs[0].payload if recent_runs else None
+        return {
+            "active_pack_version": active_pack.version,
+            "candidate_pack_version": candidate_pack.version if candidate_pack is not None else None,
+            "latest_run": latest_run,
+            "confidence_state": (latest_run or {}).get("confidence_state") or "unknown",
+        }
+
     async def explain(self, *, series: list[str] | None = None) -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)

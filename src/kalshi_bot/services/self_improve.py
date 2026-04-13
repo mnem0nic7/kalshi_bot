@@ -108,6 +108,28 @@ class SelfImproveService:
             "recent_dataset_builds": dataset_builds,
         }
 
+    async def get_dashboard_status(self) -> dict[str, Any]:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await self.agent_pack_service.ensure_initialized(repo)
+            control = await repo.get_deployment_control()
+            evaluations = await repo.list_evaluation_runs(limit=1)
+            await session.commit()
+        return {
+            "active_color": control.active_color,
+            "agent_packs": dict(control.notes.get("agent_packs") or {}),
+            "recent_evaluations": [
+                {
+                    "id": record.id,
+                    "status": record.status,
+                    "candidate_version": record.candidate_version,
+                    "champion_version": record.champion_version,
+                    "passed": record.passed,
+                }
+                for record in evaluations
+            ],
+        }
+
     async def critique_recent_rooms(self, *, days: int | None = None, limit: int = 200) -> SelfImproveResult:
         days = days or self.settings.self_improve_window_days
         if self.training_corpus_service is None:
