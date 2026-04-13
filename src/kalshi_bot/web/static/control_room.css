@@ -649,6 +649,10 @@
   place-items: center;
 }
 
+.control-room-modal[hidden] {
+  display: none;
+}
+
 .control-room-modal-backdrop {
   position: absolute;
   inset: 0;
