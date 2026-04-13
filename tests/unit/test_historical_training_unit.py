@@ -132,9 +132,16 @@ def test_historical_market_days_for_coverage_counts_only_matching_coverage() -> 
         coverage_class=HistoricalTrainingService.COVERAGE_FULL,
         room_ids={"room-full-2", "room-late"},
     )
+    empty_holdout_full_days = HistoricalTrainingService._historical_market_days_for_coverage(
+        service,
+        bundles,
+        coverage_class=HistoricalTrainingService.COVERAGE_FULL,
+        room_ids=set(),
+    )
 
     assert all_full_days == {"2026-04-10"}
     assert holdout_full_days == {"2026-04-10"}
+    assert empty_holdout_full_days == set()
 
 
 def test_coverage_class_detects_full_and_late_only() -> None:

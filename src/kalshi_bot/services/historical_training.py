@@ -2940,12 +2940,11 @@ class HistoricalTrainingService:
         coverage_class: str,
         room_ids: set[str] | None = None,
     ) -> set[str]:
-        selected_room_ids = room_ids or set()
         return {
             str((bundle.historical_provenance or {}).get("local_market_day") or "")
             for bundle in bundles
             if (bundle.coverage_class or (bundle.historical_provenance or {}).get("coverage_class")) == coverage_class
-            and (not selected_room_ids or bundle.room["id"] in selected_room_ids)
+            and (room_ids is None or bundle.room["id"] in room_ids)
             and (bundle.historical_provenance or {}).get("local_market_day")
         }
 
