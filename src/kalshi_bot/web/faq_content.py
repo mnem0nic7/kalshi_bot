@@ -135,6 +135,7 @@ FAQ_SECTIONS = [
                 "question": "What should I watch on the dashboard?",
                 "answer": [
                     "Start with the top summary strip. It gives the fastest read on system health, active deployment, positions, research confidence, room outcomes, and quality debt without making you scroll through historical detail first.",
+                    "Read the strip intentionally: System Status is the real operator state like KILL SWITCH ON or HEALTHY, Active Deployment foregrounds the active color while watchdog freshness stays secondary, Room Outcomes uses resolved rooms only in the headline ratio with running rooms called out separately, and Quality Debt shows stale, missed, and weak counts so the total is explainable at a glance.",
                     "Then use the top tabs deliberately: Overview for deployment state and blockers, Training & Historical for quality debt and replay health, Research for dossiers and expiry, Rooms for grouped room outcomes, and Operations for positions, ops events, and dangerous controls.",
                     "If the next bottleneck is not obvious from that panel, something is missing in the status surface and we should improve it.",
                 ],

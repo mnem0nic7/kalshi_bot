@@ -105,6 +105,12 @@ kalshi-bot-cli shadow-campaign run --limit 3
 
 The control room index page now uses a top-tabbed dashboard layout with a summary strip at the top and lazy-loaded `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations` tabs.
 It still offers the same operator actions like `Run Shadow Room`, grouped dataset builds, kill-switch and color promotion controls, but the heavy historical and training views now stay out of the initial page load until their tab is opened.
+The top summary strip should be read as operator truth, not raw internals:
+
+- `System Status` shows the actual operator state like `KILL SWITCH ON`, `HEALTHY`, or `DEGRADED`; active color is supporting context, not the headline
+- `Active Deployment` foregrounds the active color, while watchdog freshness is shown as relative time
+- `Room Outcomes` uses resolved rooms only in the `succeeded/total` headline; running rooms are shown separately so in-flight work does not make the denominator misleading
+- `Quality Debt` detail now breaks out `stale`, `missed`, and `weak` counts so the visible breakdown reconciles to the total
 
 ## Training corpus
 

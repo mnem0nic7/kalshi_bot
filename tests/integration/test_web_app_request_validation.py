@@ -279,7 +279,14 @@ def test_control_room_page_and_tab_endpoints_render_payloads(tmp_path, monkeypat
                 "open_positions": {"count": 0, "total_contracts": "0.00"},
                 "research_confidence": {"average": 0.91, "count": 3, "sparkline": [0.82, 0.91, 0.96]},
                 "room_outcomes": {"succeeded": 0, "total": 6, "window_hours": 24, "blocked": 3, "stand_down": 2, "failed": 1},
-                "quality_debt": {"total": 12, "stale_mismatch_count": 2, "missed_stand_down_count": 1, "recent_stale_mismatch_count": 1},
+                "quality_debt": {
+                    "total": 12,
+                    "stale_mismatch_count": 2,
+                    "missed_stand_down_count": 1,
+                    "weak_resolved_trade_count": 9,
+                    "recent_stale_mismatch_count": 1,
+                    "recent_missed_stand_down_count": 0,
+                },
             },
             "initial_tab_payload": {
                 "runtime_health": {
@@ -320,6 +327,9 @@ def test_control_room_page_and_tab_endpoints_render_payloads(tmp_path, monkeypat
     assert "Training &amp; Historical" in index_response.text
     assert "control-room-bootstrap" in index_response.text
     assert "/static/control_room.js" in index_response.text
+    assert "KILL SWITCH ON" in index_response.text
+    assert "Tracked contracts:" in index_response.text
+    assert "weak 9" in index_response.text
     assert summary_response.status_code == 200
     assert summary_response.json()["system_status"]["label"] == "Healthy"
     assert tab_response.status_code == 200

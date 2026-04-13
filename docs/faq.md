@@ -139,6 +139,13 @@ Read more: `docs/self_improve.md`, `docs/training.md`
 
 Start with the top summary strip. It gives the fastest read on system health, active deployment, positions, research confidence, room outcomes, and quality debt without making you scroll through historical detail first.
 
+Read the strip intentionally:
+
+- `System Status` is the actual operator state like `KILL SWITCH ON`, `HEALTHY`, or `DEGRADED`; active color is supporting context
+- `Active Deployment` tells you which color is active, while the watchdog line tells you how fresh that deployment state is
+- `Room Outcomes` uses resolved rooms only in the headline ratio, with running rooms called out separately
+- `Quality Debt` breaks out stale, missed, and weak counts so the total is explainable at a glance
+
 Then use the top tabs deliberately:
 
 - `Overview` for deployment state, runtime health, blockers, next actions, and pack controls

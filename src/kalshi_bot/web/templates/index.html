@@ -24,30 +24,34 @@
   </section>
 
   <section class="control-room-summary-grid" id="control-room-summary">
-    <article class="summary-card summary-card-critical" data-summary-card="system-status">
+    <article class="summary-card{% if initial_summary.system_status.level == 'critical' %} summary-card-critical{% endif %}" data-summary-card="system-status">
       <div class="summary-card-heading">
         <span class="summary-card-label">System Status</span>
-        <span class="status-pill {% if initial_summary.system_status.level == 'healthy' %}status-good{% elif initial_summary.system_status.level == 'critical' %}status-bad{% endif %}">
-          {{ initial_summary.system_status.label }}
+        <span class="status-pill {% if initial_summary.system_status.level == 'healthy' %}status-good{% elif initial_summary.system_status.level == 'warning' %}status-warning{% elif initial_summary.system_status.level == 'critical' %}status-bad{% endif %}">
+          {{ initial_summary.system_status.level|upper }}
         </span>
       </div>
-      <strong class="summary-card-value">{{ initial_summary.system_status.active_color|upper }}</strong>
+      <strong class="summary-card-value">{{ initial_summary.system_status.label|upper }}</strong>
       <span class="summary-card-detail">{{ initial_summary.system_status.detail }}</span>
+      <span class="summary-card-subdetail">Active {{ initial_summary.system_status.active_color|upper }}</span>
     </article>
     <article class="summary-card" data-summary-card="active-deployment">
       <div class="summary-card-heading">
         <span class="summary-card-label">Active Deployment</span>
-        <span class="status-pill">{{ initial_summary.active_deployment.active_color }}</span>
+        <span class="status-pill {% if initial_summary.active_deployment.kill_switch_enabled %}status-bad{% endif %}">
+          {{ "KILL SWITCH ON" if initial_summary.active_deployment.kill_switch_enabled else "WATCHDOG" }}
+        </span>
       </div>
-      <strong class="summary-card-value" data-timestamp="{{ initial_summary.active_deployment.watchdog_updated_at }}">{{ initial_summary.active_deployment.watchdog_updated_at or "never" }}</strong>
-      <span class="summary-card-detail">Last action: {{ (initial_summary.active_deployment.last_action or {}).get("action", "n/a") }}</span>
+      <strong class="summary-card-value">{{ initial_summary.active_deployment.active_color|upper }}</strong>
+      <span class="summary-card-detail" data-timestamp="{{ initial_summary.active_deployment.watchdog_updated_at }}">Watchdog {{ initial_summary.active_deployment.watchdog_updated_at or "never" }}</span>
+      <span class="summary-card-subdetail">Last action: {{ (initial_summary.active_deployment.last_action or {}).get("action", "n/a") }}</span>
     </article>
     <article class="summary-card" data-summary-card="open-positions">
       <div class="summary-card-heading">
         <span class="summary-card-label">Open Positions</span>
       </div>
       <strong class="summary-card-value">{{ initial_summary.open_positions.count }}</strong>
-      <span class="summary-card-detail">Contracts tracked: {{ initial_summary.open_positions.total_contracts }}</span>
+      <span class="summary-card-detail">Tracked contracts: {{ initial_summary.open_positions.total_contracts }}</span>
     </article>
     <article class="summary-card" data-summary-card="research-confidence">
       <div class="summary-card-heading">
@@ -63,12 +67,13 @@
       <span class="summary-card-detail">{{ initial_summary.research_confidence.count }} active dossiers</span>
       <div class="summary-sparkline" data-sparkline='{{ initial_summary.research_confidence.sparkline|tojson }}'></div>
     </article>
-    <article class="summary-card" data-summary-card="room-outcomes">
+    {% set resolved_room_total = initial_summary.room_outcomes.resolved_total if initial_summary.room_outcomes.resolved_total is defined else initial_summary.room_outcomes.total %}
+    <article class="summary-card{% if resolved_room_total and initial_summary.room_outcomes.succeeded == 0 %} summary-card-critical{% endif %}" data-summary-card="room-outcomes">
       <div class="summary-card-heading">
         <span class="summary-card-label">Room Outcomes</span>
       </div>
-      <strong class="summary-card-value">{{ initial_summary.room_outcomes.succeeded }}/{{ initial_summary.room_outcomes.total }}</strong>
-      <span class="summary-card-detail">Succeeded in the last {{ initial_summary.room_outcomes.window_hours }}h</span>
+      <strong class="summary-card-value">{{ initial_summary.room_outcomes.succeeded }}/{{ resolved_room_total }}</strong>
+      <span class="summary-card-detail">Resolved last {{ initial_summary.room_outcomes.window_hours }}h · running {{ initial_summary.room_outcomes.running or 0 }}</span>
       <span class="summary-card-subdetail">
         blocked {{ initial_summary.room_outcomes.blocked }} · stand down {{ initial_summary.room_outcomes.stand_down }} · failed {{ initial_summary.room_outcomes.failed }}
       </span>
@@ -79,9 +84,11 @@
       </div>
       <strong class="summary-card-value">{{ initial_summary.quality_debt.total }}</strong>
       <span class="summary-card-detail">
-        stale {{ initial_summary.quality_debt.stale_mismatch_count }} · missed {{ initial_summary.quality_debt.missed_stand_down_count }}
+        stale {{ initial_summary.quality_debt.stale_mismatch_count }} · missed {{ initial_summary.quality_debt.missed_stand_down_count }} · weak {{ initial_summary.quality_debt.weak_resolved_trade_count or 0 }}
       </span>
-      <span class="summary-card-subdetail">recent stale {{ initial_summary.quality_debt.recent_stale_mismatch_count }}</span>
+      <span class="summary-card-subdetail">
+        recent stale {{ initial_summary.quality_debt.recent_stale_mismatch_count }} · recent missed {{ initial_summary.quality_debt.recent_missed_stand_down_count or 0 }}
+      </span>
     </article>
   </section>
 

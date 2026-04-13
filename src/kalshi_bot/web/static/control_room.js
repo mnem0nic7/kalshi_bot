@@ -329,32 +329,34 @@
     const researchConfidence = summary.research_confidence || {};
     const roomOutcomes = summary.room_outcomes || {};
     const qualityDebt = summary.quality_debt || {};
+    const resolvedRoomCount = Number(roomOutcomes.resolved_total || 0);
 
     const summaryCards = [
       summaryCard({
         label: "System Status",
-        value: String(systemStatus.active_color || "n/a").toUpperCase(),
+        value: String(systemStatus.label || "Unknown").toUpperCase(),
         detail: systemStatus.detail || "No runtime story available.",
+        subdetail: `Active ${String(systemStatus.active_color || "unknown").toUpperCase()}`,
         pill: {
-          label: systemStatus.label || "Unknown",
-          tone: systemStatus.level,
+          label: String(systemStatus.level || "unknown").toUpperCase(),
+          tone: systemStatus.level || "neutral",
         },
         critical: systemStatus.level === "critical",
       }),
       summaryCard({
         label: "Active Deployment",
-        value: formatRelativeTime(activeDeployment.watchdog_updated_at),
-        detail: `Last action: ${((activeDeployment.last_action || {}).action) || "n/a"}`,
-        subdetail: `Color ${String(activeDeployment.active_color || "unknown").toUpperCase()}`,
+        value: String(activeDeployment.active_color || "unknown").toUpperCase(),
+        detail: `Watchdog ${formatRelativeTime(activeDeployment.watchdog_updated_at)}`,
+        subdetail: `Last action: ${((activeDeployment.last_action || {}).action) || "n/a"}`,
         pill: {
-          label: activeDeployment.active_color || "unknown",
+          label: activeDeployment.kill_switch_enabled ? "KILL SWITCH ON" : "WATCHDOG",
           tone: activeDeployment.kill_switch_enabled ? "bad" : "neutral",
         },
       }),
       summaryCard({
         label: "Open Positions",
         value: formatInteger(openPositions.count || 0),
-        detail: `Contracts tracked ${openPositions.total_contracts || "0.00"}`,
+        detail: `Tracked contracts: ${openPositions.total_contracts || "0.00"}`,
       }),
       summaryCard({
         label: "Research Confidence",
@@ -364,16 +366,16 @@
       }),
       summaryCard({
         label: "Room Outcomes",
-        value: `${formatInteger(roomOutcomes.succeeded || 0)}/${formatInteger(roomOutcomes.total || 0)}`,
-        detail: `Last ${formatInteger(roomOutcomes.window_hours || 24)}h`,
+        value: `${formatInteger(roomOutcomes.succeeded || 0)}/${formatInteger(resolvedRoomCount)}`,
+        detail: `Resolved last ${formatInteger(roomOutcomes.window_hours || 24)}h · running ${formatInteger(roomOutcomes.running || 0)}`,
         subdetail: `blocked ${formatInteger(roomOutcomes.blocked || 0)} · stand down ${formatInteger(roomOutcomes.stand_down || 0)} · failed ${formatInteger(roomOutcomes.failed || 0)}`,
-        critical: Number(roomOutcomes.total || 0) > 0 && Number(roomOutcomes.succeeded || 0) === 0,
+        critical: resolvedRoomCount > 0 && Number(roomOutcomes.succeeded || 0) === 0,
       }),
       summaryCard({
         label: "Quality Debt",
         value: formatInteger(qualityDebt.total || 0),
-        detail: `stale ${formatInteger(qualityDebt.stale_mismatch_count || 0)} · missed ${formatInteger(qualityDebt.missed_stand_down_count || 0)}`,
-        subdetail: `recent stale ${formatInteger(qualityDebt.recent_stale_mismatch_count || 0)}`,
+        detail: `stale ${formatInteger(qualityDebt.stale_mismatch_count || 0)} · missed ${formatInteger(qualityDebt.missed_stand_down_count || 0)} · weak ${formatInteger(qualityDebt.weak_resolved_trade_count || 0)}`,
+        subdetail: `recent stale ${formatInteger(qualityDebt.recent_stale_mismatch_count || 0)} · recent missed ${formatInteger(qualityDebt.recent_missed_stand_down_count || 0)}`,
       }),
     ];
     summaryContainer.replaceChildren(...summaryCards);

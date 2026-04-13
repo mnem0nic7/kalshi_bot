@@ -226,15 +226,22 @@ def _recent_room_outcomes(room_views: list[dict[str, Any]], *, now: datetime) ->
     counts = Counter(room["status"] for room in recent)
     total = len(recent)
     succeeded = counts.get("succeeded", 0)
+    resolved_total = (
+        succeeded
+        + counts.get("blocked", 0)
+        + counts.get("stand_down", 0)
+        + counts.get("failed", 0)
+    )
     return {
         "window_hours": SUMMARY_ROOM_WINDOW_HOURS,
         "total": total,
+        "resolved_total": resolved_total,
         "succeeded": succeeded,
         "blocked": counts.get("blocked", 0),
         "stand_down": counts.get("stand_down", 0),
         "failed": counts.get("failed", 0),
         "running": counts.get("running", 0),
-        "success_rate": round(succeeded / total, 4) if total else 0.0,
+        "success_rate": round(succeeded / resolved_total, 4) if resolved_total else 0.0,
     }
 
 
