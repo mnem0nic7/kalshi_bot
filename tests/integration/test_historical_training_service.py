@@ -456,6 +456,9 @@ series_templates:
         assert "settlement_mismatch_breakdown" in historical_status.json()
         assert "coverage_repair_summary" in historical_status.json()
         assert "replay_refresh_counts_by_cause" in historical_status.json()
+        assert "market_checkpoint_capture_coverage" in historical_status.json()
+        assert "market_checkpoint_coverage_counts" in historical_status.json()
+        assert "market_checkpoint_capture_gaps" in historical_status.json()
 
         pipeline_status = client.get("/api/historical/pipeline/status?verbose=true")
         assert pipeline_status.status_code == 200
@@ -504,6 +507,257 @@ series_templates:
         assert lines[0]["settlement_label"]["crosscheck_status"] == "match"
         assert lines[0]["draft_only"] is False
         assert historical_room_id == lines[0]["room"]["id"]
+
+    get_settings.cache_clear()
+
+
+def test_historical_gemini_build_becomes_training_ready_with_three_full_days(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    output_dir = tmp_path / "gemini_weather"
+    map_path.write_text(
+        """
+series_templates:
+  - series_ticker: KXHIGHNY
+    display_name: NYC Daily High Temperature
+    station_id: KNYC
+    daily_summary_station_id: USW00094728
+    location_name: New York City
+    timezone_name: America/New_York
+    latitude: 40.7146
+    longitude: -74.0071
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "historical-gemini-ready.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> None:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                for ticker, local_day, checkpoint_ts in (
+                    ("KXHIGHNY-26APR10-T68", "2026-04-10", datetime(2026, 4, 10, 13, 0, tzinfo=UTC)),
+                    ("KXHIGHNY-26APR11-T68", "2026-04-11", datetime(2026, 4, 11, 13, 0, tzinfo=UTC)),
+                    ("KXHIGHNY-26APR12-T68", "2026-04-12", datetime(2026, 4, 12, 13, 0, tzinfo=UTC)),
+                ):
+                    room = await repo.create_room(
+                        RoomCreate(name=f"Historical Replay {local_day}", market_ticker=ticker),
+                        active_color=container.settings.app_color,
+                        shadow_mode=False,
+                        kill_switch_enabled=False,
+                        kalshi_env=container.settings.kalshi_env,
+                        room_origin=RoomOrigin.HISTORICAL_REPLAY.value,
+                        agent_pack_version="builtin-gemini-v1",
+                        role_models={"researcher": {"provider": "gemini", "model": "gemini-2.5-pro"}},
+                    )
+                    await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+                    for role, kind, content in (
+                        (AgentRole.RESEARCHER, MessageKind.OBSERVATION, f"Research trace {local_day}"),
+                        (AgentRole.PRESIDENT, MessageKind.POLICY_MEMO, f"Posture trace {local_day}"),
+                        (AgentRole.TRADER, MessageKind.TRADE_IDEA, f"Trade trace {local_day}"),
+                        (AgentRole.MEMORY_LIBRARIAN, MessageKind.MEMORY_NOTE, f"Memory trace {local_day}"),
+                    ):
+                        await repo.append_message(
+                            room.id,
+                            RoomMessageCreate(role=role, kind=kind, stage=RoomStage.COMPLETE, content=content, payload={}),
+                        )
+                    await repo.upsert_historical_settlement_label(
+                        market_ticker=ticker,
+                        series_ticker="KXHIGHNY",
+                        local_market_day=local_day,
+                        source_kind="kalshi_primary",
+                        kalshi_result="yes",
+                        settlement_value_dollars=Decimal("1.0000"),
+                        settlement_ts=checkpoint_ts + timedelta(hours=10),
+                        crosscheck_status="match",
+                        crosscheck_high_f=Decimal("81.00"),
+                        crosscheck_result="yes",
+                        payload={"market": {"ticker": ticker}},
+                    )
+                    await repo.create_historical_replay_run(
+                        room_id=room.id,
+                        market_ticker=ticker,
+                        series_ticker="KXHIGHNY",
+                        local_market_day=local_day,
+                        checkpoint_label="checkpoint_1",
+                        checkpoint_ts=checkpoint_ts,
+                        status="completed",
+                        agent_pack_version="builtin-gemini-v1",
+                        payload={
+                            "historical_provenance": {
+                                "room_origin": RoomOrigin.HISTORICAL_REPLAY.value,
+                                "local_market_day": local_day,
+                                "checkpoint_label": "checkpoint_1",
+                                "checkpoint_ts": checkpoint_ts.isoformat(),
+                                "timezone_name": "America/New_York",
+                                "market_snapshot_source_id": f"market-snapshot-{local_day}",
+                                "weather_snapshot_source_id": f"weather-snapshot-{local_day}",
+                                "market_source_kind": "checkpoint_captured_market_snapshot",
+                                "weather_source_kind": "archived_weather_bundle",
+                                "settlement_label_id": f"settlement-{local_day}",
+                                "settlement_crosscheck_status": "match",
+                                "coverage_class": "full_checkpoint_coverage",
+                                "source_coverage": {
+                                    "market_snapshot": True,
+                                    "weather_snapshot": True,
+                                    "settlement_label": True,
+                                },
+                            }
+                        },
+                    )
+                await session.commit()
+
+        asyncio.run(seed())
+
+        build_response = client.post(
+            "/api/training/historical/build",
+            json={
+                "mode": "gemini-finetune",
+                "date_from": "2026-04-10",
+                "date_to": "2026-04-12",
+                "series": ["KXHIGHNY"],
+                "output": str(output_dir),
+            },
+        )
+
+        assert build_response.status_code == 200
+        payload = build_response.json()
+        assert payload["build"]["room_count"] == 3
+        assert payload["build"]["draft_only"] is False
+        assert payload["build"]["training_ready"] is True
+
+        manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["draft_only"] is False
+        assert manifest["training_ready"] is True
+        assert len(manifest["split_boundaries"]["train_room_ids"]) == 1
+        assert len(manifest["split_boundaries"]["validation_room_ids"]) == 1
+        assert len(manifest["split_boundaries"]["holdout_room_ids"]) == 1
+
+        historical_status = client.get("/api/historical/status")
+        assert historical_status.status_code == 200
+        assert historical_status.json()["historical_build_readiness"]["training_ready"] is True
+
+    get_settings.cache_clear()
+
+
+def test_historical_status_reports_market_checkpoint_capture_coverage(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text(
+        """
+series_templates:
+  - series_ticker: KXHIGHNY
+    display_name: NYC Daily High Temperature
+    station_id: KNYC
+    daily_summary_station_id: USW00094728
+    location_name: New York City
+    timezone_name: America/New_York
+    latitude: 40.7146
+    longitude: -74.0071
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "historical-market-checkpoint-status.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> None:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                ticker = "KXHIGHNY-26APR11-T68"
+                local_market_day = "2026-04-11"
+                close_ts = datetime(2026, 4, 11, 23, 59, 59, tzinfo=UTC)
+                settlement_ts = datetime(2026, 4, 12, 0, 30, tzinfo=UTC)
+                await repo.upsert_historical_settlement_label(
+                    market_ticker=ticker,
+                    series_ticker="KXHIGHNY",
+                    local_market_day=local_market_day,
+                    source_kind="kalshi_primary",
+                    kalshi_result="yes",
+                    settlement_value_dollars=Decimal("1.0000"),
+                    settlement_ts=settlement_ts,
+                    crosscheck_status="match",
+                    crosscheck_high_f=Decimal("81.00"),
+                    crosscheck_result="yes",
+                    payload={
+                        "market": {
+                            "ticker": ticker,
+                            "strike_type": "greater",
+                            "floor_strike": 68,
+                            "close_time": close_ts.isoformat(),
+                        }
+                    },
+                )
+                for checkpoint_label, asof_ts in (
+                    ("open_0900", datetime(2026, 4, 11, 12, 55, tzinfo=UTC)),
+                    ("midday_1300", datetime(2026, 4, 11, 16, 55, tzinfo=UTC)),
+                    ("late_1700", datetime(2026, 4, 11, 20, 55, tzinfo=UTC)),
+                ):
+                    await repo.upsert_historical_market_snapshot(
+                        market_ticker=ticker,
+                        series_ticker="KXHIGHNY",
+                        station_id="KNYC",
+                        local_market_day=local_market_day,
+                        asof_ts=asof_ts,
+                        source_kind="checkpoint_captured_market_snapshot",
+                        source_id=f"market-{checkpoint_label}",
+                        source_hash=f"hash-market-{checkpoint_label}",
+                        close_ts=close_ts,
+                        settlement_ts=settlement_ts,
+                        yes_bid_dollars=Decimal("0.5100"),
+                        yes_ask_dollars=Decimal("0.5500"),
+                        no_ask_dollars=Decimal("0.4900"),
+                        last_price_dollars=Decimal("0.5300"),
+                        payload={
+                            "market": {
+                                "ticker": ticker,
+                                "strike_type": "greater",
+                                "floor_strike": 68,
+                                "updated_time": asof_ts.isoformat(),
+                            }
+                        },
+                    )
+                    await repo.upsert_historical_weather_snapshot(
+                        station_id="KNYC",
+                        series_ticker="KXHIGHNY",
+                        local_market_day=local_market_day,
+                        asof_ts=asof_ts,
+                        source_kind="archived_weather_bundle",
+                        source_id=f"weather-{checkpoint_label}",
+                        source_hash=f"hash-weather-{checkpoint_label}",
+                        observation_ts=asof_ts,
+                        forecast_updated_ts=asof_ts - timedelta(minutes=15),
+                        forecast_high_f=Decimal("81.00"),
+                        current_temp_f=Decimal("72.00"),
+                        payload={"asof_ts": asof_ts.isoformat()},
+                    )
+                await session.commit()
+
+        asyncio.run(seed())
+
+        historical_status = client.get("/api/historical/status?verbose=true")
+        assert historical_status.status_code == 200
+        body = historical_status.json()
+        assert body["full_checkpoint_coverage_count"] == 1
+        assert body["market_checkpoint_capture_coverage"]["checkpoint_coverage_counts"]["full_checkpoint_coverage"] == 1
+        assert body["market_checkpoint_coverage_counts"]["full_checkpoint_coverage"] == 1
+        assert "market_checkpoint_capture_gaps" in body
+        assert "market_checkpoint_market_day_coverage" in body
 
     get_settings.cache_clear()
 

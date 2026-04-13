@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 import asyncio
 
+import httpx
 import pytest
 
 from decimal import Decimal
@@ -39,13 +40,27 @@ class _DummyClient:
 
 
 class _DummyKalshi:
-    def __init__(self, responses):
-        self.responses = list(responses)
+    def __init__(self, responses=None, candlestick_responses=None):
+        self.responses = list(responses or [])
+        self.candlestick_responses = list(candlestick_responses or [])
         self.calls = []
 
     async def list_markets(self, **params):
         self.calls.append(params)
         return self.responses.pop(0)
+
+    async def get_market_candlesticks(self, series_ticker: str, market_ticker: str, **params):
+        self.calls.append(
+            {
+                "series_ticker": series_ticker,
+                "market_ticker": market_ticker,
+                **params,
+            }
+        )
+        response = self.candlestick_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 @pytest.mark.asyncio
@@ -171,6 +186,35 @@ def test_historical_split_keeps_market_day_together() -> None:
     assert split_by_room["room-a"] == split_by_room["room-b"]
 
 
+def test_historical_split_two_days_creates_train_and_holdout_only() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    bundles = [
+        SimpleNamespace(room={"id": "room-a"}, historical_provenance={"local_market_day": "2026-04-10"}),
+        SimpleNamespace(room={"id": "room-b"}, historical_provenance={"local_market_day": "2026-04-11"}),
+    ]
+
+    split = HistoricalTrainingService._split_historical_bundles(service, bundles)
+
+    assert split.train == ["room-a"]
+    assert split.validation == []
+    assert split.holdout == ["room-b"]
+
+
+def test_historical_split_three_days_creates_train_validation_and_holdout() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    bundles = [
+        SimpleNamespace(room={"id": "room-a"}, historical_provenance={"local_market_day": "2026-04-10"}),
+        SimpleNamespace(room={"id": "room-b"}, historical_provenance={"local_market_day": "2026-04-11"}),
+        SimpleNamespace(room={"id": "room-c"}, historical_provenance={"local_market_day": "2026-04-12"}),
+    ]
+
+    split = HistoricalTrainingService._split_historical_bundles(service, bundles)
+
+    assert split.train == ["room-a"]
+    assert split.validation == ["room-b"]
+    assert split.holdout == ["room-c"]
+
+
 def test_historical_market_days_for_coverage_counts_only_matching_coverage() -> None:
     service = object.__new__(HistoricalTrainingService)
     bundles = [
@@ -272,9 +316,22 @@ def test_coverage_class_detects_partial_and_outcome_only() -> None:
 
 def test_checkpoint_capture_due_and_metadata_validation() -> None:
     service = object.__new__(HistoricalTrainingService)
-    service.settings = SimpleNamespace(historical_checkpoint_capture_grace_seconds=900)
+    service.settings = SimpleNamespace(
+        historical_checkpoint_capture_lead_seconds=300,
+        historical_checkpoint_capture_grace_seconds=900,
+    )
     checkpoint_ts = datetime(2026, 4, 10, 13, 0, tzinfo=UTC)
 
+    assert HistoricalTrainingService._checkpoint_capture_due(
+        service,
+        checkpoint_ts,
+        now=datetime(2026, 4, 10, 12, 56, tzinfo=UTC),
+    ) is True
+    assert HistoricalTrainingService._checkpoint_capture_due(
+        service,
+        checkpoint_ts,
+        now=datetime(2026, 4, 10, 12, 54, tzinfo=UTC),
+    ) is False
     assert HistoricalTrainingService._checkpoint_capture_due(service, checkpoint_ts, now=checkpoint_ts) is True
     assert HistoricalTrainingService._checkpoint_capture_due(
         service,
@@ -286,6 +343,35 @@ def test_checkpoint_capture_due_and_metadata_validation() -> None:
         checkpoint_ts,
         now=datetime(2026, 4, 10, 13, 16, tzinfo=UTC),
     ) is False
+
+
+def test_checkpoint_market_snapshot_asof_rejects_future_and_stale_quotes() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.settings = SimpleNamespace(historical_replay_market_stale_seconds=900)
+    checkpoint_ts = datetime(2026, 4, 10, 13, 0, tzinfo=UTC)
+
+    future_asof, future_reason = HistoricalTrainingService._checkpoint_market_snapshot_asof(
+        service,
+        {"updated_time": "2026-04-10T13:01:00+00:00"},
+        checkpoint_ts=checkpoint_ts,
+    )
+    stale_asof, stale_reason = HistoricalTrainingService._checkpoint_market_snapshot_asof(
+        service,
+        {"updated_time": "2026-04-10T12:30:00+00:00"},
+        checkpoint_ts=checkpoint_ts,
+    )
+    fresh_asof, fresh_reason = HistoricalTrainingService._checkpoint_market_snapshot_asof(
+        service,
+        {"updated_time": "2026-04-10T12:55:00+00:00"},
+        checkpoint_ts=checkpoint_ts,
+    )
+
+    assert future_asof is None
+    assert future_reason == "market_snapshot_future"
+    assert stale_asof is None
+    assert stale_reason == "market_snapshot_stale"
+    assert fresh_asof == datetime(2026, 4, 10, 12, 55, tzinfo=UTC)
+    assert fresh_reason is None
 
     assert HistoricalTrainingService._checkpoint_archive_metadata_valid(
         {
@@ -558,6 +644,201 @@ def test_select_market_snapshot_rejects_stale_captured_and_uses_fresh_reconstruc
 
     assert snapshot is fresh_reconstructed
     assert reason is None
+
+
+def test_select_market_snapshot_prefers_exact_checkpoint_capture() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.settings = SimpleNamespace(risk_stale_market_seconds=300, historical_replay_market_stale_seconds=900)
+    checkpoint_ts = datetime(2026, 4, 10, 21, 0, tzinfo=UTC)
+
+    checkpoint_captured = SimpleNamespace(
+        asof_ts=datetime(2026, 4, 10, 20, 58, tzinfo=UTC),
+        source_kind=HistoricalTrainingService.CHECKPOINT_CAPTURED_MARKET_SOURCE,
+    )
+    captured = SimpleNamespace(
+        asof_ts=datetime(2026, 4, 10, 20, 57, tzinfo=UTC),
+        source_kind=HistoricalTrainingService.CAPTURED_MARKET_SOURCE,
+    )
+    reconstructed = SimpleNamespace(
+        asof_ts=datetime(2026, 4, 10, 20, 56, tzinfo=UTC),
+        source_kind=HistoricalTrainingService.RECONSTRUCTED_MARKET_SOURCE,
+    )
+
+    class _Repo:
+        async def get_latest_historical_market_snapshot(self, **kwargs):
+            if kwargs.get("source_kind") == HistoricalTrainingService.CHECKPOINT_CAPTURED_MARKET_SOURCE:
+                return checkpoint_captured
+            if kwargs.get("source_kind") == HistoricalTrainingService.CAPTURED_MARKET_SOURCE:
+                return captured
+            if kwargs.get("source_kind") == HistoricalTrainingService.RECONSTRUCTED_MARKET_SOURCE:
+                return reconstructed
+            return None
+
+    snapshot, reason = asyncio.run(
+        HistoricalTrainingService._select_market_snapshot(
+            service,
+            _Repo(),
+            market_ticker="KXHIGHMIA-26APR10-T76",
+            local_market_day="2026-04-10",
+            checkpoint_ts=checkpoint_ts,
+        )
+    )
+
+    assert snapshot is checkpoint_captured
+    assert reason is None
+
+
+def test_reconstruct_market_checkpoint_prefers_one_minute_candlesticks(monkeypatch) -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.settings = SimpleNamespace(
+        historical_replay_market_snapshot_lookback_hours=36,
+        historical_replay_market_stale_seconds=900,
+    )
+    calls: list[dict[str, object]] = []
+
+    class _FakeRepo:
+        def __init__(self, session):
+            self.session = session
+
+        async def upsert_historical_market_snapshot(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(source_id=kwargs["source_id"], source_kind=kwargs["source_kind"])
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr("kalshi_bot.services.historical_training.PlatformRepository", _FakeRepo)
+    service.session_factory = lambda: _FakeSession()
+    service.kalshi = _DummyKalshi(
+        candlestick_responses=[
+            {
+                "candlesticks": [
+                    {
+                        "end_period_ts": int(datetime(2026, 4, 10, 20, 59, tzinfo=UTC).timestamp()),
+                        "yes_bid": {"close_dollars": "0.5100"},
+                        "yes_ask": {"close_dollars": "0.5500"},
+                        "price": {"close_dollars": "0.5300"},
+                    }
+                ]
+            }
+        ]
+    )
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHNY-26APR10-T68",
+        market_type="weather",
+        station_id="KNYC",
+        location_name="New York City",
+        latitude=40.7146,
+        longitude=-74.0071,
+        threshold_f=68,
+        operator=">",
+        settlement_source="NWS daily summary",
+        series_ticker="KXHIGHNY",
+    )
+    settlement_label = SimpleNamespace(
+        market_ticker="KXHIGHNY-26APR10-T68",
+        local_market_day="2026-04-10",
+        payload={"market": {"ticker": "KXHIGHNY-26APR10-T68", "close_time": "2026-04-10T23:59:59+00:00"}},
+    )
+
+    result = asyncio.run(
+        HistoricalTrainingService._reconstruct_market_checkpoint(
+            service,
+            mapping=mapping,
+            settlement_label=settlement_label,
+            checkpoint_label="late_1700",
+            checkpoint_ts=datetime(2026, 4, 10, 21, 0, tzinfo=UTC),
+        )
+    )
+
+    assert result is not None
+    assert service.kalshi.calls[0]["period_interval"] == 1
+    assert calls[0]["asof_ts"] == datetime(2026, 4, 10, 20, 59, tzinfo=UTC)
+
+
+def test_reconstruct_market_checkpoint_falls_back_to_hourly_when_one_minute_unavailable(monkeypatch) -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.settings = SimpleNamespace(
+        historical_replay_market_snapshot_lookback_hours=36,
+        historical_replay_market_stale_seconds=900,
+    )
+    calls: list[dict[str, object]] = []
+
+    class _FakeRepo:
+        def __init__(self, session):
+            self.session = session
+
+        async def upsert_historical_market_snapshot(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(source_id=kwargs["source_id"], source_kind=kwargs["source_kind"])
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def commit(self):
+            return None
+
+    request = httpx.Request("GET", "https://kalshi.test/candlesticks")
+    response = httpx.Response(400, request=request)
+    monkeypatch.setattr("kalshi_bot.services.historical_training.PlatformRepository", _FakeRepo)
+    service.session_factory = lambda: _FakeSession()
+    service.kalshi = _DummyKalshi(
+        candlestick_responses=[
+            httpx.HTTPStatusError("bad request", request=request, response=response),
+            {
+                "candlesticks": [
+                    {
+                        "end_period_ts": int(datetime(2026, 4, 10, 20, 55, tzinfo=UTC).timestamp()),
+                        "yes_bid": {"close_dollars": "0.4900"},
+                        "yes_ask": {"close_dollars": "0.5300"},
+                        "price": {"close_dollars": "0.5100"},
+                    }
+                ]
+            },
+        ]
+    )
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHNY-26APR10-T68",
+        market_type="weather",
+        station_id="KNYC",
+        location_name="New York City",
+        latitude=40.7146,
+        longitude=-74.0071,
+        threshold_f=68,
+        operator=">",
+        settlement_source="NWS daily summary",
+        series_ticker="KXHIGHNY",
+    )
+    settlement_label = SimpleNamespace(
+        market_ticker="KXHIGHNY-26APR10-T68",
+        local_market_day="2026-04-10",
+        payload={"market": {"ticker": "KXHIGHNY-26APR10-T68", "close_time": "2026-04-10T23:59:59+00:00"}},
+    )
+
+    result = asyncio.run(
+        HistoricalTrainingService._reconstruct_market_checkpoint(
+            service,
+            mapping=mapping,
+            settlement_label=settlement_label,
+            checkpoint_label="late_1700",
+            checkpoint_ts=datetime(2026, 4, 10, 21, 0, tzinfo=UTC),
+        )
+    )
+
+    assert result is not None
+    assert [call["period_interval"] for call in service.kalshi.calls] == [1, 60]
+    assert calls[0]["asof_ts"] == datetime(2026, 4, 10, 20, 55, tzinfo=UTC)
 
 
 def test_gemini_build_readiness_requires_multiple_market_days_and_splits() -> None:

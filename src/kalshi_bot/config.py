@@ -124,6 +124,7 @@ class Settings(BaseSettings):
     historical_replay_market_snapshot_lookback_hours: int = 36
     historical_replay_market_stale_seconds: int = 900
     historical_weather_archive_path: str = "data/historical_weather"
+    historical_checkpoint_capture_lead_seconds: int = 300
     historical_checkpoint_capture_grace_seconds: int = 900
     active_heuristic_pack_version: str = "historical-baseline-v1"
     historical_intelligence_window_days: int = 365

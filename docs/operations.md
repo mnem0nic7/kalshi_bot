@@ -143,7 +143,7 @@ kalshi-bot-cli training-build historical --mode gemini-finetune --date-from 2026
 
 Historical replay rooms are stored with `room_origin = historical_replay`. They reuse the room/export machinery, but the main control-room lists and live/shadow learning surfaces keep filtering to `shadow` and `live` by default so operator views stay focused.
 
-Historical status now reports replayable market-days, exact checkpoint-capture coverage, missing checkpoint reasons, settlement-backfill progress, and whether the Gemini export is only draft-ready or truly split-ready for training.
+Historical status now reports replayable market-days, exact weather checkpoint-archive coverage, exact market checkpoint-capture coverage, missing checkpoint reasons, settlement-backfill progress, and whether the Gemini export is only draft-ready or truly split-ready for training.
 Historical status should be interpreted in layers:
 
 - `source_replay_coverage` tells you what the current strict-asof sources can support
@@ -162,7 +162,7 @@ Weather-archive backfill now has a second repair job besides writing raw archive
 
 Deploy findings from April 12, 2026:
 
-- `historical-archive checkpoint-capture --once` returning `captured_checkpoint_count = 0` is expected outside the due checkpoint windows; it means nothing was due, not that the job failed
+- `historical-archive checkpoint-capture --once` now captures weather checkpoint archives and exact market checkpoint snapshots; `captured_checkpoint_count = 0` is still expected outside the due checkpoint windows and means nothing was due, not that the job failed
 - `historical-backfill settlements` is now part of the operational repair path for closed markets with missing labels; the first live sweep backfilled labels immediately and materially reduced the `possible_ingestion_gap` backlog
 - historical replay readiness is still constrained by missing checkpoint-weather coverage, so the right next action is continued checkpoint capture, not lowering training-readiness thresholds
 - historical replay repair is also now a normal maintenance tool after replay-logic changes; source tables can be ahead of the materialized replay corpus until `historical-repair refresh` is run

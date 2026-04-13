@@ -81,7 +81,7 @@ Deploy findings from April 12, 2026:
 
 - the new checkpoint archive path is healthy, but a manual `historical-archive checkpoint-capture --once` may correctly return zero captures when no checkpoint slot is currently due
 - settlement backfill is already proving useful on the live shadow corpus and should be treated as a normal maturity-repair tool, not an emergency-only action
-- the current blocker for historical Gemini fine-tuning is still missing full-checkpoint weather coverage, so exports should remain `draft_only` until distinct full-coverage market-days accumulate naturally
+- the current blocker for historical Gemini fine-tuning is still missing strict full-checkpoint coverage; older days are mostly missing checkpoint-time weather, while recent partial days can also be blocked by missing or stale exact market checkpoints
 - historical replay repair is now part of the normal maintenance path when replay logic changes; stale derived replay rooms should be refreshed rather than trusted
 - historical intelligence indicators are only trustworthy after replay refresh, because stale replay rooms can otherwise collapse into misleading blanket stand-down reasons like `market_stale`
 - settlement refresh is now also part of replay maintenance; when crosscheck semantics or mismatch classification change, the rolling replay corpus and overlapping historical builds should be refreshed so readiness stays tied to current truth
@@ -327,9 +327,10 @@ The Gemini export writes:
 
 The split is chronological by local settlement day:
 
-- oldest `70%` train
-- next `15%` validation
-- newest `15%` holdout
+- `1` day: all train
+- `2` days: oldest day train, newest day holdout
+- `3` days: oldest day train, middle day validation, newest day holdout
+- `4+` days: oldest `70%` train, next `15%` validation, newest `15%` holdout, while keeping at least one validation day and one holdout day
 
 All checkpoints from the same market-day stay together in one split.
 

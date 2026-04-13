@@ -126,7 +126,8 @@ class HistoricalTrainingService:
         ("midday_1300", 13),
         ("late_1700", 17),
     )
-    REPLAY_LOGIC_VERSION = "historical_replay_2026_04_13_support_repair_v1"
+    REPLAY_LOGIC_VERSION = "historical_replay_2026_04_14_strict_checkpoint_market_capture_v1"
+    CHECKPOINT_CAPTURED_MARKET_SOURCE = "checkpoint_captured_market_snapshot"
     CHECKPOINT_CAPTURED_WEATHER_SOURCE = "checkpoint_archived_weather_bundle"
     PROMOTED_CHECKPOINT_ARCHIVE_SOURCE = "coverage_repair_checkpoint_promotion"
     CAPTURED_MARKET_SOURCE = "captured_market_snapshot"
@@ -709,110 +710,186 @@ class HistoricalTrainingService:
         skipped_future_source = 0
         skipped_missing_metadata = 0
         samples: list[dict[str, Any]] = []
+        captured_market_snapshots = 0
+        skipped_market_existing = 0
+        skipped_market_not_due = 0
+        skipped_market_future_source = 0
+        skipped_market_stale = 0
+        skipped_market_missing_metadata = 0
+        market_samples: list[dict[str, Any]] = []
 
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             for template in templates:
                 local_market_day = now.astimezone(ZoneInfo(template.timezone_name or "UTC")).date().isoformat()
-                market = await self._find_market_for_template_day(template, local_market_day=local_market_day)
+                day_markets = await self._list_template_day_markets(template, local_market_day=local_market_day)
+                market = day_markets[0] if day_markets else None
                 mapping = self._checkpoint_mapping(template, market=market)
                 checkpoints = self._checkpoint_times(mapping, local_market_day=local_market_day, market_payload=market or {})
                 for checkpoint_label, checkpoint_ts in checkpoints:
-                    if due_only and not self._checkpoint_capture_due(checkpoint_ts, now=now):
+                    capture_due = self._checkpoint_capture_due(checkpoint_ts, now=now)
+                    if due_only and not capture_due:
                         skipped_not_due += 1
-                        continue
-                    existing = await repo.get_historical_checkpoint_archive(
-                        series_ticker=template.series_ticker,
-                        local_market_day=local_market_day,
-                        checkpoint_label=checkpoint_label,
-                    )
-                    if existing is not None:
-                        skipped_existing += 1
-                        continue
-                    weather_bundle = await self.research_coordinator.weather.build_market_snapshot(mapping)
-                    archive_meta = weather_bundle_archive_metadata(weather_bundle, captured_at=checkpoint_ts)
-                    if archive_meta is None:
-                        skipped_missing_metadata += 1
-                        continue
-                    if not self._checkpoint_archive_metadata_valid(archive_meta, checkpoint_ts):
-                        skipped_future_source += 1
-                        continue
-                    source_id = f"checkpoint:{template.series_ticker}:{local_market_day}:{checkpoint_label}"
-                    archive_record = append_weather_bundle_archive(
-                        self.settings,
-                        weather_bundle,
-                        source_id=source_id,
-                        archive_source=source_kind,
-                        captured_at=checkpoint_ts,
-                    )
-                    await repo.upsert_historical_weather_snapshot(
-                        station_id=template.station_id,
-                        series_ticker=template.series_ticker,
-                        local_market_day=local_market_day,
-                        asof_ts=checkpoint_ts,
-                        source_kind=self.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
-                        source_id=source_id,
-                        source_hash=_hash_payload(weather_bundle),
-                        observation_ts=archive_meta["observation_ts"],
-                        forecast_updated_ts=archive_meta["forecast_updated_ts"],
-                        forecast_high_f=archive_meta["forecast_high_f"],
-                        current_temp_f=archive_meta["current_temp_f"],
-                        payload={
-                            **weather_bundle,
-                            "_checkpoint_archive": {
-                                "checkpoint_label": checkpoint_label,
-                                "checkpoint_ts": checkpoint_ts.isoformat(),
-                                "captured_at": now.isoformat(),
-                                "archive_source": source_kind,
-                            },
-                            "_archive": {
-                                "archive_path": archive_record["archive_path"] if archive_record is not None else None,
-                                "archive_source": source_kind,
-                                "source_id": source_id,
-                                "captured_at": checkpoint_ts.isoformat(),
-                            },
-                        },
-                    )
-                    await repo.upsert_historical_checkpoint_archive(
-                        series_ticker=template.series_ticker,
-                        market_ticker=(str(market.get("ticker")) if isinstance(market, dict) and market.get("ticker") else None),
-                        station_id=template.station_id,
-                        local_market_day=local_market_day,
-                        checkpoint_label=checkpoint_label,
-                        checkpoint_ts=checkpoint_ts,
-                        captured_at=now,
-                        source_kind=source_kind,
-                        source_id=source_id,
-                        source_hash=_hash_payload(weather_bundle),
-                        observation_ts=archive_meta["observation_ts"],
-                        forecast_updated_ts=archive_meta["forecast_updated_ts"],
-                        archive_path=(archive_record["archive_path"] if archive_record is not None else None),
-                        payload={
-                            "series_ticker": template.series_ticker,
-                            "market_ticker": (str(market.get("ticker")) if isinstance(market, dict) and market.get("ticker") else None),
-                            "station_id": template.station_id,
-                            "local_market_day": local_market_day,
-                            "checkpoint_label": checkpoint_label,
-                            "checkpoint_ts": checkpoint_ts.isoformat(),
-                            "captured_at": now.isoformat(),
-                            "weather_source_kind": self.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
-                            "weather_source_id": source_id,
-                            "archive_source": source_kind,
-                        },
-                    )
-                    await repo.log_weather_event(template.station_id, "historical_checkpoint_capture", weather_bundle)
-                    captured += 1
-                    if len(samples) < 10:
-                        samples.append(
-                            {
-                                "series_ticker": template.series_ticker,
-                                "market_ticker": (str(market.get("ticker")) if isinstance(market, dict) and market.get("ticker") else None),
-                                "local_market_day": local_market_day,
-                                "checkpoint_label": checkpoint_label,
-                                "checkpoint_ts": checkpoint_ts.isoformat(),
-                                "archive_path": archive_record["archive_path"] if archive_record is not None else None,
-                            }
+                    else:
+                        existing = await repo.get_historical_checkpoint_archive(
+                            series_ticker=template.series_ticker,
+                            local_market_day=local_market_day,
+                            checkpoint_label=checkpoint_label,
                         )
+                        if existing is not None:
+                            skipped_existing += 1
+                        else:
+                            weather_bundle = await self.research_coordinator.weather.build_market_snapshot(mapping)
+                            archive_meta = weather_bundle_archive_metadata(weather_bundle, captured_at=checkpoint_ts)
+                            if archive_meta is None:
+                                skipped_missing_metadata += 1
+                            elif not self._checkpoint_archive_metadata_valid(archive_meta, checkpoint_ts):
+                                skipped_future_source += 1
+                            else:
+                                source_id = f"checkpoint:{template.series_ticker}:{local_market_day}:{checkpoint_label}"
+                                archive_record = append_weather_bundle_archive(
+                                    self.settings,
+                                    weather_bundle,
+                                    source_id=source_id,
+                                    archive_source=source_kind,
+                                    captured_at=checkpoint_ts,
+                                )
+                                await repo.upsert_historical_weather_snapshot(
+                                    station_id=template.station_id,
+                                    series_ticker=template.series_ticker,
+                                    local_market_day=local_market_day,
+                                    asof_ts=checkpoint_ts,
+                                    source_kind=self.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
+                                    source_id=source_id,
+                                    source_hash=_hash_payload(weather_bundle),
+                                    observation_ts=archive_meta["observation_ts"],
+                                    forecast_updated_ts=archive_meta["forecast_updated_ts"],
+                                    forecast_high_f=archive_meta["forecast_high_f"],
+                                    current_temp_f=archive_meta["current_temp_f"],
+                                    payload={
+                                        **weather_bundle,
+                                        "_checkpoint_archive": {
+                                            "checkpoint_label": checkpoint_label,
+                                            "checkpoint_ts": checkpoint_ts.isoformat(),
+                                            "captured_at": now.isoformat(),
+                                            "archive_source": source_kind,
+                                        },
+                                        "_archive": {
+                                            "archive_path": archive_record["archive_path"] if archive_record is not None else None,
+                                            "archive_source": source_kind,
+                                            "source_id": source_id,
+                                            "captured_at": checkpoint_ts.isoformat(),
+                                        },
+                                    },
+                                )
+                                await repo.upsert_historical_checkpoint_archive(
+                                    series_ticker=template.series_ticker,
+                                    market_ticker=(str(market.get("ticker")) if isinstance(market, dict) and market.get("ticker") else None),
+                                    station_id=template.station_id,
+                                    local_market_day=local_market_day,
+                                    checkpoint_label=checkpoint_label,
+                                    checkpoint_ts=checkpoint_ts,
+                                    captured_at=now,
+                                    source_kind=source_kind,
+                                    source_id=source_id,
+                                    source_hash=_hash_payload(weather_bundle),
+                                    observation_ts=archive_meta["observation_ts"],
+                                    forecast_updated_ts=archive_meta["forecast_updated_ts"],
+                                    archive_path=(archive_record["archive_path"] if archive_record is not None else None),
+                                    payload={
+                                        "series_ticker": template.series_ticker,
+                                        "market_ticker": (str(market.get("ticker")) if isinstance(market, dict) and market.get("ticker") else None),
+                                        "station_id": template.station_id,
+                                        "local_market_day": local_market_day,
+                                        "checkpoint_label": checkpoint_label,
+                                        "checkpoint_ts": checkpoint_ts.isoformat(),
+                                        "captured_at": now.isoformat(),
+                                        "weather_source_kind": self.CHECKPOINT_CAPTURED_WEATHER_SOURCE,
+                                        "weather_source_id": source_id,
+                                        "archive_source": source_kind,
+                                    },
+                                )
+                                await repo.log_weather_event(template.station_id, "historical_checkpoint_capture", weather_bundle)
+                                captured += 1
+                                if len(samples) < 10:
+                                    samples.append(
+                                        {
+                                            "series_ticker": template.series_ticker,
+                                            "market_ticker": (str(market.get("ticker")) if isinstance(market, dict) and market.get("ticker") else None),
+                                            "local_market_day": local_market_day,
+                                            "checkpoint_label": checkpoint_label,
+                                            "checkpoint_ts": checkpoint_ts.isoformat(),
+                                            "archive_path": archive_record["archive_path"] if archive_record is not None else None,
+                                        }
+                                    )
+
+                    for day_market in day_markets:
+                        market_ticker = str(day_market.get("ticker") or "")
+                        if due_only and not capture_due:
+                            skipped_market_not_due += 1
+                            continue
+                        existing_market = await repo.get_latest_historical_market_snapshot(
+                            market_ticker=market_ticker,
+                            before_asof=checkpoint_ts,
+                            source_kind=self.CHECKPOINT_CAPTURED_MARKET_SOURCE,
+                            local_market_day=local_market_day,
+                        )
+                        if existing_market is not None:
+                            skipped_market_existing += 1
+                            continue
+                        asof_ts, market_skip_reason = self._checkpoint_market_snapshot_asof(
+                            day_market,
+                            checkpoint_ts=checkpoint_ts,
+                        )
+                        if market_skip_reason == "market_snapshot_future":
+                            skipped_market_future_source += 1
+                            continue
+                        if market_skip_reason == "market_snapshot_stale":
+                            skipped_market_stale += 1
+                            continue
+                        if asof_ts is None:
+                            skipped_market_missing_metadata += 1
+                            continue
+                        market_source_id = (
+                            f"checkpoint:{template.series_ticker}:{local_market_day}:{checkpoint_label}:{market_ticker}"
+                        )
+                        await repo.upsert_historical_market_snapshot(
+                            market_ticker=market_ticker,
+                            series_ticker=template.series_ticker,
+                            station_id=template.station_id,
+                            local_market_day=local_market_day,
+                            asof_ts=asof_ts,
+                            source_kind=self.CHECKPOINT_CAPTURED_MARKET_SOURCE,
+                            source_id=market_source_id,
+                            source_hash=_hash_payload({"market": day_market}),
+                            close_ts=self._market_timestamp(day_market, "close_time", "close_ts"),
+                            settlement_ts=self._market_timestamp(day_market, "settlement_ts", "settlement_time"),
+                            yes_bid_dollars=_parse_decimal(day_market.get("yes_bid_dollars")),
+                            yes_ask_dollars=_parse_decimal(day_market.get("yes_ask_dollars")),
+                            no_ask_dollars=_parse_decimal(day_market.get("no_ask_dollars")),
+                            last_price_dollars=_parse_decimal(day_market.get("last_price_dollars")),
+                            payload={
+                                "market": day_market,
+                                "_checkpoint_capture": {
+                                    "checkpoint_label": checkpoint_label,
+                                    "checkpoint_ts": checkpoint_ts.isoformat(),
+                                    "captured_at": now.isoformat(),
+                                    "source_kind": source_kind,
+                                },
+                            },
+                        )
+                        captured_market_snapshots += 1
+                        if len(market_samples) < 10:
+                            market_samples.append(
+                                {
+                                    "series_ticker": template.series_ticker,
+                                    "market_ticker": market_ticker,
+                                    "local_market_day": local_market_day,
+                                    "checkpoint_label": checkpoint_label,
+                                    "checkpoint_ts": checkpoint_ts.isoformat(),
+                                    "market_asof_ts": asof_ts.isoformat(),
+                                }
+                            )
             await session.commit()
         return {
             "status": "completed",
@@ -823,6 +900,13 @@ class HistoricalTrainingService:
             "skipped_future_source_count": skipped_future_source,
             "skipped_missing_metadata_count": skipped_missing_metadata,
             "samples": samples,
+            "captured_market_snapshot_count": captured_market_snapshots,
+            "skipped_market_existing_count": skipped_market_existing,
+            "skipped_market_not_due_count": skipped_market_not_due,
+            "skipped_market_future_source_count": skipped_market_future_source,
+            "skipped_market_stale_count": skipped_market_stale,
+            "skipped_market_missing_metadata_count": skipped_market_missing_metadata,
+            "market_samples": market_samples,
         }
 
     async def checkpoint_capture_status(
@@ -1500,6 +1584,7 @@ class HistoricalTrainingService:
         ]
         coverage = await self._coverage_status(settlement_labels, verbose=verbose)
         checkpoint_capture = await self._checkpoint_capture_status(settlement_labels, verbose=verbose)
+        market_checkpoint_capture = await self._market_checkpoint_capture_status(settlement_labels, verbose=verbose)
         replay_audit = self._build_replay_audit(
             coverage_rows=coverage["all_market_day_coverage"],
             replay_runs=replay_runs,
@@ -1509,6 +1594,8 @@ class HistoricalTrainingService:
         public_coverage.pop("all_market_day_coverage", None)
         public_checkpoint_capture = dict(checkpoint_capture)
         public_checkpoint_capture.pop("all_market_day_coverage", None)
+        public_market_checkpoint_capture = dict(market_checkpoint_capture)
+        public_market_checkpoint_capture.pop("all_market_day_coverage", None)
         coverage_backlog = self._coverage_backlog(
             coverage_rows=coverage["all_market_day_coverage"],
             checkpoint_rows=checkpoint_capture["all_market_day_coverage"],
@@ -1594,6 +1681,7 @@ class HistoricalTrainingService:
             "settlement_mismatch_breakdown": settlement_mismatch_breakdown,
             "source_replay_coverage": public_coverage,
             "checkpoint_archive_coverage": public_checkpoint_capture,
+            "market_checkpoint_capture_coverage": public_market_checkpoint_capture,
             "replay_corpus": replay_corpus,
             "refresh_needed": replay_audit["refresh_needed"],
             "stale_build_count": stale_build_count,
@@ -1606,6 +1694,8 @@ class HistoricalTrainingService:
             "missing_checkpoint_reason_counts": public_coverage["missing_checkpoint_reason_counts"],
             "checkpoint_coverage_counts": public_checkpoint_capture["checkpoint_coverage_counts"],
             "checkpoint_capture_gaps": public_checkpoint_capture["checkpoint_capture_gaps"],
+            "market_checkpoint_coverage_counts": public_market_checkpoint_capture["checkpoint_coverage_counts"],
+            "market_checkpoint_capture_gaps": public_market_checkpoint_capture["checkpoint_capture_gaps"],
             "draft_training_ready": draft_only,
             "training_ready": training_ready,
             "historical_dataset_readiness": historical_build_readiness,
@@ -1620,6 +1710,7 @@ class HistoricalTrainingService:
             "bootstrap_progress": bootstrap_progress,
             "market_day_coverage": public_coverage.get("market_day_coverage", []),
             "checkpoint_market_day_coverage": public_checkpoint_capture.get("market_day_coverage", []),
+            "market_checkpoint_market_day_coverage": public_market_checkpoint_capture.get("market_day_coverage", []),
             "replay_audit": replay_audit,
             "recent_pipeline_runs": [
                 {
@@ -3176,6 +3267,94 @@ class HistoricalTrainingService:
             "all_market_day_coverage": rows,
         }
 
+    async def _market_checkpoint_capture_status(self, settlement_labels: list[Any], *, verbose: bool) -> dict[str, Any]:
+        gap_counts: Counter[str] = Counter()
+        gap_samples: list[dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
+        coverage_counts = Counter()
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            for label in settlement_labels:
+                mapping = self._mapping_for_market(label.market_ticker, (label.payload or {}).get("market"))
+                if mapping is None or not mapping.supports_structured_weather:
+                    continue
+                checkpoints = self._checkpoint_times(
+                    mapping,
+                    local_market_day=label.local_market_day,
+                    market_payload=(label.payload or {}).get("market", {}),
+                )
+                selections: list[HistoricalCheckpointSelection] = []
+                checkpoint_rows: list[dict[str, Any]] = []
+                for checkpoint_label, checkpoint_ts in checkpoints:
+                    captured = await repo.get_latest_historical_market_snapshot(
+                        market_ticker=label.market_ticker,
+                        before_asof=checkpoint_ts,
+                        source_kind=self.CHECKPOINT_CAPTURED_MARKET_SOURCE,
+                        local_market_day=label.local_market_day,
+                    )
+                    if captured is None:
+                        gap_counts["market_checkpoint_missing"] += 1
+                        if len(gap_samples) < 10:
+                            gap_samples.append(
+                                {
+                                    "series_ticker": mapping.series_ticker,
+                                    "market_ticker": label.market_ticker,
+                                    "local_market_day": label.local_market_day,
+                                    "checkpoint_label": checkpoint_label,
+                                    "gap": "market_checkpoint_missing",
+                                }
+                            )
+                    selections.append(
+                        HistoricalCheckpointSelection(
+                            checkpoint_label=checkpoint_label,
+                            checkpoint_ts=checkpoint_ts,
+                            market_snapshot=captured,
+                            weather_snapshot=captured,
+                            market_source_kind=(captured.source_kind if captured is not None else None),
+                            weather_source_kind=(captured.source_kind if captured is not None else None),
+                            missing_reasons=[] if captured else ["market_checkpoint_missing"],
+                        )
+                    )
+                    checkpoint_rows.append(
+                        {
+                            "checkpoint_label": checkpoint_label,
+                            "checkpoint_ts": checkpoint_ts.isoformat(),
+                            "captured": captured is not None,
+                            "source_kind": (captured.source_kind if captured is not None else None),
+                            "captured_at": (captured.created_at.isoformat() if captured is not None else None),
+                            "market_snapshot_id": (captured.id if captured is not None else None),
+                            "market_asof_ts": (captured.asof_ts.isoformat() if captured is not None else None),
+                        }
+                    )
+                coverage_class = self._coverage_class(selections, use_outcome_only=False)
+                coverage_counts[coverage_class] += 1
+                rows.append(
+                    {
+                        "series_ticker": mapping.series_ticker,
+                        "market_ticker": label.market_ticker,
+                        "local_market_day": label.local_market_day,
+                        "coverage_class": coverage_class,
+                        "checkpoints": checkpoint_rows,
+                    }
+                )
+            await session.commit()
+        return {
+            "checkpoint_coverage_counts": {
+                self.COVERAGE_FULL: coverage_counts.get(self.COVERAGE_FULL, 0),
+                self.COVERAGE_LATE_ONLY: coverage_counts.get(self.COVERAGE_LATE_ONLY, 0),
+                self.COVERAGE_PARTIAL: coverage_counts.get(self.COVERAGE_PARTIAL, 0),
+                self.COVERAGE_OUTCOME_ONLY: coverage_counts.get(self.COVERAGE_OUTCOME_ONLY, 0),
+                self.COVERAGE_NONE: coverage_counts.get(self.COVERAGE_NONE, 0),
+            },
+            "checkpoint_capture_gaps": {
+                "reason_counts": dict(gap_counts),
+                "samples": gap_samples,
+            },
+            "market_day_coverage": rows if verbose else rows[:12],
+            "all_market_day_coverage": rows,
+        }
+
     async def _resolve_market_day_selections(self, repo: PlatformRepository, *, label: Any, mapping: WeatherMarketMapping) -> list[HistoricalCheckpointSelection]:
         selections: list[HistoricalCheckpointSelection] = []
         for checkpoint_label, checkpoint_ts in self._checkpoint_times(
@@ -3230,23 +3409,24 @@ class HistoricalTrainingService:
         local_market_day: str,
         checkpoint_ts: datetime,
     ) -> tuple[Any | None, str | None]:
-        captured = await repo.get_latest_historical_market_snapshot(
-            market_ticker=market_ticker,
-            before_asof=checkpoint_ts,
-            source_kind=self.CAPTURED_MARKET_SOURCE,
-            local_market_day=local_market_day,
-        )
-        if captured is not None and self._historical_market_snapshot_valid(captured, checkpoint_ts=checkpoint_ts):
-            return captured, None
-        reconstructed = await repo.get_latest_historical_market_snapshot(
-            market_ticker=market_ticker,
-            before_asof=checkpoint_ts,
-            source_kind=self.RECONSTRUCTED_MARKET_SOURCE,
-            local_market_day=local_market_day,
-        )
-        if reconstructed is not None and self._historical_market_snapshot_valid(reconstructed, checkpoint_ts=checkpoint_ts):
-            return reconstructed, None
-        if captured is not None or reconstructed is not None:
+        saw_stale = False
+        for source_kind in (
+            self.CHECKPOINT_CAPTURED_MARKET_SOURCE,
+            self.CAPTURED_MARKET_SOURCE,
+            self.RECONSTRUCTED_MARKET_SOURCE,
+        ):
+            snapshot = await repo.get_latest_historical_market_snapshot(
+                market_ticker=market_ticker,
+                before_asof=checkpoint_ts,
+                source_kind=source_kind,
+                local_market_day=local_market_day,
+            )
+            if snapshot is None:
+                continue
+            if self._historical_market_snapshot_valid(snapshot, checkpoint_ts=checkpoint_ts):
+                return snapshot, None
+            saw_stale = True
+        if saw_stale:
             return None, "market_snapshot_stale"
         return None, None
 
@@ -3384,28 +3564,35 @@ class HistoricalTrainingService:
         checkpoint_ts: datetime,
     ) -> dict[str, Any] | None:
         window_start = checkpoint_ts - timedelta(hours=self.settings.historical_replay_market_snapshot_lookback_hours)
-        try:
-            response = await self.kalshi.get_market_candlesticks(
-                mapping.series_ticker,
-                settlement_label.market_ticker,
-                period_interval=60,
-                start_ts=int(window_start.timestamp()),
-                end_ts=int(checkpoint_ts.timestamp()),
-            )
-        except httpx.HTTPStatusError:
-            return None
-        candlesticks = response.get("candlesticks") or []
         selected = None
-        for candlestick in candlesticks:
-            end_period_ts = candlestick.get("end_period_ts")
-            if end_period_ts in (None, ""):
-                continue
+        for period_interval in (1, 60):
             try:
-                end_at = datetime.fromtimestamp(int(end_period_ts), tz=UTC)
-            except (OverflowError, OSError, ValueError):
+                response = await self.kalshi.get_market_candlesticks(
+                    mapping.series_ticker,
+                    settlement_label.market_ticker,
+                    period_interval=period_interval,
+                    start_ts=int(window_start.timestamp()),
+                    end_ts=int(checkpoint_ts.timestamp()),
+                )
+            except httpx.HTTPStatusError:
                 continue
-            if end_at <= checkpoint_ts:
-                selected = (candlestick, end_at)
+            candlesticks = response.get("candlesticks") or []
+            for candlestick in candlesticks:
+                end_period_ts = candlestick.get("end_period_ts")
+                if end_period_ts in (None, ""):
+                    continue
+                try:
+                    end_at = datetime.fromtimestamp(int(end_period_ts), tz=UTC)
+                except (OverflowError, OSError, ValueError):
+                    continue
+                if end_at <= checkpoint_ts:
+                    selected = (candlestick, end_at)
+            if selected is not None and not is_market_stale(
+                observed_at=selected[1],
+                stale_after_seconds=self.settings.historical_replay_market_stale_seconds,
+                reference_time=checkpoint_ts,
+            ):
+                break
         if selected is None:
             return None
 
@@ -3638,17 +3825,23 @@ class HistoricalTrainingService:
         if not ordered_days:
             return HistoricalBuildSplit(train=[], validation=[], holdout=[])
         day_count = len(ordered_days)
-        train_days = max(1, int(day_count * 0.70))
-        validation_days = max(1, int(day_count * 0.15)) if day_count >= 3 else 0
-        if train_days + validation_days >= day_count:
-            validation_days = max(0, day_count - train_days - 1)
-        holdout_days = max(0, day_count - train_days - validation_days)
-        if holdout_days == 0 and day_count >= 2:
-            if validation_days > 0:
-                validation_days -= 1
-            else:
-                train_days -= 1
+        if day_count == 1:
+            train_days = 1
+            validation_days = 0
+            holdout_days = 0
+        elif day_count == 2:
+            train_days = 1
+            validation_days = 0
             holdout_days = 1
+        elif day_count == 3:
+            train_days = 1
+            validation_days = 1
+            holdout_days = 1
+        else:
+            validation_days = max(1, int(day_count * 0.15))
+            train_days = max(1, int(day_count * 0.70))
+            train_days = min(train_days, day_count - validation_days - 1)
+            holdout_days = max(1, day_count - train_days - validation_days)
         train = ordered_days[:train_days]
         validation = ordered_days[train_days : train_days + validation_days]
         holdout = ordered_days[train_days + validation_days :]
@@ -3982,10 +4175,20 @@ class HistoricalTrainingService:
         *,
         local_market_day: str,
     ) -> dict[str, Any] | None:
+        markets = await self._list_template_day_markets(template, local_market_day=local_market_day)
+        return markets[0] if markets else None
+
+    async def _list_template_day_markets(
+        self,
+        template: WeatherSeriesTemplate,
+        *,
+        local_market_day: str,
+    ) -> list[dict[str, Any]]:
         start_local = datetime.fromisoformat(local_market_day)
         zone = ZoneInfo(template.timezone_name or "UTC")
         start_ts = int(datetime.combine(start_local.date(), time.min, tzinfo=zone).astimezone(UTC).timestamp())
         end_ts = int(datetime.combine(start_local.date() + timedelta(days=1), time.min, tzinfo=zone).astimezone(UTC).timestamp())
+        markets: dict[str, dict[str, Any]] = {}
         cursor: str | None = None
         while True:
             response = await self.kalshi.list_markets(
@@ -4001,11 +4204,11 @@ class HistoricalTrainingService:
                 if resolved is None:
                     continue
                 if self._market_local_day(resolved, market) == local_market_day:
-                    return market
+                    markets[resolved.market_ticker] = market
             cursor = response.get("cursor")
             if not cursor or not page:
                 break
-        return None
+        return [markets[ticker] for ticker in sorted(markets)]
 
     def _checkpoint_mapping(self, template: WeatherSeriesTemplate, *, market: dict[str, Any] | None) -> WeatherMarketMapping:
         if market is not None:
@@ -4033,8 +4236,28 @@ class HistoricalTrainingService:
         )
 
     def _checkpoint_capture_due(self, checkpoint_ts: datetime, *, now: datetime) -> bool:
+        lead = timedelta(seconds=max(0, self.settings.historical_checkpoint_capture_lead_seconds))
         grace = timedelta(seconds=max(60, self.settings.historical_checkpoint_capture_grace_seconds))
-        return checkpoint_ts <= now <= checkpoint_ts + grace
+        return checkpoint_ts - lead <= now <= checkpoint_ts + grace
+
+    def _checkpoint_market_snapshot_asof(
+        self,
+        market_payload: dict[str, Any],
+        *,
+        checkpoint_ts: datetime,
+    ) -> tuple[datetime | None, str | None]:
+        asof_ts = self._market_timestamp(market_payload, "updated_time")
+        if asof_ts is None:
+            return None, "market_snapshot_missing_metadata"
+        if asof_ts > checkpoint_ts:
+            return None, "market_snapshot_future"
+        if is_market_stale(
+            observed_at=asof_ts,
+            stale_after_seconds=self.settings.historical_replay_market_stale_seconds,
+            reference_time=checkpoint_ts,
+        ):
+            return None, "market_snapshot_stale"
+        return asof_ts, None
 
     @staticmethod
     def _checkpoint_archive_metadata_valid(metadata: dict[str, Any], checkpoint_ts: datetime) -> bool:
