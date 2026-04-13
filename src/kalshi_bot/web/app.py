@@ -10,6 +10,7 @@ from enum import Enum
 from typing import AsyncIterator, TypeVar
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -33,6 +34,12 @@ from kalshi_bot.core.schemas import (
 )
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.container import AppContainer
+from kalshi_bot.web.control_room import (
+    CONTROL_ROOM_TABS,
+    build_control_room_bootstrap,
+    build_control_room_summary,
+    build_control_room_tab,
+)
 from kalshi_bot.web.faq_content import FAQ_SECTIONS
 from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
 
@@ -610,6 +617,20 @@ def create_app() -> FastAPI:
             }
         )
 
+    @app.get("/api/control-room/summary")
+    async def control_room_summary(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await build_control_room_summary(app_container)
+        return JSONResponse(jsonable_encoder(payload))
+
+    @app.get("/api/control-room/tab/{tab_name}")
+    async def control_room_tab(tab_name: str, request: Request) -> JSONResponse:
+        if tab_name not in CONTROL_ROOM_TABS:
+            raise HTTPException(status_code=404, detail="Unknown control room tab")
+        app_container = container(request)
+        payload = await build_control_room_tab(app_container, tab_name)
+        return JSONResponse(jsonable_encoder(payload))
+
     @app.get("/api/research/{market_ticker}")
     async def research_dossier(market_ticker: str, request: Request) -> JSONResponse:
         app_container = container(request)
@@ -830,73 +851,15 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         app_container = container(request)
-        async with app_container.session_factory() as session:
-            repo = PlatformRepository(session)
-            rooms = await repo.list_rooms(origins=["shadow", "live"])
-            control = await repo.get_deployment_control()
-            positions = await repo.list_positions(limit=8)
-            ops_events = await repo.list_ops_events(limit=8)
-            dossier_records = await repo.list_research_dossiers(limit=100)
-            runtime_health = await app_container.watchdog_service.get_status(repo)
-            await session.commit()
-        self_improve_status_payload = await app_container.self_improve_service.get_status()
-        training_status_payload = await app_container.training_corpus_service.get_status(persist_readiness=False)
-        historical_status_payload = await app_container.historical_training_service.get_status()
-        heuristic_status_payload = await app_container.historical_intelligence_service.get_status()
-        training_status_payload["historical"] = historical_status_payload
-        research_audit_payload = await app_container.training_corpus_service.research_audit(limit=8)
-        dossiers_by_market = {record.market_ticker: record.payload for record in dossier_records}
-        configured_markets = []
-        try:
-            discoveries = await app_container.discovery_service.discover_configured_markets()
-        except Exception:
-            logger.exception("Failed to load live market discovery for index page")
-            discoveries = []
-        seen_markets: set[str] = set()
-        for discovery in discoveries:
-            configured_markets.append(
-                {
-                    "market_ticker": discovery.mapping.market_ticker,
-                    "label": discovery.mapping.label,
-                    "market_type": discovery.mapping.market_type,
-                    "status": discovery.status,
-                    "can_trade": discovery.can_trade,
-                    "notes": discovery.notes,
-                    "series_ticker": discovery.mapping.series_ticker,
-                    "dossier": dossiers_by_market.get(discovery.mapping.market_ticker),
-                }
-            )
-            seen_markets.add(discovery.mapping.market_ticker)
-        for mapping in app_container.weather_directory.all():
-            if mapping.market_ticker in seen_markets:
-                continue
-            configured_markets.append(
-                {
-                    "market_ticker": mapping.market_ticker,
-                    "label": mapping.label,
-                    "market_type": mapping.market_type,
-                    "status": "configured",
-                    "can_trade": False,
-                    "notes": ["No live market snapshot loaded yet."],
-                    "series_ticker": mapping.series_ticker,
-                    "dossier": dossiers_by_market.get(mapping.market_ticker),
-                }
-            )
+        bootstrap_payload = jsonable_encoder(await build_control_room_bootstrap(app_container))
         return templates.TemplateResponse(
             request,
             "index.html",
             {
-                "rooms": rooms,
-                "control": control,
-                "positions": positions,
-                "ops_events": ops_events,
-                "configured_markets": configured_markets,
-                "self_improve_status": self_improve_status_payload,
-                "training_status": training_status_payload,
-                "historical_status": historical_status_payload,
-                "heuristic_status": heuristic_status_payload,
-                "research_audit": [issue.model_dump(mode="json") for issue in research_audit_payload],
-                "runtime_health": runtime_health,
+                "bootstrap": bootstrap_payload,
+                "control_room_tabs": bootstrap_payload["tabs"],
+                "initial_summary": bootstrap_payload["summary"],
+                "initial_tab_payload": bootstrap_payload["initial_tab_payload"],
                 "settings": app_container.settings,
             },
         )

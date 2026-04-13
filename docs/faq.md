@@ -137,7 +137,15 @@ Read more: `docs/self_improve.md`, `docs/training.md`
 
 ## What should I watch on the dashboard?
 
-The training panel shows room counts, cleaned-trainable share, recent exclusion memory, quality debt, unsettled backlog, settled-label velocity, and readiness blockers.
+Start with the top summary strip. It gives the fastest read on system health, active deployment, positions, research confidence, room outcomes, and quality debt without making you scroll through historical detail first.
+
+Then use the top tabs deliberately:
+
+- `Overview` for deployment state, runtime health, blockers, next actions, and pack controls
+- `Training & Historical` for quality debt, historical coverage, pipeline progress, and backlog
+- `Research` for active versus closed dossiers, confidence, expiry, and refresh actions
+- `Rooms` for grouped recent room outcomes plus quick room and shadow-run actions
+- `Operations` for positions, ops events, and dangerous operator controls
 
 If the next bottleneck is not obvious from that panel, something is missing in the status surface and we should improve it.
 
@@ -161,7 +169,9 @@ Read more: `docs/operations.md`, `docs/security.md`
 
 ## Where do I inspect the system quickly?
 
-Use the Control Room for runtime health, room creation, training status, audits, and research status. Use room pages for the detailed decision trace. Use the CLI for exact JSON and operational scripts when you need machine-readable state.
+Use the Control Room for the operator view: summary strip, runtime health, room creation, training status, audits, research status, and ops events. Use room pages for the detailed decision trace. Use the CLI for exact JSON and operational scripts when you need machine-readable state.
+
+The Control Room is no longer meant to be a giant single scroll. Heavy sections lazy-load behind the top tabs, so if a historical or research detail is not visible immediately, open that tab instead of assuming the data is missing.
 
 Useful commands include `training-status`, `research-audit`, `strategy-audit summary`, `shadow-campaign run`, `reconcile`, and `self-improve status`.
 

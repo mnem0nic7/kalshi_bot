@@ -471,9 +471,18 @@ series_templates:
 
         index_response = client.get("/")
         assert index_response.status_code == 200
-        assert "Historical Corpus" in index_response.text
-        assert "Visible Room" in index_response.text
-        assert "Historical Replay Room" not in index_response.text
+        assert "Control Room" in index_response.text
+        assert "control-room-bootstrap" in index_response.text
+
+        training_tab_response = client.get("/api/control-room/tab/training")
+        assert training_tab_response.status_code == 200
+        assert training_tab_response.json()["historical"]["corpus"]["replayed_checkpoint_count"] == 1
+
+        rooms_tab_response = client.get("/api/control-room/tab/rooms")
+        assert rooms_tab_response.status_code == 200
+        room_names = {room["name"] for room in rooms_tab_response.json()["rooms"]}
+        assert "Visible Room" in room_names
+        assert "Historical Replay Room" not in room_names
 
         build_response = client.post(
             "/api/training/historical/build",

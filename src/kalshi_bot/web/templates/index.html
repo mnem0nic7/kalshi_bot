@@ -1,616 +1,255 @@
 {% extends "base.html" %}
+{% block extra_head %}
+  <link rel="stylesheet" href="/static/control_room.css" />
+{% endblock %}
+{% block main_class %}shell-main-wide{% endblock %}
 {% block content %}
-<section class="panel">
-  <h1>Control Room</h1>
-  <p>Active color: <strong>{{ control.active_color }}</strong> | Kill switch: <strong>{{ control.kill_switch_enabled }}</strong></p>
-  <p>Need the operator walkthrough? Open the <a href="/faq">FAQ</a>.</p>
-  <div class="actions">
-    <button onclick="toggleKill(true)">Enable Kill Switch</button>
-    <button onclick="toggleKill(false)">Disable Kill Switch</button>
-    <button onclick="promote('blue')">Promote Blue</button>
-    <button onclick="promote('green')">Promote Green</button>
-  </div>
-</section>
-
-<section class="panel">
-  <h2>Runtime Health</h2>
-  <p>Watchdog updated: <strong>{{ runtime_health.updated_at or "never" }}</strong></p>
-  <div class="room-list">
-    {% for color, health in runtime_health.colors.items() %}
-    <div class="room-card">
-      <strong>{{ color }}</strong>
-      <span>app {{ health.app.status }}{% if health.app.observed_at %} · {{ health.app.observed_at }}{% endif %}</span>
-      <span>daemon {{ "healthy" if health.daemon.healthy else "unhealthy" }} · age {{ health.daemon.heartbeat_age_seconds if health.daemon.heartbeat_age_seconds is not none else "n/a" }}s</span>
-      <span>combined {{ "healthy" if health.combined_healthy else "degraded" }}</span>
+<div class="control-room-page" id="control-room-page">
+  <section class="control-room-hero panel">
+    <div class="control-room-hero-copy">
+      <h1>Control Room</h1>
+      <p>Monitor runtime health, research freshness, room outcomes, and historical support without living in a 17kpx scroll wall.</p>
+      <p class="control-room-hero-note">Need the operator walkthrough? Open the <a href="/faq">FAQ</a>.</p>
     </div>
-    {% endfor %}
-  </div>
-  {% if runtime_health.last_action %}
-  <p>Last action: {{ runtime_health.last_action.action }} · {{ runtime_health.last_action.outcome }} · {{ runtime_health.last_action.reason }}</p>
-  {% endif %}
-  {% if runtime_health.last_failover %}
-  <p>Last failover: {{ runtime_health.last_failover.from_color }} -> {{ runtime_health.last_failover.to_color }} · {{ runtime_health.last_failover.reason }}</p>
-  {% endif %}
-  {% if runtime_health.last_boot_recovery %}
-  <p>Last boot recovery: {{ runtime_health.last_boot_recovery.status }} · {{ runtime_health.last_boot_recovery.reason }}</p>
-  {% endif %}
-</section>
-
-<section class="panel">
-  <h2>Training And Research</h2>
-  <p>
-    Complete rooms: <strong>{{ training_status.room_count }}</strong>
-    | Trainable rooms: <strong>{{ training_status.trainable_room_count }}</strong>
-    | Holdout rooms: <strong>{{ training_status.evaluation_holdout_room_count }}</strong>
-  </p>
-  <p>
-    Research gate pass rate: <strong>{{ "%.2f"|format(training_status.research_gate_pass_rate) }}</strong>
-    | Freshness pass rate: <strong>{{ "%.2f"|format(training_status.dossier_freshness_pass_rate) }}</strong>
-    | Settled coverage: <strong>{{ "%.2f"|format(training_status.settled_label_coverage) }}</strong>
-  </p>
-  <p>
-    Unsettled complete rooms: <strong>{{ training_status.unsettled_complete_room_count }}</strong>
-    | Oldest unsettled age: <strong>{{ training_status.oldest_unsettled_room_age_seconds if training_status.oldest_unsettled_room_age_seconds is not none else "n/a" }}</strong>s
-    | Near settlement: <strong>{{ training_status.unsettled_near_settlement_count }}</strong>
-  </p>
-  <p>
-    Settled velocity 24h: <strong>{{ training_status.settled_label_velocity["24h"] }}</strong>
-    | Settled velocity 7d: <strong>{{ training_status.settled_label_velocity["7d"] }}</strong>
-  </p>
-  <p>
-    Ready for SFT: <strong>{{ training_status.readiness.ready_for_sft_export }}</strong>
-    | Critique: <strong>{{ training_status.readiness.ready_for_critique }}</strong>
-    | Eval: <strong>{{ training_status.readiness.ready_for_evaluation }}</strong>
-    | Promote: <strong>{{ training_status.readiness.ready_for_promotion }}</strong>
-  </p>
-  <p>
-    Campaign enabled: <strong>{{ training_status.campaign_settings.enabled }}</strong>
-    | Rooms/run: <strong>{{ training_status.campaign_settings.rooms_per_run }}</strong>
-    | Cooldown: <strong>{{ training_status.campaign_settings.cooldown_seconds }}</strong>s
-    | Max recent/market: <strong>{{ training_status.campaign_settings.max_recent_per_market }}</strong>
-    | Reconcile cadence: <strong>{{ training_status.campaign_settings.daemon_reconcile_interval_seconds }}</strong>s
-  </p>
-  <p>
-    Audited rooms: <strong>{{ training_status.strategy_audit_progress.audited_room_count }}</strong>
-    | Forward: <strong>{{ training_status.strategy_audit_progress.forward_audit_count }}</strong>
-    | Backfilled: <strong>{{ training_status.strategy_audit_progress.backfilled_audit_count }}</strong>
-    | Pending backfill: <strong>{{ training_status.strategy_audit_progress.pending_backfill_room_count }}</strong>
-  </p>
-  <div class="actions">
-    <button type="button" onclick="runShadowCampaign()">Run Shadow Campaign</button>
-    <button type="button" onclick="buildTrainingDataset('room-bundles')">Build Room Bundles</button>
-    <button type="button" onclick="buildTrainingDataset('role-sft')">Build Role SFT</button>
-    <button type="button" onclick="buildTrainingDataset('evaluation-holdout')">Build Eval Holdout</button>
-    <button type="button" onclick="buildHistoricalDataset('bundles')">Build Historical Bundles</button>
-    <button type="button" onclick="buildHistoricalDataset('gemini-finetune')">Build Gemini Fine-Tune</button>
-  </div>
-  {% if training_status.top_missing_data %}
-  <p>Top missing data: {{ training_status.top_missing_data|join(" | ") }}</p>
-  {% endif %}
-  <div class="room-list">
-    <div class="room-card">
-      <strong>Quality Debt</strong>
-      <span>stale mismatch · {{ training_status.quality_debt_summary.stale_mismatch_count }}</span>
-      <span>missed stand-down · {{ training_status.quality_debt_summary.missed_stand_down_count }}</span>
-      <span>weak resolved trade · {{ training_status.quality_debt_summary.weak_resolved_trade_count }}</span>
-      <span>cleaned trainable · {{ training_status.quality_debt_summary.cleaned_trainable_room_count }}</span>
-      <span>recent stale mismatch · {{ training_status.quality_debt_summary.recent_stale_mismatch_count }}</span>
-      <span>recent missed stand-down · {{ training_status.quality_debt_summary.recent_missed_stand_down_count }}</span>
-    </div>
-    <div class="room-card">
-      <strong>Historical Corpus</strong>
-      <span>imported market-days · {{ historical_status.imported_market_days }}</span>
-      <span>source replayable market-days · {{ historical_status.source_replay_coverage.replayable_market_day_count }}</span>
-      <span>source full coverage days · {{ historical_status.source_replay_coverage.full_checkpoint_coverage_count }}</span>
-      <span>source late-only days · {{ historical_status.source_replay_coverage.late_only_coverage_count }}</span>
-      <span>source partial days · {{ historical_status.source_replay_coverage.partial_checkpoint_coverage_count }}</span>
-      <span>source outcome-only days · {{ historical_status.source_replay_coverage.outcome_only_coverage_count }}</span>
-      <span>checkpoint-archive full · {{ historical_status.checkpoint_archive_coverage.checkpoint_coverage_counts.full_checkpoint_coverage }}</span>
-      <span>checkpoint-archive late-only · {{ historical_status.checkpoint_archive_coverage.checkpoint_coverage_counts.late_only_coverage }}</span>
-      <span>imported markets · {{ historical_status.imported_market_count }}</span>
-      <span>materialized replay rooms · {{ historical_status.replay_corpus.room_count }}</span>
-      <span>materialized replay checkpoints · {{ historical_status.replay_corpus.checkpoint_count }}</span>
-      <span>materialized replay market-days · {{ historical_status.replay_corpus.market_day_count }}</span>
-      <span>clean trainable · {{ historical_status.clean_historical_trainable_count }}</span>
-      <span>settlement mismatches · {{ historical_status.settlement_mismatch_count }}</span>
-      <span>mismatch breakdown · {{ historical_status.settlement_mismatch_breakdown }}</span>
-      <span>settlement backfilled · {{ historical_status.settlement_backfilled_count }}</span>
-      <span>checkpoint promotions · {{ historical_status.checkpoint_archive_promotion_count }}</span>
-      <span>possible ingestion gaps · {{ historical_status.possible_ingestion_gap_count }}</span>
-      <span>refresh needed · {{ historical_status.refresh_needed }}</span>
-      <span>stale builds · {{ historical_status.stale_build_count }}</span>
-      <span>confidence state · {{ historical_status.confidence_state }}</span>
-      <span>Gemini training ready · {{ historical_status.training_ready }}</span>
-      <span>draft only · {{ historical_status.draft_training_ready }}</span>
-      {% if historical_status.bootstrap_progress %}
-      <span>bootstrap chunks · {{ historical_status.bootstrap_progress.completed_chunk_count }} / {{ historical_status.bootstrap_progress.total_chunks }}</span>
-      {% if historical_status.bootstrap_progress.next_chunk_start %}
-      <span>next bootstrap chunk · {{ historical_status.bootstrap_progress.next_chunk_start }}</span>
-      {% endif %}
-      {% endif %}
-      {% if historical_status.origin_room_counts %}
-      <span>origins · {{ historical_status.origin_room_counts }}</span>
-      {% endif %}
-      {% if historical_status.latest_pipeline_run %}
-      <span>latest pipeline · {{ historical_status.latest_pipeline_run.pipeline_kind }} · {{ historical_status.latest_pipeline_run.status }}</span>
-      {% endif %}
-    </div>
-    <div class="room-card">
-      <strong>Historical Heuristics</strong>
-      <span>active pack · {{ heuristic_status.active_pack_version }}</span>
-      <span>candidate pack · {{ heuristic_status.candidate_pack_version or "none" }}</span>
-      <span>window days · {{ heuristic_status.intelligence_window_days }}</span>
-      <span>confidence state · {{ heuristic_status.confidence_state }}</span>
-      {% if heuristic_status.latest_run %}
-      <span>latest run · {{ heuristic_status.latest_run.status }}</span>
-      <span>latest rows · {{ heuristic_status.latest_run.row_count }}</span>
-      <span>promoted pack · {{ heuristic_status.latest_run.promoted_pack_version or "none" }}</span>
-      {% else %}
-      <span>No historical intelligence runs yet.</span>
-      {% endif %}
-    </div>
-    <div class="room-card">
-      <strong>Top Exclusion Reasons</strong>
-      {% for reason, count in training_status.quality_exclusion_reasons.items() %}
-      <span>{{ reason }} · {{ count }}</span>
-      {% else %}
-      <span>No current quality exclusions.</span>
-      {% endfor %}
-    </div>
-  </div>
-  <div class="metric-grid">
-    <div class="room-card">
-      <strong>Historical Coverage Gaps</strong>
-      <span>missing market snapshots · {{ historical_status.source_replay_coverage.source_coverage_gaps.missing_market_snapshot_count }}</span>
-      <span>missing weather snapshots · {{ historical_status.source_replay_coverage.source_coverage_gaps.missing_weather_snapshot_count }}</span>
-      {% for reason, count in historical_status.coverage_backlog.reason_counts.items() %}
-      <span>{{ reason }} · {{ count }}</span>
-      {% endfor %}
-      {% for reason, count in historical_status.coverage_backlog.market_day_reason_counts.items() %}
-      <span>market-days with {{ reason }} · {{ count }}</span>
-      {% endfor %}
-      {% for reason, count in historical_status.source_replay_coverage.missing_checkpoint_reason_counts.items() %}
-      <span>{{ reason }} · {{ count }}</span>
-      {% endfor %}
-      {% for reason, count in historical_status.checkpoint_archive_coverage.checkpoint_capture_gaps.reason_counts.items() %}
-      <span>{{ reason }} · {{ count }}</span>
-      {% endfor %}
-      <span>coverage repair summary · {{ historical_status.coverage_repair_summary }}</span>
-      {% for sample in historical_status.coverage_backlog.samples %}
-      <span>{{ sample.market_ticker }} · {{ sample.local_market_day }} · {{ sample.promotable_status }} · {{ sample.day_reasons }}</span>
-      {% else %}
-      <span>No historical coverage gaps sampled.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Historical Readiness</strong>
-      <span>training ready · {{ historical_status.historical_build_readiness.training_ready }}</span>
-      <span>draft only · {{ historical_status.historical_build_readiness.draft_only }}</span>
-      <span>full coverage market-days · {{ historical_status.historical_build_readiness.distinct_full_coverage_market_days }}</span>
-      <span>holdout full market-days · {{ historical_status.historical_build_readiness.holdout_full_coverage_market_days }}</span>
-      <span>clean trainable · {{ historical_status.historical_build_readiness.clean_trainable_count }}</span>
-      <span>settlement mismatches · {{ historical_status.historical_build_readiness.settlement_mismatch_count }}</span>
-      <span>train split rooms · {{ historical_status.historical_build_readiness.split_counts.train }}</span>
-      <span>validation split rooms · {{ historical_status.historical_build_readiness.split_counts.validation }}</span>
-      <span>holdout split rooms · {{ historical_status.historical_build_readiness.split_counts.holdout }}</span>
-      <span>stale replay checkpoints · {{ historical_status.replay_corpus.stale_replay_count }}</span>
-      <span>missing replay checkpoints · {{ historical_status.replay_corpus.missing_replay_count }}</span>
-      <span>orphan replay checkpoints · {{ historical_status.replay_corpus.orphan_replay_count }}</span>
-      <span>refresh causes · {{ historical_status.replay_refresh_counts_by_cause }}</span>
-      <span>execution support · {{ historical_status.confidence_progress.execution_support.current }} / {{ historical_status.confidence_progress.execution_support.target }}</span>
-      <span>directional support · {{ historical_status.confidence_progress.directional_support.current }} / {{ historical_status.confidence_progress.directional_support.target }}</span>
-      <span>holdout support · {{ historical_status.confidence_progress.holdout_support.current }} / {{ historical_status.confidence_progress.holdout_support.target }}</span>
-      <span>promotion blockers · {{ historical_status.confidence_progress.promotion_blockers }}</span>
-      <span>candidate eval allowed · {{ historical_status.confidence_progress.execution_candidate_evaluation_allowed }}</span>
-      <span>directional candidate allowed · {{ historical_status.confidence_progress.directional_candidate_evaluation_allowed }}</span>
-    </div>
-    <div class="room-card">
-      <strong>Historical Import Runs</strong>
-      {% for run in historical_status.recent_import_runs %}
-      <span>{{ run.status }} · {{ run.source }} · {{ run.started_at }}</span>
-      {% else %}
-      <span>No historical imports recorded yet.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Historical Pipeline Runs</strong>
-      {% for run in historical_status.recent_pipeline_runs %}
-      <span>{{ run.pipeline_kind }} · {{ run.status }} · {{ run.started_at }}</span>
-      {% else %}
-      <span>No historical pipeline runs recorded yet.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Historical Backlog</strong>
-      {% for key, count in historical_status.promotable_market_day_counts.items() %}
-      <span>{{ key }} · {{ count }}</span>
-      {% else %}
-      <span>No promotable historical market-days yet.</span>
-      {% endfor %}
-      {% if historical_status.bootstrap_progress and historical_status.bootstrap_progress.remaining_date_window %}
-      <span>remaining bootstrap window · {{ historical_status.bootstrap_progress.remaining_date_window.date_from }} to {{ historical_status.bootstrap_progress.remaining_date_window.date_to }}</span>
-      {% endif %}
-    </div>
-  </div>
-  <div class="metric-grid">
-    <div class="room-card">
-      <strong>Settlement Maturity</strong>
-      {% for status_name, count in training_status.settlement_maturity.status_counts.items() %}
-      <span>{{ status_name }} · {{ count }}</span>
-      {% else %}
-      <span>No unsettled backlog.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Recent Exclusion Memory</strong>
-      {% for item in training_status.recent_exclusion_memory.by_market %}
-      <span>{{ item.market_ticker }} · {{ item.count }} · {{ item.reasons }}</span>
-      {% else %}
-      <span>No repeat exclusion markets in the current lookback window.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Source Replay Coverage Samples</strong>
-      {% for day in historical_status.source_replay_coverage.market_day_coverage %}
-      <span>{{ day.market_ticker }} · {{ day.local_market_day }} · {{ day.coverage_class }}</span>
-      {% else %}
-      <span>No historical market-day coverage sampled yet.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Checkpoint Coverage Samples</strong>
-      {% for day in historical_status.checkpoint_archive_coverage.market_day_coverage %}
-      <span>{{ day.market_ticker }} · {{ day.local_market_day }} · {{ day.coverage_class }}</span>
-      {% else %}
-      <span>No checkpoint coverage sampled yet.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Replay Corpus Samples</strong>
-      {% for day in historical_status.replay_corpus.market_day_coverage %}
-      <span>{{ day.market_ticker }} · {{ day.local_market_day }} · {{ day.coverage_class }} · rooms {{ day.materialized_room_count }}</span>
-      {% else %}
-      <span>No replay corpus sampled yet.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Top Blockers</strong>
-      {% for blocker in training_status.top_blockers %}
-      <span>{{ blocker }}</span>
-      {% else %}
-      <span>No blockers reported.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Next Actions</strong>
-      {% for action in training_status.next_actions %}
-      <span>{{ action }}</span>
-      {% else %}
-      <span>No action needed.</span>
-      {% endfor %}
-    </div>
-  </div>
-  <div class="room-list">
-    <div class="room-card">
-      <strong>Unsettled Backlog</strong>
-      {% for item in training_status.settlement_maturity.backlog %}
-      <span>{{ item.market_ticker }} · {{ item.status }} · room age {{ item.age_seconds if item.age_seconds is not none else "n/a" }}s</span>
-      {% else %}
-      <span>No unsettled rooms in the current window.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Backlog By Market</strong>
-      {% for market_ticker, count in training_status.unsettled_backlog_by_market.items() %}
-      <span>{{ market_ticker }} · {{ count }}</span>
-      {% else %}
-      <span>No unsettled backlog by market.</span>
-      {% endfor %}
-    </div>
-  </div>
-  <div class="room-list">
-    <div class="room-card">
-      <strong>Active failure reasons</strong>
-      {% for reason, count in training_status.active_failed_research_reasons.items() %}
-      <span>{{ reason }} · {{ count }}</span>
-      {% else %}
-      <span>No active-config failures.</span>
-      {% endfor %}
-    </div>
-    <div class="room-card">
-      <strong>Legacy failure reasons</strong>
-      {% for reason, count in training_status.legacy_failed_research_reasons.items() %}
-      <span>{{ reason }} · {{ count }}</span>
-      {% else %}
-      <span>No legacy failures recorded.</span>
-      {% endfor %}
-    </div>
-  </div>
-  <div class="room-list">
-    {% for market_ticker, count in training_status.complete_rooms_per_market.items() %}
-    <div class="room-card">
-      <strong>{{ market_ticker }}</strong>
-      <span>{{ count }} complete rooms</span>
-    </div>
-    {% endfor %}
-  </div>
-  <div class="room-list">
-    {% for build in training_status.recent_dataset_builds %}
-    <div class="room-card">
-      <strong>{{ build.build_version }}</strong>
-      <span>{{ build.mode }} · {{ build.status }}</span>
-      <span>{{ build.room_count }} rooms</span>
-    </div>
-    {% else %}
-    <p>No dataset builds recorded yet.</p>
-    {% endfor %}
-  </div>
-</section>
-
-<section class="panel">
-  <h2>Create Room</h2>
-  <form id="room-form">
-    <label>Name <input type="text" name="name" required /></label>
-    <label>Market ticker <input type="text" name="market_ticker" required /></label>
-    <label>Prompt <textarea name="prompt" rows="3"></textarea></label>
-    <button type="submit">Create</button>
-  </form>
-</section>
-
-<section class="panel">
-  <h2>Research Audit</h2>
-  <div class="room-list">
-    {% for issue in research_audit %}
-    <div class="room-card">
-      <strong>{{ issue.market_ticker }}</strong>
-      <span>{{ issue.severity }} · {{ issue.code }}</span>
-      <span>{{ issue.summary }}</span>
-    </div>
-    {% else %}
-    <p>No research audit issues detected.</p>
-    {% endfor %}
-  </div>
-</section>
-
-<section class="panel">
-  <h2>Self Improve</h2>
-  <p>
-    Champion: <strong>{{ self_improve_status.agent_packs.champion_version or "n/a" }}</strong>
-    | Candidate: <strong>{{ self_improve_status.agent_packs.candidate_version or "none" }}</strong>
-    | Blue pack: <strong>{{ self_improve_status.agent_packs.blue_version or "n/a" }}</strong>
-    | Green pack: <strong>{{ self_improve_status.agent_packs.green_version or "n/a" }}</strong>
-  </p>
-  {% if self_improve_status.agent_packs.canary %}
-  <p>Canary: {{ self_improve_status.agent_packs.canary.status }} on {{ self_improve_status.agent_packs.canary.color }} for {{ self_improve_status.agent_packs.canary.version }}</p>
-  {% endif %}
-  {% if self_improve_status.agent_packs.live_monitor %}
-  <p>Live monitor: {{ self_improve_status.agent_packs.live_monitor.status }} for {{ self_improve_status.agent_packs.live_monitor.version }}</p>
-  {% endif %}
-  <div class="actions">
-    <button type="button" onclick="runCritique()">Run Critique</button>
-    {% if self_improve_status.recent_critiques and self_improve_status.recent_critiques[0].candidate_version %}
-    <button type="button" onclick="runEval('{{ self_improve_status.recent_critiques[0].candidate_version }}')">Eval Latest Candidate</button>
-    {% endif %}
-    {% if self_improve_status.recent_evaluations and self_improve_status.recent_evaluations[0].passed %}
-    <button type="button" onclick="promotePack('{{ self_improve_status.recent_evaluations[0].id }}')">Promote Passing Eval</button>
-    {% endif %}
-    <button type="button" onclick="rollbackPack()">Rollback Pack</button>
-  </div>
-  <div class="room-list">
-    {% for pack in self_improve_status.recent_packs %}
-    <div class="room-card">
-      <strong>{{ pack.version }}</strong>
-      <span>{{ pack.status }} · {{ pack.source }}</span>
-      <span>{{ pack.description }}</span>
-    </div>
-    {% else %}
-    <p>No agent packs recorded yet.</p>
-    {% endfor %}
-  </div>
-</section>
-
-<section class="panel">
-  <h2>Recent Rooms</h2>
-  <div class="room-list">
-    {% for room in rooms %}
-    <a class="room-card" href="/rooms/{{ room.id }}">
-      <strong>{{ room.name }}</strong>
-      <span>{{ room.market_ticker }}</span>
-      <span>{{ room.stage }}</span>
-      <span>{{ room.updated_at }}</span>
-    </a>
-    {% else %}
-    <p>No rooms yet.</p>
-    {% endfor %}
-  </div>
-</section>
-
-<section class="panel">
-  <h2>Research Status</h2>
-  <div class="room-list">
-    {% for market in configured_markets %}
-    <div class="room-card">
-      <strong>{{ market.label }}</strong>
-      <span>{{ market.market_ticker }} · {{ market.market_type }} · {{ market.status }}</span>
-      {% if market.series_ticker %}
-      <span>series {{ market.series_ticker }}</span>
-      {% endif %}
-      {% if market.dossier %}
-      <span>
-        gate {{ "passed" if market.dossier.gate.passed else "blocked" }}
-        · mode {{ market.dossier.mode }}
-        · confidence {{ "%.2f"|format(market.dossier.summary.research_confidence) }}
-      </span>
-      <span>
-        refreshed {{ market.dossier.freshness.refreshed_at }}
-        · expires {{ market.dossier.freshness.expires_at }}
-      </span>
-      <span>{{ market.dossier.summary.source_coverage }}</span>
-      <div class="actions">
-        <button type="button" onclick='runShadowRoom({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Run Shadow Room</button>
-        <button type="button" onclick='createRoomForMarket({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Create Room</button>
-        <button type="button" onclick="refreshResearch('{{ market.market_ticker }}')">Refresh Research</button>
-        <a href="/api/research/{{ market.market_ticker }}" target="_blank" rel="noreferrer">Open JSON</a>
+    <div class="control-room-refresh-bar" id="control-room-refresh-bar">
+      <div class="control-room-refresh-meta">
+        <span class="control-room-refresh-label">Last refreshed</span>
+        <strong id="control-room-last-refreshed" data-timestamp="{{ initial_summary.as_of }}">{{ initial_summary.as_of }}</strong>
       </div>
-      {% else %}
-      <span>No dossier yet.</span>
-      {% if market.notes %}
-      <span>{{ market.notes|join(" | ") }}</span>
-      {% endif %}
-      <div class="actions">
-        <button type="button" onclick='runShadowRoom({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Run Shadow Room</button>
-        <button type="button" onclick='createRoomForMarket({{ market.market_ticker|tojson }}, {{ market.label|tojson }})'>Create Room</button>
-        <button type="button" onclick="refreshResearch('{{ market.market_ticker }}')">Create Dossier</button>
+      <div class="control-room-refresh-actions">
+        <span class="status-pill" id="control-room-refresh-state">Auto refresh on</span>
+        <button type="button" class="button button-secondary" data-action="refresh-now">Refresh Now</button>
       </div>
-      {% endif %}
     </div>
-    {% else %}
-    <p>No configured markets loaded.</p>
+  </section>
+
+  <section class="control-room-summary-grid" id="control-room-summary">
+    <article class="summary-card summary-card-critical" data-summary-card="system-status">
+      <div class="summary-card-heading">
+        <span class="summary-card-label">System Status</span>
+        <span class="status-pill {% if initial_summary.system_status.level == 'healthy' %}status-good{% elif initial_summary.system_status.level == 'critical' %}status-bad{% endif %}">
+          {{ initial_summary.system_status.label }}
+        </span>
+      </div>
+      <strong class="summary-card-value">{{ initial_summary.system_status.active_color|upper }}</strong>
+      <span class="summary-card-detail">{{ initial_summary.system_status.detail }}</span>
+    </article>
+    <article class="summary-card" data-summary-card="active-deployment">
+      <div class="summary-card-heading">
+        <span class="summary-card-label">Active Deployment</span>
+        <span class="status-pill">{{ initial_summary.active_deployment.active_color }}</span>
+      </div>
+      <strong class="summary-card-value" data-timestamp="{{ initial_summary.active_deployment.watchdog_updated_at }}">{{ initial_summary.active_deployment.watchdog_updated_at or "never" }}</strong>
+      <span class="summary-card-detail">Last action: {{ (initial_summary.active_deployment.last_action or {}).get("action", "n/a") }}</span>
+    </article>
+    <article class="summary-card" data-summary-card="open-positions">
+      <div class="summary-card-heading">
+        <span class="summary-card-label">Open Positions</span>
+      </div>
+      <strong class="summary-card-value">{{ initial_summary.open_positions.count }}</strong>
+      <span class="summary-card-detail">Contracts tracked: {{ initial_summary.open_positions.total_contracts }}</span>
+    </article>
+    <article class="summary-card" data-summary-card="research-confidence">
+      <div class="summary-card-heading">
+        <span class="summary-card-label">Research Confidence</span>
+      </div>
+      <strong class="summary-card-value">
+        {% if initial_summary.research_confidence.average is not none %}
+          {{ "%.2f"|format(initial_summary.research_confidence.average) }}
+        {% else %}
+          n/a
+        {% endif %}
+      </strong>
+      <span class="summary-card-detail">{{ initial_summary.research_confidence.count }} active dossiers</span>
+      <div class="summary-sparkline" data-sparkline='{{ initial_summary.research_confidence.sparkline|tojson }}'></div>
+    </article>
+    <article class="summary-card" data-summary-card="room-outcomes">
+      <div class="summary-card-heading">
+        <span class="summary-card-label">Room Outcomes</span>
+      </div>
+      <strong class="summary-card-value">{{ initial_summary.room_outcomes.succeeded }}/{{ initial_summary.room_outcomes.total }}</strong>
+      <span class="summary-card-detail">Succeeded in the last {{ initial_summary.room_outcomes.window_hours }}h</span>
+      <span class="summary-card-subdetail">
+        blocked {{ initial_summary.room_outcomes.blocked }} · stand down {{ initial_summary.room_outcomes.stand_down }} · failed {{ initial_summary.room_outcomes.failed }}
+      </span>
+    </article>
+    <article class="summary-card" data-summary-card="quality-debt">
+      <div class="summary-card-heading">
+        <span class="summary-card-label">Quality Debt</span>
+      </div>
+      <strong class="summary-card-value">{{ initial_summary.quality_debt.total }}</strong>
+      <span class="summary-card-detail">
+        stale {{ initial_summary.quality_debt.stale_mismatch_count }} · missed {{ initial_summary.quality_debt.missed_stand_down_count }}
+      </span>
+      <span class="summary-card-subdetail">recent stale {{ initial_summary.quality_debt.recent_stale_mismatch_count }}</span>
+    </article>
+  </section>
+
+  <nav class="control-room-tabs panel" aria-label="Control room sections">
+    <div class="control-room-tab-list" role="tablist">
+      {% for tab in control_room_tabs %}
+      <button
+        type="button"
+        class="control-room-tab{% if tab.id == bootstrap.initial_tab %} is-active{% endif %}"
+        id="tab-button-{{ tab.id }}"
+        data-tab="{{ tab.id }}"
+        role="tab"
+        aria-selected="{{ 'true' if tab.id == bootstrap.initial_tab else 'false' }}"
+        aria-controls="tab-panel-{{ tab.id }}"
+      >
+        {{ tab.label }}
+      </button>
+      {% endfor %}
+    </div>
+  </nav>
+
+  <div class="control-room-tab-panels">
+    <section class="control-room-tab-panel is-active" id="tab-panel-overview" data-tab-panel="overview" role="tabpanel" aria-labelledby="tab-button-overview">
+      <div class="control-room-grid">
+        <article class="control-card control-card-actions">
+          <div class="control-card-header">
+            <h2>Deployment Controls</h2>
+            <p>Critical operator actions are grouped and confirmation-gated.</p>
+          </div>
+          <div class="control-action-groups">
+            <div class="action-group">
+              <span class="action-group-label">Safety</span>
+              <div class="actions">
+                <button type="button" class="button button-danger" data-action="toggle-kill" data-enabled="true">Enable Kill Switch</button>
+                <button type="button" class="button button-secondary" data-action="toggle-kill" data-enabled="false">Disable Kill Switch</button>
+              </div>
+            </div>
+            <div class="action-group">
+              <span class="action-group-label">Deployment</span>
+              <div class="actions">
+                <button type="button" class="button button-primary" data-action="promote-color" data-color="blue">Promote Blue</button>
+                <button type="button" class="button button-primary" data-action="promote-color" data-color="green">Promote Green</button>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="control-card">
+          <div class="control-card-header">
+            <h2>Runtime Health</h2>
+            <p>Per-color app and daemon freshness with combined health state.</p>
+          </div>
+          <div class="runtime-health-grid">
+            {% for color, health in initial_tab_payload.runtime_health.colors.items() %}
+            <div class="runtime-card">
+              <div class="runtime-card-top">
+                <strong>{{ color|upper }}</strong>
+                <span class="status-pill {% if health.combined_healthy %}status-good{% else %}status-bad{% endif %}">
+                  {{ "healthy" if health.combined_healthy else "degraded" }}
+                </span>
+              </div>
+              <span>app {{ health.app.status }}</span>
+              <span>daemon {{ "healthy" if health.daemon.healthy else "unhealthy" }}</span>
+              <span data-seconds="{{ health.daemon.heartbeat_age_seconds if health.daemon.heartbeat_age_seconds is not none else '' }}">
+                age {{ health.daemon.heartbeat_age_seconds if health.daemon.heartbeat_age_seconds is not none else "n/a" }}s
+              </span>
+            </div>
+            {% endfor %}
+          </div>
+        </article>
+
+        <article class="control-card">
+          <div class="control-card-header">
+            <h2>Top Blockers</h2>
+            <p>The highest-signal problems from training and settlement status.</p>
+          </div>
+          <div class="token-list">
+            {% for blocker in initial_tab_payload.top_blockers %}
+            <span class="token-chip token-chip-bad">{{ blocker }}</span>
+            {% else %}
+            <span class="token-chip">No blockers reported.</span>
+            {% endfor %}
+          </div>
+        </article>
+
+        <article class="control-card">
+          <div class="control-card-header">
+            <h2>Next Actions</h2>
+            <p>The next operational moves the system is already recommending.</p>
+          </div>
+          <div class="token-list">
+            {% for item in initial_tab_payload.next_actions %}
+            <span class="token-chip token-chip-good">{{ item }}</span>
+            {% else %}
+            <span class="token-chip">No actions needed.</span>
+            {% endfor %}
+          </div>
+        </article>
+
+        <article class="control-card">
+          <div class="control-card-header">
+            <h2>Recent Ops</h2>
+            <p>Compact event stream for the latest runtime activity.</p>
+          </div>
+          <div class="compact-list">
+            {% for event in initial_tab_payload.ops_events %}
+            <div class="compact-row">
+              <span class="status-pill">{{ event.severity }}</span>
+              <div class="compact-row-body">
+                <strong>{{ event.summary }}</strong>
+                <span>{{ event.source }}</span>
+              </div>
+            </div>
+            {% else %}
+            <p>No ops events recorded yet.</p>
+            {% endfor %}
+          </div>
+        </article>
+
+        <article class="control-card">
+          <div class="control-card-header">
+            <h2>Self Improve</h2>
+            <p>Pack status and rollout actions live here instead of competing with training history.</p>
+          </div>
+          <div class="stat-list">
+            <div><span>Champion</span><strong>{{ initial_tab_payload.self_improve.agent_packs.champion_version or "n/a" }}</strong></div>
+            <div><span>Candidate</span><strong>{{ initial_tab_payload.self_improve.agent_packs.candidate_version or "none" }}</strong></div>
+            <div><span>Blue</span><strong>{{ initial_tab_payload.self_improve.agent_packs.blue_version or "n/a" }}</strong></div>
+            <div><span>Green</span><strong>{{ initial_tab_payload.self_improve.agent_packs.green_version or "n/a" }}</strong></div>
+          </div>
+          <div class="actions">
+            <button type="button" class="button button-secondary" data-action="run-critique">Run Critique</button>
+            <button type="button" class="button button-danger" data-action="rollback-pack">Rollback Pack</button>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    {% for tab in control_room_tabs if tab.id != bootstrap.initial_tab %}
+    <section class="control-room-tab-panel" id="tab-panel-{{ tab.id }}" data-tab-panel="{{ tab.id }}" role="tabpanel" aria-labelledby="tab-button-{{ tab.id }}" hidden>
+      <div class="tab-loading-state">
+        <p>{{ tab.label }} will load when opened.</p>
+      </div>
+    </section>
     {% endfor %}
   </div>
-</section>
 
-<section class="panel">
-  <h2>Positions</h2>
-  <div class="room-list">
-    {% for position in positions %}
-    <div class="room-card">
-      <strong>{{ position.market_ticker }}</strong>
-      <span>{{ position.side }} {{ position.count_fp }}</span>
-      <span>avg {{ position.average_price_dollars }}</span>
+  <div class="control-room-modal" id="control-room-modal" hidden>
+    <div class="control-room-modal-backdrop" data-action="close-modal"></div>
+    <div class="control-room-modal-card" role="dialog" aria-modal="true" aria-labelledby="control-room-modal-title">
+      <h2 id="control-room-modal-title">Confirm action</h2>
+      <p id="control-room-modal-body">This action changes live operator state.</p>
+      <div class="actions">
+        <button type="button" class="button button-secondary" data-action="close-modal">Cancel</button>
+        <button type="button" class="button button-danger" id="control-room-modal-confirm">Confirm</button>
+      </div>
     </div>
-    {% else %}
-    <p>No reconciled positions yet.</p>
-    {% endfor %}
   </div>
-</section>
 
-<section class="panel">
-  <h2>Ops Events</h2>
-  <div class="room-list">
-    {% for event in ops_events %}
-    <div class="room-card">
-      <strong>{{ event.severity }}</strong>
-      <span>{{ event.summary }}</span>
-      <span>{{ event.source }}</span>
-    </div>
-    {% else %}
-    <p>No ops events recorded yet.</p>
-    {% endfor %}
-  </div>
-</section>
+  <noscript>
+    <section class="panel">
+      <p>JavaScript is required for live tabs, filtering, and auto-refresh. The overview content above is still available, and the raw APIs remain under <code>/api/*</code>.</p>
+    </section>
+  </noscript>
 
-<script>
-  document.getElementById("room-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const formData = new FormData(event.target);
-    const payload = Object.fromEntries(formData.entries());
-    const response = await fetch("/api/rooms", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await response.json();
-    window.location.href = data.redirect;
-  });
-
-  async function toggleKill(enabled) {
-    await fetch(`/api/control/kill-switch/${enabled}`, { method: "POST" });
-    window.location.reload();
-  }
-
-  async function promote(color) {
-    await fetch(`/api/control/promote/${color}`, { method: "POST" });
-    window.location.reload();
-  }
-
-  async function refreshResearch(marketTicker) {
-    await fetch(`/api/research/${marketTicker}/refresh`, { method: "POST" });
-    window.location.reload();
-  }
-
-  async function createRoomForMarket(marketTicker, label) {
-    const response = await fetch("/api/rooms", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: `room ${label}`,
-        market_ticker: marketTicker,
-        prompt: `Operator-created room for ${marketTicker}.`,
-      }),
-    });
-    const data = await response.json();
-    window.location.href = data.redirect;
-  }
-
-  async function runShadowRoom(marketTicker, label) {
-    const response = await fetch(`/api/markets/${encodeURIComponent(marketTicker)}/shadow-run`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: `shadow ${label}`,
-        prompt: `Shadow room launched from control room for ${marketTicker}.`,
-        reason: "ui_shadow_run",
-      }),
-    });
-    const data = await response.json();
-    window.location.href = data.redirect;
-  }
-
-  async function runShadowCampaign() {
-    await fetch("/api/shadow-campaign/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ limit: 3, reason: "ui_shadow_campaign" }),
-    });
-    window.location.reload();
-  }
-
-  async function buildTrainingDataset(mode) {
-    await fetch("/api/training/build", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode, limit: 100, days: 30, good_research_only: true }),
-    });
-    window.location.reload();
-  }
-
-  async function buildHistoricalDataset(mode) {
-    await fetch("/api/training/historical/build", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        mode,
-        date_from: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
-        date_to: new Date().toISOString().slice(0, 10),
-        quality_cleaned_only: true,
-      }),
-    });
-    window.location.reload();
-  }
-
-  async function runCritique() {
-    await fetch("/api/self-improve/critique", { method: "POST" });
-    window.location.reload();
-  }
-
-  async function runEval(candidateVersion) {
-    await fetch(`/api/self-improve/eval/${encodeURIComponent(candidateVersion)}`, { method: "POST" });
-    window.location.reload();
-  }
-
-  async function promotePack(evaluationRunId) {
-    await fetch("/api/self-improve/promote", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ evaluation_run_id: evaluationRunId, reason: "ui_promote" }),
-    });
-    window.location.reload();
-  }
-
-  async function rollbackPack() {
-    await fetch("/api/self-improve/rollback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason: "ui_rollback" }) });
-    window.location.reload();
-  }
-</script>
+  <script id="control-room-bootstrap" type="application/json">{{ bootstrap|tojson }}</script>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+  <script src="/static/control_room.js"></script>
 {% endblock %}

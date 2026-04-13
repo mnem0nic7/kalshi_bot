@@ -20,7 +20,7 @@
         <span>Color: {{ settings.app_color if settings else room.active_color }}</span>
       </div>
     </header>
-    <main class="shell-main">
+    <main class="shell-main {% block main_class %}{% endblock %}">
       {% block content %}{% endblock %}
     </main>
     {% block extra_scripts %}{% endblock %}

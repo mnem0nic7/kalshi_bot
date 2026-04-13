@@ -103,7 +103,8 @@ kalshi-bot-cli shadow-sweep --limit 3
 kalshi-bot-cli shadow-campaign run --limit 3
 ```
 
-The control room index page offers the same behavior with `Run Shadow Room`, plus a `Training And Research` panel that shows corpus readiness, recent dataset builds, research audit issues, and a one-click shadow campaign action.
+The control room index page now uses a top-tabbed dashboard layout with a summary strip at the top and lazy-loaded `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations` tabs.
+It still offers the same operator actions like `Run Shadow Room`, grouped dataset builds, kill-switch and color promotion controls, but the heavy historical and training views now stay out of the initial page load until their tab is opened.
 
 ## Training corpus
 

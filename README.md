@@ -113,9 +113,9 @@ kalshi-bot-cli promote green
 
 `discover --json` now expands any configured `series_templates` into the currently active greater/less daily temperature markets, and the control room uses the same live discovery path.
 
-The control room also supports one-click `Run Shadow Room` actions from the market cards, plus a dedicated training panel for corpus status, research audit issues, dataset builds, and one-click shadow campaigns.
-It now also shows a historical corpus panel with replayable market-days, exact checkpoint-capture coverage, missing checkpoint reasons, settlement-backfill progress, and whether Gemini fine-tuning is only draft-ready or actually training-ready.
-The historical checks should now be read as three separate layers: `source_replay_coverage` for what the current strict-asof sources could support, `checkpoint_archive_coverage` for dedicated checkpoint weather captures only, and `replay_corpus` for what has actually been materialized into `historical_replay` rooms.
+The control room is now a top-tabbed operator dashboard instead of one giant scroll wall. The top summary strip surfaces mission-critical status first, then the heavy views lazy-load into `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations`.
+It still supports one-click `Run Shadow Room` and grouped build actions, but the heavier historical and training sections are now collapsed behind focused tab content instead of rendering into the initial DOM.
+Historical checks should be read as three separate layers: `source_replay_coverage` for what the current strict-asof sources could support, `checkpoint_archive_coverage` for dedicated checkpoint weather captures only, and `replay_corpus` for what has actually been materialized into `historical_replay` rooms.
 
 ## GitHub Actions smoke workflows
 

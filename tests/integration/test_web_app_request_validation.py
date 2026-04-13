@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.core.schemas import ResearchAuditIssue
+import kalshi_bot.web.app as web_app_module
 from kalshi_bot.web.app import create_app
 
 
@@ -239,4 +240,89 @@ def test_faq_page_and_header_link_render(tmp_path, monkeypatch) -> None:
     assert faq_response.status_code == 200
     assert "What is a room?" in faq_response.text
     assert "Shadow mode" in faq_response.text
+    get_settings.cache_clear()
+
+
+def test_control_room_page_and_tab_endpoints_render_payloads(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    async def fake_bootstrap(_container):
+        return {
+            "initial_tab": "overview",
+            "tabs": [
+                {"id": "overview", "label": "Overview"},
+                {"id": "training", "label": "Training & Historical"},
+                {"id": "research", "label": "Research"},
+                {"id": "rooms", "label": "Rooms"},
+                {"id": "operations", "label": "Operations"},
+            ],
+            "summary": {
+                "as_of": "2026-04-13T16:00:00+00:00",
+                "system_status": {
+                    "level": "critical",
+                    "label": "Kill Switch On",
+                    "detail": "Trading is disabled.",
+                    "active_color": "green",
+                },
+                "active_deployment": {
+                    "active_color": "green",
+                    "watchdog_updated_at": "2026-04-13T15:59:45+00:00",
+                    "last_action": {"action": "heartbeat"},
+                },
+                "open_positions": {"count": 0, "total_contracts": "0.00"},
+                "research_confidence": {"average": 0.91, "count": 3, "sparkline": [0.82, 0.91, 0.96]},
+                "room_outcomes": {"succeeded": 0, "total": 6, "window_hours": 24, "blocked": 3, "stand_down": 2, "failed": 1},
+                "quality_debt": {"total": 12, "stale_mismatch_count": 2, "missed_stand_down_count": 1, "recent_stale_mismatch_count": 1},
+            },
+            "initial_tab_payload": {
+                "runtime_health": {
+                    "colors": {
+                        "blue": {
+                            "combined_healthy": True,
+                            "app": {"status": "healthy"},
+                            "daemon": {"healthy": True, "heartbeat_age_seconds": 19},
+                        }
+                    }
+                },
+                "top_blockers": ["not enough settled rooms"],
+                "next_actions": ["backfill weather archives"],
+                "ops_events": [{"severity": "info", "summary": "Daemon heartbeat", "source": "daemon"}],
+                "self_improve": {"agent_packs": {"champion_version": "champion-v1", "candidate_version": None, "blue_version": "blue-v1", "green_version": "green-v1"}},
+            },
+        }
+
+    async def fake_summary(_container):
+        return {"as_of": "2026-04-13T16:00:00+00:00", "system_status": {"level": "healthy", "label": "Healthy", "detail": "ok", "active_color": "green"}}
+
+    async def fake_tab(_container, tab_name: str):
+        return {"tab": tab_name, "rooms": [], "markets": [], "ops_events": []}
+
+    monkeypatch.setattr(web_app_module, "build_control_room_bootstrap", fake_bootstrap)
+    monkeypatch.setattr(web_app_module, "build_control_room_summary", fake_summary)
+    monkeypatch.setattr(web_app_module, "build_control_room_tab", fake_tab)
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        index_response = client.get("/")
+        summary_response = client.get("/api/control-room/summary")
+        tab_response = client.get("/api/control-room/tab/rooms")
+        missing_tab_response = client.get("/api/control-room/tab/not-a-tab")
+
+    assert index_response.status_code == 200
+    assert "Training &amp; Historical" in index_response.text
+    assert "control-room-bootstrap" in index_response.text
+    assert "/static/control_room.js" in index_response.text
+    assert summary_response.status_code == 200
+    assert summary_response.json()["system_status"]["label"] == "Healthy"
+    assert tab_response.status_code == 200
+    assert tab_response.json()["tab"] == "rooms"
+    assert missing_tab_response.status_code == 404
     get_settings.cache_clear()

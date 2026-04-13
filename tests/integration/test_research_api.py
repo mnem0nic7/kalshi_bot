@@ -164,8 +164,13 @@ def test_web_pages_render_index_and_room_detail(tmp_path, monkeypatch) -> None:
 
         index_response = client.get("/")
         assert index_response.status_code == 200
-        assert "WX-UI" in index_response.text
+        assert "Control Room" in index_response.text
+        assert "/static/control_room.js" in index_response.text
         assert "Runtime Health" in index_response.text
+
+        rooms_tab_response = client.get("/api/control-room/tab/rooms")
+        assert rooms_tab_response.status_code == 200
+        assert any(room["market_ticker"] == "WX-UI" for room in rooms_tab_response.json()["rooms"])
 
         room_response = client.get(f"/rooms/{room_id}")
         assert room_response.status_code == 200
