@@ -223,6 +223,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         stored_room = await repo.get_room(room.id)
         messages = await repo.list_messages(room.id)
         audit = await repo.get_room_strategy_audit(room.id)
+        weather_snapshots = await repo.list_historical_weather_snapshots(station_id="KNYC")
         await session.commit()
 
     assert stored_room is not None
@@ -231,6 +232,8 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     assert any(message.kind == "ExecReceipt" for message in messages)
     assert audit is not None
     assert audit.audit_source == "live_forward"
+    assert weather_snapshots
+    assert weather_snapshots[0].source_hash is not None
 
     await engine.dispose()
 

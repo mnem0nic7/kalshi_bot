@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -35,6 +37,10 @@ from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 logger = logging.getLogger(__name__)
+
+
+def _hash_payload(payload: dict[str, Any]) -> str:
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
 
 
 def _room_message_read(record) -> RoomMessageRead:
@@ -167,7 +173,7 @@ class WorkflowSupervisor:
                             asof_ts=archive_meta["asof_ts"],
                             source_kind="archived_weather_bundle",
                             source_id=f"room:{room.id}",
-                            source_hash=None,
+                            source_hash=_hash_payload(weather_bundle),
                             observation_ts=archive_meta["observation_ts"],
                             forecast_updated_ts=archive_meta["forecast_updated_ts"],
                             forecast_high_f=archive_meta["forecast_high_f"],
