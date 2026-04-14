@@ -102,6 +102,7 @@ Settlement mismatch reporting is now more specific too:
 Weather archive repair now also promotes already-valid as-of weather bundles into checkpoint-archive records for the exact checkpoint slot when that can be done without using future data. That helps checkpoint coverage catch up to source replayability without inventing history.
 
 There is now a second strict repair lane for older days too: `historical-backfill forecast-archive` can recover point-in-time weather from archived Open-Meteo forecast runs, but only if the archived run timestamp is still at or before the replay checkpoint. Those recovered snapshots do not bypass checkpoint validity rules; they just give the system one more honest source of knowable weather.
+If that lane still is not recovering anything, check `external_archive_backfill_reason_counts` in historical status before rerunning it. The latest run summary is also exposed as `external_archive_last_backfill`.
 
 The confidence state should also make sense:
 

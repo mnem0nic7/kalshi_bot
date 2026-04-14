@@ -13,6 +13,7 @@ from kalshi_bot.core.enums import AgentRole, MessageKind, RoomOrigin, RoomStage
 from kalshi_bot.core.schemas import RoomCreate, RoomMessageCreate
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+from kalshi_bot.integrations.forecast_archive import ForecastArchiveLookupResult
 from kalshi_bot.web.app import create_app
 
 
@@ -478,20 +479,22 @@ series_templates:
                         f"{local_market_day}T12:00",
                         f"{local_market_day}T15:00",
                     ],
-                    "temperature_2m": [70.0, 77.0, 81.0],
+                        "temperature_2m": [70.0, 77.0, 81.0],
                 },
             }
-            return container.historical_training_service.forecast_archive_client._normalize_snapshot(
-                mapping,
-                payload=raw_payload,
-                local_market_day=local_market_day,
-                checkpoint_ts=checkpoint_ts,
-                checkpoint_label=checkpoint_label,
-                model="gfs_seamless",
-                run_ts=checkpoint_ts - timedelta(hours=1),
+            return ForecastArchiveLookupResult(
+                snapshot=container.historical_training_service.forecast_archive_client._normalize_snapshot(
+                    mapping,
+                    payload=raw_payload,
+                    local_market_day=local_market_day,
+                    checkpoint_ts=checkpoint_ts,
+                    checkpoint_label=checkpoint_label,
+                    model="best_match",
+                    run_ts=checkpoint_ts - timedelta(hours=1),
+                ),
             )
 
-        container.historical_training_service.forecast_archive_client.fetch_point_in_time_forecast = fake_fetch  # type: ignore[method-assign]
+        container.historical_training_service.forecast_archive_client.fetch_point_in_time_forecast_with_diagnostics = fake_fetch  # type: ignore[method-assign]
 
         result = asyncio.run(
             container.historical_training_service.backfill_external_forecast_archives(
@@ -510,7 +513,93 @@ series_templates:
         assert body["checkpoint_archive_coverage"]["source_counts"]["external_archive_assisted_checkpoint_count"] == 3
         assert body["external_archive_coverage"]["source_counts"]["assisted_checkpoint_count"] == 3
         assert body["external_archive_recovery"]["recovered_via_external_archive_market_day_count"] == 1
+        assert body["external_archive_backfill_reason_counts"] == {}
         return
+
+
+def test_external_forecast_archive_backfill_surfaces_failure_reasons_in_status(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text(
+        """
+series_templates:
+  - series_ticker: KXHIGHNY
+    display_name: NYC Daily High Temperature
+    station_id: KNYC
+    daily_summary_station_id: USW00094728
+    location_name: New York City
+    timezone_name: America/New_York
+    latitude: 40.7146
+    longitude: -74.0071
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "historical-external-archive-failure.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        container = client.app.state.container
+
+        async def seed() -> None:
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                ticker = "KXHIGHNY-26APR10-T68"
+                await repo.upsert_historical_settlement_label(
+                    market_ticker=ticker,
+                    series_ticker="KXHIGHNY",
+                    local_market_day="2026-04-10",
+                    source_kind="kalshi_primary",
+                    kalshi_result="yes",
+                    settlement_value_dollars=Decimal("1.0000"),
+                    settlement_ts=datetime(2026, 4, 11, 0, 30, tzinfo=UTC),
+                    crosscheck_status="match",
+                    crosscheck_high_f=Decimal("81.00"),
+                    crosscheck_result="yes",
+                    payload={
+                        "market": {
+                            "ticker": ticker,
+                            "strike_type": "greater",
+                            "floor_strike": 68,
+                            "close_time": datetime(2026, 4, 10, 23, 59, 59, tzinfo=UTC).isoformat(),
+                            "result": "yes",
+                        }
+                    },
+                )
+                await session.commit()
+
+        asyncio.run(seed())
+
+        async def fake_failure(mapping, *, local_market_day: str, checkpoint_ts: datetime, checkpoint_label: str | None = None):
+            return ForecastArchiveLookupResult(
+                snapshot=None,
+                failure_reason="request_bad_request",
+                reason_counts={"request_bad_request": 1},
+                attempts=[{"run_ts": checkpoint_ts.isoformat(), "model": "best_match", "reason": "request_bad_request"}],
+            )
+
+        container.historical_training_service.forecast_archive_client.fetch_point_in_time_forecast_with_diagnostics = fake_failure  # type: ignore[method-assign]
+
+        result = asyncio.run(
+            container.historical_training_service.backfill_external_forecast_archives(
+                date_from=datetime(2026, 4, 10, tzinfo=UTC).date(),
+                date_to=datetime(2026, 4, 10, tzinfo=UTC).date(),
+                series=["KXHIGHNY"],
+            )
+        )
+
+        assert result["checkpoint_archive_promotion_count"] == 0
+        assert result["reason_counts"]["request_bad_request"] == 3
+
+        historical_status = client.get("/api/historical/status")
+        assert historical_status.status_code == 200
+        body = historical_status.json()
+        assert body["external_archive_backfill_reason_counts"]["request_bad_request"] == 3
+        assert body["external_archive_last_backfill"]["skipped_unavailable_count"] == 3
 
 def test_historical_gemini_build_becomes_training_ready_with_three_full_days(tmp_path, monkeypatch) -> None:
     map_path = tmp_path / "markets.yaml"

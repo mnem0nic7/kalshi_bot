@@ -80,6 +80,7 @@ Historical settlement crosschecks now respect strict market operators. That mean
 
 Historical weather backfill now also promotes recoverable as-of weather evidence into checkpoint-archive records when the source bundle is already valid for that checkpoint. That does not fabricate missing history; it just upgrades already-valid weather evidence into the dedicated checkpoint path so replay support and checkpoint-archive coverage stay aligned.
 Historical forecast-archive backfill extends that same idea to archived Open-Meteo runs: the external snapshot is stored in `historical_weather_snapshots`, then promoted into the canonical checkpoint archive only when its run and effective as-of times are still valid for the replay checkpoint.
+The Open-Meteo repair path now queries archived runs using checkpoint-local cycle times and `forecast_days`, not `start_date`/`end_date`, and the backfill output records `reason_counts` plus `failure_samples` when a slot cannot be recovered.
 
 Deploy findings from April 12, 2026:
 
@@ -207,6 +208,8 @@ The normal strict-fidelity recovery order is:
 4. `historical-archive checkpoint-capture --once`
 5. `historical-backfill settlements`
 6. `historical-repair audit` and `historical-repair refresh`
+
+When `historical-backfill forecast-archive` still skips slots, read its `reason_counts` first. The matching historical status fields are `external_archive_last_backfill`, `external_archive_backfill_reason_counts`, and `external_archive_backfill_failure_samples`.
 
 Export complete room bundles:
 

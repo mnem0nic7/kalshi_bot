@@ -164,6 +164,7 @@ Settlement status also has to be read more carefully now:
 
 Weather-archive backfill now has a second repair job besides writing raw archives: it promotes already-valid as-of weather bundles into checkpoint-archive records for the exact checkpoint slot when that evidence is recoverable without using future data.
 Forecast-archive backfill adds a third strict-fidelity repair lane: it fetches archived Open-Meteo forecast runs, stores them as `external_forecast_archive_weather_bundle`, and promotes them into canonical checkpoint archives only when the run timestamp still satisfies checkpoint-time validity.
+The Open-Meteo client now uses checkpoint-local cycle runs plus `forecast_days`; it does not send `start_date` or `end_date` when a specific archived run is requested.
 
 Deploy findings from April 12, 2026:
 
@@ -179,6 +180,7 @@ Deploy findings from April 14, 2026:
 - the historical repair lane now includes `historical-backfill forecast-archive`, which is the first strict external source for recovering checkpoint-time weather on older settled days
 - `checkpoint_archive_coverage` remains the canonical readiness source, but it can now be native-capture-backed or external-archive-assisted; check `checkpoint_archive_coverage.source_counts` and `external_archive_recovery_summary` before assuming which path improved readiness
 - `external_archive_coverage` is the right operator view for deciding whether a missing-weather backlog is recoverable this week or still genuinely unrecoverable
+- `historical-backfill forecast-archive` now emits `reason_counts` and `failure_samples`, and `historical-status` mirrors the latest run under `external_archive_last_backfill` plus `external_archive_backfill_reason_counts`
 
 Historical intelligence and heuristic-pack workflow:
 

@@ -137,6 +137,7 @@ class HistoricalTrainingService:
     ARCHIVED_WEATHER_SOURCE = "archived_weather_bundle"
     LEGACY_ARCHIVED_WEATHER_SOURCE = "file_weather_bundle"
     EXTERNAL_FORECAST_ARCHIVE_SOURCE = "external_forecast_archive_weather_bundle"
+    EXTERNAL_FORECAST_ARCHIVE_BACKFILL_CHECKPOINT = "historical_forecast_archive_backfill:last_run"
     FINAL_MARKET_SOURCE = "kalshi_final_market"
     SETTLEMENT_MATCH = "match"
     SETTLEMENT_MISMATCH = "mismatch"
@@ -527,7 +528,10 @@ class HistoricalTrainingService:
         checkpoint_promotions = 0
         skipped_existing = 0
         skipped_unavailable = 0
+        skipped_promotion_invalid = 0
+        reason_counts: Counter[str] = Counter()
         samples: list[dict[str, Any]] = []
+        failure_samples: list[dict[str, Any]] = []
 
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -554,15 +558,32 @@ class HistoricalTrainingService:
                     )
                     if existing_archive is not None:
                         skipped_existing += 1
+                        reason_counts["checkpoint_archive_existing"] += 1
                         continue
-                    snapshot = await self.forecast_archive_client.fetch_point_in_time_forecast(
+                    lookup = await self.forecast_archive_client.fetch_point_in_time_forecast_with_diagnostics(
                         mapping,
                         local_market_day=label.local_market_day,
                         checkpoint_ts=checkpoint_ts,
                         checkpoint_label=checkpoint_label,
                     )
+                    snapshot = lookup.snapshot
                     if snapshot is None:
                         skipped_unavailable += 1
+                        failure_reason = lookup.failure_reason or "no_valid_candidate_run"
+                        reason_counts[failure_reason] += 1
+                        if len(failure_samples) < 10:
+                            failure_samples.append(
+                                {
+                                    "series_ticker": mapping.series_ticker,
+                                    "market_ticker": label.market_ticker,
+                                    "local_market_day": label.local_market_day,
+                                    "checkpoint_label": checkpoint_label,
+                                    "checkpoint_ts": checkpoint_ts.isoformat(),
+                                    "failure_reason": failure_reason,
+                                    "reason_counts": dict(lookup.reason_counts or {}),
+                                    "attempts": list((lookup.attempts or [])[:6]),
+                                }
+                            )
                         continue
                     existing_weather = await repo.get_historical_weather_snapshot_by_source(
                         station_id=mapping.station_id,
@@ -590,6 +611,21 @@ class HistoricalTrainingService:
                     metadata = self._weather_snapshot_checkpoint_metadata(weather_record)
                     if not self._checkpoint_archive_metadata_valid(metadata, checkpoint_ts):
                         skipped_unavailable += 1
+                        skipped_promotion_invalid += 1
+                        reason_counts["checkpoint_promotion_invalid"] += 1
+                        if len(failure_samples) < 10:
+                            failure_samples.append(
+                                {
+                                    "series_ticker": mapping.series_ticker,
+                                    "market_ticker": label.market_ticker,
+                                    "local_market_day": label.local_market_day,
+                                    "checkpoint_label": checkpoint_label,
+                                    "checkpoint_ts": checkpoint_ts.isoformat(),
+                                    "failure_reason": "checkpoint_promotion_invalid",
+                                    "weather_source_id": snapshot.source_id,
+                                    "run_ts": snapshot.run_ts.isoformat(),
+                                }
+                            )
                         continue
                     source_id = (
                         f"external-promotion:{mapping.series_ticker}:{label.local_market_day}:{checkpoint_label}:{weather_record.id}"
@@ -648,20 +684,30 @@ class HistoricalTrainingService:
                                 "run_ts": snapshot.run_ts.isoformat(),
                             }
                         )
+            summary = {
+                "status": "completed",
+                "date_from": date_from.isoformat(),
+                "date_to": date_to.isoformat(),
+                "series": series_tickers,
+                "provider": "open_meteo_forecast_archive",
+                "inserted_snapshot_count": inserted_snapshots,
+                "checkpoint_archive_promotion_count": checkpoint_promotions,
+                "skipped_existing_count": skipped_existing,
+                "skipped_unavailable_count": skipped_unavailable,
+                "skipped_promotion_invalid_count": skipped_promotion_invalid,
+                "reason_counts": dict(reason_counts),
+                "samples": samples,
+                "failure_samples": failure_samples,
+                "recorded_at": datetime.now(UTC).isoformat(),
+            }
+            await repo.set_checkpoint(
+                self.EXTERNAL_FORECAST_ARCHIVE_BACKFILL_CHECKPOINT,
+                None,
+                summary,
+            )
             await session.commit()
 
-        return {
-            "status": "completed",
-            "date_from": date_from.isoformat(),
-            "date_to": date_to.isoformat(),
-            "series": series_tickers,
-            "provider": "open_meteo_forecast_archive",
-            "inserted_snapshot_count": inserted_snapshots,
-            "checkpoint_archive_promotion_count": checkpoint_promotions,
-            "skipped_existing_count": skipped_existing,
-            "skipped_unavailable_count": skipped_unavailable,
-            "samples": samples,
-        }
+        return summary
 
     async def _promote_checkpoint_archives_from_existing_weather(
         self,
@@ -1733,6 +1779,7 @@ class HistoricalTrainingService:
             historical_builds = await repo.list_training_dataset_builds(limit=1000, mode_prefix="historical-")
             intelligence_runs = await repo.list_historical_intelligence_runs(limit=10)
             pipeline_runs = await repo.list_historical_pipeline_runs(limit=10)
+            external_archive_backfill_checkpoint = await repo.get_checkpoint(self.EXTERNAL_FORECAST_ARCHIVE_BACKFILL_CHECKPOINT)
             await session.commit()
 
         replay_room_ids = [run.room_id for run in replay_runs if run.room_id]
@@ -1839,6 +1886,7 @@ class HistoricalTrainingService:
         )
         latest_pipeline_payload = pipeline_runs[0].payload if pipeline_runs else None
         bootstrap_progress = self._bootstrap_progress_from_pipeline_runs(pipeline_runs)
+        external_archive_last_backfill = dict(external_archive_backfill_checkpoint.payload or {}) if external_archive_backfill_checkpoint else {}
         return {
             "imported_market_days": len({label.local_market_day for label in settlement_labels}),
             "imported_market_count": len(settlement_labels),
@@ -1872,6 +1920,9 @@ class HistoricalTrainingService:
             "market_checkpoint_capture_gaps": public_market_checkpoint_capture["checkpoint_capture_gaps"],
             "external_archive_source_counts": public_external_archive_coverage.get("source_counts") or {},
             "external_archive_recovery_summary": public_external_archive_coverage.get("recovery_summary") or {},
+            "external_archive_last_backfill": external_archive_last_backfill,
+            "external_archive_backfill_reason_counts": external_archive_last_backfill.get("reason_counts") or {},
+            "external_archive_backfill_failure_samples": external_archive_last_backfill.get("failure_samples") or [],
             "draft_training_ready": draft_only,
             "training_ready": training_ready,
             "historical_dataset_readiness": historical_build_readiness,

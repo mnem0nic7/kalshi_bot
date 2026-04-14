@@ -117,6 +117,7 @@ kalshi-bot-cli promote green
 The control room is now a top-tabbed operator dashboard instead of one giant scroll wall. The top summary strip surfaces mission-critical status first, then the heavy views lazy-load into `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations`.
 It still supports one-click `Run Shadow Room` and grouped build actions, but the heavier historical and training sections are now collapsed behind focused tab content instead of rendering into the initial DOM.
 Historical checks should be read as four separate layers: `source_replay_coverage` for what the current strict-asof sources could support, `checkpoint_archive_coverage` for canonical checkpoint-weather coverage, `external_archive_coverage` for Open-Meteo-assisted historical recovery, and `replay_corpus` for what has actually been materialized into `historical_replay` rooms.
+When forecast-archive repair still is not moving, inspect `external_archive_last_backfill` and `external_archive_backfill_reason_counts` in `historical-status` before rerunning the same sweep.
 
 ## GitHub Actions smoke workflows
 
