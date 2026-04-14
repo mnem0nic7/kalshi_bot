@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from kalshi_bot.web.control_room import _recent_room_outcomes, _series_filter_options
+from kalshi_bot.web.control_room import _classify_room, _recent_room_outcomes, _series_filter_options
 
 
 def test_recent_room_outcomes_excludes_running_rooms_from_resolved_total() -> None:
@@ -42,3 +42,22 @@ def test_series_filter_options_follow_configured_templates() -> None:
         {"id": "KXHIGHAUS", "label": "Austin"},
         {"id": "KXHIGHNY", "label": "New York City"},
     ]
+
+
+def test_classify_room_treats_failed_stage_as_failed() -> None:
+    bundle = SimpleNamespace(
+        outcome=SimpleNamespace(
+            fills_observed=0,
+            orders_submitted=0,
+            ticket_generated=False,
+            risk_status=None,
+            blocked_by=None,
+            final_status="failed",
+            stand_down_reason=None,
+            room_stage="failed",
+        )
+    )
+
+    classification = _classify_room(bundle)
+
+    assert classification == {"status": "failed", "label": "Failed", "tone": "bad"}

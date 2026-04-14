@@ -265,12 +265,15 @@ class PlatformRepository:
         market_ticker: str | None = None,
         include_non_complete: bool = False,
         origins: list[str] | None = None,
+        updated_since: datetime | None = None,
     ) -> list[Room]:
         stmt = select(Room)
         if market_ticker is not None:
             stmt = stmt.where(Room.market_ticker == market_ticker)
         if origins:
             stmt = stmt.where(Room.room_origin.in_(origins))
+        if updated_since is not None:
+            stmt = stmt.where(Room.updated_at >= updated_since)
         if not include_non_complete:
             stmt = stmt.where(Room.stage == RoomStage.COMPLETE.value)
         result = await self.session.execute(stmt.order_by(Room.updated_at.desc()).limit(limit))

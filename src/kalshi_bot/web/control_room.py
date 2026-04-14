@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 CONTROL_ROOM_TABS = ("overview", "training", "research", "rooms", "operations")
 SUMMARY_ROOM_WINDOW_HOURS = 24
 SUMMARY_ROOM_LIMIT = 60
+SUMMARY_ROOM_OUTCOME_LIMIT = 500
 ROOM_TAB_LIMIT = 40
 POSITION_LIMIT = 100
 OPS_EVENT_LIMIT = 40
@@ -118,6 +119,8 @@ def _classify_room(bundle: Any) -> dict[str, str]:
         return {"status": "stand_down", "label": "Stand Down", "tone": "warning"}
     if outcome.blocked_by in {"risk", "research_gate"} or outcome.final_status in {"blocked", "research_blocked"}:
         return {"status": "blocked", "label": "Blocked", "tone": "bad"}
+    if outcome.final_status == "failed" or outcome.room_stage == "failed":
+        return {"status": "failed", "label": "Failed", "tone": "bad"}
     if outcome.room_stage != "complete":
         return {"status": "running", "label": "Running", "tone": "neutral"}
     return {"status": "failed", "label": "Failed", "tone": "bad"}
@@ -339,6 +342,15 @@ async def _recent_room_bundles(container: AppContainer, *, limit: int) -> list[A
     )
 
 
+async def _recent_room_outcome_bundles(container: AppContainer, *, now: datetime) -> list[Any]:
+    return await container.training_export_service.export_room_bundles(
+        limit=SUMMARY_ROOM_OUTCOME_LIMIT,
+        include_non_complete=True,
+        origins=[RoomOrigin.SHADOW.value, RoomOrigin.LIVE.value],
+        updated_since=now - timedelta(hours=SUMMARY_ROOM_WINDOW_HOURS),
+    )
+
+
 def _summary_payload(
     *,
     now: datetime,
@@ -447,9 +459,10 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         positions = await repo.list_positions(limit=POSITION_LIMIT)
         await session.commit()
 
-    configured_markets, room_bundles = await asyncio.gather(
+    configured_markets, room_bundles, room_outcome_bundles = await asyncio.gather(
         _configured_markets(container),
         _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT),
+        _recent_room_outcome_bundles(container, now=now),
     )
     training_status = await container.training_corpus_service.get_dashboard_status(bundles=room_bundles)
     return _summary_payload(
@@ -459,7 +472,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         positions=positions,
         training_status=training_status,
         configured_markets=configured_markets,
-        room_bundles=room_bundles,
+        room_bundles=room_outcome_bundles,
     )
 
 
@@ -487,9 +500,10 @@ async def build_control_room_bootstrap(container: AppContainer) -> dict[str, Any
         ops_events = await repo.list_ops_events(limit=8)
         await session.commit()
 
-    configured_markets, room_bundles, self_improve_status, heuristic_status = await asyncio.gather(
+    configured_markets, room_bundles, room_outcome_bundles, self_improve_status, heuristic_status = await asyncio.gather(
         _configured_markets(container),
         _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT),
+        _recent_room_outcome_bundles(container, now=now),
         container.self_improve_service.get_dashboard_status(),
         container.historical_intelligence_service.get_dashboard_status(),
     )
@@ -501,7 +515,7 @@ async def build_control_room_bootstrap(container: AppContainer) -> dict[str, Any
         positions=positions,
         training_status=training_status,
         configured_markets=configured_markets,
-        room_bundles=room_bundles,
+        room_bundles=room_outcome_bundles,
     )
     overview = _overview_payload(
         now=now,
@@ -641,16 +655,18 @@ async def _build_research_tab(container: AppContainer) -> dict[str, Any]:
 
 async def _build_rooms_tab(container: AppContainer) -> dict[str, Any]:
     now = datetime.now(UTC)
-    room_bundles, configured_markets = await asyncio.gather(
+    room_bundles, room_outcome_bundles, configured_markets = await asyncio.gather(
         _recent_room_bundles(container, limit=ROOM_TAB_LIMIT),
+        _recent_room_outcome_bundles(container, now=now),
         _configured_markets(container),
     )
     room_views = [_room_view(bundle) for bundle in room_bundles]
+    room_outcome_views = [_room_view(bundle) for bundle in room_outcome_bundles]
     return {
         "tab": "rooms",
         "as_of": now.isoformat(),
         "rooms": room_views,
-        "room_outcomes": _recent_room_outcomes(room_views, now=now),
+        "room_outcomes": _recent_room_outcomes(room_outcome_views, now=now),
         "quick_create_markets": [
             {
                 "market_ticker": item["market_ticker"],

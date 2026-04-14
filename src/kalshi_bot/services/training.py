@@ -150,12 +150,14 @@ class TrainingExportService:
         limit: int = 100,
         include_non_complete: bool = False,
         origins: list[str] | None = None,
+        updated_since: datetime | None = None,
     ) -> list[TrainingRoomBundle]:
         target_room_ids = room_ids or await self._list_room_ids(
             market_ticker=market_ticker,
             limit=limit,
             include_non_complete=include_non_complete,
             origins=origins,
+            updated_since=updated_since,
         )
         return [await self.build_room_bundle(room_id) for room_id in target_room_ids[:limit]]
 
@@ -236,6 +238,7 @@ class TrainingExportService:
         limit: int,
         include_non_complete: bool,
         origins: list[str] | None = None,
+        updated_since: datetime | None = None,
     ) -> list[str]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -244,6 +247,7 @@ class TrainingExportService:
                 limit=limit,
                 include_non_complete=include_non_complete,
                 origins=origins,
+                updated_since=updated_since,
             )
             await session.commit()
         return [room.id for room in rooms]
