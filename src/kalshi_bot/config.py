@@ -88,6 +88,8 @@ class Settings(BaseSettings):
     memory_embedding_dimensions: int = 16
     sse_poll_interval_seconds: float = 1.0
     research_stale_seconds: int = 900
+    research_stale_grace_factor: float = 2.0  # dossier within stale_seconds * factor may still trade at reduced size
+    research_stale_tolerance_notional_factor: float = 0.5  # notional cap multiplier when stale_tolerance_active
     research_refresh_cooldown_seconds: int = 120
     research_web_max_results: int = 5
     research_web_max_queries: int = 2

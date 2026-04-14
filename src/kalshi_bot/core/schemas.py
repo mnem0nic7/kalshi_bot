@@ -162,12 +162,14 @@ class ResearchFreshness(BaseModel):
     expires_at: datetime
     stale: bool
     max_source_age_seconds: int = 0
+    stale_grace: bool = False  # stale but within grace window; gate may still pass at reduced size
 
 
 class ResearchGateVerdict(BaseModel):
     passed: bool
     reasons: list[str] = Field(default_factory=list)
     cited_source_keys: list[str] = Field(default_factory=list)
+    stale_tolerance_active: bool = False  # passed via grace window; supervisor applies reduced notional cap
 
 
 class TradeEligibilityVerdict(BaseModel):

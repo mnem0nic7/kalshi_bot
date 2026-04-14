@@ -647,11 +647,16 @@ class ResearchCoordinator:
         refreshed_at = freshness.refreshed_at.astimezone(UTC)
         expires_at = freshness.expires_at.astimezone(UTC)
         stale = now >= expires_at
+        grace_expires_at = expires_at + timedelta(
+            seconds=self.settings.research_stale_seconds * (self.settings.research_stale_grace_factor - 1.0)
+        )
+        stale_grace = stale and now < grace_expires_at
         elapsed_since_refresh = max(0, int((now - refreshed_at).total_seconds()))
         return ResearchFreshness(
             refreshed_at=refreshed_at,
             expires_at=expires_at,
             stale=stale,
+            stale_grace=stale_grace,
             max_source_age_seconds=max(freshness.max_source_age_seconds, elapsed_since_refresh),
         )
 
@@ -732,8 +737,9 @@ class ResearchCoordinator:
     ) -> ResearchGateVerdict:
         reasons: list[str] = []
         cited = [source.source_key for source in sources]
-        if freshness.stale:
-            reasons.append("Research dossier is stale.")
+        # Hard-block checks: stale beyond the grace window, or missing quality requirements
+        if freshness.stale and not freshness.stale_grace:
+            reasons.append("Research dossier is stale beyond grace window.")
         if not sources:
             reasons.append("Research dossier has no sources.")
         if not settlement_covered:
@@ -746,7 +752,17 @@ class ResearchCoordinator:
             reasons.append("Research dossier does not cite primary or reputable sources.")
         if trader_context.fair_yes_dollars is None:
             reasons.append("Research dossier did not produce a fair-value estimate.")
-        return ResearchGateVerdict(passed=not reasons, reasons=reasons or ["Research gate passed."], cited_source_keys=cited)
+        # Stale-within-grace: passes but flags stale_tolerance_active so the supervisor
+        # can apply a reduced notional cap (research_stale_tolerance_notional_factor).
+        stale_tolerance_active = not reasons and freshness.stale_grace
+        if stale_tolerance_active:
+            reasons = ["Research gate passed (stale tolerance active — reduced position cap applies)."]
+        return ResearchGateVerdict(
+            passed=not reasons or stale_tolerance_active,
+            reasons=reasons or ["Research gate passed."],
+            cited_source_keys=cited,
+            stale_tolerance_active=stale_tolerance_active,
+        )
 
     def _quality_summary(
         self,

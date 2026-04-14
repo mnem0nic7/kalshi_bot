@@ -76,10 +76,8 @@ def test_research_gate_blocks_missing_fair_value_and_settlement_gap() -> None:
     assert any("fair-value" in reason.lower() for reason in verdict.reasons)
 
 
-def test_runtime_hydration_recomputes_staleness_from_expires_at() -> None:
-    coordinator = make_coordinator()
-    now = datetime.now(UTC)
-    dossier = ResearchDossier(
+def _make_stale_dossier(now: datetime, minutes_past_expiry: int) -> ResearchDossier:
+    return ResearchDossier(
         market_ticker="API-STALE",
         status="ready",
         mode="structured",
@@ -95,7 +93,7 @@ def test_runtime_hydration_recomputes_staleness_from_expires_at() -> None:
         ),
         freshness=ResearchFreshness(
             refreshed_at=now - timedelta(minutes=30),
-            expires_at=now - timedelta(minutes=5),
+            expires_at=now - timedelta(minutes=minutes_past_expiry),
             stale=False,
             max_source_age_seconds=0,
         ),
@@ -129,8 +127,34 @@ def test_runtime_hydration_recomputes_staleness_from_expires_at() -> None:
         settlement_covered=True,
     )
 
+
+def test_runtime_hydration_recomputes_staleness_from_expires_at() -> None:
+    """A dossier expired well beyond the grace window is hard-blocked."""
+    coordinator = make_coordinator()
+    now = datetime.now(UTC)
+    # Default: stale_seconds=900 (15 min), grace_factor=2.0 → grace window = 30 min.
+    # Expired 35 minutes ago → beyond grace → gate blocks.
+    dossier = _make_stale_dossier(now, minutes_past_expiry=35)
+
     hydrated = coordinator._hydrate_runtime_fields(dossier)
 
     assert hydrated.freshness.stale is True
+    assert hydrated.freshness.stale_grace is False
     assert hydrated.gate.passed is False
     assert any("stale" in reason.lower() for reason in hydrated.gate.reasons)
+
+
+def test_runtime_hydration_stale_within_grace_passes_with_tolerance() -> None:
+    """A dossier stale but within the grace window passes with stale_tolerance_active=True."""
+    coordinator = make_coordinator()
+    now = datetime.now(UTC)
+    # Expired 5 minutes ago → within the 30-min grace window → passes with tolerance.
+    dossier = _make_stale_dossier(now, minutes_past_expiry=5)
+
+    hydrated = coordinator._hydrate_runtime_fields(dossier)
+
+    assert hydrated.freshness.stale is True
+    assert hydrated.freshness.stale_grace is True
+    assert hydrated.gate.passed is True
+    assert hydrated.gate.stale_tolerance_active is True
+    assert any("stale tolerance" in reason.lower() for reason in hydrated.gate.reasons)

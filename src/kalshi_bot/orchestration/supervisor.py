@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -19,7 +20,7 @@ from kalshi_bot.db.models import Room
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
-from kalshi_bot.services.agent_packs import AgentPackService
+from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.historical_archive import append_weather_bundle_archive, weather_bundle_archive_metadata
 from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
@@ -141,7 +142,10 @@ class WorkflowSupervisor:
                     role_models=role_models,
                 )
                 await session.commit()
-                market_response = await self.kalshi.get_market(room.market_ticker)
+                market_response, dossier = await asyncio.gather(
+                    self.kalshi.get_market(room.market_ticker),
+                    self.research_coordinator.ensure_fresh_dossier(room.market_ticker, reason="room_start"),
+                )
                 market = market_response.get("market", market_response)
                 mapping = self.weather_directory.resolve_market(room.market_ticker, market)
                 weather_bundle = (
@@ -149,7 +153,6 @@ class WorkflowSupervisor:
                     if mapping is not None and mapping.supports_structured_weather
                     else None
                 )
-                dossier = await self.research_coordinator.ensure_fresh_dossier(room.market_ticker, reason="room_start")
                 delta = self.research_coordinator.build_room_delta(
                     dossier=dossier,
                     market_response=market_response,
@@ -434,13 +437,25 @@ class WorkflowSupervisor:
                             research_observed_at=dossier.freshness.refreshed_at,
                             current_position_notional_dollars=current_position_notional,
                         )
+                        effective_thresholds = thresholds
+                        if dossier.gate.stale_tolerance_active:
+                            factor = self.settings.research_stale_tolerance_notional_factor
+                            effective_thresholds = RuntimeThresholds(
+                                risk_min_edge_bps=thresholds.risk_min_edge_bps,
+                                risk_max_order_notional_dollars=thresholds.risk_max_order_notional_dollars * factor,
+                                risk_max_position_notional_dollars=thresholds.risk_max_position_notional_dollars * factor,
+                                trigger_max_spread_bps=thresholds.trigger_max_spread_bps,
+                                trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds,
+                                strategy_quality_edge_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
+                                strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
+                            )
                         verdict = self.risk_engine.evaluate(
                             room=room,
                             control=control,
                             ticket=ticket,
                             signal=signal,
                             context=risk_context,
-                            thresholds=thresholds,
+                            thresholds=effective_thresholds,
                         )
                         await repo.save_risk_verdict(
                             room_id=room.id,
