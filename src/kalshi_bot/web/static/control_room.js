@@ -380,9 +380,51 @@
     ];
     summaryContainer.replaceChildren(...summaryCards);
 
+    renderIntelBoard(summary);
+
     state.summary = summary;
     lastRefreshedNode.dataset.timestamp = summary.as_of || "";
     applyRelativeTime(lastRefreshedNode, summary.as_of);
+  }
+
+  function renderIntelBoard(summary) {
+    const boardEl = document.getElementById("control-room-intel-board");
+    if (!boardEl) return;
+    const rows = Array.isArray(summary.current_intel_board) ? summary.current_intel_board : [];
+    if (!rows.length) {
+      boardEl.replaceChildren();
+      return;
+    }
+    const card = element("section", "control-card");
+    const header = element("div", "control-card-header");
+    header.append(
+      element("h2", null, "Current Market Intel"),
+      element("p", null, "Gate-passing markets listed first, sorted by confidence. Blocked rows show the first blocking reason.")
+    );
+    const table = buildTable(
+      [
+        { label: "Market", render: (r) => r.ticker },
+        { label: "Gate", render: (r) => r.ticker }, // overwritten below with pills
+        { label: "Fair YES", render: (r) => r.fair_yes_dollars ? "$".concat(r.fair_yes_dollars) : "—" },
+        { label: "Confidence", render: (r) => r.confidence != null ? formatNumber(r.confidence, 2) : "—" },
+        { label: "Age", render: (r) => r.age_seconds != null ? formatDurationSeconds(r.age_seconds) : "—" },
+        { label: "Why Blocked", render: (r) => (r.gate_reasons || [])[0] || (r.gate_passed ? "" : "unknown") },
+      ],
+      rows
+    );
+    // Replace plain-text gate cells with colour-coded pills (safe DOM only)
+    const gateCells = table.querySelectorAll("td:nth-child(2)");
+    rows.forEach((r, i) => {
+      if (!gateCells[i]) return;
+      const pill = statusPill(r.gate_passed ? "PASS" : "BLOCKED", r.gate_passed ? "good" : "bad");
+      if (r.stale && r.gate_passed) {
+        gateCells[i].replaceChildren(pill, statusPill("STALE", "warning"));
+      } else {
+        gateCells[i].replaceChildren(pill);
+      }
+    });
+    card.append(header, table);
+    boardEl.replaceChildren(card);
   }
 
   function toneFromBoolean(value) {
@@ -1061,11 +1103,19 @@
             notes.append(element("span", "token-chip", item.has_dossier ? "Dossier present" : "No dossier yet"));
           }
 
+          const gateReasons = element("div", "token-list");
+          if (!item.gate_passed && (item.gate_reasons || []).length) {
+            item.gate_reasons.forEach((reason) => {
+              gateReasons.append(element("span", ["token-chip", "token-chip-bad"], reason));
+            });
+          }
+
           marketCard.append(
             cardHeader,
             confidenceMeter(item.confidence, item.confidence_band),
             meta,
             notes,
+            ...(gateReasons.childNodes.length ? [gateReasons] : []),
             actions
           );
           list.append(marketCard);
@@ -1270,8 +1320,20 @@
           anchor.textContent = room.name || room.id;
           main.append(anchor, element("span", "muted", room.reason || room.stage || "n/a"));
           const side = element("div", "room-row-side");
+          const ticketChip = (() => {
+            const t = room.ticket;
+            if (!t) return null;
+            const label = []
+              .concat(t.action ? [String(t.action).toUpperCase()] : [])
+              .concat(t.side ? [String(t.side).toUpperCase()] : [])
+              .concat(t.yes_price_dollars ? ["$".concat(t.yes_price_dollars)] : [])
+              .concat(t.count_fp ? ["x".concat(t.count_fp)] : [])
+              .join(" ");
+            return label ? element("span", ["token-chip", "token-chip-good"], label) : null;
+          })();
           side.append(
             statusPill(room.status_label || room.status, room.status_tone || room.status),
+            ...(ticketChip ? [ticketChip] : []),
             element("span", "muted", formatRelativeTime(room.updated_at)),
             element("span", "muted", String(room.room_origin || "unknown"))
           );

@@ -94,6 +94,35 @@
           <div class="stage-divider stage-{{ message.stage }}">{{ message.stage|replace("_", " ")|title }}</div>
           {% set ns.last_stage = message.stage %}
           {% endif %}
+          {% if message.kind == "TradeTicket" %}
+          <article class="message-card message-card-ticket role-{{ message.role|replace('_', '-') }}">
+            <header class="message-head">
+              <div class="message-role-block">
+                <strong class="message-role">{{ message.role|replace("_", " ")|title }}</strong>
+                <span class="badge kind-badge kind-badge-ticket">TradeTicket</span>
+                {% if message.stage %}
+                <span class="badge stage-badge">{{ message.stage|replace("_", " ")|title }}</span>
+                {% endif %}
+              </div>
+              <div class="message-meta">
+                <span>#{{ message.sequence }}</span>
+                <span>{{ message.created_at }}</span>
+              </div>
+            </header>
+            {% set p = message.payload or {} %}
+            <div class="message-body ticket-summary">
+              <strong>{{ (p.get("action") or "")|upper }} {{ (p.get("side") or "")|upper }}</strong>
+              · ${{ p.get("yes_price_dollars") or "?" }} × {{ p.get("count_fp") or "?" }}
+              · {{ p.get("market_ticker") or message.content }}
+            </div>
+            {% if message.payload %}
+            <details class="payload-drawer">
+              <summary>View full ticket</summary>
+              <pre class="payload-json">{{ message.payload|tojson(indent=2) }}</pre>
+            </details>
+            {% endif %}
+          </article>
+          {% else %}
           <article class="message-card role-{{ message.role|replace('_', '-') }}">
             <header class="message-head">
               <div class="message-role-block">
@@ -116,6 +145,7 @@
             </details>
             {% endif %}
           </article>
+          {% endif %}
         {% else %}
         <p class="empty-state">No transcript messages yet.</p>
         {% endfor %}

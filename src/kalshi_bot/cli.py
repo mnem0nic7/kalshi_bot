@@ -25,6 +25,15 @@ from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
 
 
+def _float_or_none(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
 def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -598,6 +607,51 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 print(json.dumps(payload, indent=2))
                 return 0
 
+            if args.command == "intel":
+                ticker: str | None = getattr(args, "market", None)
+                if ticker:
+                    dossier = await container.research_coordinator.get_latest_dossier(ticker)
+                    if dossier is None:
+                        print(json.dumps({"market_ticker": ticker, "status": "missing"}))
+                        return 2
+                    gate = dossier.gate
+                    payload = {
+                        "market_ticker": ticker,
+                        "gate_passed": gate.passed,
+                        "gate_reasons": list(gate.reasons or []),
+                        "fair_yes_dollars": str(dossier.trader_context.fair_yes_dollars or ""),
+                        "confidence": dossier.trader_context.confidence,
+                        "stale": dossier.freshness.stale,
+                        "refreshed_at": dossier.freshness.refreshed_at.isoformat() if dossier.freshness.refreshed_at else None,
+                    }
+                    print(json.dumps(payload, indent=2))
+                    return 0 if gate.passed else 2
+                else:
+                    configured_tickers = [
+                        str(m.market_ticker)
+                        for m in container.weather_directory.all()
+                        if getattr(m, "market_ticker", None)
+                    ]
+                    records = await repo.list_research_dossiers(limit=max(len(configured_tickers) * 4, 200))
+                    await session.commit()
+                    by_ticker = {r.market_ticker: r.payload or {} for r in records}
+                    rows = []
+                    for t in configured_tickers:
+                        d = by_ticker.get(t, {})
+                        gate_d = d.get("gate") or {}
+                        tc = d.get("trader_context") or {}
+                        summary_d = d.get("summary") or {}
+                        rows.append({
+                            "ticker": t,
+                            "gate_passed": bool(gate_d.get("passed")),
+                            "gate_reasons": list(gate_d.get("reasons") or []),
+                            "fair_yes_dollars": str(tc.get("fair_yes_dollars") or ""),
+                            "confidence": _float_or_none(summary_d.get("research_confidence")),
+                        })
+                    rows.sort(key=lambda r: (0 if r["gate_passed"] else 1, -(r["confidence"] or 0.0)))
+                    print(json.dumps(rows, indent=2))
+                    return 0
+
         raise ValueError(f"Unknown command: {args.command}")
     finally:
         await container.close()
@@ -887,6 +941,10 @@ def build_parser() -> argparse.ArgumentParser:
     kill_switch.add_argument("state", choices=["on", "off"])
 
     subparsers.add_parser("status")
+
+    intel = subparsers.add_parser("intel", help="Show current trading intel for configured markets")
+    intel.add_argument("--market", dest="market", default=None, metavar="TICKER", help="Show intel for a single market ticker")
+
     return parser
 
 
