@@ -1,0 +1,165 @@
+name: Bootstrap VPS
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    name: Write .env and start stack on VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: live
+    env:
+      DEPLOY_HOST:      ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER:      ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY:   ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_APP_DIR:   ${{ secrets.DEPLOY_APP_DIR }}
+      POSTGRES_PASSWORD:           ${{ secrets.POSTGRES_PASSWORD }}
+      DEMO_KALSHI_API_KEY:         ${{ secrets.DEMO_KALSHI_API_KEY }}
+      DEMO_KALSHI_PRIVATE_KEY_PEM: ${{ secrets.DEMO_KALSHI_PRIVATE_KEY_PEM }}
+      LIVE_KALSHI_API_KEY:         ${{ secrets.LIVE_KALSHI_API_KEY }}
+      LIVE_KALSHI_PRIVATE_KEY_PEM: ${{ secrets.LIVE_KALSHI_PRIVATE_KEY_PEM }}
+      GEMINI_KEY_VALUE: ${{ secrets.GEMINI_KEY || secrets.GEMINI_API_KEY }}
+
+    steps:
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+          ok=1
+          for var in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_APP_DIR \
+                     POSTGRES_PASSWORD \
+                     DEMO_KALSHI_API_KEY DEMO_KALSHI_PRIVATE_KEY_PEM \
+                     LIVE_KALSHI_API_KEY LIVE_KALSHI_PRIVATE_KEY_PEM \
+                     GEMINI_KEY_VALUE; do
+            test -n "${!var}" || { echo "Missing secret: ${var}"; ok=0; }
+          done
+          test "${ok}" = "1" || exit 1
+
+      - name: Prepare SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Write PEM files on VPS
+        run: |
+          set -euo pipefail
+          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+                   -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
+          app_dir_q="$(printf '%q' "${DEPLOY_APP_DIR}")"
+
+          # Base64-encode PEM content: the output is [A-Za-z0-9+/=], which
+          # has no shell-special chars and passes safely through SSH arguments.
+          demo_pem_b64="$(printf '%s' "${DEMO_KALSHI_PRIVATE_KEY_PEM}" | base64 -w 0)"
+          live_pem_b64="$(printf '%s' "${LIVE_KALSHI_PRIVATE_KEY_PEM}" | base64 -w 0)"
+
+          # Unquoted heredoc: local shell expands ${…} before sending to SSH.
+          # base64 values contain no shell-special chars so expansion is safe.
+          "${ssh_cmd[@]}" << ENDSSH
+          set -euo pipefail
+          cd ${app_dir_q}
+          mkdir -p .secrets
+          chmod 700 .secrets
+          printf '%s' "${demo_pem_b64}" | base64 -d > .secrets/kalshi-demo.pem
+          printf '%s' "${live_pem_b64}" | base64 -d > .secrets/kalshi-live.pem
+          chmod 600 .secrets/kalshi-demo.pem .secrets/kalshi-live.pem
+          echo "PEM files written."
+          ENDSSH
+
+      - name: Write .env on VPS
+        run: |
+          set -euo pipefail
+          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+                   -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
+          app_dir_q="$(printf '%q' "${DEPLOY_APP_DIR}")"
+
+          # Build the .env using printf '%s' for each value — this is safe for
+          # any value including those containing $, \, or other shell metacharacters.
+          # Base64-encode the whole file for safe SSH transport.
+          env_b64="$(
+            {
+              printf '%s\n' "APP_ENV=production"
+              printf '%s\n' "APP_HOST=0.0.0.0"
+              printf '%s\n' "APP_PORT=8000"
+              printf '%s\n' "APP_COLOR=blue"
+              printf '%s\n' "APP_SHADOW_MODE=true"
+              printf '%s\n' "APP_ENABLE_KILL_SWITCH=true"
+              printf '%s\n' "POSTGRES_HOST=postgres"
+              printf '%s\n' "POSTGRES_PORT=5432"
+              printf '%s\n' "POSTGRES_DB=kalshi_bot"
+              printf '%s\n' "POSTGRES_USER=postgres"
+              printf 'POSTGRES_PASSWORD=%s\n' "${POSTGRES_PASSWORD}"
+              printf '%s\n' "KALSHI_ENV=demo"
+              printf 'DEMO_KALSHI_API_KEY=%s\n' "${DEMO_KALSHI_API_KEY}"
+              printf '%s\n' "DEMO_KALSHI_READ_PRIVATE_KEY_PATH=/run/secrets/kalshi-demo.pem"
+              printf '%s\n' "DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH=/run/secrets/kalshi-demo.pem"
+              printf 'LIVE_KALSHI_API_KEY=%s\n' "${LIVE_KALSHI_API_KEY}"
+              printf '%s\n' "LIVE_KALSHI_READ_PRIVATE_KEY_PATH=/run/secrets/kalshi-live.pem"
+              printf '%s\n' "LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH=/run/secrets/kalshi-live.pem"
+              printf '%s\n' "DEMO_KALSHI_KEY_PATH_HOST=../.secrets/kalshi-demo.pem"
+              printf '%s\n' "DEMO_KALSHI_KEY_PATH_CONTAINER=/run/secrets/kalshi-demo.pem"
+              printf '%s\n' "LIVE_KALSHI_KEY_PATH_HOST=../.secrets/kalshi-live.pem"
+              printf '%s\n' "LIVE_KALSHI_KEY_PATH_CONTAINER=/run/secrets/kalshi-live.pem"
+              printf 'GEMINI_KEY=%s\n' "${GEMINI_KEY_VALUE}"
+              printf '%s\n' "WEATHER_USER_AGENT=kalshi-bot/0.1 (ops@example.com)"
+            } | base64 -w 0
+          )"
+
+          "${ssh_cmd[@]}" << ENDSSH
+          set -euo pipefail
+          cd ${app_dir_q}
+          printf '%s' "${env_b64}" | base64 -d > .env
+          chmod 600 .env
+          echo "Written \$(wc -l < .env) lines to .env."
+          ENDSSH
+
+      - name: Start stack
+        run: |
+          set -euo pipefail
+          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+                   -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
+          app_dir_q="$(printf '%q' "${DEPLOY_APP_DIR}")"
+
+          "${ssh_cmd[@]}" "cd ${app_dir_q} && bash infra/scripts/start-stack.sh github_bootstrap"
+
+      - name: Verify health and capture status
+        run: |
+          set -euo pipefail
+          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+                   -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
+          app_dir_q="$(printf '%q' "${DEPLOY_APP_DIR}")"
+
+          # Give Nginx a moment after start-stack completes
+          sleep 5
+
+          "${ssh_cmd[@]}" "curl -fsS http://localhost:8080/healthz" > /dev/null
+          "${ssh_cmd[@]}" "curl -fsS http://localhost:8080/readyz" > /dev/null
+
+          status_json="$("${ssh_cmd[@]}" "cd ${app_dir_q} && \
+            docker compose -f infra/docker-compose.yml exec -T app_blue \
+            python -m kalshi_bot.cli status")"
+          printf '%s\n' "${status_json}" > status.json
+
+          {
+            echo "## Bootstrap VPS"
+            echo
+            echo "Stack is healthy. Runtime status from app_blue:"
+            echo
+            echo '```json'
+            cat status.json
+            echo
+            echo '```'
+            echo
+            echo "**Next steps (run from VPS):**"
+            echo '```bash'
+            echo "# 1. Confirm demo auth"
+            echo "docker compose -f infra/docker-compose.yml exec -T app_blue python -m kalshi_bot.cli discover --json"
+            echo "docker compose -f infra/docker-compose.yml exec -T app_blue python -m kalshi_bot.cli reconcile"
+            echo "# 2. Shadow-run one room (replace ticker with a real open contract)"
+            echo "docker compose -f infra/docker-compose.yml exec -T app_blue python -m kalshi_bot.cli shadow-run KXHIGHNY-26APR14-T60"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
