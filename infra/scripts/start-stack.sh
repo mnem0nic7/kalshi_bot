@@ -3,15 +3,16 @@ set -euo pipefail
 
 reason="${1:-systemd_boot}"
 compose_file="infra/docker-compose.yml"
+compose_env_file="--env-file .env"
 
 build_migrate_image() {
-  docker compose -f "${compose_file}" build migrate >/dev/null
+  docker compose -f "${compose_file}" ${compose_env_file} build migrate >/dev/null
 }
 
 service_health() {
   local service="$1"
   local container_id
-  container_id="$(docker compose -f "${compose_file}" ps -q "${service}" 2>/dev/null || true)"
+  container_id="$(docker compose -f "${compose_file}" ${compose_env_file} ps -q "${service}" 2>/dev/null || true)"
   if [[ -z "${container_id}" ]]; then
     printf '%s\n' "missing"
     return
@@ -33,35 +34,35 @@ wait_for_service_health() {
     waited=$((waited + 2))
   done
   echo "Timed out waiting for ${service} to become healthy" >&2
-  docker compose -f "${compose_file}" ps "${service}" >&2 || true
+  docker compose -f "${compose_file}" ${compose_env_file} ps "${service}" >&2 || true
   return 1
 }
 
 run_migrate() {
   build_migrate_image
-  docker compose -f "${compose_file}" run --rm --no-deps migrate "$@"
+  docker compose -f "${compose_file}" ${compose_env_file} run --rm --no-deps migrate "$@"
 }
 
 run_control() {
   local -a cmd=("$@")
-  if [[ -n "$(docker compose -f "${compose_file}" ps --status running -q app_blue 2>/dev/null || true)" ]]; then
-    docker compose -f "${compose_file}" exec -T app_blue "${cmd[@]}"
+  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q app_blue 2>/dev/null || true)" ]]; then
+    docker compose -f "${compose_file}" ${compose_env_file} exec -T app_blue "${cmd[@]}"
     return
   fi
-  if [[ -n "$(docker compose -f "${compose_file}" ps --status running -q app_green 2>/dev/null || true)" ]]; then
-    docker compose -f "${compose_file}" exec -T app_green "${cmd[@]}"
+  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q app_green 2>/dev/null || true)" ]]; then
+    docker compose -f "${compose_file}" ${compose_env_file} exec -T app_green "${cmd[@]}"
     return
   fi
   run_migrate "${cmd[@]}"
 }
 
-docker compose -f "${compose_file}" config >/dev/null
-docker compose -f "${compose_file}" up -d postgres
+docker compose -f "${compose_file}" ${compose_env_file} config >/dev/null
+docker compose -f "${compose_file}" ${compose_env_file} up -d postgres
 run_migrate
-docker compose -f "${compose_file}" up -d --build app_blue app_green daemon_blue daemon_green
+docker compose -f "${compose_file}" ${compose_env_file} up -d --build app_blue app_green daemon_blue daemon_green
 wait_for_service_health app_blue 180
 wait_for_service_health app_green 180
-docker compose -f "${compose_file}" up -d --force-recreate nginx
+docker compose -f "${compose_file}" ${compose_env_file} up -d --force-recreate nginx
 wait_for_service_health nginx 90
 
 run_control python -m kalshi_bot.cli watchdog mark-boot --status success --reason "${reason}"
