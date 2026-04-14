@@ -53,8 +53,15 @@ def is_market_stale(
 
 def market_spread_bps(market_snapshot: dict[str, Any]) -> int | None:
     market = market_snapshot.get("market", market_snapshot)
-    yes_bid = quantize_price(market.get("yes_bid_dollars")) if market.get("yes_bid_dollars") is not None else None
-    yes_ask = quantize_price(market.get("yes_ask_dollars")) if market.get("yes_ask_dollars") is not None else None
+    raw_bid = market.get("yes_bid_dollars")
+    raw_ask = market.get("yes_ask_dollars")
+    yes_bid = quantize_price(raw_bid) if raw_bid is not None else None
+    yes_ask = quantize_price(raw_ask) if raw_ask is not None else None
+    # Kalshi returns 0 when no resting orders exist — treat as no quote.
+    if yes_bid is not None and yes_bid <= Decimal("0"):
+        yes_bid = None
+    if yes_ask is not None and yes_ask <= Decimal("0"):
+        yes_ask = None
     if yes_bid is None or yes_ask is None:
         return None
     return int(((yes_ask - yes_bid) * Decimal("10000")).to_integral_value())
@@ -62,10 +69,18 @@ def market_spread_bps(market_snapshot: dict[str, Any]) -> int | None:
 
 def market_quotes(market_snapshot: dict[str, Any]) -> dict[str, Decimal | None]:
     market = market_snapshot.get("market", market_snapshot)
+
+    def _price_or_none(raw: object) -> Decimal | None:
+        if raw is None:
+            return None
+        price = quantize_price(raw)
+        # Kalshi returns 0 when no resting orders exist on that side — treat as no quote.
+        return price if price > Decimal("0") else None
+
     return {
-        "yes_bid": quantize_price(market.get("yes_bid_dollars")) if market.get("yes_bid_dollars") is not None else None,
-        "yes_ask": quantize_price(market.get("yes_ask_dollars")) if market.get("yes_ask_dollars") is not None else None,
-        "no_ask": quantize_price(market.get("no_ask_dollars")) if market.get("no_ask_dollars") is not None else None,
+        "yes_bid": _price_or_none(market.get("yes_bid_dollars")),
+        "yes_ask": _price_or_none(market.get("yes_ask_dollars")),
+        "no_ask": _price_or_none(market.get("no_ask_dollars")),
     }
 
 
