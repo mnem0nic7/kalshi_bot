@@ -83,6 +83,30 @@ class _FakeSessionFactory:
         return False
 
 
+class _FakeResult:
+    def __init__(self, rows: list[tuple]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[tuple]:
+        return self._rows
+
+
+class _OutcomeSession(_FakeSession):
+    def __init__(self, rows: list[tuple]) -> None:
+        self._rows = rows
+
+    async def execute(self, _stmt) -> _FakeResult:
+        return _FakeResult(self._rows)
+
+
+class _OutcomeSessionFactory(_FakeSessionFactory):
+    def __init__(self, rows: list[tuple]) -> None:
+        self._rows = rows
+
+    async def __aenter__(self) -> _OutcomeSession:
+        return _OutcomeSession(self._rows)
+
+
 @pytest.mark.asyncio
 async def test_research_confidence_summary_uses_cached_dossiers(monkeypatch: pytest.MonkeyPatch) -> None:
     records = [
@@ -117,6 +141,79 @@ async def test_research_confidence_summary_uses_cached_dossiers(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_recent_room_outcome_views_builds_lightweight_statuses() -> None:
+    now = datetime(2026, 4, 14, 18, 0, tzinfo=UTC)
+    rows = [
+        (
+            SimpleNamespace(
+                id="room-succeeded",
+                name="Succeeded",
+                market_ticker="KXHIGHNY-26APR14-T70",
+                stage="complete",
+                updated_at=now,
+                created_at=now,
+                agent_pack_version="pack-v1",
+                shadow_mode=True,
+                room_origin="shadow",
+            ),
+            1,
+            1,
+            0,
+            "approved",
+            True,
+            True,
+            None,
+        ),
+        (
+            SimpleNamespace(
+                id="room-blocked",
+                name="Blocked",
+                market_ticker="KXHIGHNY-26APR14-T71",
+                stage="complete",
+                updated_at=now,
+                created_at=now,
+                agent_pack_version="pack-v1",
+                shadow_mode=True,
+                room_origin="shadow",
+            ),
+            1,
+            0,
+            0,
+            "blocked",
+            True,
+            True,
+            None,
+        ),
+        (
+            SimpleNamespace(
+                id="room-stand-down",
+                name="Stand Down",
+                market_ticker="KXHIGHNY-26APR14-T72",
+                stage="complete",
+                updated_at=now,
+                created_at=now,
+                agent_pack_version="pack-v1",
+                shadow_mode=True,
+                room_origin="shadow",
+            ),
+            0,
+            0,
+            0,
+            None,
+            True,
+            False,
+            "spread_too_wide",
+        ),
+    ]
+
+    container = SimpleNamespace(session_factory=_OutcomeSessionFactory(rows))
+
+    views = await control_room_module._recent_room_outcome_views(container, now=now)
+
+    assert [item["status"] for item in views] == ["succeeded", "blocked", "stand_down"]
+
+
+@pytest.mark.asyncio
 async def test_build_control_room_summary_skips_live_market_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeRepo:
         def __init__(self, _session) -> None:
@@ -140,7 +237,7 @@ async def test_build_control_room_summary_skips_live_market_discovery(monkeypatc
         AsyncMock(return_value={"average": 0.88, "count": 4, "sparkline": [0.8, 0.9]}),
     )
     monkeypatch.setattr(control_room_module, "_recent_room_bundles", AsyncMock(return_value=[]))
-    monkeypatch.setattr(control_room_module, "_recent_room_outcome_bundles", AsyncMock(return_value=[]))
+    monkeypatch.setattr(control_room_module, "_recent_room_outcome_views", AsyncMock(return_value=[]))
 
     container = SimpleNamespace(
         session_factory=_FakeSessionFactory(),
@@ -188,7 +285,7 @@ async def test_build_control_room_bootstrap_skips_live_market_discovery(monkeypa
         AsyncMock(return_value={"average": 0.77, "count": 3, "sparkline": [0.7, 0.8, 0.81]}),
     )
     monkeypatch.setattr(control_room_module, "_recent_room_bundles", AsyncMock(return_value=[]))
-    monkeypatch.setattr(control_room_module, "_recent_room_outcome_bundles", AsyncMock(return_value=[]))
+    monkeypatch.setattr(control_room_module, "_recent_room_outcome_views", AsyncMock(return_value=[]))
 
     container = SimpleNamespace(
         session_factory=_FakeSessionFactory(),

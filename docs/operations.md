@@ -105,7 +105,7 @@ kalshi-bot-cli shadow-campaign run --limit 3
 
 The control room index page now uses a top-tabbed dashboard layout with a summary strip at the top and lazy-loaded `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations` tabs.
 It still offers the same operator actions like `Run Shadow Room`, grouped dataset builds, kill-switch and color promotion controls, but the heavy historical and training views now stay out of the initial page load until their tab is opened.
-The summary strip and bootstrap path now compute `Research Confidence` from cached research dossiers instead of live all-city discovery, so `/` and `/api/control-room/summary` should stay fast even after expanding to every configured city.
+The summary strip and bootstrap path now compute `Research Confidence` from cached research dossiers instead of live all-city discovery, and the `Room Outcomes` card uses lightweight room outcome snapshots instead of full room-bundle exports. `/` and `/api/control-room/summary` should stay fast even after expanding to every configured city and a larger 24-hour room history.
 The top summary strip should be read as operator truth, not raw internals:
 
 - `System Status` shows the actual operator state like `KILL SWITCH ON`, `HEALTHY`, or `DEGRADED`; active color is supporting context, not the headline

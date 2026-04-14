@@ -5,9 +5,13 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import logging
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import func, select
+
 from kalshi_bot.core.enums import RoomOrigin
+from kalshi_bot.db.models import FillRecord, OrderRecord, RiskVerdictRecord, Room, RoomResearchHealthRecord, RoomStrategyAuditRecord, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
 
 if TYPE_CHECKING:
@@ -379,6 +383,110 @@ async def _recent_room_outcome_bundles(container: AppContainer, *, now: datetime
     )
 
 
+async def _recent_room_outcome_views(container: AppContainer, *, now: datetime) -> list[dict[str, Any]]:
+    window_start = now - timedelta(hours=SUMMARY_ROOM_WINDOW_HOURS)
+    ticket_count_sq = select(func.count(TradeTicketRecord.id)).where(TradeTicketRecord.room_id == Room.id).scalar_subquery()
+    order_count_sq = (
+        select(func.count(OrderRecord.id))
+        .select_from(OrderRecord)
+        .join(TradeTicketRecord, OrderRecord.trade_ticket_id == TradeTicketRecord.id)
+        .where(TradeTicketRecord.room_id == Room.id)
+        .scalar_subquery()
+    )
+    fill_count_sq = (
+        select(func.count(FillRecord.id))
+        .select_from(FillRecord)
+        .join(OrderRecord, FillRecord.order_id == OrderRecord.id)
+        .join(TradeTicketRecord, OrderRecord.trade_ticket_id == TradeTicketRecord.id)
+        .where(TradeTicketRecord.room_id == Room.id)
+        .scalar_subquery()
+    )
+    risk_status_sq = (
+        select(RiskVerdictRecord.status)
+        .select_from(RiskVerdictRecord)
+        .join(TradeTicketRecord, RiskVerdictRecord.ticket_id == TradeTicketRecord.id)
+        .where(TradeTicketRecord.room_id == Room.id)
+        .order_by(RiskVerdictRecord.updated_at.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    gate_passed_sq = (
+        select(RoomResearchHealthRecord.gate_passed)
+        .where(RoomResearchHealthRecord.room_id == Room.id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    eligibility_passed_sq = (
+        select(RoomStrategyAuditRecord.eligibility_passed)
+        .where(RoomStrategyAuditRecord.room_id == Room.id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    stand_down_reason_sq = (
+        select(RoomStrategyAuditRecord.stand_down_reason)
+        .where(RoomStrategyAuditRecord.room_id == Room.id)
+        .limit(1)
+        .scalar_subquery()
+    )
+
+    async with container.session_factory() as session:
+        result = await session.execute(
+            select(
+                Room,
+                ticket_count_sq.label("ticket_count"),
+                order_count_sq.label("order_count"),
+                fill_count_sq.label("fill_count"),
+                risk_status_sq.label("risk_status"),
+                gate_passed_sq.label("gate_passed"),
+                eligibility_passed_sq.label("eligibility_passed"),
+                stand_down_reason_sq.label("stand_down_reason"),
+            )
+            .where(
+                Room.room_origin.in_([RoomOrigin.SHADOW.value, RoomOrigin.LIVE.value]),
+                Room.updated_at >= window_start,
+            )
+            .order_by(Room.updated_at.desc())
+        )
+        rows = list(result.all())
+        await session.commit()
+
+    room_views: list[dict[str, Any]] = []
+    for room, ticket_count, order_count, fill_count, risk_status, gate_passed, eligibility_passed, stand_down_reason in rows:
+        blocked_by = None
+        if gate_passed is False:
+            blocked_by = "research_gate"
+        elif eligibility_passed is False:
+            blocked_by = "eligibility"
+        elif risk_status == "blocked":
+            blocked_by = "risk"
+
+        bundle = SimpleNamespace(
+            room={
+                "id": room.id,
+                "name": room.name,
+                "market_ticker": room.market_ticker,
+                "stage": room.stage,
+                "updated_at": _iso_or_none(room.updated_at),
+                "created_at": _iso_or_none(room.created_at),
+                "agent_pack_version": room.agent_pack_version,
+                "shadow_mode": room.shadow_mode,
+            },
+            room_origin=room.room_origin,
+            outcome=SimpleNamespace(
+                fills_observed=int(fill_count or 0),
+                orders_submitted=int(order_count or 0),
+                ticket_generated=bool(ticket_count),
+                risk_status=risk_status,
+                blocked_by=blocked_by,
+                final_status=room.stage,
+                stand_down_reason=stand_down_reason,
+                room_stage=room.stage,
+            ),
+        )
+        room_views.append(_room_view(bundle))
+    return room_views
+
+
 def _summary_payload(
     *,
     now: datetime,
@@ -387,9 +495,8 @@ def _summary_payload(
     positions: list[Any],
     training_status: dict[str, Any],
     research_confidence: dict[str, Any],
-    room_bundles: list[Any],
+    room_views: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    room_views = [_room_view(bundle) for bundle in room_bundles]
     quality_debt = dict(training_status.get("quality_debt_summary") or {})
     room_outcomes = _recent_room_outcomes(room_views, now=now)
 
@@ -481,10 +588,10 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         positions = await repo.list_positions(limit=POSITION_LIMIT)
         await session.commit()
 
-    research_confidence, room_bundles, room_outcome_bundles = await asyncio.gather(
+    research_confidence, room_bundles, room_outcome_views = await asyncio.gather(
         _research_confidence_summary(container),
         _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT),
-        _recent_room_outcome_bundles(container, now=now),
+        _recent_room_outcome_views(container, now=now),
     )
     training_status = await container.training_corpus_service.get_dashboard_status(bundles=room_bundles)
     return _summary_payload(
@@ -494,7 +601,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         positions=positions,
         training_status=training_status,
         research_confidence=research_confidence,
-        room_bundles=room_outcome_bundles,
+        room_views=room_outcome_views,
     )
 
 
@@ -522,10 +629,10 @@ async def build_control_room_bootstrap(container: AppContainer) -> dict[str, Any
         ops_events = await repo.list_ops_events(limit=8)
         await session.commit()
 
-    research_confidence, room_bundles, room_outcome_bundles, self_improve_status, heuristic_status = await asyncio.gather(
+    research_confidence, room_bundles, room_outcome_views, self_improve_status, heuristic_status = await asyncio.gather(
         _research_confidence_summary(container),
         _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT),
-        _recent_room_outcome_bundles(container, now=now),
+        _recent_room_outcome_views(container, now=now),
         container.self_improve_service.get_dashboard_status(),
         container.historical_intelligence_service.get_dashboard_status(),
     )
@@ -537,7 +644,7 @@ async def build_control_room_bootstrap(container: AppContainer) -> dict[str, Any
         positions=positions,
         training_status=training_status,
         research_confidence=research_confidence,
-        room_bundles=room_outcome_bundles,
+        room_views=room_outcome_views,
     )
     overview = _overview_payload(
         now=now,
