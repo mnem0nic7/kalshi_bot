@@ -1,6 +1,10 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
+
+import kalshi_bot.web.control_room as control_room_module
 from kalshi_bot.web.control_room import _classify_room, _recent_room_outcomes, _series_filter_options
 
 
@@ -61,3 +65,146 @@ def test_classify_room_treats_failed_stage_as_failed() -> None:
     classification = _classify_room(bundle)
 
     assert classification == {"status": "failed", "label": "Failed", "tone": "bad"}
+
+
+class _FakeSession:
+    async def commit(self) -> None:
+        return None
+
+
+class _FakeSessionFactory:
+    def __call__(self) -> "_FakeSessionFactory":
+        return self
+
+    async def __aenter__(self) -> _FakeSession:
+        return _FakeSession()
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_research_confidence_summary_uses_cached_dossiers(monkeypatch: pytest.MonkeyPatch) -> None:
+    records = [
+        SimpleNamespace(market_ticker="KXHIGHNY", confidence=0.91),
+        SimpleNamespace(market_ticker="KXHIGHAUS", confidence=0.82),
+        SimpleNamespace(market_ticker="IGNORED", confidence=0.2),
+    ]
+
+    class FakeRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def list_research_dossiers(self, *, limit: int) -> list[SimpleNamespace]:
+            assert limit >= 200
+            return records
+
+    monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
+
+    container = SimpleNamespace(
+        session_factory=_FakeSessionFactory(),
+        weather_directory=SimpleNamespace(
+            all=lambda: [
+                SimpleNamespace(market_ticker="KXHIGHNY"),
+                SimpleNamespace(market_ticker="KXHIGHAUS"),
+            ]
+        ),
+    )
+
+    summary = await control_room_module._research_confidence_summary(container)
+
+    assert summary == {"average": 0.86, "count": 2, "sparkline": [0.82, 0.91]}
+
+
+@pytest.mark.asyncio
+async def test_build_control_room_summary_skips_live_market_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def get_deployment_control(self) -> SimpleNamespace:
+            return SimpleNamespace(active_color="green", kill_switch_enabled=False, execution_lock_holder=None)
+
+        async def list_positions(self, *, limit: int) -> list[SimpleNamespace]:
+            assert limit > 0
+            return []
+
+    async def fail_configured_markets(_container) -> list[dict]:
+        raise AssertionError("summary should not call live market discovery")
+
+    monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
+    monkeypatch.setattr(control_room_module, "_configured_markets", fail_configured_markets)
+    monkeypatch.setattr(
+        control_room_module,
+        "_research_confidence_summary",
+        AsyncMock(return_value={"average": 0.88, "count": 4, "sparkline": [0.8, 0.9]}),
+    )
+    monkeypatch.setattr(control_room_module, "_recent_room_bundles", AsyncMock(return_value=[]))
+    monkeypatch.setattr(control_room_module, "_recent_room_outcome_bundles", AsyncMock(return_value=[]))
+
+    container = SimpleNamespace(
+        session_factory=_FakeSessionFactory(),
+        watchdog_service=SimpleNamespace(
+            get_status=AsyncMock(
+                return_value={"updated_at": "2026-04-14T18:00:00+00:00", "colors": {"green": {"combined_healthy": True}}}
+            )
+        ),
+        training_corpus_service=SimpleNamespace(
+            get_dashboard_status=AsyncMock(return_value={"quality_debt_summary": {}, "top_blockers": [], "next_actions": []})
+        ),
+    )
+
+    summary = await control_room_module.build_control_room_summary(container)
+
+    assert summary["research_confidence"]["average"] == 0.88
+    assert summary["research_confidence"]["count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_build_control_room_bootstrap_skips_live_market_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def get_deployment_control(self) -> SimpleNamespace:
+            return SimpleNamespace(active_color="green", kill_switch_enabled=False, execution_lock_holder=None)
+
+        async def list_positions(self, *, limit: int) -> list[SimpleNamespace]:
+            assert limit > 0
+            return []
+
+        async def list_ops_events(self, *, limit: int) -> list[SimpleNamespace]:
+            assert limit > 0
+            return []
+
+    async def fail_configured_markets(_container) -> list[dict]:
+        raise AssertionError("bootstrap should not call live market discovery")
+
+    monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
+    monkeypatch.setattr(control_room_module, "_configured_markets", fail_configured_markets)
+    monkeypatch.setattr(
+        control_room_module,
+        "_research_confidence_summary",
+        AsyncMock(return_value={"average": 0.77, "count": 3, "sparkline": [0.7, 0.8, 0.81]}),
+    )
+    monkeypatch.setattr(control_room_module, "_recent_room_bundles", AsyncMock(return_value=[]))
+    monkeypatch.setattr(control_room_module, "_recent_room_outcome_bundles", AsyncMock(return_value=[]))
+
+    container = SimpleNamespace(
+        session_factory=_FakeSessionFactory(),
+        watchdog_service=SimpleNamespace(
+            get_status=AsyncMock(
+                return_value={"updated_at": "2026-04-14T18:00:00+00:00", "colors": {"green": {"combined_healthy": True}}}
+            )
+        ),
+        training_corpus_service=SimpleNamespace(
+            get_dashboard_status=AsyncMock(return_value={"quality_debt_summary": {}, "top_blockers": [], "next_actions": []})
+        ),
+        self_improve_service=SimpleNamespace(get_dashboard_status=AsyncMock(return_value={})),
+        historical_intelligence_service=SimpleNamespace(get_dashboard_status=AsyncMock(return_value={})),
+    )
+
+    bootstrap = await control_room_module.build_control_room_bootstrap(container)
+
+    assert bootstrap["summary"]["research_confidence"]["average"] == 0.77
+    assert bootstrap["initial_tab"] == "overview"

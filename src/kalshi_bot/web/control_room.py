@@ -334,6 +334,34 @@ async def _configured_markets(container: AppContainer) -> list[dict[str, Any]]:
     return configured_markets
 
 
+async def _research_confidence_summary(container: AppContainer) -> dict[str, Any]:
+    configured_market_tickers = {
+        str(mapping.market_ticker)
+        for mapping in container.weather_directory.all()
+        if getattr(mapping, "market_ticker", None)
+    }
+    if not configured_market_tickers:
+        return {"average": None, "count": 0, "sparkline": []}
+
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session)
+        dossier_records = await repo.list_research_dossiers(limit=max(len(configured_market_tickers) * 4, 200))
+        await session.commit()
+
+    confidences = [
+        confidence
+        for record in dossier_records
+        if record.market_ticker in configured_market_tickers
+        for confidence in [_float_or_none(record.confidence)]
+        if confidence is not None
+    ]
+    return {
+        "average": round(sum(confidences) / len(confidences), 2) if confidences else None,
+        "count": len(confidences),
+        "sparkline": list(reversed(confidences[:12])),
+    }
+
+
 async def _recent_room_bundles(container: AppContainer, *, limit: int) -> list[Any]:
     return await container.training_export_service.export_room_bundles(
         limit=limit,
@@ -358,12 +386,10 @@ def _summary_payload(
     runtime_health: dict[str, Any],
     positions: list[Any],
     training_status: dict[str, Any],
-    configured_markets: list[dict[str, Any]],
+    research_confidence: dict[str, Any],
     room_bundles: list[Any],
 ) -> dict[str, Any]:
     room_views = [_room_view(bundle) for bundle in room_bundles]
-    research_views = [_research_market_view(item) for item in configured_markets]
-    research_confidences = [item["confidence"] for item in research_views if item["confidence"] is not None]
     quality_debt = dict(training_status.get("quality_debt_summary") or {})
     room_outcomes = _recent_room_outcomes(room_views, now=now)
 
@@ -391,11 +417,7 @@ def _summary_payload(
             "last_boot_recovery": runtime_health.get("last_boot_recovery"),
         },
         "open_positions": _positions_summary(positions),
-        "research_confidence": {
-            "average": round(sum(research_confidences) / len(research_confidences), 2) if research_confidences else None,
-            "count": len(research_confidences),
-            "sparkline": research_confidences[-12:],
-        },
+        "research_confidence": research_confidence,
         "room_outcomes": room_outcomes,
         "quality_debt": {
             "total": int(
@@ -459,8 +481,8 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         positions = await repo.list_positions(limit=POSITION_LIMIT)
         await session.commit()
 
-    configured_markets, room_bundles, room_outcome_bundles = await asyncio.gather(
-        _configured_markets(container),
+    research_confidence, room_bundles, room_outcome_bundles = await asyncio.gather(
+        _research_confidence_summary(container),
         _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT),
         _recent_room_outcome_bundles(container, now=now),
     )
@@ -471,7 +493,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         runtime_health=runtime_health,
         positions=positions,
         training_status=training_status,
-        configured_markets=configured_markets,
+        research_confidence=research_confidence,
         room_bundles=room_outcome_bundles,
     )
 
@@ -500,8 +522,8 @@ async def build_control_room_bootstrap(container: AppContainer) -> dict[str, Any
         ops_events = await repo.list_ops_events(limit=8)
         await session.commit()
 
-    configured_markets, room_bundles, room_outcome_bundles, self_improve_status, heuristic_status = await asyncio.gather(
-        _configured_markets(container),
+    research_confidence, room_bundles, room_outcome_bundles, self_improve_status, heuristic_status = await asyncio.gather(
+        _research_confidence_summary(container),
         _recent_room_bundles(container, limit=SUMMARY_ROOM_LIMIT),
         _recent_room_outcome_bundles(container, now=now),
         container.self_improve_service.get_dashboard_status(),
@@ -514,7 +536,7 @@ async def build_control_room_bootstrap(container: AppContainer) -> dict[str, Any
         runtime_health=runtime_health,
         positions=positions,
         training_status=training_status,
-        configured_markets=configured_markets,
+        research_confidence=research_confidence,
         room_bundles=room_outcome_bundles,
     )
     overview = _overview_payload(

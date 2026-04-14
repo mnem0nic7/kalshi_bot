@@ -142,6 +142,7 @@ Read more: `docs/self_improve.md`, `docs/training.md`
 ## What should I watch on the dashboard?
 
 Start with the top summary strip. It gives the fastest read on system health, active deployment, positions, research confidence, room outcomes, and quality debt without making you scroll through historical detail first.
+That strip now reads research confidence from cached dossiers instead of live all-city discovery, so a growing city list should not by itself make `/` or `/api/control-room/summary` time out.
 
 Read the strip intentionally:
 
