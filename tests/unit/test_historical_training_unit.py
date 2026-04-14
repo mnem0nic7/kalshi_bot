@@ -465,6 +465,40 @@ def test_select_weather_snapshot_falls_back_to_asof_sources_when_archive_missing
     assert result.source_kind == HistoricalTrainingService.ARCHIVED_WEATHER_SOURCE
 
 
+def test_select_weather_snapshot_uses_external_archive_when_native_sources_absent() -> None:
+    service = object.__new__(HistoricalTrainingService)
+
+    class _Repo:
+        async def get_historical_checkpoint_archive(self, **kwargs):
+            return None
+
+        async def get_historical_weather_snapshot_by_source(self, **kwargs):
+            return None
+
+        async def list_historical_weather_snapshots(self, **kwargs):
+            return [
+                SimpleNamespace(
+                    source_kind=HistoricalTrainingService.EXTERNAL_FORECAST_ARCHIVE_SOURCE,
+                    source_id="external",
+                )
+            ]
+
+    result = asyncio.run(
+        HistoricalTrainingService._select_weather_snapshot(
+            service,
+            _Repo(),
+            station_id="KNYC",
+            series_ticker="KXHIGHNY",
+            local_market_day="2026-04-10",
+            checkpoint_label="open_0900",
+            checkpoint_ts=datetime(2026, 4, 10, 13, 0, tzinfo=UTC),
+        )
+    )
+
+    assert result is not None
+    assert result.source_kind == HistoricalTrainingService.EXTERNAL_FORECAST_ARCHIVE_SOURCE
+
+
 def test_coverage_backlog_distinguishes_promotable_and_permanent_outcome_only() -> None:
     service = object.__new__(HistoricalTrainingService)
     coverage_rows = [
@@ -946,6 +980,8 @@ def test_gemini_export_manifest_contains_boundaries_and_audit_stats(tmp_path) ->
             historical_provenance={"local_market_day": "2026-04-10"},
             replay_checkpoint_ts=datetime(2026, 4, 10, 13, 0, tzinfo=UTC),
             room={"agent_pack_version": "builtin-gemini-v1"},
+            market_source_kind="checkpoint_captured_market_snapshot",
+            weather_source_kind="external_forecast_archive_weather_bundle",
             exclude_reason=None,
             audit_source="historical_replay",
             settlement_label={"crosscheck_status": "match"},
@@ -955,6 +991,8 @@ def test_gemini_export_manifest_contains_boundaries_and_audit_stats(tmp_path) ->
             historical_provenance={"local_market_day": "2026-04-11"},
             replay_checkpoint_ts=datetime(2026, 4, 11, 13, 0, tzinfo=UTC),
             room={"agent_pack_version": "builtin-gemini-v1"},
+            market_source_kind="checkpoint_captured_market_snapshot",
+            weather_source_kind="archived_weather_bundle",
             exclude_reason="stale_data_mismatch",
             audit_source="historical_replay",
             settlement_label={"crosscheck_status": "mismatch"},
@@ -980,6 +1018,8 @@ def test_gemini_export_manifest_contains_boundaries_and_audit_stats(tmp_path) ->
     assert manifest["split_boundaries"]["train_room_ids"] == ["room-a"]
     assert manifest["audit_stats"]["settlement_mismatch_count"] == 1
     assert manifest["audit_stats"]["exclusion_counts"]["stale_data_mismatch"] == 1
+    assert manifest["audit_stats"]["weather_source_kind_counts"]["external_forecast_archive_weather_bundle"] == 1
+    assert manifest["audit_stats"]["external_archive_weather_count"] == 1
     assert manifest["source_windows"]["local_market_day_start"] == "2026-04-10"
 
 

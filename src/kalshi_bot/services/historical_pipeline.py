@@ -405,6 +405,11 @@ class HistoricalPipelineService:
             date_to=chunk_to,
             series=series,
         )
+        external_forecast_archive = await self.historical_training_service.backfill_external_forecast_archives(
+            date_from=chunk_from,
+            date_to=chunk_to,
+            series=series,
+        )
         settlement_backfill = await self.historical_training_service.backfill_settlements(
             date_from=chunk_from,
             date_to=chunk_to,
@@ -457,6 +462,7 @@ class HistoricalPipelineService:
                 "historical_import": import_result,
                 "market_checkpoint_backfill": market_backfill,
                 "weather_archive_backfill": weather_archive,
+                "external_forecast_archive_backfill": external_forecast_archive,
                 "settlement_backfill": settlement_backfill,
                 "replay_audit": audit,
                 "replay_refresh": refresh_result,

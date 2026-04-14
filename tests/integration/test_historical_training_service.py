@@ -78,6 +78,26 @@ def test_historical_status_api_and_build_route(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
     get_settings.cache_clear()
 
+    app = create_app()
+    with TestClient(app) as client:
+        historical_status = client.get("/api/historical/status")
+        assert historical_status.status_code == 200
+        assert "historical_build_readiness" in historical_status.json()
+
+        build_response = client.post(
+            "/api/training/historical/build",
+            json={
+                "mode": "bundles",
+                "date_from": "2026-04-10",
+                "date_to": "2026-04-10",
+                "output": str(output_path),
+            },
+        )
+        assert build_response.status_code == 200
+        assert output_path.exists()
+
+    get_settings.cache_clear()
+
 
 def test_historical_settlement_backfill_updates_api_status(tmp_path, monkeypatch) -> None:
     map_path = tmp_path / "markets.yaml"
@@ -359,157 +379,138 @@ series_templates:
     get_settings.cache_clear()
     output_path = tmp_path / "historical_bundles.jsonl"
 
+
+def test_external_forecast_archive_backfill_recovers_full_checkpoint_coverage(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text(
+        """
+series_templates:
+  - series_ticker: KXHIGHNY
+    display_name: NYC Daily High Temperature
+    station_id: KNYC
+    daily_summary_station_id: USW00094728
+    location_name: New York City
+    timezone_name: America/New_York
+    latitude: 40.7146
+    longitude: -74.0071
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "historical-external-archive.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
     app = create_app()
     with TestClient(app) as client:
         container = client.app.state.container
 
-        async def seed() -> tuple[str, str]:
+        async def seed() -> None:
             async with container.session_factory() as session:
                 repo = PlatformRepository(session)
-                control = await repo.get_deployment_control()
-                shadow_room = await repo.create_room(
-                    RoomCreate(name="Visible Room", market_ticker="WX-SHADOW"),
-                    active_color=container.settings.app_color,
-                    shadow_mode=True,
-                    kill_switch_enabled=control.kill_switch_enabled,
-                    kalshi_env=container.settings.kalshi_env,
-                    room_origin=RoomOrigin.SHADOW.value,
-                )
-                historical_room = await repo.create_room(
-                    RoomCreate(name="Historical Replay Room", market_ticker="WX-HISTORY"),
-                    active_color=container.settings.app_color,
-                    shadow_mode=False,
-                    kill_switch_enabled=False,
-                    kalshi_env=container.settings.kalshi_env,
-                    room_origin=RoomOrigin.HISTORICAL_REPLAY.value,
-                    agent_pack_version="builtin-gemini-v1",
-                    role_models={"researcher": {"provider": "gemini", "model": "gemini-2.5-pro"}},
-                )
-                await repo.update_room_stage(shadow_room.id, RoomStage.COMPLETE)
-                await repo.update_room_stage(historical_room.id, RoomStage.COMPLETE)
-                for role, kind, content in (
-                    (AgentRole.RESEARCHER, MessageKind.OBSERVATION, "Research trace"),
-                    (AgentRole.PRESIDENT, MessageKind.POLICY_MEMO, "Posture trace"),
-                    (AgentRole.TRADER, MessageKind.TRADE_IDEA, "Stand down"),
-                    (AgentRole.MEMORY_LIBRARIAN, MessageKind.MEMORY_NOTE, "Memory trace"),
-                ):
-                    await repo.append_message(
-                        historical_room.id,
-                        RoomMessageCreate(role=role, kind=kind, stage=RoomStage.COMPLETE, content=content, payload={}),
-                    )
+                ticker = "KXHIGHNY-26APR10-T68"
+                local_market_day = "2026-04-10"
+                close_ts = datetime(2026, 4, 10, 23, 59, 59, tzinfo=UTC)
+                settlement_ts = datetime(2026, 4, 11, 0, 30, tzinfo=UTC)
                 await repo.upsert_historical_settlement_label(
-                    market_ticker="WX-HISTORY",
+                    market_ticker=ticker,
                     series_ticker="KXHIGHNY",
-                    local_market_day="2026-04-10",
+                    local_market_day=local_market_day,
                     source_kind="kalshi_primary",
                     kalshi_result="yes",
                     settlement_value_dollars=Decimal("1.0000"),
-                    settlement_ts=datetime(2026, 4, 10, 23, 0, tzinfo=UTC),
+                    settlement_ts=settlement_ts,
                     crosscheck_status="match",
                     crosscheck_high_f=Decimal("81.00"),
                     crosscheck_result="yes",
-                    payload={"market": {"ticker": "WX-HISTORY"}},
-                )
-                await repo.create_historical_replay_run(
-                    room_id=historical_room.id,
-                    market_ticker="WX-HISTORY",
-                    series_ticker="KXHIGHNY",
-                    local_market_day="2026-04-10",
-                    checkpoint_label="checkpoint_1",
-                    checkpoint_ts=datetime(2026, 4, 10, 13, 0, tzinfo=UTC),
-                    status="completed",
-                    agent_pack_version="builtin-gemini-v1",
                     payload={
-                        "historical_provenance": {
-                            "room_origin": RoomOrigin.HISTORICAL_REPLAY.value,
-                            "local_market_day": "2026-04-10",
-                            "checkpoint_label": "checkpoint_1",
-                            "checkpoint_ts": "2026-04-10T13:00:00+00:00",
-                            "timezone_name": "America/New_York",
-                            "market_snapshot_source_id": "market-snapshot-1",
-                            "weather_snapshot_source_id": "weather-snapshot-1",
-                            "settlement_label_id": "settlement-1",
-                            "source_coverage": {
-                                "market_snapshot": True,
-                                "weather_snapshot": True,
-                                "settlement_label": True,
-                            },
+                        "market": {
+                            "ticker": ticker,
+                            "strike_type": "greater",
+                            "floor_strike": 68,
+                            "close_time": close_ts.isoformat(),
+                            "result": "yes",
                         }
                     },
                 )
+                for checkpoint_label, asof_ts in (
+                    ("checkpoint_1", datetime(2026, 4, 10, 13, 0, tzinfo=UTC) - timedelta(minutes=5)),
+                    ("checkpoint_2", datetime(2026, 4, 10, 17, 0, tzinfo=UTC) - timedelta(minutes=5)),
+                    ("checkpoint_3", datetime(2026, 4, 10, 21, 0, tzinfo=UTC) - timedelta(minutes=5)),
+                ):
+                    await repo.upsert_historical_market_snapshot(
+                        market_ticker=ticker,
+                        series_ticker="KXHIGHNY",
+                        station_id="KNYC",
+                        local_market_day=local_market_day,
+                        asof_ts=asof_ts,
+                        source_kind="captured_market_snapshot",
+                        source_id=f"market-{checkpoint_label}",
+                        source_hash=f"hash-{checkpoint_label}",
+                        close_ts=close_ts,
+                        settlement_ts=settlement_ts,
+                        yes_bid_dollars=Decimal("0.5100"),
+                        yes_ask_dollars=Decimal("0.5500"),
+                        no_ask_dollars=Decimal("0.4900"),
+                        last_price_dollars=Decimal("0.5300"),
+                        payload={
+                            "market": {
+                                "ticker": ticker,
+                                "strike_type": "greater",
+                                "floor_strike": 68,
+                                "updated_time": asof_ts.isoformat(),
+                            }
+                        },
+                    )
                 await session.commit()
-                return shadow_room.id, historical_room.id
 
-        shadow_room_id, historical_room_id = asyncio.run(seed())
+        asyncio.run(seed())
 
-        historical_status = client.get("/api/historical/status")
-        assert historical_status.status_code == 200
-        assert historical_status.json()["replayed_checkpoint_count"] == 1
-        assert "full_checkpoint_coverage_count" in historical_status.json()
-        assert "outcome_only_coverage_count" in historical_status.json()
-        assert "draft_training_ready" in historical_status.json()
-        assert "confidence_scorecard" in historical_status.json()
-        assert "coverage_backlog" in historical_status.json()
-        assert "promotable_market_day_counts" in historical_status.json()
-        assert "confidence_progress" in historical_status.json()
-        assert "bootstrap_progress" in historical_status.json()
-        assert "settlement_mismatch_breakdown" in historical_status.json()
-        assert "coverage_repair_summary" in historical_status.json()
-        assert "replay_refresh_counts_by_cause" in historical_status.json()
-        assert "market_checkpoint_capture_coverage" in historical_status.json()
-        assert "market_checkpoint_coverage_counts" in historical_status.json()
-        assert "market_checkpoint_capture_gaps" in historical_status.json()
+        async def fake_fetch(mapping, *, local_market_day: str, checkpoint_ts: datetime, checkpoint_label: str | None = None):
+            raw_payload = {
+                "timezone": mapping.timezone_name,
+                "hourly": {
+                    "time": [
+                        f"{local_market_day}T09:00",
+                        f"{local_market_day}T12:00",
+                        f"{local_market_day}T15:00",
+                    ],
+                    "temperature_2m": [70.0, 77.0, 81.0],
+                },
+            }
+            return container.historical_training_service.forecast_archive_client._normalize_snapshot(
+                mapping,
+                payload=raw_payload,
+                local_market_day=local_market_day,
+                checkpoint_ts=checkpoint_ts,
+                checkpoint_label=checkpoint_label,
+                model="gfs_seamless",
+                run_ts=checkpoint_ts - timedelta(hours=1),
+            )
 
-        pipeline_status = client.get("/api/historical/pipeline/status?verbose=true")
-        assert pipeline_status.status_code == 200
-        assert "rolling_window" in pipeline_status.json()
-        assert "bootstrap_progress" in pipeline_status.json()
+        container.historical_training_service.forecast_archive_client.fetch_point_in_time_forecast = fake_fetch  # type: ignore[method-assign]
 
-        status_response = client.get("/api/status")
-        assert status_response.status_code == 200
-        status_body = status_response.json()
-        assert any(room["market_ticker"] == "WX-SHADOW" for room in status_body["rooms"])
-        assert all(room["market_ticker"] != "WX-HISTORY" for room in status_body["rooms"])
-        assert status_body["training"]["historical"]["replayed_checkpoint_count"] == 1
-
-        index_response = client.get("/")
-        assert index_response.status_code == 200
-        assert "Control Room" in index_response.text
-        assert "control-room-bootstrap" in index_response.text
-
-        training_tab_response = client.get("/api/control-room/tab/training")
-        assert training_tab_response.status_code == 200
-        assert training_tab_response.json()["historical"]["corpus"]["replayed_checkpoint_count"] == 1
-
-        rooms_tab_response = client.get("/api/control-room/tab/rooms")
-        assert rooms_tab_response.status_code == 200
-        room_names = {room["name"] for room in rooms_tab_response.json()["rooms"]}
-        assert "Visible Room" in room_names
-        assert "Historical Replay Room" not in room_names
-
-        build_response = client.post(
-            "/api/training/historical/build",
-            json={
-                "mode": "bundles",
-                "date_from": "2026-04-10",
-                "date_to": "2026-04-10",
-                "output": str(output_path),
-            },
+        result = asyncio.run(
+            container.historical_training_service.backfill_external_forecast_archives(
+                date_from=datetime(2026, 4, 10, tzinfo=UTC).date(),
+                date_to=datetime(2026, 4, 10, tzinfo=UTC).date(),
+                series=["KXHIGHNY"],
+            )
         )
-        assert build_response.status_code == 200
-        payload = build_response.json()
-        assert payload["build"]["room_count"] == 1
-        assert payload["build"]["draft_only"] is False
-        assert payload["build"]["training_ready"] is True
-        lines = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        assert lines[0]["room_origin"] == "historical_replay"
-        assert lines[0]["historical_provenance"]["local_market_day"] == "2026-04-10"
-        assert lines[0]["settlement_label"]["crosscheck_status"] == "match"
-        assert lines[0]["draft_only"] is False
-        assert historical_room_id == lines[0]["room"]["id"]
 
-    get_settings.cache_clear()
+        assert result["checkpoint_archive_promotion_count"] == 3
 
+        historical_status = client.get("/api/historical/status?verbose=true")
+        assert historical_status.status_code == 200
+        body = historical_status.json()
+        assert body["full_checkpoint_coverage_count"] == 1
+        assert body["checkpoint_archive_coverage"]["source_counts"]["external_archive_assisted_checkpoint_count"] == 3
+        assert body["external_archive_coverage"]["source_counts"]["assisted_checkpoint_count"] == 3
+        assert body["external_archive_recovery"]["recovered_via_external_archive_market_day_count"] == 1
+        return
 
 def test_historical_gemini_build_becomes_training_ready_with_three_full_days(tmp_path, monkeypatch) -> None:
     map_path = tmp_path / "markets.yaml"

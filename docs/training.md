@@ -31,21 +31,24 @@ For each settled market-day we:
 - import Kalshi market metadata and settlement labels
 - import locally captured market snapshots and weather bundles when available
 - optionally ingest file-backed archived weather bundles from `HISTORICAL_WEATHER_ARCHIVE_PATH`
+- optionally backfill archived point-in-time forecast runs through Open-Meteo and normalize them into first-class historical weather snapshots
 - select fixed replay checkpoints at `09:00`, `13:00`, and `17:00` local market time, or `1 hour before close` if earlier
 - choose only sources with `source_ts <= checkpoint_ts`
 - rebuild dossier, signal, eligibility, strategy audit, and dry-run risk at that checkpoint
 
 If a checkpoint is missing a captured market snapshot or weather bundle, it is skipped rather than fabricated. That keeps the historical corpus traceable and leakage-resistant.
 Going forward, the daemon also captures dedicated checkpoint weather bundles on schedule so future settled days can become full-coverage historical replay days without depending on room traffic.
+When native checkpoint weather is absent, the repair path can now recover strict point-in-time weather from archived Open-Meteo forecast runs, but only when the archived run timestamp is still at or before the checkpoint time.
 
 Historical replay now uses checkpoint-time decision logic instead of wall-clock time. That matters because historical staleness and eligibility should be evaluated at the replay checkpoint, not at the moment the replay job happens to run.
 
 The rolling one-year bootstrap is now chunked and resumable by default. The standard shape is `--chunk-days 14`, which lets us advance a long backfill in recoverable slices. If a bootstrap is interrupted, `historical-pipeline resume` continues from the persisted chunk cursor instead of repeating completed chunks.
 
-The historical status surfaces now separate three different truths:
+The historical status surfaces now separate four different truths:
 
 - `source_replay_coverage`: what the current strict-asof source tables could replay
 - `checkpoint_archive_coverage`: what dedicated scheduled checkpoint captures alone could replay
+- `external_archive_coverage`: what archived external forecast runs can recover or have already recovered into checkpoint-quality weather slots
 - `replay_corpus`: what has actually been rebuilt into `historical_replay` rooms and is safe to use for readiness
 
 Historical training readiness should be read from the replay corpus, not from source potential alone.
@@ -76,6 +79,7 @@ Historical settlement crosschecks now respect strict market operators. That mean
 - `crosscheck_missing`: no usable NOAA/NCEI crosscheck was available
 
 Historical weather backfill now also promotes recoverable as-of weather evidence into checkpoint-archive records when the source bundle is already valid for that checkpoint. That does not fabricate missing history; it just upgrades already-valid weather evidence into the dedicated checkpoint path so replay support and checkpoint-archive coverage stay aligned.
+Historical forecast-archive backfill extends that same idea to archived Open-Meteo runs: the external snapshot is stored in `historical_weather_snapshots`, then promoted into the canonical checkpoint archive only when its run and effective as-of times are still valid for the replay checkpoint.
 
 Deploy findings from April 12, 2026:
 
@@ -177,6 +181,10 @@ kalshi-bot-cli historical-backfill weather-archive \
   --date-from 2026-03-01 \
   --date-to 2026-03-31
 
+kalshi-bot-cli historical-backfill forecast-archive \
+  --date-from 2026-03-01 \
+  --date-to 2026-03-31
+
 kalshi-bot-cli historical-archive capture --once
 
 kalshi-bot-cli historical-archive checkpoint-capture --once
@@ -190,6 +198,15 @@ kalshi-bot-cli historical-backfill settlements \
   --date-from 2026-03-01 \
   --date-to 2026-03-31
 ```
+
+The normal strict-fidelity recovery order is:
+
+1. `historical-backfill market`
+2. `historical-backfill weather-archive`
+3. `historical-backfill forecast-archive`
+4. `historical-archive checkpoint-capture --once`
+5. `historical-backfill settlements`
+6. `historical-repair audit` and `historical-repair refresh`
 
 Export complete room bundles:
 
@@ -327,6 +344,7 @@ The split is chronological by local settlement day:
 All checkpoints from the same market-day stay together in one split.
 
 Gemini exports are historical-first by default and require full checkpoint coverage. If there are fewer than `3` distinct local market-days or no viable validation/holdout day, the build still succeeds but is marked `draft_only` in the manifest instead of pretending to be training-ready.
+Historical Gemini manifests now also record `market_source_kind_counts`, `weather_source_kind_counts`, and `external_archive_weather_count` so we can tell when readiness is being satisfied by archive-assisted full-coverage days instead of native checkpoint capture alone.
 
 Include non-complete rooms if you want failure or partial-workflow examples:
 

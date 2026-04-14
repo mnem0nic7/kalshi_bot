@@ -134,6 +134,7 @@ kalshi-bot-cli historical-status --verbose
 kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-03-31
 kalshi-bot-cli historical-backfill market --date-from 2026-03-01 --date-to 2026-03-31
 kalshi-bot-cli historical-backfill weather-archive --date-from 2026-03-01 --date-to 2026-03-31
+kalshi-bot-cli historical-backfill forecast-archive --date-from 2026-03-01 --date-to 2026-03-31
 kalshi-bot-cli historical-archive capture --once
 kalshi-bot-cli historical-archive checkpoint-capture --once
 kalshi-bot-cli historical-archive checkpoint-status --date-from 2026-03-01 --date-to 2026-03-31 --verbose
@@ -150,6 +151,7 @@ Historical status should be interpreted in layers:
 
 - `source_replay_coverage` tells you what the current strict-asof sources can support
 - `checkpoint_archive_coverage` tells you how much coverage came from scheduled checkpoint captures specifically
+- `external_archive_coverage` tells you how much missing native checkpoint weather is recoverable or already recovered through archived Open-Meteo forecast runs
 - `replay_corpus` tells you what has actually been materialized and is safe to use for readiness or intelligence
 
 If `source_replay_coverage` is ahead of `replay_corpus`, run the historical repair refresh path before trusting the dashboard or the intelligence outputs.
@@ -161,6 +163,7 @@ Settlement status also has to be read more carefully now:
 - `settlement_mismatch_breakdown.crosscheck_missing` means no usable daily-summary crosscheck was available
 
 Weather-archive backfill now has a second repair job besides writing raw archives: it promotes already-valid as-of weather bundles into checkpoint-archive records for the exact checkpoint slot when that evidence is recoverable without using future data.
+Forecast-archive backfill adds a third strict-fidelity repair lane: it fetches archived Open-Meteo forecast runs, stores them as `external_forecast_archive_weather_bundle`, and promotes them into canonical checkpoint archives only when the run timestamp still satisfies checkpoint-time validity.
 
 Deploy findings from April 12, 2026:
 
@@ -170,6 +173,12 @@ Deploy findings from April 12, 2026:
 - historical replay repair is also now a normal maintenance tool after replay-logic changes; source tables can be ahead of the materialized replay corpus until `historical-repair refresh` is run
 - after the replay staleness fix, useful historical indicators should show real reasons like `spread_too_wide`, `resolved_contract`, or `book_effectively_broken` instead of collapsing into blanket `market_stale`
 - settlement crosscheck semantics now honor strict `>` and `<` operators, so exact-threshold false mismatches should be refreshed away instead of treated as real data disagreements
+
+Deploy findings from April 14, 2026:
+
+- the historical repair lane now includes `historical-backfill forecast-archive`, which is the first strict external source for recovering checkpoint-time weather on older settled days
+- `checkpoint_archive_coverage` remains the canonical readiness source, but it can now be native-capture-backed or external-archive-assisted; check `checkpoint_archive_coverage.source_counts` and `external_archive_recovery_summary` before assuming which path improved readiness
+- `external_archive_coverage` is the right operator view for deciding whether a missing-weather backlog is recoverable this week or still genuinely unrecoverable
 
 Historical intelligence and heuristic-pack workflow:
 

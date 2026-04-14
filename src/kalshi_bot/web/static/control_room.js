@@ -771,6 +771,7 @@
             { label: "Trainable Rows", value: formatInteger(corpus.clean_historical_trainable_count || 0) },
             { label: "Mismatch Count", value: formatInteger(corpus.settlement_mismatch_count || 0) },
             { label: "Archive Promotions", value: formatInteger(corpus.checkpoint_archive_promotion_count || 0) },
+            { label: "External Recoveries", value: formatInteger(((corpus.external_archive_recovery || {}).recovered_via_external_archive_market_day_count) || 0) },
           ]),
           true
         ),
@@ -820,6 +821,27 @@
             ((historical.samples || {}).checkpoint_archive_coverage || []).slice(0, 8),
             "No checkpoint archive coverage samples."
           ),
+          false
+        ),
+        accordionCard(
+          "External Archive Recovery",
+          `${Object.keys(corpus.external_archive_recovery || {}).length} recovery metrics`,
+          (() => {
+            const stack = element("div", "stack");
+            stack.append(
+              renderObjectTable(corpus.external_archive_coverage || {}, "No external archive coverage data."),
+              buildTable(
+                [
+                  { label: "Market Day", render: (row) => row.local_market_day || "n/a" },
+                  { label: "Ticker", render: (row) => row.market_ticker || "n/a" },
+                  { label: "Recovery", render: (row) => row.recovery_status || "n/a" },
+                ],
+                ((historical.samples || {}).external_archive_coverage || []).slice(0, 8),
+                "No external archive recovery samples."
+              )
+            );
+            return stack;
+          })(),
           false
         ),
         accordionCard(

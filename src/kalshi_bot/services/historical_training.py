@@ -38,6 +38,7 @@ from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping, WeatherSeriesTemplate
 from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
+from kalshi_bot.integrations.forecast_archive import OpenMeteoForecastArchiveClient
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.historical_archive import append_weather_bundle_archive, weather_bundle_archive_metadata
 
@@ -126,7 +127,7 @@ class HistoricalTrainingService:
         ("midday_1300", 13),
         ("late_1700", 17),
     )
-    REPLAY_LOGIC_VERSION = "historical_replay_2026_04_14_strict_checkpoint_market_capture_v1"
+    REPLAY_LOGIC_VERSION = "historical_replay_2026_04_14_external_forecast_archive_v1"
     CHECKPOINT_CAPTURED_MARKET_SOURCE = "checkpoint_captured_market_snapshot"
     CHECKPOINT_CAPTURED_WEATHER_SOURCE = "checkpoint_archived_weather_bundle"
     PROMOTED_CHECKPOINT_ARCHIVE_SOURCE = "coverage_repair_checkpoint_promotion"
@@ -135,6 +136,7 @@ class HistoricalTrainingService:
     CAPTURED_WEATHER_SOURCE = "captured_weather_bundle"
     ARCHIVED_WEATHER_SOURCE = "archived_weather_bundle"
     LEGACY_ARCHIVED_WEATHER_SOURCE = "file_weather_bundle"
+    EXTERNAL_FORECAST_ARCHIVE_SOURCE = "external_forecast_archive_weather_bundle"
     FINAL_MARKET_SOURCE = "kalshi_final_market"
     SETTLEMENT_MATCH = "match"
     SETTLEMENT_MISMATCH = "mismatch"
@@ -155,6 +157,7 @@ class HistoricalTrainingService:
         settings: Settings,
         session_factory: async_sessionmaker,
         kalshi: KalshiClient,
+        forecast_archive_client: OpenMeteoForecastArchiveClient,
         weather_directory: WeatherMarketDirectory,
         agent_pack_service: AgentPackService,
         historical_heuristic_service: HistoricalHeuristicService | None,
@@ -168,6 +171,7 @@ class HistoricalTrainingService:
         self.settings = settings
         self.session_factory = session_factory
         self.kalshi = kalshi
+        self.forecast_archive_client = forecast_archive_client
         self.weather_directory = weather_directory
         self.agent_pack_service = agent_pack_service
         self.historical_heuristic_service = historical_heuristic_service
@@ -187,6 +191,7 @@ class HistoricalTrainingService:
 
     async def close(self) -> None:
         await self.client.aclose()
+        await self.forecast_archive_client.close()
 
     @classmethod
     def replay_logic_version(cls) -> str:
@@ -492,6 +497,169 @@ class HistoricalTrainingService:
             "imported_snapshot_count": imported,
             "checkpoint_archive_promotion_count": checkpoint_promotions["checkpoint_archive_promotion_count"],
             "checkpoint_archive_promotions": checkpoint_promotions,
+            "samples": samples,
+        }
+
+    async def backfill_external_forecast_archives(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        series: list[str] | None = None,
+    ) -> dict[str, Any]:
+        templates = self._selected_templates(series)
+        series_tickers = [template.series_ticker for template in templates]
+        if not self.settings.historical_forecast_archive_provider_enabled:
+            return {
+                "status": "disabled",
+                "date_from": date_from.isoformat(),
+                "date_to": date_to.isoformat(),
+                "series": series_tickers,
+                "provider": "open_meteo_forecast_archive",
+                "inserted_snapshot_count": 0,
+                "checkpoint_archive_promotion_count": 0,
+                "skipped_existing_count": 0,
+                "skipped_unavailable_count": 0,
+                "samples": [],
+            }
+
+        inserted_snapshots = 0
+        checkpoint_promotions = 0
+        skipped_existing = 0
+        skipped_unavailable = 0
+        samples: list[dict[str, Any]] = []
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            settlement_labels = await repo.list_historical_settlement_labels(
+                series_tickers=series_tickers or None,
+                date_from=date_from.isoformat(),
+                date_to=date_to.isoformat(),
+                limit=5000,
+            )
+            for label in settlement_labels:
+                mapping = self._mapping_for_market(label.market_ticker, (label.payload or {}).get("market"))
+                if mapping is None or not mapping.supports_structured_weather or not mapping.series_ticker:
+                    continue
+                checkpoints = self._checkpoint_times(
+                    mapping,
+                    local_market_day=label.local_market_day,
+                    market_payload=(label.payload or {}).get("market", {}),
+                )
+                for checkpoint_label, checkpoint_ts in checkpoints:
+                    existing_archive = await repo.get_historical_checkpoint_archive(
+                        series_ticker=mapping.series_ticker,
+                        local_market_day=label.local_market_day,
+                        checkpoint_label=checkpoint_label,
+                    )
+                    if existing_archive is not None:
+                        skipped_existing += 1
+                        continue
+                    snapshot = await self.forecast_archive_client.fetch_point_in_time_forecast(
+                        mapping,
+                        local_market_day=label.local_market_day,
+                        checkpoint_ts=checkpoint_ts,
+                        checkpoint_label=checkpoint_label,
+                    )
+                    if snapshot is None:
+                        skipped_unavailable += 1
+                        continue
+                    existing_weather = await repo.get_historical_weather_snapshot_by_source(
+                        station_id=mapping.station_id,
+                        source_kind=self.EXTERNAL_FORECAST_ARCHIVE_SOURCE,
+                        source_id=snapshot.source_id,
+                    )
+                    if existing_weather is None:
+                        weather_record = await repo.upsert_historical_weather_snapshot(
+                            station_id=mapping.station_id,
+                            series_ticker=mapping.series_ticker,
+                            local_market_day=label.local_market_day,
+                            asof_ts=checkpoint_ts,
+                            source_kind=self.EXTERNAL_FORECAST_ARCHIVE_SOURCE,
+                            source_id=snapshot.source_id,
+                            source_hash=_hash_payload(snapshot.payload),
+                            observation_ts=checkpoint_ts,
+                            forecast_updated_ts=snapshot.run_ts,
+                            forecast_high_f=snapshot.forecast_high_f,
+                            current_temp_f=snapshot.current_temp_f,
+                            payload=snapshot.payload,
+                        )
+                        inserted_snapshots += 1
+                    else:
+                        weather_record = existing_weather
+                    metadata = self._weather_snapshot_checkpoint_metadata(weather_record)
+                    if not self._checkpoint_archive_metadata_valid(metadata, checkpoint_ts):
+                        skipped_unavailable += 1
+                        continue
+                    source_id = (
+                        f"external-promotion:{mapping.series_ticker}:{label.local_market_day}:{checkpoint_label}:{weather_record.id}"
+                    )
+                    await repo.upsert_historical_checkpoint_archive(
+                        series_ticker=mapping.series_ticker,
+                        market_ticker=label.market_ticker,
+                        station_id=mapping.station_id,
+                        local_market_day=label.local_market_day,
+                        checkpoint_label=checkpoint_label,
+                        checkpoint_ts=checkpoint_ts,
+                        captured_at=datetime.now(UTC),
+                        source_kind=self.PROMOTED_CHECKPOINT_ARCHIVE_SOURCE,
+                        source_id=source_id,
+                        source_hash=getattr(weather_record, "source_hash", None),
+                        observation_ts=getattr(weather_record, "observation_ts", None),
+                        forecast_updated_ts=getattr(weather_record, "forecast_updated_ts", None),
+                        archive_path=None,
+                        payload={
+                            "series_ticker": mapping.series_ticker,
+                            "market_ticker": label.market_ticker,
+                            "station_id": mapping.station_id,
+                            "local_market_day": label.local_market_day,
+                            "checkpoint_label": checkpoint_label,
+                            "checkpoint_ts": checkpoint_ts.isoformat(),
+                            "archive_source": "external_forecast_archive_backfill",
+                            "weather_source_kind": self.EXTERNAL_FORECAST_ARCHIVE_SOURCE,
+                            "weather_source_id": snapshot.source_id,
+                            "weather_snapshot_id": weather_record.id,
+                            "promoted_from_source": {
+                                "weather_source_kind": self.EXTERNAL_FORECAST_ARCHIVE_SOURCE,
+                                "weather_source_id": snapshot.source_id,
+                                "weather_snapshot_id": weather_record.id,
+                                "weather_asof_ts": self._dt_to_iso(getattr(weather_record, "asof_ts", None)),
+                            },
+                            "external_archive": {
+                                "provider": snapshot.provider,
+                                "model": snapshot.model,
+                                "run_ts": snapshot.run_ts.isoformat(),
+                            },
+                        },
+                    )
+                    checkpoint_promotions += 1
+                    if len(samples) < 10:
+                        samples.append(
+                            {
+                                "series_ticker": mapping.series_ticker,
+                                "market_ticker": label.market_ticker,
+                                "local_market_day": label.local_market_day,
+                                "checkpoint_label": checkpoint_label,
+                                "checkpoint_ts": checkpoint_ts.isoformat(),
+                                "weather_source_kind": self.EXTERNAL_FORECAST_ARCHIVE_SOURCE,
+                                "weather_source_id": snapshot.source_id,
+                                "provider": snapshot.provider,
+                                "model": snapshot.model,
+                                "run_ts": snapshot.run_ts.isoformat(),
+                            }
+                        )
+            await session.commit()
+
+        return {
+            "status": "completed",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "series": series_tickers,
+            "provider": "open_meteo_forecast_archive",
+            "inserted_snapshot_count": inserted_snapshots,
+            "checkpoint_archive_promotion_count": checkpoint_promotions,
+            "skipped_existing_count": skipped_existing,
+            "skipped_unavailable_count": skipped_unavailable,
             "samples": samples,
         }
 
@@ -1585,6 +1753,7 @@ class HistoricalTrainingService:
         coverage = await self._coverage_status(settlement_labels, verbose=verbose)
         checkpoint_capture = await self._checkpoint_capture_status(settlement_labels, verbose=verbose)
         market_checkpoint_capture = await self._market_checkpoint_capture_status(settlement_labels, verbose=verbose)
+        external_archive_coverage = await self._external_forecast_archive_status(settlement_labels, verbose=verbose)
         replay_audit = self._build_replay_audit(
             coverage_rows=coverage["all_market_day_coverage"],
             replay_runs=replay_runs,
@@ -1596,6 +1765,8 @@ class HistoricalTrainingService:
         public_checkpoint_capture.pop("all_market_day_coverage", None)
         public_market_checkpoint_capture = dict(market_checkpoint_capture)
         public_market_checkpoint_capture.pop("all_market_day_coverage", None)
+        public_external_archive_coverage = dict(external_archive_coverage)
+        public_external_archive_coverage.pop("all_market_day_coverage", None)
         coverage_backlog = self._coverage_backlog(
             coverage_rows=coverage["all_market_day_coverage"],
             checkpoint_rows=checkpoint_capture["all_market_day_coverage"],
@@ -1606,6 +1777,7 @@ class HistoricalTrainingService:
         coverage_repair_summary = self._coverage_repair_summary(
             coverage_backlog=coverage_backlog,
             checkpoint_rows=checkpoint_capture["all_market_day_coverage"],
+            external_archive_coverage=external_archive_coverage,
         )
         public_coverage_backlog = dict(coverage_backlog)
         public_coverage_backlog.pop("all_samples", None)
@@ -1682,6 +1854,8 @@ class HistoricalTrainingService:
             "source_replay_coverage": public_coverage,
             "checkpoint_archive_coverage": public_checkpoint_capture,
             "market_checkpoint_capture_coverage": public_market_checkpoint_capture,
+            "external_archive_coverage": public_external_archive_coverage,
+            "external_archive_recovery": public_external_archive_coverage.get("recovery_summary") or {},
             "replay_corpus": replay_corpus,
             "refresh_needed": replay_audit["refresh_needed"],
             "stale_build_count": stale_build_count,
@@ -1696,6 +1870,8 @@ class HistoricalTrainingService:
             "checkpoint_capture_gaps": public_checkpoint_capture["checkpoint_capture_gaps"],
             "market_checkpoint_coverage_counts": public_market_checkpoint_capture["checkpoint_coverage_counts"],
             "market_checkpoint_capture_gaps": public_market_checkpoint_capture["checkpoint_capture_gaps"],
+            "external_archive_source_counts": public_external_archive_coverage.get("source_counts") or {},
+            "external_archive_recovery_summary": public_external_archive_coverage.get("recovery_summary") or {},
             "draft_training_ready": draft_only,
             "training_ready": training_ready,
             "historical_dataset_readiness": historical_build_readiness,
@@ -1711,6 +1887,7 @@ class HistoricalTrainingService:
             "market_day_coverage": public_coverage.get("market_day_coverage", []),
             "checkpoint_market_day_coverage": public_checkpoint_capture.get("market_day_coverage", []),
             "market_checkpoint_market_day_coverage": public_market_checkpoint_capture.get("market_day_coverage", []),
+            "external_archive_market_day_coverage": public_external_archive_coverage.get("market_day_coverage", []),
             "replay_audit": replay_audit,
             "recent_pipeline_runs": [
                 {
@@ -1967,7 +2144,9 @@ class HistoricalTrainingService:
         *,
         coverage_backlog: dict[str, Any],
         checkpoint_rows: list[dict[str, Any]],
+        external_archive_coverage: dict[str, Any] | None = None,
     ) -> dict[str, int]:
+        external_archive_coverage = external_archive_coverage or {}
         promoted_checkpoint_archives = 0
         recoverable_weather_gap_market_days = 0
         permanent_weather_gap_market_days = 0
@@ -2007,6 +2186,22 @@ class HistoricalTrainingService:
             "permanent_weather_gap_market_day_count": permanent_weather_gap_market_days,
             "recoverable_checkpoint_archive_gap_market_day_count": recoverable_checkpoint_archive_gap_market_days,
             "permanent_checkpoint_archive_gap_market_day_count": permanent_checkpoint_archive_gap_market_days,
+            "external_archive_assisted_checkpoint_count": int(
+                ((external_archive_coverage.get("source_counts") or {}).get("assisted_checkpoint_count") or 0)
+            ),
+            "recovered_via_external_archive_market_day_count": int(
+                ((external_archive_coverage.get("recovery_summary") or {}).get("recovered_via_external_archive_market_day_count") or 0)
+            ),
+            "missing_native_archive_but_recoverable_via_external_market_day_count": int(
+                ((external_archive_coverage.get("recovery_summary") or {}).get(
+                    "missing_native_archive_but_recoverable_via_external_market_day_count"
+                ) or 0)
+            ),
+            "still_unrecoverable_even_with_external_market_day_count": int(
+                ((external_archive_coverage.get("recovery_summary") or {}).get(
+                    "still_unrecoverable_even_with_external_market_day_count"
+                ) or 0)
+            ),
         }
 
     def _build_replay_audit(
@@ -3192,6 +3387,8 @@ class HistoricalTrainingService:
         gap_samples: list[dict[str, Any]] = []
         rows: list[dict[str, Any]] = []
         coverage_counts = Counter()
+        native_checkpoint_archive_count = 0
+        external_archive_assisted_checkpoint_count = 0
 
         for label in settlement_labels:
             mapping = self._mapping_for_market(label.market_ticker, (label.payload or {}).get("market"))
@@ -3207,6 +3404,9 @@ class HistoricalTrainingService:
             for checkpoint_label, checkpoint_ts in checkpoints:
                 archive = archive_index.get((mapping.series_ticker, label.local_market_day, checkpoint_label))
                 captured = archive is not None
+                archive_payload = dict(archive.payload or {}) if archive is not None else {}
+                weather_source_kind = str(archive_payload.get("weather_source_kind") or "")
+                external_assisted = weather_source_kind == self.EXTERNAL_FORECAST_ARCHIVE_SOURCE
                 if not captured:
                     gap_counts["checkpoint_archive_missing"] += 1
                     if len(gap_samples) < 10:
@@ -3226,16 +3426,23 @@ class HistoricalTrainingService:
                         market_snapshot=(archive if captured else None),
                         weather_snapshot=(archive if captured else None),
                         market_source_kind=None,
-                        weather_source_kind=(self.CHECKPOINT_CAPTURED_WEATHER_SOURCE if captured else None),
+                        weather_source_kind=(weather_source_kind or self.CHECKPOINT_CAPTURED_WEATHER_SOURCE if captured else None),
                         missing_reasons=[] if captured else ["checkpoint_archive_missing"],
                     )
                 )
+                if captured:
+                    if external_assisted:
+                        external_archive_assisted_checkpoint_count += 1
+                    else:
+                        native_checkpoint_archive_count += 1
                 checkpoint_rows.append(
                     {
                         "checkpoint_label": checkpoint_label,
                         "checkpoint_ts": checkpoint_ts.isoformat(),
                         "captured": captured,
                         "source_kind": (archive.source_kind if archive is not None else None),
+                        "weather_source_kind": (weather_source_kind or None),
+                        "external_archive_assisted": external_assisted,
                         "captured_at": (archive.captured_at.isoformat() if archive is not None else None),
                         "archive_path": (archive.archive_path if archive is not None else None),
                     }
@@ -3262,6 +3469,10 @@ class HistoricalTrainingService:
             "checkpoint_capture_gaps": {
                 "reason_counts": dict(gap_counts),
                 "samples": gap_samples,
+            },
+            "source_counts": {
+                "native_checkpoint_archive_count": native_checkpoint_archive_count,
+                "external_archive_assisted_checkpoint_count": external_archive_assisted_checkpoint_count,
             },
             "market_day_coverage": rows if verbose else rows[:12],
             "all_market_day_coverage": rows,
@@ -3350,6 +3561,143 @@ class HistoricalTrainingService:
             "checkpoint_capture_gaps": {
                 "reason_counts": dict(gap_counts),
                 "samples": gap_samples,
+            },
+            "market_day_coverage": rows if verbose else rows[:12],
+            "all_market_day_coverage": rows,
+        }
+
+    async def _external_forecast_archive_status(self, settlement_labels: list[Any], *, verbose: bool) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        provider_counts: Counter[str] = Counter()
+        model_counts: Counter[str] = Counter()
+        snapshot_count = 0
+        assisted_checkpoint_count = 0
+        recovered_market_days = 0
+        recoverable_market_days = 0
+        unrecoverable_market_days = 0
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            external_snapshots = [
+                snapshot
+                for snapshot in await repo.list_historical_weather_snapshots(limit=5000)
+                if snapshot.source_kind == self.EXTERNAL_FORECAST_ARCHIVE_SOURCE
+            ]
+            archives = await repo.list_historical_checkpoint_archives(limit=5000)
+            await session.commit()
+
+        snapshot_index: dict[tuple[str, str], list[Any]] = defaultdict(list)
+        for snapshot in external_snapshots:
+            snapshot_count += 1
+            metadata = dict((snapshot.payload or {}).get("_external_archive") or {})
+            provider_counts[str(metadata.get("provider") or "unknown")] += 1
+            model_counts[str(metadata.get("model") or "unknown")] += 1
+            snapshot_index[(snapshot.station_id, snapshot.local_market_day)].append(snapshot)
+
+        for key in snapshot_index:
+            snapshot_index[key].sort(key=lambda item: (item.asof_ts, item.source_id), reverse=True)
+
+        archive_index = {
+            (archive.series_ticker, archive.local_market_day, archive.checkpoint_label): archive
+            for archive in archives
+        }
+
+        for label in settlement_labels:
+            mapping = self._mapping_for_market(label.market_ticker, (label.payload or {}).get("market"))
+            if mapping is None or not mapping.supports_structured_weather or not mapping.series_ticker:
+                continue
+            checkpoints = self._checkpoint_times(
+                mapping,
+                local_market_day=label.local_market_day,
+                market_payload=(label.payload or {}).get("market", {}),
+            )
+            checkpoint_rows: list[dict[str, Any]] = []
+            missing_checkpoints = 0
+            recoverable_missing_checkpoints = 0
+            external_assisted_present = False
+            for checkpoint_label, checkpoint_ts in checkpoints:
+                archive = archive_index.get((mapping.series_ticker, label.local_market_day, checkpoint_label))
+                archive_payload = dict(archive.payload or {}) if archive is not None else {}
+                external_assisted = (
+                    archive is not None
+                    and str(archive_payload.get("weather_source_kind") or "") == self.EXTERNAL_FORECAST_ARCHIVE_SOURCE
+                )
+                if external_assisted:
+                    assisted_checkpoint_count += 1
+                    external_assisted_present = True
+                snapshot = next(
+                    (
+                        item
+                        for item in snapshot_index.get((mapping.station_id, label.local_market_day), [])
+                        if _as_utc(item.asof_ts) is not None
+                        and _as_utc(item.asof_ts) <= checkpoint_ts
+                        and self._checkpoint_archive_metadata_valid(
+                            self._weather_snapshot_checkpoint_metadata(item),
+                            checkpoint_ts,
+                        )
+                    ),
+                    None,
+                )
+                external_available = snapshot is not None
+                if archive is None:
+                    missing_checkpoints += 1
+                    if external_available:
+                        recoverable_missing_checkpoints += 1
+                checkpoint_rows.append(
+                    {
+                        "checkpoint_label": checkpoint_label,
+                        "checkpoint_ts": checkpoint_ts.isoformat(),
+                        "external_snapshot_available": external_available,
+                        "external_archive_assisted": external_assisted,
+                        "weather_source_id": (snapshot.source_id if snapshot is not None else None),
+                        "provider": (
+                            str((((snapshot.payload or {}).get("_external_archive") or {}).get("provider")) or "")
+                            if snapshot is not None
+                            else None
+                        ),
+                        "model": (
+                            str((((snapshot.payload or {}).get("_external_archive") or {}).get("model")) or "")
+                            if snapshot is not None
+                            else None
+                        ),
+                        "run_ts": (
+                            str((((snapshot.payload or {}).get("_external_archive") or {}).get("run_ts")) or "")
+                            if snapshot is not None
+                            else None
+                        ),
+                    }
+                )
+            recovery_status = "native_only"
+            if missing_checkpoints == 0 and external_assisted_present:
+                recovered_market_days += 1
+                recovery_status = "recovered_via_external_archive"
+            elif missing_checkpoints > 0 and recoverable_missing_checkpoints == missing_checkpoints:
+                recoverable_market_days += 1
+                recovery_status = "missing_native_archive_but_recoverable_via_external"
+            elif missing_checkpoints > 0:
+                unrecoverable_market_days += 1
+                recovery_status = "still_unrecoverable_even_with_external"
+            rows.append(
+                {
+                    "series_ticker": mapping.series_ticker,
+                    "market_ticker": label.market_ticker,
+                    "local_market_day": label.local_market_day,
+                    "recovery_status": recovery_status,
+                    "checkpoints": checkpoint_rows,
+                }
+            )
+
+        return {
+            "source_counts": {
+                "snapshot_count": snapshot_count,
+                "provider_counts": dict(provider_counts),
+                "model_counts": dict(model_counts),
+                "assisted_checkpoint_count": assisted_checkpoint_count,
+            },
+            "recovery_summary": {
+                "recovered_via_external_archive_market_day_count": recovered_market_days,
+                "missing_native_archive_but_recoverable_via_external_market_day_count": recoverable_market_days,
+                "still_unrecoverable_even_with_external_market_day_count": unrecoverable_market_days,
             },
             "market_day_coverage": rows if verbose else rows[:12],
             "all_market_day_coverage": rows,
@@ -3476,6 +3824,7 @@ class HistoricalTrainingService:
             self.ARCHIVED_WEATHER_SOURCE,
             self.LEGACY_ARCHIVED_WEATHER_SOURCE,
             self.CAPTURED_WEATHER_SOURCE,
+            self.EXTERNAL_FORECAST_ARCHIVE_SOURCE,
         ):
             match = next((record for record in snapshots if record.source_kind == source_kind), None)
             if match is not None:
@@ -3965,10 +4314,23 @@ class HistoricalTrainingService:
         }
 
     def _historical_label_stats(self, bundles: list[Any], split: HistoricalBuildSplit, *, draft_only: bool, training_ready: bool) -> dict[str, Any]:
+        market_source_kind_counts = Counter(
+            getattr(bundle, "market_source_kind", None) or (bundle.historical_provenance or {}).get("market_source_kind")
+            for bundle in bundles
+            if getattr(bundle, "market_source_kind", None) or (bundle.historical_provenance or {}).get("market_source_kind")
+        )
+        weather_source_kind_counts = Counter(
+            getattr(bundle, "weather_source_kind", None) or (bundle.historical_provenance or {}).get("weather_source_kind")
+            for bundle in bundles
+            if getattr(bundle, "weather_source_kind", None) or (bundle.historical_provenance or {}).get("weather_source_kind")
+        )
         return {
             "origin_counts": dict(Counter(bundle.room_origin for bundle in bundles)),
             "audit_source_counts": dict(Counter(bundle.audit_source for bundle in bundles if bundle.audit_source)),
             "coverage_class_counts": dict(Counter(bundle.coverage_class for bundle in bundles if bundle.coverage_class)),
+            "market_source_kind_counts": dict(market_source_kind_counts),
+            "weather_source_kind_counts": dict(weather_source_kind_counts),
+            "external_archive_weather_count": weather_source_kind_counts.get(self.EXTERNAL_FORECAST_ARCHIVE_SOURCE, 0),
             "split_counts": {
                 "train": len(split.train),
                 "validation": len(split.validation),
@@ -4035,6 +4397,20 @@ class HistoricalTrainingService:
         exclusion_counts = dict(Counter(bundle.exclude_reason for bundle in bundles if bundle.exclude_reason))
         audit_source_counts = dict(Counter(bundle.audit_source for bundle in bundles if bundle.audit_source))
         pack_versions = sorted({bundle.room.get("agent_pack_version") for bundle in bundles if bundle.room.get("agent_pack_version")})
+        weather_source_kind_counts = dict(
+            Counter(
+                getattr(bundle, "weather_source_kind", None) or (bundle.historical_provenance or {}).get("weather_source_kind")
+                for bundle in bundles
+                if getattr(bundle, "weather_source_kind", None) or (bundle.historical_provenance or {}).get("weather_source_kind")
+            )
+        )
+        market_source_kind_counts = dict(
+            Counter(
+                getattr(bundle, "market_source_kind", None) or (bundle.historical_provenance or {}).get("market_source_kind")
+                for bundle in bundles
+                if getattr(bundle, "market_source_kind", None) or (bundle.historical_provenance or {}).get("market_source_kind")
+            )
+        )
         manifest = {
             "format": "gemini-finetune.v1",
             "format_target": "gemini_vertex_chat_jsonl",
@@ -4063,6 +4439,11 @@ class HistoricalTrainingService:
                         for bundle in bundles
                         if getattr(bundle, "coverage_class", None)
                     )
+                ),
+                "market_source_kind_counts": market_source_kind_counts,
+                "weather_source_kind_counts": weather_source_kind_counts,
+                "external_archive_weather_count": int(
+                    weather_source_kind_counts.get(self.EXTERNAL_FORECAST_ARCHIVE_SOURCE, 0)
                 ),
                 "settlement_mismatch_count": sum(
                     1

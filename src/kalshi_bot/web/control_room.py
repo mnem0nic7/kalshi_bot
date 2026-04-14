@@ -597,6 +597,8 @@ async def _build_training_tab(container: AppContainer) -> dict[str, Any]:
                 "settlement_mismatch_breakdown": historical_status.get("settlement_mismatch_breakdown") or {},
                 "source_replay_coverage": historical_status.get("source_replay_coverage") or {},
                 "checkpoint_archive_coverage": historical_status.get("checkpoint_archive_coverage") or {},
+                "external_archive_coverage": historical_status.get("external_archive_coverage") or {},
+                "external_archive_recovery": historical_status.get("external_archive_recovery") or {},
                 "replay_corpus": historical_status.get("replay_corpus") or {},
                 "coverage_repair_summary": historical_status.get("coverage_repair_summary") or {},
                 "checkpoint_archive_promotion_count": historical_status.get("checkpoint_archive_promotion_count") or 0,
@@ -604,6 +606,7 @@ async def _build_training_tab(container: AppContainer) -> dict[str, Any]:
             "samples": {
                 "source_replay_coverage": (historical_status.get("source_replay_coverage") or {}).get("market_day_coverage") or [],
                 "checkpoint_archive_coverage": (historical_status.get("checkpoint_archive_coverage") or {}).get("market_day_coverage") or [],
+                "external_archive_coverage": (historical_status.get("external_archive_coverage") or {}).get("market_day_coverage") or [],
                 "replay_corpus": (historical_status.get("replay_corpus") or {}).get("market_day_coverage") or [],
                 "coverage_backlog": (historical_status.get("coverage_backlog") or {}).get("samples") or [],
             },

@@ -124,6 +124,12 @@ class Settings(BaseSettings):
     historical_replay_market_snapshot_lookback_hours: int = 36
     historical_replay_market_stale_seconds: int = 900
     historical_weather_archive_path: str = "data/historical_weather"
+    historical_forecast_archive_provider_enabled: bool = True
+    historical_forecast_archive_base_url: str = "https://single-runs-api.open-meteo.com/v1/forecast"
+    historical_forecast_archive_api_key: str | None = None
+    historical_forecast_archive_model_preference: str = "gfs_seamless"
+    historical_forecast_archive_timeout_seconds: float = 30.0
+    historical_forecast_archive_max_retries: int = 2
     historical_checkpoint_capture_lead_seconds: int = 300
     historical_checkpoint_capture_grace_seconds: int = 900
     active_heuristic_pack_version: str = "historical-baseline-v1"

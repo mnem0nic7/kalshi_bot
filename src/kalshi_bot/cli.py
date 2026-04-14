@@ -350,6 +350,15 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2))
             return 0
 
+        if args.command == "historical-backfill" and args.historical_backfill_kind == "forecast-archive":
+            result = await container.historical_training_service.backfill_external_forecast_archives(
+                date_from=date.fromisoformat(args.date_from),
+                date_to=date.fromisoformat(args.date_to),
+                series=args.series or None,
+            )
+            print(json.dumps(result, indent=2))
+            return 0
+
         if args.command == "historical-backfill" and args.historical_backfill_kind == "settlements":
             result = await container.historical_training_service.backfill_settlements(
                 date_from=date.fromisoformat(args.date_from),
@@ -758,6 +767,10 @@ def build_parser() -> argparse.ArgumentParser:
     historical_backfill_weather.add_argument("--date-from", required=True)
     historical_backfill_weather.add_argument("--date-to", required=True)
     historical_backfill_weather.add_argument("--series", nargs="*", default=None)
+    historical_backfill_forecast = historical_backfill_subparsers.add_parser("forecast-archive")
+    historical_backfill_forecast.add_argument("--date-from", required=True)
+    historical_backfill_forecast.add_argument("--date-to", required=True)
+    historical_backfill_forecast.add_argument("--series", nargs="*", default=None)
     historical_backfill_settlements = historical_backfill_subparsers.add_parser("settlements")
     historical_backfill_settlements.add_argument("--date-from", required=True)
     historical_backfill_settlements.add_argument("--date-to", required=True)

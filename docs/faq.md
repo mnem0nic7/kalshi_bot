@@ -76,10 +76,11 @@ The default operational mode is now a rolling one-year historical pipeline. `his
 
 ## How do I tell whether the historical checks are healthy?
 
-Read the historical status in three layers:
+Read the historical status in four layers:
 
 - `source_replay_coverage`: what the current strict-asof source tables could replay right now
-- `checkpoint_archive_coverage`: what the scheduled checkpoint weather archive alone could support
+- `checkpoint_archive_coverage`: what the canonical checkpoint-weather archive could support right now
+- `external_archive_coverage`: what archived Open-Meteo forecast runs can recover or have already recovered into checkpoint-quality weather slots
 - `replay_corpus`: what has actually been rebuilt into `historical_replay` rooms and is safe to use for readiness or intelligence
 
 If source coverage is ahead of replay corpus materialization, run the historical repair refresh path before trusting the dashboard or the intelligence output.
@@ -99,6 +100,8 @@ Settlement mismatch reporting is now more specific too:
 - `crosscheck_missing` means the daily-summary crosscheck was not available
 
 Weather archive repair now also promotes already-valid as-of weather bundles into checkpoint-archive records for the exact checkpoint slot when that can be done without using future data. That helps checkpoint coverage catch up to source replayability without inventing history.
+
+There is now a second strict repair lane for older days too: `historical-backfill forecast-archive` can recover point-in-time weather from archived Open-Meteo forecast runs, but only if the archived run timestamp is still at or before the replay checkpoint. Those recovered snapshots do not bypass checkpoint validity rules; they just give the system one more honest source of knowable weather.
 
 The confidence state should also make sense:
 

@@ -906,19 +906,33 @@ class ResearchCoordinator:
         retrieved_at: datetime | None = None,
     ) -> tuple[list[ResearchSourceCard], list[ResearchClaim]]:
         weather_snapshot = weather_signal.weather
+        external_archive = dict(weather_bundle.get("_external_archive") or {})
+        provider_label = str(external_archive.get("provider_label") or "NWS/NOAA")
+        provider_url = str(external_archive.get("provider_url") or "https://api.weather.gov")
+        provider_model = str(external_archive.get("model") or "").strip()
+        source_class = "weather_archive_external" if external_archive else "weather_structured"
+        trust_tier = "reputable" if external_archive else "primary"
+        title = (
+            f"Archived forecast run for {mapping.label}"
+            if external_archive
+            else f"Structured weather evidence for {mapping.label}"
+        )
         source_key = _source_key("weather_structured", mapping.market_ticker)
         source = ResearchSourceCard(
             source_key=source_key,
-            source_class="weather_structured",
-            trust_tier="primary",
-            publisher="NWS/NOAA",
-            title=f"Structured weather evidence for {mapping.label}",
-            url="https://api.weather.gov",
+            source_class=source_class,
+            trust_tier=trust_tier,
+            publisher=(f"{provider_label} {provider_model}".strip() if provider_model else provider_label),
+            title=title,
+            url=provider_url,
             snippet=weather_signal.summary,
             retrieved_at=(retrieved_at.astimezone(UTC) if retrieved_at is not None else datetime.now(UTC)),
             content={
                 "forecast_updated_time": _to_iso(weather_snapshot.forecast_updated_time),
                 "observation_time": _to_iso(weather_snapshot.observation_time),
+                "archive_provider": external_archive.get("provider"),
+                "archive_model": external_archive.get("model"),
+                "archive_run_ts": external_archive.get("run_ts"),
             },
         )
         stance = "supports" if weather_signal.fair_yes_dollars >= Decimal("0.5000") else "contradicts"

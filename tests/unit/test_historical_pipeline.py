@@ -36,6 +36,10 @@ class _FakeHistoricalTrainingService:
         self.calls.append(("weather_backfill", date_from.isoformat(), date_to.isoformat(), tuple(series or ())))
         return {"status": "completed"}
 
+    async def backfill_external_forecast_archives(self, *, date_from, date_to, series=None):
+        self.calls.append(("forecast_archive_backfill", date_from.isoformat(), date_to.isoformat(), tuple(series or ())))
+        return {"status": "completed"}
+
     async def backfill_settlements(self, *, date_from, date_to, series=None):
         self.calls.append(("settlement_backfill", date_from.isoformat(), date_to.isoformat(), tuple(series or ())))
         return {"status": "completed"}
@@ -99,10 +103,11 @@ async def test_historical_pipeline_bootstrap_runs_steps_in_order(tmp_path) -> No
 
     assert result["status"] == "completed"
     step_calls = [call[0] for call in training.calls if call[0] not in {"status"}]
-    assert step_calls[:6] == [
+    assert step_calls[:7] == [
         "import",
         "market_backfill",
         "weather_backfill",
+        "forecast_archive_backfill",
         "settlement_backfill",
         "audit",
         "refresh",

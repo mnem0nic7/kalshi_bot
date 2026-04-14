@@ -9,6 +9,7 @@ from kalshi_bot.config import Settings, get_settings
 from kalshi_bot.core.enums import DeploymentColor
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+from kalshi_bot.integrations.forecast_archive import OpenMeteoForecastArchiveClient
 from kalshi_bot.integrations.kalshi import KalshiClient, KalshiWebSocketClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.orchestration.supervisor import WorkflowSupervisor
@@ -45,6 +46,7 @@ class AppContainer:
     kalshi: KalshiClient
     kalshi_ws: KalshiWebSocketClient
     weather: NWSWeatherClient
+    forecast_archive: OpenMeteoForecastArchiveClient
     weather_directory: WeatherMarketDirectory
     agent_pack_service: AgentPackService
     signal_engine: WeatherSignalEngine
@@ -82,6 +84,7 @@ class AppContainer:
         kalshi = KalshiClient(settings)
         kalshi_ws = KalshiWebSocketClient(settings, kalshi)
         weather = NWSWeatherClient(settings)
+        forecast_archive = OpenMeteoForecastArchiveClient(settings)
         weather_directory = WeatherMarketDirectory.from_file(settings.weather_market_map_file)
         agent_pack_service = AgentPackService(settings)
         signal_engine = WeatherSignalEngine(settings)
@@ -116,6 +119,7 @@ class AppContainer:
             settings,
             session_factory,
             kalshi,
+            forecast_archive,
             weather_directory,
             agent_pack_service,
             historical_heuristic_service,
@@ -207,6 +211,7 @@ class AppContainer:
             kalshi=kalshi,
             kalshi_ws=kalshi_ws,
             weather=weather,
+            forecast_archive=forecast_archive,
             weather_directory=weather_directory,
             agent_pack_service=agent_pack_service,
             signal_engine=signal_engine,
