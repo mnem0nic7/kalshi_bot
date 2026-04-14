@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import AgentRole, MessageKind, RiskStatus, RoomStage
+from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage
 from kalshi_bot.core.fixed_point import as_decimal
 from kalshi_bot.core.metrics import ACTIVE_ROOMS, ORDERS_TOTAL, ROOM_RUNS_TOTAL
 from kalshi_bot.core.schemas import ExecReceiptPayload, MemoryNotePayload, RoomMessageCreate, RoomMessageRead
@@ -30,6 +30,7 @@ from kalshi_bot.services.signal import (
     StrategySignal,
     WeatherSignalEngine,
     apply_heuristic_application_to_signal,
+    estimate_notional_dollars,
     evaluate_trade_eligibility,
     is_market_stale,
 )
@@ -418,10 +419,20 @@ class WorkflowSupervisor:
 
                     if ticket is not None and client_order_id is not None:
                         ticket_record = await repo.save_trade_ticket(room.id, ticket, client_order_id, message_id=trader_record.id)
+                        open_position = await repo.get_position(room.market_ticker, self.settings.kalshi_subaccount)
+                        current_position_notional = (
+                            estimate_notional_dollars(
+                                ContractSide(open_position.side),
+                                open_position.average_price_dollars,
+                                open_position.count_fp,
+                            )
+                            if open_position is not None
+                            else Decimal("0")
+                        )
                         risk_context = RiskContext(
                             market_observed_at=market_state.observed_at,
                             research_observed_at=dossier.freshness.refreshed_at,
-                            current_position_notional_dollars=Decimal("0"),
+                            current_position_notional_dollars=current_position_notional,
                         )
                         verdict = self.risk_engine.evaluate(
                             room=room,

@@ -78,7 +78,7 @@ def _domain_trust_tier(url: str | None) -> str:
         return "primary"
     if host in REPUTABLE_DOMAINS or host.endswith(".edu") or host.endswith(".org"):
         return "reputable"
-    return "reputable"
+    return "weak"
 
 
 def _source_key(source_class: str, title: str, url: str | None = None) -> str:

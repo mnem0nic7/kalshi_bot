@@ -69,6 +69,59 @@ def test_risk_engine_approves_fresh_small_trade() -> None:
     assert verdict.status == RiskStatus.APPROVED
 
 
+def test_risk_engine_blocks_when_position_limit_would_be_breached() -> None:
+    """current_position_notional_dollars must be passed from the DB, not hardcoded to 0."""
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=50,  # tight cap
+        risk_min_edge_bps=50,
+    )
+    engine = DeterministicRiskEngine(settings)
+    # Existing open position of $40 notional; new order adds $5.80 → total $45.80 < $50 → passes
+    context_open = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        current_position_notional_dollars=Decimal("40.00"),
+    )
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=context_open,
+    )
+    assert verdict.status == RiskStatus.APPROVED
+
+    # Existing open position of $46 notional; new order adds $5.80 → total $51.80 > $50 → blocked
+    context_over = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        current_position_notional_dollars=Decimal("46.00"),
+    )
+    verdict_over = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=context_over,
+    )
+    assert verdict_over.status == RiskStatus.BLOCKED
+    assert any("position" in r.lower() for r in verdict_over.reasons)
+
+
 def test_risk_engine_blocks_stale_data() -> None:
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_edge_bps=50)
     engine = DeterministicRiskEngine(settings)

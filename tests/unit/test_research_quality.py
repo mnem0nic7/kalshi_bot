@@ -11,7 +11,7 @@ from kalshi_bot.core.schemas import (
     ResearchSummary,
     ResearchTraderContext,
 )
-from kalshi_bot.services.research import ResearchCoordinator
+from kalshi_bot.services.research import ResearchCoordinator, _domain_trust_tier
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
 
@@ -105,3 +105,24 @@ def test_research_quality_summary_rewards_structured_complete_weather_research()
     assert quality.fair_value_score == 1.0
     assert quality.overall_score >= 0.9
     assert quality.issues == []
+
+
+def test_domain_trust_tier_weak_for_unknown_domains() -> None:
+    """The fallback tier must be 'weak', not 'reputable'."""
+    assert _domain_trust_tier(None) == "weak"
+    assert _domain_trust_tier("https://somerandomblog.com/article") == "weak"
+    assert _domain_trust_tier("https://example.com/page") == "weak"
+
+
+def test_domain_trust_tier_reputable_domains() -> None:
+    assert _domain_trust_tier("https://reuters.com/news") == "reputable"
+    assert _domain_trust_tier("https://www.bloomberg.com/article") == "reputable"
+    assert _domain_trust_tier("https://mit.edu/research") == "reputable"
+    assert _domain_trust_tier("https://en.wikipedia.org/wiki/Foo") == "reputable"
+
+
+def test_domain_trust_tier_primary_domains() -> None:
+    assert _domain_trust_tier("https://weather.gov/forecast") == "primary"
+    assert _domain_trust_tier("https://api.weather.gov/points") == "primary"
+    assert _domain_trust_tier("https://nws.noaa.gov/data") == "primary"
+    assert _domain_trust_tier("https://kalshi.com/markets") == "primary"

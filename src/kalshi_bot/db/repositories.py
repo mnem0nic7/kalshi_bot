@@ -752,6 +752,13 @@ class PlatformRepository:
         )
         return list((await self.session.execute(stmt)).scalars())
 
+    async def get_position(self, market_ticker: str, subaccount: int = 0) -> PositionRecord | None:
+        stmt = select(PositionRecord).where(
+            PositionRecord.market_ticker == market_ticker,
+            PositionRecord.subaccount == subaccount,
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def upsert_position(
         self,
         *,

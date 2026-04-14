@@ -2,15 +2,38 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 from pydantic import BaseModel
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import AgentRoleRuntime
+
+logger = logging.getLogger(__name__)
+
+
+def _is_retryable_llm_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {429, 500, 502, 503}
+    return False
+
+
+_llm_retry = retry(
+    retry=retry_if_exception(_is_retryable_llm_error),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(initial=1, max=10),
+    reraise=True,
+    before_sleep=lambda retry_state: logger.warning(
+        "LLM provider call failed (attempt %d), retrying: %s",
+        retry_state.attempt_number,
+        retry_state.outcome.exception(),
+    ),
+)
 
 
 @dataclass(slots=True)
@@ -47,6 +70,7 @@ class OpenAICompatibleProvider:
     async def close(self) -> None:
         await self.client.aclose()
 
+    @_llm_retry
     async def complete_text(self, *, system_prompt: str, user_prompt: str, model: str, temperature: float) -> str:
         response = await self.client.post(
             f"{self.config.base_url.rstrip('/')}/chat/completions",
@@ -63,6 +87,7 @@ class OpenAICompatibleProvider:
         payload = response.json()
         return payload["choices"][0]["message"]["content"].strip()
 
+    @_llm_retry
     async def complete_json(
         self,
         *,
@@ -114,6 +139,7 @@ class NativeGeminiProvider:
         texts = [str(part.get("text", "")) for part in parts if part.get("text")]
         return "\n".join(texts).strip()
 
+    @_llm_retry
     async def complete_text(self, *, system_prompt: str, user_prompt: str, model: str, temperature: float) -> str:
         response = await self.client.post(
             self._endpoint(model),
@@ -126,6 +152,7 @@ class NativeGeminiProvider:
         response.raise_for_status()
         return self._extract_text(response.json())
 
+    @_llm_retry
     async def complete_json(
         self,
         *,
