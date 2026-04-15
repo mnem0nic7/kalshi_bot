@@ -654,6 +654,37 @@ class HistoricalIntelligenceService:
                 )
 
         policy_graph: list[HeuristicPolicyNode] = []
+        if sufficiency["directional_candidate_allowed"]:
+            for brier_entry in intelligence["directional_intelligence"]["brier_scorecard"]:
+                if brier_entry["support_count"] < self.settings.historical_intelligence_min_segment_support:
+                    continue
+                if brier_entry["mean_brier_error"] <= 0.12:
+                    continue
+                buffer_add = min(100, int(brier_entry["mean_brier_error"] * 500))
+                policy_graph.append(
+                    HeuristicPolicyNode(
+                        rule_id=(
+                            f"high-brier-{brier_entry['city_bucket']}-"
+                            f"{brier_entry['threshold_bucket']}-{brier_entry['daypart']}"
+                        ),
+                        description=(
+                            f"High Brier error ({brier_entry['mean_brier_error']:.3f}) in "
+                            f"{brier_entry['city_bucket']} {brier_entry['threshold_bucket']} "
+                            f"{brier_entry['daypart']}; require extra edge buffer."
+                        ),
+                        priority=40,
+                        support_count=int(brier_entry["support_count"]),
+                        condition=HeuristicPolicyCondition(
+                            city_buckets=[brier_entry["city_bucket"]],
+                            threshold_buckets=[brier_entry["threshold_bucket"]],
+                            dayparts=[brier_entry["daypart"]],
+                        ),
+                        action=HeuristicPolicyAction(
+                            strategy_quality_edge_buffer_bps=buffer_add,
+                        ),
+                    )
+                )
+
         for candidate in intelligence["rule_synthesis_candidates"]:
             if candidate["support_count"] < self.settings.historical_intelligence_min_segment_support:
                 continue
@@ -661,6 +692,7 @@ class HistoricalIntelligenceService:
                 series_tickers=[candidate["series_ticker"]] if candidate.get("series_ticker") else [],
                 spread_regimes=[candidate["spread_regime"]] if candidate.get("spread_regime") else [],
                 dayparts=[candidate["daypart"]] if candidate.get("daypart") else [],
+                forecast_delta_buckets=[candidate["forecast_delta_bucket"]] if candidate.get("forecast_delta_bucket") else [],
                 coverage_classes=[candidate["coverage_class"]] if candidate.get("coverage_class") else [],
             )
             action = HeuristicPolicyAction(
@@ -1011,6 +1043,44 @@ class HistoricalIntelligenceService:
                         "strategy_quality_edge_buffer_bps": 25,
                     }
                 )
+        # Flat-delta (near-threshold) quality-buffer rules.
+        # Group by (series_ticker, forecast_delta_bucket, daypart) and emit a
+        # quality-buffer rule for flat regimes that are underperforming.
+        delta_grouped: dict[tuple[str, str, str], list[IntelligenceFeatureRow]] = defaultdict(list)
+        for row in rows:
+            delta_grouped[(row.series_ticker, row.forecast_delta_bucket, row.daypart)].append(row)
+
+        for (series_ticker, forecast_delta_bucket, daypart), items in delta_grouped.items():
+            if forecast_delta_bucket != "flat":
+                continue
+            support_count = len(items)
+            if support_count < self.settings.historical_intelligence_min_segment_support:
+                continue
+            profitable = sum(1 for item in items if item.profitability_flag is True)
+            known_outcome = sum(1 for item in items if item.profitability_flag is not None)
+            profitable_rate = profitable / known_outcome if known_outcome else 0.0
+            if profitable_rate >= 0.55:
+                continue  # flat regime is performing adequately, no intervention needed
+            candidates.append(
+                {
+                    "rule_id": f"flat-delta-quality-{series_ticker}-{daypart}",
+                    "description": (
+                        f"Near-threshold forecasts for {series_ticker} during {daypart} "
+                        f"show low profitability ({profitable_rate:.0%}); require higher edge."
+                    ),
+                    "series_ticker": series_ticker,
+                    "spread_regime": None,
+                    "forecast_delta_bucket": "flat",
+                    "daypart": daypart,
+                    "coverage_class": None,
+                    "priority": 20,
+                    "support_count": support_count,
+                    "recommended_strategy_mode": StrategyMode.DIRECTIONAL_UNRESOLVED.value,
+                    "force_stand_down_reason": None,
+                    "strategy_quality_edge_buffer_bps": 50,
+                }
+            )
+
         candidates.sort(key=lambda item: (-item["support_count"], item["priority"], item["rule_id"]))
         return candidates
 
