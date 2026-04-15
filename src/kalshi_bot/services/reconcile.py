@@ -74,7 +74,17 @@ class ReconciliationService:
             client_order_id = _stringish(order.get("client_order_id"), _stringish(order.get("order_id"), "unknown"))
             market_ticker = _stringish(order.get("ticker") or order.get("market_ticker"), "unknown")
             yes_price = order.get("yes_price_dollars") or order.get("price_dollars") or "0.5000"
-            count = order.get("count_fp") or order.get("remaining_count_fp") or "1.00"
+            # Kalshi uses "initial_count_fp" (not "count_fp") in order objects.
+            # "remaining_count_fp" = 0 for filled/canceled IOC orders — skip those.
+            raw_count = (
+                order.get("initial_count_fp")
+                or order.get("count_fp")
+                or order.get("remaining_count_fp")
+                or "0"
+            )
+            if as_decimal(raw_count) <= Decimal("0"):
+                continue
+            count = raw_count
             await repo.upsert_order(
                 client_order_id=client_order_id,
                 market_ticker=market_ticker,
