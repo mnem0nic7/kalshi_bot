@@ -219,6 +219,10 @@ class OpenMeteoForecastArchiveClient:
                 last_error = exc
             except httpx.HTTPError as exc:
                 last_error = exc
+            except (ValueError, Exception) as exc:
+                # Catches json.JSONDecodeError (subclass of ValueError) when the
+                # server returns a 200 with an empty or non-JSON body.
+                last_error = exc
             if attempt < retries:
                 await asyncio.sleep(0.25 * (attempt + 1))
         if last_error is not None:
