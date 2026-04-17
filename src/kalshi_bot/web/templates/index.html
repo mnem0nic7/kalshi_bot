@@ -178,6 +178,9 @@
               <span data-seconds="{{ health.daemon.heartbeat_age_seconds if health.daemon.heartbeat_age_seconds is not none else '' }}">
                 age {{ health.daemon.heartbeat_age_seconds if health.daemon.heartbeat_age_seconds is not none else "n/a" }}s
               </span>
+              <span class="muted" data-timestamp="{{ health.daemon.last_reconcile_at or '' }}">
+                reconcile {{ health.daemon.last_reconcile_at or "never" }}
+              </span>
             </div>
             {% endfor %}
           </div>

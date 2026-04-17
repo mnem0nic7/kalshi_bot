@@ -601,7 +601,8 @@
         top,
         element("span", null, `app ${((health.app || {}).status) || "unknown"}`),
         element("span", null, `daemon ${((health.daemon || {}).healthy) ? "healthy" : "unhealthy"}`),
-        element("span", "muted", `heartbeat ${formatDurationSeconds((health.daemon || {}).heartbeat_age_seconds)}`)
+        element("span", "muted", `heartbeat ${formatDurationSeconds((health.daemon || {}).heartbeat_age_seconds)}`),
+        element("span", "muted", `reconcile ${(health.daemon || {}).last_reconcile_at ? formatDateTime((health.daemon || {}).last_reconcile_at) : "never"}`)
       );
       runtimeGrid.append(card);
     });

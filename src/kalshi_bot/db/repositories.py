@@ -2139,7 +2139,12 @@ class PlatformRepository:
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def list_positions(self, limit: int = 50) -> list[PositionRecord]:
-        result = await self.session.execute(select(PositionRecord).order_by(PositionRecord.updated_at.desc()).limit(limit))
+        result = await self.session.execute(
+            select(PositionRecord)
+            .where(PositionRecord.count_fp != 0)
+            .order_by(PositionRecord.updated_at.desc())
+            .limit(limit)
+        )
         return list(result.scalars())
 
     async def list_ops_events(self, limit: int = 50) -> list[OpsEvent]:
