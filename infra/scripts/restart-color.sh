@@ -42,9 +42,17 @@ wait_for_service_health() {
   return 1
 }
 
-docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps --force-recreate "app_${color}" "daemon_${color}"
+# Stop containers explicitly first to avoid Docker removal race conditions
+docker compose -f "${compose_file}" ${compose_env_file} stop "app_${color}" "daemon_${color}" 2>/dev/null || true
+docker compose -f "${compose_file}" ${compose_env_file} rm -f "app_${color}" "daemon_${color}" 2>/dev/null || true
+
+docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps "app_${color}" "daemon_${color}"
 wait_for_service_health "app_${color}" 180
-docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps --force-recreate nginx
+
+# Stop and remove nginx explicitly before recreating to avoid removal-in-progress errors
+docker compose -f "${compose_file}" ${compose_env_file} stop nginx 2>/dev/null || true
+docker compose -f "${compose_file}" ${compose_env_file} rm -f nginx 2>/dev/null || true
+docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps nginx
 wait_for_service_health nginx 90
 
 echo "Recreated ${color} and refreshed nginx"
