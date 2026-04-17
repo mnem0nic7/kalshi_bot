@@ -388,6 +388,20 @@ class PlatformRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def reap_orphaned_rooms(self, *, color: str) -> list[str]:
+        """Mark all non-terminal rooms for *color* as failed. Returns IDs reaped."""
+        stmt = select(Room).where(
+            Room.stage.not_in([RoomStage.COMPLETE.value, RoomStage.FAILED.value]),
+            Room.active_color == color,
+        )
+        rooms = list((await self.session.execute(stmt)).scalars())
+        now = datetime.now(UTC)
+        for room in rooms:
+            room.stage = RoomStage.FAILED.value
+            room.updated_at = now
+        await self.session.flush()
+        return [room.id for room in rooms]
+
     async def update_room_stage(self, room_id: str, stage: RoomStage) -> None:
         room = await self.get_room(room_id)
         if room is not None:

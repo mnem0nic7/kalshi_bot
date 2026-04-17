@@ -66,6 +66,20 @@ class DaemonService:
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
 
+    async def _recover_orphaned_rooms(self) -> None:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            reaped_ids = await repo.reap_orphaned_rooms(color=self.settings.app_color)
+            if reaped_ids:
+                await repo.log_ops_event(
+                    severity="warning",
+                    summary=f"Daemon startup: reaped {len(reaped_ids)} orphaned room(s) from prior run",
+                    source="daemon",
+                    payload={"room_ids": reaped_ids, "color": self.settings.app_color},
+                )
+                logger.warning("Reaped %d orphaned room(s) on startup: %s", len(reaped_ids), reaped_ids)
+            await session.commit()
+
     async def reconcile_once(self) -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -147,6 +161,7 @@ class DaemonService:
         should_auto_trigger = self.settings.trigger_enable_auto_rooms if auto_trigger is None else auto_trigger
         self._auto_trigger_enabled_for_run = should_auto_trigger
 
+        await self._recover_orphaned_rooms()
         if self.settings.daemon_start_with_reconcile:
             await self.reconcile_once()
         self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
