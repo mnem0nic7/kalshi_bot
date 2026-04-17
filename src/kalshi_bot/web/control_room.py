@@ -183,6 +183,20 @@ def _room_view(bundle: Any) -> dict[str, Any]:
     }
 
 
+def _position_view(position: Any) -> dict[str, Any]:
+    count = _decimal_or_zero(position.count_fp)
+    avg_price = _decimal_or_zero(position.average_price_dollars)
+    notional = (count * avg_price).quantize(Decimal("0.01"))
+    return {
+        "market_ticker": position.market_ticker,
+        "side": position.side,
+        "count_fp": str(count.quantize(Decimal("0.01"))),
+        "average_price_dollars": str(avg_price.quantize(Decimal("0.0001"))),
+        "notional_dollars": str(notional),
+        "updated_at": _iso_or_none(position.updated_at),
+    }
+
+
 def _positions_summary(positions: list[Any]) -> dict[str, Any]:
     total_contracts = sum(abs(_decimal_or_zero(position.count_fp)) for position in positions)
     return {
@@ -650,6 +664,7 @@ def _overview_payload(
         "next_actions": list(training_status.get("next_actions") or []),
         "ops_events": [_ops_event_view(event) for event in ops_events],
         "positions_summary": _positions_summary(positions),
+        "positions": [_position_view(p) for p in positions],
         "self_improve": self_improve_status,
         "heuristics": heuristic_status,
     }

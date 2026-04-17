@@ -136,6 +136,30 @@
           </div>
         </article>
 
+        <article class="control-card control-card-wide">
+          <div class="control-card-header">
+            <h2>Open Positions</h2>
+          </div>
+          {% if initial_tab_payload.positions %}
+          <table class="positions-table">
+            <thead><tr><th>Market</th><th>Side</th><th>Contracts</th><th>Avg Price</th><th>Notional</th></tr></thead>
+            <tbody>
+              {% for pos in initial_tab_payload.positions %}
+              <tr>
+                <td class="mono">{{ pos.market_ticker }}</td>
+                <td><span class="status-pill {% if pos.side == 'yes' %}status-good{% else %}status-warning{% endif %}">{{ pos.side }}</span></td>
+                <td class="mono">{{ pos.count_fp }}</td>
+                <td class="mono">${{ pos.average_price_dollars }}</td>
+                <td class="mono">${{ pos.notional_dollars }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+          {% else %}
+          <p class="empty-state">No open positions.</p>
+          {% endif %}
+        </article>
+
         <article class="control-card">
           <div class="control-card-header">
             <h2>Runtime Health</h2>

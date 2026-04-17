@@ -467,6 +467,35 @@
   justify-self: start;
 }
 
+.positions-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.positions-table th,
+.positions-table td {
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.positions-table th {
+  font-size: 0.78rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #9fb2cb;
+}
+
+.positions-table td {
+  color: #eef4fd;
+  font-size: 0.95rem;
+}
+
+.mono {
+  font-family: ui-monospace, "Cascadia Code", "Source Code Pro", monospace;
+  font-size: 0.9rem;
+}
+
 .intel-conf {
   display: grid;
   gap: 0.3rem;
