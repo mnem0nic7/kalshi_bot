@@ -3311,9 +3311,17 @@ class HistoricalTrainingService:
             "units": "standard",
             "format": "json",
         }
-        response = await self.client.get(self.NCEI_DAILY_SUMMARY_URL, params=params)
-        response.raise_for_status()
-        rows = response.json()
+        try:
+            response = await self.client.get(self.NCEI_DAILY_SUMMARY_URL, params=params)
+            response.raise_for_status()
+            rows = response.json()
+        except (httpx.TimeoutException, httpx.HTTPError, ValueError):
+            return {
+                "status": self.SETTLEMENT_MISSING,
+                "daily_high_f": None,
+                "result": None,
+                "mismatch_reason": self.SETTLEMENT_MISMATCH_REASON_MISSING,
+            }
         if not isinstance(rows, list) or not rows:
             return {
                 "status": self.SETTLEMENT_MISSING,

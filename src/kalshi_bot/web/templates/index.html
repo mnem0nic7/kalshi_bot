@@ -8,8 +8,6 @@
   <section class="control-room-hero panel">
     <div class="control-room-hero-copy">
       <h1>Control Room</h1>
-      <p>Monitor runtime health, research freshness, room outcomes, and historical support without living in a 17kpx scroll wall.</p>
-      <p class="control-room-hero-note">Need the operator walkthrough? Open the <a href="/faq">FAQ</a>.</p>
     </div>
     <div class="control-room-refresh-bar" id="control-room-refresh-bar">
       <div class="control-room-refresh-meta">
@@ -78,17 +76,16 @@
         blocked {{ initial_summary.room_outcomes.blocked }} · stand down {{ initial_summary.room_outcomes.stand_down }} · failed {{ initial_summary.room_outcomes.failed }}
       </span>
     </article>
-    <article class="summary-card" data-summary-card="quality-debt">
+    <article class="summary-card{% if initial_summary.error_alert.error_count > 0 %} summary-card-critical{% elif initial_summary.error_alert.warning_count > 0 %} summary-card-warn{% endif %}" data-summary-card="error-events">
       <div class="summary-card-heading">
-        <span class="summary-card-label">Quality Debt</span>
+        <span class="summary-card-label">Error Events</span>
+        <span class="status-pill {% if initial_summary.error_alert.error_count > 0 %}status-bad{% elif initial_summary.error_alert.warning_count > 0 %}status-warning{% else %}status-good{% endif %}">
+          {{ "ERRORS" if initial_summary.error_alert.error_count > 0 else ("WARNINGS" if initial_summary.error_alert.warning_count > 0 else "CLEAR") }}
+        </span>
       </div>
-      <strong class="summary-card-value">{{ initial_summary.quality_debt.total }}</strong>
-      <span class="summary-card-detail">
-        stale {{ initial_summary.quality_debt.stale_mismatch_count }} · missed {{ initial_summary.quality_debt.missed_stand_down_count }} · weak {{ initial_summary.quality_debt.weak_resolved_trade_count or 0 }}
-      </span>
-      <span class="summary-card-subdetail">
-        recent stale {{ initial_summary.quality_debt.recent_stale_mismatch_count }} · recent missed {{ initial_summary.quality_debt.recent_missed_stand_down_count or 0 }}
-      </span>
+      <strong class="summary-card-value">{{ initial_summary.error_alert.error_count }}</strong>
+      <span class="summary-card-detail">{{ initial_summary.error_alert.warning_count }} warnings (24h)</span>
+      <span class="summary-card-subdetail">{{ initial_summary.error_alert.most_recent or "No recent errors." }}</span>
     </article>
   </section>
 
@@ -120,7 +117,6 @@
         <article class="control-card control-card-actions">
           <div class="control-card-header">
             <h2>Deployment Controls</h2>
-            <p>Critical operator actions are grouped and confirmation-gated.</p>
           </div>
           <div class="control-action-groups">
             <div class="action-group">
@@ -143,7 +139,6 @@
         <article class="control-card">
           <div class="control-card-header">
             <h2>Runtime Health</h2>
-            <p>Per-color app and daemon freshness with combined health state.</p>
           </div>
           <div class="runtime-health-grid">
             {% for color, health in initial_tab_payload.runtime_health.colors.items() %}
@@ -167,7 +162,6 @@
         <article class="control-card">
           <div class="control-card-header">
             <h2>Top Blockers</h2>
-            <p>The highest-signal problems from training and settlement status.</p>
           </div>
           <div class="token-list">
             {% for blocker in initial_tab_payload.top_blockers %}
@@ -181,7 +175,6 @@
         <article class="control-card">
           <div class="control-card-header">
             <h2>Next Actions</h2>
-            <p>The next operational moves the system is already recommending.</p>
           </div>
           <div class="token-list">
             {% for item in initial_tab_payload.next_actions %}
@@ -195,12 +188,11 @@
         <article class="control-card">
           <div class="control-card-header">
             <h2>Recent Ops</h2>
-            <p>Compact event stream for the latest runtime activity.</p>
           </div>
           <div class="compact-list">
-            {% for event in initial_tab_payload.ops_events %}
+            {% for event in initial_tab_payload.ops_events | sort(attribute='severity') %}
             <div class="compact-row">
-              <span class="status-pill">{{ event.severity }}</span>
+              <span class="status-pill {% if event.severity == 'error' %}status-bad{% elif event.severity == 'warning' %}status-warning{% else %}status-neutral{% endif %}">{{ event.severity }}</span>
               <div class="compact-row-body">
                 <strong>{{ event.summary }}</strong>
                 <span>{{ event.source }}</span>
@@ -209,23 +201,6 @@
             {% else %}
             <p>No ops events recorded yet.</p>
             {% endfor %}
-          </div>
-        </article>
-
-        <article class="control-card">
-          <div class="control-card-header">
-            <h2>Self Improve</h2>
-            <p>Pack status and rollout actions live here instead of competing with training history.</p>
-          </div>
-          <div class="stat-list">
-            <div><span>Champion</span><strong>{{ initial_tab_payload.self_improve.agent_packs.champion_version or "n/a" }}</strong></div>
-            <div><span>Candidate</span><strong>{{ initial_tab_payload.self_improve.agent_packs.candidate_version or "none" }}</strong></div>
-            <div><span>Blue</span><strong>{{ initial_tab_payload.self_improve.agent_packs.blue_version or "n/a" }}</strong></div>
-            <div><span>Green</span><strong>{{ initial_tab_payload.self_improve.agent_packs.green_version or "n/a" }}</strong></div>
-          </div>
-          <div class="actions">
-            <button type="button" class="button button-secondary" data-action="run-critique">Run Critique</button>
-            <button type="button" class="button button-danger" data-action="rollback-pack">Rollback Pack</button>
           </div>
         </article>
       </div>

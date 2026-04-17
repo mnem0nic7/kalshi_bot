@@ -41,6 +41,20 @@ def logistic_probability(delta_f: float, spread_f: float = 3.5) -> float:
     return 1.0 / (1.0 + math.exp(-delta_f / spread))
 
 
+def _adaptive_spread_f(delta_f: float) -> float:
+    """Widen logistic spread near threshold to avoid overconfident predictions.
+
+    Historical backtests show flat-delta markets (|delta| < 3°F) are near
+    coin-flip regardless of the NWS forecast. Widening the spread reduces
+    overconfident fair-value estimates in these hard-to-call regimes.
+    """
+    if abs(delta_f) < 2.0:
+        return 6.0   # very flat: ~0.43–0.57 range instead of ~0.36–0.64
+    if abs(delta_f) < 4.0:
+        return 4.5   # near-threshold zone
+    return 3.5       # comfortable delta: standard spread
+
+
 @dataclass(slots=True)
 class WeatherSignalSnapshot:
     fair_yes_dollars: Decimal
@@ -96,7 +110,8 @@ def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[s
         delta_f = forecast_high_f - mapping.threshold_f
         if mapping.operator in ("<", "<="):
             delta_f = -delta_f
-        probability = logistic_probability(delta_f)
+        adaptive_spread = _adaptive_spread_f(delta_f)
+        probability = logistic_probability(delta_f, spread_f=adaptive_spread)
         fair = quantize_price(probability)
         confidence = min(0.95, 0.45 + min(abs(delta_f) / 12, 0.35) + (0.15 if current_temp_f is not None else 0.0))
         summary = (
