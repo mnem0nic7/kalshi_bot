@@ -119,37 +119,93 @@ def _pnl_tone(value: Decimal | None) -> str:
     return "neutral"
 
 
+def _capital_bucket_from_signal_payload(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return "risky"
+    explicit = str(payload.get("capital_bucket") or "").strip().lower()
+    if explicit in {"safe", "risky"}:
+        return explicit
+    trade_regime = str(payload.get("trade_regime") or "").strip().lower()
+    if trade_regime in {"near_threshold", "longshot_yes", "longshot_no"}:
+        return "risky"
+    if trade_regime == "standard":
+        return "safe"
+    return "risky"
+
+
+def _dossier_value(dossier: Any | None, key: str, *, fallback_key: str | None = None, default: Any = None) -> Any:
+    if dossier is None:
+        return default
+    if isinstance(dossier, dict):
+        if key in dossier:
+            return dossier.get(key, default)
+        trader_context = dossier.get("trader_context") or {}
+        if fallback_key is not None:
+            return trader_context.get(fallback_key, default)
+        return trader_context.get(key, default)
+    if hasattr(dossier, key):
+        return getattr(dossier, key)
+    trader_context = getattr(dossier, "trader_context", None)
+    if trader_context is not None:
+        return getattr(trader_context, fallback_key or key, default)
+    return default
+
+
 def _midpoint(lower: Decimal | None, upper: Decimal | None) -> Decimal | None:
     if lower is not None and upper is not None:
         return ((lower + upper) / Decimal("2")).quantize(Decimal("0.0001"))
     return lower if lower is not None else upper
 
 
+def _market_field(source: Any | None, field: str) -> Any | None:
+    if source is None:
+        return None
+    if isinstance(source, dict):
+        payload = source.get("market", source)
+        return payload.get(field)
+    return getattr(source, field, None)
+
+
 def _position_mark_price(position_side: str, market_state: Any | None) -> tuple[Decimal | None, str | None]:
     if market_state is None:
         return None, None
 
-    yes_bid = _quote_or_none(getattr(market_state, "yes_bid_dollars", None))
-    yes_ask = _quote_or_none(getattr(market_state, "yes_ask_dollars", None))
-    last_trade = _quote_or_none(getattr(market_state, "last_trade_dollars", None))
+    yes_bid = _quote_or_none(_market_field(market_state, "yes_bid_dollars"))
+    yes_ask = _quote_or_none(_market_field(market_state, "yes_ask_dollars"))
+    no_bid = _quote_or_none(_market_field(market_state, "no_bid_dollars"))
+    no_ask = _quote_or_none(_market_field(market_state, "no_ask_dollars"))
+    last_trade = (
+        _quote_or_none(_market_field(market_state, "last_price_dollars"))
+        or _quote_or_none(_market_field(market_state, "last_trade_dollars"))
+    )
 
     if position_side == "no":
-        if yes_bid is not None and yes_ask is not None:
-            no_bid = (Decimal("1.0000") - yes_ask).quantize(Decimal("0.0001"))
-            no_ask = (Decimal("1.0000") - yes_bid).quantize(Decimal("0.0001"))
+        if last_trade is not None:
+            return (Decimal("1.0000") - last_trade).quantize(Decimal("0.0001")), "last_trade"
+        if no_bid is not None and no_ask is not None:
             mark = _midpoint(no_bid, no_ask)
             if mark is not None:
                 return mark, "midpoint"
-        if last_trade is not None:
-            return (Decimal("1.0000") - last_trade).quantize(Decimal("0.0001")), "last_trade"
+        if yes_bid is not None and yes_ask is not None:
+            derived_no_bid = (Decimal("1.0000") - yes_ask).quantize(Decimal("0.0001"))
+            derived_no_ask = (Decimal("1.0000") - yes_bid).quantize(Decimal("0.0001"))
+            mark = _midpoint(derived_no_bid, derived_no_ask)
+            if mark is not None:
+                return mark, "midpoint"
         return None, None
 
+    if last_trade is not None:
+        return last_trade, "last_trade"
     if yes_bid is not None and yes_ask is not None:
         mark = _midpoint(yes_bid, yes_ask)
         if mark is not None:
             return mark, "midpoint"
-    if last_trade is not None:
-        return last_trade, "last_trade"
+    if no_bid is not None and no_ask is not None:
+        derived_yes_bid = (Decimal("1.0000") - no_ask).quantize(Decimal("0.0001"))
+        derived_yes_ask = (Decimal("1.0000") - no_bid).quantize(Decimal("0.0001"))
+        mark = _midpoint(derived_yes_bid, derived_yes_ask)
+        if mark is not None:
+            return mark, "midpoint"
     return None, None
 
 
@@ -331,13 +387,23 @@ def _room_view(bundle: Any) -> dict[str, Any]:
     }
 
 
-def _position_view(position: Any, market_state: Any | None = None) -> dict[str, Any]:
+def _position_view(
+    position: Any,
+    market_state: Any | None = None,
+    live_market: Any | None = None,
+    dossier: Any | None = None,
+    signal_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     count = _decimal_or_zero(position.count_fp)
     avg_price = _decimal_or_zero(position.average_price_dollars)
     notional = (count * avg_price).quantize(Decimal("0.01"))
-    mark_price, mark_source = _position_mark_price(str(position.side), market_state)
+    mark_price, mark_source = _position_mark_price(str(position.side), live_market)
+    if mark_price is None:
+        mark_price, mark_source = _position_mark_price(str(position.side), market_state)
     current_value = (count * mark_price).quantize(Decimal("0.01")) if mark_price is not None else None
     unrealized_pnl = (current_value - notional).quantize(Decimal("0.01")) if current_value is not None else None
+    recommended_size_cap_fp = _decimal_or_none(_dossier_value(dossier, "recommended_size_cap_fp"))
+    model_quality_reasons = [str(reason) for reason in (_dossier_value(dossier, "model_quality_reasons", default=[]) or [])]
     return {
         "market_ticker": position.market_ticker,
         "side": position.side,
@@ -355,7 +421,37 @@ def _position_view(position: Any, market_state: Any | None = None) -> dict[str, 
         "unrealized_pnl_tone": _pnl_tone(unrealized_pnl),
         "mark_source": mark_source,
         "mark_observed_at": _iso_or_none(getattr(market_state, "observed_at", None)),
+        "trade_regime": str(_dossier_value(dossier, "trade_regime", default="standard") or "standard"),
+        "model_quality_status": str(_dossier_value(dossier, "model_quality_status", default="pass") or "pass"),
+        "model_quality_reasons": model_quality_reasons,
+        "recommended_size_cap_fp": str(recommended_size_cap_fp) if recommended_size_cap_fp is not None else None,
+        "warn_only_blocked": bool(_dossier_value(dossier, "warn_only_blocked", default=False)),
+        "capital_bucket": _capital_bucket_from_signal_payload(signal_payload),
         "updated_at": _iso_or_none(position.updated_at),
+    }
+
+
+async def _load_live_position_markets(container: AppContainer, positions: list[Any]) -> dict[str, dict[str, Any]]:
+    kalshi_client = getattr(container, "kalshi", None)
+    if kalshi_client is None or not positions:
+        return {}
+
+    tickers = list(dict.fromkeys(str(position.market_ticker) for position in positions if getattr(position, "market_ticker", None)))
+    if not tickers:
+        return {}
+
+    async def fetch_market(ticker: str) -> tuple[str, dict[str, Any] | None]:
+        try:
+            return ticker, await kalshi_client.get_market(ticker)
+        except Exception:
+            logger.warning("Failed to load live market quote for dashboard position %s", ticker, exc_info=True)
+            return ticker, None
+
+    results = await asyncio.gather(*(fetch_market(ticker) for ticker in tickers))
+    return {
+        ticker: payload
+        for ticker, payload in results
+        if payload is not None
     }
 
 
@@ -377,6 +473,38 @@ def _positions_summary(positions: list[Any], position_views: list[dict[str, Any]
         "total_notional_dollars": str(total_notional.quantize(Decimal("0.01"))) if positions else "0.00",
         "total_unrealized_pnl_dollars": str(total_unrealized) if total_unrealized is not None else None,
         "has_pnl_summary": total_unrealized is not None,
+    }
+
+
+def _capital_bucket_summary(snapshot: Any) -> dict[str, Any]:
+    return {
+        "safe_used_dollars": str(snapshot.safe_used_dollars),
+        "safe_used_display": _money_display(snapshot.safe_used_dollars),
+        "safe_remaining_dollars": str(snapshot.safe_remaining_dollars),
+        "safe_remaining_display": _money_display(snapshot.safe_remaining_dollars),
+        "safe_reserve_target_dollars": str(snapshot.safe_reserve_target_dollars),
+        "safe_reserve_target_display": _money_display(snapshot.safe_reserve_target_dollars),
+        "risky_used_dollars": str(snapshot.risky_used_dollars),
+        "risky_used_display": _money_display(snapshot.risky_used_dollars),
+        "risky_limit_dollars": str(snapshot.risky_limit_dollars),
+        "risky_limit_display": _money_display(snapshot.risky_limit_dollars),
+        "risky_remaining_dollars": str(snapshot.risky_remaining_dollars),
+        "risky_remaining_display": _money_display(snapshot.risky_remaining_dollars),
+        "overall_used_dollars": str(snapshot.overall_used_dollars),
+        "overall_used_display": _money_display(snapshot.overall_used_dollars),
+        "overall_remaining_dollars": str(snapshot.overall_remaining_dollars),
+        "overall_remaining_display": _money_display(snapshot.overall_remaining_dollars),
+    }
+
+
+def _active_room_view(room: Any) -> dict[str, Any]:
+    return {
+        "id": room.id,
+        "market_ticker": room.market_ticker,
+        "stage": room.stage,
+        "active_color": room.active_color,
+        "created_at": _iso_or_none(room.created_at),
+        "updated_at": _iso_or_none(room.updated_at),
     }
 
 
@@ -1088,9 +1216,31 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         repo = PlatformRepository(session)
         positions = await repo.list_positions(limit=100, kalshi_env=kalshi_env)
         ops_events = await repo.list_ops_events(limit=50)
+        active_rooms = await repo.list_active_rooms(
+            kalshi_env=kalshi_env,
+            updated_within_seconds=container.settings.trigger_active_room_stale_seconds,
+            limit=20,
+        )
         market_states = await repo.list_market_states([position.market_ticker for position in positions])
         balance_checkpoint = await repo.get_checkpoint("reconcile")
         runtime_health = await container.watchdog_service.get_status(repo)
+        pack = await container.agent_pack_service.get_pack_for_color(repo, container.settings.app_color)
+        thresholds = container.agent_pack_service.runtime_thresholds(pack)
+        signal_payload_by_ticker = await repo.latest_signal_payloads_for_markets(
+            market_tickers=[position.market_ticker for position in positions],
+            kalshi_env=kalshi_env,
+        )
+        capital_buckets = await repo.portfolio_bucket_snapshot(
+            kalshi_env=kalshi_env,
+            subaccount=container.settings.kalshi_subaccount,
+            total_capital_dollars=Decimal(str(thresholds.risk_max_position_notional_dollars)),
+            safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
+            risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
+        )
+        dossier_by_ticker = {
+            position.market_ticker: await repo.get_research_dossier(position.market_ticker)
+            for position in positions
+        }
         await session.commit()
 
     severity_rank = {"error": 0, "warning": 1, "info": 2}
@@ -1099,14 +1249,27 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         key=lambda e: severity_rank.get(e.severity, 3),
     )
     market_state_by_ticker = {item.market_ticker: item for item in market_states}
-    position_views = [_position_view(position, market_state_by_ticker.get(position.market_ticker)) for position in positions]
+    live_market_by_ticker = await _load_live_position_markets(container, positions)
+    position_views = [
+        _position_view(
+            position,
+            market_state_by_ticker.get(position.market_ticker),
+            live_market_by_ticker.get(position.market_ticker),
+            dossier_by_ticker.get(position.market_ticker).payload if dossier_by_ticker.get(position.market_ticker) is not None else None,
+            signal_payload_by_ticker.get(position.market_ticker),
+        )
+        for position in positions
+    ]
+    positions_summary = _positions_summary(positions, position_views)
+    positions_summary["capital_buckets"] = _capital_bucket_summary(capital_buckets)
     return {
         "kalshi_env": kalshi_env,
         "as_of": now.isoformat(),
         "portfolio": _balance_summary(balance_checkpoint, position_views),
-        "positions_summary": _positions_summary(positions, position_views),
+        "positions_summary": positions_summary,
         "positions": position_views,
         "alerts": [_ops_event_view(e) for e in alerts],
+        "active_rooms": [_active_room_view(r) for r in active_rooms],
         "runtime_health": runtime_health,
     }
 

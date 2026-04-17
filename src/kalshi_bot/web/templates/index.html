@@ -57,6 +57,27 @@
             {% if errors %}{{ errors | length }} error{{ "s" if errors | length != 1 }}{% elif warnings %}{{ warnings | length }} warning{{ "s" if warnings | length != 1 }}{% else %}Clear{% endif %}
           </span>
         </div>
+
+        <section class="dash-subsection active-rooms-section">
+          <div class="dash-subsection-header">
+            <h3>Active rooms</h3>
+            <span class="muted-label active-rooms-count">{{ env_data.active_rooms | length }} active</span>
+          </div>
+          {% if env_data.active_rooms %}
+          <ul class="active-rooms-list">
+            {% for room in env_data.active_rooms %}
+            <li class="active-room-row">
+              <span class="mono active-room-ticker">{{ room.market_ticker }}</span>
+              <span class="status-pill status-neutral active-room-stage">{{ room.stage }}</span>
+              {% if room.updated_at %}<span class="muted-label" data-timestamp="{{ room.updated_at }}">{{ room.updated_at }}</span>{% endif %}
+            </li>
+            {% endfor %}
+          </ul>
+          {% else %}
+          <p class="empty-state">No active rooms.</p>
+          {% endif %}
+        </section>
+
         {% if env_data.alerts %}
         <div class="alert-list">
           {% for alert in env_data.alerts %}
@@ -76,7 +97,15 @@
 
       <article class="dash-card dash-card-positions">
         <div class="dash-card-header">
-          <h2>Open Positions</h2>
+          <div class="dash-card-title-block">
+            <h2>Open Positions</h2>
+            {% if env_data.positions_summary.capital_buckets %}
+            <span class="muted-label bucket-usage-line">
+              Safe {{ env_data.positions_summary.capital_buckets.safe_used_display }} used ·
+              Risky {{ env_data.positions_summary.capital_buckets.risky_used_display }} / {{ env_data.positions_summary.capital_buckets.risky_limit_display }}
+            </span>
+            {% endif %}
+          </div>
           <span class="muted-label">{{ env_data.positions | length }} position{{ "s" if env_data.positions | length != 1 }}</span>
         </div>
         {% if env_data.positions %}
@@ -88,7 +117,20 @@
             <tbody>
               {% for pos in env_data.positions %}
               <tr>
-                <td class="mono">{{ pos.market_ticker }}</td>
+                <td>
+                  <div class="position-market">
+                    <span class="mono">{{ pos.market_ticker }}</span>
+                    {% if pos.model_quality_status == "warn" %}
+                    {% set oversized = pos.recommended_size_cap_fp and (pos.count_fp | float) > (pos.recommended_size_cap_fp | float) %}
+                    <div class="position-flags" {% if pos.model_quality_reasons %}title="{{ pos.model_quality_reasons | join(' ') }}"{% endif %}>
+                      {% if pos.trade_regime == "near_threshold" %}<span class="position-flag">Near Threshold</span>{% endif %}
+                      {% if pos.trade_regime in ["longshot_yes", "longshot_no"] %}<span class="position-flag">Longshot</span>{% endif %}
+                      {% if pos.warn_only_blocked %}<span class="position-flag">Broken Book</span>{% endif %}
+                      {% if oversized %}<span class="position-flag">Oversized</span>{% endif %}
+                    </div>
+                    {% endif %}
+                  </div>
+                </td>
                 <td><span class="status-pill {% if pos.side == 'yes' %}status-good{% else %}status-warning{% endif %}">{{ pos.side }}</span></td>
                 <td class="mono">{{ pos.count_fp }}</td>
                 <td class="mono">{{ pos.average_price_display }}</td>

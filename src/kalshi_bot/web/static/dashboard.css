@@ -1,5 +1,5 @@
 .shell-main.shell-main-wide {
-  max-width: 1100px;
+  max-width: 1320px;
 }
 
 .dashboard {
@@ -82,7 +82,7 @@
 .dash-grid {
   display: grid;
   gap: 1rem;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr);
+  grid-template-columns: minmax(320px, 0.9fr) minmax(0, 1.7fr);
 }
 
 /* Cards */
@@ -107,7 +107,7 @@
 .dash-card-header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.75rem;
 }
 
@@ -116,6 +116,68 @@
   font-size: 1rem;
   font-weight: 700;
   letter-spacing: 0.02em;
+}
+
+.dash-card-title-block {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.bucket-usage-line {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+/* Active rooms (within alerts card) */
+.dash-subsection {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.dash-subsection-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.dash-subsection-header h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #c5d3e8;
+}
+
+.active-rooms-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.active-room-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+}
+
+.active-room-ticker {
+  color: #eef4fd;
+}
+
+.active-room-stage {
+  font-size: 0.72rem;
+  padding: 0.15rem 0.5rem;
 }
 
 /* Alerts */
@@ -163,7 +225,7 @@
 .positions-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 720px;
+  min-width: 680px;
 }
 
 .positions-table th,
@@ -183,6 +245,31 @@
 .positions-table td {
   color: #eef4fd;
   font-size: 0.95rem;
+}
+
+.position-market {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.position-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.position-flag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.18rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #f4d27b;
+  background: rgba(244, 210, 123, 0.12);
+  border: 1px solid rgba(244, 210, 123, 0.18);
 }
 
 .positions-table tbody tr:last-child td {

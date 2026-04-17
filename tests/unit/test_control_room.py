@@ -359,15 +359,15 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     market_states = [
         SimpleNamespace(
             market_ticker="KXHIGHCHI-26APR17-T79",
-            yes_bid_dollars=Decimal("0.4800"),
-            yes_ask_dollars=Decimal("0.5200"),
+            yes_bid_dollars=Decimal("0.0400"),
+            yes_ask_dollars=None,
             last_trade_dollars=None,
             observed_at=now,
         ),
         SimpleNamespace(
             market_ticker="KXHIGHTSFO-26APR17-T71",
-            yes_bid_dollars=Decimal("0.1500"),
-            yes_ask_dollars=Decimal("0.1700"),
+            yes_bid_dollars=None,
+            yes_ask_dollars=None,
             last_trade_dollars=None,
             observed_at=now,
         ),
@@ -377,7 +377,13 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
         def __init__(self, _session) -> None:
             pass
 
-        async def list_positions(self, *, limit: int, kalshi_env: str | None = None) -> list[SimpleNamespace]:
+        async def list_positions(
+            self,
+            *,
+            limit: int,
+            kalshi_env: str | None = None,
+            subaccount: int | None = None,
+        ) -> list[SimpleNamespace]:
             assert limit == 100
             assert kalshi_env == "demo"
             return positions
@@ -397,11 +403,101 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
                 updated_at=now,
             )
 
+        async def get_research_dossier(self, market_ticker: str) -> SimpleNamespace | None:
+            payloads = {
+                "KXHIGHCHI-26APR17-T79": {
+                    "trade_regime": "standard",
+                    "model_quality_status": "warn",
+                    "model_quality_reasons": ["Strict quality review would block this setup because the order book is effectively broken."],
+                    "recommended_size_cap_fp": None,
+                    "warn_only_blocked": True,
+                },
+                "KXHIGHTSFO-26APR17-T71": {
+                    "trade_regime": "near_threshold",
+                    "model_quality_status": "warn",
+                    "model_quality_reasons": ["Near-threshold setup carries low confidence and should be sized conservatively."],
+                    "recommended_size_cap_fp": "10.00",
+                    "warn_only_blocked": False,
+                },
+            }
+            payload = payloads.get(market_ticker)
+            return SimpleNamespace(payload=payload) if payload is not None else None
+
+        async def latest_signal_payloads_for_markets(
+            self,
+            *,
+            market_tickers: list[str],
+            kalshi_env: str,
+        ) -> dict[str, dict[str, str]]:
+            assert market_tickers == [position.market_ticker for position in positions]
+            assert kalshi_env == "demo"
+            return {
+                "KXHIGHCHI-26APR17-T79": {"capital_bucket": "safe", "trade_regime": "standard"},
+                "KXHIGHTSFO-26APR17-T71": {"capital_bucket": "risky", "trade_regime": "near_threshold"},
+            }
+
+        async def list_active_rooms(
+            self,
+            *,
+            kalshi_env: str | None = None,
+            updated_within_seconds: int | None = None,
+            limit: int = 20,
+        ) -> list[SimpleNamespace]:
+            return []
+
+        async def portfolio_bucket_snapshot(
+            self,
+            *,
+            kalshi_env: str,
+            subaccount: int,
+            total_capital_dollars: Decimal,
+            safe_capital_reserve_ratio: float,
+            risky_capital_max_ratio: float,
+        ) -> SimpleNamespace:
+            assert kalshi_env == "demo"
+            assert subaccount == 0
+            assert total_capital_dollars == Decimal("250.0")
+            assert safe_capital_reserve_ratio == 0.70
+            assert risky_capital_max_ratio == 0.30
+            return SimpleNamespace(
+                safe_used_dollars=Decimal("13.4400"),
+                safe_remaining_dollars=Decimal("232.5600"),
+                safe_reserve_target_dollars=Decimal("175.0000"),
+                risky_used_dollars=Decimal("4.0000"),
+                risky_limit_dollars=Decimal("75.0000"),
+                risky_remaining_dollars=Decimal("71.0000"),
+                overall_used_dollars=Decimal("17.4400"),
+                overall_remaining_dollars=Decimal("232.5600"),
+            )
+
     monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
+
+    async def fake_get_market(ticker: str) -> dict[str, str]:
+        markets = {
+            "KXHIGHCHI-26APR17-T79": {
+                "ticker": "KXHIGHCHI-26APR17-T79",
+                "last_price_dollars": "0.5000",
+            },
+            "KXHIGHTSFO-26APR17-T71": {
+                "ticker": "KXHIGHTSFO-26APR17-T71",
+                "last_price_dollars": "0.1600",
+            },
+        }
+        return markets[ticker]
 
     container = SimpleNamespace(
         session_factory=_FakeSessionFactory(),
         watchdog_service=SimpleNamespace(get_status=AsyncMock(return_value={"updated_at": now.isoformat(), "colors": {}})),
+        kalshi=SimpleNamespace(get_market=AsyncMock(side_effect=fake_get_market)),
+        settings=SimpleNamespace(app_color="blue", kalshi_subaccount=0, trigger_active_room_stale_seconds=1800),
+        agent_pack_service=SimpleNamespace(
+            get_pack_for_color=AsyncMock(return_value=SimpleNamespace()),
+            runtime_thresholds=lambda _pack: SimpleNamespace(
+                risk_max_position_notional_dollars=250.0,
+                risk_safe_capital_reserve_ratio=0.70,
+                risk_risky_capital_max_ratio=0.30,
+            ),
+        ),
     )
 
     payload = await control_room_module.build_env_dashboard(container, "demo")
@@ -413,5 +509,12 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert payload["positions_summary"]["has_pnl_summary"] is True
     assert payload["positions"][0]["current_price_display"] == "$0.5000"
     assert payload["positions"][0]["unrealized_pnl_display"] == "-$1.44"
+    assert payload["positions"][0]["model_quality_status"] == "warn"
+    assert payload["positions"][0]["warn_only_blocked"] is True
+    assert payload["positions"][0]["capital_bucket"] == "safe"
     assert payload["positions"][1]["current_price_display"] == "$0.1600"
     assert payload["positions"][1]["unrealized_pnl_display"] == "$0.00"
+    assert payload["positions"][1]["trade_regime"] == "near_threshold"
+    assert payload["positions"][1]["recommended_size_cap_fp"] == "10.00"
+    assert payload["positions_summary"]["capital_buckets"]["risky_limit_display"] == "$75.00"
+    assert container.kalshi.get_market.await_count == 2

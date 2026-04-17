@@ -75,6 +75,39 @@
     });
   }
 
+  function renderActiveRooms(card, rooms) {
+    const section = card.querySelector(".active-rooms-section");
+    if (!section) return;
+    const countLabel = section.querySelector(".active-rooms-count");
+    if (countLabel) countLabel.textContent = `${rooms.length} active`;
+
+    let listEl = section.querySelector(".active-rooms-list");
+    const emptyEl = section.querySelector("p.empty-state");
+    if (!rooms.length) {
+      if (listEl) listEl.remove();
+      if (!emptyEl) section.appendChild(el("p", "empty-state", "No active rooms."));
+      return;
+    }
+    if (emptyEl) emptyEl.remove();
+    if (!listEl) {
+      listEl = el("ul", "active-rooms-list");
+      section.appendChild(listEl);
+    }
+    listEl.replaceChildren(
+      ...rooms.map((r) => {
+        const li = el("li", "active-room-row");
+        li.append(el("span", "mono active-room-ticker", r.market_ticker));
+        li.append(el("span", "status-pill status-neutral active-room-stage", r.stage));
+        if (r.updated_at) {
+          const ts = el("span", "muted-label", formatAge(r.updated_at));
+          ts.dataset.timestamp = r.updated_at;
+          li.appendChild(ts);
+        }
+        return li;
+      })
+    );
+  }
+
   function renderAlerts(card, alerts) {
     const header = card.querySelector(".dash-card-header");
     const errors = alerts.filter((a) => a.severity === "error");
@@ -154,12 +187,33 @@
     const tbody = el("tbody");
     positions.forEach((pos) => {
       const tr = el("tr");
+      const marketTd = el("td");
+      const marketWrap = el("div", "position-market");
+      marketWrap.appendChild(el("span", "mono", pos.market_ticker));
+      if (pos.model_quality_status === "warn") {
+        const flags = [];
+        const count = parseFloat(pos.count_fp || "0");
+        const cap = pos.recommended_size_cap_fp ? parseFloat(pos.recommended_size_cap_fp) : null;
+        if (pos.trade_regime === "near_threshold") flags.push("Near Threshold");
+        if (pos.trade_regime === "longshot_yes" || pos.trade_regime === "longshot_no") flags.push("Longshot");
+        if (pos.warn_only_blocked) flags.push("Broken Book");
+        if (cap != null && Number.isFinite(cap) && count > cap) flags.push("Oversized");
+        if (flags.length) {
+          const flagWrap = el("div", "position-flags");
+          if (Array.isArray(pos.model_quality_reasons) && pos.model_quality_reasons.length) {
+            flagWrap.title = pos.model_quality_reasons.join(" ");
+          }
+          flags.forEach((flag) => flagWrap.appendChild(el("span", "position-flag", flag)));
+          marketWrap.appendChild(flagWrap);
+        }
+      }
+      marketTd.appendChild(marketWrap);
       const sidePill = el("span", `status-pill ${pos.side === "yes" ? "status-good" : "status-warning"}`, pos.side);
       const sideTd = el("td");
       sideTd.appendChild(sidePill);
       const pnlTd = el("td", `mono ${toneClass(pos.unrealized_pnl_tone)}`.trim(), pos.unrealized_pnl_display || "—");
       tr.append(
-        el("td", "mono", pos.market_ticker),
+        marketTd,
         sideTd,
         el("td", "mono", pos.count_fp),
         el("td", "mono", pos.average_price_display || "—"),
@@ -173,6 +227,14 @@
     tableWrap.replaceChildren(table);
   }
 
+  function renderCapitalBuckets(card, summary) {
+    if (!card) return;
+    const line = card.querySelector(".bucket-usage-line");
+    const buckets = summary && summary.capital_buckets;
+    if (!line || !buckets) return;
+    line.textContent = `Safe ${buckets.safe_used_display || "—"} used · Risky ${buckets.risky_used_display || "—"} / ${buckets.risky_limit_display || "—"}`;
+  }
+
   async function refresh(env) {
     try {
       const resp = await fetch(`/api/dashboard/${env}`);
@@ -181,7 +243,9 @@
       const panel = document.querySelector(`.dash-panel[data-env="${env}"]`);
       if (!panel) return;
       renderSummary(panel.querySelector(".dash-summary"), data.portfolio || {});
+      renderActiveRooms(panel.querySelector(".dash-card-alerts"), data.active_rooms || []);
       renderAlerts(panel.querySelector(".dash-card-alerts"), data.alerts || []);
+      renderCapitalBuckets(panel.querySelector(".dash-card-positions"), data.positions_summary || {});
       renderPositions(panel.querySelector(".dash-card-positions"), data.positions || []);
     } catch (_) {
       // skip on network error

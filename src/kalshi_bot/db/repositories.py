@@ -11,11 +11,13 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kalshi_bot.core.enums import DeploymentColor, MessageKind, RiskStatus, RoomOrigin, RoomStage
+from kalshi_bot.core.fixed_point import as_decimal
 from kalshi_bot.core.schemas import (
     AgentPack,
     EvaluationSummary,
     HistoricalHeuristicPack,
     MemoryNotePayload,
+    PortfolioBucketSnapshot,
     ResearchClaim,
     ResearchDossier,
     ResearchSourceCard,
@@ -69,6 +71,24 @@ from kalshi_bot.db.models import (
     TrainingReadinessRecord,
     TradeTicketRecord,
 )
+
+
+def _capital_bucket_from_signal_payload(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return "risky"
+    explicit = str(payload.get("capital_bucket") or "").strip().lower()
+    if explicit in {"safe", "risky"}:
+        return explicit
+    trade_regime = str(payload.get("trade_regime") or "").strip().lower()
+    if trade_regime in {"near_threshold", "longshot_yes", "longshot_no"}:
+        return "risky"
+    if trade_regime == "standard":
+        return "safe"
+    return "risky"
+
+
+def _quantize_money(value: Any) -> Decimal:
+    return as_decimal(value).quantize(Decimal("0.0001"))
 
 
 class PlatformRepository:
@@ -330,6 +350,24 @@ class PlatformRepository:
             stmt = stmt.where(Room.updated_at >= cutoff)
         return int((await self.session.execute(stmt)).scalar_one())
 
+    async def list_active_rooms(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        updated_within_seconds: int | None = None,
+        limit: int = 20,
+    ) -> list[Room]:
+        stmt = select(Room).where(
+            Room.stage.not_in([RoomStage.COMPLETE.value, RoomStage.FAILED.value])
+        )
+        if kalshi_env is not None:
+            stmt = stmt.where(Room.kalshi_env == kalshi_env)
+        if updated_within_seconds is not None:
+            cutoff = datetime.now(UTC) - timedelta(seconds=updated_within_seconds)
+            stmt = stmt.where(Room.updated_at >= cutoff)
+        stmt = stmt.order_by(Room.updated_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
     async def get_room(self, room_id: str) -> Room | None:
         return await self.session.get(Room, room_id)
 
@@ -525,6 +563,30 @@ class PlatformRepository:
     async def get_latest_signal_for_room(self, room_id: str) -> Signal | None:
         stmt = select(Signal).where(Signal.room_id == room_id).order_by(Signal.created_at.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def latest_signal_payloads_for_markets(
+        self,
+        *,
+        market_tickers: list[str],
+        kalshi_env: str,
+    ) -> dict[str, dict[str, Any]]:
+        if not market_tickers:
+            return {}
+        stmt = (
+            select(Signal.market_ticker, Signal.payload)
+            .join(Room, Signal.room_id == Room.id)
+            .where(
+                Signal.market_ticker.in_(market_tickers),
+                Room.kalshi_env == kalshi_env,
+            )
+            .order_by(Signal.market_ticker.asc(), Signal.created_at.desc())
+        )
+        results = await self.session.execute(stmt)
+        payloads: dict[str, dict[str, Any]] = {}
+        for market_ticker, payload in results:
+            if market_ticker not in payloads:
+                payloads[str(market_ticker)] = dict(payload or {})
+        return payloads
 
     async def save_signal(
         self,
@@ -2205,12 +2267,67 @@ class PlatformRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def list_positions(self, limit: int = 50, kalshi_env: str | None = None) -> list[PositionRecord]:
+    async def list_positions(
+        self,
+        limit: int = 50,
+        kalshi_env: str | None = None,
+        subaccount: int | None = None,
+    ) -> list[PositionRecord]:
         stmt = select(PositionRecord).where(PositionRecord.count_fp != 0)
         if kalshi_env is not None:
             stmt = stmt.where(PositionRecord.kalshi_env == kalshi_env)
+        if subaccount is not None:
+            stmt = stmt.where(PositionRecord.subaccount == subaccount)
         stmt = stmt.order_by(PositionRecord.updated_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
+
+    async def portfolio_bucket_snapshot(
+        self,
+        *,
+        kalshi_env: str,
+        subaccount: int,
+        total_capital_dollars: Decimal,
+        safe_capital_reserve_ratio: float,
+        risky_capital_max_ratio: float,
+    ) -> PortfolioBucketSnapshot:
+        positions = await self.list_positions(limit=5000, kalshi_env=kalshi_env, subaccount=subaccount)
+        signal_payloads = await self.latest_signal_payloads_for_markets(
+            market_tickers=[position.market_ticker for position in positions],
+            kalshi_env=kalshi_env,
+        )
+
+        overall_used = Decimal("0.0000")
+        safe_used = Decimal("0.0000")
+        risky_used = Decimal("0.0000")
+        for position in positions:
+            notional = _quantize_money(abs(Decimal(str(position.count_fp))) * Decimal(str(position.average_price_dollars)))
+            overall_used += notional
+            bucket = _capital_bucket_from_signal_payload(signal_payloads.get(position.market_ticker))
+            if bucket == "safe":
+                safe_used += notional
+            else:
+                risky_used += notional
+
+        total_capital = _quantize_money(total_capital_dollars)
+        risky_limit = _quantize_money(total_capital * Decimal(str(risky_capital_max_ratio)))
+        safe_reserve_target = _quantize_money(total_capital * Decimal(str(safe_capital_reserve_ratio)))
+        overall_remaining = _quantize_money(max(Decimal("0.0000"), total_capital - overall_used))
+        risky_remaining = _quantize_money(max(Decimal("0.0000"), min(overall_remaining, risky_limit - risky_used)))
+        safe_remaining = overall_remaining
+
+        return PortfolioBucketSnapshot(
+            total_capital_dollars=total_capital,
+            overall_used_dollars=overall_used,
+            overall_remaining_dollars=overall_remaining,
+            safe_used_dollars=safe_used,
+            safe_remaining_dollars=safe_remaining,
+            safe_reserve_target_dollars=safe_reserve_target,
+            risky_used_dollars=risky_used,
+            risky_limit_dollars=risky_limit,
+            risky_remaining_dollars=risky_remaining,
+            safe_capital_reserve_ratio=safe_capital_reserve_ratio,
+            risky_capital_max_ratio=risky_capital_max_ratio,
+        )
 
     async def list_ops_events(self, limit: int = 50) -> list[OpsEvent]:
         result = await self.session.execute(select(OpsEvent).order_by(OpsEvent.updated_at.desc()).limit(limit))
