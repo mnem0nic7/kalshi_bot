@@ -4,6 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kalshi Bot Control Room</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/static/style.css" />
     {% block extra_head %}{% endblock %}
   </head>
@@ -17,7 +20,7 @@
         </nav>
       </div>
       <div class="header-meta">
-        <span>Color: {{ settings.app_color if settings else room.active_color }}</span>
+        <span class="header-color-badge">{{ settings.app_color if settings else room.active_color }}</span>
       </div>
     </header>
     <main class="shell-main {% block main_class %}{% endblock %}">
