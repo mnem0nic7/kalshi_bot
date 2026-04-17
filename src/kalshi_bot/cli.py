@@ -558,7 +558,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 return 0
 
             if args.command == "reconcile":
-                summary = await container.reconciliation_service.reconcile(repo, subaccount=container.settings.kalshi_subaccount)
+                summary = await container.reconciliation_service.reconcile(
+                    repo,
+                    subaccount=container.settings.kalshi_subaccount,
+                    kalshi_env=container.settings.kalshi_env,
+                )
                 await session.commit()
                 print(json.dumps(asdict(summary), indent=2))
                 return 0

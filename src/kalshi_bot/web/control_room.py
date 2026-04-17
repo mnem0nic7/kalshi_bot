@@ -62,6 +62,154 @@ def _decimal_or_zero(value: Any) -> Decimal:
     return Decimal(str(value))
 
 
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except ArithmeticError:
+        return None
+
+
+def _quote_or_none(value: Any) -> Decimal | None:
+    quote = _decimal_or_none(value)
+    if quote is None:
+        return None
+    quote = quote.quantize(Decimal("0.0001"))
+    return quote if quote > 0 else None
+
+
+def _cents_to_dollars(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    amount = _decimal_or_none(value)
+    if amount is None:
+        return None
+    raw = str(value).strip().lower()
+    if "." not in raw and "e" not in raw:
+        amount = amount / Decimal("100")
+    return amount.quantize(Decimal("0.01"))
+
+
+def _money_display(value: Decimal | None, *, signed: bool = False) -> str:
+    if value is None:
+        return "—"
+    amount = value.quantize(Decimal("0.01"))
+    if signed:
+        if amount > 0:
+            return f"+${amount}"
+        if amount < 0:
+            return f"-${abs(amount)}"
+    return f"${amount}"
+
+
+def _price_display(value: Decimal | None) -> str:
+    if value is None:
+        return "—"
+    return f"${value.quantize(Decimal('0.0001'))}"
+
+
+def _pnl_tone(value: Decimal | None) -> str:
+    if value is None:
+        return "neutral"
+    if value > 0:
+        return "good"
+    if value < 0:
+        return "bad"
+    return "neutral"
+
+
+def _midpoint(lower: Decimal | None, upper: Decimal | None) -> Decimal | None:
+    if lower is not None and upper is not None:
+        return ((lower + upper) / Decimal("2")).quantize(Decimal("0.0001"))
+    return lower if lower is not None else upper
+
+
+def _position_mark_price(position_side: str, market_state: Any | None) -> tuple[Decimal | None, str | None]:
+    if market_state is None:
+        return None, None
+
+    yes_bid = _quote_or_none(getattr(market_state, "yes_bid_dollars", None))
+    yes_ask = _quote_or_none(getattr(market_state, "yes_ask_dollars", None))
+    last_trade = _quote_or_none(getattr(market_state, "last_trade_dollars", None))
+
+    if position_side == "no":
+        if yes_bid is not None and yes_ask is not None:
+            no_bid = (Decimal("1.0000") - yes_ask).quantize(Decimal("0.0001"))
+            no_ask = (Decimal("1.0000") - yes_bid).quantize(Decimal("0.0001"))
+            mark = _midpoint(no_bid, no_ask)
+            if mark is not None:
+                return mark, "midpoint"
+        if last_trade is not None:
+            return (Decimal("1.0000") - last_trade).quantize(Decimal("0.0001")), "last_trade"
+        return None, None
+
+    if yes_bid is not None and yes_ask is not None:
+        mark = _midpoint(yes_bid, yes_ask)
+        if mark is not None:
+            return mark, "midpoint"
+    if last_trade is not None:
+        return last_trade, "last_trade"
+    return None, None
+
+
+def _balance_summary(balance_checkpoint: Any | None, position_views: list[dict[str, Any]]) -> dict[str, Any]:
+    checkpoint_payload = dict(getattr(balance_checkpoint, "payload", {}) or {})
+    balance_payload = dict(checkpoint_payload.get("balance") or {})
+
+    cash = None
+    for key in ("balance", "cash_balance", "cash"):
+        cash = _cents_to_dollars(balance_payload.get(key))
+        if cash is not None:
+            break
+
+    raw_portfolio = None
+    for key in ("portfolio_value", "portfolioValue", "portfolio"):
+        raw_portfolio = _cents_to_dollars(balance_payload.get(key))
+        if raw_portfolio is not None:
+            break
+
+    total_notional = sum((_decimal_or_zero(view.get("notional_dollars")) for view in position_views), Decimal("0.00"))
+    total_marked_value = sum((_decimal_or_zero(view.get("current_value_dollars")) for view in position_views), Decimal("0.00"))
+    all_marked = all(view.get("current_value_dollars") is not None for view in position_views) if position_views else True
+
+    positions_value = raw_portfolio
+    portfolio = None
+    if cash is not None and raw_portfolio is not None:
+        if raw_portfolio < cash:
+            positions_value = raw_portfolio.quantize(Decimal("0.01"))
+            portfolio = (cash + positions_value).quantize(Decimal("0.01"))
+        else:
+            portfolio = raw_portfolio.quantize(Decimal("0.01"))
+            positions_value = (portfolio - cash).quantize(Decimal("0.01"))
+    elif all_marked:
+        positions_value = total_marked_value.quantize(Decimal("0.01"))
+        if cash is not None:
+            portfolio = (cash + positions_value).quantize(Decimal("0.01"))
+
+    gain_loss = None
+    if positions_value is not None:
+        gain_loss = (positions_value - total_notional).quantize(Decimal("0.01"))
+    elif all(view.get("unrealized_pnl_dollars") is not None for view in position_views):
+        gain_loss = sum(
+            (_decimal_or_zero(view.get("unrealized_pnl_dollars")) for view in position_views),
+            Decimal("0.00"),
+        ).quantize(Decimal("0.01"))
+
+    return {
+        "cash_dollars": str(cash) if cash is not None else None,
+        "cash_display": _money_display(cash),
+        "portfolio_dollars": str(portfolio) if portfolio is not None else None,
+        "portfolio_display": _money_display(portfolio),
+        "positions_value_dollars": str(positions_value) if positions_value is not None else None,
+        "positions_value_display": _money_display(positions_value),
+        "gain_loss_dollars": str(gain_loss) if gain_loss is not None else None,
+        "gain_loss_display": _money_display(gain_loss, signed=True),
+        "gain_loss_tone": _pnl_tone(gain_loss),
+        "updated_at": _iso_or_none(getattr(balance_checkpoint, "updated_at", None)),
+    }
+
+
 def _confidence_band(value: float | None) -> str:
     if value is None:
         return "none"
@@ -183,26 +331,52 @@ def _room_view(bundle: Any) -> dict[str, Any]:
     }
 
 
-def _position_view(position: Any) -> dict[str, Any]:
+def _position_view(position: Any, market_state: Any | None = None) -> dict[str, Any]:
     count = _decimal_or_zero(position.count_fp)
     avg_price = _decimal_or_zero(position.average_price_dollars)
     notional = (count * avg_price).quantize(Decimal("0.01"))
+    mark_price, mark_source = _position_mark_price(str(position.side), market_state)
+    current_value = (count * mark_price).quantize(Decimal("0.01")) if mark_price is not None else None
+    unrealized_pnl = (current_value - notional).quantize(Decimal("0.01")) if current_value is not None else None
     return {
         "market_ticker": position.market_ticker,
         "side": position.side,
         "count_fp": str(count.quantize(Decimal("0.01"))),
         "average_price_dollars": str(avg_price.quantize(Decimal("0.0001"))),
+        "average_price_display": _price_display(avg_price),
         "notional_dollars": str(notional),
+        "notional_display": _money_display(notional),
+        "current_price_dollars": str(mark_price) if mark_price is not None else None,
+        "current_price_display": _price_display(mark_price),
+        "current_value_dollars": str(current_value) if current_value is not None else None,
+        "current_value_display": _money_display(current_value),
+        "unrealized_pnl_dollars": str(unrealized_pnl) if unrealized_pnl is not None else None,
+        "unrealized_pnl_display": _money_display(unrealized_pnl, signed=True),
+        "unrealized_pnl_tone": _pnl_tone(unrealized_pnl),
+        "mark_source": mark_source,
+        "mark_observed_at": _iso_or_none(getattr(market_state, "observed_at", None)),
         "updated_at": _iso_or_none(position.updated_at),
     }
 
 
-def _positions_summary(positions: list[Any]) -> dict[str, Any]:
-    total_contracts = sum(abs(_decimal_or_zero(position.count_fp)) for position in positions)
+def _positions_summary(positions: list[Any], position_views: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    total_contracts = sum((abs(_decimal_or_zero(position.count_fp)) for position in positions), Decimal("0.00"))
+    total_notional = sum(
+        (abs(_decimal_or_zero(position.count_fp)) * _decimal_or_zero(position.average_price_dollars) for position in positions),
+        Decimal("0.00"),
+    )
+    total_unrealized = None
+    if position_views is not None and all(item.get("unrealized_pnl_dollars") is not None for item in position_views):
+        total_unrealized = sum(
+            (_decimal_or_zero(item.get("unrealized_pnl_dollars")) for item in position_views),
+            Decimal("0.00"),
+        ).quantize(Decimal("0.01"))
     return {
         "count": len(positions),
         "total_contracts": str(total_contracts.quantize(Decimal("0.01"))) if positions else "0.00",
-        "has_pnl_summary": False,
+        "total_notional_dollars": str(total_notional.quantize(Decimal("0.01"))) if positions else "0.00",
+        "total_unrealized_pnl_dollars": str(total_unrealized) if total_unrealized is not None else None,
+        "has_pnl_summary": total_unrealized is not None,
     }
 
 
@@ -914,6 +1088,8 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         repo = PlatformRepository(session)
         positions = await repo.list_positions(limit=100, kalshi_env=kalshi_env)
         ops_events = await repo.list_ops_events(limit=50)
+        market_states = await repo.list_market_states([position.market_ticker for position in positions])
+        balance_checkpoint = await repo.get_checkpoint("reconcile")
         runtime_health = await container.watchdog_service.get_status(repo)
         await session.commit()
 
@@ -922,10 +1098,14 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         [e for e in ops_events if e.severity in ("error", "warning")],
         key=lambda e: severity_rank.get(e.severity, 3),
     )
+    market_state_by_ticker = {item.market_ticker: item for item in market_states}
+    position_views = [_position_view(position, market_state_by_ticker.get(position.market_ticker)) for position in positions]
     return {
         "kalshi_env": kalshi_env,
         "as_of": now.isoformat(),
-        "positions": [_position_view(p) for p in positions],
+        "portfolio": _balance_summary(balance_checkpoint, position_views),
+        "positions_summary": _positions_summary(positions, position_views),
+        "positions": position_views,
         "alerts": [_ops_event_view(e) for e in alerts],
         "runtime_health": runtime_health,
     }

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -65,6 +66,29 @@ def test_classify_room_treats_failed_stage_as_failed() -> None:
     classification = _classify_room(bundle)
 
     assert classification == {"status": "failed", "label": "Failed", "tone": "bad"}
+
+
+def test_position_view_ignores_one_sided_book_for_mark_to_market() -> None:
+    now = datetime(2026, 4, 17, 18, 5, tzinfo=UTC)
+    position = SimpleNamespace(
+        market_ticker="KXHIGHCHI-26APR17-T79",
+        side="no",
+        count_fp=Decimal("24.00"),
+        average_price_dollars=Decimal("0.5600"),
+        updated_at=now,
+    )
+    market_state = SimpleNamespace(
+        market_ticker="KXHIGHCHI-26APR17-T79",
+        yes_bid_dollars=Decimal("0.0400"),
+        yes_ask_dollars=None,
+        last_trade_dollars=None,
+        observed_at=now,
+    )
+
+    view = control_room_module._position_view(position, market_state)
+
+    assert view["current_price_display"] == "—"
+    assert view["unrealized_pnl_display"] == "—"
 
 
 class _FakeSession:
@@ -226,6 +250,10 @@ async def test_build_control_room_summary_skips_live_market_discovery(monkeypatc
             assert limit > 0
             return []
 
+        async def list_ops_events(self, *, limit: int) -> list[SimpleNamespace]:
+            assert limit > 0
+            return []
+
     async def fail_configured_markets(_container) -> list[dict]:
         raise AssertionError("summary should not call live market discovery")
 
@@ -307,3 +335,83 @@ async def test_build_control_room_bootstrap_skips_live_market_discovery(monkeypa
 
     assert bootstrap["summary"]["research_confidence"]["average"] == 0.77
     assert bootstrap["initial_tab"] == "overview"
+
+
+@pytest.mark.asyncio
+async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 4, 17, 17, 50, tzinfo=UTC)
+    positions = [
+        SimpleNamespace(
+            market_ticker="KXHIGHCHI-26APR17-T79",
+            side="no",
+            count_fp=Decimal("24.00"),
+            average_price_dollars=Decimal("0.5600"),
+            updated_at=now,
+        ),
+        SimpleNamespace(
+            market_ticker="KXHIGHTSFO-26APR17-T71",
+            side="yes",
+            count_fp=Decimal("25.00"),
+            average_price_dollars=Decimal("0.1600"),
+            updated_at=now,
+        ),
+    ]
+    market_states = [
+        SimpleNamespace(
+            market_ticker="KXHIGHCHI-26APR17-T79",
+            yes_bid_dollars=Decimal("0.4800"),
+            yes_ask_dollars=Decimal("0.5200"),
+            last_trade_dollars=None,
+            observed_at=now,
+        ),
+        SimpleNamespace(
+            market_ticker="KXHIGHTSFO-26APR17-T71",
+            yes_bid_dollars=Decimal("0.1500"),
+            yes_ask_dollars=Decimal("0.1700"),
+            last_trade_dollars=None,
+            observed_at=now,
+        ),
+    ]
+
+    class FakeRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def list_positions(self, *, limit: int, kalshi_env: str | None = None) -> list[SimpleNamespace]:
+            assert limit == 100
+            assert kalshi_env == "demo"
+            return positions
+
+        async def list_ops_events(self, *, limit: int) -> list[SimpleNamespace]:
+            assert limit == 50
+            return []
+
+        async def list_market_states(self, market_tickers: list[str]) -> list[SimpleNamespace]:
+            assert market_tickers == [position.market_ticker for position in positions]
+            return market_states
+
+        async def get_checkpoint(self, stream_name: str) -> SimpleNamespace:
+            assert stream_name == "reconcile"
+            return SimpleNamespace(
+                payload={"balance": {"balance": 60582, "portfolio_value": 1600}},
+                updated_at=now,
+            )
+
+    monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
+
+    container = SimpleNamespace(
+        session_factory=_FakeSessionFactory(),
+        watchdog_service=SimpleNamespace(get_status=AsyncMock(return_value={"updated_at": now.isoformat(), "colors": {}})),
+    )
+
+    payload = await control_room_module.build_env_dashboard(container, "demo")
+
+    assert payload["portfolio"]["cash_display"] == "$605.82"
+    assert payload["portfolio"]["portfolio_display"] == "$621.82"
+    assert payload["portfolio"]["positions_value_display"] == "$16.00"
+    assert payload["portfolio"]["gain_loss_display"] == "-$1.44"
+    assert payload["positions_summary"]["has_pnl_summary"] is True
+    assert payload["positions"][0]["current_price_display"] == "$0.5000"
+    assert payload["positions"][0]["unrealized_pnl_display"] == "-$1.44"
+    assert payload["positions"][1]["current_price_display"] == "$0.1600"
+    assert payload["positions"][1]["unrealized_pnl_display"] == "$0.00"

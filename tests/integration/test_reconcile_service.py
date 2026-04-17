@@ -126,3 +126,24 @@ async def test_reconciliation_service_normalizes_negative_positions_to_no_side(t
     assert str(positions[0].average_price_dollars) == "0.5600"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_service_persists_position_environment(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/reconcile-env.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    service = ReconciliationService(FakeKalshiForReconcile())  # type: ignore[arg-type]
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await service.reconcile(repo, kalshi_env="demo")
+        positions = await repo.list_positions(kalshi_env="demo")
+        await session.commit()
+
+    assert len(positions) == 1
+    assert positions[0].kalshi_env == "demo"
+
+    await engine.dispose()

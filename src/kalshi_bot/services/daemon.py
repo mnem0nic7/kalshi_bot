@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -24,6 +25,8 @@ from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
+
+logger = logging.getLogger(__name__)
 
 
 class DaemonService:
@@ -61,11 +64,16 @@ class DaemonService:
         self.historical_intelligence_service = historical_intelligence_service
         self.historical_pipeline_service = historical_pipeline_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
+        self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
 
     async def reconcile_once(self) -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            summary = await self.reconciliation_service.reconcile(repo, subaccount=self.settings.kalshi_subaccount, kalshi_env=self.settings.kalshi_env)
+            summary = await self.reconciliation_service.reconcile(
+                repo,
+                subaccount=self.settings.kalshi_subaccount,
+                kalshi_env=self.settings.kalshi_env,
+            )
             await repo.set_checkpoint(
                 f"daemon_reconcile:{self.settings.app_color}",
                 None,
@@ -78,7 +86,7 @@ class DaemonService:
             await session.commit()
         return asdict(summary)
 
-    async def heartbeat_once(self) -> dict[str, Any]:
+    async def heartbeat_once(self, *, run_follow_up: bool = True) -> dict[str, Any]:
         payload = {
             "app_color": self.settings.app_color,
             "kalshi_env": self.settings.kalshi_env,
@@ -122,36 +130,8 @@ class DaemonService:
                 },
             )
             await session.commit()
-        if (
-            self.shadow_campaign_service is not None
-            and self.settings.training_campaign_enabled
-            and self.settings.app_color == payload.get("active_color")
-        ):
-            await self.shadow_campaign_service.run(
-                ShadowCampaignRequest(
-                    limit=self.settings.training_campaign_rooms_per_run,
-                    reason="daemon_shadow_campaign",
-                )
-            )
-        if self.settings.app_color == payload.get("active_color"):
-            checkpoint_capture = await self._maybe_capture_checkpoint_archives()
-            if checkpoint_capture is not None:
-                payload["checkpoint_capture"] = checkpoint_capture
-            settlement_follow_up = await self._maybe_run_settlement_follow_up()
-            if settlement_follow_up is not None:
-                payload["settlement_follow_up"] = settlement_follow_up
-            historical_pipeline = await self._maybe_run_historical_pipeline()
-            if historical_pipeline is not None:
-                payload["historical_pipeline"] = historical_pipeline
-            elif self.historical_pipeline_service is None:
-                historical_intelligence = await self._maybe_run_historical_intelligence()
-                if historical_intelligence is not None:
-                    payload["historical_intelligence"] = historical_intelligence
-        rollout_result = await self.self_improve_service.monitor_rollouts()
-        if rollout_result.status == "canary_running":
-            canary = rollout_result.payload
-            if self.settings.app_color == canary.get("color"):
-                await self.shadow_training_service.run_shadow_sweep(limit=1, reason="canary_shadow")
+        if run_follow_up:
+            await self._run_heartbeat_follow_up(payload)
         return payload
 
     async def run(
@@ -169,7 +149,7 @@ class DaemonService:
 
         if self.settings.daemon_start_with_reconcile:
             await self.reconcile_once()
-        await self.heartbeat_once()
+        self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
 
         tasks: dict[str, asyncio.Task] = {
             "stream": asyncio.create_task(
@@ -201,6 +181,7 @@ class DaemonService:
             await asyncio.gather(*pending, return_exceptions=True)
             await self.research_coordinator.wait_for_tasks()
             await self.auto_trigger_service.wait_for_tasks()
+            await self._await_heartbeat_follow_up()
 
             result: dict[str, Any] = {"completed": completed_name, "markets": selected_markets}
             stream_task = tasks["stream"]
@@ -215,6 +196,10 @@ class DaemonService:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks.values(), return_exceptions=True)
+            follow_up_task = self._heartbeat_follow_up_task
+            if follow_up_task is not None and not follow_up_task.done():
+                follow_up_task.cancel()
+                await asyncio.gather(follow_up_task, return_exceptions=True)
 
     async def _handle_market_update(self, market_ticker: str) -> None:
         await self.research_coordinator.handle_market_update(market_ticker)
@@ -229,7 +214,70 @@ class DaemonService:
     async def _periodic_heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.daemon_heartbeat_interval_seconds)
-            await self.heartbeat_once()
+            self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
+
+    async def _run_heartbeat_follow_up(self, payload: dict[str, Any]) -> None:
+        if (
+            self.shadow_campaign_service is not None
+            and self.settings.training_campaign_enabled
+            and self.settings.app_color == payload.get("active_color")
+        ):
+            await self.shadow_campaign_service.run(
+                ShadowCampaignRequest(
+                    limit=self.settings.training_campaign_rooms_per_run,
+                    reason="daemon_shadow_campaign",
+                )
+            )
+        if self.settings.app_color == payload.get("active_color"):
+            checkpoint_capture = await self._maybe_capture_checkpoint_archives()
+            if checkpoint_capture is not None:
+                payload["checkpoint_capture"] = checkpoint_capture
+            settlement_follow_up = await self._maybe_run_settlement_follow_up()
+            if settlement_follow_up is not None:
+                payload["settlement_follow_up"] = settlement_follow_up
+            historical_pipeline = await self._maybe_run_historical_pipeline()
+            if historical_pipeline is not None:
+                payload["historical_pipeline"] = historical_pipeline
+            elif self.historical_pipeline_service is None:
+                historical_intelligence = await self._maybe_run_historical_intelligence()
+                if historical_intelligence is not None:
+                    payload["historical_intelligence"] = historical_intelligence
+        rollout_result = await self.self_improve_service.monitor_rollouts()
+        if rollout_result.status == "canary_running":
+            canary = rollout_result.payload
+            if self.settings.app_color == canary.get("color"):
+                await self.shadow_training_service.run_shadow_sweep(limit=1, reason="canary_shadow")
+
+    def _schedule_heartbeat_follow_up(self, payload: dict[str, Any]) -> None:
+        if self._heartbeat_follow_up_task is not None and not self._heartbeat_follow_up_task.done():
+            return
+        self._heartbeat_follow_up_task = asyncio.create_task(self._heartbeat_follow_up_runner(dict(payload)))
+
+    async def _heartbeat_follow_up_runner(self, payload: dict[str, Any]) -> None:
+        try:
+            await self._run_heartbeat_follow_up(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("daemon heartbeat follow-up failed")
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                await repo.log_ops_event(
+                    severity="error",
+                    summary="Daemon heartbeat follow-up error",
+                    source="daemon",
+                    payload={"error": str(exc), "app_color": self.settings.app_color},
+                )
+                await session.commit()
+        finally:
+            if asyncio.current_task() is self._heartbeat_follow_up_task:
+                self._heartbeat_follow_up_task = None
+
+    async def _await_heartbeat_follow_up(self) -> None:
+        task = self._heartbeat_follow_up_task
+        if task is None:
+            return
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _maybe_run_settlement_follow_up(self) -> dict[str, Any] | None:
         if self.training_corpus_service is None:

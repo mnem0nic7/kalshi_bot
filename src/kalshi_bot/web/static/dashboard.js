@@ -56,6 +56,25 @@
     return el("span", ["status-pill", "alert-pill", map[tone] || ""].join(" ").trim(), text);
   }
 
+  function toneClass(tone) {
+    if (tone === "good") return "value-positive";
+    if (tone === "bad") return "value-negative";
+    return "value-neutral";
+  }
+
+  function renderSummary(panel, summary) {
+    if (!panel) return;
+    panel.querySelectorAll("[data-summary-key]").forEach((node) => {
+      const key = node.dataset.summaryKey;
+      node.textContent = (summary && key && summary[key]) || "—";
+      const toneKey = node.dataset.summaryTone;
+      if (toneKey) {
+        node.classList.remove("value-positive", "value-negative", "value-neutral");
+        node.classList.add(toneClass((summary && summary[toneKey]) || "neutral"));
+      }
+    });
+  }
+
   function renderAlerts(card, alerts) {
     const header = card.querySelector(".dash-card-header");
     const errors = alerts.filter((a) => a.severity === "error");
@@ -128,7 +147,7 @@
     const table = el("table", "positions-table");
     const thead = el("thead");
     const headerRow = el("tr");
-    ["Market", "Side", "Contracts", "Avg Price", "Notional"].forEach((h) => headerRow.appendChild(el("th", null, h)));
+    ["Market", "Side", "Contracts", "Avg Price", "Now", "Notional", "P/L"].forEach((h) => headerRow.appendChild(el("th", null, h)));
     thead.appendChild(headerRow);
     table.appendChild(thead);
 
@@ -138,12 +157,15 @@
       const sidePill = el("span", `status-pill ${pos.side === "yes" ? "status-good" : "status-warning"}`, pos.side);
       const sideTd = el("td");
       sideTd.appendChild(sidePill);
+      const pnlTd = el("td", `mono ${toneClass(pos.unrealized_pnl_tone)}`.trim(), pos.unrealized_pnl_display || "—");
       tr.append(
         el("td", "mono", pos.market_ticker),
         sideTd,
         el("td", "mono", pos.count_fp),
-        el("td", "mono", `$${pos.average_price_dollars}`),
-        el("td", "mono", `$${pos.notional_dollars}`)
+        el("td", "mono", pos.average_price_display || "—"),
+        el("td", "mono", pos.current_price_display || "—"),
+        el("td", "mono", pos.notional_display || "—"),
+        pnlTd
       );
       tbody.appendChild(tr);
     });
@@ -158,6 +180,7 @@
       const data = await resp.json();
       const panel = document.querySelector(`.dash-panel[data-env="${env}"]`);
       if (!panel) return;
+      renderSummary(panel.querySelector(".dash-summary"), data.portfolio || {});
       renderAlerts(panel.querySelector(".dash-card-alerts"), data.alerts || []);
       renderPositions(panel.querySelector(".dash-card-positions"), data.positions || []);
     } catch (_) {

@@ -11,12 +11,21 @@ from collections.abc import Awaitable, Callable
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.fixed_point import quantize_count, quantize_price
+from kalshi_bot.core.fixed_point import as_decimal, quantize_count, quantize_price
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiWebSocketClient
 from kalshi_bot.core.metrics import FEED_FRESHNESS_SECONDS
 
 logger = logging.getLogger(__name__)
+
+
+def _first_positive_count(*values: Any) -> str | None:
+    for value in values:
+        if value in (None, ""):
+            continue
+        if as_decimal(value) > 0:
+            return str(value)
+    return None
 
 
 class SequenceGapError(RuntimeError):
@@ -225,7 +234,17 @@ class MarketStreamService:
     async def _handle_user_order(self, repo: PlatformRepository, message: dict[str, Any]) -> None:
         msg = message["msg"]
         yes_price = msg.get("yes_price_dollars") or msg.get("price_dollars") or "0.5000"
-        count = msg.get("remaining_count_fp") or msg.get("initial_count_fp") or "1.00"
+        count = _first_positive_count(
+            msg.get("remaining_count_fp"),
+            msg.get("initial_count_fp"),
+            msg.get("count_fp"),
+        )
+        if count is None:
+            logger.warning(
+                "skipping websocket user_order with non-positive count",
+                extra={"order_id": msg.get("order_id"), "ticker": msg.get("ticker") or msg.get("market_ticker")},
+            )
+            return
         await repo.upsert_order(
             client_order_id=msg.get("client_order_id") or msg.get("order_id"),
             market_ticker=msg.get("ticker") or msg.get("market_ticker") or "unknown",
@@ -241,7 +260,13 @@ class MarketStreamService:
     async def _handle_fill(self, repo: PlatformRepository, message: dict[str, Any]) -> None:
         msg = message["msg"]
         yes_price = msg.get("yes_price_dollars") or msg.get("price_dollars") or "0.5000"
-        count = msg.get("count_fp") or "1.00"
+        count = _first_positive_count(msg.get("count_fp"))
+        if count is None:
+            logger.warning(
+                "skipping websocket fill with non-positive count",
+                extra={"trade_id": msg.get("trade_id"), "ticker": msg.get("ticker") or msg.get("market_ticker")},
+            )
+            return
         await repo.upsert_fill(
             market_ticker=msg.get("market_ticker") or msg.get("ticker") or "unknown",
             side=msg.get("side", "yes"),

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -503,6 +504,12 @@ class PlatformRepository:
     async def get_market_state(self, market_ticker: str) -> MarketState | None:
         return await self.session.get(MarketState, market_ticker)
 
+    async def list_market_states(self, market_tickers: list[str]) -> list[MarketState]:
+        if not market_tickers:
+            return []
+        stmt = select(MarketState).where(MarketState.market_ticker.in_(market_tickers))
+        return list((await self.session.execute(stmt)).scalars())
+
     async def get_latest_signal_for_room(self, room_id: str) -> Signal | None:
         stmt = select(Signal).where(Signal.room_id == room_id).order_by(Signal.created_at.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
@@ -713,6 +720,51 @@ class PlatformRepository:
         trade_id: str | None = None,
         is_taker: bool = True,
     ) -> FillRecord:
+        if trade_id is not None:
+            observed_at = datetime.now(UTC)
+            insert_values = {
+                "id": str(uuid4()),
+                "order_id": order_id,
+                "trade_id": trade_id,
+                "market_ticker": market_ticker,
+                "side": side,
+                "action": action,
+                "yes_price_dollars": yes_price_dollars,
+                "count_fp": count_fp,
+                "raw": raw,
+                "is_taker": is_taker,
+                "created_at": observed_at,
+                "updated_at": observed_at,
+            }
+            dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
+            if dialect_name == "postgresql":
+                stmt = pg_insert(FillRecord).values(**insert_values)
+            elif dialect_name == "sqlite":
+                stmt = sqlite_insert(FillRecord).values(**insert_values)
+            else:
+                stmt = None
+            if stmt is not None:
+                excluded = stmt.excluded
+                await self.session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=[FillRecord.trade_id],
+                        set_={
+                            "order_id": func.coalesce(excluded.order_id, FillRecord.order_id),
+                            "market_ticker": excluded.market_ticker,
+                            "side": excluded.side,
+                            "action": excluded.action,
+                            "yes_price_dollars": excluded.yes_price_dollars,
+                            "count_fp": excluded.count_fp,
+                            "raw": excluded.raw,
+                            "is_taker": excluded.is_taker,
+                            "updated_at": observed_at,
+                        },
+                    )
+                )
+                await self.session.flush()
+                stmt = select(FillRecord).where(FillRecord.trade_id == trade_id)
+                return (await self.session.execute(stmt)).scalar_one()
+
         record: FillRecord | None = None
         if trade_id is not None:
             stmt = select(FillRecord).where(FillRecord.trade_id == trade_id)

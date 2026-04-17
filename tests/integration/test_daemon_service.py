@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from sqlalchemy import select
 
@@ -22,7 +24,11 @@ class FakeStreamService:
 
 
 class FakeReconciliationService:
-    async def reconcile(self, repo, *, subaccount=0):
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def reconcile(self, repo, *, subaccount=0, kalshi_env=""):
+        self.calls.append({"subaccount": subaccount, "kalshi_env": kalshi_env})
         return ReconcileSummary(
             balances_seen=True,
             positions_count=0,
@@ -105,6 +111,19 @@ class FakeHistoricalPipelineService:
         return {"status": "completed", "pipeline_kind": "daily"}
 
 
+class BlockingShadowCampaignService:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, request) -> dict:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return {"status": "completed", "reason": request.reason}
+
+
 @pytest.mark.asyncio
 async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> None:
     settings = Settings(
@@ -130,13 +149,14 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
         }
     )
     stream_service = FakeStreamService()
+    reconciliation_service = FakeReconciliationService()
     daemon = DaemonService(
         settings,
         session_factory,
         directory,
         FakeDiscoveryService(),  # type: ignore[arg-type]
         stream_service,  # type: ignore[arg-type]
-        FakeReconciliationService(),  # type: ignore[arg-type]
+        reconciliation_service,  # type: ignore[arg-type]
         FakeResearchCoordinator(),  # type: ignore[arg-type]
         FakeAutoTriggerService(),  # type: ignore[arg-type]
         FakeShadowTrainingService(),  # type: ignore[arg-type]
@@ -161,6 +181,7 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
     assert result["completed"] == "stream"
     assert result["processed_messages"] == 3
     assert stream_service.calls == [["WX-DISCOVERED"]]
+    assert reconciliation_service.calls == [{"subaccount": 0, "kalshi_env": "demo"}]
     assert heartbeat.summary == "Daemon heartbeat"
     assert heartbeat_checkpoint.payload["app_color"] == "blue"
     assert "heartbeat_at" in heartbeat_checkpoint.payload
@@ -222,11 +243,12 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
 
     class CountingReconciliationService(FakeReconciliationService):
         def __init__(self) -> None:
+            super().__init__()
             self.calls = 0
 
-        async def reconcile(self, repo, *, subaccount=0):
+        async def reconcile(self, repo, *, subaccount=0, kalshi_env=""):
             self.calls += 1
-            return await super().reconcile(repo, subaccount=subaccount)
+            return await super().reconcile(repo, subaccount=subaccount, kalshi_env=kalshi_env)
 
     reconcile_service = CountingReconciliationService()
     historical_training = FakeHistoricalTrainingService()
@@ -299,5 +321,55 @@ async def test_daemon_heartbeat_runs_historical_pipeline_when_available(tmp_path
 
     assert pipeline.daily_calls == 1
     assert payload["historical_pipeline"]["pipeline_kind"] == "daily"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_checkpoint_stays_fresh_while_follow_up_is_running(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-follow-up-scheduling.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        training_campaign_enabled=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory({})
+    shadow_campaign = BlockingShadowCampaignService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        shadow_campaign,  # type: ignore[arg-type]
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+    )
+
+    first = await daemon.heartbeat_once(run_follow_up=False)
+    daemon._schedule_heartbeat_follow_up(first)
+    await asyncio.wait_for(shadow_campaign.started.wait(), timeout=1.0)
+
+    second = await daemon.heartbeat_once(run_follow_up=False)
+    daemon._schedule_heartbeat_follow_up(second)
+
+    async with session_factory() as session:
+        checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:blue"))
+        ).scalar_one()
+
+    assert shadow_campaign.calls == 1
+    assert checkpoint.payload["heartbeat_at"] == second["heartbeat_at"]
+
+    shadow_campaign.release.set()
+    await daemon._await_heartbeat_follow_up()
 
     await engine.dispose()

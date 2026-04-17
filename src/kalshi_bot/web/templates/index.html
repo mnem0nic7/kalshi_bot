@@ -23,6 +23,29 @@
     role="tabpanel"
     {% if env_key != "demo" %}hidden{% endif %}
   >
+    <div class="dash-summary">
+      <article class="dash-stat">
+        <span class="muted-label">Cash</span>
+        <strong class="dash-stat-value" data-summary-key="cash_display">{{ env_data.portfolio.cash_display }}</strong>
+      </article>
+      <article class="dash-stat">
+        <span class="muted-label">Portfolio</span>
+        <strong class="dash-stat-value" data-summary-key="portfolio_display">{{ env_data.portfolio.portfolio_display }}</strong>
+      </article>
+      <article class="dash-stat">
+        <span class="muted-label">Positions</span>
+        <strong class="dash-stat-value" data-summary-key="positions_value_display">{{ env_data.portfolio.positions_value_display }}</strong>
+      </article>
+      <article class="dash-stat">
+        <span class="muted-label">Gain/Loss</span>
+        <strong
+          class="dash-stat-value {% if env_data.portfolio.gain_loss_tone == 'good' %}value-positive{% elif env_data.portfolio.gain_loss_tone == 'bad' %}value-negative{% else %}value-neutral{% endif %}"
+          data-summary-key="gain_loss_display"
+          data-summary-tone="gain_loss_tone"
+        >{{ env_data.portfolio.gain_loss_display }}</strong>
+      </article>
+    </div>
+
     <div class="dash-grid">
 
       <article class="dash-card dash-card-alerts">
@@ -60,7 +83,7 @@
         <div class="table-wrap">
           <table class="positions-table">
             <thead>
-              <tr><th>Market</th><th>Side</th><th>Contracts</th><th>Avg Price</th><th>Notional</th></tr>
+              <tr><th>Market</th><th>Side</th><th>Contracts</th><th>Avg Price</th><th>Now</th><th>Notional</th><th>P/L</th></tr>
             </thead>
             <tbody>
               {% for pos in env_data.positions %}
@@ -68,8 +91,10 @@
                 <td class="mono">{{ pos.market_ticker }}</td>
                 <td><span class="status-pill {% if pos.side == 'yes' %}status-good{% else %}status-warning{% endif %}">{{ pos.side }}</span></td>
                 <td class="mono">{{ pos.count_fp }}</td>
-                <td class="mono">${{ pos.average_price_dollars }}</td>
-                <td class="mono">${{ pos.notional_dollars }}</td>
+                <td class="mono">{{ pos.average_price_display }}</td>
+                <td class="mono">{{ pos.current_price_display }}</td>
+                <td class="mono">{{ pos.notional_display }}</td>
+                <td class="mono {% if pos.unrealized_pnl_tone == 'good' %}value-positive{% elif pos.unrealized_pnl_tone == 'bad' %}value-negative{% else %}value-neutral{% endif %}">{{ pos.unrealized_pnl_display }}</td>
               </tr>
               {% endfor %}
             </tbody>
