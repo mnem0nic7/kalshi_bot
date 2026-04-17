@@ -63,6 +63,20 @@ class FakeKalshiForReconcile:
         return {"settlements": [{"market_ticker": "OLD-WX", "realized_pnl_dollars": "3.2500"}]}
 
 
+class FakeKalshiNegativePosition(FakeKalshiForReconcile):
+    async def get_positions(self, **params) -> dict:
+        return {
+            "market_positions": [
+                {
+                    "ticker": "WX-NO",
+                    "subaccount": 0,
+                    "position_fp": "-24.00",
+                    "market_exposure_dollars": "13.440000",
+                }
+            ]
+        }
+
+
 @pytest.mark.asyncio
 async def test_reconciliation_service_persists_exchange_state(tmp_path) -> None:
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/reconcile.db")
@@ -88,3 +102,27 @@ async def test_reconciliation_service_persists_exchange_state(tmp_path) -> None:
 
     await engine.dispose()
 
+
+@pytest.mark.asyncio
+async def test_reconciliation_service_normalizes_negative_positions_to_no_side(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/reconcile-negative.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    service = ReconciliationService(FakeKalshiNegativePosition())  # type: ignore[arg-type]
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        summary = await service.reconcile(repo)
+        positions = await repo.list_positions()
+        await session.commit()
+
+    assert summary.positions_count == 1
+    assert len(positions) == 1
+    assert positions[0].market_ticker == "WX-NO"
+    assert positions[0].side == "no"
+    assert str(positions[0].count_fp) == "24.00"
+    assert str(positions[0].average_price_dollars) == "0.5600"
+
+    await engine.dispose()

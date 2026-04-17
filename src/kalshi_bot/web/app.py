@@ -39,6 +39,7 @@ from kalshi_bot.web.control_room import (
     build_control_room_bootstrap,
     build_control_room_summary,
     build_control_room_tab,
+    build_env_dashboard,
 )
 from kalshi_bot.web.faq_content import FAQ_SECTIONS
 from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
@@ -851,18 +852,27 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         app_container = container(request)
-        bootstrap_payload = jsonable_encoder(await build_control_room_bootstrap(app_container))
+        demo_data, prod_data = await asyncio.gather(
+            build_env_dashboard(app_container, "demo"),
+            build_env_dashboard(app_container, "production"),
+        )
         return templates.TemplateResponse(
             request,
             "index.html",
             {
-                "bootstrap": bootstrap_payload,
-                "control_room_tabs": bootstrap_payload["tabs"],
-                "initial_summary": bootstrap_payload["summary"],
-                "initial_tab_payload": bootstrap_payload["initial_tab_payload"],
+                "demo": jsonable_encoder(demo_data),
+                "production": jsonable_encoder(prod_data),
                 "settings": app_container.settings,
             },
         )
+
+    @app.get("/api/dashboard/{kalshi_env}")
+    async def dashboard_env(kalshi_env: str, request: Request) -> JSONResponse:
+        if kalshi_env not in ("demo", "production"):
+            return JSONResponse({"error": "invalid env"}, status_code=400)
+        app_container = container(request)
+        payload = await build_env_dashboard(app_container, kalshi_env)
+        return JSONResponse(jsonable_encoder(payload))
 
     @app.post("/api/rooms")
     async def create_room_endpoint(request: Request) -> JSONResponse:

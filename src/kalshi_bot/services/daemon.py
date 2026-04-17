@@ -65,7 +65,7 @@ class DaemonService:
     async def reconcile_once(self) -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            summary = await self.reconciliation_service.reconcile(repo, subaccount=self.settings.kalshi_subaccount)
+            summary = await self.reconciliation_service.reconcile(repo, subaccount=self.settings.kalshi_subaccount, kalshi_env=self.settings.kalshi_env)
             await repo.set_checkpoint(
                 f"daemon_reconcile:{self.settings.app_color}",
                 None,

@@ -908,6 +908,29 @@ async def _build_rooms_tab(container: AppContainer) -> dict[str, Any]:
     }
 
 
+async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[str, Any]:
+    now = datetime.now(UTC)
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session)
+        positions = await repo.list_positions(limit=100, kalshi_env=kalshi_env)
+        ops_events = await repo.list_ops_events(limit=50)
+        runtime_health = await container.watchdog_service.get_status(repo)
+        await session.commit()
+
+    severity_rank = {"error": 0, "warning": 1, "info": 2}
+    alerts = sorted(
+        [e for e in ops_events if e.severity in ("error", "warning")],
+        key=lambda e: severity_rank.get(e.severity, 3),
+    )
+    return {
+        "kalshi_env": kalshi_env,
+        "as_of": now.isoformat(),
+        "positions": [_position_view(p) for p in positions],
+        "alerts": [_ops_event_view(e) for e in alerts],
+        "runtime_health": runtime_health,
+    }
+
+
 async def _build_operations_tab(container: AppContainer) -> dict[str, Any]:
     now = datetime.now(UTC)
     async with container.session_factory() as session:

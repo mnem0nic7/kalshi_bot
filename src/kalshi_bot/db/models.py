@@ -169,6 +169,7 @@ class PositionRecord(Base, IdMixin, TimestampMixin):
 
     market_ticker: Mapped[str] = mapped_column(String(128), index=True)
     subaccount: Mapped[int] = mapped_column(Integer, default=0)
+    kalshi_env: Mapped[str] = mapped_column(String(16), default="")
     side: Mapped[str] = mapped_column(String(16))
     count_fp: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     average_price_dollars: Mapped[Decimal] = mapped_column(Numeric(10, 4))

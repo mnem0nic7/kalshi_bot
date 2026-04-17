@@ -764,6 +764,7 @@ class PlatformRepository:
         *,
         market_ticker: str,
         subaccount: int,
+        kalshi_env: str = "",
         side: str,
         count_fp: Decimal,
         average_price_dollars: Decimal,
@@ -777,6 +778,7 @@ class PlatformRepository:
             existing = PositionRecord(
                 market_ticker=market_ticker,
                 subaccount=subaccount,
+                kalshi_env=kalshi_env,
                 side=side,
                 count_fp=count_fp,
                 average_price_dollars=average_price_dollars,
@@ -784,6 +786,7 @@ class PlatformRepository:
             )
             self.session.add(existing)
         else:
+            existing.kalshi_env = kalshi_env
             existing.side = side
             existing.count_fp = count_fp
             existing.average_price_dollars = average_price_dollars
@@ -2138,14 +2141,12 @@ class PlatformRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def list_positions(self, limit: int = 50) -> list[PositionRecord]:
-        result = await self.session.execute(
-            select(PositionRecord)
-            .where(PositionRecord.count_fp != 0)
-            .order_by(PositionRecord.updated_at.desc())
-            .limit(limit)
-        )
-        return list(result.scalars())
+    async def list_positions(self, limit: int = 50, kalshi_env: str | None = None) -> list[PositionRecord]:
+        stmt = select(PositionRecord).where(PositionRecord.count_fp != 0)
+        if kalshi_env is not None:
+            stmt = stmt.where(PositionRecord.kalshi_env == kalshi_env)
+        stmt = stmt.order_by(PositionRecord.updated_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
 
     async def list_ops_events(self, limit: int = 50) -> list[OpsEvent]:
         result = await self.session.execute(select(OpsEvent).order_by(OpsEvent.updated_at.desc()).limit(limit))

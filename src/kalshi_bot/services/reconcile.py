@@ -21,6 +21,30 @@ def _stringish(value: Any, default: str) -> str:
     return str(value) if value is not None else default
 
 
+def _normalized_position(position: dict[str, Any], default_side: str = "yes") -> tuple[Decimal, str]:
+    raw_count = position.get("position_fp") or position.get("count_fp") or position.get("net_position_fp") or "0.00"
+    signed_count = as_decimal(raw_count)
+    if signed_count == Decimal("0"):
+        return Decimal("0.00"), default_side
+    raw_side = position.get("side") or position.get("position_side")
+    if raw_side is None:
+        side = "no" if signed_count < 0 else default_side
+    else:
+        side = _stringish(raw_side, default_side)
+    return abs(signed_count), side
+
+
+def _position_average_price(position: dict[str, Any], count: Decimal) -> Decimal:
+    raw_avg = position.get("average_price_dollars") or position.get("avg_price_dollars")
+    if raw_avg not in (None, ""):
+        return quantize_price(raw_avg)
+    if count > 0:
+        raw_exposure = position.get("market_exposure_dollars") or position.get("total_traded_dollars")
+        if raw_exposure not in (None, ""):
+            return quantize_price(as_decimal(raw_exposure) / count)
+    return quantize_price("0.5000")
+
+
 @dataclass(slots=True)
 class ReconcileSummary:
     balances_seen: bool
@@ -35,7 +59,7 @@ class ReconciliationService:
     def __init__(self, kalshi: KalshiClient) -> None:
         self.kalshi = kalshi
 
-    async def reconcile(self, repo: PlatformRepository, *, subaccount: int = 0) -> ReconcileSummary:
+    async def reconcile(self, repo: PlatformRepository, *, subaccount: int = 0, kalshi_env: str = "") -> ReconcileSummary:
         historical_cutoff = await self.kalshi.get_historical_cutoff()
         balance = await self.kalshi.get_balance()
         positions_payload = await self.kalshi.get_positions(subaccount=subaccount)
@@ -57,16 +81,16 @@ class ReconciliationService:
 
         for position in positions:
             market_ticker = _stringish(position.get("ticker") or position.get("market_ticker"), "unknown")
-            count = position.get("position_fp") or position.get("count_fp") or position.get("net_position_fp") or "0.00"
-            if Decimal(str(count)) == Decimal("0"):
+            count, side = _normalized_position(position)
+            if count == Decimal("0"):
                 continue
-            avg_price = position.get("average_price_dollars") or position.get("avg_price_dollars") or "0.5000"
             await repo.upsert_position(
                 market_ticker=market_ticker,
                 subaccount=int(position.get("subaccount", subaccount)),
-                side=_stringish(position.get("side") or position.get("position_side"), "yes"),
+                kalshi_env=kalshi_env,
+                side=side,
                 count_fp=quantize_count(count),
-                average_price_dollars=quantize_price(avg_price),
+                average_price_dollars=_position_average_price(position, count),
                 raw=position,
             )
 
@@ -143,4 +167,3 @@ class ReconciliationService:
             settlements_count=len(settlements),
             historical_cutoff_seen=bool(historical_cutoff),
         )
-

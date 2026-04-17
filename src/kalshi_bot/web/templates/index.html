@@ -1,150 +1,69 @@
 {% extends "base.html" %}
 {% block extra_head %}
-  <link rel="stylesheet" href="/static/control_room.css" />
+  <link rel="stylesheet" href="/static/dashboard.css" />
 {% endblock %}
 {% block main_class %}shell-main-wide{% endblock %}
 {% block content %}
-<div class="control-room-page" id="control-room-page">
-  <section class="control-room-hero panel">
-    <div class="control-room-hero-copy">
-      <h1>Control Room</h1>
-    </div>
-    <div class="control-room-refresh-bar" id="control-room-refresh-bar">
-      <div class="control-room-refresh-meta">
-        <span class="control-room-refresh-label">Last refreshed</span>
-        <strong id="control-room-last-refreshed" data-timestamp="{{ initial_summary.as_of }}">{{ initial_summary.as_of }}</strong>
-      </div>
-      <div class="control-room-refresh-actions">
-        <span class="status-pill" id="control-room-refresh-state">Auto refresh on</span>
-        <button type="button" class="button button-secondary" data-action="refresh-now">Refresh Now</button>
-      </div>
-    </div>
-  </section>
+<div class="dashboard" id="dashboard">
 
-  <section class="control-room-summary-grid" id="control-room-summary">
-    <article class="summary-card{% if initial_summary.system_status.level == 'critical' %} summary-card-critical{% endif %}" data-summary-card="system-status">
-      <div class="summary-card-heading">
-        <span class="summary-card-label">System Status</span>
-        <span class="status-pill {% if initial_summary.system_status.level == 'healthy' %}status-good{% elif initial_summary.system_status.level == 'warning' %}status-warning{% elif initial_summary.system_status.level == 'critical' %}status-bad{% endif %}">
-          {{ initial_summary.system_status.level|upper }}
-        </span>
-      </div>
-      <strong class="summary-card-value">{{ initial_summary.system_status.label|upper }}</strong>
-      <span class="summary-card-detail">{{ initial_summary.system_status.detail }}</span>
-      <span class="summary-card-subdetail">Active {{ initial_summary.system_status.active_color|upper }}</span>
-    </article>
-    <article class="summary-card" data-summary-card="active-deployment">
-      <div class="summary-card-heading">
-        <span class="summary-card-label">Active Deployment</span>
-        <span class="status-pill {% if initial_summary.active_deployment.kill_switch_enabled %}status-bad{% endif %}">
-          {{ "KILL SWITCH ON" if initial_summary.active_deployment.kill_switch_enabled else "WATCHDOG" }}
-        </span>
-      </div>
-      <strong class="summary-card-value">{{ initial_summary.active_deployment.active_color|upper }}</strong>
-      <span class="summary-card-detail" data-timestamp="{{ initial_summary.active_deployment.watchdog_updated_at }}">Watchdog {{ initial_summary.active_deployment.watchdog_updated_at or "never" }}</span>
-      <span class="summary-card-subdetail">Last action: {{ (initial_summary.active_deployment.last_action or {}).get("action", "n/a") }}</span>
-    </article>
-    <article class="summary-card" data-summary-card="open-positions">
-      <div class="summary-card-heading">
-        <span class="summary-card-label">Open Positions</span>
-      </div>
-      <strong class="summary-card-value">{{ initial_summary.open_positions.count }}</strong>
-      <span class="summary-card-detail">Tracked contracts: {{ initial_summary.open_positions.total_contracts }}</span>
-    </article>
-    <article class="summary-card" data-summary-card="research-confidence">
-      <div class="summary-card-heading">
-        <span class="summary-card-label">Research Confidence</span>
-      </div>
-      <strong class="summary-card-value">
-        {% if initial_summary.research_confidence.average is not none %}
-          {{ "%.2f"|format(initial_summary.research_confidence.average) }}
-        {% else %}
-          n/a
-        {% endif %}
-      </strong>
-      <span class="summary-card-detail">{{ initial_summary.research_confidence.count }} active dossiers</span>
-      <div class="summary-sparkline" data-sparkline='{{ initial_summary.research_confidence.sparkline|tojson }}'></div>
-    </article>
-    {% set resolved_room_total = initial_summary.room_outcomes.resolved_total if initial_summary.room_outcomes.resolved_total is defined else initial_summary.room_outcomes.total %}
-    <article class="summary-card{% if resolved_room_total and initial_summary.room_outcomes.succeeded == 0 %} summary-card-critical{% endif %}" data-summary-card="room-outcomes">
-      <div class="summary-card-heading">
-        <span class="summary-card-label">Room Outcomes</span>
-      </div>
-      <strong class="summary-card-value">{{ initial_summary.room_outcomes.succeeded }}/{{ resolved_room_total }}</strong>
-      <span class="summary-card-detail">Resolved last {{ initial_summary.room_outcomes.window_hours }}h · running {{ initial_summary.room_outcomes.running or 0 }}</span>
-      <span class="summary-card-subdetail">
-        blocked {{ initial_summary.room_outcomes.blocked }} · stand down {{ initial_summary.room_outcomes.stand_down }} · failed {{ initial_summary.room_outcomes.failed }}
-      </span>
-    </article>
-    <article class="summary-card{% if initial_summary.error_alert.error_count > 0 %} summary-card-critical{% elif initial_summary.error_alert.warning_count > 0 %} summary-card-warn{% endif %}" data-summary-card="error-events">
-      <div class="summary-card-heading">
-        <span class="summary-card-label">Error Events</span>
-        <span class="status-pill {% if initial_summary.error_alert.error_count > 0 %}status-bad{% elif initial_summary.error_alert.warning_count > 0 %}status-warning{% else %}status-good{% endif %}">
-          {{ "ERRORS" if initial_summary.error_alert.error_count > 0 else ("WARNINGS" if initial_summary.error_alert.warning_count > 0 else "CLEAR") }}
-        </span>
-      </div>
-      <strong class="summary-card-value">{{ initial_summary.error_alert.error_count }}</strong>
-      <span class="summary-card-detail">{{ initial_summary.error_alert.warning_count }} warnings (24h)</span>
-      <span class="summary-card-subdetail">{{ initial_summary.error_alert.most_recent or "No recent errors." }}</span>
-    </article>
-  </section>
-
-  <section class="control-room-intel-board" id="control-room-intel-board" aria-label="Current market intel">
-    <!-- Populated by renderIntelBoard() in control_room.js -->
-  </section>
-
-  <nav class="control-room-tabs panel" aria-label="Control room sections">
-    <div class="control-room-tab-list" role="tablist">
-      {% for tab in control_room_tabs %}
-      <button
-        type="button"
-        class="control-room-tab{% if tab.id == bootstrap.initial_tab %} is-active{% endif %}"
-        id="tab-button-{{ tab.id }}"
-        data-tab="{{ tab.id }}"
-        role="tab"
-        aria-selected="{{ 'true' if tab.id == bootstrap.initial_tab else 'false' }}"
-        aria-controls="tab-panel-{{ tab.id }}"
-      >
-        {{ tab.label }}
-      </button>
-      {% endfor %}
-    </div>
+  <nav class="dash-tabs panel" aria-label="Environment">
+    <button class="dash-tab is-active" data-env="demo" role="tab" aria-selected="true" aria-controls="panel-demo">Demo</button>
+    <button class="dash-tab" data-env="production" role="tab" aria-selected="false" aria-controls="panel-production">Production</button>
+    <span class="dash-refresh-label">
+      <span class="muted-label">Last refreshed</span>
+      <strong id="dash-last-refreshed">—</strong>
+    </span>
   </nav>
 
-  <div class="control-room-tab-panels">
-    <section class="control-room-tab-panel is-active" id="tab-panel-overview" data-tab-panel="overview" role="tabpanel" aria-labelledby="tab-button-overview">
-      <div class="control-room-grid">
-        <article class="control-card control-card-actions">
-          <div class="control-card-header">
-            <h2>Deployment Controls</h2>
-          </div>
-          <div class="control-action-groups">
-            <div class="action-group">
-              <span class="action-group-label">Safety</span>
-              <div class="actions">
-                <button type="button" class="button button-danger" data-action="toggle-kill" data-enabled="true">Enable Kill Switch</button>
-                <button type="button" class="button button-secondary" data-action="toggle-kill" data-enabled="false">Disable Kill Switch</button>
-              </div>
-            </div>
-            <div class="action-group">
-              <span class="action-group-label">Deployment</span>
-              <div class="actions">
-                <button type="button" class="button button-primary" data-action="promote-color" data-color="blue">Promote Blue</button>
-                <button type="button" class="button button-primary" data-action="promote-color" data-color="green">Promote Green</button>
-              </div>
-            </div>
-          </div>
-        </article>
+  {% for env_key, env_data in [("demo", demo), ("production", production)] %}
+  <section
+    class="dash-panel{% if env_key == "demo" %} is-active{% endif %}"
+    id="panel-{{ env_key }}"
+    data-env="{{ env_key }}"
+    role="tabpanel"
+    {% if env_key != "demo" %}hidden{% endif %}
+  >
+    <div class="dash-grid">
 
-        <article class="control-card control-card-wide">
-          <div class="control-card-header">
-            <h2>Open Positions</h2>
+      <article class="dash-card dash-card-alerts">
+        <div class="dash-card-header">
+          <h2>Alerts</h2>
+          {% set errors = env_data.alerts | selectattr("severity", "equalto", "error") | list %}
+          {% set warnings = env_data.alerts | selectattr("severity", "equalto", "warning") | list %}
+          <span class="status-pill {% if errors %}status-bad{% elif warnings %}status-warning{% else %}status-good{% endif %}">
+            {% if errors %}{{ errors | length }} error{{ "s" if errors | length != 1 }}{% elif warnings %}{{ warnings | length }} warning{{ "s" if warnings | length != 1 }}{% else %}Clear{% endif %}
+          </span>
+        </div>
+        {% if env_data.alerts %}
+        <div class="alert-list">
+          {% for alert in env_data.alerts %}
+          <div class="alert-row alert-row-{{ alert.severity }}">
+            <span class="status-pill {% if alert.severity == 'error' %}status-bad{% elif alert.severity == 'warning' %}status-warning{% else %}status-neutral{% endif %} alert-pill">{{ alert.severity }}</span>
+            <div class="alert-body">
+              <strong>{{ alert.summary }}</strong>
+              <span class="muted-label">{{ alert.source }}{% if alert.created_at %} · <span data-timestamp="{{ alert.created_at }}">{{ alert.created_at }}</span>{% endif %}</span>
+            </div>
           </div>
-          {% if initial_tab_payload.positions %}
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="empty-state">No recent alerts.</p>
+        {% endif %}
+      </article>
+
+      <article class="dash-card dash-card-positions">
+        <div class="dash-card-header">
+          <h2>Open Positions</h2>
+          <span class="muted-label">{{ env_data.positions | length }} position{{ "s" if env_data.positions | length != 1 }}</span>
+        </div>
+        {% if env_data.positions %}
+        <div class="table-wrap">
           <table class="positions-table">
-            <thead><tr><th>Market</th><th>Side</th><th>Contracts</th><th>Avg Price</th><th>Notional</th></tr></thead>
+            <thead>
+              <tr><th>Market</th><th>Side</th><th>Contracts</th><th>Avg Price</th><th>Notional</th></tr>
+            </thead>
             <tbody>
-              {% for pos in initial_tab_payload.positions %}
+              {% for pos in env_data.positions %}
               <tr>
                 <td class="mono">{{ pos.market_ticker }}</td>
                 <td><span class="status-pill {% if pos.side == 'yes' %}status-good{% else %}status-warning{% endif %}">{{ pos.side }}</span></td>
@@ -155,114 +74,18 @@
               {% endfor %}
             </tbody>
           </table>
-          {% else %}
-          <p class="empty-state">No open positions.</p>
-          {% endif %}
-        </article>
+        </div>
+        {% else %}
+        <p class="empty-state">No open positions.</p>
+        {% endif %}
+      </article>
 
-        <article class="control-card">
-          <div class="control-card-header">
-            <h2>Runtime Health</h2>
-          </div>
-          <div class="runtime-health-grid">
-            {% for color, health in initial_tab_payload.runtime_health.colors.items() %}
-            <div class="runtime-card">
-              <div class="runtime-card-top">
-                <strong>{{ color|upper }}</strong>
-                <span class="status-pill {% if health.combined_healthy %}status-good{% else %}status-bad{% endif %}">
-                  {{ "healthy" if health.combined_healthy else "degraded" }}
-                </span>
-              </div>
-              <span>app {{ health.app.status }}</span>
-              <span>daemon {{ "healthy" if health.daemon.healthy else "unhealthy" }}</span>
-              <span data-seconds="{{ health.daemon.heartbeat_age_seconds if health.daemon.heartbeat_age_seconds is not none else '' }}">
-                age {{ health.daemon.heartbeat_age_seconds if health.daemon.heartbeat_age_seconds is not none else "n/a" }}s
-              </span>
-              <span class="muted" data-timestamp="{{ health.daemon.last_reconcile_at or '' }}">
-                reconcile {{ health.daemon.last_reconcile_at or "never" }}
-              </span>
-            </div>
-            {% endfor %}
-          </div>
-        </article>
-
-        <article class="control-card">
-          <div class="control-card-header">
-            <h2>Top Blockers</h2>
-          </div>
-          <div class="token-list">
-            {% for blocker in initial_tab_payload.top_blockers %}
-            <span class="token-chip token-chip-bad">{{ blocker }}</span>
-            {% else %}
-            <span class="token-chip">No blockers reported.</span>
-            {% endfor %}
-          </div>
-        </article>
-
-        <article class="control-card">
-          <div class="control-card-header">
-            <h2>Next Actions</h2>
-          </div>
-          <div class="token-list">
-            {% for item in initial_tab_payload.next_actions %}
-            <span class="token-chip token-chip-good">{{ item }}</span>
-            {% else %}
-            <span class="token-chip">No actions needed.</span>
-            {% endfor %}
-          </div>
-        </article>
-
-        <article class="control-card">
-          <div class="control-card-header">
-            <h2>Recent Ops</h2>
-          </div>
-          <div class="compact-list">
-            {% for event in initial_tab_payload.ops_events | sort(attribute='severity') %}
-            <div class="compact-row">
-              <span class="status-pill {% if event.severity == 'error' %}status-bad{% elif event.severity == 'warning' %}status-warning{% else %}status-neutral{% endif %}">{{ event.severity }}</span>
-              <div class="compact-row-body">
-                <strong>{{ event.summary }}</strong>
-                <span>{{ event.source }}</span>
-              </div>
-            </div>
-            {% else %}
-            <p>No ops events recorded yet.</p>
-            {% endfor %}
-          </div>
-        </article>
-      </div>
-    </section>
-
-    {% for tab in control_room_tabs if tab.id != bootstrap.initial_tab %}
-    <section class="control-room-tab-panel" id="tab-panel-{{ tab.id }}" data-tab-panel="{{ tab.id }}" role="tabpanel" aria-labelledby="tab-button-{{ tab.id }}" hidden>
-      <div class="tab-loading-state">
-        <p>{{ tab.label }} will load when opened.</p>
-      </div>
-    </section>
-    {% endfor %}
-  </div>
-
-  <div class="control-room-modal" id="control-room-modal" hidden>
-    <div class="control-room-modal-backdrop" data-action="close-modal"></div>
-    <div class="control-room-modal-card" role="dialog" aria-modal="true" aria-labelledby="control-room-modal-title">
-      <h2 id="control-room-modal-title">Confirm action</h2>
-      <p id="control-room-modal-body">This action changes live operator state.</p>
-      <div class="actions">
-        <button type="button" class="button button-secondary" data-action="close-modal">Cancel</button>
-        <button type="button" class="button button-danger" id="control-room-modal-confirm">Confirm</button>
-      </div>
     </div>
-  </div>
+  </section>
+  {% endfor %}
 
-  <noscript>
-    <section class="panel">
-      <p>JavaScript is required for live tabs, filtering, and auto-refresh. The overview content above is still available, and the raw APIs remain under <code>/api/*</code>.</p>
-    </section>
-  </noscript>
-
-  <script id="control-room-bootstrap" type="application/json">{{ bootstrap|tojson }}</script>
 </div>
 {% endblock %}
 {% block extra_scripts %}
-  <script src="/static/control_room.js"></script>
+  <script src="/static/dashboard.js"></script>
 {% endblock %}
