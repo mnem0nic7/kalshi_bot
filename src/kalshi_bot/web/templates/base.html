@@ -20,7 +20,7 @@
         </nav>
       </div>
       <div class="header-meta">
-        <span class="header-color-badge">{{ settings.app_color if settings else room.active_color }}</span>
+        <span class="header-color-badge" aria-label="Color: {{ settings.app_color if settings else room.active_color }}">{{ settings.app_color if settings else room.active_color }}</span>
       </div>
     </header>
     <main class="shell-main {% block main_class %}{% endblock %}">
