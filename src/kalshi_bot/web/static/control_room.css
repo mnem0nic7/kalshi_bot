@@ -135,12 +135,12 @@
 .control-room-intel-board {
   display: grid;
   gap: 0.85rem;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
 }
 
 .control-room-tabs {
   position: sticky;
-  top: 0.75rem;
+  top: calc(var(--header-height, 3.5rem) + 0.5rem);
   z-index: 20;
   padding: 0.6rem;
 }

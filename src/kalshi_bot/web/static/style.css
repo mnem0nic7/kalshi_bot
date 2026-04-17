@@ -1,3 +1,7 @@
+:root {
+  --header-height: 3.5rem;
+}
+
 body {
   margin: 0;
   font-family: "IBM Plex Sans", "Helvetica Neue", sans-serif;
@@ -88,7 +92,7 @@ body {
 *:focus-visible {
   outline: 2px solid rgba(249, 215, 126, 0.8);
   outline-offset: 2px;
-  border-radius: 4px;
+  border-radius: inherit;
 }
 
 .panel a {
