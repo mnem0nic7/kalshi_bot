@@ -563,6 +563,16 @@ async def _recent_room_outcome_views(container: AppContainer, *, now: datetime) 
     return room_views
 
 
+def _error_alert_summary(ops_events: list[Any]) -> dict[str, Any]:
+    errors = [e for e in ops_events if e.severity == "error"]
+    warnings = [e for e in ops_events if e.severity == "warning"]
+    return {
+        "error_count": len(errors),
+        "warning_count": len(warnings),
+        "most_recent": errors[0].summary if errors else (warnings[0].summary if warnings else None),
+    }
+
+
 def _summary_payload(
     *,
     now: datetime,
@@ -573,8 +583,8 @@ def _summary_payload(
     research_confidence: dict[str, Any],
     room_views: list[dict[str, Any]],
     intel_board: list[dict[str, Any]] | None = None,
+    ops_events: list[Any] | None = None,
 ) -> dict[str, Any]:
-    quality_debt = dict(training_status.get("quality_debt_summary") or {})
     room_outcomes = _recent_room_outcomes(room_views, now=now)
 
     return {
@@ -604,19 +614,7 @@ def _summary_payload(
         "research_confidence": research_confidence,
         "current_intel_board": intel_board or [],
         "room_outcomes": room_outcomes,
-        "quality_debt": {
-            "total": int(
-                quality_debt.get("stale_mismatch_count", 0)
-                + quality_debt.get("missed_stand_down_count", 0)
-                + quality_debt.get("weak_resolved_trade_count", 0)
-            ),
-            "stale_mismatch_count": int(quality_debt.get("stale_mismatch_count", 0)),
-            "missed_stand_down_count": int(quality_debt.get("missed_stand_down_count", 0)),
-            "weak_resolved_trade_count": int(quality_debt.get("weak_resolved_trade_count", 0)),
-            "recent_stale_mismatch_count": int(quality_debt.get("recent_stale_mismatch_count", 0)),
-            "recent_missed_stand_down_count": int(quality_debt.get("recent_missed_stand_down_count", 0)),
-            "cleaned_trainable_room_count": int(quality_debt.get("cleaned_trainable_room_count", 0)),
-        },
+        "error_alert": _error_alert_summary(ops_events or []),
     }
 
 
@@ -664,6 +662,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         control = await repo.get_deployment_control()
         runtime_health = await container.watchdog_service.get_status(repo)
         positions = await repo.list_positions(limit=POSITION_LIMIT)
+        ops_events = await repo.list_ops_events(limit=20)
         await session.commit()
 
     research_confidence, room_bundles, room_outcome_views, intel_board = await asyncio.gather(
@@ -682,6 +681,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         research_confidence=research_confidence,
         room_views=room_outcome_views,
         intel_board=intel_board,
+        ops_events=ops_events,
     )
 
 

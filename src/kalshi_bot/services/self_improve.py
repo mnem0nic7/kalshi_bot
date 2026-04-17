@@ -154,8 +154,10 @@ class SelfImproveService:
             await session.commit()
 
         try:
-            bundles = await self.training_export_service.export_room_bundles(room_ids=room_ids, limit=len(room_ids), include_non_complete=False)
-            critiques = [await self._critique_bundle(champion_pack, bundle) for bundle in bundles]
+            critiques: list[SelfImproveCritiqueItem] = []
+            for room_id in room_ids:
+                bundle = await self.training_export_service.build_room_bundle(room_id)
+                critiques.append(await self._critique_bundle(champion_pack, bundle))
             candidate = await self._build_candidate_pack(champion_pack, critiques, critique_run_id=critique_run.id)
             candidate = self.agent_pack_service.sanitize_candidate_pack(candidate, parent_version=champion_pack.version)
             async with self.session_factory() as session:
@@ -169,12 +171,12 @@ class SelfImproveService:
                         "candidate_version": candidate.version,
                     },
                     candidate_version=candidate.version,
-                    room_count=len(bundles),
+                    room_count=len(critiques),
                 )
                 await session.commit()
             return SelfImproveResult(
                 status="completed",
-                payload={"critique_run_id": critique_run.id, "candidate_version": candidate.version, "room_count": len(bundles)},
+                payload={"critique_run_id": critique_run.id, "candidate_version": candidate.version, "room_count": len(critiques)},
             )
         except Exception as exc:
             async with self.session_factory() as session:
@@ -221,9 +223,14 @@ class SelfImproveService:
             await session.commit()
 
         try:
-            bundles = await self.training_export_service.export_room_bundles(room_ids=holdout_ids, limit=len(holdout_ids), include_non_complete=False)
-            champion_metrics = await self._evaluate_pack(champion_pack, bundles)
-            candidate_metrics = await self._evaluate_pack(candidate_pack, bundles)
+            champion_scores: list[dict[str, float]] = []
+            candidate_scores: list[dict[str, float]] = []
+            for room_id in holdout_ids:
+                bundle = await self.training_export_service.build_room_bundle(room_id)
+                champion_scores.append(await self._score_bundle(champion_pack, bundle))
+                candidate_scores.append(await self._score_bundle(candidate_pack, bundle))
+            champion_metrics = self._metrics_from_scores(champion_scores)
+            candidate_metrics = self._metrics_from_scores(candidate_scores)
             summary = self._evaluation_summary(
                 champion_version=champion_pack.version,
                 candidate_version=candidate_pack.version,
@@ -235,7 +242,7 @@ class SelfImproveService:
                 await repo.complete_evaluation_run(
                     evaluation.id,
                     summary=summary,
-                    holdout_room_count=len(bundles),
+                    holdout_room_count=len(champion_scores),
                 )
                 await session.commit()
             return SelfImproveResult(
@@ -534,26 +541,22 @@ class SelfImproveService:
         )
 
     async def _evaluate_pack(self, pack: AgentPack, bundles: list[TrainingRoomBundle]) -> EvaluationMetrics:
-        scores: list[dict[str, float]] = []
-        invalid_payloads = 0
-        gate_violations = 0
-        safety_violations = 0
-        settled_scores: list[float] = []
-        for bundle in bundles:
-            score = await self._score_bundle(pack, bundle)
-            scores.append(score)
-            invalid_payloads += int(score["invalid_payload"])
-            gate_violations += int(score["gate_violation"])
-            safety_violations += int(score["safety_violation"])
-            if "settled_pnl_score" in score:
-                settled_scores.append(score["settled_pnl_score"])
+        scores = [await self._score_bundle(pack, bundle) for bundle in bundles]
+        return self._metrics_from_scores(scores)
+
+    @staticmethod
+    def _metrics_from_scores(scores: list[dict[str, float]]) -> EvaluationMetrics:
         sample_size = len(scores)
         if sample_size == 0:
             return EvaluationMetrics()
-        research_quality = self._average([item["research_quality"] for item in scores])
-        directional_agreement = self._average([item["directional_agreement"] for item in scores])
-        risk_compliance = self._average([item["risk_compliance"] for item in scores])
-        memory_usefulness = self._average([item["memory_usefulness"] for item in scores])
+        invalid_payloads = sum(int(s["invalid_payload"]) for s in scores)
+        gate_violations = sum(int(s["gate_violation"]) for s in scores)
+        safety_violations = sum(int(s["safety_violation"]) for s in scores)
+        settled_scores = [s["settled_pnl_score"] for s in scores if "settled_pnl_score" in s]
+        research_quality = SelfImproveService._average([s["research_quality"] for s in scores])
+        directional_agreement = SelfImproveService._average([s["directional_agreement"] for s in scores])
+        risk_compliance = SelfImproveService._average([s["risk_compliance"] for s in scores])
+        memory_usefulness = SelfImproveService._average([s["memory_usefulness"] for s in scores])
         composite = (
             research_quality * 0.40
             + directional_agreement * 0.25
@@ -569,7 +572,7 @@ class SelfImproveService:
             invalid_payload_rate=invalid_payloads / sample_size,
             gate_violation_count=gate_violations,
             safety_violation_count=safety_violations,
-            settled_pnl_score=(self._average(settled_scores) if settled_scores else None),
+            settled_pnl_score=(SelfImproveService._average(settled_scores) if settled_scores else None),
             sample_size=sample_size,
         )
 

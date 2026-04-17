@@ -302,7 +302,8 @@
   }
 
   function summaryCard(config) {
-    const card = element("article", ["summary-card"].concat(config.critical ? ["summary-card-critical"] : []));
+    const extraClass = config.critical ? "summary-card-critical" : config.warn ? "summary-card-warn" : null;
+    const card = element("article", ["summary-card"].concat(extraClass ? [extraClass] : []));
     const heading = element("div", "summary-card-heading");
     heading.append(element("span", "summary-card-label", config.label));
     if (config.pill) {
@@ -328,7 +329,7 @@
     const openPositions = summary.open_positions || {};
     const researchConfidence = summary.research_confidence || {};
     const roomOutcomes = summary.room_outcomes || {};
-    const qualityDebt = summary.quality_debt || {};
+    const errorAlert = summary.error_alert || {};
     const resolvedRoomCount = Number(roomOutcomes.resolved_total || 0);
 
     const summaryCards = [
@@ -372,10 +373,16 @@
         critical: resolvedRoomCount > 0 && Number(roomOutcomes.succeeded || 0) === 0,
       }),
       summaryCard({
-        label: "Quality Debt",
-        value: formatInteger(qualityDebt.total || 0),
-        detail: `stale ${formatInteger(qualityDebt.stale_mismatch_count || 0)} · missed ${formatInteger(qualityDebt.missed_stand_down_count || 0)} · weak ${formatInteger(qualityDebt.weak_resolved_trade_count || 0)}`,
-        subdetail: `recent stale ${formatInteger(qualityDebt.recent_stale_mismatch_count || 0)} · recent missed ${formatInteger(qualityDebt.recent_missed_stand_down_count || 0)}`,
+        label: "Error Events",
+        value: formatInteger(errorAlert.error_count || 0),
+        detail: `${formatInteger(errorAlert.warning_count || 0)} warnings (24h)`,
+        subdetail: errorAlert.most_recent || "No recent errors.",
+        pill: {
+          label: (errorAlert.error_count || 0) > 0 ? "ERRORS" : (errorAlert.warning_count || 0) > 0 ? "WARNINGS" : "CLEAR",
+          tone: (errorAlert.error_count || 0) > 0 ? "bad" : (errorAlert.warning_count || 0) > 0 ? "warning" : "good",
+        },
+        critical: (errorAlert.error_count || 0) > 0,
+        warn: (errorAlert.error_count || 0) === 0 && (errorAlert.warning_count || 0) > 0,
       }),
     ];
     summaryContainer.replaceChildren(...summaryCards);
@@ -406,7 +413,18 @@
         { label: "Market", render: (r) => r.ticker },
         { label: "Gate", render: (r) => r.ticker }, // overwritten below with pills
         { label: "Fair YES", render: (r) => r.fair_yes_dollars ? "$".concat(r.fair_yes_dollars) : "—" },
-        { label: "Confidence", render: (r) => r.confidence != null ? formatNumber(r.confidence, 2) : "—" },
+        {
+          label: "Confidence",
+          render: (r) => {
+            if (r.confidence == null) return element("span", "muted", "—");
+            const wrap = element("div", "intel-conf");
+            const bar = element("div", "intel-conf-bar");
+            bar.style.width = `${Math.round(r.confidence * 100)}%`;
+            bar.classList.add(r.confidence >= 0.9 ? "confidence-high" : r.confidence >= 0.75 ? "confidence-medium" : "confidence-low");
+            wrap.append(element("span", null, formatNumber(r.confidence, 2)), bar);
+            return wrap;
+          },
+        },
         { label: "Age", render: (r) => r.age_seconds != null ? formatDurationSeconds(r.age_seconds) : "—" },
         { label: "Why Blocked", render: (r) => (r.gate_reasons || [])[0] || (r.gate_passed ? "" : "unknown") },
       ],
@@ -539,7 +557,7 @@
 
     const actionsCard = element("article", ["control-card", "control-card-actions"]);
     const actionsHeader = element("div", "control-card-header");
-    actionsHeader.append(element("h2", null, "Deployment Controls"), element("p", null, "Critical actions stay confirmation-gated and visually distinct."));
+    actionsHeader.append(element("h2", null, "Deployment Controls"));
     const groups = element("div", "control-action-groups");
     const safetyGroup = element("div", "action-group");
     safetyGroup.append(
@@ -570,7 +588,7 @@
 
     const runtimeCard = element("article", ["control-card", "control-card-wide"]);
     const runtimeHeader = element("div", "control-card-header");
-    runtimeHeader.append(element("h2", null, "Runtime Health"), element("p", null, "App and daemon freshness with combined deployment state."));
+    runtimeHeader.append(element("h2", null, "Runtime Health"));
     const runtimeGrid = element("div", "runtime-health-grid");
     Object.entries(runtimeHealth.colors || {}).forEach(([color, health]) => {
       const card = element("div", "runtime-card");
@@ -593,7 +611,7 @@
     blockerCard.append(
       (() => {
         const header = element("div", "control-card-header");
-        header.append(element("h2", null, "Top Blockers"), element("p", null, "The clearest reasons the system is not ready to move faster."));
+        header.append(element("h2", null, "Top Blockers"));
         return header;
       })(),
       (() => {
@@ -612,7 +630,7 @@
     nextActionCard.append(
       (() => {
         const header = element("div", "control-card-header");
-        header.append(element("h2", null, "Next Actions"), element("p", null, "The highest-signal operational follow-ups from current status."));
+        header.append(element("h2", null, "Next Actions"));
         return header;
       })(),
       (() => {
@@ -631,12 +649,15 @@
     recentOpsCard.append(
       (() => {
         const header = element("div", "control-card-header");
-        header.append(element("h2", null, "Recent Ops"), element("p", null, "Compact event stream so the important runtime changes stay visible."));
+        header.append(element("h2", null, "Recent Ops"));
         return header;
       })()
     );
     const opsList = element("div", "compact-list");
-    const opsEvents = Array.isArray(payload.ops_events) ? payload.ops_events : [];
+    const severityRank = { error: 0, warning: 1, info: 2 };
+    const opsEvents = (Array.isArray(payload.ops_events) ? payload.ops_events : [])
+      .slice()
+      .sort((a, b) => (severityRank[a.severity] ?? 3) - (severityRank[b.severity] ?? 3));
     if (!opsEvents.length) {
       opsList.append(element("p", "empty-state", "No ops events recorded yet."));
     } else {
@@ -652,32 +673,7 @@
     }
     recentOpsCard.append(opsList);
 
-    const packCard = element("article", ["control-card", "control-card-medium"]);
-    packCard.append(
-      (() => {
-        const header = element("div", "control-card-header");
-        header.append(element("h2", null, "Pack Status"), element("p", null, "Historical heuristic pack actions live here with safe confirmations."));
-        return header;
-      })(),
-      compactStatGrid([
-        { label: "Champion", value: (selfImprove.agent_packs || {}).champion_version || "n/a" },
-        { label: "Candidate", value: (selfImprove.agent_packs || {}).candidate_version || "none" },
-        { label: "Heuristic Active", value: heuristics.active_pack_version || "n/a" },
-        { label: "Heuristic Candidate", value: heuristics.candidate_pack_version || "none" },
-      ])
-    );
-    const packActions = element("div", "actions");
-    packActions.append(
-      button("Run Critique", ["button-secondary"], { dataset: { action: "runCritique" } }),
-      button("Promote Pack", ["button-primary"], {
-        dataset: { action: "promotePack", candidateVersion: heuristics.candidate_pack_version || "" },
-        disabled: !heuristics.candidate_pack_version,
-      }),
-      button("Rollback Pack", ["button-danger"], { dataset: { action: "rollbackPack" } })
-    );
-    packCard.append(packActions);
-
-    grid.append(actionsCard, runtimeCard, blockerCard, nextActionCard, recentOpsCard, packCard);
+    grid.append(actionsCard, runtimeCard, blockerCard, nextActionCard, recentOpsCard);
     panel.append(grid);
   }
 
