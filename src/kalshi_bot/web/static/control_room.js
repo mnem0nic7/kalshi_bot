@@ -673,7 +673,36 @@
     }
     recentOpsCard.append(opsList);
 
-    grid.append(actionsCard, runtimeCard, blockerCard, nextActionCard, recentOpsCard);
+    const positionsCard = element("article", ["control-card", "control-card-wide"]);
+    const positionsHeader = element("div", "control-card-header");
+    positionsHeader.append(element("h2", null, "Open Positions"));
+    positionsCard.append(positionsHeader);
+    const positions = Array.isArray(payload.positions) ? payload.positions : [];
+    if (!positions.length) {
+      positionsCard.append(element("p", "empty-state", "No open positions."));
+    } else {
+      const tbl = element("table", "positions-table");
+      const thead = element("thead");
+      const hrow = element("tr");
+      ["Market", "Side", "Contracts", "Avg Price", "Notional"].forEach((h) => hrow.append(element("th", null, h)));
+      thead.append(hrow);
+      const tbody = element("tbody");
+      positions.forEach((pos) => {
+        const row = element("tr");
+        row.append(
+          element("td", "mono", pos.market_ticker),
+          (() => { const td = element("td"); td.append(statusPill(pos.side, pos.side === "yes" ? "good" : "warning")); return td; })(),
+          element("td", "mono", pos.count_fp),
+          element("td", "mono", `$${pos.average_price_dollars}`),
+          element("td", "mono", `$${pos.notional_dollars}`)
+        );
+        tbody.append(row);
+      });
+      tbl.append(thead, tbody);
+      positionsCard.append(tbl);
+    }
+
+    grid.append(actionsCard, positionsCard, runtimeCard, blockerCard, nextActionCard, recentOpsCard);
     panel.append(grid);
   }
 
