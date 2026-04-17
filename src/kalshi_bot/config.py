@@ -97,6 +97,7 @@ class Settings(BaseSettings):
     trigger_cooldown_seconds: int = 300
     trigger_max_spread_bps: int = 1200
     trigger_max_concurrent_rooms: int = 4
+    trigger_active_room_stale_seconds: int = 1800
     daemon_reconcile_interval_seconds: int = 60
     daemon_heartbeat_interval_seconds: int = 60
     daemon_start_with_reconcile: bool = True

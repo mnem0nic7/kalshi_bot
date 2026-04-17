@@ -57,7 +57,11 @@ class AutoTriggerService:
                 await session.commit()
                 return
 
-            if await repo.count_active_rooms() >= self.settings.trigger_max_concurrent_rooms:
+            active_count = await repo.count_active_rooms(
+                color=self.settings.app_color,
+                updated_within_seconds=self.settings.trigger_active_room_stale_seconds,
+            )
+            if active_count >= self.settings.trigger_max_concurrent_rooms:
                 await repo.log_ops_event(
                     severity="warning",
                     summary=f"Auto-trigger skipped for {market_ticker}: max concurrent rooms reached",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -314,8 +314,20 @@ class PlatformRepository:
         result = await self.session.execute(stmt.limit(limit))
         return list(result.scalars())
 
-    async def count_active_rooms(self) -> int:
-        stmt = select(func.count()).select_from(Room).where(Room.stage.not_in([RoomStage.COMPLETE.value, RoomStage.FAILED.value]))
+    async def count_active_rooms(
+        self,
+        *,
+        color: str | None = None,
+        updated_within_seconds: int | None = None,
+    ) -> int:
+        stmt = select(func.count()).select_from(Room).where(
+            Room.stage.not_in([RoomStage.COMPLETE.value, RoomStage.FAILED.value])
+        )
+        if color is not None:
+            stmt = stmt.where(Room.active_color == color)
+        if updated_within_seconds is not None:
+            cutoff = datetime.now(UTC) - timedelta(seconds=updated_within_seconds)
+            stmt = stmt.where(Room.updated_at >= cutoff)
         return int((await self.session.execute(stmt)).scalar_one())
 
     async def get_room(self, room_id: str) -> Room | None:
