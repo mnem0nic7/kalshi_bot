@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 from kalshi_bot.config import Settings
@@ -10,9 +10,11 @@ from kalshi_bot.core.enums import ContractSide, StandDownReason, StrategyMode, T
 from kalshi_bot.core.fixed_point import as_decimal, quantize_price
 from kalshi_bot.core.schemas import ResearchFreshness, TradeEligibilityVerdict
 from kalshi_bot.weather.models import WeatherMarketMapping
-from kalshi_bot.weather.scoring import WeatherSignalSnapshot, score_weather_market
+from kalshi_bot.weather.scoring import WeatherSignalSnapshot, confidence_band_for, score_weather_market
 
 NO_TRADE_SUMMARY_SENTENCE = "No taker trade clears the configured edge threshold."
+ADVISORY_SIZE_CAP_FP = Decimal("10.00")
+TAIL_PAYOUT_WARN_THRESHOLD = Decimal("0.9500")
 
 
 @dataclass(slots=True)
@@ -30,6 +32,14 @@ class StrategySignal:
     eligibility: TradeEligibilityVerdict | None = None
     stand_down_reason: StandDownReason | None = None
     heuristic_application: dict[str, Any] | None = None
+    trade_regime: str = "standard"
+    capital_bucket: str = "safe"
+    forecast_delta_f: float | None = None
+    confidence_band: str = "low"
+    model_quality_status: str = "pass"
+    model_quality_reasons: list[str] = field(default_factory=list)
+    recommended_size_cap_fp: Decimal | None = None
+    warn_only_blocked: bool = False
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -92,6 +102,7 @@ def base_strategy_summary(summary: str) -> str:
         " Market spread is too wide for the base strategy.",
         " Order book is effectively broken",
         " No actionable edge remains after applying the quality buffer to current quotes.",
+        " Model-quality review:",
         " Stand down:",
     ):
         marker_index = cleaned.find(marker)
@@ -143,10 +154,197 @@ def non_trade_market_reason(
     )
 
 
+def summarize_signal_action(
+    base_summary: str,
+    *,
+    recommendation_action: TradeAction | None,
+    recommendation_side: ContractSide | None,
+    target_yes_price_dollars: Decimal | None,
+    edge_bps: int,
+    market_snapshot: dict[str, Any],
+    spread_limit_bps: int,
+) -> str:
+    summary = base_strategy_summary(base_summary)
+    if recommendation_action is not None and recommendation_side is not None and target_yes_price_dollars is not None:
+        return (
+            f"{summary}. Recommend {recommendation_action.value} {recommendation_side.value} "
+            f"at yes price {target_yes_price_dollars} with edge {edge_bps} bps."
+        )
+    no_trade_reason, no_trade_text = non_trade_market_reason(
+        market_snapshot,
+        spread_limit_bps=spread_limit_bps,
+    )
+    if no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
+        return f"{summary}. {no_trade_text}"
+    if no_trade_reason == StandDownReason.SPREAD_TOO_WIDE:
+        return f"{summary}. Market spread is too wide for the base strategy."
+    return f"{summary}. {NO_TRADE_SUMMARY_SENTENCE}"
+
+
 def remaining_payout_dollars(side: ContractSide, yes_price_dollars: Decimal) -> Decimal:
     if side == ContractSide.YES:
         return quantize_price(Decimal("1.0000") - yes_price_dollars)
     return quantize_price(yes_price_dollars)
+
+
+def suggested_trade_count_fp(
+    *,
+    settings: Settings,
+    signal: StrategySignal,
+    max_order_notional_dollars: float | None = None,
+) -> Decimal | None:
+    if signal.recommended_side is None or signal.target_yes_price_dollars is None:
+        return None
+    notional_cap = max_order_notional_dollars if max_order_notional_dollars is not None else settings.risk_max_order_notional_dollars
+    max_notional = Decimal(str(notional_cap)) * Decimal(str(signal.confidence))
+    unit_price = (
+        signal.target_yes_price_dollars
+        if signal.recommended_side == ContractSide.YES
+        else Decimal("1.0000") - signal.target_yes_price_dollars
+    )
+    raw_count = (max_notional / max(unit_price, Decimal("0.01"))).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    capped_count = min(raw_count, Decimal(str(settings.risk_max_order_count_fp)))
+    return max(capped_count, Decimal("1.00"))
+
+
+def signal_trade_regime(signal: StrategySignal) -> str:
+    fair_yes = signal.fair_yes_dollars
+    fair_no = Decimal("1.0000") - fair_yes
+    if signal.recommended_side == ContractSide.YES and fair_yes <= Decimal("0.0800"):
+        return "longshot_yes"
+    if signal.recommended_side == ContractSide.NO and fair_no <= Decimal("0.0800"):
+        return "longshot_no"
+    if signal.forecast_delta_f is not None and abs(signal.forecast_delta_f) <= 2.0:
+        return "near_threshold"
+    return "standard"
+
+
+def capital_bucket_for_trade_regime(trade_regime: str | None) -> str:
+    if trade_regime in {"near_threshold", "longshot_yes", "longshot_no"}:
+        return "risky"
+    return "safe"
+
+
+def _model_quality_review(
+    *,
+    settings: Settings,
+    signal: StrategySignal,
+    market_snapshot: dict[str, Any],
+    current_ticket_count_fp: Decimal | None = None,
+) -> tuple[str, list[str], Decimal | None, bool]:
+    reasons: list[str] = []
+    recommended_size_cap_fp: Decimal | None = None
+    warn_only_blocked = False
+
+    if signal.trade_regime == "near_threshold":
+        recommended_size_cap_fp = ADVISORY_SIZE_CAP_FP
+        if signal.confidence < 0.70:
+            reasons.append("Near-threshold setup carries low confidence and should be sized conservatively.")
+
+    if signal.trade_regime in {"longshot_yes", "longshot_no"}:
+        recommended_size_cap_fp = ADVISORY_SIZE_CAP_FP
+        reasons.append("Longshot setup should be treated as small tail exposure.")
+        if signal.recommended_side is not None and signal.target_yes_price_dollars is not None:
+            remaining_payout = remaining_payout_dollars(signal.recommended_side, signal.target_yes_price_dollars)
+            if remaining_payout < TAIL_PAYOUT_WARN_THRESHOLD:
+                reasons.append(
+                    f"Remaining payout {remaining_payout:.4f} is below the tail-trade comfort threshold of {TAIL_PAYOUT_WARN_THRESHOLD:.4f}."
+                )
+
+    if current_ticket_count_fp is None:
+        current_ticket_count_fp = suggested_trade_count_fp(settings=settings, signal=signal)
+    if (
+        recommended_size_cap_fp is not None
+        and current_ticket_count_fp is not None
+        and current_ticket_count_fp > recommended_size_cap_fp
+    ):
+        reasons.append(
+            f"Current default ticket size {current_ticket_count_fp:.2f} exceeds advisory cap {recommended_size_cap_fp:.2f}."
+        )
+
+    no_trade_reason, _ = non_trade_market_reason(
+        market_snapshot,
+        spread_limit_bps=settings.trigger_max_spread_bps,
+    )
+    if no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
+        warn_only_blocked = True
+        reasons.append("Strict quality review would block this setup because the order book is effectively broken.")
+
+    status = "warn" if reasons else "pass"
+    return status, reasons, recommended_size_cap_fp, warn_only_blocked
+
+
+def _model_quality_summary_text(
+    *,
+    signal: StrategySignal,
+    recommended_size_cap_fp: Decimal | None,
+    reasons: list[str],
+    warn_only_blocked: bool,
+) -> str | None:
+    details: list[str] = []
+    if signal.trade_regime == "near_threshold":
+        details.append("near-threshold setup")
+    elif signal.trade_regime in {"longshot_yes", "longshot_no"}:
+        details.append("longshot setup")
+    if warn_only_blocked:
+        details.append("strict mode would block the broken book")
+    if recommended_size_cap_fp is not None:
+        details.append(f"recommended cap is {recommended_size_cap_fp:.2f} contracts")
+    if reasons:
+        detail_reasons = [
+            reason
+            for reason in reasons
+            if "Current default ticket size" in reason or "Remaining payout" in reason
+        ]
+        details.extend(detail_reasons)
+    if not details:
+        return None
+    return "; ".join(details)
+
+
+def annotate_signal_quality(
+    *,
+    settings: Settings,
+    signal: StrategySignal,
+    market_snapshot: dict[str, Any],
+    max_order_notional_dollars: float | None = None,
+) -> StrategySignal:
+    signal.trade_regime = signal_trade_regime(signal)
+    signal.capital_bucket = capital_bucket_for_trade_regime(signal.trade_regime)
+    signal.confidence_band = confidence_band_for(signal.confidence)
+    current_ticket_count_fp = suggested_trade_count_fp(
+        settings=settings,
+        signal=signal,
+        max_order_notional_dollars=max_order_notional_dollars,
+    )
+    status, reasons, recommended_size_cap_fp, warn_only_blocked = _model_quality_review(
+        settings=settings,
+        signal=signal,
+        market_snapshot=market_snapshot,
+        current_ticket_count_fp=current_ticket_count_fp,
+    )
+    signal.model_quality_status = status
+    signal.model_quality_reasons = reasons
+    signal.recommended_size_cap_fp = recommended_size_cap_fp
+    signal.warn_only_blocked = warn_only_blocked
+    signal.summary = summarize_signal_action(
+        base_strategy_summary(signal.summary),
+        recommendation_action=signal.recommended_action,
+        recommendation_side=signal.recommended_side,
+        target_yes_price_dollars=signal.target_yes_price_dollars,
+        edge_bps=signal.edge_bps,
+        market_snapshot=market_snapshot,
+        spread_limit_bps=settings.trigger_max_spread_bps,
+    )
+    quality_summary = _model_quality_summary_text(
+        signal=signal,
+        recommended_size_cap_fp=recommended_size_cap_fp,
+        reasons=reasons,
+        warn_only_blocked=warn_only_blocked,
+    )
+    if quality_summary:
+        signal.summary = f"{signal.summary} Model-quality review: {quality_summary}."
+    return signal
 
 
 def _trade_recommendation(
@@ -209,23 +407,16 @@ def apply_heuristic_application_to_signal(
     if adjusted_fair != signal.fair_yes_dollars:
         adjust_bps = int(application.get("fair_yes_adjust_bps") or 0)
         summary = f"{summary}. Historical heuristics adjusted fair yes by {adjust_bps:+d}bps"
-    if recommendation_action is not None and recommendation_side is not None and target_yes is not None:
-        summary = (
-            f"{summary}. Recommend {recommendation_action.value} {recommendation_side.value} "
-            f"at yes price {target_yes} with edge {edge_bps} bps."
-        )
-    else:
-        no_trade_reason, no_trade_text = non_trade_market_reason(
-            market_snapshot,
-            spread_limit_bps=spread_limit_bps,
-        )
-        if no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
-            summary = f"{summary}. {no_trade_text}"
-        elif no_trade_reason == StandDownReason.SPREAD_TOO_WIDE:
-            summary = f"{summary}. Market spread is too wide for the base strategy."
-        else:
-            summary = f"{summary}. {NO_TRADE_SUMMARY_SENTENCE}"
-    return StrategySignal(
+    summary = summarize_signal_action(
+        summary,
+        recommendation_action=recommendation_action,
+        recommendation_side=recommendation_side,
+        target_yes_price_dollars=target_yes,
+        edge_bps=edge_bps,
+        market_snapshot=market_snapshot,
+        spread_limit_bps=spread_limit_bps,
+    )
+    annotated = StrategySignal(
         fair_yes_dollars=adjusted_fair,
         confidence=signal.confidence,
         edge_bps=edge_bps,
@@ -237,6 +428,15 @@ def apply_heuristic_application_to_signal(
         resolution_state=signal.resolution_state,
         strategy_mode=signal.strategy_mode,
         heuristic_application=application,
+        trade_regime=signal.trade_regime,
+        capital_bucket=signal.capital_bucket,
+        forecast_delta_f=signal.forecast_delta_f,
+        confidence_band=signal.confidence_band,
+    )
+    return annotate_signal_quality(
+        settings=settings,
+        signal=annotated,
+        market_snapshot=market_snapshot,
     )
 
 
@@ -339,6 +539,7 @@ def evaluate_trade_eligibility(
         strategy_mode=strategy_mode,
         resolution_state=signal.resolution_state,
         stand_down_reason=stand_down_reason,
+        capital_bucket=signal.capital_bucket,
         reasons=reasons or ["Trade passed marketability checks."],
         market_stale=market_stale,
         research_stale=research_stale,
@@ -346,6 +547,10 @@ def evaluate_trade_eligibility(
         market_spread_bps=spread_bps,
         edge_after_quality_buffer_bps=edge_after_quality_buffer_bps,
         blocked_upstream=stand_down_reason is not None,
+        model_quality_status=signal.model_quality_status,
+        model_quality_reasons=signal.model_quality_reasons,
+        recommended_size_cap_fp=signal.recommended_size_cap_fp,
+        warn_only_blocked=signal.warn_only_blocked,
     )
 
 
@@ -374,25 +579,17 @@ class WeatherSignalEngine:
             min_edge_bps=effective_min_edge_bps,
         )
 
-        summary = weather.summary
-        if recommendation_action is not None and target_yes is not None:
-            summary = (
-                f"{summary} Recommend {recommendation_action.value} {recommendation_side.value} "
-                f"at yes price {target_yes} with edge {edge_bps} bps."
-            )
-        else:
-            no_trade_reason, no_trade_text = non_trade_market_reason(
-                market_snapshot,
-                spread_limit_bps=self.settings.trigger_max_spread_bps,
-            )
-            if no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
-                summary = f"{summary} {no_trade_text}"
-            elif no_trade_reason == StandDownReason.SPREAD_TOO_WIDE:
-                summary = f"{summary} Market spread is too wide for the base strategy."
-            else:
-                summary = f"{summary} {NO_TRADE_SUMMARY_SENTENCE}"
+        summary = summarize_signal_action(
+            weather.summary,
+            recommendation_action=recommendation_action,
+            recommendation_side=recommendation_side,
+            target_yes_price_dollars=target_yes,
+            edge_bps=edge_bps,
+            market_snapshot=market_snapshot,
+            spread_limit_bps=self.settings.trigger_max_spread_bps,
+        )
 
-        return StrategySignal(
+        signal = StrategySignal(
             fair_yes_dollars=weather.fair_yes_dollars,
             confidence=weather.confidence,
             edge_bps=edge_bps,
@@ -407,6 +604,15 @@ class WeatherSignalEngine:
                 if weather.resolution_state != WeatherResolutionState.UNRESOLVED
                 else StrategyMode.DIRECTIONAL_UNRESOLVED
             ),
+            trade_regime=weather.trade_regime,
+            capital_bucket=capital_bucket_for_trade_regime(weather.trade_regime),
+            forecast_delta_f=weather.forecast_delta_f,
+            confidence_band=weather.confidence_band,
+        )
+        return annotate_signal_quality(
+            settings=self.settings,
+            signal=signal,
+            market_snapshot=market_snapshot,
         )
 
 

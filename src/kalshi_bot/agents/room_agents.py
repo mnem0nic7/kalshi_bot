@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 
 from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.config import Settings
@@ -16,7 +16,7 @@ from kalshi_bot.core.schemas import (
     TradeTicket,
 )
 from kalshi_bot.db.models import Room
-from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
+from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars, suggested_trade_count_fp
 
 
 class AgentSuite:
@@ -208,18 +208,20 @@ class AgentSuite:
             )
 
         price = signal.target_yes_price_dollars
-        notional_cap = max_order_notional_dollars if max_order_notional_dollars is not None else self.settings.risk_max_order_notional_dollars
-        max_notional = Decimal(str(notional_cap)) * Decimal(str(signal.confidence))
-        unit_price = price if signal.recommended_side.value == "yes" else Decimal("1.0000") - price
-        raw_count = (max_notional / max(unit_price, Decimal("0.01"))).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        capped_count = min(raw_count, Decimal(str(self.settings.risk_max_order_count_fp)))
-        count_fp = max(capped_count, Decimal("1.00"))
+        count_fp = suggested_trade_count_fp(
+            settings=self.settings,
+            signal=signal,
+            max_order_notional_dollars=max_order_notional_dollars,
+        )
+        if count_fp is None:
+            raise RuntimeError("Suggested trade count is unavailable for an otherwise executable signal.")
         ticket = TradeTicket(
             market_ticker=market_ticker,
             action=signal.recommended_action,
             side=signal.recommended_side,
             yes_price_dollars=price,
             count_fp=count_fp,
+            capital_bucket=signal.capital_bucket,
             rationale_message_ids=rationale_ids,
             note=signal.summary,
         )

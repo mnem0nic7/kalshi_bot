@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     risk_max_position_notional_dollars: float = 250.0
     risk_daily_loss_limit_dollars: float = 100.0
     risk_max_order_count_fp: float = 25.0
+    risk_safe_capital_reserve_ratio: float = 0.70
+    risk_risky_capital_max_ratio: float = 0.30
     risk_stale_market_seconds: int = 30
     risk_stale_weather_seconds: int = 900
     risk_min_edge_bps: int = 50

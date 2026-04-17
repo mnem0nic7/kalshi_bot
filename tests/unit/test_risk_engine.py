@@ -3,25 +3,28 @@ from decimal import Decimal
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, DeploymentColor, RiskStatus, TradeAction, WeatherResolutionState
-from kalshi_bot.core.schemas import TradeTicket
+from kalshi_bot.core.schemas import PortfolioBucketSnapshot, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
 from kalshi_bot.services.signal import StrategySignal
 from kalshi_bot.weather.scoring import WeatherSignalSnapshot
 
 
-def make_signal(edge_bps: int = 100) -> StrategySignal:
+def make_signal(edge_bps: int = 100, *, capital_bucket: str = "safe", trade_regime: str = "standard") -> StrategySignal:
     weather = WeatherSignalSnapshot(
         fair_yes_dollars=Decimal("0.6400"),
         confidence=0.8,
         forecast_high_f=86,
         current_temp_f=78,
+        forecast_delta_f=6.0,
+        confidence_band="medium",
+        trade_regime=trade_regime,
         resolution_state=WeatherResolutionState.UNRESOLVED,
         observation_time=datetime.now(UTC),
         forecast_updated_time=datetime.now(UTC),
         summary="test signal",
     )
-    return StrategySignal(
+    signal = StrategySignal(
         fair_yes_dollars=Decimal("0.6400"),
         confidence=0.8,
         edge_bps=edge_bps,
@@ -30,7 +33,10 @@ def make_signal(edge_bps: int = 100) -> StrategySignal:
         target_yes_price_dollars=Decimal("0.5800"),
         summary="test",
         weather=weather,
+        trade_regime=trade_regime,
+        capital_bucket=capital_bucket,
     )
+    return signal
 
 
 def make_room() -> Room:
@@ -141,3 +147,127 @@ def test_risk_engine_blocks_stale_data() -> None:
     )
     assert verdict.status == RiskStatus.BLOCKED
     assert any("stale" in reason.lower() for reason in verdict.reasons)
+
+
+def test_risk_engine_resizes_risky_trade_to_bucket_remaining() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=20,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-RISKY",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(capital_bucket="risky", trade_regime="near_threshold"),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            portfolio_bucket_snapshot=PortfolioBucketSnapshot(
+                total_capital_dollars="20.0000",
+                overall_used_dollars="8.0000",
+                overall_remaining_dollars="12.0000",
+                safe_used_dollars="4.0000",
+                safe_remaining_dollars="12.0000",
+                safe_reserve_target_dollars="14.0000",
+                risky_used_dollars="4.0000",
+                risky_limit_dollars="6.0000",
+                risky_remaining_dollars="2.0000",
+            ),
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.resized_by_bucket is True
+    assert verdict.approved_count_fp == Decimal("4.00")
+    assert verdict.approved_notional_dollars == Decimal("2.0000")
+
+
+def test_risk_engine_blocks_risky_trade_when_bucket_has_no_room() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=20,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-RISKY",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(capital_bucket="risky", trade_regime="near_threshold"),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            portfolio_bucket_snapshot=PortfolioBucketSnapshot(
+                total_capital_dollars="20.0000",
+                overall_used_dollars="19.5000",
+                overall_remaining_dollars="0.5000",
+                safe_used_dollars="13.5000",
+                safe_remaining_dollars="0.5000",
+                safe_reserve_target_dollars="14.0000",
+                risky_used_dollars="6.0000",
+                risky_limit_dollars="6.0000",
+                risky_remaining_dollars="0.0000",
+            ),
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert verdict.approved_count_fp is None
+    assert any("capital bucket is full" in reason.lower() for reason in verdict.reasons)
+
+
+def test_risk_engine_safe_trade_is_not_blocked_when_risky_bucket_is_full() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=20,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-SAFE",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("4.00"),
+        ),
+        signal=make_signal(capital_bucket="safe", trade_regime="standard"),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            portfolio_bucket_snapshot=PortfolioBucketSnapshot(
+                total_capital_dollars="20.0000",
+                overall_used_dollars="10.0000",
+                overall_remaining_dollars="10.0000",
+                safe_used_dollars="4.0000",
+                safe_remaining_dollars="10.0000",
+                safe_reserve_target_dollars="14.0000",
+                risky_used_dollars="6.0000",
+                risky_limit_dollars="6.0000",
+                risky_remaining_dollars="0.0000",
+            ),
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.capital_bucket == "safe"
+    assert verdict.resized_by_bucket is False

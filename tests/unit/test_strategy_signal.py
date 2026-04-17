@@ -10,6 +10,7 @@ from kalshi_bot.core.schemas import ResearchFreshness
 from kalshi_bot.services.signal import (
     StrategySignal,
     apply_heuristic_application_to_signal,
+    annotate_signal_quality,
     base_strategy_summary,
     evaluate_trade_eligibility,
 )
@@ -30,6 +31,9 @@ def _signal(*, resolution_state: WeatherResolutionState = WeatherResolutionState
             confidence=1.0 if resolution_state != WeatherResolutionState.UNRESOLVED else 0.9,
             forecast_high_f=80,
             current_temp_f=51.8,
+            forecast_delta_f=4.0,
+            confidence_band="high" if resolution_state != WeatherResolutionState.UNRESOLVED else "medium",
+            trade_regime="standard",
             resolution_state=resolution_state,
             observation_time=datetime.now(UTC),
             forecast_updated_time=datetime.now(UTC),
@@ -336,3 +340,121 @@ def test_trade_eligibility_uses_decision_time_for_historical_checks() -> None:
 
     assert verdict.market_stale is False
     assert verdict.research_stale is False
+
+
+def test_annotate_signal_quality_assigns_safe_bucket_for_standard_trade() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.6400"),
+        confidence=0.8,
+        edge_bps=90,
+        recommended_action=TradeAction.BUY,
+        recommended_side=ContractSide.YES,
+        target_yes_price_dollars=Decimal("0.5800"),
+        summary="Standard setup.",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+        forecast_delta_f=4.0,
+    )
+
+    annotated = annotate_signal_quality(
+        settings=settings,
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.5600", "yes_ask_dollars": "0.5800", "no_ask_dollars": "0.4200"}},
+    )
+
+    assert annotated.trade_regime == "standard"
+    assert annotated.capital_bucket == "safe"
+
+
+def test_annotate_signal_quality_warns_on_near_threshold_low_confidence_and_oversize() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.6200"),
+        confidence=0.65,
+        edge_bps=90,
+        recommended_action=TradeAction.BUY,
+        recommended_side=ContractSide.YES,
+        target_yes_price_dollars=Decimal("0.5800"),
+        summary="Forecast high 81F versus threshold 80F implies fair yes near 0.6200.",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+        forecast_delta_f=1.0,
+    )
+
+    annotated = annotate_signal_quality(
+        settings=settings,
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.5600", "yes_ask_dollars": "0.5800", "no_ask_dollars": "0.4200"}},
+    )
+
+    assert annotated.trade_regime == "near_threshold"
+    assert annotated.capital_bucket == "risky"
+    assert annotated.model_quality_status == "warn"
+    assert annotated.recommended_size_cap_fp == Decimal("10.00")
+    assert annotated.warn_only_blocked is False
+    assert any("low confidence" in reason.lower() for reason in annotated.model_quality_reasons)
+    assert any("exceeds advisory cap" in reason.lower() for reason in annotated.model_quality_reasons)
+    assert "Model-quality review:" in annotated.summary
+
+
+def test_annotate_signal_quality_warns_on_longshot_yes_setup() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.0400"),
+        confidence=0.62,
+        edge_bps=30,
+        recommended_action=TradeAction.BUY,
+        recommended_side=ContractSide.YES,
+        target_yes_price_dollars=Decimal("0.0100"),
+        summary="Cheap tail setup.",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+        forecast_delta_f=6.0,
+    )
+
+    annotated = annotate_signal_quality(
+        settings=settings,
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0100", "no_ask_dollars": "0.9900"}},
+    )
+
+    assert annotated.trade_regime == "longshot_yes"
+    assert annotated.capital_bucket == "risky"
+    assert annotated.model_quality_status == "warn"
+    assert annotated.recommended_size_cap_fp == Decimal("10.00")
+    assert any("longshot" in reason.lower() for reason in annotated.model_quality_reasons)
+
+
+def test_annotate_signal_quality_marks_broken_book_as_warn_only_block() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.6300"),
+        confidence=0.75,
+        edge_bps=0,
+        recommended_action=None,
+        recommended_side=None,
+        target_yes_price_dollars=None,
+        summary="Broken book setup.",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+        forecast_delta_f=4.0,
+    )
+
+    annotated = annotate_signal_quality(
+        settings=settings,
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.0400", "yes_ask_dollars": "1.0000", "no_ask_dollars": "0.9600"}},
+    )
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=annotated,
+        market_snapshot={"market": {"yes_bid_dollars": "0.0400", "yes_ask_dollars": "1.0000", "no_ask_dollars": "0.9600"}},
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert annotated.warn_only_blocked is True
+    assert annotated.model_quality_status == "warn"
+    assert verdict.stand_down_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN

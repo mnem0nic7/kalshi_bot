@@ -820,6 +820,32 @@ class TrainingCorpusService:
             trainable_default=trainable_default,
             exclude_reason=exclude_reason,
             quality_warnings=quality_warnings,
+            trade_regime=(
+                str(signal_payload.get("trade_regime"))
+                if isinstance(signal_payload, dict) and signal_payload.get("trade_regime")
+                else None
+            ),
+            capital_bucket=(
+                str(signal_payload.get("capital_bucket"))
+                if isinstance(signal_payload, dict) and signal_payload.get("capital_bucket")
+                else None
+            ),
+            model_quality_status=(
+                str(signal_payload.get("model_quality_status") or "pass")
+                if isinstance(signal_payload, dict)
+                else "pass"
+            ),
+            model_quality_reasons=(
+                [str(reason) for reason in (signal_payload.get("model_quality_reasons") or [])]
+                if isinstance(signal_payload, dict)
+                else []
+            ),
+            recommended_size_cap_fp=(
+                signal_payload.get("recommended_size_cap_fp")
+                if isinstance(signal_payload, dict)
+                else None
+            ),
+            warn_only_blocked=bool(signal_payload.get("warn_only_blocked")) if isinstance(signal_payload, dict) else False,
             audited_at=datetime.now(UTC),
             reasons=reasons,
         )

@@ -32,7 +32,14 @@ from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.historical_archive import append_weather_bundle_archive, weather_bundle_archive_metadata
-from kalshi_bot.services.signal import StrategySignal, WeatherSignalEngine, base_strategy_summary, non_trade_market_reason
+from kalshi_bot.services.signal import (
+    StrategySignal,
+    WeatherSignalEngine,
+    annotate_signal_quality,
+    base_strategy_summary,
+    capital_bucket_for_trade_regime,
+    summarize_signal_action,
+)
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
 from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
@@ -473,24 +480,16 @@ class ResearchCoordinator:
         elif bid_yes is not None and fair_yes - bid_yes >= min_edge:
             edge_bps = int(((fair_yes - bid_yes) * Decimal("10000")).to_integral_value())
 
-        summary = base_strategy_summary(dossier.trader_context.thesis)
-        if recommendation_action is None or recommendation_side is None or target_yes is None:
-            no_trade_reason, no_trade_text = non_trade_market_reason(
-                market_response,
-                spread_limit_bps=self.settings.trigger_max_spread_bps,
-            )
-            if no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
-                summary = f"{summary}. {no_trade_text}"
-            elif no_trade_reason == StandDownReason.SPREAD_TOO_WIDE:
-                summary = f"{summary}. Market spread is too wide for the base strategy."
-            else:
-                summary = f"{summary}. No taker trade clears the configured edge threshold."
-        else:
-            summary = (
-                f"{summary}. Recommend {recommendation_action.value} {recommendation_side.value} at yes price {target_yes} "
-                f"with edge {edge_bps} bps."
-            )
-        return StrategySignal(
+        summary = summarize_signal_action(
+            base_strategy_summary(dossier.trader_context.thesis),
+            recommendation_action=recommendation_action,
+            recommendation_side=recommendation_side,
+            target_yes_price_dollars=target_yes,
+            edge_bps=edge_bps,
+            market_snapshot=market_response,
+            spread_limit_bps=self.settings.trigger_max_spread_bps,
+        )
+        signal = StrategySignal(
             fair_yes_dollars=fair_yes,
             confidence=dossier.trader_context.confidence,
             edge_bps=edge_bps,
@@ -501,6 +500,19 @@ class ResearchCoordinator:
             weather=None,
             resolution_state=dossier.trader_context.resolution_state,
             strategy_mode=dossier.trader_context.strategy_mode,
+            trade_regime=dossier.trade_regime or dossier.trader_context.trade_regime,
+            capital_bucket=dossier.capital_bucket or dossier.trader_context.capital_bucket,
+            forecast_delta_f=(
+                dossier.forecast_delta_f
+                if dossier.forecast_delta_f is not None
+                else dossier.trader_context.forecast_delta_f
+            ),
+            confidence_band=dossier.confidence_band or dossier.trader_context.confidence_band,
+        )
+        return annotate_signal_quality(
+            settings=self.settings,
+            signal=signal,
+            market_snapshot=market_response,
         )
 
     def _build_dossier(
@@ -541,6 +553,7 @@ class ResearchCoordinator:
                 {
                     "forecast_high_f": weather_snapshot.forecast_high_f,
                     "current_temp_f": weather_snapshot.current_temp_f,
+                    "forecast_delta_f": weather_snapshot.forecast_delta_f,
                     "threshold_f": mapping.threshold_f if mapping is not None else None,
                     "resolution_state": weather_snapshot.resolution_state.value,
                 }
@@ -602,6 +615,26 @@ class ResearchCoordinator:
                 and weather_signal.weather.resolution_state != WeatherResolutionState.UNRESOLVED
                 else StrategyMode.DIRECTIONAL_UNRESOLVED
             ),
+            trade_regime=weather_signal.trade_regime if weather_signal is not None else "standard",
+            capital_bucket=(
+                weather_signal.capital_bucket
+                if weather_signal is not None
+                else capital_bucket_for_trade_regime("standard")
+            ),
+            forecast_delta_f=(
+                weather_signal.forecast_delta_f
+                if weather_signal is not None
+                else numeric_facts.get("forecast_delta_f")
+            ),
+            confidence_band=weather_signal.confidence_band if weather_signal is not None else "low",
+            model_quality_status=weather_signal.model_quality_status if weather_signal is not None else "pass",
+            model_quality_reasons=list(weather_signal.model_quality_reasons) if weather_signal is not None else [],
+            recommended_size_cap_fp=(
+                weather_signal.recommended_size_cap_fp
+                if weather_signal is not None
+                else None
+            ),
+            warn_only_blocked=weather_signal.warn_only_blocked if weather_signal is not None else False,
         )
         contradiction_count = sum(1 for claim in claims if claim.stance == "contradicts")
         unresolved_count = len(summary.unresolved_uncertainties)
@@ -638,6 +671,14 @@ class ResearchCoordinator:
             contradiction_count=contradiction_count,
             unresolved_count=unresolved_count,
             settlement_covered=settlement_covered,
+            trade_regime=trader_context.trade_regime,
+            capital_bucket=trader_context.capital_bucket,
+            forecast_delta_f=trader_context.forecast_delta_f,
+            confidence_band=trader_context.confidence_band,
+            model_quality_status=trader_context.model_quality_status,
+            model_quality_reasons=trader_context.model_quality_reasons,
+            recommended_size_cap_fp=trader_context.recommended_size_cap_fp,
+            warn_only_blocked=trader_context.warn_only_blocked,
             created_at=now,
             last_run_id=last_run_id,
         )

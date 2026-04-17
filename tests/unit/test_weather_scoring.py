@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from kalshi_bot.core.enums import WeatherResolutionState
 from kalshi_bot.weather.models import WeatherMarketMapping
 from kalshi_bot.weather.scoring import score_weather_market
@@ -75,3 +77,76 @@ def test_score_weather_market_locks_no_when_below_threshold_is_already_breached(
     assert signal.fair_yes_dollars == 0
     assert signal.confidence == 1.0
     assert signal.resolution_state == WeatherResolutionState.LOCKED_NO
+
+
+def test_score_weather_market_marks_near_threshold_regime_and_shrinks_edge() -> None:
+    mapping = WeatherMarketMapping(
+        market_ticker="WX-NEAR",
+        station_id="KSEA",
+        location_name="Seattle",
+        latitude=47.0,
+        longitude=-122.0,
+        threshold_f=70,
+        operator=">",
+    )
+    forecast = {
+        "properties": {
+            "updated": "2026-04-10T00:00:00+00:00",
+            "periods": [{"isDaytime": True, "temperature": 72, "temperatureUnit": "F"}],
+        }
+    }
+    observation = {"properties": {"temperature": {"value": 16.0}, "timestamp": "2026-04-10T18:00:00+00:00"}}
+
+    signal = score_weather_market(mapping, forecast, observation)
+
+    assert signal.forecast_delta_f == 2.0
+    assert signal.trade_regime == "near_threshold"
+    assert signal.fair_yes_dollars == Decimal("0.5593")
+
+
+def test_score_weather_market_penalizes_longshot_yes_setup() -> None:
+    mapping = WeatherMarketMapping(
+        market_ticker="WX-LONG-YES",
+        station_id="KDCA",
+        location_name="Washington",
+        latitude=38.0,
+        longitude=-77.0,
+        threshold_f=92,
+        operator=">",
+    )
+    forecast = {
+        "properties": {
+            "updated": "2026-04-10T00:00:00+00:00",
+            "periods": [{"isDaytime": True, "temperature": 83, "temperatureUnit": "F"}],
+        }
+    }
+    observation = {"properties": {"temperature": {"value": 18.0}, "timestamp": "2026-04-10T18:00:00+00:00"}}
+
+    signal = score_weather_market(mapping, forecast, observation)
+
+    assert signal.trade_regime == "longshot_yes"
+    assert signal.fair_yes_dollars == Decimal("0.0560")
+
+
+def test_score_weather_market_penalizes_longshot_no_setup() -> None:
+    mapping = WeatherMarketMapping(
+        market_ticker="WX-LONG-NO",
+        station_id="KLAS",
+        location_name="Las Vegas",
+        latitude=36.0,
+        longitude=-115.0,
+        threshold_f=73,
+        operator="<",
+    )
+    forecast = {
+        "properties": {
+            "updated": "2026-04-10T00:00:00+00:00",
+            "periods": [{"isDaytime": True, "temperature": 62, "temperatureUnit": "F"}],
+        }
+    }
+    observation = {"properties": {"temperature": {"value": 18.0}, "timestamp": "2026-04-10T18:00:00+00:00"}}
+
+    signal = score_weather_market(mapping, forecast, observation)
+
+    assert signal.trade_regime == "longshot_no"
+    assert signal.fair_yes_dollars == Decimal("0.9736")

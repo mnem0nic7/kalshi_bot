@@ -1184,6 +1184,8 @@ class HistoricalIntelligenceService:
             risk_min_edge_bps=self.settings.risk_min_edge_bps,
             risk_max_order_notional_dollars=self.settings.risk_max_order_notional_dollars,
             risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
+            risk_safe_capital_reserve_ratio=self.settings.risk_safe_capital_reserve_ratio,
+            risk_risky_capital_max_ratio=self.settings.risk_risky_capital_max_ratio,
             trigger_max_spread_bps=self.settings.trigger_max_spread_bps,
             trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
             strategy_quality_edge_buffer_bps=self.settings.strategy_quality_edge_buffer_bps,

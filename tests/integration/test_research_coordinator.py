@@ -125,6 +125,13 @@ async def test_research_refresh_persists_weather_dossier(tmp_path) -> None:
 
     assert dossier.gate.passed is True
     assert dossier.trader_context.structured_source_used is True
+    assert dossier.trade_regime == "standard"
+    assert dossier.capital_bucket == "safe"
+    assert dossier.forecast_delta_f == 6.0
+    assert dossier.confidence_band == "high"
+    assert dossier.model_quality_status == "pass"
+    assert dossier.model_quality_reasons == []
+    assert dossier.recommended_size_cap_fp is None
     assert record is not None
     assert runs[0].status == "completed"
     assert len(sources) >= 2

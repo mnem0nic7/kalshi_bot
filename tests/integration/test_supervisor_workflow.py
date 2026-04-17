@@ -90,6 +90,31 @@ class FakeWeather:
         return None
 
 
+class NearThresholdWeather:
+    async def build_market_snapshot(self, mapping: WeatherMarketMapping) -> dict:
+        return {
+            "mapping": mapping.model_dump(mode="json"),
+            "forecast": {
+                "properties": {
+                    "updated": "2026-04-10T00:00:00+00:00",
+                    "periods": [
+                        {"isDaytime": True, "temperature": 80, "temperatureUnit": "F"},
+                    ],
+                }
+            },
+            "observation": {
+                "properties": {
+                    "temperature": {"value": 20.0},
+                    "timestamp": "2026-04-10T01:00:00+00:00",
+                }
+            },
+            "points": {},
+        }
+
+    async def close(self) -> None:
+        return None
+
+
 class ResolvedNoWeather:
     async def build_market_snapshot(self, mapping: WeatherMarketMapping) -> dict:
         return {
@@ -340,5 +365,136 @@ async def test_supervisor_stands_down_on_resolved_contract_before_risk(tmp_path)
     assert signal is not None
     assert signal.payload["resolution_state"] == "locked_no"
     assert signal.payload["eligibility"]["eligible"] is False
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_executes_bucket_resized_trade_size(tmp_path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path}/bucketed.db"
+    settings = Settings(
+        database_url=database_url,
+        app_color="blue",
+        app_shadow_mode=False,
+        risk_min_edge_bps=10,
+        risk_max_order_notional_dollars=50,
+        risk_max_position_notional_dollars=20,
+        risk_max_order_count_fp=20,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    providers = FakeProviders()
+    agent_pack_service = AgentPackService(settings)
+    agents = AgentSuite(settings, providers)  # type: ignore[arg-type]
+    signal_engine = WeatherSignalEngine(settings)
+    risk_engine = DeterministicRiskEngine(settings)
+    execution_service = ExecutionService(settings, FakeKalshi())  # type: ignore[arg-type]
+    memory_service = MemoryService(providers)  # type: ignore[arg-type]
+    directory = WeatherMarketDirectory(
+        {
+            "WX-NEAR": WeatherMarketMapping(
+                market_ticker="WX-NEAR",
+                market_type="weather",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+                settlement_source="NWS station observation",
+            )
+        }
+    )
+    research_coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        FakeKalshi(),  # type: ignore[arg-type]
+        NearThresholdWeather(),  # type: ignore[arg-type]
+        directory,
+        providers,  # type: ignore[arg-type]
+        signal_engine,
+        agent_pack_service,
+    )
+    training_corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        DiscoveryService(FakeKalshi(), directory),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
+    supervisor = WorkflowSupervisor(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=FakeKalshi(),  # type: ignore[arg-type]
+        weather=NearThresholdWeather(),  # type: ignore[arg-type]
+        weather_directory=directory,
+        agent_pack_service=agent_pack_service,
+        signal_engine=signal_engine,
+        risk_engine=risk_engine,
+        execution_service=execution_service,
+        memory_service=memory_service,
+        research_coordinator=research_coordinator,
+        training_corpus_service=training_corpus_service,
+        agents=agents,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(settings.app_color)
+        seed_room = await repo.create_room(
+            RoomCreate(name="Seed Risky", market_ticker="OTHER-RISK"),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        await repo.save_signal(
+            room_id=seed_room.id,
+            market_ticker="OTHER-RISK",
+            fair_yes_dollars=Decimal("0.5000"),
+            edge_bps=80,
+            confidence=0.6,
+            summary="Seed risky signal",
+            payload={"trade_regime": "near_threshold", "capital_bucket": "risky"},
+        )
+        await repo.upsert_position(
+            market_ticker="OTHER-RISK",
+            subaccount=settings.kalshi_subaccount,
+            kalshi_env=settings.kalshi_env,
+            side="yes",
+            count_fp=Decimal("10.00"),
+            average_price_dollars=Decimal("0.4000"),
+            raw={"seeded": True},
+        )
+        room = await repo.create_room(
+            RoomCreate(name="Bucketed Room", market_ticker="WX-NEAR"),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        await session.commit()
+
+    await supervisor.run_room(room.id, reason="bucket_resize_test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        trade_ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        risk_verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        signal = await repo.get_latest_signal_for_room(room.id)
+        orders = await repo.list_orders_for_room(room.id)
+        await session.commit()
+
+    assert trade_ticket is not None
+    assert risk_verdict is not None
+    assert signal is not None
+    assert orders
+    assert trade_ticket.count_fp == Decimal("20.00")
+    assert risk_verdict.approved_count_fp == Decimal("4.44")
+    assert risk_verdict.payload["resized_by_bucket"] is True
+    assert risk_verdict.payload["capital_bucket"] == "risky"
+    assert orders[0].count_fp == Decimal("4.44")
+    assert signal.payload["capital_bucket"] == "risky"
 
     await engine.dispose()

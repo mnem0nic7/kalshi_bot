@@ -26,7 +26,7 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
-from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
+from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext, approved_ticket_for_verdict
 from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
 from kalshi_bot.services.signal import (
     apply_heuristic_application_to_signal,
@@ -2873,6 +2873,16 @@ class HistoricalTrainingService:
                     "effective_research_freshness": dossier.freshness.model_dump(mode="json"),
                     "resolution_state": signal.resolution_state.value,
                     "strategy_mode": signal.strategy_mode.value,
+                    "trade_regime": signal.trade_regime,
+                    "capital_bucket": signal.capital_bucket,
+                    "forecast_delta_f": signal.forecast_delta_f,
+                    "confidence_band": signal.confidence_band,
+                    "model_quality_status": signal.model_quality_status,
+                    "model_quality_reasons": signal.model_quality_reasons,
+                    "recommended_size_cap_fp": (
+                        str(signal.recommended_size_cap_fp) if signal.recommended_size_cap_fp is not None else None
+                    ),
+                    "warn_only_blocked": signal.warn_only_blocked,
                     "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
                     "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
                     "agent_pack_version": pack.version,
@@ -3070,6 +3080,13 @@ class HistoricalTrainingService:
                         kill_switch_enabled=False,
                         shadow_color=self.settings.app_color,
                     )
+                    portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
+                        kalshi_env=room.kalshi_env,
+                        subaccount=self.settings.kalshi_subaccount,
+                        total_capital_dollars=Decimal(str(thresholds.risk_max_position_notional_dollars)),
+                        safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
+                        risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
+                    )
                     verdict = self.risk_engine.evaluate(
                         room=room,
                         control=historical_control,
@@ -3080,6 +3097,7 @@ class HistoricalTrainingService:
                             research_observed_at=dossier.freshness.refreshed_at,
                             decision_time=checkpoint_ts,
                             current_position_notional_dollars=Decimal("0"),
+                            portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                         ),
                         thresholds=thresholds,
                     )
@@ -3100,8 +3118,9 @@ class HistoricalTrainingService:
                     role_models[AgentRole.RISK_OFFICER.value] = risk_usage
                     rationale_ids.append(risk_record.id)
 
+                    approved_ticket = approved_ticket_for_verdict(ticket, verdict)
                     counterfactual = self.training_export_service._counterfactual_pnl(
-                        trade_ticket=ticket.model_dump(mode="json"),
+                        trade_ticket=approved_ticket.model_dump(mode="json"),
                         settlement={
                             "settlement_value_dollars": (
                                 str(settlement_label.settlement_value_dollars)

@@ -156,6 +156,11 @@ def _serialize_risk_verdict(verdict) -> dict | None:
             str(verdict.approved_notional_dollars) if verdict.approved_notional_dollars is not None else None
         ),
         "approved_count_fp": str(verdict.approved_count_fp) if verdict.approved_count_fp is not None else None,
+        "capital_bucket": (verdict.payload or {}).get("capital_bucket"),
+        "bucket_limit_dollars": (verdict.payload or {}).get("bucket_limit_dollars"),
+        "bucket_used_dollars_before": (verdict.payload or {}).get("bucket_used_dollars_before"),
+        "bucket_used_dollars_after": (verdict.payload or {}).get("bucket_used_dollars_after"),
+        "resized_by_bucket": bool((verdict.payload or {}).get("resized_by_bucket", False)),
         "payload": verdict.payload,
         "created_at": verdict.created_at.isoformat(),
     }

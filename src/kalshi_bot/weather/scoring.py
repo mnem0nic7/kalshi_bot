@@ -10,6 +10,11 @@ from kalshi_bot.core.enums import WeatherResolutionState
 from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.weather.models import WeatherMarketMapping
 
+NEAR_THRESHOLD_DELTA_F = 2.0
+LONGSHOT_FAIR_THRESHOLD = Decimal("0.0800")
+NEAR_THRESHOLD_PENALTY = Decimal("0.0500")
+LONGSHOT_PENALTY = Decimal("0.0150")
+
 
 def celsius_to_fahrenheit(value_c: float | None) -> float | None:
     if value_c is None:
@@ -61,6 +66,9 @@ class WeatherSignalSnapshot:
     confidence: float
     forecast_high_f: float | None
     current_temp_f: float | None
+    forecast_delta_f: float | None
+    confidence_band: str
+    trade_regime: str
     resolution_state: WeatherResolutionState
     observation_time: datetime | None
     forecast_updated_time: datetime | None
@@ -74,6 +82,40 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
     except ValueError:
         return None
+
+
+def confidence_band_for(confidence: float) -> str:
+    if confidence >= 0.85:
+        return "high"
+    if confidence >= 0.70:
+        return "medium"
+    return "low"
+
+
+def classify_trade_regime(*, forecast_delta_f: float | None, fair_yes_dollars: Decimal) -> str:
+    if forecast_delta_f is not None and abs(forecast_delta_f) <= NEAR_THRESHOLD_DELTA_F:
+        return "near_threshold"
+    if fair_yes_dollars <= LONGSHOT_FAIR_THRESHOLD:
+        return "longshot_yes"
+    if (Decimal("1.0000") - fair_yes_dollars) <= LONGSHOT_FAIR_THRESHOLD:
+        return "longshot_no"
+    return "standard"
+
+
+def apply_trade_regime_penalty(*, fair_yes_dollars: Decimal, trade_regime: str) -> Decimal:
+    if trade_regime == "near_threshold":
+        edge = fair_yes_dollars - Decimal("0.5000")
+        if edge == 0:
+            return Decimal("0.5000")
+        adjusted_edge = max(abs(edge) - NEAR_THRESHOLD_PENALTY, Decimal("0.0000"))
+        direction = Decimal("1.0000") if edge > 0 else Decimal("-1.0000")
+        return quantize_price(Decimal("0.5000") + (direction * adjusted_edge))
+    if trade_regime == "longshot_yes":
+        return quantize_price(max(Decimal("0.0000"), fair_yes_dollars - LONGSHOT_PENALTY))
+    if trade_regime == "longshot_no":
+        fair_no = max(Decimal("0.0000"), (Decimal("1.0000") - fair_yes_dollars) - LONGSHOT_PENALTY)
+        return quantize_price(Decimal("1.0000") - fair_no)
+    return quantize_price(fair_yes_dollars)
 
 
 def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[str, Any], observation_payload: dict[str, Any]) -> WeatherSignalSnapshot:
@@ -114,6 +156,23 @@ def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[s
         probability = logistic_probability(delta_f, spread_f=adaptive_spread)
         fair = quantize_price(probability)
         confidence = min(0.95, 0.45 + min(abs(delta_f) / 12, 0.35) + (0.15 if current_temp_f is not None else 0.0))
+    forecast_delta_f = None
+    if forecast_high_f is not None and mapping.threshold_f is not None:
+        forecast_delta_f = forecast_high_f - mapping.threshold_f
+        if mapping.operator in ("<", "<="):
+            forecast_delta_f = -forecast_delta_f
+    trade_regime = classify_trade_regime(
+        forecast_delta_f=forecast_delta_f,
+        fair_yes_dollars=fair,
+    )
+    fair = apply_trade_regime_penalty(
+        fair_yes_dollars=fair,
+        trade_regime=trade_regime,
+    )
+    confidence_band = confidence_band_for(confidence)
+    if resolution_state in {WeatherResolutionState.LOCKED_YES, WeatherResolutionState.LOCKED_NO}:
+        trade_regime = "standard"
+    elif forecast_high_f is not None:
         summary = (
             f"Forecast high {forecast_high_f:.1f}F versus threshold {mapping.threshold_f:.1f}F "
             f"implies fair yes near {fair} with confidence {confidence:.2f}."
@@ -123,6 +182,9 @@ def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[s
         confidence=confidence,
         forecast_high_f=forecast_high_f,
         current_temp_f=current_temp_f,
+        forecast_delta_f=forecast_delta_f,
+        confidence_band=confidence_band,
+        trade_regime=trade_regime,
         resolution_state=resolution_state,
         observation_time=parse_iso_datetime(observation_payload.get("properties", {}).get("timestamp")),
         forecast_updated_time=parse_iso_datetime(forecast_payload.get("properties", {}).get("updated")),

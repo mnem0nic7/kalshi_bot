@@ -98,7 +98,14 @@ def test_research_api_serves_dossier_and_history(tmp_path, monkeypatch) -> None:
 
         response = client.get("/api/research/API-TEST")
         assert response.status_code == 200
-        assert response.json()["market_ticker"] == "API-TEST"
+        body = response.json()
+        assert body["market_ticker"] == "API-TEST"
+        assert body["trade_regime"] == "standard"
+        assert body["capital_bucket"] == "safe"
+        assert body["forecast_delta_f"] is None
+        assert body["model_quality_status"] == "pass"
+        assert body["model_quality_reasons"] == []
+        assert body["recommended_size_cap_fp"] is None
 
         history = client.get("/api/research/API-TEST/history")
         assert history.status_code == 200
@@ -165,8 +172,8 @@ def test_web_pages_render_index_and_room_detail(tmp_path, monkeypatch) -> None:
         index_response = client.get("/")
         assert index_response.status_code == 200
         assert "Control Room" in index_response.text
-        assert "/static/control_room.js" in index_response.text
-        assert "Runtime Health" in index_response.text
+        assert "/static/dashboard.js" in index_response.text
+        assert "Open Positions" in index_response.text
 
         rooms_tab_response = client.get("/api/control-room/tab/rooms")
         assert rooms_tab_response.status_code == 200

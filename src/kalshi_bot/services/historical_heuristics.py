@@ -279,6 +279,8 @@ class HistoricalHeuristicService:
             risk_min_edge_bps=int(payload.get("risk_min_edge_bps") or base_thresholds.risk_min_edge_bps),
             risk_max_order_notional_dollars=base_thresholds.risk_max_order_notional_dollars,
             risk_max_position_notional_dollars=base_thresholds.risk_max_position_notional_dollars,
+            risk_safe_capital_reserve_ratio=base_thresholds.risk_safe_capital_reserve_ratio,
+            risk_risky_capital_max_ratio=base_thresholds.risk_risky_capital_max_ratio,
             trigger_max_spread_bps=int(payload.get("trigger_max_spread_bps") or base_thresholds.trigger_max_spread_bps),
             trigger_cooldown_seconds=base_thresholds.trigger_cooldown_seconds,
             strategy_quality_edge_buffer_bps=int(

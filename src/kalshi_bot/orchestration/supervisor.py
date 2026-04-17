@@ -35,6 +35,7 @@ from kalshi_bot.services.signal import (
     evaluate_trade_eligibility,
     is_market_stale,
 )
+from kalshi_bot.services.risk import approved_ticket_for_verdict
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
@@ -258,6 +259,16 @@ class WorkflowSupervisor:
                         "effective_research_freshness": dossier.freshness.model_dump(mode="json"),
                         "resolution_state": signal.resolution_state.value,
                         "strategy_mode": signal.strategy_mode.value,
+                        "trade_regime": signal.trade_regime,
+                        "capital_bucket": signal.capital_bucket,
+                        "forecast_delta_f": signal.forecast_delta_f,
+                        "confidence_band": signal.confidence_band,
+                        "model_quality_status": signal.model_quality_status,
+                        "model_quality_reasons": signal.model_quality_reasons,
+                        "recommended_size_cap_fp": (
+                            str(signal.recommended_size_cap_fp) if signal.recommended_size_cap_fp is not None else None
+                        ),
+                        "warn_only_blocked": signal.warn_only_blocked,
                         "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
                         "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
                         "agent_pack_version": pack.version,
@@ -432,11 +443,6 @@ class WorkflowSupervisor:
                             if open_position is not None
                             else Decimal("0")
                         )
-                        risk_context = RiskContext(
-                            market_observed_at=market_state.observed_at,
-                            research_observed_at=dossier.freshness.refreshed_at,
-                            current_position_notional_dollars=current_position_notional,
-                        )
                         effective_thresholds = thresholds
                         if dossier.gate.stale_tolerance_active:
                             factor = self.settings.research_stale_tolerance_notional_factor
@@ -444,11 +450,26 @@ class WorkflowSupervisor:
                                 risk_min_edge_bps=thresholds.risk_min_edge_bps,
                                 risk_max_order_notional_dollars=thresholds.risk_max_order_notional_dollars * factor,
                                 risk_max_position_notional_dollars=thresholds.risk_max_position_notional_dollars * factor,
+                                risk_safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
+                                risk_risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
                                 trigger_max_spread_bps=thresholds.trigger_max_spread_bps,
                                 trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds,
                                 strategy_quality_edge_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
                                 strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
                             )
+                        portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
+                            kalshi_env=room.kalshi_env,
+                            subaccount=self.settings.kalshi_subaccount,
+                            total_capital_dollars=Decimal(str(effective_thresholds.risk_max_position_notional_dollars)),
+                            safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
+                            risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
+                        )
+                        risk_context = RiskContext(
+                            market_observed_at=market_state.observed_at,
+                            research_observed_at=dossier.freshness.refreshed_at,
+                            current_position_notional_dollars=current_position_notional,
+                            portfolio_bucket_snapshot=portfolio_bucket_snapshot,
+                        )
                         verdict = self.risk_engine.evaluate(
                             room=room,
                             control=control,
@@ -476,6 +497,7 @@ class WorkflowSupervisor:
                         await session.commit()
 
                         if verdict.status == RiskStatus.APPROVED:
+                            approved_ticket = approved_ticket_for_verdict(ticket, verdict)
                             await repo.update_room_stage(room.id, RoomStage.EXECUTING)
                             lock_acquired = await repo.acquire_execution_lock(
                                 holder=self.settings.app_color,
@@ -485,7 +507,7 @@ class WorkflowSupervisor:
                                 receipt = await self.execution_service.execute(
                                     room=room,
                                     control=control,
-                                    ticket=ticket,
+                                    ticket=approved_ticket,
                                     client_order_id=client_order_id,
                                 )
                             else:
@@ -499,12 +521,12 @@ class WorkflowSupervisor:
                                 await repo.save_order(
                                     ticket_id=ticket_record.id,
                                     client_order_id=client_order_id,
-                                    market_ticker=ticket.market_ticker,
+                                    market_ticker=approved_ticket.market_ticker,
                                     status=receipt.status,
-                                    side=ticket.side.value,
-                                    action=ticket.action.value,
-                                    yes_price_dollars=ticket.yes_price_dollars,
-                                    count_fp=ticket.count_fp,
+                                    side=approved_ticket.side.value,
+                                    action=approved_ticket.action.value,
+                                    yes_price_dollars=approved_ticket.yes_price_dollars,
+                                    count_fp=approved_ticket.count_fp,
                                     raw=receipt.details,
                                     kalshi_order_id=receipt.external_order_id,
                                 )

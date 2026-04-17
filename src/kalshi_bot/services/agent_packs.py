@@ -26,6 +26,8 @@ class RuntimeThresholds:
     trigger_cooldown_seconds: int
     strategy_quality_edge_buffer_bps: int
     strategy_min_remaining_payout_bps: int
+    risk_safe_capital_reserve_ratio: float = 0.70
+    risk_risky_capital_max_ratio: float = 0.30
 
 
 class AgentPackService:
@@ -97,6 +99,8 @@ class AgentPackService:
                 risk_min_edge_bps=self.settings.risk_min_edge_bps,
                 risk_max_order_notional_dollars=self.settings.risk_max_order_notional_dollars,
                 risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
+                risk_safe_capital_reserve_ratio=self.settings.risk_safe_capital_reserve_ratio,
+                risk_risky_capital_max_ratio=self.settings.risk_risky_capital_max_ratio,
                 trigger_max_spread_bps=self.settings.trigger_max_spread_bps,
                 trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
             ),
@@ -222,6 +226,12 @@ class AgentPackService:
             risk_max_position_notional_dollars=(
                 thresholds.risk_max_position_notional_dollars or self.settings.risk_max_position_notional_dollars
             ),
+            risk_safe_capital_reserve_ratio=(
+                thresholds.risk_safe_capital_reserve_ratio or self.settings.risk_safe_capital_reserve_ratio
+            ),
+            risk_risky_capital_max_ratio=(
+                thresholds.risk_risky_capital_max_ratio or self.settings.risk_risky_capital_max_ratio
+            ),
             trigger_max_spread_bps=thresholds.trigger_max_spread_bps or self.settings.trigger_max_spread_bps,
             trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds or self.settings.trigger_cooldown_seconds,
             strategy_quality_edge_buffer_bps=self.settings.strategy_quality_edge_buffer_bps,
@@ -236,6 +246,12 @@ class AgentPackService:
         thresholds.risk_max_order_notional_dollars = self._clamp_float(thresholds.risk_max_order_notional_dollars, 5.0, 250.0)
         thresholds.risk_max_position_notional_dollars = self._clamp_float(
             thresholds.risk_max_position_notional_dollars, 25.0, 1000.0
+        )
+        thresholds.risk_safe_capital_reserve_ratio = self._clamp_float(
+            thresholds.risk_safe_capital_reserve_ratio, 0.0, 1.0
+        )
+        thresholds.risk_risky_capital_max_ratio = self._clamp_float(
+            thresholds.risk_risky_capital_max_ratio, 0.0, 1.0
         )
         sanitized_roles = {
             role_name: role.model_copy(update={"temperature": max(0.0, min(1.0, role.temperature))})

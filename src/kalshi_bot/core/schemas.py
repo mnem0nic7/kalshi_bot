@@ -19,7 +19,11 @@ from kalshi_bot.core.enums import (
     TradeAction,
     WeatherResolutionState,
 )
-from kalshi_bot.core.fixed_point import quantize_count, quantize_price
+from kalshi_bot.core.fixed_point import as_decimal, quantize_count, quantize_price
+
+
+def _quantize_money(value: Any) -> Decimal:
+    return as_decimal(value).quantize(Decimal("0.0001"))
 
 
 class RoomCreate(BaseModel):
@@ -61,6 +65,7 @@ class TradeTicket(BaseModel):
     side: ContractSide
     yes_price_dollars: Decimal
     count_fp: Decimal
+    capital_bucket: str | None = None
     time_in_force: str = "immediate_or_cancel"
     rationale_message_ids: list[str] = Field(default_factory=list)
     nonce: str = Field(default_factory=lambda: uuid4().hex[:12])
@@ -82,6 +87,63 @@ class RiskVerdictPayload(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     approved_notional_dollars: Decimal | None = None
     approved_count_fp: Decimal | None = None
+    capital_bucket: str | None = None
+    bucket_limit_dollars: Decimal | None = None
+    bucket_used_dollars_before: Decimal | None = None
+    bucket_used_dollars_after: Decimal | None = None
+    resized_by_bucket: bool = False
+
+    @field_validator(
+        "approved_notional_dollars",
+        "bucket_limit_dollars",
+        "bucket_used_dollars_before",
+        "bucket_used_dollars_after",
+        mode="before",
+    )
+    @classmethod
+    def validate_risk_dollars(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return _quantize_money(value)
+
+    @field_validator("approved_count_fp", mode="before")
+    @classmethod
+    def validate_approved_count(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return quantize_count(value)
+
+
+class PortfolioBucketSnapshot(BaseModel):
+    total_capital_dollars: Decimal
+    overall_used_dollars: Decimal = Decimal("0.0000")
+    overall_remaining_dollars: Decimal = Decimal("0.0000")
+    safe_used_dollars: Decimal = Decimal("0.0000")
+    safe_remaining_dollars: Decimal = Decimal("0.0000")
+    safe_reserve_target_dollars: Decimal = Decimal("0.0000")
+    risky_used_dollars: Decimal = Decimal("0.0000")
+    risky_limit_dollars: Decimal = Decimal("0.0000")
+    risky_remaining_dollars: Decimal = Decimal("0.0000")
+    safe_capital_reserve_ratio: float = 0.70
+    risky_capital_max_ratio: float = 0.30
+
+    @field_validator(
+        "total_capital_dollars",
+        "overall_used_dollars",
+        "overall_remaining_dollars",
+        "safe_used_dollars",
+        "safe_remaining_dollars",
+        "safe_reserve_target_dollars",
+        "risky_used_dollars",
+        "risky_limit_dollars",
+        "risky_remaining_dollars",
+        mode="before",
+    )
+    @classmethod
+    def validate_bucket_dollars(cls, value: Any) -> Decimal:
+        if value in (None, ""):
+            return Decimal("0.0000")
+        return _quantize_money(value)
 
 
 class ExecReceiptPayload(BaseModel):
@@ -148,6 +210,14 @@ class ResearchTraderContext(BaseModel):
     resolution_state: WeatherResolutionState = WeatherResolutionState.UNRESOLVED
     strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED
     heuristic_application: dict[str, Any] = Field(default_factory=dict)
+    trade_regime: str = "standard"
+    capital_bucket: str = "safe"
+    forecast_delta_f: float | None = None
+    confidence_band: str = "low"
+    model_quality_status: str = "pass"
+    model_quality_reasons: list[str] = Field(default_factory=list)
+    recommended_size_cap_fp: Decimal | None = None
+    warn_only_blocked: bool = False
 
     @field_validator("fair_yes_dollars", mode="before")
     @classmethod
@@ -155,6 +225,13 @@ class ResearchTraderContext(BaseModel):
         if value in (None, ""):
             return None
         return quantize_price(value)
+
+    @field_validator("recommended_size_cap_fp", mode="before")
+    @classmethod
+    def validate_recommended_size_cap(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return quantize_count(value)
 
 
 class ResearchFreshness(BaseModel):
@@ -177,6 +254,7 @@ class TradeEligibilityVerdict(BaseModel):
     strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED
     resolution_state: WeatherResolutionState = WeatherResolutionState.UNRESOLVED
     stand_down_reason: StandDownReason | None = None
+    capital_bucket: str = "safe"
     reasons: list[str] = Field(default_factory=list)
     market_stale: bool = False
     research_stale: bool = False
@@ -184,6 +262,10 @@ class TradeEligibilityVerdict(BaseModel):
     market_spread_bps: int | None = None
     edge_after_quality_buffer_bps: int | None = None
     blocked_upstream: bool = False
+    model_quality_status: str = "pass"
+    model_quality_reasons: list[str] = Field(default_factory=list)
+    recommended_size_cap_fp: Decimal | None = None
+    warn_only_blocked: bool = False
 
     @field_validator("remaining_payout_dollars", mode="before")
     @classmethod
@@ -191,6 +273,13 @@ class TradeEligibilityVerdict(BaseModel):
         if value in (None, ""):
             return None
         return quantize_price(value)
+
+    @field_validator("recommended_size_cap_fp", mode="before")
+    @classmethod
+    def validate_recommended_size_cap(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return quantize_count(value)
 
 
 class ResearchDelta(BaseModel):
@@ -225,8 +314,23 @@ class ResearchDossier(BaseModel):
     contradiction_count: int = 0
     unresolved_count: int = 0
     settlement_covered: bool = False
+    trade_regime: str = "standard"
+    capital_bucket: str = "safe"
+    forecast_delta_f: float | None = None
+    confidence_band: str = "low"
+    model_quality_status: str = "pass"
+    model_quality_reasons: list[str] = Field(default_factory=list)
+    recommended_size_cap_fp: Decimal | None = None
+    warn_only_blocked: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_run_id: str | None = None
+
+    @field_validator("recommended_size_cap_fp", mode="before")
+    @classmethod
+    def validate_research_recommended_size_cap(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return quantize_count(value)
 
 
 class AgentRoleRuntime(BaseModel):
@@ -260,6 +364,8 @@ class AgentPackThresholds(BaseModel):
     risk_min_edge_bps: int | None = None
     risk_max_order_notional_dollars: float | None = None
     risk_max_position_notional_dollars: float | None = None
+    risk_safe_capital_reserve_ratio: float | None = None
+    risk_risky_capital_max_ratio: float | None = None
     trigger_max_spread_bps: int | None = None
     trigger_cooldown_seconds: int | None = None
 
@@ -428,8 +534,21 @@ class StrategyAuditResult(BaseModel):
     trainable_default: bool = True
     exclude_reason: str | None = None
     quality_warnings: list[str] = Field(default_factory=list)
+    trade_regime: str | None = None
+    capital_bucket: str | None = None
+    model_quality_status: str = "pass"
+    model_quality_reasons: list[str] = Field(default_factory=list)
+    recommended_size_cap_fp: Decimal | None = None
+    warn_only_blocked: bool = False
     audited_at: datetime | None = None
     reasons: list[str] = Field(default_factory=list)
+
+    @field_validator("recommended_size_cap_fp", mode="before")
+    @classmethod
+    def validate_strategy_recommended_size_cap(cls, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        return quantize_count(value)
 
 
 class StrategyAuditSummary(BaseModel):
