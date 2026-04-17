@@ -1,0 +1,78 @@
+name: Redeploy
+
+"on":
+  workflow_dispatch:
+    inputs:
+      color:
+        description: "Color to restart: blue, green, or both (default: both)"
+        default: "both"
+        type: choice
+        options:
+          - both
+          - blue
+          - green
+
+permissions:
+  contents: read
+
+jobs:
+  redeploy:
+    name: Pull and Restart on VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
+      INPUT_COLOR: ${{ github.event.inputs.color }}
+
+    steps:
+      - name: Validate secrets
+        run: |
+          set -euo pipefail
+          for var in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_APP_DIR; do
+            test -n "${!var}" || { echo "Missing secret: ${var}"; exit 1; }
+          done
+
+      - name: Prepare SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Pull latest and restart
+        run: |
+          set -euo pipefail
+          app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
+
+          # Validate color to prevent injection (choice input, but be explicit)
+          color="${INPUT_COLOR:-both}"
+          case "${color}" in
+            blue|green|both) ;;
+            *) echo "Invalid color: ${color}" >&2; exit 1 ;;
+          esac
+
+          if [[ "${color}" == "both" ]]; then
+            colors="blue green"
+          else
+            colors="${color}"
+          fi
+
+          ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd ${app_dir_quoted} && git pull --ff-only"
+
+          for c in ${colors}; do
+            ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              "cd ${app_dir_quoted} && infra/scripts/restart-color.sh ${c}"
+          done
+
+          {
+            echo "## Redeploy"
+            echo
+            echo "- Host: \`${DEPLOY_HOST}\`"
+            echo "- Color(s): \`${color}\`"
+            echo "- Ref: \`${GITHUB_SHA}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
