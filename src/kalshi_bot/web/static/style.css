@@ -3,15 +3,34 @@ body {
   font-family: "IBM Plex Sans", "Helvetica Neue", sans-serif;
   background: linear-gradient(180deg, #0d1b2a 0%, #1b263b 100%);
   color: #f4f6fb;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 .shell-header {
+  position: sticky;
+  top: 0;
+  z-index: 30;
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 1rem 1.5rem;
-  background: rgba(10, 15, 24, 0.75);
+  background: rgba(10, 15, 24, 0.85);
+  backdrop-filter: blur(12px);
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.header-color-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(249, 215, 126, 0.14);
+  color: #f9d77e;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
 }
 
 .header-nav {
@@ -58,6 +77,18 @@ body {
   border-radius: 16px;
   padding: 1rem;
   backdrop-filter: blur(12px);
+  transition: box-shadow 160ms ease, border-color 160ms ease;
+}
+
+.panel:hover {
+  border-color: rgba(255, 255, 255, 0.16);
+  box-shadow: 0 16px 40px rgba(5, 10, 20, 0.28);
+}
+
+*:focus-visible {
+  outline: 2px solid rgba(249, 215, 126, 0.8);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 .panel a {

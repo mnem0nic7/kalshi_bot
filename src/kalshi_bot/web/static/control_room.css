@@ -67,6 +67,13 @@
     rgba(6, 13, 24, 0.55);
   border: 1px solid rgba(255, 255, 255, 0.09);
   box-shadow: 0 14px 35px rgba(5, 10, 20, 0.2);
+  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+}
+
+.summary-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 20px 48px rgba(5, 10, 20, 0.32);
+  border-color: rgba(255, 255, 255, 0.16);
 }
 
 .summary-card-critical {
@@ -125,6 +132,12 @@
   opacity: 0.9;
 }
 
+.control-room-intel-board {
+  display: grid;
+  gap: 0.85rem;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
 .control-room-tabs {
   position: sticky;
   top: 0.75rem;
@@ -144,6 +157,12 @@
   color: #eaf1fb;
   min-width: 0;
   white-space: nowrap;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+
+.control-room-tab:not(.is-active):hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.16);
 }
 
 .control-room-tab.is-active {
@@ -174,6 +193,12 @@
   border-radius: 18px;
   background: rgba(6, 13, 24, 0.45);
   border: 1px solid rgba(255, 255, 255, 0.08);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.control-card:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  box-shadow: 0 12px 32px rgba(5, 10, 20, 0.24);
 }
 
 .control-card > * {

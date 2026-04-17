@@ -46,6 +46,14 @@
   border-radius: 14px;
   background: rgba(6, 13, 24, 0.5);
   border: 1px solid rgba(255, 255, 255, 0.08);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.summary-tile:hover,
+.metric-card:hover,
+.mini-card:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  box-shadow: 0 6px 18px rgba(5, 10, 20, 0.2);
 }
 
 .summary-label,
@@ -129,6 +137,12 @@
   background: #f9d77e;
   border-color: rgba(249, 215, 126, 0.4);
   box-shadow: 0 0 0 6px rgba(249, 215, 126, 0.12);
+  animation: timeline-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes timeline-pulse {
+  0%, 100% { box-shadow: 0 0 0 6px rgba(249, 215, 126, 0.12); }
+  50% { box-shadow: 0 0 0 10px rgba(249, 215, 126, 0.22); }
 }
 
 .timeline-content {
@@ -174,6 +188,12 @@
   background: rgba(6, 13, 24, 0.58);
   border: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.message-card:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03), 0 8px 24px rgba(5, 10, 20, 0.2);
 }
 
 .message-head {
