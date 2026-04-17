@@ -445,7 +445,7 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
         ) -> list[SimpleNamespace]:
             return []
 
-        async def get_cash_balance_dollars(self) -> Decimal | None:
+        async def get_total_capital_dollars(self) -> Decimal | None:
             return Decimal("534.17")
 
         async def portfolio_bucket_snapshot(

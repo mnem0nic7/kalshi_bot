@@ -1230,11 +1230,11 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
             market_tickers=[position.market_ticker for position in positions],
             kalshi_env=kalshi_env,
         )
-        cash_balance = await repo.get_cash_balance_dollars()
+        total_capital = await repo.get_total_capital_dollars()
         capital_buckets = await repo.portfolio_bucket_snapshot(
             kalshi_env=kalshi_env,
             subaccount=container.settings.kalshi_subaccount,
-            total_capital_dollars=cash_balance if cash_balance is not None else Decimal(str(thresholds.risk_max_position_notional_dollars)),
+            total_capital_dollars=total_capital if total_capital is not None else Decimal(str(thresholds.risk_max_position_notional_dollars)),
             safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
             risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
         )

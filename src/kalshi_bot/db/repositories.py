@@ -2363,20 +2363,35 @@ class PlatformRepository:
         stmt = select(Checkpoint).where(Checkpoint.stream_name == stream_name)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def get_cash_balance_dollars(self) -> Decimal | None:
-        """Return cash balance from the latest reconcile checkpoint, or None if unavailable."""
+    async def get_total_capital_dollars(self) -> Decimal | None:
+        """Return total portfolio value (cash + positions) from the latest reconcile checkpoint."""
         checkpoint = await self.get_checkpoint("reconcile")
         if checkpoint is None:
             return None
         balance_payload = dict((checkpoint.payload or {}).get("balance") or {})
+        cash_cents = None
         for key in ("balance", "cash_balance", "cash"):
             raw = balance_payload.get(key)
             if raw is not None:
                 try:
-                    return Decimal(str(raw)) / Decimal("100")
+                    cash_cents = Decimal(str(raw))
+                    break
                 except ArithmeticError:
                     pass
-        return None
+        positions_cents = None
+        for key in ("portfolio_value", "portfolioValue"):
+            raw = balance_payload.get(key)
+            if raw is not None:
+                try:
+                    positions_cents = Decimal(str(raw))
+                    break
+                except ArithmeticError:
+                    pass
+        if cash_cents is None:
+            return None
+        # Kalshi returns portfolio_value as positions market value when it's < cash
+        effective_positions = positions_cents if (positions_cents is not None and positions_cents < cash_cents) else Decimal("0")
+        return (cash_cents + effective_positions) / Decimal("100")
 
     async def list_exchange_events(
         self,
