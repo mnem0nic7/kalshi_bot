@@ -445,6 +445,9 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
         ) -> list[SimpleNamespace]:
             return []
 
+        async def get_cash_balance_dollars(self) -> Decimal | None:
+            return Decimal("534.17")
+
         async def portfolio_bucket_snapshot(
             self,
             *,
@@ -456,7 +459,7 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
         ) -> SimpleNamespace:
             assert kalshi_env == "demo"
             assert subaccount == 0
-            assert total_capital_dollars == Decimal("250.0")
+            assert total_capital_dollars == Decimal("534.17")
             assert safe_capital_reserve_ratio == 0.70
             assert risky_capital_max_ratio == 0.30
             return SimpleNamespace(

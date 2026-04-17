@@ -457,10 +457,11 @@ class WorkflowSupervisor:
                                 strategy_quality_edge_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
                                 strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
                             )
+                        cash_balance = await repo.get_cash_balance_dollars()
                         portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
                             kalshi_env=room.kalshi_env,
                             subaccount=self.settings.kalshi_subaccount,
-                            total_capital_dollars=Decimal(str(effective_thresholds.risk_max_position_notional_dollars)),
+                            total_capital_dollars=cash_balance if cash_balance is not None else Decimal(str(effective_thresholds.risk_max_position_notional_dollars)),
                             safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
                             risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
                         )

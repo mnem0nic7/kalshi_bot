@@ -2363,6 +2363,21 @@ class PlatformRepository:
         stmt = select(Checkpoint).where(Checkpoint.stream_name == stream_name)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def get_cash_balance_dollars(self) -> Decimal | None:
+        """Return cash balance from the latest reconcile checkpoint, or None if unavailable."""
+        checkpoint = await self.get_checkpoint("reconcile")
+        if checkpoint is None:
+            return None
+        balance_payload = dict((checkpoint.payload or {}).get("balance") or {})
+        for key in ("balance", "cash_balance", "cash"):
+            raw = balance_payload.get(key)
+            if raw is not None:
+                try:
+                    return Decimal(str(raw)) / Decimal("100")
+                except ArithmeticError:
+                    pass
+        return None
+
     async def list_exchange_events(
         self,
         *,
