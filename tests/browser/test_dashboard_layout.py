@@ -50,7 +50,17 @@ def _build_positions(count: int) -> list[dict[str, object]]:
     return positions
 
 
-def _build_env_payload(cash_display: str, positions_count: int) -> dict[str, object]:
+def _build_env_payload(
+    cash_display: str,
+    positions_count: int,
+    *,
+    total_value_dollars: str | None = "$115.20",
+    total_value_display: str = "$115.20",
+    total_value_label: str = "Current",
+    total_value_is_marked: bool = True,
+    total_unrealized_pnl_display: str = "+$7.20",
+    total_unrealized_pnl_tone: str = "good",
+) -> dict[str, object]:
     return {
         "portfolio": {
             "cash_display": cash_display,
@@ -67,10 +77,14 @@ def _build_env_payload(cash_display: str, positions_count: int) -> dict[str, obj
         "positions": _build_positions(positions_count),
         "positions_summary": {
             "capital_buckets": None,
-            "total_current_value_dollars": None,
-            "total_current_value_display": "$0.00",
-            "total_unrealized_pnl_display": "$0.00",
-            "total_unrealized_pnl_tone": "neutral",
+            "total_current_value_dollars": total_value_dollars if total_value_is_marked else None,
+            "total_current_value_display": total_value_display if total_value_is_marked else "$0.00",
+            "total_value_dollars": total_value_dollars,
+            "total_value_display": total_value_display,
+            "total_value_label": total_value_label,
+            "total_value_is_marked": total_value_is_marked,
+            "total_unrealized_pnl_display": total_unrealized_pnl_display,
+            "total_unrealized_pnl_tone": total_unrealized_pnl_tone,
         },
     }
 
@@ -83,7 +97,11 @@ def _artifact_root() -> Path:
 
 
 @contextmanager
-def _serve_dashboard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def _serve_dashboard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    payloads: dict[str, object] | None = None,
+):
     map_path = tmp_path / "markets.yaml"
     map_path.write_text("markets: []\n", encoding="utf-8")
     db_path = tmp_path / "browser.db"
@@ -93,10 +111,11 @@ def _serve_dashboard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
     get_settings.cache_clear()
 
-    payloads = {
-        "demo": _build_env_payload("$1,250.00", positions_count=24),
-        "production": _build_env_payload("$2,500.00", positions_count=18),
-    }
+    if payloads is None:
+        payloads = {
+            "demo": _build_env_payload("$1,250.00", positions_count=24),
+            "production": _build_env_payload("$2,500.00", positions_count=18),
+        }
 
     async def fake_build_env_dashboard(_container, kalshi_env: str) -> dict[str, object]:
         return payloads[kalshi_env]
@@ -206,5 +225,89 @@ def test_dashboard_alerts_card_stays_top_aligned(
                 page.wait_for_selector("#panel-demo .dash-card-alerts", timeout=15_000)
                 _assert_layout(page, "demo", viewport_name)
                 _assert_layout(page, "production", viewport_name)
+            finally:
+                browser.close()
+
+
+def _positions_total_row(page: Page, env_key: str = "demo") -> dict[str, object] | None:
+    """Return label and value text from the positions tfoot row, or None if absent."""
+    return page.evaluate(
+        """
+        (envKey) => {
+          const panel = document.querySelector(`#panel-${envKey}`);
+          const tfoot = panel?.querySelector('.positions-totals');
+          if (!tfoot) return null;
+          const cells = tfoot.querySelectorAll('td');
+          return {
+            label: cells[0]?.textContent?.trim() ?? null,
+            value: cells[1]?.textContent?.trim() ?? null,
+            pnl:   cells[2]?.textContent?.trim() ?? null,
+          };
+        }
+        """,
+        env_key,
+    )
+
+
+def test_positions_total_row_shows_current_when_marked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payloads = {
+        "demo": _build_env_payload(
+            "$1,250.00",
+            positions_count=3,
+            total_value_dollars="$115.20",
+            total_value_display="$115.20",
+            total_value_label="Current",
+            total_value_is_marked=True,
+            total_unrealized_pnl_display="+$7.20",
+            total_unrealized_pnl_tone="good",
+        ),
+        "production": _build_env_payload("$2,500.00", positions_count=1),
+    }
+    with _serve_dashboard(monkeypatch, tmp_path, payloads=payloads) as base_url:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                page.goto(base_url, wait_until="load", timeout=15_000)
+                page.wait_for_selector("#panel-demo .positions-table", timeout=15_000)
+                row = _positions_total_row(page)
+                assert row is not None, "positions tfoot not rendered"
+                assert row["label"] == "Current", row
+                assert row["value"] == "$115.20", row
+                assert row["pnl"] == "+$7.20", row
+            finally:
+                browser.close()
+
+
+def test_positions_total_row_shows_cost_when_unmarked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payloads = {
+        "demo": _build_env_payload(
+            "$1,250.00",
+            positions_count=3,
+            total_value_dollars="$108.00",
+            total_value_display="$108.00",
+            total_value_label="Cost",
+            total_value_is_marked=False,
+            total_unrealized_pnl_display="—",
+            total_unrealized_pnl_tone="neutral",
+        ),
+        "production": _build_env_payload("$2,500.00", positions_count=1),
+    }
+    with _serve_dashboard(monkeypatch, tmp_path, payloads=payloads) as base_url:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                page.goto(base_url, wait_until="load", timeout=15_000)
+                page.wait_for_selector("#panel-demo .positions-table", timeout=15_000)
+                row = _positions_total_row(page)
+                assert row is not None, "positions tfoot not rendered"
+                assert row["label"] == "Cost", row
+                assert row["value"] == "$108.00", row
+                assert row["pnl"] == "—", row
             finally:
                 browser.close()
