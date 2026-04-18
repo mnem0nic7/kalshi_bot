@@ -157,7 +157,7 @@
     );
   }
 
-  function renderPositions(card, positions) {
+  function renderPositions(card, positions, summary) {
     const header = card.querySelector(".dash-card-header");
     const countLabel = header.querySelector(".muted-label");
     if (countLabel) countLabel.textContent = `${positions.length} position${positions.length !== 1 ? "s" : ""}`;
@@ -224,6 +224,23 @@
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
+
+    if (summary && summary.total_value_dollars) {
+      const tfoot = el("tfoot", "positions-totals");
+      const tr = el("tr");
+      const labelTd = el("td", "totals-label", summary.total_value_label || "Total");
+      labelTd.setAttribute("colspan", "5");
+      const pnlDisplay = summary.total_value_is_marked ? (summary.total_unrealized_pnl_display || "—") : "—";
+      const pnlTone = summary.total_value_is_marked ? toneClass(summary.total_unrealized_pnl_tone) : "";
+      tr.append(
+        labelTd,
+        el("td", "mono", summary.total_value_display || "—"),
+        el("td", `mono ${pnlTone}`.trim(), pnlDisplay),
+      );
+      tfoot.appendChild(tr);
+      table.appendChild(tfoot);
+    }
+
     tableWrap.replaceChildren(table);
   }
 
@@ -246,7 +263,7 @@
       renderActiveRooms(panel.querySelector(".dash-card-alerts"), data.active_rooms || []);
       renderAlerts(panel.querySelector(".dash-card-alerts"), data.alerts || []);
       renderCapitalBuckets(panel.querySelector(".dash-card-positions"), data.positions_summary || {});
-      renderPositions(panel.querySelector(".dash-card-positions"), data.positions || []);
+      renderPositions(panel.querySelector(".dash-card-positions"), data.positions || [], data.positions_summary || {});
     } catch (_) {
       // skip on network error
     }

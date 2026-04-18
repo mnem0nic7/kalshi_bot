@@ -462,23 +462,35 @@ def _positions_summary(positions: list[Any], position_views: list[dict[str, Any]
         Decimal("0.00"),
     )
     total_unrealized = None
-    total_current_value = None
-    if position_views is not None and all(item.get("unrealized_pnl_dollars") is not None for item in position_views):
-        total_unrealized = sum(
-            (_decimal_or_zero(item.get("unrealized_pnl_dollars")) for item in position_views),
+    total_value = None
+    total_value_is_marked = False
+    if position_views is not None and positions:
+        if all(item.get("unrealized_pnl_dollars") is not None for item in position_views):
+            total_unrealized = sum(
+                (_decimal_or_zero(item.get("unrealized_pnl_dollars")) for item in position_views),
+                Decimal("0.00"),
+            ).quantize(Decimal("0.01"))
+        all_marked = all(item.get("current_value_dollars") is not None for item in position_views)
+        total_value = sum(
+            (
+                _decimal_or_zero(item.get("current_value_dollars") or item.get("notional_dollars"))
+                for item in position_views
+            ),
             Decimal("0.00"),
         ).quantize(Decimal("0.01"))
-    if position_views is not None and all(item.get("current_value_dollars") is not None for item in position_views):
-        total_current_value = sum(
-            (_decimal_or_zero(item.get("current_value_dollars")) for item in position_views),
-            Decimal("0.00"),
-        ).quantize(Decimal("0.01"))
+        total_value_is_marked = all_marked
+    # keep legacy keys for callers that still reference them
+    total_current_value = total_value if total_value_is_marked else None
     return {
         "count": len(positions),
         "total_contracts": str(total_contracts.quantize(Decimal("0.01"))) if positions else "0.00",
         "total_notional_dollars": str(total_notional.quantize(Decimal("0.01"))) if positions else "0.00",
         "total_current_value_dollars": str(total_current_value) if total_current_value is not None else None,
         "total_current_value_display": _money_display(total_current_value),
+        "total_value_dollars": str(total_value) if total_value is not None else None,
+        "total_value_display": _money_display(total_value),
+        "total_value_label": "Current" if total_value_is_marked else "Cost",
+        "total_value_is_marked": total_value_is_marked,
         "total_unrealized_pnl_dollars": str(total_unrealized) if total_unrealized is not None else None,
         "total_unrealized_pnl_display": _money_display(total_unrealized, signed=True),
         "total_unrealized_pnl_tone": _pnl_tone(total_unrealized),
