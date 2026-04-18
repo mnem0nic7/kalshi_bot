@@ -82,6 +82,7 @@
 .dash-grid {
   display: grid;
   gap: 1rem;
+  align-items: start;
   grid-template-columns: minmax(320px, 0.9fr) minmax(0, 1.7fr);
 }
 
