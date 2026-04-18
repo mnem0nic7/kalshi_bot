@@ -32,6 +32,7 @@ from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
+from kalshi_bot.services.market_history import MarketHistoryService
 from kalshi_bot.services.watchdog import WatchdogService
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -68,6 +69,7 @@ class AppContainer:
     shadow_training_service: ShadowTrainingService
     shadow_campaign_service: ShadowCampaignService
     self_improve_service: SelfImproveService
+    market_history_service: MarketHistoryService
     watchdog_service: WatchdogService
     agents: AgentSuite
     supervisor: WorkflowSupervisor
@@ -93,6 +95,12 @@ class AppContainer:
         memory_service = MemoryService(providers)
         watchdog_service = WatchdogService(settings)
         discovery_service = DiscoveryService(kalshi, weather_directory)
+        market_history_service = MarketHistoryService(
+            session_factory,
+            kalshi,
+            discovery_service,
+            retention_hours=settings.daemon_market_history_retention_hours,
+        )
         reconciliation_service = ReconciliationService(kalshi)
         stream_service = MarketStreamService(settings, session_factory, kalshi_ws)
         training_export_service = TrainingExportService(session_factory)
@@ -198,10 +206,11 @@ class AppContainer:
             shadow_training_service,
             shadow_campaign_service,
             self_improve_service,
-            training_corpus_service,
-            historical_training_service,
-            historical_intelligence_service,
-            historical_pipeline_service,
+            training_corpus_service=training_corpus_service,
+            historical_training_service=historical_training_service,
+            historical_intelligence_service=historical_intelligence_service,
+            historical_pipeline_service=historical_pipeline_service,
+            market_history_service=market_history_service,
         )
         container = cls(
             settings=settings,
@@ -233,6 +242,7 @@ class AppContainer:
             shadow_training_service=shadow_training_service,
             shadow_campaign_service=shadow_campaign_service,
             self_improve_service=self_improve_service,
+            market_history_service=market_history_service,
             watchdog_service=watchdog_service,
             agents=agents,
             supervisor=supervisor,

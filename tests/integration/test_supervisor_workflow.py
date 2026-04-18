@@ -55,6 +55,7 @@ class FakeKalshi:
                 "yes_ask_dollars": "0.5600",
                 "no_ask_dollars": "0.4500",
                 "last_price_dollars": "0.5500",
+                "volume": 200,
             }
         }
 

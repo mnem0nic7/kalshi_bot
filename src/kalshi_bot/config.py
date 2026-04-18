@@ -102,6 +102,8 @@ class Settings(BaseSettings):
     trigger_active_room_stale_seconds: int = 1800
     daemon_reconcile_interval_seconds: int = 60
     daemon_heartbeat_interval_seconds: int = 60
+    daemon_market_history_interval_seconds: int = 60
+    daemon_market_history_retention_hours: int = 24
     daemon_start_with_reconcile: bool = True
     self_improve_window_days: int = 14
     self_improve_holdout_ratio: float = 0.2

@@ -91,6 +91,19 @@ class MarketState(Base, TimestampMixin):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
 
 
+class MarketPriceHistory(Base, IdMixin):
+    __tablename__ = "market_price_history"
+
+    market_ticker: Mapped[str] = mapped_column(String(128), nullable=False)
+    yes_bid_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    yes_ask_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    mid_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    last_trade_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    volume: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
 class Signal(Base, IdMixin, TimestampMixin):
     __tablename__ = "signals"
 

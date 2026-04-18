@@ -17,6 +17,7 @@ from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.historical_training import HistoricalTrainingService
 from kalshi_bot.services.historical_intelligence import HistoricalIntelligenceService
 from kalshi_bot.services.historical_pipeline import HistoricalPipelineService
+from kalshi_bot.services.market_history import MarketHistoryService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
@@ -47,6 +48,7 @@ class DaemonService:
         historical_training_service: HistoricalTrainingService | None = None,
         historical_intelligence_service: HistoricalIntelligenceService | None = None,
         historical_pipeline_service: HistoricalPipelineService | None = None,
+        market_history_service: MarketHistoryService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -63,6 +65,7 @@ class DaemonService:
         self.historical_training_service = historical_training_service
         self.historical_intelligence_service = historical_intelligence_service
         self.historical_pipeline_service = historical_pipeline_service
+        self.market_history_service = market_history_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
 
@@ -177,6 +180,7 @@ class DaemonService:
             ),
             "reconcile": asyncio.create_task(self._periodic_reconcile_loop()),
             "heartbeat": asyncio.create_task(self._periodic_heartbeat_loop()),
+            "market_history": asyncio.create_task(self._periodic_market_history_loop()),
         }
         if run_seconds is not None:
             tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
@@ -230,6 +234,17 @@ class DaemonService:
         while True:
             await asyncio.sleep(self.settings.daemon_heartbeat_interval_seconds)
             self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
+
+    async def _periodic_market_history_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.daemon_market_history_interval_seconds)
+            if self.market_history_service is None:
+                continue
+            try:
+                await self.market_history_service.snapshot_once()
+                await self.market_history_service.purge_once()
+            except Exception:
+                logger.warning("market_history loop error", exc_info=True)
 
     async def _run_heartbeat_follow_up(self, payload: dict[str, Any]) -> None:
         if (

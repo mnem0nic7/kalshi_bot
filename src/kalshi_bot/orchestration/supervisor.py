@@ -27,6 +27,8 @@ from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
+import numpy as np
+
 from kalshi_bot.services.signal import (
     StrategySignal,
     WeatherSignalEngine,
@@ -93,6 +95,102 @@ class WorkflowSupervisor:
         self.research_coordinator = research_coordinator
         self.training_corpus_service = training_corpus_service
         self.agents = agents
+
+    async def _run_market_gates(
+        self,
+        repo: "PlatformRepository",
+        signal: StrategySignal,
+        market: dict[str, Any],
+        market_ticker: str,
+    ) -> bool:
+        from datetime import timedelta
+        from kalshi_bot.core.enums import StandDownReason
+        from kalshi_bot.core.fixed_point import quantize_price
+        from kalshi_bot.core.schemas import TradeEligibilityVerdict
+
+        def _d(key: str) -> Decimal | None:
+            v = market.get(key)
+            if v is None or v == "":
+                return None
+            try:
+                d = quantize_price(v)
+                return d if d > Decimal("0") else None
+            except Exception:
+                return None
+
+        def _reject(reason: "StandDownReason", msg: str) -> bool:
+            if signal.eligibility is None:
+                signal.eligibility = TradeEligibilityVerdict(eligible=False, reasons=[msg])
+            else:
+                signal.eligibility = signal.eligibility.model_copy(update={"eligible": False, "reasons": list(signal.eligibility.reasons) + [msg]})
+            signal.stand_down_reason = reason
+            signal.summary = f"Stand down: {msg}"
+            return False
+
+        bid = _d("yes_bid_dollars")
+        ask = _d("yes_ask_dollars")
+
+        # Gate 1: bid-ask spread > 60% of mid
+        if bid is not None and ask is not None:
+            mid = (bid + ask) / Decimal("2")
+            if mid > Decimal("0") and (ask - bid) / mid > Decimal("0.60"):
+                return _reject(
+                    StandDownReason.MARKET_SPREAD_OVER_60PCT,
+                    f"Bid-ask spread {((ask - bid) / mid * 100):.1f}% exceeds 60% threshold",
+                )
+        else:
+            mid = None
+
+        # Gate 2: edge recalculation vs market mid
+        if mid is not None:
+            side = signal.recommended_side
+            if side is not None:
+                from kalshi_bot.core.enums import ContractSide
+                if side == ContractSide.YES:
+                    market_edge_bps = int((signal.fair_yes_dollars - mid) * Decimal("10000"))
+                else:
+                    market_edge_bps = int((mid - signal.fair_yes_dollars) * Decimal("10000"))
+                signal.edge_bps = market_edge_bps
+                if market_edge_bps <= 0:
+                    return _reject(
+                        StandDownReason.NEGATIVE_MARKET_EDGE,
+                        f"Edge vs market mid is {market_edge_bps} bps (non-positive)",
+                    )
+
+        # Gate 3: momentum (linear regression on 60 min of mid prices)
+        if signal.recommended_side is not None:
+            from kalshi_bot.core.enums import ContractSide
+            from datetime import timedelta as _td
+            history = await repo.fetch_recent_prices(market_ticker, window=timedelta(minutes=60))
+            valid_points = [(row.observed_at.timestamp(), float(row.mid_dollars)) for row in history if row.mid_dollars is not None]
+            if len(valid_points) >= 5:
+                xs = np.array([p[0] for p in valid_points])
+                ys = np.array([p[1] for p in valid_points])
+                xs = xs - xs[0]
+                slope = np.polyfit(xs, ys, 1)[0]
+                if signal.recommended_side == ContractSide.YES and slope < 0:
+                    return _reject(
+                        StandDownReason.MOMENTUM_AGAINST_TRADE,
+                        f"Price momentum (slope={slope:.6f}/s) is against YES trade",
+                    )
+                if signal.recommended_side == ContractSide.NO and slope > 0:
+                    return _reject(
+                        StandDownReason.MOMENTUM_AGAINST_TRADE,
+                        f"Price momentum (slope={slope:.6f}/s) is against NO trade",
+                    )
+
+        # Gate 4: volume check and size_factor — only gate if volume is explicitly reported
+        raw_volume = market.get("volume")
+        if raw_volume is not None:
+            volume = int(raw_volume)
+            if volume < 5:
+                return _reject(
+                    StandDownReason.VOLUME_TOO_LOW,
+                    f"Market volume {volume} is below minimum threshold of 5",
+                )
+            signal.size_factor = min(Decimal(volume) / Decimal("100"), Decimal("1.00"))
+
+        return True
 
     async def run_room(self, room_id: str, reason: str = "manual") -> None:
         ACTIVE_ROOMS.inc()
@@ -268,6 +366,7 @@ class WorkflowSupervisor:
                         "recommended_size_cap_fp": (
                             str(signal.recommended_size_cap_fp) if signal.recommended_size_cap_fp is not None else None
                         ),
+                        "size_factor": str(signal.size_factor),
                         "warn_only_blocked": signal.warn_only_blocked,
                         "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
                         "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
@@ -305,6 +404,11 @@ class WorkflowSupervisor:
                     },
                 )
                 await session.commit()
+
+                # Market structure gates run after signal save; mutate signal in-place on failure.
+                # The existing no-ticket → stand_down path at the end of the agent sequence
+                # handles gate rejections naturally — no separate early-exit needed.
+                await self._run_market_gates(repo, signal, market, room.market_ticker)
 
                 recent_memories = [note.summary for note in await repo.list_recent_memory_notes(limit=5)]
                 await repo.update_room_stage(room.id, RoomStage.RESEARCHING)
@@ -431,6 +535,14 @@ class WorkflowSupervisor:
                     rationale_ids.append(trader_record.id)
                     await session.commit()
 
+                    if ticket is not None and client_order_id is not None:
+                        if signal.size_factor < Decimal("1.00"):
+                            from kalshi_bot.core.fixed_point import quantize_count
+                            scaled = quantize_count(ticket.count_fp * signal.size_factor)
+                            if scaled <= Decimal("0"):
+                                ticket = None
+                            else:
+                                ticket = ticket.model_copy(update={"count_fp": scaled})
                     if ticket is not None and client_order_id is not None:
                         ticket_record = await repo.save_trade_ticket(room.id, ticket, client_order_id, message_id=trader_record.id)
                         open_position = await repo.get_position(room.market_ticker, self.settings.kalshi_subaccount)

@@ -40,6 +40,7 @@ class StrategySignal:
     model_quality_reasons: list[str] = field(default_factory=list)
     recommended_size_cap_fp: Decimal | None = None
     warn_only_blocked: bool = False
+    size_factor: Decimal = field(default_factory=lambda: Decimal("1.00"))
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

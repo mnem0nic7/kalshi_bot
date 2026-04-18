@@ -73,6 +73,10 @@ class StandDownReason(StrEnum):
     SPREAD_TOO_WIDE = "spread_too_wide"
     BOOK_EFFECTIVELY_BROKEN = "book_effectively_broken"
     INSUFFICIENT_REMAINING_PAYOUT = "insufficient_remaining_payout"
+    MARKET_SPREAD_OVER_60PCT = "market_spread_over_60pct"
+    NEGATIVE_MARKET_EDGE = "negative_market_edge"
+    MOMENTUM_AGAINST_TRADE = "momentum_against_trade"
+    VOLUME_TOO_LOW = "volume_too_low"
 
 
 class RiskStatus(StrEnum):

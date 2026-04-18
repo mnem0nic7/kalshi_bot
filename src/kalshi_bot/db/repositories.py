@@ -46,6 +46,7 @@ from kalshi_bot.db.models import (
     HeuristicPackPromotionRecord,
     HeuristicPackRecord,
     HeuristicPatchSuggestionRecord,
+    MarketPriceHistory,
     MarketState,
     MemoryEmbedding,
     MemoryNoteRecord,
@@ -625,6 +626,55 @@ class PlatformRepository:
         self.session.add(record)
         await self.session.flush()
         return record
+
+    async def record_market_price_snapshot(
+        self,
+        *,
+        market_ticker: str,
+        yes_bid_dollars: Decimal | None,
+        yes_ask_dollars: Decimal | None,
+        mid_dollars: Decimal | None,
+        last_trade_dollars: Decimal | None,
+        volume: int | None,
+        observed_at: datetime,
+    ) -> MarketPriceHistory:
+        record = MarketPriceHistory(
+            id=str(uuid4()),
+            market_ticker=market_ticker,
+            yes_bid_dollars=yes_bid_dollars,
+            yes_ask_dollars=yes_ask_dollars,
+            mid_dollars=mid_dollars,
+            last_trade_dollars=last_trade_dollars,
+            volume=volume,
+            observed_at=observed_at,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def fetch_recent_prices(
+        self,
+        market_ticker: str,
+        *,
+        window: timedelta,
+    ) -> list[MarketPriceHistory]:
+        cutoff = datetime.now(UTC) - window
+        stmt = (
+            select(MarketPriceHistory)
+            .where(
+                MarketPriceHistory.market_ticker == market_ticker,
+                MarketPriceHistory.observed_at >= cutoff,
+            )
+            .order_by(MarketPriceHistory.observed_at.asc())
+        )
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def purge_market_price_history(self, *, older_than: timedelta) -> int:
+        from sqlalchemy import delete as sa_delete
+        cutoff = datetime.now(UTC) - older_than
+        stmt = sa_delete(MarketPriceHistory).where(MarketPriceHistory.observed_at < cutoff)
+        result = await self.session.execute(stmt)
+        return result.rowcount or 0
 
     async def get_latest_trade_ticket_for_room(self, room_id: str) -> TradeTicketRecord | None:
         stmt = (
