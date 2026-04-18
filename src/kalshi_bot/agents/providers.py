@@ -4,12 +4,14 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
+from kalshi_bot.agents.chatgpt_auth import ChatGPTAuthManager
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import AgentRoleRuntime
@@ -185,6 +187,128 @@ class NativeGeminiProvider:
         return decoded
 
 
+_OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+
+
+class ChatGPTCodexProvider:
+    """OpenAI chat/completions via ChatGPT OAuth tokens (no static API key required)."""
+
+    def __init__(self, auth_manager: ChatGPTAuthManager, timeout_seconds: float) -> None:
+        self.auth_manager = auth_manager
+        self.client = httpx.AsyncClient(
+            timeout=timeout_seconds,
+            headers={"Content-Type": "application/json"},
+        )
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    async def _auth_headers(self) -> dict[str, str]:
+        token = await self.auth_manager.get_access_token()
+        account_id = await self.auth_manager.get_account_id()
+        return {"Authorization": f"Bearer {token}", "chatgpt-account-id": account_id}
+
+    @_llm_retry
+    async def complete_text(self, *, system_prompt: str, user_prompt: str, model: str, temperature: float) -> str:
+        response = await self.client.post(
+            _OPENAI_CHAT_URL,
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": temperature,
+            },
+            headers=await self._auth_headers(),
+        )
+        if response.status_code == 401:
+            raise RuntimeError(
+                "Codex ChatGPT OAuth: 401 Unauthorized. "
+                "Run `printenv OPENAI_API_KEY | codex login --with-api-key` "
+                "or `codex login` then re-authenticate."
+            )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()
+
+    @_llm_retry
+    async def complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        model: str,
+        temperature: float,
+        schema_model: type[BaseModel] | None = None,
+    ) -> dict[str, Any]:
+        response = await self.client.post(
+            _OPENAI_CHAT_URL,
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": temperature,
+                "response_format": {"type": "json_object"},
+            },
+            headers=await self._auth_headers(),
+        )
+        response.raise_for_status()
+        decoded = json.loads(response.json()["choices"][0]["message"]["content"])
+        if schema_model is not None:
+            decoded = schema_model.model_validate(decoded).model_dump(mode="json")
+        return decoded
+
+
+def _read_codex_auth_json(settings: Settings) -> dict | None:
+    path = Path(settings.codex_auth_json_path).expanduser()
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _build_codex_provider(
+    settings: Settings,
+) -> tuple[OpenAICompatibleProvider | ChatGPTCodexProvider | None, str]:
+    """Return (provider, description) based on codex auth configuration.
+
+    Priority: chatgpt OAuth from auth.json → env API key → API key from auth.json.
+    """
+    data = _read_codex_auth_json(settings)
+    if data is not None:
+        auth_mode = data.get("auth_mode", "")
+        if auth_mode == "chatgpt" and data.get("tokens", {}).get("access_token"):
+            path = Path(settings.codex_auth_json_path).expanduser()
+            mgr = ChatGPTAuthManager(path)
+            logger.info("Codex provider: ChatGPT OAuth (auth.json auth_mode=chatgpt)")
+            return ChatGPTCodexProvider(mgr, settings.llm_request_timeout_seconds), "chatgpt-oauth"
+        if auth_mode in ("apikey", "api_key"):
+            api_key = data.get("OPENAI_API_KEY") or data.get("api_key")
+            if api_key:
+                logger.info("Codex provider: API key from auth.json (auth_mode=%s)", auth_mode)
+                return (
+                    OpenAICompatibleProvider(
+                        ProviderConfig(base_url=settings.codex_base_url, model=settings.codex_model, api_key=api_key),
+                        timeout_seconds=settings.llm_request_timeout_seconds,
+                    ),
+                    "apikey-from-auth-json",
+                )
+    if settings.codex_api_key:
+        logger.info("Codex provider: API key from environment")
+        return (
+            OpenAICompatibleProvider(
+                ProviderConfig(base_url=settings.codex_base_url, model=settings.codex_model, api_key=settings.codex_api_key),
+                timeout_seconds=settings.llm_request_timeout_seconds,
+            ),
+            "apikey-from-env",
+        )
+    return None, "unavailable"
+
+
 class ProviderRouter:
     GEMINI_ROLE_DEFAULTS = {
         AgentRole.RESEARCHER: "gemini_model_researcher",
@@ -209,18 +333,7 @@ class ProviderRouter:
             if settings.gemini_api_key
             else None
         )
-        self.codex = (
-            OpenAICompatibleProvider(
-                ProviderConfig(
-                    base_url=settings.codex_base_url,
-                    model=settings.codex_model,
-                    api_key=settings.codex_api_key,
-                ),
-                timeout_seconds=settings.llm_request_timeout_seconds,
-            )
-            if settings.codex_api_key
-            else None
-        )
+        self.codex, _codex_mode = _build_codex_provider(settings)
         self.hosted = (
             OpenAICompatibleProvider(
                 ProviderConfig(

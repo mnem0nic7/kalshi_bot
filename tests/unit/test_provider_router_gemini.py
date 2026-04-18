@@ -33,6 +33,8 @@ async def test_provider_router_falls_back_to_local_without_gemini() -> None:
         Settings(
             database_url="sqlite+aiosqlite:///./test.db",
             gemini_api_key=None,
+            codex_api_key=None,
+            codex_auth_json_path="/nonexistent/auth.json",
             llm_local_base_url="http://localhost:11434/v1",
             llm_local_api_key="dummy",
         )
