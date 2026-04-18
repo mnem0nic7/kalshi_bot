@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from kalshi_bot.agents.codex_cli import CodexCLIProvider
 from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
@@ -28,7 +29,8 @@ async def test_provider_router_prefers_gemini_when_available() -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_router_falls_back_to_local_without_gemini() -> None:
+async def test_provider_router_falls_back_to_local_without_gemini(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(CodexCLIProvider, "is_available", staticmethod(lambda: False))
     router = ProviderRouter(
         Settings(
             database_url="sqlite+aiosqlite:///./test.db",

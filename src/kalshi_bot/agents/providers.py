@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 from kalshi_bot.agents.chatgpt_auth import ChatGPTAuthManager
+from kalshi_bot.agents.codex_cli import CodexCLIProvider
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import AgentRoleRuntime
@@ -273,11 +274,16 @@ def _read_codex_auth_json(settings: Settings) -> dict | None:
 
 def _build_codex_provider(
     settings: Settings,
-) -> tuple[OpenAICompatibleProvider | ChatGPTCodexProvider | None, str]:
+) -> tuple[OpenAICompatibleProvider | ChatGPTCodexProvider | CodexCLIProvider | None, str]:
     """Return (provider, description) based on codex auth configuration.
 
-    Priority: chatgpt OAuth from auth.json → env API key → API key from auth.json.
+    Priority: Codex CLI binary → chatgpt OAuth token → env/auth.json API key.
+    The CLI handles its own auth (reads ~/.codex/auth.json internally), so if
+    the binary is present it is always preferred.
     """
+    if CodexCLIProvider.is_available():
+        logger.info("Codex provider: CLI binary (codex exec)")
+        return CodexCLIProvider(timeout_seconds=settings.llm_request_timeout_seconds), "codex-cli"
     data = _read_codex_auth_json(settings)
     if data is not None:
         auth_mode = data.get("auth_mode", "")
