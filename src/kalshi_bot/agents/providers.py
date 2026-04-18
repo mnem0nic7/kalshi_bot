@@ -209,6 +209,18 @@ class ProviderRouter:
             if settings.gemini_api_key
             else None
         )
+        self.codex = (
+            OpenAICompatibleProvider(
+                ProviderConfig(
+                    base_url=settings.codex_base_url,
+                    model=settings.codex_model,
+                    api_key=settings.codex_api_key,
+                ),
+                timeout_seconds=settings.llm_request_timeout_seconds,
+            )
+            if settings.codex_api_key
+            else None
+        )
         self.hosted = (
             OpenAICompatibleProvider(
                 ProviderConfig(
@@ -233,6 +245,8 @@ class ProviderRouter:
     async def close(self) -> None:
         if self.gemini is not None:
             await self.gemini.close()
+        if self.codex is not None:
+            await self.codex.close()
         if self.hosted is not None:
             await self.hosted.close()
         await self.local.close()
@@ -251,6 +265,15 @@ class ProviderRouter:
             if self.gemini is not None:
                 model = config.model or getattr(self.settings, self.GEMINI_ROLE_DEFAULTS.get(role, "gemini_model_researcher"))
                 return self.gemini, ProviderUsage(provider="gemini", model=model, temperature=temperature)
+            requested_provider = "codex"
+        if requested_provider == "codex":
+            if self.codex is not None:
+                return self.codex, ProviderUsage(
+                    provider="codex",
+                    model=config.model or self.settings.codex_model,
+                    temperature=temperature,
+                    fallback_used=(role_config is not None and role_config.provider.lower() not in {"codex"}),
+                )
             requested_provider = "hosted"
         if requested_provider == "hosted":
             if self.hosted is not None:
@@ -265,7 +288,7 @@ class ProviderRouter:
                 provider="local",
                 model=config.model or self.settings.llm_local_model,
                 temperature=temperature,
-                fallback_used=(role_config is not None and role_config.provider.lower() != "local"),
+                fallback_used=(role_config is not None and role_config.provider.lower() not in {"local"}),
             )
         return None, ProviderUsage(provider="none", model=None, temperature=temperature, fallback_used=True)
 
