@@ -371,9 +371,11 @@ class ProviderRouter:
         await self.local.close()
 
     def default_role_runtime(self, role: AgentRole) -> AgentRoleRuntime:
-        if role in self.GEMINI_ROLE_DEFAULTS:
+        if self.gemini is not None and role in self.GEMINI_ROLE_DEFAULTS:
             default_model = getattr(self.settings, self.GEMINI_ROLE_DEFAULTS[role])
             return AgentRoleRuntime(provider="gemini", model=default_model, temperature=0.2)
+        if self.codex is not None:
+            return AgentRoleRuntime(provider="codex", model=self.settings.codex_model, temperature=0.2)
         return AgentRoleRuntime(provider="local", model=self.settings.llm_local_model, temperature=0.2)
 
     def resolve_usage(self, *, role: AgentRole, role_config: AgentRoleRuntime | None = None) -> tuple[Any | None, ProviderUsage]:
