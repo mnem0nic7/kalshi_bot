@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import zoneinfo
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
+
+_PACIFIC = zoneinfo.ZoneInfo("America/Los_Angeles")
 
 from kalshi_bot.core.fixed_point import as_decimal, quantize_count, quantize_price
 from kalshi_bot.db.repositories import PlatformRepository
@@ -147,6 +151,15 @@ class ReconciliationService:
                 "settlements_count": len(settlements),
             },
         )
+
+        # Write start-of-day baseline once per Pacific calendar day (never overwrite).
+        pacific_today = datetime.now(_PACIFIC).strftime("%Y-%m-%d")
+        existing_baseline = await repo.get_daily_portfolio_baseline_dollars(pacific_date=pacific_today)
+        if existing_baseline is None:
+            total_capital = await repo.get_total_capital_dollars()
+            if total_capital is not None:
+                await repo.set_daily_portfolio_baseline_dollars(total_capital, pacific_date=pacific_today)
+
         await repo.log_ops_event(
             severity="info",
             summary="Reconciliation completed",

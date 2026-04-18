@@ -254,6 +254,9 @@ async def test_build_control_room_summary_skips_live_market_discovery(monkeypatc
             assert limit > 0
             return []
 
+        async def get_daily_pnl_dollars(self) -> Decimal | None:
+            return None
+
     async def fail_configured_markets(_container) -> list[dict]:
         raise AssertionError("summary should not call live market discovery")
 
@@ -447,6 +450,9 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
 
         async def get_total_capital_dollars(self) -> Decimal | None:
             return Decimal("534.17")
+
+        async def get_daily_pnl_dollars(self) -> Decimal | None:
+            return Decimal("3.21")
 
         async def portfolio_bucket_snapshot(
             self,

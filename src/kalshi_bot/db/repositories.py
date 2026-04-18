@@ -2393,6 +2393,41 @@ class PlatformRepository:
         effective_positions = positions_cents if (positions_cents is not None and positions_cents < cash_cents) else Decimal("0")
         return (cash_cents + effective_positions) / Decimal("100")
 
+    @staticmethod
+    def _pacific_today() -> str:
+        """Return today's date string in Pacific Time (YYYY-MM-DD)."""
+        import zoneinfo
+        return datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+
+    async def get_daily_portfolio_baseline_dollars(self, *, pacific_date: str | None = None) -> Decimal | None:
+        date = pacific_date or self._pacific_today()
+        checkpoint = await self.get_checkpoint(f"daily_portfolio:{date}")
+        if checkpoint is None:
+            return None
+        raw = (checkpoint.payload or {}).get("total_capital_dollars")
+        if raw is None:
+            return None
+        try:
+            return Decimal(str(raw))
+        except ArithmeticError:
+            return None
+
+    async def set_daily_portfolio_baseline_dollars(self, total_capital_dollars: Decimal, *, pacific_date: str | None = None) -> None:
+        date = pacific_date or self._pacific_today()
+        await self.set_checkpoint(
+            f"daily_portfolio:{date}",
+            cursor=None,
+            payload={"total_capital_dollars": str(total_capital_dollars), "date": date},
+        )
+
+    async def get_daily_pnl_dollars(self) -> Decimal | None:
+        """Return today's P&L: current portfolio value minus start-of-day baseline (Pacific Time)."""
+        current = await self.get_total_capital_dollars()
+        baseline = await self.get_daily_portfolio_baseline_dollars()
+        if current is None or baseline is None:
+            return None
+        return (current - baseline).quantize(Decimal("0.01"))
+
     async def list_exchange_events(
         self,
         *,

@@ -980,6 +980,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         runtime_health = await container.watchdog_service.get_status(repo)
         positions = await repo.list_positions(limit=POSITION_LIMIT)
         ops_events = await repo.list_ops_events(limit=20)
+        daily_pnl = await repo.get_daily_pnl_dollars()
         await session.commit()
 
     research_confidence, room_bundles, room_outcome_views, intel_board = await asyncio.gather(
@@ -989,7 +990,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         _current_intel_board(container),
     )
     training_status = await container.training_corpus_service.get_dashboard_status(bundles=room_bundles)
-    return _summary_payload(
+    payload = _summary_payload(
         now=now,
         control=control,
         runtime_health=runtime_health,
@@ -1000,6 +1001,9 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
         intel_board=intel_board,
         ops_events=ops_events,
     )
+    payload["daily_pnl_display"] = _money_display(daily_pnl, signed=True)
+    payload["daily_pnl_tone"] = _pnl_tone(daily_pnl)
+    return payload
 
 
 async def build_control_room_tab(container: AppContainer, tab: str) -> dict[str, Any]:
@@ -1263,10 +1267,12 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
     ]
     positions_summary = _positions_summary(positions, position_views)
     positions_summary["capital_buckets"] = _capital_bucket_summary(capital_buckets)
+    daily_pnl = await repo.get_daily_pnl_dollars()
     return {
         "kalshi_env": kalshi_env,
         "as_of": now.isoformat(),
         "portfolio": _balance_summary(balance_checkpoint, position_views),
+        "daily_pnl_dollars": str(daily_pnl) if daily_pnl is not None else None,
         "positions_summary": positions_summary,
         "positions": position_views,
         "alerts": [_ops_event_view(e) for e in alerts],

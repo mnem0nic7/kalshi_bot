@@ -44,6 +44,14 @@
           data-summary-tone="gain_loss_tone"
         >{{ env_data.portfolio.gain_loss_display }}</strong>
       </article>
+      <article class="dash-stat">
+        <span class="muted-label">Today (PT)</span>
+        <strong
+          class="dash-stat-value {% if env_data.daily_pnl_dollars %}{% set dp = env_data.daily_pnl_dollars | float %}{% if dp > 0 %}value-positive{% elif dp < 0 %}value-negative{% else %}value-neutral{% endif %}{% else %}value-neutral{% endif %}"
+          data-summary-key="daily_pnl_display"
+          data-summary-tone="daily_pnl_tone"
+        >{% if env_data.daily_pnl_dollars %}{% set dp = env_data.daily_pnl_dollars | float %}{% if dp > 0 %}+{% endif %}${{ "%.2f"|format(dp|abs) }}{% else %}—{% endif %}</strong>
+      </article>
     </div>
 
     <div class="dash-grid">
