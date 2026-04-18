@@ -1,0 +1,55 @@
+name: Dashboard Layout Browser
+
+"on":
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/dashboard-layout-browser.yml"
+      - "pyproject.toml"
+      - "src/kalshi_bot/web/**"
+      - "tests/browser/**"
+
+permissions:
+  contents: read
+
+jobs:
+  dashboard-layout-browser:
+    name: Playwright Dashboard Layout Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PLAYWRIGHT_ARTIFACTS_DIR: .tmp/playwright-artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Install Chromium
+        run: |
+          set -euo pipefail
+          python -m playwright install --with-deps chromium
+
+      - name: Run dashboard browser test
+        run: |
+          set -euo pipefail
+          mkdir -p "${PLAYWRIGHT_ARTIFACTS_DIR}"
+          python -m pytest -q tests/browser/test_dashboard_layout.py
+
+      - name: Upload Playwright screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-layout-playwright-artifacts
+          path: .tmp/playwright-artifacts
+          if-no-files-found: ignore

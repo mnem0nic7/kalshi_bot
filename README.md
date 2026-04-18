@@ -54,6 +54,15 @@ alembic upgrade head
 python3 -m kalshi_bot.main
 ```
 
+## Local browser check
+
+For the dashboard layout regression check:
+
+```bash
+python -m playwright install chromium
+python -m pytest -q tests/browser/test_dashboard_layout.py
+```
+
 ## Operator commands
 
 After activating the virtualenv:
@@ -127,6 +136,7 @@ The repo includes manual read-only smoke workflows for both Kalshi environments:
 - `.github/workflows/demo-smoke.yml`
 - `.github/workflows/live-smoke.yml`
 - `.github/workflows/compose-shadow-smoke.yml`
+- `.github/workflows/dashboard-layout-browser.yml`
 - `.github/workflows/self-improve.yml`
 - `.github/workflows/rollback-agent-pack.yml`
 - `.github/workflows/sync-gemini-runtime.yml`
