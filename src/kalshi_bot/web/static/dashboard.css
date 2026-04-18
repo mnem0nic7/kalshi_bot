@@ -96,7 +96,8 @@
   transition: border-color 160ms ease;
 }
 
-.dash-card-positions {
+.dash-card-positions,
+.dash-card-alerts {
   align-content: start;
 }
 
