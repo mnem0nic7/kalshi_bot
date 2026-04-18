@@ -148,6 +148,15 @@
               </tr>
               {% endfor %}
             </tbody>
+            {% if env_data.positions_summary.total_current_value_dollars %}
+            <tfoot class="positions-totals">
+              <tr>
+                <td colspan="5" class="totals-label">Total</td>
+                <td class="mono">{{ env_data.positions_summary.total_current_value_display }}</td>
+                <td class="mono {{ env_data.positions_summary.total_unrealized_pnl_tone | default('') | replace('good','value-positive') | replace('bad','value-negative') }}">{{ env_data.positions_summary.total_unrealized_pnl_display }}</td>
+              </tr>
+            </tfoot>
+            {% endif %}
           </table>
         </div>
         {% else %}
