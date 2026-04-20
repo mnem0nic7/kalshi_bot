@@ -252,6 +252,23 @@ class WorkflowSupervisor:
                     if mapping is not None and mapping.supports_structured_weather
                     else None
                 )
+                if mapping is not None and mapping.series_ticker:
+                    city_assignment = await repo.get_city_strategy_assignment(mapping.series_ticker)
+                    if city_assignment is not None:
+                        strategy_record = await repo.get_strategy_by_name(city_assignment.strategy_name)
+                        if strategy_record is not None:
+                            d = strategy_record.thresholds
+                            thresholds = RuntimeThresholds(
+                                risk_min_edge_bps=int(d["risk_min_edge_bps"]),
+                                risk_max_order_notional_dollars=float(d["risk_max_order_notional_dollars"]),
+                                risk_max_position_notional_dollars=float(d["risk_max_position_notional_dollars"]),
+                                trigger_max_spread_bps=int(d["trigger_max_spread_bps"]),
+                                trigger_cooldown_seconds=int(d["trigger_cooldown_seconds"]),
+                                strategy_quality_edge_buffer_bps=int(d["strategy_quality_edge_buffer_bps"]),
+                                strategy_min_remaining_payout_bps=int(d["strategy_min_remaining_payout_bps"]),
+                                risk_safe_capital_reserve_ratio=float(d["risk_safe_capital_reserve_ratio"]),
+                                risk_risky_capital_max_ratio=float(d["risk_risky_capital_max_ratio"]),
+                            )
                 delta = self.research_coordinator.build_room_delta(
                     dossier=dossier,
                     market_response=market_response,

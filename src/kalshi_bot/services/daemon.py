@@ -24,6 +24,7 @@ from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.strategy_eval import StrategyEvaluationService
+from kalshi_bot.services.strategy_regression import StrategyRegressionService
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -51,6 +52,7 @@ class DaemonService:
         historical_pipeline_service: HistoricalPipelineService | None = None,
         market_history_service: MarketHistoryService | None = None,
         strategy_eval_service: StrategyEvaluationService | None = None,
+        strategy_regression_service: StrategyRegressionService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -69,6 +71,7 @@ class DaemonService:
         self.historical_pipeline_service = historical_pipeline_service
         self.market_history_service = market_history_service
         self.strategy_eval_service = strategy_eval_service
+        self.strategy_regression_service = strategy_regression_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
 
@@ -273,6 +276,9 @@ class DaemonService:
             settlement_follow_up = await self._maybe_run_settlement_follow_up()
             if settlement_follow_up is not None:
                 payload["settlement_follow_up"] = settlement_follow_up
+            strategy_regression = await self._maybe_run_strategy_regression()
+            if strategy_regression is not None:
+                payload["strategy_regression"] = strategy_regression
             historical_pipeline = await self._maybe_run_historical_pipeline()
             if historical_pipeline is not None:
                 payload["historical_pipeline"] = historical_pipeline
@@ -435,6 +441,20 @@ class DaemonService:
             )
             await session.commit()
         return result
+
+    async def _maybe_run_strategy_regression(self) -> dict[str, Any] | None:
+        if self.strategy_regression_service is None:
+            return None
+        last_run_at = await self._checkpoint_time("strategy_regression")
+        now = datetime.now(UTC)
+        min_interval = timedelta(seconds=max(3600, self.settings.strategy_regression_daily_run_seconds))
+        if last_run_at is not None and now - last_run_at < min_interval:
+            return None
+        try:
+            return await self.strategy_regression_service.run_regression()
+        except Exception:
+            logger.warning("strategy_regression failed", exc_info=True)
+            return None
 
     async def _checkpoint_time(self, stream_name: str) -> datetime | None:
         async with self.session_factory() as session:

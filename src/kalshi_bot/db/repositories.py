@@ -66,7 +66,10 @@ from kalshi_bot.db.models import (
     RoomMessage,
     RoomResearchHealthRecord,
     RoomStrategyAuditRecord,
+    CityStrategyAssignment,
     Signal,
+    StrategyRecord,
+    StrategyResultRecord,
     TrainingDatasetBuildItemRecord,
     TrainingDatasetBuildRecord,
     TrainingReadinessRecord,
@@ -2577,3 +2580,120 @@ class PlatformRepository:
             stmt = stmt.where(RawWeatherEvent.created_at <= created_before)
         stmt = stmt.order_by(RawWeatherEvent.created_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
+
+    # ── Strategy presets ────────────────────────────────────────────────────
+
+    async def seed_strategies(self, presets: list[dict[str, Any]]) -> None:
+        for preset in presets:
+            stmt = (
+                pg_insert(StrategyRecord)
+                .values(
+                    name=preset["name"],
+                    description=preset.get("description"),
+                    thresholds=preset["thresholds"],
+                    is_active=preset.get("is_active", True),
+                    created_at=datetime.now(UTC),
+                )
+                .on_conflict_do_nothing(index_elements=["name"])
+            )
+            await self.session.execute(stmt)
+        await self.session.flush()
+
+    async def list_strategies(self, *, active_only: bool = True) -> list[StrategyRecord]:
+        stmt = select(StrategyRecord)
+        if active_only:
+            stmt = stmt.where(StrategyRecord.is_active.is_(True))
+        stmt = stmt.order_by(StrategyRecord.id)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def get_strategy_by_name(self, name: str) -> StrategyRecord | None:
+        stmt = select(StrategyRecord).where(StrategyRecord.name == name)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def save_strategy_results(self, results: list[dict[str, Any]]) -> None:
+        for row in results:
+            record = StrategyResultRecord(
+                strategy_id=row["strategy_id"],
+                run_at=row["run_at"],
+                date_from=row["date_from"],
+                date_to=row["date_to"],
+                series_ticker=row["series_ticker"],
+                rooms_evaluated=row["rooms_evaluated"],
+                trade_count=row["trade_count"],
+                win_count=row["win_count"],
+                total_pnl_dollars=Decimal(str(row["total_pnl_dollars"])),
+                trade_rate=Decimal(str(row["trade_rate"])) if row.get("trade_rate") is not None else None,
+                win_rate=Decimal(str(row["win_rate"])) if row.get("win_rate") is not None else None,
+                avg_edge_bps=Decimal(str(row["avg_edge_bps"])) if row.get("avg_edge_bps") is not None else None,
+            )
+            self.session.add(record)
+        await self.session.flush()
+
+    async def get_latest_strategy_results(self) -> list[StrategyResultRecord]:
+        """Return the most recent result per (strategy_id, series_ticker)."""
+        subq = (
+            select(
+                StrategyResultRecord.strategy_id,
+                StrategyResultRecord.series_ticker,
+                func.max(StrategyResultRecord.run_at).label("max_run_at"),
+            )
+            .group_by(StrategyResultRecord.strategy_id, StrategyResultRecord.series_ticker)
+            .subquery()
+        )
+        stmt = select(StrategyResultRecord).join(
+            subq,
+            (StrategyResultRecord.strategy_id == subq.c.strategy_id)
+            & (StrategyResultRecord.series_ticker == subq.c.series_ticker)
+            & (StrategyResultRecord.run_at == subq.c.max_run_at),
+        )
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def get_city_strategy_assignment(self, series_ticker: str) -> CityStrategyAssignment | None:
+        stmt = select(CityStrategyAssignment).where(CityStrategyAssignment.series_ticker == series_ticker)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def set_city_strategy_assignment(
+        self, series_ticker: str, strategy_name: str, assigned_by: str = "auto_regression"
+    ) -> None:
+        stmt = (
+            pg_insert(CityStrategyAssignment)
+            .values(
+                series_ticker=series_ticker,
+                strategy_name=strategy_name,
+                assigned_at=datetime.now(UTC),
+                assigned_by=assigned_by,
+            )
+            .on_conflict_do_update(
+                index_elements=["series_ticker"],
+                set_={"strategy_name": strategy_name, "assigned_at": datetime.now(UTC), "assigned_by": assigned_by},
+            )
+        )
+        await self.session.execute(stmt)
+        await self.session.flush()
+
+    async def list_city_strategy_assignments(self) -> list[CityStrategyAssignment]:
+        stmt = select(CityStrategyAssignment).order_by(CityStrategyAssignment.series_ticker)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def get_strategy_regression_rooms(
+        self, date_from: datetime, date_to: datetime
+    ) -> list[dict[str, Any]]:
+        """Return historical replay rooms with signal and fill data for counterfactual eval."""
+        stmt = (
+            select(
+                Room.id.label("room_id"),
+                Room.market_ticker,
+                Signal.edge_bps,
+                Signal.fair_yes_dollars,
+                Signal.payload.label("signal_payload"),
+            )
+            .join(Signal, Signal.room_id == Room.id)
+            .where(
+                Room.room_origin == "historical_replay",
+                Room.stage == "complete",
+                Room.created_at >= date_from,
+                Room.created_at <= date_to,
+            )
+        )
+        rows = list((await self.session.execute(stmt)).mappings())
+        return [dict(r) for r in rows]

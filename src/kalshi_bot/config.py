@@ -160,6 +160,7 @@ class Settings(BaseSettings):
     historical_pipeline_chunk_days: int = 14
     historical_pipeline_daily_run_seconds: int = 86400
     historical_pipeline_incremental_days: int = 7
+    strategy_regression_daily_run_seconds: int = 86400
     historical_execution_confidence_min_market_days: int = 60
     historical_directional_confidence_min_full_market_days: int = 30
     historical_directional_confidence_min_holdout_market_days: int = 7

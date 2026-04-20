@@ -9,6 +9,7 @@
   <nav class="dash-tabs panel" aria-label="Environment">
     <button class="dash-tab is-active" data-env="demo" role="tab" aria-selected="true" aria-controls="panel-demo">Demo</button>
     <button class="dash-tab" data-env="production" role="tab" aria-selected="false" aria-controls="panel-production">Production</button>
+    <button class="dash-tab" data-env="strategies" role="tab" aria-selected="false" aria-controls="panel-strategies">Strategies</button>
     <span class="dash-refresh-label">
       <span class="muted-label">Last refreshed</span>
       <strong id="dash-last-refreshed">—</strong>
@@ -169,6 +170,80 @@
     </div>
   </section>
   {% endfor %}
+
+  <section
+    class="dash-panel"
+    id="panel-strategies"
+    data-env="strategies"
+    role="tabpanel"
+    hidden
+  >
+    <div class="dash-summary">
+      <article class="dash-stat">
+        <span class="muted-label">Corpus rooms <span class="muted-label" style="font-size:0.75em">(180d)</span></span>
+        <strong class="dash-stat-value" data-strategies-key="corpus_rooms">{{ strategies.corpus_rooms }}</strong>
+      </article>
+      <article class="dash-stat">
+        <span class="muted-label">Last evaluated</span>
+        <strong class="dash-stat-value" data-strategies-key="last_evaluated">
+          {% if strategies.last_evaluated %}<span data-timestamp="{{ strategies.last_evaluated }}">{{ strategies.last_evaluated }}</span>{% else %}—{% endif %}
+        </strong>
+      </article>
+      <article class="dash-stat">
+        <span class="muted-label">Best strategy</span>
+        <strong class="dash-stat-value" data-strategies-key="best_strategy_name">{{ strategies.best_strategy_name }}</strong>
+        <span class="dash-stat-detail muted-label" data-strategies-key="best_strategy_win_rate">{{ strategies.best_strategy_win_rate }}</span>
+      </article>
+    </div>
+
+    <div class="dash-grid">
+      <article class="dash-card" style="grid-column: 1 / -1;">
+        <div class="dash-card-header">
+          <h2>Strategy Regression</h2>
+          <span class="muted-label">{{ strategies.strategies | length }} strategies · rolling 180d window</span>
+        </div>
+        {% if strategies.strategies %}
+        <div class="table-wrap">
+          <table class="positions-table">
+            <thead>
+              <tr><th>Strategy</th><th>City</th><th>Rooms</th><th>Trade Rate</th><th>Win Rate</th><th>Total P/L</th><th>Avg Edge</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              {% for strategy in strategies.strategies %}
+              {% for city in strategy.city_breakdown %}
+              <tr>
+                {% if loop.first %}
+                <td rowspan="{{ strategy.city_breakdown | length }}" style="vertical-align:top; padding-top:0.5rem;">
+                  <strong class="mono">{{ strategy.name }}</strong>
+                  <details style="margin-top:0.25rem;">
+                    <summary class="muted-label" style="cursor:pointer;font-size:0.8em;">thresholds</summary>
+                    <dl style="font-size:0.75em;margin:0.25rem 0 0 0;">
+                      {% for k, v in strategy.thresholds.items() %}
+                      <dt class="muted-label">{{ k }}</dt><dd class="mono">{{ v }}</dd>
+                      {% endfor %}
+                    </dl>
+                  </details>
+                </td>
+                {% endif %}
+                <td class="mono">{{ city.series_ticker }}</td>
+                <td class="mono">{{ city.rooms_evaluated }}</td>
+                <td class="mono">{{ city.trade_rate_display }}</td>
+                <td class="mono {% if city.win_rate is not none and city.win_rate >= 0.6 %}value-positive{% elif city.win_rate is not none and city.win_rate <= 0.35 %}value-negative{% endif %}">{{ city.win_rate_display }}</td>
+                <td class="mono">{{ city.total_pnl_display }}</td>
+                <td class="mono">{{ city.avg_edge_bps_display }}</td>
+                <td>{% if city.assigned %}<span class="status-pill status-good">Active</span>{% else %}<span class="status-pill status-neutral">—</span>{% endif %}</td>
+              </tr>
+              {% endfor %}
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="empty-state">No regression results yet. Nightly evaluation runs once per 24h after historical replay rooms are available.</p>
+        {% endif %}
+      </article>
+    </div>
+  </section>
 
 </div>
 {% endblock %}

@@ -31,6 +31,7 @@ from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.strategy_eval import StrategyEvaluationService
+from kalshi_bot.services.strategy_regression import StrategyRegressionService
 from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.services.market_history import MarketHistoryService
@@ -195,6 +196,7 @@ class AppContainer:
         )
         auto_trigger_service = AutoTriggerService(settings, session_factory, weather_directory, agent_pack_service, supervisor)
         strategy_eval_service = StrategyEvaluationService(settings, session_factory, agent_pack_service)
+        strategy_regression_service = StrategyRegressionService(settings, session_factory, weather_directory, agent_pack_service)
         daemon_service = DaemonService(
             settings,
             session_factory,
@@ -213,6 +215,7 @@ class AppContainer:
             historical_pipeline_service=historical_pipeline_service,
             market_history_service=market_history_service,
             strategy_eval_service=strategy_eval_service,
+            strategy_regression_service=strategy_regression_service,
         )
         container = cls(
             settings=settings,
@@ -259,6 +262,7 @@ class AppContainer:
                 )
                 await agent_pack_service.ensure_initialized(repo)
                 await historical_heuristic_service.ensure_initialized(repo)
+                await strategy_regression_service.seed_strategies(repo)
                 await session.commit()
         return container
 

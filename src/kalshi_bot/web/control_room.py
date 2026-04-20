@@ -1389,3 +1389,93 @@ async def _build_operations_tab(container: AppContainer) -> dict[str, Any]:
         "self_improve": self_improve_status,
         "heuristics": heuristic_status,
     }
+
+
+async def build_strategies_dashboard(container: AppContainer) -> dict[str, Any]:
+    now = datetime.now(UTC)
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session)
+        strategies = await repo.list_strategies(active_only=True)
+        latest_results = await repo.get_latest_strategy_results()
+        assignments = await repo.list_city_strategy_assignments()
+        regression_checkpoint = await repo.get_checkpoint("strategy_regression")
+        await session.commit()
+
+    # Index results by (strategy_id, series_ticker)
+    results_index: dict[tuple[int, str], Any] = {
+        (r.strategy_id, r.series_ticker): r for r in latest_results
+    }
+    # Index assignments by series_ticker
+    assignment_index: dict[str, str] = {a.series_ticker: a.strategy_name for a in assignments}
+
+    # Collect all series tickers seen across results
+    all_series: set[str] = {r.series_ticker for r in latest_results}
+
+    strategy_rows = []
+    for strategy in strategies:
+        city_breakdown: list[dict[str, Any]] = []
+        total_trade_count = 0
+        win_numerator = 0.0
+        win_denominator = 0
+
+        for series_ticker in sorted(all_series):
+            result = results_index.get((strategy.id, series_ticker))
+            if result is None:
+                continue
+            win_rate_val = float(result.win_rate) if result.win_rate is not None else None
+            trade_count = result.trade_count or 0
+            total_trade_count += trade_count
+            if win_rate_val is not None and trade_count > 0:
+                win_numerator += win_rate_val * trade_count
+                win_denominator += trade_count
+
+            city_breakdown.append({
+                "series_ticker": series_ticker,
+                "rooms_evaluated": result.rooms_evaluated,
+                "trade_count": trade_count,
+                "win_count": result.win_count,
+                "trade_rate_display": f"{float(result.trade_rate):.0%}" if result.trade_rate is not None else "—",
+                "win_rate_display": f"{win_rate_val:.0%}" if win_rate_val is not None else "—",
+                "win_rate": win_rate_val,
+                "total_pnl_display": f"${float(result.total_pnl_dollars):+.2f}" if result.total_pnl_dollars is not None else "—",
+                "avg_edge_bps_display": f"{float(result.avg_edge_bps):.0f}" if result.avg_edge_bps is not None else "—",
+                "assigned": assignment_index.get(series_ticker) == strategy.name,
+                "run_at": result.run_at.isoformat() if result.run_at else None,
+            })
+
+        overall_win_rate = (win_numerator / win_denominator) if win_denominator > 0 else None
+        strategy_rows.append({
+            "name": strategy.name,
+            "description": strategy.description,
+            "thresholds": strategy.thresholds,
+            "total_trade_count": total_trade_count,
+            "overall_win_rate_display": f"{overall_win_rate:.0%}" if overall_win_rate is not None else "—",
+            "overall_win_rate": overall_win_rate,
+            "city_breakdown": city_breakdown,
+        })
+
+    # Summary
+    last_evaluated = None
+    corpus_rooms = 0
+    if regression_checkpoint is not None and isinstance(regression_checkpoint.payload, dict):
+        last_evaluated = regression_checkpoint.payload.get("ran_at")
+        corpus_rooms = regression_checkpoint.payload.get("rooms_scanned", 0)
+
+    best_strategy = max(
+        (s for s in strategy_rows if s["overall_win_rate"] is not None),
+        key=lambda s: s["overall_win_rate"],
+        default=None,
+    )
+
+    return {
+        "as_of": now.isoformat(),
+        "corpus_rooms": corpus_rooms,
+        "last_evaluated": last_evaluated,
+        "best_strategy_name": best_strategy["name"] if best_strategy else "—",
+        "best_strategy_win_rate": best_strategy["overall_win_rate_display"] if best_strategy else "—",
+        "strategies": strategy_rows,
+        "assignments": [
+            {"series_ticker": a.series_ticker, "strategy_name": a.strategy_name, "assigned_by": a.assigned_by}
+            for a in assignments
+        ],
+    }

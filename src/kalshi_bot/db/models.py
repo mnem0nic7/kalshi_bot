@@ -623,3 +623,41 @@ class DeploymentControl(Base):
 
 Index("ix_room_messages_room_created", RoomMessage.room_id, RoomMessage.created_at)
 Index("ix_raw_exchange_events_stream_created", RawExchangeEvent.stream_name, RawExchangeEvent.created_at)
+
+
+class StrategyRecord(Base):
+    __tablename__ = "strategies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    thresholds: Mapped[dict] = mapped_column(JSON, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class StrategyResultRecord(Base):
+    __tablename__ = "strategy_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[int] = mapped_column(ForeignKey("strategies.id"), index=True)
+    run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    date_from: Mapped[str] = mapped_column(String(16))
+    date_to: Mapped[str] = mapped_column(String(16))
+    series_ticker: Mapped[str] = mapped_column(String(64), index=True)
+    rooms_evaluated: Mapped[int] = mapped_column(Integer, default=0)
+    trade_count: Mapped[int] = mapped_column(Integer, default=0)
+    win_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_pnl_dollars: Mapped[Decimal] = mapped_column(Numeric(12, 4), default=Decimal("0"))
+    trade_rate: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
+    win_rate: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
+    avg_edge_bps: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+
+
+class CityStrategyAssignment(Base):
+    __tablename__ = "city_strategy_assignments"
+
+    series_ticker: Mapped[str] = mapped_column(String(64), primary_key=True)
+    strategy_name: Mapped[str] = mapped_column(String(64))
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    assigned_by: Mapped[str] = mapped_column(String(64), default="auto_regression")

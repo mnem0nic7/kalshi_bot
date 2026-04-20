@@ -40,6 +40,7 @@ from kalshi_bot.web.control_room import (
     build_control_room_summary,
     build_control_room_tab,
     build_env_dashboard,
+    build_strategies_dashboard,
 )
 from kalshi_bot.web.faq_content import FAQ_SECTIONS
 from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
@@ -857,9 +858,10 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         app_container = container(request)
-        demo_data, prod_data = await asyncio.gather(
+        demo_data, prod_data, strategies_data = await asyncio.gather(
             build_env_dashboard(app_container, "demo"),
             build_env_dashboard(app_container, "production"),
+            build_strategies_dashboard(app_container),
         )
         return templates.TemplateResponse(
             request,
@@ -867,9 +869,16 @@ def create_app() -> FastAPI:
             {
                 "demo": jsonable_encoder(demo_data),
                 "production": jsonable_encoder(prod_data),
+                "strategies": jsonable_encoder(strategies_data),
                 "settings": app_container.settings,
             },
         )
+
+    @app.get("/api/dashboard/strategies")
+    async def dashboard_strategies(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await build_strategies_dashboard(app_container)
+        return JSONResponse(jsonable_encoder(payload))
 
     @app.get("/api/dashboard/{kalshi_env}")
     async def dashboard_env(kalshi_env: str, request: Request) -> JSONResponse:
