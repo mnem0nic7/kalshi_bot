@@ -76,6 +76,8 @@ class StopLossService:
 
     async def check_once(self) -> list[dict[str, Any]]:
         triggered: list[dict[str, Any]] = []
+
+        # Load positions and market states in one read session
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             positions = await repo.list_positions(
@@ -84,74 +86,81 @@ class StopLossService:
                 subaccount=self.settings.kalshi_subaccount,
             )
             if not positions:
-                await session.commit()
                 return triggered
-
             tickers = [p.market_ticker for p in positions]
             market_states = {ms.market_ticker: ms for ms in await repo.list_market_states(tickers)}
 
-            now = datetime.now(UTC)
-            for position in positions:
-                ms = market_states.get(position.market_ticker)
-                if ms is None:
-                    continue
+        now = datetime.now(UTC)
+        for position in positions:
+            ms = market_states.get(position.market_ticker)
+            if ms is None:
+                continue
 
-                # shared submit cooldown — both triggers respect it
-                submit_key = f"stop_loss_submit:{position.market_ticker}"
-                submit_cp = await repo.get_checkpoint(submit_key)
-                if submit_cp is not None:
-                    last = submit_cp.payload.get("submitted_at")
-                    if last is not None:
-                        last_dt = datetime.fromisoformat(last)
-                        if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
-                            continue
+            mid = _midpoint(ms, position.side)
+            if mid is None:
+                continue
 
-                mid = _midpoint(ms, position.side)
-                if mid is None:
-                    continue
-
-                # Trigger 1: loss-ratio threshold
-                ratio = _loss_ratio(position, mid)
-                if ratio is not None and ratio >= self.settings.stop_loss_threshold_pct:
-                    sell_px = _sell_price(ms, position.side)
-                    if sell_px is not None and sell_px > 0:
-                        result = await self._submit(
-                            repo, position, sell_px, mid, ratio, now, trigger="loss_ratio"
-                        )
-                        triggered.append(result)
-                        continue
-
-                # Trigger 2: adverse momentum (no P&L requirement)
-                created_at = position.created_at
-                if created_at.tzinfo is None:
-                    created_at = created_at.replace(tzinfo=UTC)
-                hold_minutes = (now - created_at).total_seconds() / 60
-                if hold_minutes < self.settings.stop_loss_momentum_min_hold_minutes:
-                    continue
-
-                prices = await repo.fetch_recent_prices(
-                    position.market_ticker, window=timedelta(minutes=60)
-                )
-                slope = _momentum_slope(prices)
-                if slope is None:
-                    continue
-
-                # adverse slope: YES falling for YES holder, YES rising for NO holder
-                slope_against = slope if position.side == "yes" else -slope
-                if slope_against >= self.settings.stop_loss_momentum_slope_threshold_cents_per_min:
-                    continue
-
-                sell_px = _sell_price(ms, position.side)
-                if sell_px is None or sell_px <= 0:
-                    continue
-
-                result = await self._submit(
-                    repo, position, sell_px, mid, ratio, now, trigger="momentum", slope=slope
-                )
+            result = await self._evaluate_and_submit(position, ms, mid, now)
+            if result is not None:
                 triggered.append(result)
 
-            await session.commit()
         return triggered
+
+    async def _evaluate_and_submit(
+        self,
+        position: PositionRecord,
+        ms: MarketState,
+        mid: Decimal,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """Evaluate one position in its own committed transaction to make the cooldown checkpoint immediately visible."""
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+
+            # shared submit cooldown — read with committed isolation
+            submit_key = f"stop_loss_submit:{position.market_ticker}"
+            submit_cp = await repo.get_checkpoint(submit_key)
+            if submit_cp is not None:
+                last = submit_cp.payload.get("submitted_at")
+                if last is not None:
+                    last_dt = datetime.fromisoformat(last)
+                    if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
+                        return None
+
+            # Trigger 1: loss-ratio threshold
+            ratio = _loss_ratio(position, mid)
+            if ratio is not None and ratio >= self.settings.stop_loss_threshold_pct:
+                sell_px = _sell_price(ms, position.side)
+                if sell_px is not None and sell_px > 0:
+                    result = await self._submit(repo, position, sell_px, mid, ratio, now, trigger="loss_ratio")
+                    await session.commit()
+                    return result
+
+            # Trigger 2: adverse momentum (no P&L requirement)
+            created_at = position.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            hold_minutes = (now - created_at).total_seconds() / 60
+            if hold_minutes < self.settings.stop_loss_momentum_min_hold_minutes:
+                return None
+
+            prices = await repo.fetch_recent_prices(position.market_ticker, window=timedelta(minutes=60))
+            slope = _momentum_slope(prices)
+            if slope is None:
+                return None
+
+            # adverse slope: YES falling for YES holder, YES rising for NO holder
+            slope_against = slope if position.side == "yes" else -slope
+            if slope_against >= self.settings.stop_loss_momentum_slope_threshold_cents_per_min:
+                return None
+
+            sell_px = _sell_price(ms, position.side)
+            if sell_px is None or sell_px <= 0:
+                return None
+
+            result = await self._submit(repo, position, sell_px, mid, ratio, now, trigger="momentum", slope=slope)
+            await session.commit()
+            return result
 
     async def _submit(
         self,
