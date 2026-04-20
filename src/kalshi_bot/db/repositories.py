@@ -782,34 +782,66 @@ class PlatformRepository:
         ticket_id: str | None = None,
         kalshi_order_id: str | None = None,
     ) -> OrderRecord:
-        stmt = select(OrderRecord).where(OrderRecord.client_order_id == client_order_id)
-        record = (await self.session.execute(stmt)).scalar_one_or_none()
-        if record is None:
-            record = OrderRecord(
-                trade_ticket_id=ticket_id,
-                client_order_id=client_order_id,
-                market_ticker=market_ticker,
-                status=status,
-                side=side,
-                action=action,
-                yes_price_dollars=yes_price_dollars,
-                count_fp=count_fp,
-                raw=raw,
-                kalshi_order_id=kalshi_order_id,
-            )
-            self.session.add(record)
+        from kalshi_bot.db.models import OrderRecord as _OR
+        record_id = str(uuid4())
+        now = datetime.now(UTC)
+        insert_values = {
+            "id": record_id,
+            "trade_ticket_id": ticket_id,
+            "client_order_id": client_order_id,
+            "market_ticker": market_ticker,
+            "status": status,
+            "side": side,
+            "action": action,
+            "yes_price_dollars": yes_price_dollars,
+            "count_fp": count_fp,
+            "raw": raw,
+            "kalshi_order_id": kalshi_order_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+        update_values = {
+            "status": status,
+            "market_ticker": market_ticker,
+            "side": side,
+            "action": action,
+            "yes_price_dollars": yes_price_dollars,
+            "count_fp": count_fp,
+            "raw": raw,
+            "updated_at": now,
+        }
+        dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
+        if dialect_name == "postgresql":
+            stmt = pg_insert(_OR).values(**insert_values)
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(_OR).values(**insert_values)
         else:
-            record.trade_ticket_id = ticket_id or record.trade_ticket_id
-            record.market_ticker = market_ticker
-            record.status = status
-            record.side = side
-            record.action = action
-            record.yes_price_dollars = yes_price_dollars
-            record.count_fp = count_fp
-            record.raw = raw
-            record.kalshi_order_id = kalshi_order_id or record.kalshi_order_id
+            # fallback: SELECT then mutate
+            existing = (await self.session.execute(select(_OR).where(_OR.client_order_id == client_order_id))).scalar_one_or_none()
+            if existing is None:
+                existing = _OR(**insert_values)
+                self.session.add(existing)
+            else:
+                for k, v in update_values.items():
+                    setattr(existing, k, v)
+                if ticket_id and not existing.trade_ticket_id:
+                    existing.trade_ticket_id = ticket_id
+                if kalshi_order_id and not existing.kalshi_order_id:
+                    existing.kalshi_order_id = kalshi_order_id
+            await self.session.flush()
+            return existing
+
+        # COALESCE keeps an already-set kalshi_order_id rather than overwriting with NULL
+        coalesce_kalshi_id = func.coalesce(stmt.excluded.kalshi_order_id, _OR.kalshi_order_id)
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["client_order_id"],
+                set_={**update_values, "kalshi_order_id": coalesce_kalshi_id},
+            )
+        )
         await self.session.flush()
-        return record
+        result = (await self.session.execute(select(_OR).where(_OR.client_order_id == client_order_id))).scalar_one()
+        return result
 
     async def list_orders_for_room(self, room_id: str) -> list[OrderRecord]:
         stmt = (
