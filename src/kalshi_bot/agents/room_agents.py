@@ -52,17 +52,7 @@ class AgentSuite:
         )
         if heuristic_summary:
             fallback = f"{fallback} Historical heuristic pack {heuristic_pack_version or 'unknown'} guidance: {heuristic_summary}"
-        content, usage = await self.providers.rewrite_with_metadata(
-            role=AgentRole.RESEARCHER,
-            fallback_text=fallback,
-            system_prompt=(
-                role_config.system_prompt
-                if role_config is not None
-                else "You are the researcher agent in a Kalshi trading room. Be factual and concise."
-            ),
-            user_prompt=fallback,
-            role_config=role_config,
-        )
+        content = fallback
         payload = {
             "thesis": dossier.trader_context.thesis,
             "evidence_ids": dossier.gate.cited_source_keys,
@@ -86,7 +76,7 @@ class AgentSuite:
             stage=RoomStage.RESEARCHING,
             content=content,
             payload=payload,
-        ), self._usage_dict(usage)
+        ), {"provider": "none", "model": None, "temperature": 0.0, "fallback_used": True}
 
     async def president_message(
         self,
@@ -110,22 +100,11 @@ class AgentSuite:
         )
         if heuristic_summary:
             fallback = f"{fallback} Active heuristic pack {heuristic_pack_version or 'unknown'} notes: {heuristic_summary}"
-        content, usage = await self.providers.rewrite_with_metadata(
-            role=AgentRole.PRESIDENT,
-            fallback_text=fallback,
-            system_prompt=(
-                role_config.system_prompt
-                if role_config is not None
-                else "You are an advisory president agent setting posture for a trading room."
-            ),
-            user_prompt=fallback,
-            role_config=role_config,
-        )
         return RoomMessageCreate(
             role=AgentRole.PRESIDENT,
             kind=MessageKind.POLICY_MEMO,
             stage=RoomStage.POSTURE,
-            content=content,
+            content=fallback,
             payload={
                 "posture": posture,
                 "capital_tone": "small_clips",
@@ -133,7 +112,7 @@ class AgentSuite:
                 "heuristic_pack_version": heuristic_pack_version,
                 "heuristic_summary": heuristic_summary,
             },
-        ), self._usage_dict(usage)
+        ), {"provider": "none", "model": None, "temperature": 0.0, "fallback_used": True}
 
     async def trader_message(
         self,
@@ -233,23 +212,12 @@ class AgentSuite:
         )
         if heuristic_summary:
             fallback = f"{fallback} Historical heuristic pack {heuristic_pack_version or 'unknown'} guidance: {heuristic_summary}"
-        content, usage = await self.providers.rewrite_with_metadata(
-            role=AgentRole.TRADER,
-            fallback_text=fallback,
-            system_prompt=(
-                role_config.system_prompt
-                if role_config is not None
-                else "You are the trader agent. Speak clearly and reference the deterministic rationale."
-            ),
-            user_prompt=fallback,
-            role_config=role_config,
-        )
         return (
             RoomMessageCreate(
                 role=AgentRole.TRADER,
                 kind=MessageKind.TRADE_TICKET,
                 stage=RoomStage.PROPOSING,
-                content=content,
+                content=fallback,
                 payload={
                     **ticket.model_dump(mode="json"),
                     "resolution_state": signal.resolution_state.value,
@@ -262,7 +230,7 @@ class AgentSuite:
             ),
             ticket,
             client_order_id,
-            self._usage_dict(usage),
+            {"provider": "none", "model": None, "temperature": 0.0, "fallback_used": True},
         )
 
     async def risk_message(
@@ -272,24 +240,13 @@ class AgentSuite:
         role_config: AgentPackRoleConfig | None = None,
     ) -> tuple[RoomMessageCreate, dict]:
         fallback = f"Deterministic risk verdict: {verdict.status.value}. " + " ".join(verdict.reasons)
-        content, usage = await self.providers.rewrite_with_metadata(
-            role=AgentRole.RISK_OFFICER,
-            fallback_text=fallback,
-            system_prompt=(
-                role_config.system_prompt
-                if role_config is not None
-                else "You are the risk officer explaining a deterministic verdict."
-            ),
-            user_prompt=fallback,
-            role_config=role_config,
-        )
         return RoomMessageCreate(
             role=AgentRole.RISK_OFFICER,
             kind=MessageKind.RISK_VERDICT,
             stage=RoomStage.RISK,
-            content=content,
+            content=fallback,
             payload=verdict.model_dump(mode="json"),
-        ), self._usage_dict(usage)
+        ), {"provider": "none", "model": None, "temperature": 0.0, "fallback_used": True}
 
     async def execution_message(self, status: str, payload: dict) -> RoomMessageCreate:
         return RoomMessageCreate(

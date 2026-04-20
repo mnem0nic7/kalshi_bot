@@ -54,12 +54,17 @@ def _build_env_payload(
     cash_display: str,
     positions_count: int,
     *,
+    daily_pnl_display: str = "+$42.00",
+    daily_pnl_tone: str = "good",
+    daily_pnl_line_display: str = "+$42.00 (0.42%) today (PT)",
     total_value_dollars: str | None = "$115.20",
     total_value_display: str = "$115.20",
     total_value_label: str = "Current",
     total_value_is_marked: bool = True,
+    total_notional_display: str = "$108.00",
     total_unrealized_pnl_display: str = "+$7.20",
     total_unrealized_pnl_tone: str = "good",
+    has_pnl_summary: bool = True,
 ) -> dict[str, object]:
     return {
         "portfolio": {
@@ -70,8 +75,9 @@ def _build_env_payload(
             "gain_loss_tone": "good",
         },
         "daily_pnl_dollars": None,
-        "daily_pnl_display": "—",
-        "daily_pnl_tone": "neutral",
+        "daily_pnl_display": daily_pnl_display,
+        "daily_pnl_tone": daily_pnl_tone,
+        "daily_pnl_line_display": daily_pnl_line_display,
         "alerts": [],
         "active_rooms": [],
         "positions": _build_positions(positions_count),
@@ -83,8 +89,10 @@ def _build_env_payload(
             "total_value_display": total_value_display,
             "total_value_label": total_value_label,
             "total_value_is_marked": total_value_is_marked,
+            "total_notional_display": total_notional_display,
             "total_unrealized_pnl_display": total_unrealized_pnl_display,
             "total_unrealized_pnl_tone": total_unrealized_pnl_tone,
+            "has_pnl_summary": has_pnl_summary,
         },
     }
 
@@ -249,19 +257,30 @@ def _positions_total_row(page: Page, env_key: str = "demo") -> dict[str, object]
     )
 
 
-def test_positions_total_row_shows_current_when_marked(
+def _portfolio_recent_line(page: Page, env_key: str = "demo") -> str | None:
+    return page.evaluate(
+        """
+        (envKey) => {
+          const panel = document.querySelector(`#panel-${envKey}`);
+          const line = panel?.querySelector('.dash-stat-portfolio .dash-stat-detail');
+          return line?.textContent?.trim() ?? null;
+        }
+        """,
+        env_key,
+    )
+
+
+def test_positions_total_row_shows_notional_and_pnl_when_marked(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payloads = {
         "demo": _build_env_payload(
             "$1,250.00",
             positions_count=3,
-            total_value_dollars="$115.20",
-            total_value_display="$115.20",
-            total_value_label="Current",
-            total_value_is_marked=True,
+            total_notional_display="$108.00",
             total_unrealized_pnl_display="+$7.20",
             total_unrealized_pnl_tone="good",
+            has_pnl_summary=True,
         ),
         "production": _build_env_payload("$2,500.00", positions_count=1),
     }
@@ -274,26 +293,49 @@ def test_positions_total_row_shows_current_when_marked(
                 page.wait_for_selector("#panel-demo .positions-table", timeout=15_000)
                 row = _positions_total_row(page)
                 assert row is not None, "positions tfoot not rendered"
-                assert row["label"] == "Current", row
-                assert row["value"] == "$115.20", row
+                assert row["label"] == "Totals", row
+                assert row["value"] == "$108.00", row
                 assert row["pnl"] == "+$7.20", row
             finally:
                 browser.close()
 
 
-def test_positions_total_row_shows_cost_when_unmarked(
+def test_portfolio_card_shows_recent_pnl_line(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payloads = {
         "demo": _build_env_payload(
             "$1,250.00",
             positions_count=3,
-            total_value_dollars="$108.00",
-            total_value_display="$108.00",
-            total_value_label="Cost",
-            total_value_is_marked=False,
+            daily_pnl_display="+$65.30",
+            daily_pnl_tone="good",
+            daily_pnl_line_display="+$65.30 (9.96%) today (PT)",
+        ),
+        "production": _build_env_payload("$2,500.00", positions_count=1),
+    }
+    with _serve_dashboard(monkeypatch, tmp_path, payloads=payloads) as base_url:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                page.goto(base_url, wait_until="load", timeout=15_000)
+                page.wait_for_selector("#panel-demo .dash-stat-portfolio .dash-stat-detail", timeout=15_000)
+                assert _portfolio_recent_line(page) == "+$65.30 (9.96%) today (PT)"
+            finally:
+                browser.close()
+
+
+def test_positions_total_row_shows_dash_pnl_when_unmarked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payloads = {
+        "demo": _build_env_payload(
+            "$1,250.00",
+            positions_count=3,
+            total_notional_display="$108.00",
             total_unrealized_pnl_display="—",
             total_unrealized_pnl_tone="neutral",
+            has_pnl_summary=False,
         ),
         "production": _build_env_payload("$2,500.00", positions_count=1),
     }
@@ -306,7 +348,7 @@ def test_positions_total_row_shows_cost_when_unmarked(
                 page.wait_for_selector("#panel-demo .positions-table", timeout=15_000)
                 row = _positions_total_row(page)
                 assert row is not None, "positions tfoot not rendered"
-                assert row["label"] == "Cost", row
+                assert row["label"] == "Totals", row
                 assert row["value"] == "$108.00", row
                 assert row["pnl"] == "—", row
             finally:

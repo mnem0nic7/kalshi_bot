@@ -949,6 +949,29 @@ class PlatformRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def zero_settled_positions(
+        self,
+        *,
+        kalshi_env: str,
+        subaccount: int,
+        live_tickers: set[str],
+    ) -> int:
+        """Zero out DB positions not present in the live Kalshi response (i.e. settled)."""
+        stmt = select(PositionRecord).where(
+            PositionRecord.kalshi_env == kalshi_env,
+            PositionRecord.subaccount == subaccount,
+            PositionRecord.count_fp != 0,
+        )
+        rows = list((await self.session.execute(stmt)).scalars())
+        zeroed = 0
+        for row in rows:
+            if row.market_ticker not in live_tickers:
+                row.count_fp = Decimal("0")
+                zeroed += 1
+        if zeroed:
+            await self.session.flush()
+        return zeroed
+
     async def upsert_position(
         self,
         *,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -9,9 +8,8 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import AgentRole, DeploymentColor
+from kalshi_bot.core.enums import DeploymentColor
 from kalshi_bot.core.schemas import (
     AgentPack,
     AgentPackThresholds,
@@ -38,7 +36,6 @@ class SelfImproveService:
         self,
         settings: Settings,
         session_factory: async_sessionmaker,
-        providers: ProviderRouter,
         training_export_service: TrainingExportService,
         training_corpus_service: TrainingCorpusService | None,
         agent_pack_service: AgentPackService,
@@ -46,7 +43,6 @@ class SelfImproveService:
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
-        self.providers = providers
         self.training_export_service = training_export_service
         self.training_corpus_service = training_corpus_service
         self.agent_pack_service = agent_pack_service
@@ -441,24 +437,7 @@ class SelfImproveService:
         return SelfImproveResult(status="live_monitoring", payload={"metrics": metrics, "version": version})
 
     async def _critique_bundle(self, base_pack: AgentPack, bundle: TrainingRoomBundle) -> SelfImproveCritiqueItem:
-        fallback = self._fallback_critique(bundle)
-        prompt = json.dumps(
-            {
-                "pack": base_pack.model_dump(mode="json"),
-                "bundle": bundle.model_dump(mode="json"),
-            },
-            indent=2,
-            default=str,
-        )
-        payload, _ = await self.providers.complete_json_with_metadata(
-            role=AgentRole.RESEARCHER,
-            fallback_payload=fallback.model_dump(mode="json"),
-            system_prompt=base_pack.research.critique_system_prompt,
-            user_prompt=prompt,
-            role_config=base_pack.roles.get(AgentRole.RESEARCHER.value),
-            schema_model=SelfImproveCritiqueItem,
-        )
-        return SelfImproveCritiqueItem.model_validate(payload)
+        return self._fallback_critique(bundle)
 
     async def _build_candidate_pack(
         self,
@@ -467,44 +446,7 @@ class SelfImproveService:
         *,
         critique_run_id: str,
     ) -> AgentPack:
-        fallback = self._fallback_candidate_pack(champion_pack, critiques, critique_run_id=critique_run_id)
-        prompt = json.dumps(
-            {
-                "champion_pack": champion_pack.model_dump(mode="json"),
-                "critiques": [item.model_dump(mode="json") for item in critiques],
-                "instructions": {
-                    "mutable_thresholds_only": [
-                        "risk_min_edge_bps",
-                        "risk_max_order_notional_dollars",
-                        "risk_max_position_notional_dollars",
-                        "trigger_max_spread_bps",
-                        "trigger_cooldown_seconds",
-                    ],
-                    "never_change": [
-                        "risk_daily_loss_limit_dollars",
-                        "stale-data thresholds",
-                        "kill-switch semantics",
-                        "execution lock behavior",
-                        "write credentials",
-                        "order schema invariants",
-                    ],
-                },
-            },
-            indent=2,
-            default=str,
-        )
-        payload = await self.providers.maybe_complete_json(
-            role=AgentRole.RESEARCHER,
-            fallback_payload=fallback.model_dump(mode="json"),
-            system_prompt=(
-                "You are designing the next Kalshi agent pack candidate. Return JSON only matching the AgentPack schema. "
-                "Improve prompts and bounded thresholds for risk-safe decision quality. Do not change immutable safety controls."
-            ),
-            user_prompt=prompt,
-            role_config=champion_pack.roles.get(AgentRole.RESEARCHER.value),
-            schema_model=AgentPack,
-        )
-        return AgentPack.model_validate(payload)
+        return self._fallback_candidate_pack(champion_pack, critiques, critique_run_id=critique_run_id)
 
     def _fallback_candidate_pack(
         self,
@@ -711,13 +653,7 @@ class SelfImproveService:
             f"Room {room.name} on {room.market_ticker} moved through {room.stage} with "
             f"{len(bundle.messages)} messages and a final outcome captured in the transcript."
         )
-        text, _ = await self.providers.rewrite_with_metadata(
-            role=AgentRole.MEMORY_LIBRARIAN,
-            fallback_text=fallback,
-            system_prompt=pack.memory.system_prompt,
-            user_prompt=f"Summarize this room in {pack.memory.max_sentences} sentences.\n\n{fallback}",
-            role_config=pack.roles.get(AgentRole.MEMORY_LIBRARIAN.value),
-        )
+        text = fallback
         if not text.strip():
             return 0.0
         mentions_market = bundle.room["market_ticker"] in text

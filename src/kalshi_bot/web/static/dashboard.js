@@ -259,7 +259,12 @@
       const data = await resp.json();
       const panel = document.querySelector(`.dash-panel[data-env="${env}"]`);
       if (!panel) return;
-      renderSummary(panel.querySelector(".dash-summary"), data.portfolio || {});
+      renderSummary(panel.querySelector(".dash-summary"), {
+        ...(data.portfolio || {}),
+        daily_pnl_display: data.daily_pnl_display,
+        daily_pnl_line_display: data.daily_pnl_line_display,
+        daily_pnl_tone: data.daily_pnl_tone,
+      });
       renderActiveRooms(panel.querySelector(".dash-card-alerts"), data.active_rooms || []);
       renderAlerts(panel.querySelector(".dash-card-alerts"), data.alerts || []);
       renderCapitalBuckets(panel.querySelector(".dash-card-positions"), data.positions_summary || {});

@@ -24,33 +24,30 @@
     {% if env_key != "demo" %}hidden{% endif %}
   >
     <div class="dash-summary">
+      <article class="dash-stat dash-stat-portfolio">
+        <span class="muted-label">Portfolio</span>
+        <strong class="dash-stat-value dash-stat-value-hero" data-summary-key="portfolio_display">{{ env_data.portfolio.portfolio_display }}</strong>
+        <span
+          class="dash-stat-detail {% if env_data.daily_pnl_tone == 'good' %}value-positive{% elif env_data.daily_pnl_tone == 'bad' %}value-negative{% else %}value-neutral{% endif %}"
+          data-summary-key="daily_pnl_line_display"
+          data-summary-tone="daily_pnl_tone"
+        >{{ env_data.daily_pnl_line_display }}</span>
+      </article>
       <article class="dash-stat">
         <span class="muted-label">Cash</span>
         <strong class="dash-stat-value" data-summary-key="cash_display">{{ env_data.portfolio.cash_display }}</strong>
-      </article>
-      <article class="dash-stat">
-        <span class="muted-label">Portfolio</span>
-        <strong class="dash-stat-value" data-summary-key="portfolio_display">{{ env_data.portfolio.portfolio_display }}</strong>
       </article>
       <article class="dash-stat">
         <span class="muted-label">Positions</span>
         <strong class="dash-stat-value" data-summary-key="positions_value_display">{{ env_data.portfolio.positions_value_display }}</strong>
       </article>
       <article class="dash-stat">
-        <span class="muted-label">Gain/Loss</span>
+        <span class="muted-label">Unrealized</span>
         <strong
           class="dash-stat-value {% if env_data.portfolio.gain_loss_tone == 'good' %}value-positive{% elif env_data.portfolio.gain_loss_tone == 'bad' %}value-negative{% else %}value-neutral{% endif %}"
           data-summary-key="gain_loss_display"
           data-summary-tone="gain_loss_tone"
         >{{ env_data.portfolio.gain_loss_display }}</strong>
-      </article>
-      <article class="dash-stat">
-        <span class="muted-label">Today (PT)</span>
-        <strong
-          class="dash-stat-value {% if env_data.daily_pnl_dollars %}{% set dp = env_data.daily_pnl_dollars | float %}{% if dp > 0 %}value-positive{% elif dp < 0 %}value-negative{% else %}value-neutral{% endif %}{% else %}value-neutral{% endif %}"
-          data-summary-key="daily_pnl_display"
-          data-summary-tone="daily_pnl_tone"
-        >{% if env_data.daily_pnl_dollars %}{% set dp = env_data.daily_pnl_dollars | float %}{% if dp > 0 %}+{% endif %}${{ "%.2f"|format(dp|abs) }}{% else %}—{% endif %}</strong>
       </article>
     </div>
 
@@ -148,12 +145,12 @@
               </tr>
               {% endfor %}
             </tbody>
-            {% if env_data.positions_summary.total_value_dollars %}
+            {% if env_data.positions %}
             <tfoot class="positions-totals">
               <tr>
-                <td colspan="5" class="totals-label">{{ env_data.positions_summary.total_value_label }}</td>
-                <td class="mono">{{ env_data.positions_summary.total_value_display }}</td>
-                <td class="mono {{ env_data.positions_summary.total_unrealized_pnl_tone | default('') | replace('good','value-positive') | replace('bad','value-negative') }}">{{ env_data.positions_summary.total_unrealized_pnl_display if env_data.positions_summary.total_value_is_marked else "—" }}</td>
+                <td colspan="5" class="totals-label">Totals</td>
+                <td class="mono">{{ env_data.positions_summary.total_notional_display }}</td>
+                <td class="mono {{ env_data.positions_summary.total_unrealized_pnl_tone | default('') | replace('good','value-positive') | replace('bad','value-negative') }}">{{ env_data.positions_summary.total_unrealized_pnl_display if env_data.positions_summary.has_pnl_summary else "—" }}</td>
               </tr>
             </tfoot>
             {% endif %}

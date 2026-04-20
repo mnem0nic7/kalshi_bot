@@ -103,6 +103,15 @@ def _money_display(value: Decimal | None, *, signed: bool = False) -> str:
     return f"${amount}"
 
 
+def _percent_display(value: Decimal | None, *, signed: bool = False) -> str | None:
+    if value is None:
+        return None
+    amount = value.quantize(Decimal("0.01"))
+    if signed and amount > 0:
+        return f"+{amount}%"
+    return f"{amount}%"
+
+
 def _price_display(value: Decimal | None) -> str:
     if value is None:
         return "—"
@@ -117,6 +126,22 @@ def _pnl_tone(value: Decimal | None) -> str:
     if value < 0:
         return "bad"
     return "neutral"
+
+
+def _percent_change(change: Decimal | None, baseline: Decimal | None) -> Decimal | None:
+    if change is None or baseline is None or baseline <= 0:
+        return None
+    return ((change / baseline) * Decimal("100")).quantize(Decimal("0.01"))
+
+
+def _daily_pnl_line_display(daily_pnl: Decimal | None, daily_pnl_percent: Decimal | None) -> str:
+    money_text = _money_display(daily_pnl, signed=True)
+    if daily_pnl is None:
+        return money_text
+    percent_text = _percent_display(daily_pnl_percent)
+    if percent_text is None:
+        return f"{money_text} today (PT)"
+    return f"{money_text} ({percent_text}) today (PT)"
 
 
 def _capital_bucket_from_signal_payload(payload: dict[str, Any] | None) -> str:
@@ -481,10 +506,12 @@ def _positions_summary(positions: list[Any], position_views: list[dict[str, Any]
         total_value_is_marked = all_marked
     # keep legacy keys for callers that still reference them
     total_current_value = total_value if total_value_is_marked else None
+    total_notional_q = total_notional.quantize(Decimal("0.01")) if positions else Decimal("0.00")
     return {
         "count": len(positions),
         "total_contracts": str(total_contracts.quantize(Decimal("0.01"))) if positions else "0.00",
-        "total_notional_dollars": str(total_notional.quantize(Decimal("0.01"))) if positions else "0.00",
+        "total_notional_dollars": str(total_notional_q),
+        "total_notional_display": _money_display(total_notional_q),
         "total_current_value_dollars": str(total_current_value) if total_current_value is not None else None,
         "total_current_value_display": _money_display(total_current_value),
         "total_value_dollars": str(total_value) if total_value is not None else None,
@@ -1257,6 +1284,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
             kalshi_env=kalshi_env,
         )
         total_capital = await repo.get_total_capital_dollars()
+        daily_pnl_baseline = await repo.get_daily_portfolio_baseline_dollars()
         capital_buckets = await repo.portfolio_bucket_snapshot(
             kalshi_env=kalshi_env,
             subaccount=container.settings.kalshi_subaccount,
@@ -1287,14 +1315,24 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         )
         for position in positions
     ]
+    portfolio_summary = _balance_summary(balance_checkpoint, position_views)
+    current_portfolio_dollars = _decimal_or_none(portfolio_summary.get("portfolio_dollars")) or total_capital
+    daily_pnl = None
+    if current_portfolio_dollars is not None and daily_pnl_baseline is not None:
+        daily_pnl = (current_portfolio_dollars - daily_pnl_baseline).quantize(Decimal("0.01"))
     positions_summary = _positions_summary(positions, position_views)
     positions_summary["capital_buckets"] = _capital_bucket_summary(capital_buckets)
-    daily_pnl = await repo.get_daily_pnl_dollars()
+    daily_pnl_percent = _percent_change(daily_pnl, daily_pnl_baseline)
     return {
         "kalshi_env": kalshi_env,
         "as_of": now.isoformat(),
-        "portfolio": _balance_summary(balance_checkpoint, position_views),
+        "portfolio": portfolio_summary,
         "daily_pnl_dollars": str(daily_pnl) if daily_pnl is not None else None,
+        "daily_pnl_display": _money_display(daily_pnl, signed=True),
+        "daily_pnl_percent": str(daily_pnl_percent) if daily_pnl_percent is not None else None,
+        "daily_pnl_percent_display": _percent_display(daily_pnl_percent),
+        "daily_pnl_line_display": _daily_pnl_line_display(daily_pnl, daily_pnl_percent),
+        "daily_pnl_tone": _pnl_tone(daily_pnl),
         "positions_summary": positions_summary,
         "positions": position_views,
         "alerts": [_ops_event_view(e) for e in alerts],

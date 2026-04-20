@@ -92,7 +92,7 @@ class AppContainer:
         signal_engine = WeatherSignalEngine(settings)
         risk_engine = DeterministicRiskEngine(settings)
         execution_service = ExecutionService(settings, kalshi)
-        memory_service = MemoryService(providers)
+        memory_service = MemoryService()
         watchdog_service = WatchdogService(settings)
         discovery_service = DiscoveryService(kalshi, weather_directory)
         market_history_service = MarketHistoryService(
@@ -157,7 +157,6 @@ class AppContainer:
         self_improve_service = SelfImproveService(
             settings,
             session_factory,
-            providers,
             training_export_service,
             training_corpus_service,
             agent_pack_service,

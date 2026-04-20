@@ -83,11 +83,13 @@ class ReconciliationService:
         fills = _first_present(fills_payload, "fills", "trades")
         settlements = _first_present(settlements_payload, "settlements")
 
+        live_tickers: set[str] = set()
         for position in positions:
             market_ticker = _stringish(position.get("ticker") or position.get("market_ticker"), "unknown")
             count, side = _normalized_position(position)
             if count == Decimal("0"):
                 continue
+            live_tickers.add(market_ticker)
             await repo.upsert_position(
                 market_ticker=market_ticker,
                 subaccount=int(position.get("subaccount", subaccount)),
@@ -97,6 +99,12 @@ class ReconciliationService:
                 average_price_dollars=_position_average_price(position, count),
                 raw=position,
             )
+
+        await repo.zero_settled_positions(
+            kalshi_env=kalshi_env,
+            subaccount=subaccount,
+            live_tickers=live_tickers,
+        )
 
         for order in orders:
             client_order_id = _stringish(order.get("client_order_id"), _stringish(order.get("order_id"), "unknown"))

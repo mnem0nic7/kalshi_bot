@@ -451,6 +451,9 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
         async def get_total_capital_dollars(self) -> Decimal | None:
             return Decimal("534.17")
 
+        async def get_daily_portfolio_baseline_dollars(self) -> Decimal | None:
+            return Decimal("618.61")
+
         async def get_daily_pnl_dollars(self) -> Decimal | None:
             return Decimal("3.21")
 
@@ -515,6 +518,9 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert payload["portfolio"]["portfolio_display"] == "$621.82"
     assert payload["portfolio"]["positions_value_display"] == "$16.00"
     assert payload["portfolio"]["gain_loss_display"] == "-$1.44"
+    assert payload["daily_pnl_display"] == "+$3.21"
+    assert payload["daily_pnl_percent_display"] == "0.52%"
+    assert payload["daily_pnl_line_display"] == "+$3.21 (0.52%) today (PT)"
     assert payload["positions_summary"]["has_pnl_summary"] is True
     assert payload["positions"][0]["current_price_display"] == "$0.5000"
     assert payload["positions"][0]["unrealized_pnl_display"] == "-$1.44"

@@ -30,7 +30,6 @@ async def test_self_improve_critique_blocks_when_training_corpus_is_not_ready() 
         settings,
         None,
         None,
-        None,
         FakeCorpusService(),  # type: ignore[arg-type]
         AgentPackService(settings),
         None,
