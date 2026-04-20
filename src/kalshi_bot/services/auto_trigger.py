@@ -77,6 +77,15 @@ class AutoTriggerService:
                 await session.commit()
                 return
 
+            reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{market_ticker}")
+            if reentry_cp is not None:
+                stopped_at = reentry_cp.payload.get("stopped_at")
+                if stopped_at is not None:
+                    stopped_dt = datetime.fromisoformat(stopped_at)
+                    if datetime.now(UTC) - stopped_dt < timedelta(seconds=self.settings.stop_loss_reentry_cooldown_seconds):
+                        await session.commit()
+                        return
+
             checkpoint = await repo.get_checkpoint(f"auto_trigger:{market_ticker}")
             if checkpoint is not None:
                 last_triggered_at = checkpoint.payload.get("last_triggered_at")

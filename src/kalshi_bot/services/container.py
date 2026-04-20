@@ -30,6 +30,7 @@ from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.self_improve import SelfImproveService
+from kalshi_bot.services.stop_loss import StopLossService
 from kalshi_bot.services.strategy_eval import StrategyEvaluationService
 from kalshi_bot.services.strategy_regression import StrategyRegressionService
 from kalshi_bot.services.training import TrainingExportService
@@ -195,6 +196,7 @@ class AppContainer:
             shadow_training_service,
         )
         auto_trigger_service = AutoTriggerService(settings, session_factory, weather_directory, agent_pack_service, supervisor)
+        stop_loss_service = StopLossService(settings, session_factory, kalshi)
         strategy_eval_service = StrategyEvaluationService(settings, session_factory, agent_pack_service)
         strategy_regression_service = StrategyRegressionService(settings, session_factory, weather_directory, agent_pack_service)
         daemon_service = DaemonService(
@@ -216,6 +218,7 @@ class AppContainer:
             market_history_service=market_history_service,
             strategy_eval_service=strategy_eval_service,
             strategy_regression_service=strategy_regression_service,
+            stop_loss_service=stop_loss_service,
         )
         container = cls(
             settings=settings,

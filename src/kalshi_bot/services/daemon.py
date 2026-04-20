@@ -24,6 +24,7 @@ from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.strategy_eval import StrategyEvaluationService
+from kalshi_bot.services.stop_loss import StopLossService
 from kalshi_bot.services.strategy_regression import StrategyRegressionService
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
@@ -53,6 +54,7 @@ class DaemonService:
         market_history_service: MarketHistoryService | None = None,
         strategy_eval_service: StrategyEvaluationService | None = None,
         strategy_regression_service: StrategyRegressionService | None = None,
+        stop_loss_service: StopLossService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -72,6 +74,7 @@ class DaemonService:
         self.market_history_service = market_history_service
         self.strategy_eval_service = strategy_eval_service
         self.strategy_regression_service = strategy_regression_service
+        self.stop_loss_service = stop_loss_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
 
@@ -192,6 +195,7 @@ class DaemonService:
             "reconcile": asyncio.create_task(self._periodic_reconcile_loop()),
             "heartbeat": asyncio.create_task(self._periodic_heartbeat_loop()),
             "market_history": asyncio.create_task(self._periodic_market_history_loop()),
+            "stop_loss": asyncio.create_task(self._periodic_stop_loss_loop()),
         }
         if run_seconds is not None:
             tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
@@ -245,6 +249,16 @@ class DaemonService:
         while True:
             await asyncio.sleep(self.settings.daemon_heartbeat_interval_seconds)
             self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
+
+    async def _periodic_stop_loss_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.stop_loss_check_interval_seconds)
+            if self.stop_loss_service is None:
+                continue
+            try:
+                await self.stop_loss_service.check_once()
+            except Exception:
+                logger.warning("stop_loss check failed", exc_info=True)
 
     async def _periodic_market_history_loop(self) -> None:
         while True:

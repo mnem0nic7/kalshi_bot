@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     risk_max_order_notional_dollars: float = 50.0
     risk_max_position_notional_dollars: float = 250.0
     risk_daily_loss_limit_dollars: float = 100.0
+    stop_loss_threshold_pct: float = 0.50
+    stop_loss_reentry_cooldown_seconds: int = 14400
+    stop_loss_submit_cooldown_seconds: int = 300
+    stop_loss_check_interval_seconds: int = 60
     risk_max_order_count_fp: float = 500.0
     risk_safe_capital_reserve_ratio: float = 0.70
     risk_risky_capital_max_ratio: float = 0.30
