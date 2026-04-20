@@ -506,6 +506,9 @@ def evaluate_trade_eligibility(
             reasons.append(
                 "Historical heuristic policy forced an early stand-down for this regime before order generation."
             )
+    elif signal.trade_regime in {"longshot_yes", "longshot_no"}:
+        reasons.append(f"Longshot bet blocked: trade regime is {signal.trade_regime}.")
+        stand_down_reason = StandDownReason.LONGSHOT_BET
     elif signal.recommended_action is None or signal.recommended_side is None or signal.target_yes_price_dollars is None:
         reasons.append(no_trade_text)
         stand_down_reason = no_trade_reason

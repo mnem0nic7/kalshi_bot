@@ -77,6 +77,7 @@ class StandDownReason(StrEnum):
     NEGATIVE_MARKET_EDGE = "negative_market_edge"
     MOMENTUM_AGAINST_TRADE = "momentum_against_trade"
     VOLUME_TOO_LOW = "volume_too_low"
+    LONGSHOT_BET = "longshot_bet"
 
 
 class RiskStatus(StrEnum):
