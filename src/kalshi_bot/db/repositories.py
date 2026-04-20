@@ -942,6 +942,38 @@ class PlatformRepository:
         )
         return list((await self.session.execute(stmt)).scalars())
 
+    async def settle_fills(self, settlements: list[dict[str, Any]]) -> int:
+        """Mark fills as win/loss based on settlement results. Returns number of fills updated."""
+        settled = 0
+        for s in settlements:
+            ticker = s.get("ticker") or s.get("market_ticker")
+            result = s.get("market_result")
+            if not ticker or result not in ("yes", "no"):
+                continue
+            stmt = select(FillRecord).where(
+                FillRecord.market_ticker == ticker,
+                FillRecord.settlement_result.is_(None),
+            )
+            fills = list((await self.session.execute(stmt)).scalars())
+            for fill in fills:
+                fill.settlement_result = "win" if fill.side == result else "loss"
+                settled += 1
+        if settled:
+            await self.session.flush()
+        return settled
+
+    async def get_fill_win_rate_30d(self) -> dict[str, Any]:
+        """Return 30-day rolling win rate by contract count."""
+        cutoff = datetime.now(UTC) - timedelta(days=30)
+        stmt = select(FillRecord).where(
+            FillRecord.created_at >= cutoff,
+            FillRecord.settlement_result.in_(["win", "loss"]),
+        )
+        fills = list((await self.session.execute(stmt)).scalars())
+        won = sum(float(f.count_fp) for f in fills if f.settlement_result == "win")
+        total = sum(float(f.count_fp) for f in fills)
+        return {"won_contracts": won, "total_contracts": total}
+
     async def get_position(self, market_ticker: str, subaccount: int = 0) -> PositionRecord | None:
         stmt = select(PositionRecord).where(
             PositionRecord.market_ticker == market_ticker,

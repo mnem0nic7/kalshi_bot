@@ -12,6 +12,7 @@ from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.models import MarketState
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
+from kalshi_bot.services.signal import market_quotes
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -81,9 +82,24 @@ class AutoTriggerService:
                 last_triggered_at = checkpoint.payload.get("last_triggered_at")
                 if last_triggered_at is not None:
                     last_trigger_time = datetime.fromisoformat(last_triggered_at)
-                    if datetime.now(UTC) - last_trigger_time < timedelta(seconds=thresholds.trigger_cooldown_seconds):
+                    cooldown = (
+                        self.settings.trigger_broken_book_retry_seconds
+                        if checkpoint.payload.get("book_broken")
+                        else thresholds.trigger_cooldown_seconds
+                    )
+                    if datetime.now(UTC) - last_trigger_time < timedelta(seconds=cooldown):
                         await session.commit()
                         return
+
+            if self._book_is_broken(market_state):
+                await repo.set_checkpoint(
+                    f"auto_trigger:{market_ticker}",
+                    cursor=None,
+                    payload={"last_triggered_at": datetime.now(UTC).isoformat(), "book_broken": True},
+                )
+                await session.commit()
+                return
+
             spread_bps = self._spread_bps(market_state)
             room = await repo.create_room(
                 RoomCreate(
@@ -130,6 +146,17 @@ class AutoTriggerService:
     async def wait_for_tasks(self) -> None:
         if self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
+
+    def _book_is_broken(self, market_state: MarketState) -> bool:
+        quotes = market_quotes(market_state.snapshot)
+        yes_ask = quotes.get("yes_ask")
+        no_ask = quotes.get("no_ask")
+        if yes_ask is None or no_ask is None:
+            return True
+        return (
+            (yes_ask >= Decimal("0.9900") and no_ask >= Decimal("0.9400"))
+            or (no_ask >= Decimal("0.9900") and yes_ask >= Decimal("0.9400"))
+        )
 
     def _market_is_actionable(self, market_state: MarketState, thresholds: RuntimeThresholds) -> bool:
         yes_bid = market_state.yes_bid_dollars

@@ -128,6 +128,15 @@ def _pnl_tone(value: Decimal | None) -> str:
     return "neutral"
 
 
+def _win_rate_display(win_rate_data: dict) -> str:
+    total = win_rate_data.get("total_contracts", 0)
+    if not total:
+        return "—"
+    won = win_rate_data.get("won_contracts", 0)
+    pct = int(round(100 * won / total))
+    return f"{pct}%"
+
+
 def _percent_change(change: Decimal | None, baseline: Decimal | None) -> Decimal | None:
     if change is None or baseline is None or baseline <= 0:
         return None
@@ -1285,6 +1294,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         )
         total_capital = await repo.get_total_capital_dollars()
         daily_pnl_baseline = await repo.get_daily_portfolio_baseline_dollars()
+        win_rate_data = await repo.get_fill_win_rate_30d()
         capital_buckets = await repo.portfolio_bucket_snapshot(
             kalshi_env=kalshi_env,
             subaccount=container.settings.kalshi_subaccount,
@@ -1333,6 +1343,8 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         "daily_pnl_percent_display": _percent_display(daily_pnl_percent),
         "daily_pnl_line_display": _daily_pnl_line_display(daily_pnl, daily_pnl_percent),
         "daily_pnl_tone": _pnl_tone(daily_pnl),
+        "win_rate_display": _win_rate_display(win_rate_data),
+        "win_rate_contracts": f"{int(win_rate_data.get('won_contracts', 0))}W / {int(win_rate_data.get('total_contracts', 0))}T",
         "positions_summary": positions_summary,
         "positions": position_views,
         "alerts": [_ops_event_view(e) for e in alerts],

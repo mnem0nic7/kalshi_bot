@@ -457,6 +457,9 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
         async def get_daily_pnl_dollars(self) -> Decimal | None:
             return Decimal("3.21")
 
+        async def get_fill_win_rate_30d(self) -> dict:
+            return {"won_contracts": 47.0, "total_contracts": 68.0}
+
         async def portfolio_bucket_snapshot(
             self,
             *,

@@ -147,6 +147,8 @@ class ReconciliationService:
                 is_taker=bool(fill.get("is_taker", True)),
             )
 
+        await repo.settle_fills(settlements)
+
         await repo.set_checkpoint(
             "reconcile",
             cursor=None,

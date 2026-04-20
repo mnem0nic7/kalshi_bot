@@ -173,6 +173,7 @@ class FillRecord(Base, IdMixin, TimestampMixin):
     yes_price_dollars: Mapped[Decimal] = mapped_column(Numeric(10, 4))
     count_fp: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     is_taker: Mapped[bool] = mapped_column(Boolean, default=True)
+    settlement_result: Mapped[str | None] = mapped_column(String(8), nullable=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 

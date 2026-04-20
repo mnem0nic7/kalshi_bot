@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     active_agent_pack_version: str = "builtin-gemini-v1"
     llm_request_timeout_seconds: float = 30.0
 
+    trigger_broken_book_retry_seconds: int = 30
     risk_order_pct: float = 0.10
     risk_position_pct: float = 0.10
     risk_max_order_notional_dollars: float = 50.0

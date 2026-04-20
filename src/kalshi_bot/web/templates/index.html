@@ -49,6 +49,11 @@
           data-summary-tone="gain_loss_tone"
         >{{ env_data.portfolio.gain_loss_display }}</strong>
       </article>
+      <article class="dash-stat">
+        <span class="muted-label">Win Rate <span class="muted-label" style="font-size:0.75em">(30d)</span></span>
+        <strong class="dash-stat-value" data-summary-key="win_rate_display">{{ env_data.win_rate_display }}</strong>
+        <span class="dash-stat-detail muted-label" data-summary-key="win_rate_contracts">{{ env_data.win_rate_contracts }}</span>
+      </article>
     </div>
 
     <div class="dash-grid">
