@@ -511,6 +511,12 @@ class WorkflowSupervisor:
                     final_status = "research_blocked"
                     await session.commit()
                 else:
+                    total_capital_early = await repo.get_total_capital_dollars()
+                    if total_capital_early is not None and total_capital_early > 0:
+                        dynamic_order_cap = float(total_capital_early) * self.settings.risk_order_pct
+                    else:
+                        dynamic_order_cap = thresholds.risk_max_order_notional_dollars
+
                     await repo.update_room_stage(room.id, RoomStage.POSTURE)
                     president_message, president_usage = await self.agents.president_message(
                         signal=signal,
@@ -528,7 +534,7 @@ class WorkflowSupervisor:
                         market_ticker=room.market_ticker,
                         rationale_ids=rationale_ids.copy(),
                         role_config=self.agent_pack_service.role_config(pack, AgentRole.TRADER),
-                        max_order_notional_dollars=thresholds.risk_max_order_notional_dollars,
+                        max_order_notional_dollars=dynamic_order_cap,
                     )
                     trader_record = await repo.append_message(room.id, trader_message)
                     role_models[AgentRole.TRADER.value] = trader_usage
@@ -569,7 +575,21 @@ class WorkflowSupervisor:
                                 strategy_quality_edge_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
                                 strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
                             )
-                        total_capital = await repo.get_total_capital_dollars()
+                        total_capital = total_capital_early
+                        if total_capital is not None and total_capital > 0:
+                            order_cap = float(total_capital) * self.settings.risk_order_pct
+                            position_cap = float(total_capital) * self.settings.risk_position_pct
+                            effective_thresholds = RuntimeThresholds(
+                                risk_min_edge_bps=effective_thresholds.risk_min_edge_bps,
+                                risk_max_order_notional_dollars=order_cap,
+                                risk_max_position_notional_dollars=position_cap,
+                                risk_safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
+                                risk_risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
+                                trigger_max_spread_bps=effective_thresholds.trigger_max_spread_bps,
+                                trigger_cooldown_seconds=effective_thresholds.trigger_cooldown_seconds,
+                                strategy_quality_edge_buffer_bps=effective_thresholds.strategy_quality_edge_buffer_bps,
+                                strategy_min_remaining_payout_bps=effective_thresholds.strategy_min_remaining_payout_bps,
+                            )
                         portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
                             kalshi_env=room.kalshi_env,
                             subaccount=self.settings.kalshi_subaccount,
