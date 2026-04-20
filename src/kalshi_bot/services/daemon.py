@@ -23,6 +23,7 @@ from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.shadow import ShadowTrainingService
+from kalshi_bot.services.strategy_eval import StrategyEvaluationService
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -49,6 +50,7 @@ class DaemonService:
         historical_intelligence_service: HistoricalIntelligenceService | None = None,
         historical_pipeline_service: HistoricalPipelineService | None = None,
         market_history_service: MarketHistoryService | None = None,
+        strategy_eval_service: StrategyEvaluationService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -66,6 +68,7 @@ class DaemonService:
         self.historical_intelligence_service = historical_intelligence_service
         self.historical_pipeline_service = historical_pipeline_service
         self.market_history_service = market_history_service
+        self.strategy_eval_service = strategy_eval_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
 
@@ -101,7 +104,12 @@ class DaemonService:
                 },
             )
             await session.commit()
-        return asdict(summary)
+        result = asdict(summary)
+        if summary.settlements_count > 0 and self.strategy_eval_service is not None:
+            adjustment = await self.strategy_eval_service.maybe_adjust()
+            if adjustment:
+                result["edge_adjustment"] = adjustment
+        return result
 
     async def heartbeat_once(self, *, run_follow_up: bool = True) -> dict[str, Any]:
         payload = {
