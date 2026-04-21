@@ -112,7 +112,7 @@ async def test_training_export_service_builds_room_bundle_and_role_examples(tmp_
     signal_engine = WeatherSignalEngine(settings)
     risk_engine = DeterministicRiskEngine(settings)
     execution_service = ExecutionService(settings, FakeKalshi())  # type: ignore[arg-type]
-    memory_service = MemoryService(providers)  # type: ignore[arg-type]
+    memory_service = MemoryService()
     directory = WeatherMarketDirectory(
         {
             "WX-TEST": WeatherMarketMapping(
