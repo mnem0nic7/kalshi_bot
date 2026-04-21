@@ -58,6 +58,7 @@ def test_risk_engine_approves_fresh_small_trade() -> None:
         risk_max_order_notional_dollars=100,
         risk_max_position_notional_dollars=300,
         risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
     )
     engine = DeterministicRiskEngine(settings)
     verdict = engine.evaluate(
@@ -83,6 +84,7 @@ def test_risk_engine_blocks_when_position_limit_would_be_breached() -> None:
         risk_max_order_notional_dollars=100,
         risk_max_position_notional_dollars=50,  # tight cap
         risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
     )
     engine = DeterministicRiskEngine(settings)
     # Existing open position of $40 notional; new order adds $5.80 → total $45.80 < $50 → passes
@@ -237,6 +239,7 @@ def test_risk_engine_safe_trade_is_not_blocked_when_risky_bucket_is_full() -> No
         risk_min_edge_bps=50,
         risk_max_order_notional_dollars=100,
         risk_max_position_notional_dollars=20,
+        risk_min_probability_extremity_pct=0.0,
     )
     engine = DeterministicRiskEngine(settings)
     verdict = engine.evaluate(
@@ -391,6 +394,7 @@ def test_risk_engine_allows_when_under_per_ticker_count_cap() -> None:
         risk_max_order_notional_dollars=100,
         risk_max_position_notional_dollars=500,
         risk_max_position_count_fp_per_ticker=200,
+        risk_min_probability_extremity_pct=0.0,
     )
     engine = DeterministicRiskEngine(settings)
     verdict = engine.evaluate(

@@ -116,8 +116,8 @@ class Settings(BaseSettings):
     risk_min_confidence: float = 0.60
     risk_min_contract_price_dollars: float = 0.05
     # Probability distance from 50%: 25.0 means fair_yes must be <0.25 or >0.75.
-    # Set to 0.0 to disable (useful in tests and when the pipeline has city-specific calibration).
-    risk_min_probability_extremity_pct: float = 0.0
+    # Set to 0.0 to disable (only in tests or when the pipeline has city-specific calibration).
+    risk_min_probability_extremity_pct: float = 25.0
     strategy_min_remaining_payout_bps: int = 300
     strategy_quality_edge_buffer_bps: int = 25
 
