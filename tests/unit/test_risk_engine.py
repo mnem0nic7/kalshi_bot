@@ -301,6 +301,33 @@ def test_risk_engine_blocks_when_per_ticker_count_cap_reached() -> None:
     assert any("200" in r for r in verdict.reasons)
 
 
+def test_risk_engine_blocks_runaway_edge_as_model_error() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_credible_edge_bps=5000,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.0200"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(edge_bps=7382),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+        ),
+    )
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("credibility" in r for r in verdict.reasons)
+
+
 def test_risk_engine_allows_when_under_per_ticker_count_cap() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",

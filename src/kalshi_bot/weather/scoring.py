@@ -22,18 +22,51 @@ def celsius_to_fahrenheit(value_c: float | None) -> float | None:
     return (value_c * 9 / 5) + 32
 
 
-def extract_forecast_high_f(payload: dict[str, Any]) -> float | None:
+def extract_forecast_high_f(
+    payload: dict[str, Any],
+    target_date: date | None = None,
+) -> float | None:
+    """Return the forecast high for target_date from NWS /forecast periods.
+
+    target_date is compared against each period's startTime (local date with tz offset).
+    Falls back to the first daytime period when no period matches.
+    """
     periods = payload.get("properties", {}).get("periods", [])
-    highs: list[float] = []
-    for period in periods:
-        if not period.get("isDaytime", False):
-            continue
+    use_date = target_date
+
+    def _temp_f(period: dict[str, Any]) -> float | None:
         temperature = period.get("temperature")
         unit = period.get("temperatureUnit", "F")
         if temperature is None:
+            return None
+        return float(temperature) if unit == "F" else celsius_to_fahrenheit(float(temperature))
+
+    # First pass: return the daytime period whose startTime matches target_date.
+    for period in periods:
+        if not period.get("isDaytime", False):
             continue
-        highs.append(float(temperature) if unit == "F" else celsius_to_fahrenheit(float(temperature)) or 0.0)
-    return max(highs) if highs else None
+        start_time = period.get("startTime", "")
+        if use_date is not None and start_time:
+            try:
+                dt = datetime.fromisoformat(start_time)
+                if dt.date() != use_date:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        val = _temp_f(period)
+        if val is not None:
+            return val
+
+    # Second pass fallback: first available daytime period (target_date was set but unmatched).
+    if use_date is not None:
+        for period in periods:
+            if not period.get("isDaytime", False):
+                continue
+            val = _temp_f(period)
+            if val is not None:
+                return val
+
+    return None
 
 
 def extract_current_temp_f(payload: dict[str, Any]) -> float | None:
@@ -190,14 +223,19 @@ def score_weather_market(
     if not mapping.supports_structured_weather or mapping.threshold_f is None:
         raise RuntimeError(f"{mapping.market_ticker} is missing structured weather configuration")
 
+    # Derive settlement date from the observation timestamp so date comparisons remain
+    # consistent whether called live or in historical replay.
+    obs_ts = parse_iso_datetime(observation_payload.get("properties", {}).get("timestamp"))
+    settlement_date: date | None = obs_ts.date() if obs_ts is not None else None
+
     # Layer 2: precise gridpoint max temp (unrounded Celsius→F) via forecastGridData.
     # Falls back to Layer 1 (rounded daily period) when unavailable.
     gridpoint_max_f = (
-        extract_gridpoint_max_temp_f(forecast_grid_payload)
+        extract_gridpoint_max_temp_f(forecast_grid_payload, target_date=settlement_date)
         if forecast_grid_payload
         else None
     )
-    forecast_high_f = gridpoint_max_f if gridpoint_max_f is not None else extract_forecast_high_f(forecast_payload)
+    forecast_high_f = gridpoint_max_f if gridpoint_max_f is not None else extract_forecast_high_f(forecast_payload, target_date=settlement_date)
     using_gridpoint = gridpoint_max_f is not None
 
     current_temp_f = extract_current_temp_f(observation_payload)
@@ -272,7 +310,7 @@ def score_weather_market(
         confidence_band=confidence_band,
         trade_regime=trade_regime,
         resolution_state=resolution_state,
-        observation_time=parse_iso_datetime(observation_payload.get("properties", {}).get("timestamp")),
+        observation_time=obs_ts,
         forecast_updated_time=parse_iso_datetime(forecast_payload.get("properties", {}).get("updated")),
         summary=summary,
     )

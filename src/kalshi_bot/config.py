@@ -108,6 +108,7 @@ class Settings(BaseSettings):
     risk_stale_market_seconds: int = 30
     risk_stale_weather_seconds: int = 900
     risk_min_edge_bps: int = 100
+    risk_max_credible_edge_bps: int = 5000
     strategy_min_remaining_payout_bps: int = 300
     strategy_quality_edge_buffer_bps: int = 25
 

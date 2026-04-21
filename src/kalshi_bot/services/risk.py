@@ -116,6 +116,11 @@ class DeterministicRiskEngine:
                 block(reason)
         if signal.edge_bps < active_thresholds.risk_min_edge_bps:
             block(f"Edge {signal.edge_bps}bps is below configured minimum of {active_thresholds.risk_min_edge_bps}bps.")
+        if signal.edge_bps > self.settings.risk_max_credible_edge_bps:
+            block(
+                f"Edge {signal.edge_bps}bps exceeds credibility limit of "
+                f"{self.settings.risk_max_credible_edge_bps}bps; likely model error."
+            )
 
         if market_observed_at is None or (now - market_observed_at).total_seconds() > self.settings.risk_stale_market_seconds:
             block("Kalshi market data is stale.")

@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from kalshi_bot.core.enums import WeatherResolutionState
 from kalshi_bot.weather.models import WeatherMarketMapping
-from kalshi_bot.weather.scoring import score_weather_market
+from kalshi_bot.weather.scoring import extract_forecast_high_f, score_weather_market
 
 
 def test_score_weather_market_above_threshold_is_bullish() -> None:
@@ -150,3 +150,81 @@ def test_score_weather_market_penalizes_longshot_no_setup() -> None:
 
     assert signal.trade_regime == "longshot_no"
     assert signal.fair_yes_dollars == Decimal("0.9736")
+
+
+def test_extract_forecast_high_f_returns_target_date_not_hottest_day() -> None:
+    """Regression: must return today's period, not max across the full 7-day forecast."""
+    forecast = {
+        "properties": {
+            "periods": [
+                {
+                    "isDaytime": True,
+                    "startTime": "2026-04-21T06:00:00-04:00",
+                    "temperature": 47,
+                    "temperatureUnit": "F",
+                },
+                {
+                    "isDaytime": False,
+                    "startTime": "2026-04-21T18:00:00-04:00",
+                    "temperature": 42,
+                    "temperatureUnit": "F",
+                },
+                {
+                    "isDaytime": True,
+                    "startTime": "2026-04-22T06:00:00-04:00",
+                    "temperature": 59,
+                    "temperatureUnit": "F",
+                },
+            ]
+        }
+    }
+    from datetime import date
+
+    result = extract_forecast_high_f(forecast, target_date=date(2026, 4, 21))
+    assert result == 47, f"Expected today's 47°F, got {result}"
+
+
+def test_score_weather_market_uses_observation_date_not_hottest_period() -> None:
+    """Integration: score_weather_market must use today's forecast, not tomorrow's."""
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHTBOS-26APR21-T55",
+        station_id="KBOS",
+        location_name="Boston",
+        latitude=42.4,
+        longitude=-71.0,
+        threshold_f=55,
+        operator=">",
+    )
+    # Forecast has today (Apr 21) at 47°F and tomorrow at 59°F.
+    forecast = {
+        "properties": {
+            "updated": "2026-04-21T12:00:00+00:00",
+            "periods": [
+                {
+                    "isDaytime": True,
+                    "startTime": "2026-04-21T06:00:00-04:00",
+                    "temperature": 47,
+                    "temperatureUnit": "F",
+                },
+                {
+                    "isDaytime": True,
+                    "startTime": "2026-04-22T06:00:00-04:00",
+                    "temperature": 59,
+                    "temperatureUnit": "F",
+                },
+            ],
+        }
+    }
+    observation = {
+        "properties": {
+            "temperature": {"value": 8.0},  # ~46°F
+            "timestamp": "2026-04-21T17:00:00+00:00",
+        }
+    }
+    signal = score_weather_market(mapping, forecast, observation)
+
+    assert signal.forecast_high_f == 47, f"Expected 47°F (today), got {signal.forecast_high_f}"
+    # With today's 47°F (8°F below 55°F threshold), fair_yes should be very low — not near 0.76.
+    assert signal.fair_yes_dollars < Decimal("0.15")
+    # The buggy version would have used tomorrow's 59°F and returned fair_yes ≈ 0.76.
+    assert signal.fair_yes_dollars < Decimal("0.50")
