@@ -172,7 +172,7 @@ class HistoricalHeuristicService:
 
     def compile_pack(self, pack: HistoricalHeuristicPack) -> HistoricalHeuristicPack:
         thresholds = pack.thresholds.model_copy(deep=True)
-        thresholds.risk_min_edge_bps = self._clamp_int(thresholds.risk_min_edge_bps, 5, 500)
+        thresholds.risk_min_edge_bps = self._clamp_int(thresholds.risk_min_edge_bps, 100, 500)
         thresholds.trigger_max_spread_bps = self._clamp_int(thresholds.trigger_max_spread_bps, 50, 2500)
         thresholds.strategy_quality_edge_buffer_bps = self._clamp_int(thresholds.strategy_quality_edge_buffer_bps, 0, 500)
         thresholds.strategy_min_remaining_payout_bps = self._clamp_int(thresholds.strategy_min_remaining_payout_bps, 50, 5000)
@@ -328,7 +328,7 @@ class HistoricalHeuristicService:
     def _compiled_policy_node(self, node: HeuristicPolicyNode) -> HeuristicPolicyNode:
         action = node.action.model_copy(deep=True)
         action.fair_yes_adjust_bps = self._clamp_int(action.fair_yes_adjust_bps, -2500, 2500)
-        action.risk_min_edge_bps = self._clamp_int(action.risk_min_edge_bps, 5, 500)
+        action.risk_min_edge_bps = self._clamp_int(action.risk_min_edge_bps, 100, 500)
         action.trigger_max_spread_bps = self._clamp_int(action.trigger_max_spread_bps, 50, 2500)
         action.strategy_quality_edge_buffer_bps = self._clamp_int(action.strategy_quality_edge_buffer_bps, 0, 500)
         action.strategy_min_remaining_payout_bps = self._clamp_int(action.strategy_min_remaining_payout_bps, 50, 5000)

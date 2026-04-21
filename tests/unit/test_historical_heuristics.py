@@ -74,7 +74,7 @@ def test_apply_to_signal_matches_rule_and_adjusts_thresholds() -> None:
     pack = HistoricalHeuristicPack(
         version="heuristic-live",
         thresholds={
-            "risk_min_edge_bps": 40,
+            "risk_min_edge_bps": 150,
             "trigger_max_spread_bps": 900,
             "strategy_quality_edge_buffer_bps": 80,
             "strategy_min_remaining_payout_bps": 700,
@@ -117,7 +117,7 @@ def test_apply_to_signal_matches_rule_and_adjusts_thresholds() -> None:
         market_snapshot={"market": {"yes_bid_dollars": "0.0100", "yes_ask_dollars": "1.0000", "no_ask_dollars": "0.9600"}},
         reference_time=datetime.now(UTC),
         base_thresholds=RuntimeThresholds(
-            risk_min_edge_bps=30,
+            risk_min_edge_bps=100,
             risk_max_order_notional_dollars=50.0,
             risk_max_position_notional_dollars=200.0,
             trigger_max_spread_bps=1200,
@@ -130,5 +130,5 @@ def test_apply_to_signal_matches_rule_and_adjusts_thresholds() -> None:
     assert application["heuristic_pack_version"] == "heuristic-live"
     assert application["recommended_strategy_mode"] == StrategyMode.LATE_DAY_AVOID.value
     assert application["force_stand_down_reason"] == StandDownReason.BOOK_EFFECTIVELY_BROKEN.value
-    assert application["thresholds"]["risk_min_edge_bps"] == 40
+    assert application["thresholds"]["risk_min_edge_bps"] == 150
     assert application["rule_trace"][0]["rule_id"] == "broken-book"
