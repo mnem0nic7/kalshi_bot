@@ -137,6 +137,16 @@ class DeterministicRiskEngine:
                 f"Contract price {contract_price} is below minimum {min_price}; "
                 f"market has priced this as nearly impossible."
             )
+        extremity_pct = self.settings.risk_min_probability_extremity_pct
+        if extremity_pct > 0:
+            extremity = extremity_pct / 100.0
+            fair_yes = float(signal.fair_yes_dollars)
+            if extremity <= fair_yes <= (1.0 - extremity):
+                block(
+                    f"Fair probability {fair_yes:.2f} is too close to 50% (must be "
+                    f"<{extremity:.0%} or >{1.0 - extremity:.0%}); forecast error noise "
+                    f"exceeds reliable edge at this probability."
+                )
 
         if market_observed_at is None or (now - market_observed_at).total_seconds() > self.settings.risk_stale_market_seconds:
             block("Kalshi market data is stale.")

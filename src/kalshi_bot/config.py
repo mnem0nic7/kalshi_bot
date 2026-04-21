@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     app_shadow_mode: bool = True
     app_auto_init_db: bool = False
     app_enable_kill_switch: bool = True
+    web_auth_enabled: bool = True
+    web_auth_cookie_name: str = "kalshi_bot_session"
+    web_auth_session_ttl_seconds: int = 1_209_600
+    web_auth_allowed_registration_emails: str = "m7.ga.77@gmail.com"
 
     database_url: str | None = None
     postgres_host: str = "localhost"
@@ -107,10 +111,13 @@ class Settings(BaseSettings):
     risk_risky_capital_max_ratio: float = 0.0
     risk_stale_market_seconds: int = 60
     risk_stale_weather_seconds: int = 900
-    risk_min_edge_bps: int = 100
+    risk_min_edge_bps: int = 500
     risk_max_credible_edge_bps: int = 5000
     risk_min_confidence: float = 0.60
     risk_min_contract_price_dollars: float = 0.05
+    # Probability distance from 50%: 25.0 means fair_yes must be <0.25 or >0.75.
+    # Set to 0.0 to disable (useful in tests and when the pipeline has city-specific calibration).
+    risk_min_probability_extremity_pct: float = 0.0
     strategy_min_remaining_payout_bps: int = 300
     strategy_quality_edge_buffer_bps: int = 25
 
@@ -211,6 +218,14 @@ class Settings(BaseSettings):
     @property
     def execution_enabled(self) -> bool:
         return not self.app_shadow_mode
+
+    @property
+    def web_auth_allowed_registration_email_set(self) -> set[str]:
+        return {
+            item.strip().lower()
+            for item in self.web_auth_allowed_registration_emails.split(",")
+            if item.strip()
+        }
 
     def api_key_id(self, write: bool) -> str | None:
         direct = self.kalshi_write_api_key_id if write else self.kalshi_read_api_key_id

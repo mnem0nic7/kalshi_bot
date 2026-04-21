@@ -67,7 +67,7 @@ For each open weather market, compute `fair_yes_dollars` = modeled probability t
 
 ```
 edge_bps = |fair_yes_dollars − market_touch| × 10,000
-100 bps ≤ edge_bps ≤ 5000 bps       ← risk_min_edge_bps / risk_max_credible_edge_bps
+500 bps ≤ edge_bps ≤ 5000 bps       ← risk_min_edge_bps / risk_max_credible_edge_bps
 confidence ≥ 0.60                   ← risk_min_confidence; hard block in risk engine
 trade_regime == "standard"          ← near-threshold and longshot trades are blocked
 ```
@@ -291,11 +291,12 @@ Resolution-state detection: if `current_temp_f >= threshold`, the market is `LOC
 | 1 | Kill switch | `control.kill_switch_enabled` |
 | 2 | Signal eligibility | No recommended action, side, or price |
 | 3 | Resolution state | Market not UNRESOLVED |
-| 4 | Min edge | `edge_bps < risk_min_edge_bps` (100 bps) |
+| 4 | Min edge | `edge_bps < risk_min_edge_bps` (500 bps) |
 | 5 | Max edge (credibility) | `edge_bps > risk_max_credible_edge_bps` (5000 bps) — model error signal |
 | 6 | Confidence floor | `signal.confidence < risk_min_confidence` (0.60) |
 | 7 | Contract price floor | contract price < `risk_min_contract_price_dollars` (0.05) — market pricing it as nearly impossible |
-| 8 | Market staleness | `market_observed_at` older than 30s |
+| 7b | Probability extremity | `fair_yes` between 25% and 75% — too close to coin-flip; forecast noise exceeds edge signal (`risk_min_probability_extremity_pct=25.0`, disabled by default, enable in production) |
+| 8 | Market staleness | `market_observed_at` older than 60s |
 | 9 | Research staleness | `research_observed_at` older than 900s |
 | 10 | Order count cap | `count_fp > risk_max_order_count_fp` |
 | 11 | Position count cap | `current_position_count_fp >= risk_max_position_count_fp_per_ticker` |
@@ -545,10 +546,11 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `RISK_ORDER_PCT` | 0.05 | 5% of live balance per order |
 | `RISK_POSITION_PCT` | 0.10 | 10% of live balance per position |
 | `RISK_DAILY_LOSS_PCT` | 0.05 | 5% daily loss limit (self-improve gate) |
-| `RISK_MIN_EDGE_BPS` | 100 | Minimum 1-cent edge required |
+| `RISK_MIN_EDGE_BPS` | 500 | Minimum edge required; self-improvement pipeline can tune down to 100 bps floor |
 | `RISK_MAX_CREDIBLE_EDGE_BPS` | 5000 | Maximum credible edge; larger values indicate model error |
 | `RISK_MIN_CONFIDENCE` | 0.60 | Hard block below this confidence score |
 | `RISK_MIN_CONTRACT_PRICE_DOLLARS` | 0.05 | Hard block if the traded side costs less than 5¢ |
+| `RISK_MIN_PROBABILITY_EXTREMITY_PCT` | 0.0 (prod: 25.0) | Block trades where fair_yes is within this many pct-points of 50%; set 25.0 in production |
 | `RISK_MAX_CONCURRENT_TICKERS` | 10 | Max open-position tickers |
 | `RISK_MAX_ORDER_NOTIONAL_DOLLARS` | None | Optional hard-cap override |
 | `RISK_MAX_POSITION_NOTIONAL_DOLLARS` | None | Optional hard-cap override |
