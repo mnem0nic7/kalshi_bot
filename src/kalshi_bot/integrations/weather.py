@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -36,18 +37,32 @@ class NWSWeatherClient:
     async def get_latest_observation(self, station_id: str) -> dict[str, Any]:
         return await self._get(f"/stations/{station_id}/observations/latest")
 
+    async def get_forecast_grid_data(self, grid_data_url: str) -> dict[str, Any]:
+        return await self._get(grid_data_url)
+
     async def build_market_snapshot(self, mapping: WeatherMarketMapping) -> dict[str, Any]:
         if not mapping.supports_structured_weather:
             raise RuntimeError(f"{mapping.market_ticker} does not have structured weather fields configured")
         points = await self.get_points(mapping.latitude, mapping.longitude)
-        forecast_url = points.get("properties", {}).get("forecast")
+        props = points.get("properties", {})
+        forecast_url = props.get("forecast")
         if not forecast_url:
             raise RuntimeError(f"No forecast URL returned by NWS for {mapping.label}")
-        forecast = await self._get(forecast_url)
-        observation = await self.get_latest_observation(mapping.station_id)
+        grid_data_url = props.get("forecastGridData")
+        forecast, observation = await asyncio.gather(
+            self._get(forecast_url),
+            self.get_latest_observation(mapping.station_id),
+        )
+        forecast_grid: dict[str, Any] = {}
+        if grid_data_url:
+            try:
+                forecast_grid = await self.get_forecast_grid_data(grid_data_url)
+            except Exception:
+                pass  # non-fatal; Layer 2 falls back to Layer 1 inputs
         return {
             "mapping": mapping.model_dump(mode="json"),
             "points": points,
             "forecast": forecast,
+            "forecast_grid": forecast_grid,
             "observation": observation,
         }

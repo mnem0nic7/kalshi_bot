@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -75,6 +75,69 @@ class WeatherSignalSnapshot:
     summary: str
 
 
+def gaussian_probability(delta_f: float, sigma_f: float = 3.5) -> float:
+    """P(high > threshold) = Φ(delta_f / sigma_f) where delta_f = forecast_high - threshold."""
+    sigma = max(abs(sigma_f), 0.5)
+    return 0.5 * (1.0 + math.erf(delta_f / (sigma * math.sqrt(2))))
+
+
+# Default forecast uncertainty by month (σ in °F).  Calibrate per-station once ASOS data lands.
+_MONTHLY_SIGMA_F: dict[int, float] = {
+    1: 4.5, 2: 4.5, 3: 4.0, 4: 3.5, 5: 3.5,
+    6: 3.0, 7: 2.8, 8: 2.8, 9: 3.0, 10: 3.5,
+    11: 4.0, 12: 4.5,
+}
+
+
+def nws_forecast_sigma_f(month: int) -> float:
+    return _MONTHLY_SIGMA_F.get(month, 3.5)
+
+
+def extract_gridpoint_max_temp_f(
+    gridpoint_payload: dict[str, Any],
+    target_date: date | None = None,
+) -> float | None:
+    """Parse maxTemperature from NWS forecastGridData for a target date (defaults to today UTC)."""
+    values = (
+        gridpoint_payload
+        .get("properties", {})
+        .get("maxTemperature", {})
+        .get("values", [])
+    )
+    if not values:
+        return None
+    uom = gridpoint_payload.get("properties", {}).get("maxTemperature", {}).get("uom", "")
+    use_date = target_date or datetime.now(UTC).date()
+    for entry in values:
+        valid_time_str = entry.get("validTime", "")
+        if not valid_time_str:
+            continue
+        try:
+            # validTime format: "2026-04-21T06:00:00+00:00/PT24H"
+            dt_part = valid_time_str.split("/")[0]
+            dt = datetime.fromisoformat(dt_part.replace("Z", "+00:00"))
+            if dt.date() == use_date:
+                value_c = entry.get("value")
+                if value_c is None:
+                    continue
+                # NWS gridpoint temperatures are in Celsius (wmoUnit:degC)
+                if "degC" in uom or uom == "":
+                    return celsius_to_fahrenheit(float(value_c))
+                return float(value_c)
+        except (ValueError, TypeError):
+            continue
+    # Fall back to first available value if target date not matched
+    try:
+        first_value = values[0].get("value")
+        if first_value is not None:
+            if "degC" in uom or uom == "":
+                return celsius_to_fahrenheit(float(first_value))
+            return float(first_value)
+    except (ValueError, TypeError, IndexError):
+        pass
+    return None
+
+
 def parse_iso_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -118,10 +181,25 @@ def apply_trade_regime_penalty(*, fair_yes_dollars: Decimal, trade_regime: str) 
     return quantize_price(fair_yes_dollars)
 
 
-def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[str, Any], observation_payload: dict[str, Any]) -> WeatherSignalSnapshot:
+def score_weather_market(
+    mapping: WeatherMarketMapping,
+    forecast_payload: dict[str, Any],
+    observation_payload: dict[str, Any],
+    forecast_grid_payload: dict[str, Any] | None = None,
+) -> WeatherSignalSnapshot:
     if not mapping.supports_structured_weather or mapping.threshold_f is None:
         raise RuntimeError(f"{mapping.market_ticker} is missing structured weather configuration")
-    forecast_high_f = extract_forecast_high_f(forecast_payload)
+
+    # Layer 2: precise gridpoint max temp (unrounded Celsius→F) via forecastGridData.
+    # Falls back to Layer 1 (rounded daily period) when unavailable.
+    gridpoint_max_f = (
+        extract_gridpoint_max_temp_f(forecast_grid_payload)
+        if forecast_grid_payload
+        else None
+    )
+    forecast_high_f = gridpoint_max_f if gridpoint_max_f is not None else extract_forecast_high_f(forecast_payload)
+    using_gridpoint = gridpoint_max_f is not None
+
     current_temp_f = extract_current_temp_f(observation_payload)
     resolution_state = WeatherResolutionState.UNRESOLVED
     if current_temp_f is not None:
@@ -152,10 +230,17 @@ def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[s
         delta_f = forecast_high_f - mapping.threshold_f
         if mapping.operator in ("<", "<="):
             delta_f = -delta_f
-        adaptive_spread = _adaptive_spread_f(delta_f)
-        probability = logistic_probability(delta_f, spread_f=adaptive_spread)
+        if using_gridpoint:
+            # Layer 2: Gaussian CDF with calibrated monthly σ.
+            month = datetime.now(UTC).month
+            sigma = nws_forecast_sigma_f(month)
+            probability = gaussian_probability(delta_f, sigma_f=sigma)
+        else:
+            # Layer 1 fallback: logistic with adaptive spread.
+            probability = logistic_probability(delta_f, spread_f=_adaptive_spread_f(delta_f))
         fair = quantize_price(probability)
         confidence = min(0.95, 0.45 + min(abs(delta_f) / 12, 0.35) + (0.15 if current_temp_f is not None else 0.0))
+
     forecast_delta_f = None
     if forecast_high_f is not None and mapping.threshold_f is not None:
         forecast_delta_f = forecast_high_f - mapping.threshold_f
@@ -173,8 +258,9 @@ def score_weather_market(mapping: WeatherMarketMapping, forecast_payload: dict[s
     if resolution_state in {WeatherResolutionState.LOCKED_YES, WeatherResolutionState.LOCKED_NO}:
         trade_regime = "standard"
     elif forecast_high_f is not None:
+        layer_tag = "gridpoint" if using_gridpoint else "daily-period"
         summary = (
-            f"Forecast high {forecast_high_f:.1f}F versus threshold {mapping.threshold_f:.1f}F "
+            f"Forecast high {forecast_high_f:.1f}F [{layer_tag}] versus threshold {mapping.threshold_f:.1f}F "
             f"implies fair yes near {fair} with confidence {confidence:.2f}."
         )
     return WeatherSignalSnapshot(

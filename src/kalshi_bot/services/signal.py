@@ -575,7 +575,12 @@ class WeatherSignalEngine:
         *,
         min_edge_bps: int | None = None,
     ) -> StrategySignal:
-        weather = score_weather_market(mapping, weather_bundle.get("forecast", {}), weather_bundle.get("observation", {}))
+        weather = score_weather_market(
+            mapping,
+            weather_bundle.get("forecast", {}),
+            weather_bundle.get("observation", {}),
+            forecast_grid_payload=weather_bundle.get("forecast_grid") or None,
+        )
         effective_min_edge_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
         recommendation_action, recommendation_side, target_yes, edge_bps = _trade_recommendation(
             fair_yes_dollars=weather.fair_yes_dollars,
