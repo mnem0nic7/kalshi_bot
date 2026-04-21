@@ -13,9 +13,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage
-from kalshi_bot.core.fixed_point import as_decimal
+from kalshi_bot.core.fixed_point import as_decimal, make_client_order_id, quantize_count
 from kalshi_bot.core.metrics import ACTIVE_ROOMS, ORDERS_TOTAL, ROOM_RUNS_TOTAL
-from kalshi_bot.core.schemas import ExecReceiptPayload, MemoryNotePayload, RoomMessageCreate, RoomMessageRead
+from kalshi_bot.core.schemas import ExecReceiptPayload, MemoryNotePayload, RoomMessageCreate, RoomMessageRead, TradeTicket
 from kalshi_bot.db.models import Room
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
@@ -36,6 +36,7 @@ from kalshi_bot.services.signal import (
     estimate_notional_dollars,
     evaluate_trade_eligibility,
     is_market_stale,
+    suggested_trade_count_fp,
 )
 from kalshi_bot.services.risk import approved_ticket_for_verdict
 from kalshi_bot.services.training_corpus import TrainingCorpusService
@@ -191,6 +192,192 @@ class WorkflowSupervisor:
             signal.size_factor = min(Decimal(volume) / Decimal("100"), Decimal("1.00"))
 
         return True
+
+    async def _run_deterministic_fast_path(
+        self,
+        *,
+        repo: "PlatformRepository",
+        session: Any,
+        room: Room,
+        control: Any,
+        signal: StrategySignal,
+        thresholds: Any,
+    ) -> None:
+        receipt = ExecReceiptPayload(status="no_trade", details={})
+        final_status = "no_trade"
+
+        eligible = (
+            signal.eligibility is not None
+            and signal.eligibility.eligible
+            and signal.recommended_action is not None
+            and signal.recommended_side is not None
+            and signal.target_yes_price_dollars is not None
+        )
+
+        if eligible:
+            total_capital = await repo.get_total_capital_dollars()
+            dynamic_order_cap = (
+                float(total_capital) * self.settings.risk_order_pct
+                if total_capital is not None and total_capital > 0
+                else thresholds.risk_max_order_notional_dollars
+            )
+            count_fp = suggested_trade_count_fp(
+                settings=self.settings,
+                signal=signal,
+                max_order_notional_dollars=dynamic_order_cap,
+            )
+            if count_fp is None or count_fp <= Decimal("0"):
+                eligible = False
+
+        if eligible:
+            ticket = TradeTicket(
+                market_ticker=room.market_ticker,
+                action=signal.recommended_action,
+                side=signal.recommended_side,
+                yes_price_dollars=signal.target_yes_price_dollars,
+                count_fp=count_fp,
+                capital_bucket=signal.capital_bucket,
+                time_in_force="gtc",
+            )
+            if signal.size_factor < Decimal("1.00"):
+                scaled = quantize_count(ticket.count_fp * signal.size_factor)
+                ticket = ticket.model_copy(update={"count_fp": scaled}) if scaled > Decimal("0") else None
+
+            if ticket is not None:
+                client_order_id = make_client_order_id(room.id, room.market_ticker, ticket.nonce)
+                ticket_record = await repo.save_trade_ticket(room.id, ticket, client_order_id)
+                open_position = await repo.get_position(room.market_ticker, self.settings.kalshi_subaccount)
+                current_position_notional = (
+                    estimate_notional_dollars(
+                        ContractSide(open_position.side),
+                        open_position.average_price_dollars,
+                        open_position.count_fp,
+                    )
+                    if open_position is not None
+                    else Decimal("0")
+                )
+                position_cap = (
+                    float(total_capital) * self.settings.risk_position_pct
+                    if total_capital is not None and total_capital > 0
+                    else thresholds.risk_max_position_notional_dollars
+                )
+                effective_thresholds = thresholds.__class__(
+                    risk_min_edge_bps=thresholds.risk_min_edge_bps,
+                    risk_max_order_notional_dollars=dynamic_order_cap,
+                    risk_max_position_notional_dollars=position_cap,
+                    trigger_max_spread_bps=thresholds.trigger_max_spread_bps,
+                    trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds,
+                    strategy_quality_edge_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
+                    strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
+                    risk_safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
+                    risk_risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
+                )
+                portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
+                    kalshi_env=room.kalshi_env,
+                    subaccount=self.settings.kalshi_subaccount,
+                    total_capital_dollars=total_capital if total_capital is not None else Decimal(str(effective_thresholds.risk_max_position_notional_dollars)),
+                    safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
+                    risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
+                )
+                risk_context = RiskContext(
+                    market_observed_at=None,
+                    research_observed_at=None,
+                    current_position_notional_dollars=current_position_notional,
+                    current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
+                    portfolio_bucket_snapshot=portfolio_bucket_snapshot,
+                )
+                verdict = self.risk_engine.evaluate(
+                    room=room,
+                    control=control,
+                    ticket=ticket,
+                    signal=signal,
+                    context=risk_context,
+                    thresholds=effective_thresholds,
+                )
+                await repo.save_risk_verdict(
+                    room_id=room.id,
+                    ticket_id=ticket_record.id,
+                    status=verdict.status,
+                    reasons=verdict.reasons,
+                    approved_notional_dollars=verdict.approved_notional_dollars,
+                    approved_count_fp=verdict.approved_count_fp,
+                    payload=verdict.model_dump(mode="json"),
+                )
+                if verdict.status == RiskStatus.APPROVED:
+                    approved_ticket = approved_ticket_for_verdict(ticket, verdict)
+                    await repo.update_room_stage(room.id, RoomStage.EXECUTING)
+                    lock_acquired = await repo.acquire_execution_lock(
+                        holder=self.settings.app_color,
+                        color=self.settings.app_color,
+                    )
+                    if lock_acquired:
+                        receipt = await self.execution_service.execute(
+                            room=room,
+                            control=control,
+                            ticket=approved_ticket,
+                            client_order_id=client_order_id,
+                            fair_yes_dollars=signal.fair_yes_dollars,
+                        )
+                    else:
+                        receipt = ExecReceiptPayload(
+                            status="lock_denied",
+                            client_order_id=client_order_id,
+                            details={"reason": "execution lock held by another deployment color"},
+                        )
+                    ORDERS_TOTAL.labels(status=receipt.status).inc()
+                    if receipt.external_order_id or receipt.status not in ("shadow_skipped", "inactive_color_skipped"):
+                        await repo.save_order(
+                            ticket_id=ticket_record.id,
+                            client_order_id=client_order_id,
+                            market_ticker=approved_ticket.market_ticker,
+                            status=receipt.status,
+                            side=approved_ticket.side.value,
+                            action=approved_ticket.action.value,
+                            yes_price_dollars=approved_ticket.yes_price_dollars,
+                            count_fp=approved_ticket.count_fp,
+                            raw=receipt.details,
+                            kalshi_order_id=receipt.external_order_id,
+                        )
+                else:
+                    receipt = ExecReceiptPayload(
+                        status="blocked",
+                        client_order_id=client_order_id,
+                        details={"reasons": verdict.reasons},
+                    )
+                    ORDERS_TOTAL.labels(status="blocked").inc()
+                final_status = receipt.status
+            else:
+                final_status = "stand_down"
+        else:
+            final_status = "stand_down"
+
+        await repo.append_message(
+            room.id,
+            RoomMessageCreate(
+                role=AgentRole.SUPERVISOR,
+                kind=MessageKind.OBSERVATION,
+                stage=RoomStage.COMPLETE,
+                content=f"Deterministic path: {final_status}. {signal.summary}",
+                payload={"final_status": final_status},
+            ),
+        )
+        await repo.update_room_campaign(
+            room.id,
+            payload_updates={
+                "final_status": final_status,
+                "room_completed_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+        ROOM_RUNS_TOTAL.labels(status="success").inc()
+        await session.commit()
+        try:
+            await self.training_corpus_service.persist_strategy_audit_for_room(
+                room.id,
+                audit_source="live_forward",
+            )
+        except Exception:
+            logger.exception("failed to persist strategy audit", extra={"room_id": room.id})
 
     async def run_room(self, room_id: str, reason: str = "manual") -> None:
         ACTIVE_ROOMS.inc()
@@ -456,6 +643,17 @@ class WorkflowSupervisor:
                 # The existing no-ticket → stand_down path at the end of the agent sequence
                 # handles gate rejections naturally — no separate early-exit needed.
                 await self._run_market_gates(repo, signal, market, room.market_ticker)
+
+                if not self.settings.llm_trading_enabled:
+                    await self._run_deterministic_fast_path(
+                        repo=repo,
+                        session=session,
+                        room=room,
+                        control=control,
+                        signal=signal,
+                        thresholds=thresholds,
+                    )
+                    return
 
                 recent_memories = [note.summary for note in await repo.list_recent_memory_notes(limit=5)]
                 await repo.update_room_stage(room.id, RoomStage.RESEARCHING)

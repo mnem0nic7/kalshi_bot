@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     gemini_model_memory_librarian: str = "gemini-2.5-flash"
     active_agent_pack_version: str = "builtin-gemini-v1"
     llm_request_timeout_seconds: float = 30.0
+    llm_trading_enabled: bool = False
 
     trigger_broken_book_retry_seconds: int = 30
     risk_order_pct: float = 0.10
