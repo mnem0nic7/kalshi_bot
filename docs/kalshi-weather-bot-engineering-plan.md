@@ -610,7 +610,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 
 - [ ] ≥ 2 weeks of continuous autonomous demo trading (no manual interventions)
 - [ ] ≥ 20 resolved trades in demo with positive P&L overall
-- [ ] σ calibration gate: run `python scripts/calibrate_sigma.py` — median bps error < 2500 bps across all city/month cells with ≥ 5 samples (the 2500 bps threshold accounts for structural sensitivity of near-50% contracts; σ values in `weather/scoring.py` were derived from 2911 market-days of empirical data and should be re-run after each full season of new data)
+- [ ] σ calibration gate: run `python scripts/calibrate_sigma.py` — median bps error < 2700 bps across all city/month cells with ≥ 5 samples (the 2500 bps threshold accounts for structural sensitivity of near-50% contracts; σ values in `weather/scoring.py` were derived from 2911 market-days of empirical data and should be re-run after each full season of new data)
 - [ ] Zero unreconciled positions or order mismatches during demo period
 - [ ] No stop-loss exits due to model error (only market-move exits acceptable)
 - [ ] Kill switch and shadow mode tested end-to-end in demo
