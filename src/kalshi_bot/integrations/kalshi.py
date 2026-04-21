@@ -155,6 +155,9 @@ class KalshiClient:
     async def create_order(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", "/portfolio/orders", json=payload, write=True)
 
+    async def get_order(self, order_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/portfolio/orders/{order_id}")
+
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         return await self._request("DELETE", f"/portfolio/orders/{order_id}", write=True)
 

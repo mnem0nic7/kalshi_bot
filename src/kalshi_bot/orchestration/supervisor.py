@@ -690,6 +690,7 @@ class WorkflowSupervisor:
                                     control=control,
                                     ticket=approved_ticket,
                                     client_order_id=client_order_id,
+                                    fair_yes_dollars=signal.fair_yes_dollars,
                                 )
                             else:
                                 receipt = ExecReceiptPayload(
