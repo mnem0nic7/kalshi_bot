@@ -197,6 +197,8 @@ def suggested_trade_count_fp(
     if signal.recommended_side is None or signal.target_yes_price_dollars is None:
         return None
     notional_cap = max_order_notional_dollars if max_order_notional_dollars is not None else settings.risk_max_order_notional_dollars
+    if notional_cap is None:
+        return None
     max_notional = Decimal(str(notional_cap)) * Decimal(str(signal.confidence))
     unit_price = (
         signal.target_yes_price_dollars

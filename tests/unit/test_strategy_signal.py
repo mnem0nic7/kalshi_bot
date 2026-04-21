@@ -386,6 +386,7 @@ def test_annotate_signal_quality_warns_on_near_threshold_low_confidence_and_over
         settings=settings,
         signal=signal,
         market_snapshot={"market": {"yes_bid_dollars": "0.5600", "yes_ask_dollars": "0.5800", "no_ask_dollars": "0.4200"}},
+        max_order_notional_dollars=20.0,
     )
 
     assert annotated.trade_regime == "near_threshold"

@@ -216,19 +216,17 @@ class WorkflowSupervisor:
 
         if eligible:
             total_capital = await repo.get_total_capital_dollars()
-            assumed = self.settings.risk_assumed_capital_dollars
-            dynamic_order_cap = (
-                float(total_capital) * self.settings.risk_order_pct
-                if total_capital is not None and total_capital > 0
-                else self.settings.risk_order_pct * assumed
-            )
-            count_fp = suggested_trade_count_fp(
-                settings=self.settings,
-                signal=signal,
-                max_order_notional_dollars=dynamic_order_cap,
-            )
-            if count_fp is None or count_fp <= Decimal("0"):
+            if total_capital is None or total_capital <= 0:
                 eligible = False
+            else:
+                dynamic_order_cap = float(total_capital) * self.settings.risk_order_pct
+                count_fp = suggested_trade_count_fp(
+                    settings=self.settings,
+                    signal=signal,
+                    max_order_notional_dollars=dynamic_order_cap,
+                )
+                if count_fp is None or count_fp <= Decimal("0"):
+                    eligible = False
 
         if eligible:
             ticket = TradeTicket(
@@ -257,11 +255,7 @@ class WorkflowSupervisor:
                     if open_position is not None
                     else Decimal("0")
                 )
-                position_cap = (
-                    float(total_capital) * self.settings.risk_position_pct
-                    if total_capital is not None and total_capital > 0
-                    else self.settings.risk_position_pct * assumed
-                )
+                position_cap = float(total_capital) * self.settings.risk_position_pct
                 effective_thresholds = thresholds.__class__(
                     risk_min_edge_bps=thresholds.risk_min_edge_bps,
                     risk_max_order_notional_dollars=dynamic_order_cap,
@@ -276,7 +270,7 @@ class WorkflowSupervisor:
                 portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
                     kalshi_env=room.kalshi_env,
                     subaccount=self.settings.kalshi_subaccount,
-                    total_capital_dollars=total_capital if total_capital is not None else Decimal(str(self.settings.risk_assumed_capital_dollars)),
+                    total_capital_dollars=total_capital,
                     safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
                     risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
                 )
@@ -764,7 +758,7 @@ class WorkflowSupervisor:
                     if total_capital_early is not None and total_capital_early > 0:
                         dynamic_order_cap = float(total_capital_early) * self.settings.risk_order_pct
                     else:
-                        dynamic_order_cap = self.settings.risk_order_pct * self.settings.risk_assumed_capital_dollars
+                        dynamic_order_cap = 0.0  # block trades until capital is reconciled
 
                     await repo.update_room_stage(room.id, RoomStage.POSTURE)
                     president_message, president_usage = await self.agents.president_message(
@@ -812,8 +806,7 @@ class WorkflowSupervisor:
                         )
                         effective_thresholds = thresholds
                         total_capital = total_capital_early
-                        _assumed = self.settings.risk_assumed_capital_dollars
-                        _cap = float(total_capital) if total_capital is not None and total_capital > 0 else _assumed
+                        _cap = float(total_capital) if total_capital is not None and total_capital > 0 else 0.0
                         order_cap = _cap * self.settings.risk_order_pct
                         position_cap = _cap * self.settings.risk_position_pct
                         if dossier.gate.stale_tolerance_active:
@@ -834,7 +827,7 @@ class WorkflowSupervisor:
                         portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
                             kalshi_env=room.kalshi_env,
                             subaccount=self.settings.kalshi_subaccount,
-                            total_capital_dollars=total_capital if total_capital is not None else Decimal(str(_assumed)),
+                            total_capital_dollars=total_capital or Decimal("0"),
                             safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
                             risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
                         )

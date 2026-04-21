@@ -143,9 +143,9 @@ class DeterministicRiskEngine:
                 f"Trade regime '{signal.trade_regime}' is not permitted; only standard-regime trades are allowed."
             )
 
-        if float(order_notional) > active_thresholds.risk_max_order_notional_dollars:
+        if active_thresholds.risk_max_order_notional_dollars is not None and float(order_notional) > active_thresholds.risk_max_order_notional_dollars:
             block("Ticket notional exceeds max order notional.")
-        if float(context.current_position_notional_dollars + order_notional) > active_thresholds.risk_max_position_notional_dollars:
+        if active_thresholds.risk_max_position_notional_dollars is not None and float(context.current_position_notional_dollars + order_notional) > active_thresholds.risk_max_position_notional_dollars:
             block("Projected position exceeds max position notional.")
 
         snapshot = context.portfolio_bucket_snapshot

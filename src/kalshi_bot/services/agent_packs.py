@@ -20,8 +20,8 @@ from kalshi_bot.db.repositories import PlatformRepository
 @dataclass(slots=True)
 class RuntimeThresholds:
     risk_min_edge_bps: int
-    risk_max_order_notional_dollars: float
-    risk_max_position_notional_dollars: float
+    risk_max_order_notional_dollars: float | None
+    risk_max_position_notional_dollars: float | None
     trigger_max_spread_bps: int
     trigger_cooldown_seconds: int
     strategy_quality_edge_buffer_bps: int
