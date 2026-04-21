@@ -216,10 +216,11 @@ class WorkflowSupervisor:
 
         if eligible:
             total_capital = await repo.get_total_capital_dollars()
+            assumed = self.settings.risk_assumed_capital_dollars
             dynamic_order_cap = (
                 float(total_capital) * self.settings.risk_order_pct
                 if total_capital is not None and total_capital > 0
-                else thresholds.risk_max_order_notional_dollars
+                else self.settings.risk_order_pct * assumed
             )
             count_fp = suggested_trade_count_fp(
                 settings=self.settings,
@@ -259,7 +260,7 @@ class WorkflowSupervisor:
                 position_cap = (
                     float(total_capital) * self.settings.risk_position_pct
                     if total_capital is not None and total_capital > 0
-                    else thresholds.risk_max_position_notional_dollars
+                    else self.settings.risk_position_pct * assumed
                 )
                 effective_thresholds = thresholds.__class__(
                     risk_min_edge_bps=thresholds.risk_min_edge_bps,
@@ -275,7 +276,7 @@ class WorkflowSupervisor:
                 portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
                     kalshi_env=room.kalshi_env,
                     subaccount=self.settings.kalshi_subaccount,
-                    total_capital_dollars=total_capital if total_capital is not None else Decimal(str(effective_thresholds.risk_max_position_notional_dollars)),
+                    total_capital_dollars=total_capital if total_capital is not None else Decimal(str(self.settings.risk_assumed_capital_dollars)),
                     safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
                     risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
                 )
@@ -763,7 +764,7 @@ class WorkflowSupervisor:
                     if total_capital_early is not None and total_capital_early > 0:
                         dynamic_order_cap = float(total_capital_early) * self.settings.risk_order_pct
                     else:
-                        dynamic_order_cap = thresholds.risk_max_order_notional_dollars
+                        dynamic_order_cap = self.settings.risk_order_pct * self.settings.risk_assumed_capital_dollars
 
                     await repo.update_room_stage(room.id, RoomStage.POSTURE)
                     president_message, president_usage = await self.agents.president_message(
@@ -810,38 +811,30 @@ class WorkflowSupervisor:
                             else Decimal("0")
                         )
                         effective_thresholds = thresholds
+                        total_capital = total_capital_early
+                        _assumed = self.settings.risk_assumed_capital_dollars
+                        _cap = float(total_capital) if total_capital is not None and total_capital > 0 else _assumed
+                        order_cap = _cap * self.settings.risk_order_pct
+                        position_cap = _cap * self.settings.risk_position_pct
                         if dossier.gate.stale_tolerance_active:
                             factor = self.settings.research_stale_tolerance_notional_factor
-                            effective_thresholds = RuntimeThresholds(
-                                risk_min_edge_bps=thresholds.risk_min_edge_bps,
-                                risk_max_order_notional_dollars=thresholds.risk_max_order_notional_dollars * factor,
-                                risk_max_position_notional_dollars=thresholds.risk_max_position_notional_dollars * factor,
-                                risk_safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
-                                risk_risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
-                                trigger_max_spread_bps=thresholds.trigger_max_spread_bps,
-                                trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds,
-                                strategy_quality_edge_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
-                                strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
-                            )
-                        total_capital = total_capital_early
-                        if total_capital is not None and total_capital > 0:
-                            order_cap = float(total_capital) * self.settings.risk_order_pct
-                            position_cap = float(total_capital) * self.settings.risk_position_pct
-                            effective_thresholds = RuntimeThresholds(
-                                risk_min_edge_bps=effective_thresholds.risk_min_edge_bps,
-                                risk_max_order_notional_dollars=order_cap,
-                                risk_max_position_notional_dollars=position_cap,
-                                risk_safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
-                                risk_risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
-                                trigger_max_spread_bps=effective_thresholds.trigger_max_spread_bps,
-                                trigger_cooldown_seconds=effective_thresholds.trigger_cooldown_seconds,
-                                strategy_quality_edge_buffer_bps=effective_thresholds.strategy_quality_edge_buffer_bps,
-                                strategy_min_remaining_payout_bps=effective_thresholds.strategy_min_remaining_payout_bps,
-                            )
+                            order_cap *= factor
+                            position_cap *= factor
+                        effective_thresholds = RuntimeThresholds(
+                            risk_min_edge_bps=thresholds.risk_min_edge_bps,
+                            risk_max_order_notional_dollars=order_cap,
+                            risk_max_position_notional_dollars=position_cap,
+                            risk_safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
+                            risk_risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
+                            trigger_max_spread_bps=thresholds.trigger_max_spread_bps,
+                            trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds,
+                            strategy_quality_edge_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
+                            strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
+                        )
                         portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
                             kalshi_env=room.kalshi_env,
                             subaccount=self.settings.kalshi_subaccount,
-                            total_capital_dollars=total_capital if total_capital is not None else Decimal(str(effective_thresholds.risk_max_position_notional_dollars)),
+                            total_capital_dollars=total_capital if total_capital is not None else Decimal(str(_assumed)),
                             safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
                             risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
                         )

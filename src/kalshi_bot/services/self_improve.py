@@ -720,7 +720,8 @@ class SelfImproveService:
             return "abnormal blocked-order spike"
         if metrics["stale_rate"] > 0.5:
             return "stale-data spike"
-        if metrics["drawdown"] < -abs(self.settings.risk_daily_loss_limit_dollars):
+        daily_loss_limit = self.settings.risk_daily_loss_limit_dollars or (self.settings.risk_daily_loss_pct * self.settings.risk_assumed_capital_dollars)
+        if metrics["drawdown"] < -abs(daily_loss_limit):
             return "drawdown breach"
         return None
 

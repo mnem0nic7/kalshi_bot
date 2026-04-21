@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -84,12 +84,26 @@ class Settings(BaseSettings):
     llm_trading_enabled: bool = False
 
     trigger_broken_book_retry_seconds: int = 30
+    risk_assumed_capital_dollars: float = 1000.0
     risk_order_pct: float = 0.05
     risk_position_pct: float = 0.10
-    risk_max_order_notional_dollars: float = 50.0
-    risk_max_position_notional_dollars: float = 100.0
-    risk_daily_loss_limit_dollars: float = 50.0
+    risk_daily_loss_pct: float = 0.05
     risk_max_concurrent_tickers: int = 10
+    # Dollar amounts derived from pct × assumed_capital when not explicitly set.
+    # Set these only to override the percentage-based calculation (e.g. in tests).
+    risk_max_order_notional_dollars: float | None = None
+    risk_max_position_notional_dollars: float | None = None
+    risk_daily_loss_limit_dollars: float | None = None
+
+    @model_validator(mode="after")
+    def _compute_dollar_limits(self) -> "Settings":
+        if self.risk_max_order_notional_dollars is None:
+            self.risk_max_order_notional_dollars = self.risk_order_pct * self.risk_assumed_capital_dollars
+        if self.risk_max_position_notional_dollars is None:
+            self.risk_max_position_notional_dollars = self.risk_position_pct * self.risk_assumed_capital_dollars
+        if self.risk_daily_loss_limit_dollars is None:
+            self.risk_daily_loss_limit_dollars = self.risk_daily_loss_pct * self.risk_assumed_capital_dollars
+        return self
     stop_loss_threshold_pct: float = 0.25
     stop_loss_profit_protection_threshold_pct: float = 0.15
     stop_loss_reentry_cooldown_seconds: int = 14400
