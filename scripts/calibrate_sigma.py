@@ -231,8 +231,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--min-samples", type=int, default=5, help="Minimum market-days per cell (default: 5)")
     parser.add_argument(
-        "--error-threshold-bps", type=float, default=2000.0,
-        help="Median bps error above which a cell is flagged (default: 2000)",
+        "--error-threshold-bps", type=float, default=2500.0,
+        help="Median bps error above which a cell is flagged (default: 2500)",
     )
     args = parser.parse_args()
     sys.exit(asyncio.run(run(args.min_samples, args.error_threshold_bps)))
