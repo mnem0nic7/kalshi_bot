@@ -64,7 +64,7 @@ def test_compile_pack_clamps_invalid_actions() -> None:
     assert compiled.thresholds.risk_min_edge_bps == 500
     assert compiled.thresholds.trigger_max_spread_bps == 50
     assert compiled.thresholds.strategy_quality_edge_buffer_bps == 500
-    assert compiled.thresholds.strategy_min_remaining_payout_bps == 50
+    assert compiled.thresholds.strategy_min_remaining_payout_bps == 300
     assert compiled.policy_graph[0].action.recommended_strategy_mode == StrategyMode.LATE_DAY_AVOID
     assert compiled.policy_graph[0].action.force_stand_down_reason == StandDownReason.NO_ACTIONABLE_EDGE
 

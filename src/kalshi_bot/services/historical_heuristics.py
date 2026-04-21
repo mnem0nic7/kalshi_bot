@@ -175,7 +175,7 @@ class HistoricalHeuristicService:
         thresholds.risk_min_edge_bps = self._clamp_int(thresholds.risk_min_edge_bps, 100, 500)
         thresholds.trigger_max_spread_bps = self._clamp_int(thresholds.trigger_max_spread_bps, 50, 2500)
         thresholds.strategy_quality_edge_buffer_bps = self._clamp_int(thresholds.strategy_quality_edge_buffer_bps, 0, 500)
-        thresholds.strategy_min_remaining_payout_bps = self._clamp_int(thresholds.strategy_min_remaining_payout_bps, 50, 5000)
+        thresholds.strategy_min_remaining_payout_bps = self._clamp_int(thresholds.strategy_min_remaining_payout_bps, 300, 5000)
         calibrations = [self._compiled_calibration(entry) for entry in pack.calibration_entries]
         policy_graph = [self._compiled_policy_node(node) for node in pack.policy_graph]
         return pack.model_copy(update={"thresholds": thresholds, "calibration_entries": calibrations, "policy_graph": policy_graph})
@@ -331,7 +331,7 @@ class HistoricalHeuristicService:
         action.risk_min_edge_bps = self._clamp_int(action.risk_min_edge_bps, 100, 500)
         action.trigger_max_spread_bps = self._clamp_int(action.trigger_max_spread_bps, 50, 2500)
         action.strategy_quality_edge_buffer_bps = self._clamp_int(action.strategy_quality_edge_buffer_bps, 0, 500)
-        action.strategy_min_remaining_payout_bps = self._clamp_int(action.strategy_min_remaining_payout_bps, 50, 5000)
+        action.strategy_min_remaining_payout_bps = self._clamp_int(action.strategy_min_remaining_payout_bps, 300, 5000)
         if action.recommended_strategy_mode is not None and action.recommended_strategy_mode.value not in self.ALLOWED_STRATEGY_MODES:
             action.recommended_strategy_mode = StrategyMode.LATE_DAY_AVOID
         if action.force_stand_down_reason is not None and action.force_stand_down_reason.value not in self.ALLOWED_FORCE_STAND_DOWN:
