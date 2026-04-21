@@ -26,7 +26,7 @@ services:
     environment:
       APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
       APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-true}
+      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
       KALSHI_ENV: ${KALSHI_ENV:-demo}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
@@ -53,7 +53,7 @@ services:
     environment:
       APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
       APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-true}
+      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
       KALSHI_ENV: ${KALSHI_ENV:-demo}
       APP_COLOR: blue
       POSTGRES_HOST: postgres
@@ -89,7 +89,7 @@ services:
     environment:
       APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
       APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-true}
+      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
       KALSHI_ENV: ${KALSHI_ENV:-demo}
       APP_COLOR: green
       POSTGRES_HOST: postgres
@@ -126,7 +126,7 @@ services:
     environment:
       APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
       APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-true}
+      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
       KALSHI_ENV: ${KALSHI_ENV:-demo}
       APP_COLOR: blue
       POSTGRES_HOST: postgres
@@ -161,7 +161,7 @@ services:
     environment:
       APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
       APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-true}
+      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
       KALSHI_ENV: ${KALSHI_ENV:-demo}
       APP_COLOR: green
       POSTGRES_HOST: postgres
