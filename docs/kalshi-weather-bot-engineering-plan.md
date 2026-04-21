@@ -10,7 +10,7 @@
 
 A Python async service that trades Kalshi's daily-resolving weather contracts (temperature highs) using probabilistic fair-value estimates derived from free NWS/NOAA data. The system is **deliberately selective**: it only opens positions when modeled probability diverges materially from market price and model confidence is high. Target profile is high win-rate, low volume — not market-making.
 
-The core trading loop is **fully deterministic**: signal → risk → execution runs without any LLM involvement. An optional LLM agent suite (8 roles backed by Gemini 2.5) is available for research, posture-setting, and audit but is disabled by default (`llm_trading_enabled = False`). A self-improvement pipeline critiques completed rooms and proposes updated agent packs; a historical intelligence pipeline mines 365 days of archived weather and market data to tune heuristics.
+The core trading loop is **fully deterministic**: signal → risk → execution runs without any LLM involvement (`llm_trading_enabled = False`, permanently). The LLM agent suite (8 roles backed by Gemini 2.5) is scaffolding that is not used in production. A self-improvement pipeline critiques completed rooms and proposes updated agent packs; a historical intelligence pipeline mines 365 days of archived weather and market data to tune heuristics.
 
 ### Why this setup wins
 
@@ -530,7 +530,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `APP_SHADOW_MODE` | `true` | `false` to enable live orders |
 | `APP_ENABLE_KILL_SWITCH` | `true` | `false` to permit execution |
 | `APP_COLOR` | `blue` | Blue/green identity |
-| `LLM_TRADING_ENABLED` | `false` | Enable full 8-role LLM agent suite |
+| `LLM_TRADING_ENABLED` | `false` | Not used in production; deterministic fast path only |
 | `GEMINI_API_KEY` | — | Primary LLM provider |
 | `WEATHER_MARKET_MAP_PATH` | `docs/examples/weather_markets.example.yaml` | Market → NWS mapping |
 | `DEMO_KALSHI_API_KEY` | — | Demo API key ID |
