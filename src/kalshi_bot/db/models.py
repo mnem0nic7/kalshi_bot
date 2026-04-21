@@ -82,6 +82,7 @@ class RawWeatherEvent(Base, IdMixin):
 class MarketState(Base, TimestampMixin):
     __tablename__ = "market_state"
 
+    kalshi_env: Mapped[str] = mapped_column(String(16), primary_key=True, default="demo")
     market_ticker: Mapped[str] = mapped_column(String(128), primary_key=True)
     source: Mapped[str] = mapped_column(String(64), default="kalshi")
     yes_bid_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
@@ -94,6 +95,7 @@ class MarketState(Base, TimestampMixin):
 class MarketPriceHistory(Base, IdMixin):
     __tablename__ = "market_price_history"
 
+    kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False, default="demo", index=True)
     market_ticker: Mapped[str] = mapped_column(String(128), nullable=False)
     yes_bid_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
     yes_ask_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
@@ -147,9 +149,10 @@ class RiskVerdictRecord(Base, IdMixin, TimestampMixin):
 
 class OrderRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "orders"
-    __table_args__ = (UniqueConstraint("client_order_id", name="uq_orders_client_order_id"),)
+    __table_args__ = (UniqueConstraint("kalshi_env", "client_order_id", name="uq_orders_env_client_order_id"),)
 
     trade_ticket_id: Mapped[str | None] = mapped_column(ForeignKey("trade_tickets.id", ondelete="SET NULL"), nullable=True)
+    kalshi_env: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     kalshi_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     client_order_id: Mapped[str] = mapped_column(String(64))
     market_ticker: Mapped[str] = mapped_column(String(128), index=True)
@@ -163,9 +166,10 @@ class OrderRecord(Base, IdMixin, TimestampMixin):
 
 class FillRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "fills"
-    __table_args__ = (UniqueConstraint("trade_id", name="uq_fills_trade_id"),)
+    __table_args__ = (UniqueConstraint("kalshi_env", "trade_id", name="uq_fills_env_trade_id"),)
 
     order_id: Mapped[str | None] = mapped_column(ForeignKey("orders.id", ondelete="SET NULL"), nullable=True, index=True)
+    kalshi_env: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     trade_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     market_ticker: Mapped[str] = mapped_column(String(128), index=True)
     side: Mapped[str] = mapped_column(String(16))
@@ -179,11 +183,11 @@ class FillRecord(Base, IdMixin, TimestampMixin):
 
 class PositionRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "positions"
-    __table_args__ = (UniqueConstraint("market_ticker", "subaccount", name="uq_positions_market_subaccount"),)
+    __table_args__ = (UniqueConstraint("kalshi_env", "market_ticker", "subaccount", name="uq_positions_env_market_subaccount"),)
 
     market_ticker: Mapped[str] = mapped_column(String(128), index=True)
     subaccount: Mapped[int] = mapped_column(Integer, default=0)
-    kalshi_env: Mapped[str] = mapped_column(String(16), default="")
+    kalshi_env: Mapped[str] = mapped_column(String(16), default="demo", index=True)
     side: Mapped[str] = mapped_column(String(16))
     count_fp: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     average_price_dollars: Mapped[Decimal] = mapped_column(Numeric(10, 4))
@@ -194,10 +198,34 @@ class OpsEvent(Base, IdMixin, TimestampMixin):
     __tablename__ = "ops_events"
 
     room_id: Mapped[str | None] = mapped_column(ForeignKey("rooms.id", ondelete="SET NULL"), nullable=True, index=True)
+    kalshi_env: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     severity: Mapped[str] = mapped_column(String(16))
     summary: Mapped[str] = mapped_column(Text())
     source: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WebUser(Base, IdMixin, TimestampMixin):
+    __tablename__ = "web_users"
+
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    password_salt: Mapped[str] = mapped_column(String(64))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+    sessions: Mapped[list["WebSession"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class WebSession(Base, IdMixin, TimestampMixin):
+    __tablename__ = "web_sessions"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("web_users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+    user: Mapped[WebUser] = relationship(back_populates="sessions")
 
 
 class ResearchDossierRecord(Base, TimestampMixin):
@@ -608,7 +636,7 @@ class Checkpoint(Base, IdMixin, TimestampMixin):
 class DeploymentControl(Base):
     __tablename__ = "deployment_control"
 
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default="default")
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default="demo")
     active_color: Mapped[str] = mapped_column(String(16), default=DeploymentColor.BLUE.value)
     kill_switch_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     execution_lock_holder: Mapped[str | None] = mapped_column(String(64), nullable=True)

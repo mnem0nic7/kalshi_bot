@@ -40,7 +40,8 @@ class StrategyEvaluationService:
         return result
 
     async def _maybe_adjust(self, repo: PlatformRepository) -> dict[str, Any] | None:
-        win_rate_data = await repo.get_fill_win_rate_30d()
+        checkpoint_name = f"{_CHECKPOINT}:{self.settings.kalshi_env}"
+        win_rate_data = await repo.get_fill_win_rate_30d(kalshi_env=self.settings.kalshi_env)
         total = win_rate_data["total_contracts"]
         won = win_rate_data["won_contracts"]
 
@@ -50,7 +51,7 @@ class StrategyEvaluationService:
         win_rate = won / total
         now = datetime.now(UTC)
 
-        checkpoint = await repo.get_checkpoint(_CHECKPOINT)
+        checkpoint = await repo.get_checkpoint(checkpoint_name)
         if checkpoint is not None:
             last_at = datetime.fromisoformat(checkpoint.payload["adjusted_at"])
             last_dir = checkpoint.payload.get("direction")
@@ -95,7 +96,7 @@ class StrategyEvaluationService:
             "win_rate": round(win_rate, 4),
             "total_contracts": total,
         }
-        await repo.set_checkpoint(_CHECKPOINT, cursor=None, payload=event_payload)
+        await repo.set_checkpoint(checkpoint_name, cursor=None, payload=event_payload)
         await repo.log_ops_event(
             severity="info",
             summary=(

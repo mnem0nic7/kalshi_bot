@@ -7,7 +7,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 compose_file="${COMPOSE_FILE:-infra/docker-compose.yml}"
-service="${APP_SERVICE:-app_blue}"
+service="${APP_SERVICE:-app_demo_blue}"
 
 extra_env=()
 gemini_runtime_key="${GEMINI_API_KEY:-${GEMINI_KEY:-}}"

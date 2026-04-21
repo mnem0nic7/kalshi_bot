@@ -309,10 +309,10 @@ def test_risk_engine_blocks_low_confidence_signal() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         risk_min_edge_bps=50,
-        risk_min_confidence=0.60,
+        risk_min_confidence=0.70,
     )
     engine = DeterministicRiskEngine(settings)
-    low_conf_signal = replace(make_signal(edge_bps=200), confidence=0.45)
+    low_conf_signal = replace(make_signal(edge_bps=200), confidence=0.65)
     verdict = engine.evaluate(
         room=make_room(),
         control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),

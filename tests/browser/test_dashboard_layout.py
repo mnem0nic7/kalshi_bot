@@ -402,6 +402,8 @@ def _serve_dashboard(
     tmp_path: Path,
     payloads: dict[str, object] | None = None,
     strategies_payload_factory=None,
+    *,
+    site_kind: str = "combined",
 ):
     map_path = tmp_path / "markets.yaml"
     map_path.write_text("markets: []\n", encoding="utf-8")
@@ -410,6 +412,7 @@ def _serve_dashboard(
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    monkeypatch.setenv("WEB_SITE_KIND", site_kind)
     get_settings.cache_clear()
 
     if payloads is None:
@@ -699,5 +702,21 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert "Recommendation Rationale" in detail_text_90d
                 assert "Approve Recommendation" not in detail_text_90d
                 assert "Stored regression history" in detail_text_90d
+            finally:
+                browser.close()
+
+
+def test_single_site_shell_renders_static_site_label(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with _serve_dashboard(monkeypatch, tmp_path, site_kind="demo") as base_url:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                page.goto(base_url, wait_until="load", timeout=15_000)
+                page.wait_for_selector(".dash-shell-site-label", timeout=15_000)
+                assert page.locator(".dash-shell-site-label").text_content(timeout=15_000) == "Demo"
+                assert page.locator(".dash-tab").count() == 0
+                assert page.title() == "Kalshi Bot Demo"
+                assert page.locator("#panel-demo").is_visible()
             finally:
                 browser.close()

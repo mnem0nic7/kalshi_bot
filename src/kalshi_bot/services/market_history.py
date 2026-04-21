@@ -81,6 +81,7 @@ class MarketHistoryService:
                 volume = int(raw_volume) if raw_volume is not None else None
                 await repo.record_market_price_snapshot(
                     market_ticker=ticker,
+                    kalshi_env=self.kalshi.settings.kalshi_env,
                     yes_bid_dollars=bid,
                     yes_ask_dollars=ask,
                     mid_dollars=mid,
@@ -101,7 +102,9 @@ class MarketHistoryService:
         self._last_purge_at = now
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            deleted = await repo.purge_market_price_history(older_than=timedelta(hours=self.retention_hours))
+            deleted = await repo.purge_market_price_history(
+                older_than=timedelta(hours=self.retention_hours),
+            )
             await session.commit()
         if deleted:
             logger.info("market_history: purge_once removed %d rows older than %dh", deleted, self.retention_hours)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from kalshi_bot.agents.providers import ProviderRouter
@@ -91,6 +94,8 @@ class AppContainer:
         weather = NWSWeatherClient(settings)
         forecast_archive = OpenMeteoForecastArchiveClient(settings)
         weather_directory = WeatherMarketDirectory.from_file(settings.weather_market_map_file)
+        for warning in weather_directory.validate():
+            logger.warning("Market map validation: %s", warning)
         agent_pack_service = AgentPackService(settings)
         signal_engine = WeatherSignalEngine(settings)
         risk_engine = DeterministicRiskEngine(settings)

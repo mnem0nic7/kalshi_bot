@@ -61,6 +61,16 @@
     }
   }
 
+  const dashboardRoot = document.getElementById("dashboard");
+  const dashboardMode = dashboardRoot?.dataset.dashboardMode || "combined";
+
+  function currentDashboardEnv() {
+    if (dashboardMode === "single_site") {
+      return dashboardRoot?.dataset.activeEnv || "demo";
+    }
+    return document.querySelector('.dash-tab.is-active[data-tab-mode="local"]')?.dataset.env || dashboardRoot?.dataset.activeEnv || "demo";
+  }
+
   const strategyState = {
     payload: parseBootstrap(),
     windowDays: 180,
@@ -82,9 +92,10 @@
     }
   }
 
-  document.querySelectorAll(".dash-tab").forEach((btn) => {
+  document.querySelectorAll('.dash-tab[data-tab-mode="local"]').forEach((btn) => {
     btn.addEventListener("click", () => {
       const env = btn.dataset.env;
+      if (!env) return;
       document.querySelectorAll(".dash-tab").forEach((b) => {
         b.classList.toggle("is-active", b === btn);
         b.setAttribute("aria-selected", b === btn ? "true" : "false");
@@ -94,6 +105,7 @@
         panel.classList.toggle("is-active", active);
         panel.hidden = !active;
       });
+      if (dashboardRoot) dashboardRoot.dataset.activeEnv = env;
       if (env === "strategies") {
         if (strategyState.dirty || !strategyState.payload) {
           loadStrategies();
@@ -1329,8 +1341,23 @@
   }
 
   async function refreshAll() {
+    const activeEnv = currentDashboardEnv();
+    if (dashboardMode === "single_site") {
+      if (activeEnv === "strategies") {
+        await loadStrategies({
+          windowDays: strategyState.windowDays,
+          seriesTicker: strategyState.selectedSeriesTicker,
+          strategyName: strategyState.selectedSeriesTicker ? null : strategyState.selectedStrategyName,
+        });
+      } else {
+        await refreshEnv(activeEnv);
+      }
+      setLastRefreshed();
+      refreshTimestamps();
+      return;
+    }
+
     await Promise.all([refreshEnv("demo"), refreshEnv("production")]);
-    const activeEnv = document.querySelector(".dash-tab.is-active")?.dataset.env;
     if (activeEnv === "strategies" && strategyState.payload) {
       await loadStrategies({
         windowDays: strategyState.windowDays,

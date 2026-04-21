@@ -109,7 +109,10 @@ class StopLossService:
             if not positions:
                 return triggered
             tickers = [p.market_ticker for p in positions]
-            market_states = {ms.market_ticker: ms for ms in await repo.list_market_states(tickers)}
+            market_states = {
+                ms.market_ticker: ms
+                for ms in await repo.list_market_states(tickers, kalshi_env=self.settings.kalshi_env)
+            }
 
         now = datetime.now(UTC)
         # Fetch a full trading day of price history for each held ticker.
@@ -118,11 +121,24 @@ class StopLossService:
             repo = PlatformRepository(session)
             price_histories = {}
             for ticker in tickers:
-                price_histories[ticker] = await repo.fetch_recent_prices(ticker, window=today_window)
+                price_histories[ticker] = await repo.fetch_recent_prices(
+                    ticker,
+                    kalshi_env=self.settings.kalshi_env,
+                    window=today_window,
+                )
 
+        stale_cutoff = timedelta(seconds=self.settings.risk_stale_market_seconds)
         for position in positions:
             ms = market_states.get(position.market_ticker)
             if ms is None:
+                continue
+
+            if ms.observed_at is None or (now - ms.observed_at) > stale_cutoff:
+                logger.warning(
+                    "stop_loss skipping %s: market state stale (observed_at=%s)",
+                    position.market_ticker,
+                    ms.observed_at,
+                )
                 continue
 
             mid = _midpoint(ms, position.side)
@@ -149,7 +165,7 @@ class StopLossService:
             repo = PlatformRepository(session)
 
             # shared submit cooldown — read with committed isolation
-            submit_key = f"stop_loss_submit:{position.market_ticker}"
+            submit_key = f"stop_loss_submit:{self.settings.kalshi_env}:{position.market_ticker}"
             submit_cp = await repo.get_checkpoint(submit_key)
             if submit_cp is not None:
                 next_retry = submit_cp.payload.get("next_retry_at")
@@ -282,12 +298,12 @@ class StopLossService:
             # Back off 30 min on order failure to avoid spamming an illiquid book.
             submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
         await repo.set_checkpoint(
-            f"stop_loss_submit:{market_ticker}",
+            f"stop_loss_submit:{self.settings.kalshi_env}:{market_ticker}",
             cursor=None,
             payload=submit_payload,
         )
         await repo.set_checkpoint(
-            f"stop_loss_reentry:{market_ticker}",
+            f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}",
             cursor=None,
             payload={
                 "stopped_at": now.isoformat(),

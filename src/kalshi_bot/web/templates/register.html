@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+
+{% block main_class %}auth-main{% endblock %}
+
+{% block content %}
+  <section class="auth-layout">
+    <article class="panel auth-panel">
+      <p class="auth-eyebrow">Restricted Registration</p>
+      <div class="auth-copy">
+        <h1>Create the operator account</h1>
+        <p>Registration is intentionally narrow and limited to the approved operator account for this site.</p>
+      </div>
+      <form method="post" action="/register{{ next_query or '' }}" class="auth-form">
+        {% if error_message %}
+          <div class="auth-error" role="alert">{{ error_message }}</div>
+        {% endif %}
+        <label>
+          Email
+          <input type="email" name="email" autocomplete="email" value="{{ form_values.email if form_values else '' }}" required />
+        </label>
+        <label>
+          Password
+          <input type="password" name="password" autocomplete="new-password" minlength="8" required />
+        </label>
+        <div class="auth-actions">
+          <button type="submit">Register</button>
+          <a class="auth-secondary-link" href="/login{{ next_query or '' }}">Already have access?</a>
+        </div>
+      </form>
+    </article>
+
+    <aside class="panel auth-panel">
+      <p class="auth-eyebrow">What This Does</p>
+      <ul class="auth-list">
+        <li>Creates the single approved operator account for this site.</li>
+        <li>Starts a secure session in this browser right away.</li>
+        <li>Leaves the rest of the site locked behind login.</li>
+      </ul>
+    </aside>
+  </section>
+{% endblock %}

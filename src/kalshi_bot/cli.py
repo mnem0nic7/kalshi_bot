@@ -437,13 +437,20 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "health-check":
             if args.health_command == "app":
-                payload = await container.watchdog_service.app_health(color=args.color)
+                payload = await container.watchdog_service.app_health(
+                    color=args.color,
+                    kalshi_env=container.settings.kalshi_env,
+                )
                 print(json.dumps(payload, indent=2))
                 return 0 if payload["healthy"] else 1
             if args.health_command == "daemon":
                 async with container.session_factory() as session:
                     repo = PlatformRepository(session)
-                    payload = await container.watchdog_service.daemon_health(repo, color=args.color)
+                    payload = await container.watchdog_service.daemon_health(
+                        repo,
+                        color=args.color,
+                        kalshi_env=container.settings.kalshi_env,
+                    )
                     await session.commit()
                 print(json.dumps(payload, indent=2))
                 return 0 if payload["healthy"] else 1
@@ -452,7 +459,10 @@ async def _run_cli(args: argparse.Namespace) -> int:
             async with container.session_factory() as session:
                 repo = PlatformRepository(session)
                 if args.watchdog_command == "status":
-                    payload = await container.watchdog_service.get_status(repo)
+                    payload = await container.watchdog_service.get_status(
+                        repo,
+                        kalshi_env=container.settings.kalshi_env,
+                    )
                     await session.commit()
                     print(json.dumps(payload, indent=2))
                     return 0
@@ -582,10 +592,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
             if args.command == "status":
                 control = await repo.get_deployment_control()
-                positions = await repo.list_positions(limit=10)
-                ops_events = await repo.list_ops_events(limit=10)
+                positions = await repo.list_positions(limit=10, kalshi_env=container.settings.kalshi_env)
+                ops_events = await repo.list_ops_events(limit=10, kalshi_env=container.settings.kalshi_env)
                 await session.commit()
                 payload = {
+                    "kalshi_env": container.settings.kalshi_env,
                     "active_color": control.active_color,
                     "kill_switch_enabled": control.kill_switch_enabled,
                     "execution_lock_holder": control.execution_lock_holder,

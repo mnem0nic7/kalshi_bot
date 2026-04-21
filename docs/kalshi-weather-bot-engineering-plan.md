@@ -27,6 +27,8 @@ The core trading loop is **fully deterministic**: signal → risk → execution 
 
 Markets are configured in `weather_market_map_path` (YAML). The weather directory maps each Kalshi series ticker to a specific ICAO station and NWS gridpoint. All series below are currently mapped and receiving live feeds.
 
+**Adding/removing cities:** Edit the YAML and restart. At startup, `WeatherMarketDirectory.validate()` checks every `market_type=weather` entry for required fields (`station_id`, `location_name`, `latitude`, `longitude`, `threshold_f`). Missing fields produce a `WARNING` log — the service starts normally but the incomplete city will not be tradeable until the YAML is corrected.
+
 | Series | Market | NWS Station | Notes |
 |---|---|---|---|
 | `KXHIGHAUS` | Austin daily high | EWX/KSAT | Active |
@@ -68,7 +70,7 @@ For each open weather market, compute `fair_yes_dollars` = modeled probability t
 ```
 edge_bps = |fair_yes_dollars − market_touch| × 10,000
 500 bps ≤ edge_bps ≤ 5000 bps       ← risk_min_edge_bps / risk_max_credible_edge_bps
-confidence ≥ 0.60                   ← risk_min_confidence; hard block in risk engine
+confidence ≥ 0.70                   ← risk_min_confidence; hard block in risk engine
 trade_regime == "standard"          ← near-threshold and longshot trades are blocked
 ```
 
@@ -114,19 +116,27 @@ confidence = min(0.95, 0.45 + min(|delta_f| / 12, 0.35) + (0.15 if current_obs a
 Position size is derived from live account balance at trade time:
 
 ```
-max_order_notional  = total_capital × risk_order_pct    (5%)
+max_order_notional    = total_capital × risk_order_pct     (5%)
 max_position_notional = total_capital × risk_position_pct  (10%)
-count_fp = floor((max_order_notional × confidence) / yes_price_dollars)
-count_fp = min(count_fp, risk_max_order_count_fp)        (500 contracts hard cap)
+
+confidence_factor:
+  confidence ≥ 0.90 → 100% of max_order_notional
+  confidence ≥ 0.80 → 75%
+  confidence ≥ 0.70 → 50%   (trades below 0.70 are blocked entirely)
+
+count_fp = floor((max_order_notional × confidence_factor) / yes_price_dollars)
+count_fp = min(count_fp, risk_max_order_count_fp)          (500 contracts hard cap)
 ```
 
 If live capital cannot be determined (reconcile not yet run, API unreachable), trading is blocked entirely rather than falling back to an assumed amount.
 
+**Daily loss sensitivity.** If today's realized P&L represents a loss ≥ `risk_daily_loss_sensitivity_pct` (10%) of total capital, the risk engine automatically tightens parameters for subsequent trades: `risk_min_edge_bps` doubles (×2.0) and `risk_max_order_notional_dollars` is halved (×0.5). This does not block trading — a genuinely high-confidence setup still executes, but at smaller size and with a harder edge requirement. The sensitivity state is logged in the SUPERVISOR room message.
+
 A `size_factor` (0–1) is applied when entering market gates:
 - Spread > 60% of mid → reject entirely.
-- Volume < 5 contracts → reject.
+- Volume < 50 contracts → reject (floor ensures meaningful book depth for IOC fills).
 - Adverse 60-minute momentum → reject.
-- Otherwise size_factor scales linearly with volume.
+- Otherwise `size_factor` scales linearly from 0 at 50 contracts to 1.0 at 100+ contracts.
 
 ### 3.5 Execution style
 
@@ -137,11 +147,11 @@ A `size_factor` (0–1) is applied when entering market gates:
 
 ### 3.6 Stop loss and position protection
 
-Three exit triggers checked every 60 seconds:
+Three exit triggers checked every 60 seconds. Each evaluation first verifies that the ticker's `market_state.observed_at` is within `risk_stale_market_seconds` (60s) — if the WebSocket feed is down, evaluation is skipped rather than acting on a stale price:
 
 | Trigger | Condition | Cooldown before re-entry |
 |---|---|---|
-| Loss threshold | Unrealized loss ≥ 25% of cost basis | 5-min momentum check required |
+| Trailing stop | Price drops ≥ 10% from today's intraday peak (not cost basis) | 5-min momentum check required |
 | Adverse momentum | Held ≥ 30 min AND slope ≤ −0.2 ¢/min | 5-min momentum check required |
 | Profit protection | Unrealized gain ≥ 15% AND slope ≤ −0.2 ¢/min | 5-min momentum check required |
 
@@ -293,7 +303,7 @@ Resolution-state detection: if `current_temp_f >= threshold`, the market is `LOC
 | 3 | Resolution state | Market not UNRESOLVED |
 | 4 | Min edge | `edge_bps < risk_min_edge_bps` (500 bps) |
 | 5 | Max edge (credibility) | `edge_bps > risk_max_credible_edge_bps` (5000 bps) — model error signal |
-| 6 | Confidence floor | `signal.confidence < risk_min_confidence` (0.60) |
+| 6 | Confidence floor | `signal.confidence < risk_min_confidence` (0.70) |
 | 7 | Contract price floor | contract price < `risk_min_contract_price_dollars` (0.05) — market pricing it as nearly impossible |
 | 7b | Probability extremity | `fair_yes` between 25% and 75% — too close to coin-flip; forecast noise exceeds edge signal (`risk_min_probability_extremity_pct=25.0`, disabled by default, enable in production) |
 | 8 | Market staleness | `market_observed_at` older than 60s |
@@ -304,7 +314,7 @@ Resolution-state detection: if `current_temp_f >= threshold`, the market is `LOC
 | 13 | Trade regime | regime in `{near_threshold, longshot_yes, longshot_no}` |
 | 14 | Order notional | `order_notional > total_capital × 5%` |
 | 15 | Position notional | `(position + order) > total_capital × 10%` |
-| 16 | Capital bucket | Risky bucket full, or safe reserve target not met |
+| 16 | Capital bucket | Risky bucket full, or safe reserve target not met — **intentionally disabled** (`risk_safe_capital_reserve_ratio=0.0`, `risk_risky_capital_max_ratio=0.0`); regime filtering (guard #13) already excludes all risky trades |
 
 **Risk limits (current production defaults):**
 
@@ -315,10 +325,12 @@ Resolution-state detection: if `current_temp_f >= threshold`, the market is `LOC
 | Max concurrent tickers | 10 | Unique open-position tickers |
 | Min edge | 100 bps (1 cent) | Hard cutoff |
 | Allowed trade regimes | standard only | near_threshold and longshot blocked |
-| Safe capital reserve | 0% | No portion reserved |
-| Risky capital max | 0% | No risky-bucket trades |
+| Safe capital reserve | 0% | Disabled — no reserve held back |
+| Risky capital max | 0% | Disabled — risky-regime trades blocked upstream at guard #13 |
 
-**Kill switch.** `DeploymentControl.kill_switch_enabled` blocks all execution. Toggleable via the control room UI. Default: enabled.
+**Kill switch.** `DeploymentControl.kill_switch_enabled` blocks all execution. Toggleable via the control room UI. Default: enabled. The watchdog auto-enables it if the active color's `daemon_reconcile` checkpoint is stale by more than `daemon_reconcile_stale_kill_switch_seconds` (300s, ~5 missed reconcile cycles) and logs a `critical` ops event. Clearing the kill switch after an auto-trip still requires a successful post-clear reconcile (see below).
+
+**Post-clear reconcile gate.** When the kill switch is cleared, `kill_switch_cleared_at` is stamped in `DeploymentControl.notes`. The supervisor refuses to execute until the `daemon_reconcile:{color}` checkpoint carries a `reconciled_at` timestamp newer than that clear time — typically one 60s reconcile cycle. This ensures positions and orders are synchronized before any live order is submitted after a kill switch event.
 
 ---
 
@@ -357,7 +369,7 @@ Enabled in all running environments (`TRIGGER_ENABLE_AUTO_ROOMS=true`). This is 
 1. Receives market ticker updates from the WebSocket stream.
 2. Skips tickers not in the weather directory.
 3. Checks spread ≤ `trigger_max_spread_bps` (1200 bps) and both sides quoted.
-4. Enforces per-ticker cooldown (300s normal, 30s after broken-book event).
+4. Enforces per-ticker cooldown (300s normal, 30s after broken-book event). **Bypass:** if the YES mid price has moved ≥ `trigger_price_move_bypass_bps` (1500 bps) since the last trigger, the cooldown is overridden — the move magnitude itself justifies a fresh evaluation.
 5. Enforces `trigger_max_concurrent_rooms` (4) limit.
 6. Checks `stop_loss_reentry` checkpoint: if set, requires 5-minute sustained directional momentum (|slope| ≥ 0.2 ¢/min) before opening.
 7. Creates a room and runs it via supervisor.
@@ -548,7 +560,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `RISK_DAILY_LOSS_PCT` | 0.05 | 5% daily loss limit (self-improve gate) |
 | `RISK_MIN_EDGE_BPS` | 500 | Minimum edge required; self-improvement pipeline can tune down to 100 bps floor |
 | `RISK_MAX_CREDIBLE_EDGE_BPS` | 5000 | Maximum credible edge; larger values indicate model error |
-| `RISK_MIN_CONFIDENCE` | 0.60 | Hard block below this confidence score |
+| `RISK_MIN_CONFIDENCE` | 0.70 | Hard block below this confidence score; 0.70–0.80 gets 50% size, 0.80–0.90 gets 75%, ≥0.90 gets 100% |
 | `RISK_MIN_CONTRACT_PRICE_DOLLARS` | 0.05 | Hard block if the traded side costs less than 5¢ |
 | `RISK_MIN_PROBABILITY_EXTREMITY_PCT` | 0.0 (prod: 25.0) | Block trades where fair_yes is within this many pct-points of 50%; set 25.0 in production |
 | `RISK_MAX_CONCURRENT_TICKERS` | 10 | Max open-position tickers |
@@ -559,7 +571,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `STOP_LOSS_THRESHOLD_PCT` | 0.25 | Exit at 25% unrealized loss |
+| `STOP_LOSS_THRESHOLD_PCT` | 0.10 | Exit when price drops ≥ 10% from today's intraday peak |
 | `STOP_LOSS_PROFIT_PROTECTION_THRESHOLD_PCT` | 0.15 | Exit profitable positions on adverse momentum |
 | `STOP_LOSS_MOMENTUM_SLOPE_THRESHOLD_CENTS_PER_MIN` | −0.2 | Adverse momentum sensitivity |
 | `STOP_LOSS_MOMENTUM_MIN_HOLD_MINUTES` | 30 | Minimum hold before momentum exit |

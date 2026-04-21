@@ -188,6 +188,15 @@ def remaining_payout_dollars(side: ContractSide, yes_price_dollars: Decimal) -> 
     return quantize_price(yes_price_dollars)
 
 
+def _confidence_size_factor(confidence: float) -> Decimal:
+    """Three-tier position sizing: 0.70–0.80 → 50%, 0.80–0.90 → 75%, 0.90+ → 100%."""
+    if confidence >= 0.90:
+        return Decimal("1.00")
+    if confidence >= 0.80:
+        return Decimal("0.75")
+    return Decimal("0.50")
+
+
 def suggested_trade_count_fp(
     *,
     settings: Settings,
@@ -199,7 +208,7 @@ def suggested_trade_count_fp(
     notional_cap = max_order_notional_dollars if max_order_notional_dollars is not None else settings.risk_max_order_notional_dollars
     if notional_cap is None:
         return None
-    max_notional = Decimal(str(notional_cap)) * Decimal(str(signal.confidence))
+    max_notional = Decimal(str(notional_cap)) * _confidence_size_factor(signal.confidence)
     unit_price = (
         signal.target_yes_price_dollars
         if signal.recommended_side == ContractSide.YES

@@ -52,6 +52,14 @@ jobs:
           LIVE_KALSHI_KEY_PATH_CONTAINER=/run/secrets/kalshi-live.pem
           DEMO_KALSHI_KEY_PATH_HOST=.tmp/github-secrets/dummy.pem
           DEMO_KALSHI_KEY_PATH_CONTAINER=/run/secrets/kalshi-demo.pem
+          WEB_SITE_KIND=combined
+          WEB_DEMO_HOST=demo.ai-al.site
+          WEB_PRODUCTION_HOST=prod.ai-al.site
+          WEB_STRATEGIES_HOST=strategy.ai-al.site
+          WEB_AUTH_COOKIE_DOMAIN=.ai-al.site
+          HTTP_PORT=8080
+          HTTPS_PORT=8443
+          CADDY_ACME_EMAIL=ops@example.com
           LLM_LOCAL_API_KEY=dummy
           WEATHER_USER_AGENT=kalshi-bot-ci/0.1 (ops@example.com)
           EOF
@@ -75,7 +83,10 @@ jobs:
       - name: Start web stack
         run: |
           set -euo pipefail
-          docker compose -f infra/docker-compose.yml up -d --build app_blue app_green nginx
+          docker compose -f infra/docker-compose.yml up -d --build \
+            app_blue app_green \
+            web_demo web_production web_strategies \
+            caddy
 
       - name: Check health endpoints
         run: |
@@ -106,7 +117,7 @@ jobs:
         run: |
           set -euo pipefail
           docker compose -f infra/docker-compose.yml ps
-          docker compose -f infra/docker-compose.yml logs --tail=200 postgres app_blue app_green nginx
+          docker compose -f infra/docker-compose.yml logs --tail=200 postgres app_blue app_green web_demo web_production web_strategies caddy
 
       - name: Tear down stack
         if: always()

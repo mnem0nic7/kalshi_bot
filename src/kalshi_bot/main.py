@@ -10,9 +10,14 @@ from kalshi_bot.web.app import create_app
 def main() -> None:
     settings = get_settings()
     configure_logging()
-    uvicorn.run(create_app(), host=settings.app_host, port=settings.app_port)
+    uvicorn.run(
+        create_app(),
+        host=settings.app_host,
+        port=settings.app_port,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
 
 
 if __name__ == "__main__":
     main()
-

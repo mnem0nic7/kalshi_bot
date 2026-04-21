@@ -1,0 +1,24 @@
+(shared_proxy) {
+	reverse_proxy {args[0]} {
+		header_up Host {host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		flush_interval -1
+	}
+}
+
+{$WEB_DEMO_HOST} {
+	import shared_proxy web_demo:8000
+}
+
+{$WEB_PRODUCTION_HOST} {
+	import shared_proxy web_production:8000
+}
+
+{$WEB_STRATEGIES_HOST} {
+	import shared_proxy web_strategies:8000
+}
+
+http://localhost, http://127.0.0.1 {
+	import shared_proxy web_demo:8000
+}

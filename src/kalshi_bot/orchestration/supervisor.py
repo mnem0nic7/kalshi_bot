@@ -63,6 +63,32 @@ def _room_message_read(record) -> RoomMessageRead:
     )
 
 
+async def _pending_post_kill_switch_reconcile(
+    repo: PlatformRepository,
+    control: Any,
+    app_color: str,
+    kalshi_env: str,
+) -> str | None:
+    """Return a reason string if execution must wait for a post-kill-switch reconcile, else None."""
+    cleared_at_raw = (control.notes or {}).get("kill_switch_cleared_at")
+    if not cleared_at_raw:
+        return None
+    cleared_at = datetime.fromisoformat(cleared_at_raw)
+    reconcile_cp = await repo.get_checkpoint(f"daemon_reconcile:{kalshi_env}:{app_color}")
+    if reconcile_cp is None:
+        return "Kill switch was recently cleared; waiting for first reconcile before executing."
+    reconciled_at_raw = reconcile_cp.payload.get("reconciled_at") if isinstance(reconcile_cp.payload, dict) else None
+    if not reconciled_at_raw:
+        return "Kill switch was recently cleared; waiting for reconcile checkpoint to carry reconciled_at."
+    reconciled_at = datetime.fromisoformat(reconciled_at_raw)
+    if reconciled_at < cleared_at:
+        return (
+            f"Kill switch cleared at {cleared_at.isoformat()}; last reconcile was at "
+            f"{reconciled_at.isoformat()} — waiting for a post-clear reconcile before executing."
+        )
+    return None
+
+
 class WorkflowSupervisor:
     def __init__(
         self,
@@ -162,7 +188,11 @@ class WorkflowSupervisor:
         if signal.recommended_side is not None:
             from kalshi_bot.core.enums import ContractSide
             from datetime import timedelta as _td
-            history = await repo.fetch_recent_prices(market_ticker, window=timedelta(minutes=60))
+            history = await repo.fetch_recent_prices(
+                market_ticker,
+                kalshi_env=self.settings.kalshi_env,
+                window=timedelta(minutes=60),
+            )
             valid_points = [(row.observed_at.timestamp(), float(row.mid_dollars)) for row in history if row.mid_dollars is not None]
             if len(valid_points) >= 5:
                 xs = np.array([p[0] for p in valid_points])
@@ -184,12 +214,12 @@ class WorkflowSupervisor:
         raw_volume = market.get("volume")
         if raw_volume is not None:
             volume = int(raw_volume)
-            if volume < 5:
+            if volume < 50:
                 return _reject(
                     StandDownReason.VOLUME_TOO_LOW,
-                    f"Market volume {volume} is below minimum threshold of 5",
+                    f"Market volume {volume} is below minimum threshold of 50",
                 )
-            signal.size_factor = min(Decimal(volume) / Decimal("100"), Decimal("1.00"))
+            signal.size_factor = min(Decimal(volume) / Decimal("50"), Decimal("1.00"))
 
         return True
 
@@ -215,7 +245,7 @@ class WorkflowSupervisor:
         )
 
         if eligible:
-            total_capital = await repo.get_total_capital_dollars()
+            total_capital = await repo.get_total_capital_dollars(kalshi_env=room.kalshi_env)
             if total_capital is None or total_capital <= 0:
                 eligible = False
             else:
@@ -228,6 +258,7 @@ class WorkflowSupervisor:
                 if count_fp is None or count_fp <= Decimal("0"):
                     eligible = False
 
+        loss_sensitivity_active = False
         if eligible:
             ticket = TradeTicket(
                 market_ticker=room.market_ticker,
@@ -245,7 +276,11 @@ class WorkflowSupervisor:
             if ticket is not None:
                 client_order_id = make_client_order_id(room.id, room.market_ticker, ticket.nonce)
                 ticket_record = await repo.save_trade_ticket(room.id, ticket, client_order_id)
-                open_position = await repo.get_position(room.market_ticker, self.settings.kalshi_subaccount)
+                open_position = await repo.get_position(
+                    room.market_ticker,
+                    self.settings.kalshi_subaccount,
+                    kalshi_env=room.kalshi_env,
+                )
                 current_position_notional = (
                     estimate_notional_dollars(
                         ContractSide(open_position.side),
@@ -256,9 +291,27 @@ class WorkflowSupervisor:
                     else Decimal("0")
                 )
                 position_cap = float(total_capital) * self.settings.risk_position_pct
+                daily_pnl = await repo.get_daily_pnl_dollars(kalshi_env=room.kalshi_env)
+                loss_sensitivity_active = False
+                if (
+                    daily_pnl is not None
+                    and float(total_capital) > 0
+                    and self.settings.risk_daily_loss_sensitivity_pct > 0
+                ):
+                    daily_loss_ratio = float(-daily_pnl) / float(total_capital)
+                    loss_sensitivity_active = daily_loss_ratio >= self.settings.risk_daily_loss_sensitivity_pct
+
+                effective_edge_bps = thresholds.risk_min_edge_bps
+                effective_order_cap = dynamic_order_cap
+                if loss_sensitivity_active:
+                    effective_edge_bps = int(
+                        effective_edge_bps * self.settings.risk_daily_loss_sensitivity_edge_multiplier
+                    )
+                    effective_order_cap = effective_order_cap * self.settings.risk_daily_loss_sensitivity_size_multiplier
+
                 effective_thresholds = thresholds.__class__(
-                    risk_min_edge_bps=thresholds.risk_min_edge_bps,
-                    risk_max_order_notional_dollars=dynamic_order_cap,
+                    risk_min_edge_bps=effective_edge_bps,
+                    risk_max_order_notional_dollars=effective_order_cap,
                     risk_max_position_notional_dollars=position_cap,
                     trigger_max_spread_bps=thresholds.trigger_max_spread_bps,
                     trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds,
@@ -304,24 +357,35 @@ class WorkflowSupervisor:
                 if verdict.status == RiskStatus.APPROVED:
                     approved_ticket = approved_ticket_for_verdict(ticket, verdict)
                     await repo.update_room_stage(room.id, RoomStage.EXECUTING)
-                    lock_acquired = await repo.acquire_execution_lock(
-                        holder=self.settings.app_color,
-                        color=self.settings.app_color,
+                    pending_reconcile = await _pending_post_kill_switch_reconcile(
+                        repo, control, self.settings.app_color, room.kalshi_env
                     )
-                    if lock_acquired:
-                        receipt = await self.execution_service.execute(
-                            room=room,
-                            control=control,
-                            ticket=approved_ticket,
+                    if pending_reconcile:
+                        receipt = ExecReceiptPayload(
+                            status="pending_reconcile_after_kill_switch_clear",
                             client_order_id=client_order_id,
-                            fair_yes_dollars=signal.fair_yes_dollars,
+                            details={"reason": pending_reconcile},
                         )
                     else:
-                        receipt = ExecReceiptPayload(
-                            status="lock_denied",
-                            client_order_id=client_order_id,
-                            details={"reason": "execution lock held by another deployment color"},
+                        lock_acquired = await repo.acquire_execution_lock(
+                            holder=self.settings.app_color,
+                            color=self.settings.app_color,
+                            kalshi_env=room.kalshi_env,
                         )
+                        if lock_acquired:
+                            receipt = await self.execution_service.execute(
+                                room=room,
+                                control=control,
+                                ticket=approved_ticket,
+                                client_order_id=client_order_id,
+                                fair_yes_dollars=signal.fair_yes_dollars,
+                            )
+                        else:
+                            receipt = ExecReceiptPayload(
+                                status="lock_denied",
+                                client_order_id=client_order_id,
+                                details={"reason": "execution lock held by another deployment color"},
+                            )
                     ORDERS_TOTAL.labels(status=receipt.status).inc()
                     if receipt.external_order_id or receipt.status not in ("shadow_skipped", "inactive_color_skipped"):
                         await repo.save_order(
@@ -335,6 +399,7 @@ class WorkflowSupervisor:
                             count_fp=approved_ticket.count_fp,
                             raw=receipt.details,
                             kalshi_order_id=receipt.external_order_id,
+                            kalshi_env=room.kalshi_env,
                         )
                 else:
                     receipt = ExecReceiptPayload(
@@ -355,8 +420,9 @@ class WorkflowSupervisor:
                 role=AgentRole.SUPERVISOR,
                 kind=MessageKind.OBSERVATION,
                 stage=RoomStage.COMPLETE,
-                content=f"Deterministic path: {final_status}. {signal.summary}",
-                payload={"final_status": final_status},
+                content=f"Deterministic path: {final_status}. {signal.summary}"
+                + (" [loss sensitivity active: edge x2, size x0.5]" if loss_sensitivity_active else ""),
+                payload={"final_status": final_status, "loss_sensitivity_active": loss_sensitivity_active},
             ),
         )
         await repo.update_room_campaign(
@@ -524,6 +590,7 @@ class WorkflowSupervisor:
                         )
                 market_state = await repo.upsert_market_state(
                     room.market_ticker,
+                    kalshi_env=room.kalshi_env,
                     snapshot=market,
                     yes_bid_dollars=as_decimal(market["yes_bid_dollars"]) if market.get("yes_bid_dollars") is not None else None,
                     yes_ask_dollars=as_decimal(market["yes_ask_dollars"]) if market.get("yes_ask_dollars") is not None else None,
@@ -754,7 +821,7 @@ class WorkflowSupervisor:
                     final_status = "research_blocked"
                     await session.commit()
                 else:
-                    total_capital_early = await repo.get_total_capital_dollars()
+                    total_capital_early = await repo.get_total_capital_dollars(kalshi_env=room.kalshi_env)
                     if total_capital_early is not None and total_capital_early > 0:
                         dynamic_order_cap = float(total_capital_early) * self.settings.risk_order_pct
                     else:
@@ -794,7 +861,11 @@ class WorkflowSupervisor:
                                 ticket = ticket.model_copy(update={"count_fp": scaled})
                     if ticket is not None and client_order_id is not None:
                         ticket_record = await repo.save_trade_ticket(room.id, ticket, client_order_id, message_id=trader_record.id)
-                        open_position = await repo.get_position(room.market_ticker, self.settings.kalshi_subaccount)
+                        open_position = await repo.get_position(
+                            room.market_ticker,
+                            self.settings.kalshi_subaccount,
+                            kalshi_env=room.kalshi_env,
+                        )
                         current_position_notional = (
                             estimate_notional_dollars(
                                 ContractSide(open_position.side),
@@ -870,24 +941,35 @@ class WorkflowSupervisor:
                         if verdict.status == RiskStatus.APPROVED:
                             approved_ticket = approved_ticket_for_verdict(ticket, verdict)
                             await repo.update_room_stage(room.id, RoomStage.EXECUTING)
-                            lock_acquired = await repo.acquire_execution_lock(
-                                holder=self.settings.app_color,
-                                color=self.settings.app_color,
+                            pending_reconcile = await _pending_post_kill_switch_reconcile(
+                                repo, control, self.settings.app_color, room.kalshi_env
                             )
-                            if lock_acquired:
-                                receipt = await self.execution_service.execute(
-                                    room=room,
-                                    control=control,
-                                    ticket=approved_ticket,
+                            if pending_reconcile:
+                                receipt = ExecReceiptPayload(
+                                    status="pending_reconcile_after_kill_switch_clear",
                                     client_order_id=client_order_id,
-                                    fair_yes_dollars=signal.fair_yes_dollars,
+                                    details={"reason": pending_reconcile},
                                 )
                             else:
-                                receipt = ExecReceiptPayload(
-                                    status="lock_denied",
-                                    client_order_id=client_order_id,
-                                    details={"reason": "execution lock held by another deployment color"},
+                                lock_acquired = await repo.acquire_execution_lock(
+                                    holder=self.settings.app_color,
+                                    color=self.settings.app_color,
+                                    kalshi_env=room.kalshi_env,
                                 )
+                                if lock_acquired:
+                                    receipt = await self.execution_service.execute(
+                                        room=room,
+                                        control=control,
+                                        ticket=approved_ticket,
+                                        client_order_id=client_order_id,
+                                        fair_yes_dollars=signal.fair_yes_dollars,
+                                    )
+                                else:
+                                    receipt = ExecReceiptPayload(
+                                        status="lock_denied",
+                                        client_order_id=client_order_id,
+                                        details={"reason": "execution lock held by another deployment color"},
+                                    )
                             ORDERS_TOTAL.labels(status=receipt.status).inc()
                             if receipt.external_order_id or receipt.status not in ("shadow_skipped", "inactive_color_skipped"):
                                 await repo.save_order(
@@ -901,6 +983,7 @@ class WorkflowSupervisor:
                                     count_fp=approved_ticket.count_fp,
                                     raw=receipt.details,
                                     kalshi_order_id=receipt.external_order_id,
+                                    kalshi_env=room.kalshi_env,
                                 )
                         else:
                             receipt = ExecReceiptPayload(

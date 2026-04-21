@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Kalshi Bot Control Room</title>
+    <title>{{ dashboard_shell.browser_title if dashboard_shell else "Kalshi Bot Control Room" }}</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet" />
@@ -13,14 +13,25 @@
   <body>
     <header class="shell-header">
       <div class="header-nav">
-        <a href="/" class="brand">Kalshi Bot Control Room</a>
+        <a href="/" class="brand">{{ dashboard_shell.brand_label if dashboard_shell else "Kalshi Bot Control Room" }}</a>
         <nav class="header-links" aria-label="Primary">
-          <a href="/">Control Room</a>
+          <a href="/">{% if dashboard_shell and dashboard_shell.mode == "single_site" %}{{ dashboard_shell.active_label }}{% else %}Control Room{% endif %}</a>
           <a href="/faq">FAQ</a>
         </nav>
       </div>
       <div class="header-meta">
         <span class="header-color-badge" aria-label="Color: {{ settings.app_color if settings else room.active_color }}">{{ settings.app_color if settings else room.active_color }}</span>
+        <div class="header-auth">
+          {% if current_user_email %}
+            <span class="header-user">{{ current_user_email }}</span>
+            <form method="post" action="/logout" class="header-logout-form">
+              <button type="submit" class="secondary-button">Log out</button>
+            </form>
+          {% else %}
+            <a href="/login" class="header-auth-link">Login</a>
+            <a href="/register" class="header-auth-link header-auth-link-accent">Register</a>
+          {% endif %}
+        </div>
       </div>
     </header>
     <main class="shell-main {% block main_class %}{% endblock %}">

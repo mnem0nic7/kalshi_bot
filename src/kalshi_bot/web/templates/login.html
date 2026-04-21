@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+
+{% block main_class %}auth-main{% endblock %}
+
+{% block content %}
+  <section class="auth-layout">
+    <article class="panel auth-panel">
+      <p class="auth-eyebrow">Operator Access</p>
+      <div class="auth-copy">
+        <h1>Sign in to the control room</h1>
+        <p>The dashboard, room pages, and strategy tools are now behind operator login.</p>
+        <p>Use the approved account to continue into the site.</p>
+      </div>
+      <form method="post" action="/login{{ next_query or '' }}" class="auth-form">
+        {% if error_message %}
+          <div class="auth-error" role="alert">{{ error_message }}</div>
+        {% endif %}
+        <label>
+          Email
+          <input type="email" name="email" autocomplete="email" value="{{ form_values.email if form_values else '' }}" required />
+        </label>
+        <label>
+          Password
+          <input type="password" name="password" autocomplete="current-password" required />
+        </label>
+        <div class="auth-actions">
+          <button type="submit">Sign in</button>
+          <a class="auth-secondary-link" href="/register{{ next_query or '' }}">Create account</a>
+        </div>
+      </form>
+    </article>
+
+    <aside class="panel auth-panel">
+      <p class="auth-eyebrow">Access Policy</p>
+      <div class="auth-copy">
+        <h2>Single-operator registration</h2>
+        <p>Registration is limited to the approved operator account. Once that account exists, future access should happen through login rather than additional signups.</p>
+      </div>
+    </aside>
+  </section>
+{% endblock %}

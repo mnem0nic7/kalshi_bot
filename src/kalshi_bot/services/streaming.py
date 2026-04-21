@@ -308,7 +308,7 @@ class MarketStreamService:
         return msg.get("market_ticker") or msg.get("ticker")
 
     def _checkpoint_name(self, sid: int) -> str:
-        return f"kalshi_ws:{self.settings.app_color}:{sid}"
+        return f"kalshi_ws:{self.settings.kalshi_env}:{self.settings.app_color}:{sid}"
 
     def _reset_connection_state(self) -> None:
         self.orderbooks.clear()

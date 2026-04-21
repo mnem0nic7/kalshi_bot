@@ -5,9 +5,10 @@ from collections import Counter
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import AsyncIterator, TypeVar
+from typing import Any, AsyncIterator, TypeVar
+from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -17,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ValidationError
 
+from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import (
     HeuristicPackPromoteRequest,
@@ -32,6 +34,8 @@ from kalshi_bot.core.schemas import (
     StrategyAssignmentApprovalRequest,
     TrainingBuildRequest,
     TriggerRequest,
+    WebLoginRequest,
+    WebRegisterRequest,
 )
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.container import AppContainer
@@ -47,6 +51,14 @@ from kalshi_bot.web.control_room import (
     build_control_room_tab,
     build_env_dashboard,
     build_strategies_dashboard,
+)
+from kalshi_bot.web.auth import (
+    hash_password,
+    hash_session_token,
+    is_registration_email_allowed,
+    new_session_token,
+    normalize_auth_email,
+    verify_password,
 )
 from kalshi_bot.web.faq_content import FAQ_SECTIONS
 from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_high_f
@@ -64,6 +76,11 @@ ROOM_STAGE_FLOW = [
     "auditing",
     "memory",
 ]
+SITE_LABELS = {
+    "demo": "Demo",
+    "production": "Production",
+    "strategies": "Strategies",
+}
 
 
 def _enum_value(value):
@@ -545,6 +562,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="Kalshi Bot Control Room", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory="src/kalshi_bot/web/static"), name="static")
+    container_type_settings = get_settings()
 
     def container(request: Request) -> AppContainer:
         return request.app.state.container
@@ -572,6 +590,193 @@ def create_app() -> FastAPI:
                 detail=jsonable_encoder(exc.errors(include_url=False)),
             ) from exc
 
+    async def parse_form_model(request: Request, model_cls: type[ModelT]) -> ModelT:
+        raw_body = await request.body()
+        form_data = parse_qs(raw_body.decode("utf-8"), keep_blank_values=True) if raw_body else {}
+        payload = {key: values[-1] if values else "" for key, values in form_data.items()}
+        return model_cls.model_validate(payload)
+
+    def validation_error_message(exc: ValidationError) -> str:
+        error = exc.errors(include_url=False)[0] if exc.errors(include_url=False) else {}
+        return str(error.get("msg") or "Invalid input")
+
+    def request_path_with_query(request: Request) -> str:
+        return f"{request.url.path}?{request.url.query}" if request.url.query else request.url.path
+
+    def as_utc_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    def safe_next_path(next_path: str | None) -> str:
+        if not next_path:
+            return "/"
+        if not next_path.startswith("/") or next_path.startswith("//"):
+            return "/"
+        return next_path
+
+    def auth_redirect_url(next_path: str | None) -> str:
+        target = safe_next_path(next_path)
+        if target == "/":
+            return "/login"
+        return f"/login?next={quote(target, safe='/?=&')}"
+
+    def next_query_suffix(next_path: str) -> str:
+        if next_path == "/":
+            return ""
+        return f"?next={quote(next_path, safe='/?=&')}"
+
+    def normalized_site_kind() -> str:
+        site_kind = container_type_settings.web_site_kind.strip().lower()
+        return site_kind if site_kind in SITE_LABELS else "combined"
+
+    def dashboard_shell() -> dict[str, Any]:
+        site_kind = normalized_site_kind()
+        combined = site_kind == "combined"
+        active_env = "demo" if combined else site_kind
+        active_label = SITE_LABELS[active_env]
+        tabs = []
+        if combined:
+            for key, label in SITE_LABELS.items():
+                tabs.append(
+                    {
+                        "id": key,
+                        "label": label,
+                        "active": key == active_env,
+                        "mode": "local",
+                    }
+                )
+        return {
+            "mode": "combined" if combined else "single_site",
+            "active_env": active_env,
+            "active_label": active_label,
+            "brand_label": "Kalshi Bot Control Room" if combined else f"Kalshi Bot {active_label}",
+            "browser_title": "Kalshi Bot Control Room" if combined else f"Kalshi Bot {active_label}",
+            "tabs": tabs,
+        }
+
+    def configured_cookie_domain() -> str | None:
+        domain = container_type_settings.web_auth_cookie_domain
+        return domain.strip() if isinstance(domain, str) and domain.strip() else None
+
+    def set_session_cookie(response: RedirectResponse, request: Request, token: str) -> None:
+        app_container = container(request)
+        cookie_kwargs: dict[str, Any] = {
+            "key": app_container.settings.web_auth_cookie_name,
+            "value": token,
+            "max_age": app_container.settings.web_auth_session_ttl_seconds,
+            "httponly": True,
+            "samesite": "lax",
+            "secure": request.url.scheme == "https",
+            "path": "/",
+        }
+        cookie_domain = configured_cookie_domain()
+        if cookie_domain is not None:
+            cookie_kwargs["domain"] = cookie_domain
+        response.set_cookie(**cookie_kwargs)
+
+    def clear_session_cookie(response: RedirectResponse | JSONResponse | HTMLResponse, request: Request) -> None:
+        app_container = container(request)
+        cookie_kwargs: dict[str, Any] = {
+            "key": app_container.settings.web_auth_cookie_name,
+            "httponly": True,
+            "samesite": "lax",
+            "secure": request.url.scheme == "https",
+            "path": "/",
+        }
+        cookie_domain = configured_cookie_domain()
+        if cookie_domain is not None:
+            cookie_kwargs["domain"] = cookie_domain
+        response.delete_cookie(**cookie_kwargs)
+
+    def template_context(request: Request, **extra: Any) -> dict[str, Any]:
+        app_container = container(request)
+        current_user = getattr(request.state, "current_user", None)
+        return {
+            "request": request,
+            "settings": app_container.settings,
+            "current_user": current_user,
+            "current_user_email": getattr(current_user, "email", None),
+            "dashboard_shell": dashboard_shell(),
+            **extra,
+        }
+
+    def auth_required_response(request: Request, *, clear_cookie: bool = False):
+        if request.url.path.startswith("/api/"):
+            response: JSONResponse | RedirectResponse = JSONResponse(
+                {"error": "auth_required", "login_url": auth_redirect_url(request_path_with_query(request))},
+                status_code=401,
+            )
+        else:
+            response = RedirectResponse(url=auth_redirect_url(request_path_with_query(request)), status_code=303)
+        if clear_cookie:
+            clear_session_cookie(response, request)
+        return response
+
+    @app.middleware("http")
+    async def require_authenticated_session(request: Request, call_next):
+        request.state.current_user = None
+        request.state.current_session = None
+
+        app_container = container(request)
+        settings = app_container.settings
+        if not settings.web_auth_enabled:
+            return await call_next(request)
+
+        path = request.url.path
+        if path.startswith("/static/") or path in {"/healthz", "/readyz", "/metrics", "/favicon.ico"}:
+            return await call_next(request)
+
+        cookie_token = request.cookies.get(settings.web_auth_cookie_name)
+        clear_cookie = False
+        if cookie_token:
+            token_hash = hash_session_token(cookie_token)
+            async with app_container.session_factory() as session:
+                repo = PlatformRepository(session)
+                session_record = await repo.get_web_session_by_token_hash(token_hash)
+                now = datetime.now(UTC)
+                if session_record is None:
+                    clear_cookie = True
+                elif as_utc_datetime(session_record.expires_at) <= now:
+                    await repo.delete_web_session(session_record.id)
+                    clear_cookie = True
+                else:
+                    user = await repo.get_web_user(session_record.user_id)
+                    if user is None or not user.is_active:
+                        await repo.delete_web_session(session_record.id)
+                        clear_cookie = True
+                    else:
+                        await repo.touch_web_session(session_record.id, seen_at=now)
+                        request.state.current_user = user
+                        request.state.current_session = session_record
+                await session.commit()
+
+        if path in {"/login", "/register"}:
+            if request.method == "GET" and getattr(request.state, "current_user", None) is not None:
+                response = RedirectResponse(
+                    url=safe_next_path(request.query_params.get("next")),
+                    status_code=303,
+                )
+            else:
+                response = await call_next(request)
+            if clear_cookie:
+                clear_session_cookie(response, request)
+            return response
+
+        if path == "/logout":
+            response = await call_next(request)
+            if clear_cookie:
+                clear_session_cookie(response, request)
+            return response
+
+        if getattr(request.state, "current_user", None) is None:
+            return auth_required_response(request, clear_cookie=clear_cookie)
+
+        response = await call_next(request)
+        if clear_cookie:
+            clear_session_cookie(response, request)
+        return response
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         return JSONResponse({"status": "ok"})
@@ -591,13 +796,17 @@ def create_app() -> FastAPI:
         async with app_container.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.get_deployment_control()
-            positions = await repo.list_positions(limit=10)
-            ops_events = await repo.list_ops_events(limit=10)
+            positions = await repo.list_positions(limit=10, kalshi_env=app_container.settings.kalshi_env)
+            ops_events = await repo.list_ops_events(limit=10, kalshi_env=app_container.settings.kalshi_env)
             dossiers = [
                 {"market_ticker": room.market_ticker, "stage": room.stage}
-                for room in await repo.list_rooms(limit=10, origins=["shadow", "live"])
+                for room in await repo.list_rooms(limit=20, origins=["shadow", "live"])
+                if room.kalshi_env == app_container.settings.kalshi_env
             ]
-            runtime_health = await app_container.watchdog_service.get_status(repo)
+            runtime_health = await app_container.watchdog_service.get_status(
+                repo,
+                kalshi_env=app_container.settings.kalshi_env,
+            )
             await session.commit()
         training_status_payload = await app_container.training_corpus_service.get_status(persist_readiness=False)
         historical_status_payload = await app_container.historical_training_service.get_status()
@@ -605,6 +814,7 @@ def create_app() -> FastAPI:
         training_status_payload["historical"] = historical_status_payload
         return JSONResponse(
             {
+                "kalshi_env": app_container.settings.kalshi_env,
                 "active_color": control.active_color,
                 "kill_switch_enabled": control.kill_switch_enabled,
                 "execution_lock_holder": control.execution_lock_holder,
@@ -852,35 +1062,230 @@ def create_app() -> FastAPI:
     async def metrics() -> PlainTextResponse:
         return PlainTextResponse(generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
 
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page(request: Request) -> HTMLResponse:
+        next_path = safe_next_path(request.query_params.get("next"))
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            template_context(
+                request,
+                next_path=next_path,
+                next_query=next_query_suffix(next_path),
+                form_values={"email": ""},
+            ),
+        )
+
+    @app.post("/login", response_class=HTMLResponse, response_model=None)
+    async def login_submit(request: Request) -> HTMLResponse | RedirectResponse:
+        app_container = container(request)
+        next_path = safe_next_path(request.query_params.get("next"))
+        try:
+            payload = await parse_form_model(request, WebLoginRequest)
+        except ValidationError as exc:
+            return templates.TemplateResponse(
+                request,
+                "login.html",
+                template_context(
+                    request,
+                    next_path=next_path,
+                    next_query=next_query_suffix(next_path),
+                    form_values={"email": ""},
+                    error_message=validation_error_message(exc),
+                ),
+                status_code=422,
+            )
+
+        normalized_email = normalize_auth_email(payload.email)
+        async with app_container.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.prune_expired_web_sessions()
+            user = await repo.get_web_user_by_email(normalized_email)
+            if user is None or not user.is_active or not verify_password(
+                payload.password,
+                expected_hash=user.password_hash if user is not None else "",
+                salt_hex=user.password_salt if user is not None else "",
+            ):
+                await session.commit()
+                return templates.TemplateResponse(
+                    request,
+                    "login.html",
+                    template_context(
+                        request,
+                        next_path=next_path,
+                        next_query=next_query_suffix(next_path),
+                        form_values={"email": normalized_email},
+                        error_message="Invalid email or password.",
+                    ),
+                    status_code=401,
+                )
+
+            now = datetime.now(UTC)
+            session_token = new_session_token()
+            token_hash = hash_session_token(session_token)
+            expires_at = now + timedelta(seconds=app_container.settings.web_auth_session_ttl_seconds)
+            await repo.record_web_user_login(user.id, logged_in_at=now)
+            await repo.create_web_session(
+                user_id=user.id,
+                token_hash=token_hash,
+                expires_at=expires_at,
+                last_seen_at=now,
+            )
+            await session.commit()
+
+        response = RedirectResponse(url=next_path, status_code=303)
+        set_session_cookie(response, request, session_token)
+        return response
+
+    @app.get("/register", response_class=HTMLResponse)
+    async def register_page(request: Request) -> HTMLResponse:
+        next_path = safe_next_path(request.query_params.get("next"))
+        return templates.TemplateResponse(
+            request,
+            "register.html",
+            template_context(
+                request,
+                next_path=next_path,
+                next_query=next_query_suffix(next_path),
+                form_values={"email": ""},
+            ),
+        )
+
+    @app.post("/register", response_class=HTMLResponse, response_model=None)
+    async def register_submit(request: Request) -> HTMLResponse | RedirectResponse:
+        app_container = container(request)
+        next_path = safe_next_path(request.query_params.get("next"))
+        try:
+            payload = await parse_form_model(request, WebRegisterRequest)
+        except ValidationError as exc:
+            return templates.TemplateResponse(
+                request,
+                "register.html",
+                template_context(
+                    request,
+                    next_path=next_path,
+                    next_query=next_query_suffix(next_path),
+                    form_values={"email": ""},
+                    error_message=validation_error_message(exc),
+                ),
+                status_code=422,
+            )
+
+        normalized_email = normalize_auth_email(payload.email)
+        if not is_registration_email_allowed(app_container.settings, normalized_email):
+            return templates.TemplateResponse(
+                request,
+                "register.html",
+                template_context(
+                    request,
+                    next_path=next_path,
+                    next_query=next_query_suffix(next_path),
+                    form_values={"email": normalized_email},
+                    error_message="This email is not eligible to register for this site.",
+                ),
+                status_code=403,
+            )
+
+        password_hash_value, password_salt = hash_password(payload.password)
+        async with app_container.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.prune_expired_web_sessions()
+            existing_user = await repo.get_web_user_by_email(normalized_email)
+            if existing_user is not None:
+                await session.commit()
+                return templates.TemplateResponse(
+                    request,
+                    "register.html",
+                    template_context(
+                        request,
+                        next_path=next_path,
+                        next_query=next_query_suffix(next_path),
+                        form_values={"email": normalized_email},
+                        error_message="That account already exists. Sign in instead.",
+                    ),
+                    status_code=409,
+                )
+
+            user = await repo.create_web_user(
+                email=normalized_email,
+                password_hash=password_hash_value,
+                password_salt=password_salt,
+            )
+            now = datetime.now(UTC)
+            session_token = new_session_token()
+            token_hash = hash_session_token(session_token)
+            expires_at = now + timedelta(seconds=app_container.settings.web_auth_session_ttl_seconds)
+            await repo.record_web_user_login(user.id, logged_in_at=now)
+            await repo.create_web_session(
+                user_id=user.id,
+                token_hash=token_hash,
+                expires_at=expires_at,
+                last_seen_at=now,
+            )
+            await session.commit()
+
+        response = RedirectResponse(url=next_path, status_code=303)
+        set_session_cookie(response, request, session_token)
+        return response
+
+    @app.post("/logout")
+    async def logout(request: Request) -> RedirectResponse:
+        app_container = container(request)
+        cookie_token = request.cookies.get(app_container.settings.web_auth_cookie_name)
+        if cookie_token:
+            async with app_container.session_factory() as session:
+                repo = PlatformRepository(session)
+                await repo.delete_web_session_by_token_hash(hash_session_token(cookie_token))
+                await session.commit()
+        response = RedirectResponse(url="/login", status_code=303)
+        clear_session_cookie(response, request)
+        return response
+
     @app.get("/faq", response_class=HTMLResponse)
     async def faq(request: Request) -> HTMLResponse:
-        app_container = container(request)
         return templates.TemplateResponse(
             request,
             "faq.html",
-            {
-                "faq_sections": FAQ_SECTIONS,
-                "settings": app_container.settings,
-            },
+            template_context(
+                request,
+                faq_sections=FAQ_SECTIONS,
+            ),
         )
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         app_container = container(request)
-        demo_data, prod_data, strategies_data = await asyncio.gather(
-            build_env_dashboard(app_container, "demo"),
-            build_env_dashboard(app_container, "production"),
-            build_strategies_dashboard(app_container),
-        )
+        site_kind = normalized_site_kind()
+        shell = dashboard_shell()
+        tasks: list[tuple[str, Any]] = []
+        if site_kind in {"combined", "demo"}:
+            tasks.append(("demo", build_env_dashboard(app_container, "demo")))
+        if site_kind in {"combined", "production"}:
+            tasks.append(("production", build_env_dashboard(app_container, "production")))
+        if site_kind in {"combined", "strategies"}:
+            tasks.append(("strategies", build_strategies_dashboard(app_container)))
+
+        results = await asyncio.gather(*(task for _, task in tasks))
+        payloads = {key: jsonable_encoder(result) for (key, _), result in zip(tasks, results, strict=False)}
+        env_panels = [
+            {
+                "key": env_key,
+                "label": SITE_LABELS[env_key],
+                "data": payloads[env_key],
+                "active": shell["active_env"] == env_key,
+            }
+            for env_key in ("demo", "production")
+            if env_key in payloads
+        ]
+        strategies_panel = payloads.get("strategies")
         return templates.TemplateResponse(
             request,
             "index.html",
-            {
-                "demo": jsonable_encoder(demo_data),
-                "production": jsonable_encoder(prod_data),
-                "strategies": jsonable_encoder(strategies_data),
-                "settings": app_container.settings,
-            },
+            template_context(
+                request,
+                env_panels=env_panels,
+                strategies=strategies_panel,
+            ),
         )
 
     @app.get("/api/dashboard/strategies")
@@ -1039,10 +1444,11 @@ def create_app() -> FastAPI:
         async with app_container.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.ensure_deployment_control(app_container.settings.app_color)
-            pack = await app_container.agent_pack_service.get_pack_for_color(repo, app_container.settings.app_color)
+            active_color = control.active_color
+            pack = await app_container.agent_pack_service.get_pack_for_color(repo, active_color)
             room = await repo.create_room(
                 payload,
-                active_color=app_container.settings.app_color,
+                active_color=active_color,
                 shadow_mode=app_container.settings.app_shadow_mode,
                 kill_switch_enabled=control.kill_switch_enabled,
                 kalshi_env=app_container.settings.kalshi_env,
@@ -1105,13 +1511,13 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request,
             "room.html",
-            {
-                "room": room,
-                "messages": messages,
-                "snapshot": snapshot,
-                "room_bootstrap": room_bootstrap,
-                "settings": app_container.settings,
-            },
+            template_context(
+                request,
+                room=room,
+                messages=messages,
+                snapshot=snapshot,
+                room_bootstrap=room_bootstrap,
+            ),
         )
 
     @app.get("/rooms/{room_id}/events")

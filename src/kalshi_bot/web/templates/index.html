@@ -4,25 +4,60 @@
 {% endblock %}
 {% block main_class %}shell-main-wide{% endblock %}
 {% block content %}
-<div class="dashboard" id="dashboard">
-
-  <nav class="dash-tabs panel" aria-label="Environment">
-    <button class="dash-tab is-active" data-env="demo" role="tab" aria-selected="true" aria-controls="panel-demo">Demo</button>
-    <button class="dash-tab" data-env="production" role="tab" aria-selected="false" aria-controls="panel-production">Production</button>
-    <button class="dash-tab" data-env="strategies" role="tab" aria-selected="false" aria-controls="panel-strategies">Strategies</button>
+<div
+  class="dashboard"
+  id="dashboard"
+  data-dashboard-mode="{{ dashboard_shell.mode }}"
+  data-active-env="{{ dashboard_shell.active_env }}"
+>
+  {% if dashboard_shell.mode == "combined" %}
+  <nav class="dash-tabs panel" aria-label="{% if dashboard_shell.mode == 'combined' %}Environment{% else %}Sites{% endif %}">
+    {% for tab in dashboard_shell.tabs %}
+      {% if tab.mode == "local" %}
+        <button
+          class="dash-tab{% if tab.active %} is-active{% endif %}"
+          data-env="{{ tab.id }}"
+          data-tab-mode="local"
+          role="tab"
+          aria-selected="{% if tab.active %}true{% else %}false{% endif %}"
+          aria-controls="panel-{{ tab.id }}"
+        >{{ tab.label }}</button>
+      {% else %}
+        <a
+          class="dash-tab dash-tab-link{% if tab.active %} is-active{% endif %}"
+          data-tab-mode="link"
+          href="{{ tab.href }}"
+          {% if tab.active %}aria-current="page"{% endif %}
+        >{{ tab.label }}</a>
+      {% endif %}
+    {% endfor %}
     <span class="dash-refresh-label">
       <span class="muted-label">Last refreshed</span>
       <strong id="dash-last-refreshed">—</strong>
     </span>
   </nav>
+  {% else %}
+  <section class="dash-shell panel" aria-label="Current site">
+    <div class="dash-shell-site">
+      <span class="muted-label">Current site</span>
+      <strong class="dash-shell-site-label">{{ dashboard_shell.active_label }}</strong>
+    </div>
+    <span class="dash-refresh-label">
+      <span class="muted-label">Last refreshed</span>
+      <strong id="dash-last-refreshed">—</strong>
+    </span>
+  </section>
+  {% endif %}
 
-  {% for env_key, env_data in [("demo", demo), ("production", production)] %}
+  {% for panel in env_panels %}
+  {% set env_key = panel.key %}
+  {% set env_data = panel.data %}
   <section
-    class="dash-panel{% if env_key == "demo" %} is-active{% endif %}"
+    class="dash-panel{% if panel.active %} is-active{% endif %}"
     id="panel-{{ env_key }}"
     data-env="{{ env_key }}"
     role="tabpanel"
-    {% if env_key != "demo" %}hidden{% endif %}
+    {% if not panel.active %}hidden{% endif %}
   >
     <div class="dash-summary">
       <article class="dash-stat dash-stat-portfolio">
@@ -171,12 +206,13 @@
   </section>
   {% endfor %}
 
+  {% if strategies %}
   <section
-    class="dash-panel"
+    class="dash-panel{% if dashboard_shell.active_env == 'strategies' %} is-active{% endif %}"
     id="panel-strategies"
     data-env="strategies"
     role="tabpanel"
-    hidden
+    {% if dashboard_shell.active_env != 'strategies' %}hidden{% endif %}
   >
     <div class="strategies-toolbar panel">
       <div class="strategies-toolbar-block">
@@ -253,6 +289,7 @@
 
     <script id="strategies-bootstrap" type="application/json">{{ strategies | tojson }}</script>
   </section>
+  {% endif %}
 
 </div>
 {% endblock %}

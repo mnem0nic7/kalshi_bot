@@ -131,6 +131,7 @@ class ReconciliationService:
                 count_fp=quantize_count(count),
                 raw=order,
                 kalshi_order_id=order.get("order_id"),
+                kalshi_env=kalshi_env,
             )
 
         for fill in fills:
@@ -145,12 +146,13 @@ class ReconciliationService:
                 raw=fill,
                 trade_id=fill.get("trade_id"),
                 is_taker=bool(fill.get("is_taker", True)),
+                kalshi_env=kalshi_env,
             )
 
-        await repo.settle_fills(settlements)
+        await repo.settle_fills(settlements, kalshi_env=kalshi_env)
 
         await repo.set_checkpoint(
-            "reconcile",
+            f"reconcile:{kalshi_env}",
             cursor=None,
             payload={
                 "historical_cutoff": historical_cutoff,
@@ -164,22 +166,31 @@ class ReconciliationService:
 
         # Write start-of-day baseline once per Pacific calendar day (never overwrite).
         pacific_today = datetime.now(_PACIFIC).strftime("%Y-%m-%d")
-        existing_baseline = await repo.get_daily_portfolio_baseline_dollars(pacific_date=pacific_today)
+        existing_baseline = await repo.get_daily_portfolio_baseline_dollars(
+            pacific_date=pacific_today,
+            kalshi_env=kalshi_env,
+        )
         if existing_baseline is None:
-            total_capital = await repo.get_total_capital_dollars()
+            total_capital = await repo.get_total_capital_dollars(kalshi_env=kalshi_env)
             if total_capital is not None:
-                await repo.set_daily_portfolio_baseline_dollars(total_capital, pacific_date=pacific_today)
+                await repo.set_daily_portfolio_baseline_dollars(
+                    total_capital,
+                    pacific_date=pacific_today,
+                    kalshi_env=kalshi_env,
+                )
 
         await repo.log_ops_event(
             severity="info",
             summary="Reconciliation completed",
             source="reconcile",
             payload={
+                "kalshi_env": kalshi_env,
                 "positions_count": len(positions),
                 "orders_count": len(orders),
                 "fills_count": len(fills),
                 "settlements_count": len(settlements),
             },
+            kalshi_env=kalshi_env,
         )
 
         return ReconcileSummary(

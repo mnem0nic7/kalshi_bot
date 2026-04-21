@@ -64,7 +64,10 @@ class ShadowCampaignService:
                 for record in await repo.list_research_dossiers(limit=500)
             }
             active_rooms = {
-                discovery.mapping.market_ticker: await repo.get_latest_active_room_for_market(discovery.mapping.market_ticker)
+                discovery.mapping.market_ticker: await repo.get_latest_active_room_for_market(
+                    discovery.mapping.market_ticker,
+                    kalshi_env=self.settings.kalshi_env,
+                )
                 for discovery in discoveries
             }
             await session.commit()

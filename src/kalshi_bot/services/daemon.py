@@ -81,13 +81,20 @@ class DaemonService:
     async def _recover_orphaned_rooms(self) -> None:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            reaped_ids = await repo.reap_orphaned_rooms(color=self.settings.app_color)
+            reaped_ids = await repo.reap_orphaned_rooms(
+                color=self.settings.app_color,
+                kalshi_env=self.settings.kalshi_env,
+            )
             if reaped_ids:
                 await repo.log_ops_event(
                     severity="warning",
                     summary=f"Daemon startup: reaped {len(reaped_ids)} orphaned room(s) from prior run",
                     source="daemon",
-                    payload={"room_ids": reaped_ids, "color": self.settings.app_color},
+                    payload={
+                        "room_ids": reaped_ids,
+                        "color": self.settings.app_color,
+                        "kalshi_env": self.settings.kalshi_env,
+                    },
                 )
                 logger.warning("Reaped %d orphaned room(s) on startup: %s", len(reaped_ids), reaped_ids)
             await session.commit()
@@ -101,7 +108,7 @@ class DaemonService:
                 kalshi_env=self.settings.kalshi_env,
             )
             await repo.set_checkpoint(
-                f"daemon_reconcile:{self.settings.app_color}",
+                f"daemon_reconcile:{self.settings.kalshi_env}:{self.settings.app_color}",
                 None,
                 {
                     "reconciled_at": self._now_iso(),
@@ -128,8 +135,8 @@ class DaemonService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.get_deployment_control()
-            active_rooms = await repo.count_active_rooms()
-            checkpoint = await repo.get_checkpoint("reconcile")
+            active_rooms = await repo.count_active_rooms(kalshi_env=self.settings.kalshi_env)
+            checkpoint = await repo.get_checkpoint(f"reconcile:{self.settings.kalshi_env}")
             self_improve_status = dict(control.notes.get("agent_packs") or {})
             payload.update(
                 {
@@ -147,9 +154,11 @@ class DaemonService:
                 source="daemon",
                 payload=payload,
             )
-            last_reconcile = await repo.get_checkpoint(f"daemon_reconcile:{self.settings.app_color}")
+            last_reconcile = await repo.get_checkpoint(
+                f"daemon_reconcile:{self.settings.kalshi_env}:{self.settings.app_color}"
+            )
             await repo.set_checkpoint(
-                f"daemon_heartbeat:{self.settings.app_color}",
+                f"daemon_heartbeat:{self.settings.kalshi_env}:{self.settings.app_color}",
                 None,
                 {
                     **payload,
@@ -347,8 +356,12 @@ class DaemonService:
         if actionable <= 0:
             return summary
 
-        last_reconcile_at = await self._checkpoint_time(f"daemon_reconcile:{self.settings.app_color}")
-        last_follow_up_at = await self._checkpoint_time(f"daemon_settlement_followup:{self.settings.app_color}")
+        last_reconcile_at = await self._checkpoint_time(
+            f"daemon_reconcile:{self.settings.kalshi_env}:{self.settings.app_color}"
+        )
+        last_follow_up_at = await self._checkpoint_time(
+            f"daemon_settlement_followup:{self.settings.kalshi_env}:{self.settings.app_color}"
+        )
         min_interval = timedelta(seconds=max(30, min(self.settings.daemon_reconcile_interval_seconds, 120)))
         now = datetime.now(UTC)
         if last_reconcile_at is not None and now - last_reconcile_at < min_interval:
@@ -378,7 +391,7 @@ class DaemonService:
                 },
             )
             await repo.set_checkpoint(
-                f"daemon_settlement_followup:{self.settings.app_color}",
+                f"daemon_settlement_followup:{self.settings.kalshi_env}:{self.settings.app_color}",
                 None,
                 {
                     "followed_at": now.isoformat(),
@@ -425,7 +438,9 @@ class DaemonService:
     async def _maybe_run_historical_intelligence(self) -> dict[str, Any] | None:
         if self.historical_intelligence_service is None:
             return None
-        last_run_at = await self._checkpoint_time(f"daemon_historical_intelligence:{self.settings.app_color}")
+        last_run_at = await self._checkpoint_time(
+            f"daemon_historical_intelligence:{self.settings.kalshi_env}:{self.settings.app_color}"
+        )
         now = datetime.now(UTC)
         min_interval = timedelta(seconds=max(3600, self.settings.historical_intelligence_daily_run_seconds))
         if last_run_at is not None and now - last_run_at < min_interval:
@@ -443,7 +458,7 @@ class DaemonService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             await repo.set_checkpoint(
-                f"daemon_historical_intelligence:{self.settings.app_color}",
+                f"daemon_historical_intelligence:{self.settings.kalshi_env}:{self.settings.app_color}",
                 None,
                 {
                     "ran_at": now.isoformat(),
@@ -456,7 +471,9 @@ class DaemonService:
     async def _maybe_run_historical_pipeline(self) -> dict[str, Any] | None:
         if self.historical_pipeline_service is None:
             return None
-        last_run_at = await self._checkpoint_time(f"daemon_historical_pipeline:{self.settings.app_color}")
+        last_run_at = await self._checkpoint_time(
+            f"daemon_historical_pipeline:{self.settings.kalshi_env}:{self.settings.app_color}"
+        )
         now = datetime.now(UTC)
         min_interval = timedelta(seconds=max(3600, self.settings.historical_pipeline_daily_run_seconds))
         if last_run_at is not None and now - last_run_at < min_interval:
@@ -465,7 +482,7 @@ class DaemonService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             await repo.set_checkpoint(
-                f"daemon_historical_pipeline:{self.settings.app_color}",
+                f"daemon_historical_pipeline:{self.settings.kalshi_env}:{self.settings.app_color}",
                 None,
                 {
                     "ran_at": now.isoformat(),

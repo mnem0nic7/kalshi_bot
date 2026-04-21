@@ -16,7 +16,31 @@
   flex-wrap: wrap;
 }
 
+.dash-shell {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  justify-content: space-between;
+  padding: 0.75rem 0.9rem;
+  flex-wrap: wrap;
+}
+
+.dash-shell-site {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.dash-shell-site-label {
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #eef4fd;
+}
+
 .dash-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid rgba(255, 255, 255, 0.1);
   background: rgba(255, 255, 255, 0.05);
   color: #eaf1fb;
@@ -24,6 +48,7 @@
   padding: 0.55rem 1.1rem;
   font-weight: 600;
   cursor: pointer;
+  text-decoration: none;
   transition: background 140ms ease, border-color 140ms ease;
 }
 

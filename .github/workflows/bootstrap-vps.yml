@@ -133,11 +133,11 @@ jobs:
                    -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
           app_dir_q="$(printf '%q' "${DEPLOY_APP_DIR}")"
 
-          # Give Nginx a moment after start-stack completes
+          # Give Caddy a moment after start-stack completes
           sleep 5
 
-          "${ssh_cmd[@]}" "curl -fsS http://localhost:8080/healthz" > /dev/null
-          "${ssh_cmd[@]}" "curl -fsS http://localhost:8080/readyz" > /dev/null
+          "${ssh_cmd[@]}" "curl -fsS http://localhost/healthz" > /dev/null
+          "${ssh_cmd[@]}" "curl -fsS http://localhost/readyz" > /dev/null
 
           status_json="$("${ssh_cmd[@]}" "cd ${app_dir_q} && \
             docker compose -f infra/docker-compose.yml exec -T app_blue \

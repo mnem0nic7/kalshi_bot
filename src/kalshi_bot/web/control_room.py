@@ -1309,30 +1309,37 @@ async def _build_rooms_tab(container: AppContainer) -> dict[str, Any]:
 async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[str, Any]:
     now = datetime.now(UTC)
     async with container.session_factory() as session:
-        repo = PlatformRepository(session)
+        repo = PlatformRepository(session, kalshi_env=kalshi_env)
+        control = await repo.get_deployment_control(kalshi_env=kalshi_env)
         positions = await repo.list_positions(limit=100, kalshi_env=kalshi_env)
-        ops_events = await repo.list_ops_events(limit=50)
+        ops_events = await repo.list_ops_events(limit=50, kalshi_env=kalshi_env)
         active_rooms = await repo.list_active_rooms(
             kalshi_env=kalshi_env,
             updated_within_seconds=container.settings.trigger_active_room_stale_seconds,
             limit=20,
         )
-        market_states = await repo.list_market_states([position.market_ticker for position in positions])
-        balance_checkpoint = await repo.get_checkpoint("reconcile")
-        runtime_health = await container.watchdog_service.get_status(repo)
-        pack = await container.agent_pack_service.get_pack_for_color(repo, container.settings.app_color)
+        market_states = await repo.list_market_states(
+            [position.market_ticker for position in positions],
+            kalshi_env=kalshi_env,
+        )
+        balance_checkpoint = await repo.get_checkpoint(f"reconcile:{kalshi_env}")
+        runtime_health = await container.watchdog_service.get_status(repo, kalshi_env=kalshi_env)
+        pack = await container.agent_pack_service.get_pack_for_color(repo, control.active_color)
         thresholds = container.agent_pack_service.runtime_thresholds(pack)
         signal_payload_by_ticker = await repo.latest_signal_payloads_for_markets(
             market_tickers=[position.market_ticker for position in positions],
             kalshi_env=kalshi_env,
         )
-        total_capital = await repo.get_total_capital_dollars()
-        daily_pnl_baseline = await repo.get_daily_portfolio_baseline_dollars()
-        win_rate_data = await repo.get_fill_win_rate_30d()
+        total_capital = await repo.get_total_capital_dollars(kalshi_env=kalshi_env)
+        daily_pnl_baseline = await repo.get_daily_portfolio_baseline_dollars(kalshi_env=kalshi_env)
+        win_rate_data = await repo.get_fill_win_rate_30d(kalshi_env=kalshi_env)
+        fallback_capital = thresholds.risk_max_position_notional_dollars
+        if fallback_capital is None:
+            fallback_capital = 0
         capital_buckets = await repo.portfolio_bucket_snapshot(
             kalshi_env=kalshi_env,
             subaccount=container.settings.kalshi_subaccount,
-            total_capital_dollars=total_capital if total_capital is not None else Decimal(str(thresholds.risk_max_position_notional_dollars)),
+            total_capital_dollars=total_capital if total_capital is not None else Decimal(str(fallback_capital)),
             safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
             risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
         )

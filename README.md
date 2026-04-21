@@ -37,10 +37,13 @@ docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
 9. Start the app stack:
 
 ```bash
-docker compose -f infra/docker-compose.yml up --build -d app_blue app_green daemon_blue daemon_green nginx
+docker compose -f infra/docker-compose.yml up --build -d \
+  app_blue app_green daemon_blue daemon_green \
+  web_demo web_production web_strategies caddy
 ```
 
-10. Open `http://localhost:8080`.
+10. Open `http://localhost` for the local fallback route, or point DNS at the server and use:
+   `https://demo.ai-al.site`, `https://prod.ai-al.site`, and `https://strategy.ai-al.site`.
 
 ## Local Python workflow
 
@@ -156,7 +159,7 @@ Add these GitHub Secrets before running them:
 
 Each workflow writes the PEM to a temporary file at runtime, runs REST plus WebSocket auth checks, and removes the file before exit. Neither workflow places orders.
 
-`Compose Shadow Smoke` uses `POSTGRES_PASSWORD` to build a temporary `.env`, starts Postgres, runs Alembic migrations, boots the nginx plus FastAPI web stack in shadow mode, and hits `/healthz`, `/readyz`, and `/api/status`. It uses temporary dummy PEM files because this workflow validates deploy mechanics rather than authenticated Kalshi access.
+`Compose Shadow Smoke` uses `POSTGRES_PASSWORD` to build a temporary `.env`, starts Postgres, runs Alembic migrations, boots the Caddy plus FastAPI web stack in shadow mode, and hits `/healthz`, `/readyz`, and `/api/status`. It uses temporary dummy PEM files because this workflow validates deploy mechanics rather than authenticated Kalshi access.
 
 `Live Smoke` now runs in the GitHub Actions environment named `live`. For the safer setup:
 

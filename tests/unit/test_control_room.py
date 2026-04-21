@@ -379,8 +379,12 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     ]
 
     class FakeRepo:
-        def __init__(self, _session) -> None:
+        def __init__(self, _session, **_kwargs) -> None:
             pass
+
+        async def get_deployment_control(self, *, kalshi_env: str | None = None) -> SimpleNamespace:
+            assert kalshi_env == "demo"
+            return SimpleNamespace(active_color="green", kill_switch_enabled=False)
 
         async def list_positions(
             self,
@@ -393,16 +397,23 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
             assert kalshi_env == "demo"
             return positions
 
-        async def list_ops_events(self, *, limit: int) -> list[SimpleNamespace]:
+        async def list_ops_events(self, *, limit: int, kalshi_env: str | None = None) -> list[SimpleNamespace]:
             assert limit == 50
+            assert kalshi_env == "demo"
             return []
 
-        async def list_market_states(self, market_tickers: list[str]) -> list[SimpleNamespace]:
+        async def list_market_states(
+            self,
+            market_tickers: list[str],
+            *,
+            kalshi_env: str | None = None,
+        ) -> list[SimpleNamespace]:
             assert market_tickers == [position.market_ticker for position in positions]
+            assert kalshi_env == "demo"
             return market_states
 
         async def get_checkpoint(self, stream_name: str) -> SimpleNamespace:
-            assert stream_name == "reconcile"
+            assert stream_name == "reconcile:demo"
             return SimpleNamespace(
                 payload={"balance": {"balance": 60582, "portfolio_value": 1600}},
                 updated_at=now,
@@ -450,16 +461,20 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
         ) -> list[SimpleNamespace]:
             return []
 
-        async def get_total_capital_dollars(self) -> Decimal | None:
+        async def get_total_capital_dollars(self, *, kalshi_env: str | None = None) -> Decimal | None:
+            assert kalshi_env == "demo"
             return Decimal("534.17")
 
-        async def get_daily_portfolio_baseline_dollars(self) -> Decimal | None:
+        async def get_daily_portfolio_baseline_dollars(self, *, kalshi_env: str | None = None) -> Decimal | None:
+            assert kalshi_env == "demo"
             return Decimal("618.61")
 
-        async def get_daily_pnl_dollars(self) -> Decimal | None:
+        async def get_daily_pnl_dollars(self, *, kalshi_env: str | None = None) -> Decimal | None:
+            assert kalshi_env == "demo"
             return Decimal("3.21")
 
-        async def get_fill_win_rate_30d(self) -> dict:
+        async def get_fill_win_rate_30d(self, *, kalshi_env: str | None = None) -> dict:
+            assert kalshi_env == "demo"
             return {"won_contracts": 47.0, "total_contracts": 68.0}
 
         async def portfolio_bucket_snapshot(
@@ -538,6 +553,8 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert payload["positions"][1]["recommended_size_cap_fp"] == "10.00"
     assert payload["positions_summary"]["capital_buckets"]["risky_limit_display"] == "$75.00"
     assert container.kalshi.get_market.await_count == 2
+    assert container.watchdog_service.get_status.await_args.kwargs["kalshi_env"] == "demo"
+    assert container.agent_pack_service.get_pack_for_color.await_args.args[1] == "green"
 
 
 def _strategy_thresholds(*, min_edge_bps: int, quality_buffer_bps: int = 20, min_remaining_payout_bps: int = 500) -> dict[str, object]:

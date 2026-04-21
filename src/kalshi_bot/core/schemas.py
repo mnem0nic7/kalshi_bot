@@ -780,6 +780,58 @@ class ShadowRunRequest(BaseModel):
     prompt: str | None = None
 
 
+class WebRegisterRequest(BaseModel):
+    email: str
+    password: str
+
+    @field_validator("email", "password", mode="before")
+    @classmethod
+    def strip_auth_fields(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        if "@" not in value:
+            raise ValueError("Valid email is required")
+        return value.lower()
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return value
+
+
+class WebLoginRequest(BaseModel):
+    email: str
+    password: str
+
+    @field_validator("email", "password", mode="before")
+    @classmethod
+    def strip_auth_fields(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        if "@" not in value:
+            raise ValueError("Valid email is required")
+        return value.lower()
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if not value:
+            raise ValueError("Password is required")
+        return value
+
+
 class SelfImprovePromoteRequest(BaseModel):
     evaluation_run_id: str
     reason: str = "auto_promote"

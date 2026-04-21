@@ -44,13 +44,17 @@ run_migrate() {
 }
 
 run_control() {
+  local env_name="$1"
+  shift
   local -a cmd=("$@")
-  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q app_blue 2>/dev/null || true)" ]]; then
-    docker compose -f "${compose_file}" ${compose_env_file} exec -T app_blue "${cmd[@]}"
+  local primary_service="app_${env_name}_blue"
+  local secondary_service="app_${env_name}_green"
+  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q "${primary_service}" 2>/dev/null || true)" ]]; then
+    docker compose -f "${compose_file}" ${compose_env_file} exec -T "${primary_service}" "${cmd[@]}"
     return
   fi
-  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q app_green 2>/dev/null || true)" ]]; then
-    docker compose -f "${compose_file}" ${compose_env_file} exec -T app_green "${cmd[@]}"
+  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q "${secondary_service}" 2>/dev/null || true)" ]]; then
+    docker compose -f "${compose_file}" ${compose_env_file} exec -T "${secondary_service}" "${cmd[@]}"
     return
   fi
   run_migrate "${cmd[@]}"
@@ -59,12 +63,21 @@ run_control() {
 docker compose -f "${compose_file}" ${compose_env_file} config >/dev/null
 docker compose -f "${compose_file}" ${compose_env_file} up -d postgres
 run_migrate
-docker compose -f "${compose_file}" ${compose_env_file} up -d --build app_blue app_green daemon_blue daemon_green
-wait_for_service_health app_blue 180
-wait_for_service_health app_green 180
-docker compose -f "${compose_file}" ${compose_env_file} up -d --force-recreate nginx
-wait_for_service_health nginx 90
+docker compose -f "${compose_file}" ${compose_env_file} up -d --build \
+  app_demo_blue app_demo_green daemon_demo_blue daemon_demo_green \
+  app_production_blue app_production_green daemon_production_blue daemon_production_green \
+  web_demo web_production web_strategies
+wait_for_service_health app_demo_blue 180
+wait_for_service_health app_demo_green 180
+wait_for_service_health app_production_blue 180
+wait_for_service_health app_production_green 180
+wait_for_service_health web_demo 180
+wait_for_service_health web_production 180
+wait_for_service_health web_strategies 180
+docker compose -f "${compose_file}" ${compose_env_file} up -d --force-recreate caddy
+wait_for_service_health caddy 90
 
-run_control python -m kalshi_bot.cli watchdog mark-boot --status success --reason "${reason}"
+run_control demo python -m kalshi_bot.cli watchdog mark-boot --status success --reason "${reason}"
+run_control production python -m kalshi_bot.cli watchdog mark-boot --status success --reason "${reason}"
 
 echo "Started Kalshi Bot stack (${reason})"

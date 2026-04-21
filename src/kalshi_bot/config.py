@@ -27,8 +27,13 @@ class Settings(BaseSettings):
     app_enable_kill_switch: bool = True
     web_auth_enabled: bool = True
     web_auth_cookie_name: str = "kalshi_bot_session"
+    web_auth_cookie_domain: str | None = None
     web_auth_session_ttl_seconds: int = 1_209_600
     web_auth_allowed_registration_emails: str = "m7.ga.77@gmail.com"
+    web_site_kind: str = "combined"
+    web_demo_host: str = "demo.ai-al.site"
+    web_production_host: str = "prod.ai-al.site"
+    web_strategies_host: str = "strategy.ai-al.site"
 
     database_url: str | None = None
     postgres_host: str = "localhost"
@@ -91,6 +96,9 @@ class Settings(BaseSettings):
     risk_order_pct: float = 0.05
     risk_position_pct: float = 0.10
     risk_daily_loss_pct: float = 0.05
+    risk_daily_loss_sensitivity_pct: float = 0.10
+    risk_daily_loss_sensitivity_edge_multiplier: float = 2.0
+    risk_daily_loss_sensitivity_size_multiplier: float = 0.50
     risk_max_concurrent_tickers: int = 10
     # Override-only dollar caps — used in tests or hard-ceiling scenarios.
     # In production leave unset; supervisor derives caps from live balance × pct.
@@ -113,7 +121,7 @@ class Settings(BaseSettings):
     risk_stale_weather_seconds: int = 900
     risk_min_edge_bps: int = 500
     risk_max_credible_edge_bps: int = 5000
-    risk_min_confidence: float = 0.60
+    risk_min_confidence: float = 0.70
     risk_min_contract_price_dollars: float = 0.05
     # Probability distance from 50%: 25.0 means fair_yes must be <0.25 or >0.75.
     # Set to 0.0 to disable (only in tests or when the pipeline has city-specific calibration).
@@ -131,10 +139,12 @@ class Settings(BaseSettings):
     research_web_max_queries: int = 2
     trigger_enable_auto_rooms: bool = False
     trigger_cooldown_seconds: int = 300
+    trigger_price_move_bypass_bps: int = 1500
     trigger_max_spread_bps: int = 1200
     trigger_max_concurrent_rooms: int = 4
     trigger_active_room_stale_seconds: int = 1800
     daemon_reconcile_interval_seconds: int = 60
+    daemon_reconcile_stale_kill_switch_seconds: int = 300
     daemon_heartbeat_interval_seconds: int = 60
     daemon_market_history_interval_seconds: int = 60
     daemon_market_history_retention_hours: int = 24
@@ -225,6 +235,14 @@ class Settings(BaseSettings):
             item.strip().lower()
             for item in self.web_auth_allowed_registration_emails.split(",")
             if item.strip()
+        }
+
+    @property
+    def web_site_urls(self) -> dict[str, str]:
+        return {
+            "demo": f"https://{self.web_demo_host}",
+            "production": f"https://{self.web_production_host}",
+            "strategies": f"https://{self.web_strategies_host}",
         }
 
     def api_key_id(self, write: bool) -> str | None:

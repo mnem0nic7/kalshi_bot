@@ -77,3 +77,31 @@ class WeatherMarketDirectory:
             if resolved is not None:
                 return resolved
         return None
+
+    def validate(self) -> list[str]:
+        """Return warning strings for any configured markets missing required weather fields.
+
+        Checks station_id, location_name, latitude, longitude, and threshold_f. Templates are
+        excluded — they resolve fields dynamically from market metadata.
+        """
+        warnings: list[str] = []
+        for ticker, mapping in self._mappings.items():
+            if mapping.market_type != "weather":
+                continue
+            missing = [
+                field
+                for field, value in [
+                    ("station_id", mapping.station_id),
+                    ("location_name", mapping.location_name),
+                    ("latitude", mapping.latitude),
+                    ("longitude", mapping.longitude),
+                    ("threshold_f", mapping.threshold_f),
+                ]
+                if value is None
+            ]
+            if missing:
+                warnings.append(
+                    f"Market map entry '{ticker}' is missing required fields: {', '.join(missing)}. "
+                    "This city will not be tradeable until the YAML is corrected."
+                )
+        return warnings

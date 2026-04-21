@@ -55,13 +55,14 @@ class AutoTriggerService:
                 return
             pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
             thresholds = self.agent_pack_service.runtime_thresholds(pack)
-            market_state = await repo.get_market_state(market_ticker)
+            market_state = await repo.get_market_state(market_ticker, kalshi_env=self.settings.kalshi_env)
             if market_state is None or not self._market_is_actionable(market_state, thresholds):
                 await session.commit()
                 return
 
             active_count = await repo.count_active_rooms(
                 color=self.settings.app_color,
+                kalshi_env=self.settings.kalshi_env,
                 updated_within_seconds=self.settings.trigger_active_room_stale_seconds,
             )
             if active_count >= self.settings.trigger_max_concurrent_rooms:
@@ -74,12 +75,15 @@ class AutoTriggerService:
                 await session.commit()
                 return
 
-            existing_room = await repo.get_latest_active_room_for_market(market_ticker)
+            existing_room = await repo.get_latest_active_room_for_market(
+                market_ticker,
+                kalshi_env=self.settings.kalshi_env,
+            )
             if existing_room is not None:
                 await session.commit()
                 return
 
-            reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{market_ticker}")
+            reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}")
             if reentry_cp is not None:
                 stopped_at_str = reentry_cp.payload.get("stopped_at")
                 try:
@@ -97,7 +101,7 @@ class AutoTriggerService:
                     # First trigger after stop-loss: allow one room to evaluate the opposite
                     # side. The signal engine will trade whichever side now has edge.
                     await repo.set_checkpoint(
-                        f"stop_loss_reentry:{market_ticker}",
+                        f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}",
                         cursor=None,
                         payload={**reentry_cp.payload, "reverse_evaluated": True},
                     )
@@ -105,6 +109,7 @@ class AutoTriggerService:
                     # Within cooldown window: require sustained momentum confirmation.
                     prices = await repo.fetch_recent_prices(
                         market_ticker,
+                        kalshi_env=self.settings.kalshi_env,
                         window=timedelta(seconds=self.settings.stop_loss_momentum_reentry_window_seconds),
                     )
                     points = [
@@ -124,7 +129,7 @@ class AutoTriggerService:
                         return
                     # Momentum confirmed — allow re-entry.
 
-            checkpoint = await repo.get_checkpoint(f"auto_trigger:{market_ticker}")
+            checkpoint = await repo.get_checkpoint(f"auto_trigger:{self.settings.kalshi_env}:{market_ticker}")
             if checkpoint is not None:
                 last_triggered_at = checkpoint.payload.get("last_triggered_at")
                 if last_triggered_at is not None:
@@ -135,12 +140,21 @@ class AutoTriggerService:
                         else thresholds.trigger_cooldown_seconds
                     )
                     if datetime.now(UTC) - last_trigger_time < timedelta(seconds=cooldown):
-                        await session.commit()
-                        return
+                        # Bypass cooldown if mid price has moved enough since last trigger.
+                        last_mid_raw = checkpoint.payload.get("last_trigger_mid")
+                        bypassed = False
+                        if last_mid_raw is not None and self.settings.trigger_price_move_bypass_bps > 0:
+                            current_mid = self._mid_dollars(market_state)
+                            if current_mid is not None:
+                                move_bps = int(abs(current_mid - Decimal(str(last_mid_raw))) * Decimal("10000"))
+                                bypassed = move_bps >= self.settings.trigger_price_move_bypass_bps
+                        if not bypassed:
+                            await session.commit()
+                            return
 
             if self._book_is_broken(market_state):
                 await repo.set_checkpoint(
-                    f"auto_trigger:{market_ticker}",
+                    f"auto_trigger:{self.settings.kalshi_env}:{market_ticker}",
                     cursor=None,
                     payload={"last_triggered_at": datetime.now(UTC).isoformat(), "book_broken": True},
                 )
@@ -160,14 +174,16 @@ class AutoTriggerService:
                 kalshi_env=self.settings.kalshi_env,
                 agent_pack_version=pack.version,
             )
+            current_mid = self._mid_dollars(market_state)
             await repo.set_checkpoint(
-                f"auto_trigger:{market_ticker}",
+                f"auto_trigger:{self.settings.kalshi_env}:{market_ticker}",
                 cursor=None,
                 payload={
                     "last_triggered_at": datetime.now(UTC).isoformat(),
                     "room_id": room.id,
                     "spread_bps": spread_bps,
                     "agent_pack_version": pack.version,
+                    "last_trigger_mid": str(current_mid) if current_mid is not None else None,
                 },
             )
             await repo.log_ops_event(
@@ -220,3 +236,13 @@ class AutoTriggerService:
         yes_bid = Decimal(str(market_state.yes_bid_dollars or 0))
         yes_ask = Decimal(str(market_state.yes_ask_dollars or 0))
         return int(((yes_ask - yes_bid) * Decimal("10000")).to_integral_value())
+
+    @staticmethod
+    def _mid_dollars(market_state: MarketState) -> Decimal | None:
+        yes_bid = market_state.yes_bid_dollars
+        yes_ask = market_state.yes_ask_dollars
+        if yes_bid is None:
+            return None
+        if yes_ask is None:
+            return yes_bid
+        return (yes_bid + yes_ask) / Decimal("2")

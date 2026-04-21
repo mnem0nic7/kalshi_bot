@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -8,6 +9,8 @@ import httpx
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import DeploymentColor
 from kalshi_bot.db.repositories import PlatformRepository
+
+logger = logging.getLogger(__name__)
 
 
 class WatchdogService:
@@ -22,14 +25,21 @@ class WatchdogService:
     def active_restart_wait_seconds(self) -> int:
         return max(30, self.settings.daemon_heartbeat_interval_seconds + 15)
 
-    async def app_health(self, *, color: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
-        url = f"http://app_{color}:8000/readyz"
+    async def app_health(
+        self,
+        *,
+        color: str,
+        kalshi_env: str,
+        timeout_seconds: float = 5.0,
+    ) -> dict[str, Any]:
+        url = f"http://app_{kalshi_env}_{color}:8000/readyz"
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             try:
                 response = await client.get(url)
                 response.raise_for_status()
             except Exception as exc:
                 return {
+                    "kalshi_env": kalshi_env,
                     "color": color,
                     "healthy": False,
                     "status": "unhealthy",
@@ -38,6 +48,7 @@ class WatchdogService:
                     "observed_at": datetime.now(UTC).isoformat(),
                 }
         return {
+            "kalshi_env": kalshi_env,
             "color": color,
             "healthy": True,
             "status": "healthy",
@@ -46,10 +57,17 @@ class WatchdogService:
             "observed_at": datetime.now(UTC).isoformat(),
         }
 
-    async def daemon_health(self, repo: PlatformRepository, *, color: str) -> dict[str, Any]:
+    async def daemon_health(
+        self,
+        repo: PlatformRepository,
+        *,
+        color: str,
+        kalshi_env: str | None = None,
+    ) -> dict[str, Any]:
+        env = kalshi_env or self.settings.kalshi_env
         now = datetime.now(UTC)
-        heartbeat = await repo.get_checkpoint(f"daemon_heartbeat:{color}")
-        reconcile = await repo.get_checkpoint(f"daemon_reconcile:{color}")
+        heartbeat = await repo.get_checkpoint(f"daemon_heartbeat:{env}:{color}")
+        reconcile = await repo.get_checkpoint(f"daemon_reconcile:{env}:{color}")
         heartbeat_at = self._checkpoint_time(heartbeat, "heartbeat_at")
         reconcile_at = self._checkpoint_time(reconcile, "reconciled_at")
         heartbeat_age = self._age_seconds(now, heartbeat_at)
@@ -62,6 +80,7 @@ class WatchdogService:
         else:
             reason = "heartbeat stale"
         return {
+            "kalshi_env": env,
             "color": color,
             "healthy": healthy,
             "reason": reason,
@@ -72,14 +91,15 @@ class WatchdogService:
             "threshold_seconds": self.daemon_unhealthy_after_seconds,
         }
 
-    async def get_status(self, repo: PlatformRepository) -> dict[str, Any]:
-        control = await repo.get_deployment_control()
+    async def get_status(self, repo: PlatformRepository, *, kalshi_env: str | None = None) -> dict[str, Any]:
+        env = kalshi_env or self.settings.kalshi_env
+        control = await repo.get_deployment_control(kalshi_env=env)
         watchdog = dict(control.notes.get("watchdog") or {})
         colors: dict[str, Any] = {}
         note_colors = dict(watchdog.get("colors") or {})
         for color in (DeploymentColor.BLUE.value, DeploymentColor.GREEN.value):
             app = dict(note_colors.get(color, {}).get("app") or {})
-            daemon = await self.daemon_health(repo, color=color)
+            daemon = await self.daemon_health(repo, color=color, kalshi_env=env)
             app_healthy = app.get("healthy")
             colors[color] = {
                 "app": {
@@ -92,6 +112,7 @@ class WatchdogService:
                 "combined_healthy": bool(app_healthy) and daemon["healthy"],
             }
         return {
+            "kalshi_env": env,
             "active_color": control.active_color,
             "kill_switch_enabled": control.kill_switch_enabled,
             "colors": colors,
@@ -110,8 +131,9 @@ class WatchdogService:
         app_statuses: dict[str, str],
         source: str = "watchdog_timer",
     ) -> dict[str, Any]:
+        env = self.settings.kalshi_env
         now = datetime.now(UTC)
-        control = await repo.get_deployment_control()
+        control = await repo.get_deployment_control(kalshi_env=env)
         notes = dict(control.notes or {})
         watchdog = dict(notes.get("watchdog") or {})
         pending = dict(watchdog.get("pending_recovery") or {})
@@ -120,7 +142,7 @@ class WatchdogService:
         for color in (DeploymentColor.BLUE.value, DeploymentColor.GREEN.value):
             app = self._normalize_app_status(app_statuses.get(color, "unknown"))
             app["observed_at"] = now.isoformat()
-            daemon = await self.daemon_health(repo, color=color)
+            daemon = await self.daemon_health(repo, color=color, kalshi_env=env)
             colors[color] = {
                 "app": app,
                 "daemon": daemon,
@@ -152,8 +174,8 @@ class WatchdogService:
                 reason = "both colors unhealthy"
                 pending = {}
             elif pending.get("color") == active_color and pending.get("step") == "restart_active":
-                await repo.set_active_color(inactive_color)
-                control = await repo.get_deployment_control()
+                await repo.set_active_color(inactive_color, kalshi_env=env)
+                control = await repo.get_deployment_control(kalshi_env=env)
                 notes = dict(control.notes or {})
                 watchdog = dict(notes.get("watchdog") or {})
                 action = "failover"
@@ -178,7 +200,40 @@ class WatchdogService:
                     "reason": reason,
                 }
 
+        # Auto-enable kill switch if active color's reconcile is stale.
+        reconcile_stale_threshold = self.settings.daemon_reconcile_stale_kill_switch_seconds
+        active_daemon = colors[active_color]["daemon"]
+        reconcile_age = active_daemon.get("last_reconcile_age_seconds")
+        if (
+            reconcile_stale_threshold > 0
+            and reconcile_age is not None
+            and reconcile_age > reconcile_stale_threshold
+            and not control.kill_switch_enabled
+        ):
+            await repo.set_kill_switch(True, kalshi_env=env)
+            control = await repo.get_deployment_control(kalshi_env=env)
+            logger.critical(
+                "Reconcile stale for %.0fs (threshold %ds) — kill switch auto-enabled",
+                reconcile_age,
+                reconcile_stale_threshold,
+            )
+            await repo.log_ops_event(
+                severity="critical",
+                summary=(
+                    f"Kill switch auto-enabled: reconcile stale for {reconcile_age:.0f}s "
+                    f"(threshold {reconcile_stale_threshold}s)"
+                ),
+                source="watchdog",
+                payload={
+                    "kalshi_env": env,
+                    "active_color": active_color,
+                    "reconcile_age_seconds": reconcile_age,
+                    "threshold_seconds": reconcile_stale_threshold,
+                },
+            )
+
         action_payload = {
+            "kalshi_env": env,
             "action": action,
             "target_color": target_color,
             "failed_color": failed_color,
@@ -203,7 +258,7 @@ class WatchdogService:
             "observed_at": now.isoformat(),
         }
         notes["watchdog"] = watchdog
-        await repo.update_deployment_notes(notes)
+        await repo.update_deployment_notes(notes, kalshi_env=env)
         if action != "none":
             await repo.log_ops_event(
                 severity="critical" if action == "restart_stack" else "warning",
@@ -226,7 +281,8 @@ class WatchdogService:
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(UTC)
-        control = await repo.get_deployment_control()
+        env = self.settings.kalshi_env
+        control = await repo.get_deployment_control(kalshi_env=env)
         notes = dict(control.notes or {})
         watchdog = dict(notes.get("watchdog") or {})
         last_action = {
@@ -248,12 +304,13 @@ class WatchdogService:
                 "completed_at": now.isoformat(),
             }
         notes["watchdog"] = watchdog
-        await repo.update_deployment_notes(notes)
+        await repo.update_deployment_notes(notes, kalshi_env=env)
         await repo.log_ops_event(
             severity="info" if outcome == "succeeded" else "error",
             summary="Watchdog action outcome",
             source="watchdog",
             payload={
+                "kalshi_env": env,
                 "action": action,
                 "outcome": outcome,
                 "reason": reason,
@@ -274,7 +331,8 @@ class WatchdogService:
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(UTC)
-        control = await repo.get_deployment_control()
+        env = self.settings.kalshi_env
+        control = await repo.get_deployment_control(kalshi_env=env)
         notes = dict(control.notes or {})
         watchdog = dict(notes.get("watchdog") or {})
         watchdog["last_boot_recovery"] = {
@@ -284,12 +342,13 @@ class WatchdogService:
             **(payload or {}),
         }
         notes["watchdog"] = watchdog
-        await repo.update_deployment_notes(notes)
+        await repo.update_deployment_notes(notes, kalshi_env=env)
         await repo.log_ops_event(
             severity="info" if status == "success" else "error",
             summary="Boot recovery status recorded",
             source="watchdog",
             payload={
+                "kalshi_env": env,
                 "status": status,
                 "reason": reason,
                 **(payload or {}),

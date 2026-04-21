@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import DeploymentColor, MessageKind, RiskStatus, RoomOrigin, RoomStage
 from kalshi_bot.core.fixed_point import as_decimal
 from kalshi_bot.core.schemas import (
@@ -74,6 +75,8 @@ from kalshi_bot.db.models import (
     TrainingDatasetBuildRecord,
     TrainingReadinessRecord,
     TradeTicketRecord,
+    WebSession,
+    WebUser,
 )
 
 
@@ -96,20 +99,33 @@ def _quantize_money(value: Any) -> Decimal:
 
 
 class PlatformRepository:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, *, kalshi_env: str | None = None) -> None:
         self.session = session
+        self.kalshi_env = kalshi_env if kalshi_env is not None else get_settings().kalshi_env
+
+    def _resolved_kalshi_env(self, kalshi_env: str | None = None) -> str:
+        env = (kalshi_env or self.kalshi_env or "demo").strip()
+        return env or "demo"
+
+    def _env_stream_name(self, prefix: str, *, kalshi_env: str | None = None, suffix: str | None = None) -> str:
+        parts = [prefix, self._resolved_kalshi_env(kalshi_env)]
+        if suffix:
+            parts.append(suffix)
+        return ":".join(parts)
 
     async def ensure_deployment_control(
         self,
         color: str,
         *,
+        kalshi_env: str | None = None,
         initial_active_color: str | None = None,
         initial_kill_switch_enabled: bool | None = None,
     ) -> DeploymentControl:
-        control = await self.session.get(DeploymentControl, "default")
+        env = self._resolved_kalshi_env(kalshi_env)
+        control = await self.session.get(DeploymentControl, env)
         if control is None:
             control = DeploymentControl(
-                id="default",
+                id=env,
                 active_color=initial_active_color or DeploymentColor.BLUE.value,
                 shadow_color=color,
                 kill_switch_enabled=bool(initial_kill_switch_enabled),
@@ -118,11 +134,19 @@ class PlatformRepository:
             await self.session.flush()
         return control
 
-    async def get_deployment_control(self) -> DeploymentControl:
-        return await self.ensure_deployment_control(DeploymentColor.BLUE.value)
+    async def get_deployment_control(self, *, kalshi_env: str | None = None) -> DeploymentControl:
+        return await self.ensure_deployment_control(
+            DeploymentColor.BLUE.value,
+            kalshi_env=kalshi_env,
+        )
 
-    async def set_active_color(self, color: DeploymentColor | str) -> DeploymentControl:
-        control = await self.ensure_deployment_control(str(color))
+    async def set_active_color(
+        self,
+        color: DeploymentColor | str,
+        *,
+        kalshi_env: str | None = None,
+    ) -> DeploymentControl:
+        control = await self.ensure_deployment_control(str(color), kalshi_env=kalshi_env)
         if control.active_color != str(color):
             control.execution_lock_holder = None
         control.active_color = str(color)
@@ -138,16 +162,31 @@ class PlatformRepository:
         await self.session.flush()
         return control
 
-    async def set_kill_switch(self, enabled: bool) -> DeploymentControl:
-        control = await self.ensure_deployment_control(DeploymentColor.BLUE.value)
+    async def set_kill_switch(self, enabled: bool, *, kalshi_env: str | None = None) -> DeploymentControl:
+        control = await self.ensure_deployment_control(
+            DeploymentColor.BLUE.value,
+            kalshi_env=kalshi_env,
+        )
         control.kill_switch_enabled = enabled
         if enabled:
             control.execution_lock_holder = None
+        else:
+            # Record when the kill switch was cleared so execution can require a
+            # post-clear reconcile before the first live order goes out.
+            notes = dict(control.notes or {})
+            notes["kill_switch_cleared_at"] = datetime.now(UTC).isoformat()
+            control.notes = notes
         await self.session.flush()
         return control
 
-    async def acquire_execution_lock(self, holder: str, color: str) -> bool:
-        control = await self.ensure_deployment_control(color)
+    async def acquire_execution_lock(
+        self,
+        holder: str,
+        color: str,
+        *,
+        kalshi_env: str | None = None,
+    ) -> bool:
+        control = await self.ensure_deployment_control(color, kalshi_env=kalshi_env)
         if control.active_color != color or control.kill_switch_enabled:
             return False
         if control.execution_lock_holder not in (None, holder):
@@ -156,14 +195,25 @@ class PlatformRepository:
         await self.session.flush()
         return True
 
-    async def release_execution_lock(self, holder: str) -> None:
-        control = await self.ensure_deployment_control(DeploymentColor.BLUE.value)
+    async def release_execution_lock(self, holder: str, *, kalshi_env: str | None = None) -> None:
+        control = await self.ensure_deployment_control(
+            DeploymentColor.BLUE.value,
+            kalshi_env=kalshi_env,
+        )
         if control.execution_lock_holder == holder:
             control.execution_lock_holder = None
             await self.session.flush()
 
-    async def update_deployment_notes(self, notes: dict[str, Any]) -> DeploymentControl:
-        control = await self.ensure_deployment_control(DeploymentColor.BLUE.value)
+    async def update_deployment_notes(
+        self,
+        notes: dict[str, Any],
+        *,
+        kalshi_env: str | None = None,
+    ) -> DeploymentControl:
+        control = await self.ensure_deployment_control(
+            DeploymentColor.BLUE.value,
+            kalshi_env=kalshi_env,
+        )
         control.notes = notes
         await self.session.flush()
         return control
@@ -342,6 +392,7 @@ class PlatformRepository:
         self,
         *,
         color: str | None = None,
+        kalshi_env: str | None = None,
         updated_within_seconds: int | None = None,
     ) -> int:
         stmt = select(func.count()).select_from(Room).where(
@@ -349,6 +400,8 @@ class PlatformRepository:
         )
         if color is not None:
             stmt = stmt.where(Room.active_color == color)
+        if kalshi_env is not None:
+            stmt = stmt.where(Room.kalshi_env == kalshi_env)
         if updated_within_seconds is not None:
             cutoff = datetime.now(UTC) - timedelta(seconds=updated_within_seconds)
             stmt = stmt.where(Room.updated_at >= cutoff)
@@ -383,21 +436,30 @@ class PlatformRepository:
         await self.session.flush()
         return True
 
-    async def get_latest_active_room_for_market(self, market_ticker: str) -> Room | None:
+    async def get_latest_active_room_for_market(
+        self,
+        market_ticker: str,
+        *,
+        kalshi_env: str | None = None,
+    ) -> Room | None:
         stmt = (
             select(Room)
             .where(Room.market_ticker == market_ticker, Room.stage.not_in([RoomStage.COMPLETE.value, RoomStage.FAILED.value]))
             .order_by(Room.updated_at.desc())
             .limit(1)
         )
+        if kalshi_env is not None:
+            stmt = stmt.where(Room.kalshi_env == kalshi_env)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def reap_orphaned_rooms(self, *, color: str) -> list[str]:
+    async def reap_orphaned_rooms(self, *, color: str, kalshi_env: str | None = None) -> list[str]:
         """Mark all non-terminal rooms for *color* as failed. Returns IDs reaped."""
         stmt = select(Room).where(
             Room.stage.not_in([RoomStage.COMPLETE.value, RoomStage.FAILED.value]),
             Room.active_color == color,
         )
+        if kalshi_env is not None:
+            stmt = stmt.where(Room.kalshi_env == kalshi_env)
         rooms = list((await self.session.execute(stmt)).scalars())
         now = datetime.now(UTC)
         for room in rooms:
@@ -517,13 +579,16 @@ class PlatformRepository:
         self,
         market_ticker: str,
         *,
+        kalshi_env: str | None = None,
         snapshot: dict[str, Any],
         yes_bid_dollars: Decimal | None,
         yes_ask_dollars: Decimal | None,
         last_trade_dollars: Decimal | None,
     ) -> MarketState:
         observed_at = datetime.now(UTC)
+        env = self._resolved_kalshi_env(kalshi_env)
         insert_values = {
+            "kalshi_env": env,
             "market_ticker": market_ticker,
             "source": "kalshi",
             "snapshot": snapshot,
@@ -548,9 +613,9 @@ class PlatformRepository:
         elif dialect_name == "sqlite":
             stmt = sqlite_insert(MarketState).values(**insert_values)
         else:
-            record = await self.session.get(MarketState, market_ticker)
+            record = await self.session.get(MarketState, (env, market_ticker))
             if record is None:
-                record = MarketState(market_ticker=market_ticker, snapshot={})
+                record = MarketState(kalshi_env=env, market_ticker=market_ticker, snapshot={})
                 self.session.add(record)
             record.snapshot = snapshot
             record.yes_bid_dollars = yes_bid_dollars
@@ -562,20 +627,30 @@ class PlatformRepository:
 
         await self.session.execute(
             stmt.on_conflict_do_update(
-                index_elements=[MarketState.market_ticker],
+                index_elements=[MarketState.kalshi_env, MarketState.market_ticker],
                 set_=update_values,
             )
         )
         await self.session.flush()
-        return await self.session.get(MarketState, market_ticker)
+        return await self.session.get(MarketState, (env, market_ticker))
 
-    async def get_market_state(self, market_ticker: str) -> MarketState | None:
-        return await self.session.get(MarketState, market_ticker)
+    async def get_market_state(self, market_ticker: str, *, kalshi_env: str | None = None) -> MarketState | None:
+        env = self._resolved_kalshi_env(kalshi_env)
+        return await self.session.get(MarketState, (env, market_ticker))
 
-    async def list_market_states(self, market_tickers: list[str]) -> list[MarketState]:
+    async def list_market_states(
+        self,
+        market_tickers: list[str],
+        *,
+        kalshi_env: str | None = None,
+    ) -> list[MarketState]:
         if not market_tickers:
             return []
-        stmt = select(MarketState).where(MarketState.market_ticker.in_(market_tickers))
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = select(MarketState).where(
+            MarketState.kalshi_env == env,
+            MarketState.market_ticker.in_(market_tickers),
+        )
         return list((await self.session.execute(stmt)).scalars())
 
     async def get_latest_signal_for_room(self, room_id: str) -> Signal | None:
@@ -634,6 +709,7 @@ class PlatformRepository:
         self,
         *,
         market_ticker: str,
+        kalshi_env: str | None = None,
         yes_bid_dollars: Decimal | None,
         yes_ask_dollars: Decimal | None,
         mid_dollars: Decimal | None,
@@ -643,6 +719,7 @@ class PlatformRepository:
     ) -> MarketPriceHistory:
         record = MarketPriceHistory(
             id=str(uuid4()),
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
             market_ticker=market_ticker,
             yes_bid_dollars=yes_bid_dollars,
             yes_ask_dollars=yes_ask_dollars,
@@ -659,12 +736,15 @@ class PlatformRepository:
         self,
         market_ticker: str,
         *,
+        kalshi_env: str | None = None,
         window: timedelta,
     ) -> list[MarketPriceHistory]:
         cutoff = datetime.now(UTC) - window
+        env = self._resolved_kalshi_env(kalshi_env)
         stmt = (
             select(MarketPriceHistory)
             .where(
+                MarketPriceHistory.kalshi_env == env,
                 MarketPriceHistory.market_ticker == market_ticker,
                 MarketPriceHistory.observed_at >= cutoff,
             )
@@ -672,10 +752,19 @@ class PlatformRepository:
         )
         return list((await self.session.execute(stmt)).scalars())
 
-    async def purge_market_price_history(self, *, older_than: timedelta) -> int:
+    async def purge_market_price_history(
+        self,
+        *,
+        older_than: timedelta,
+        kalshi_env: str | None = None,
+    ) -> int:
         from sqlalchemy import delete as sa_delete
         cutoff = datetime.now(UTC) - older_than
-        stmt = sa_delete(MarketPriceHistory).where(MarketPriceHistory.observed_at < cutoff)
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = sa_delete(MarketPriceHistory).where(
+            MarketPriceHistory.kalshi_env == env,
+            MarketPriceHistory.observed_at < cutoff,
+        )
         result = await self.session.execute(stmt)
         return result.rowcount or 0
 
@@ -751,10 +840,12 @@ class PlatformRepository:
         count_fp: Decimal,
         raw: dict[str, Any],
         kalshi_order_id: str | None = None,
+        kalshi_env: str | None = None,
     ) -> OrderRecord:
         record = OrderRecord(
             trade_ticket_id=ticket_id,
             client_order_id=client_order_id,
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
             market_ticker=market_ticker,
             status=status,
             side=side,
@@ -781,14 +872,17 @@ class PlatformRepository:
         raw: dict[str, Any],
         ticket_id: str | None = None,
         kalshi_order_id: str | None = None,
+        kalshi_env: str | None = None,
     ) -> OrderRecord:
         from kalshi_bot.db.models import OrderRecord as _OR
         record_id = str(uuid4())
         now = datetime.now(UTC)
+        env = self._resolved_kalshi_env(kalshi_env)
         insert_values = {
             "id": record_id,
             "trade_ticket_id": ticket_id,
             "client_order_id": client_order_id,
+            "kalshi_env": env,
             "market_ticker": market_ticker,
             "status": status,
             "side": side,
@@ -817,7 +911,14 @@ class PlatformRepository:
             stmt = sqlite_insert(_OR).values(**insert_values)
         else:
             # fallback: SELECT then mutate
-            existing = (await self.session.execute(select(_OR).where(_OR.client_order_id == client_order_id))).scalar_one_or_none()
+            existing = (
+                await self.session.execute(
+                    select(_OR).where(
+                        _OR.kalshi_env == env,
+                        _OR.client_order_id == client_order_id,
+                    )
+                )
+            ).scalar_one_or_none()
             if existing is None:
                 existing = _OR(**insert_values)
                 self.session.add(existing)
@@ -835,12 +936,19 @@ class PlatformRepository:
         coalesce_kalshi_id = func.coalesce(stmt.excluded.kalshi_order_id, _OR.kalshi_order_id)
         await self.session.execute(
             stmt.on_conflict_do_update(
-                index_elements=["client_order_id"],
+                index_elements=["kalshi_env", "client_order_id"],
                 set_={**update_values, "kalshi_order_id": coalesce_kalshi_id},
             )
         )
         await self.session.flush()
-        result = (await self.session.execute(select(_OR).where(_OR.client_order_id == client_order_id))).scalar_one()
+        result = (
+            await self.session.execute(
+                select(_OR).where(
+                    _OR.kalshi_env == env,
+                    _OR.client_order_id == client_order_id,
+                )
+            )
+        ).scalar_one()
         return result
 
     async def list_orders_for_room(self, room_id: str) -> list[OrderRecord]:
@@ -864,10 +972,12 @@ class PlatformRepository:
         order_id: str | None = None,
         trade_id: str | None = None,
         is_taker: bool = True,
+        kalshi_env: str | None = None,
     ) -> FillRecord:
         record = FillRecord(
             order_id=order_id,
             trade_id=trade_id,
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
             market_ticker=market_ticker,
             side=side,
             action=action,
@@ -892,13 +1002,16 @@ class PlatformRepository:
         order_id: str | None = None,
         trade_id: str | None = None,
         is_taker: bool = True,
+        kalshi_env: str | None = None,
     ) -> FillRecord:
+        env = self._resolved_kalshi_env(kalshi_env)
         if trade_id is not None:
             observed_at = datetime.now(UTC)
             insert_values = {
                 "id": str(uuid4()),
                 "order_id": order_id,
                 "trade_id": trade_id,
+                "kalshi_env": env,
                 "market_ticker": market_ticker,
                 "side": side,
                 "action": action,
@@ -920,7 +1033,7 @@ class PlatformRepository:
                 excluded = stmt.excluded
                 await self.session.execute(
                     stmt.on_conflict_do_update(
-                        index_elements=[FillRecord.trade_id],
+                        index_elements=[FillRecord.kalshi_env, FillRecord.trade_id],
                         set_={
                             "order_id": func.coalesce(excluded.order_id, FillRecord.order_id),
                             "market_ticker": excluded.market_ticker,
@@ -935,17 +1048,24 @@ class PlatformRepository:
                     )
                 )
                 await self.session.flush()
-                stmt = select(FillRecord).where(FillRecord.trade_id == trade_id)
+                stmt = select(FillRecord).where(
+                    FillRecord.kalshi_env == env,
+                    FillRecord.trade_id == trade_id,
+                )
                 return (await self.session.execute(stmt)).scalar_one()
 
         record: FillRecord | None = None
         if trade_id is not None:
-            stmt = select(FillRecord).where(FillRecord.trade_id == trade_id)
+            stmt = select(FillRecord).where(
+                FillRecord.kalshi_env == env,
+                FillRecord.trade_id == trade_id,
+            )
             record = (await self.session.execute(stmt)).scalar_one_or_none()
         if record is None:
             record = FillRecord(
                 order_id=order_id,
                 trade_id=trade_id,
+                kalshi_env=env,
                 market_ticker=market_ticker,
                 side=side,
                 action=action,
@@ -977,15 +1097,17 @@ class PlatformRepository:
         )
         return list((await self.session.execute(stmt)).scalars())
 
-    async def settle_fills(self, settlements: list[dict[str, Any]]) -> int:
+    async def settle_fills(self, settlements: list[dict[str, Any]], *, kalshi_env: str | None = None) -> int:
         """Mark fills as win/loss based on settlement results. Returns number of fills updated."""
         settled = 0
+        env = self._resolved_kalshi_env(kalshi_env)
         for s in settlements:
             ticker = s.get("ticker") or s.get("market_ticker")
             result = s.get("market_result")
             if not ticker or result not in ("yes", "no"):
                 continue
             stmt = select(FillRecord).where(
+                FillRecord.kalshi_env == env,
                 FillRecord.market_ticker == ticker,
                 FillRecord.settlement_result.is_(None),
             )
@@ -997,10 +1119,12 @@ class PlatformRepository:
             await self.session.flush()
         return settled
 
-    async def get_fill_win_rate_30d(self) -> dict[str, Any]:
+    async def get_fill_win_rate_30d(self, *, kalshi_env: str | None = None) -> dict[str, Any]:
         """Return 30-day rolling win rate by contract count."""
         cutoff = datetime.now(UTC) - timedelta(days=30)
+        env = self._resolved_kalshi_env(kalshi_env)
         stmt = select(FillRecord).where(
+            FillRecord.kalshi_env == env,
             FillRecord.created_at >= cutoff,
             FillRecord.settlement_result.in_(["win", "loss"]),
         )
@@ -1009,8 +1133,16 @@ class PlatformRepository:
         total = sum(float(f.count_fp) for f in fills)
         return {"won_contracts": won, "total_contracts": total}
 
-    async def get_position(self, market_ticker: str, subaccount: int = 0) -> PositionRecord | None:
+    async def get_position(
+        self,
+        market_ticker: str,
+        subaccount: int = 0,
+        *,
+        kalshi_env: str | None = None,
+    ) -> PositionRecord | None:
+        env = self._resolved_kalshi_env(kalshi_env)
         stmt = select(PositionRecord).where(
+            PositionRecord.kalshi_env == env,
             PositionRecord.market_ticker == market_ticker,
             PositionRecord.subaccount == subaccount,
         )
@@ -1044,21 +1176,24 @@ class PlatformRepository:
         *,
         market_ticker: str,
         subaccount: int,
-        kalshi_env: str = "",
+        kalshi_env: str | None = None,
         side: str,
         count_fp: Decimal,
         average_price_dollars: Decimal,
         raw: dict[str, Any],
     ) -> PositionRecord:
+        env = self._resolved_kalshi_env(kalshi_env)
         stmt = select(PositionRecord).where(
-            PositionRecord.market_ticker == market_ticker, PositionRecord.subaccount == subaccount
+            PositionRecord.kalshi_env == env,
+            PositionRecord.market_ticker == market_ticker,
+            PositionRecord.subaccount == subaccount,
         )
         existing = (await self.session.execute(stmt)).scalar_one_or_none()
         if existing is None:
             existing = PositionRecord(
                 market_ticker=market_ticker,
                 subaccount=subaccount,
-                kalshi_env=kalshi_env,
+                kalshi_env=env,
                 side=side,
                 count_fp=count_fp,
                 average_price_dollars=average_price_dollars,
@@ -1066,7 +1201,7 @@ class PlatformRepository:
             )
             self.session.add(existing)
         else:
-            existing.kalshi_env = kalshi_env
+            existing.kalshi_env = env
             existing.side = side
             existing.count_fp = count_fp
             existing.average_price_dollars = average_price_dollars
@@ -1074,8 +1209,24 @@ class PlatformRepository:
         await self.session.flush()
         return existing
 
-    async def log_ops_event(self, *, severity: str, summary: str, source: str, payload: dict[str, Any], room_id: str | None = None) -> OpsEvent:
-        record = OpsEvent(room_id=room_id, severity=severity, summary=summary, source=source, payload=payload)
+    async def log_ops_event(
+        self,
+        *,
+        severity: str,
+        summary: str,
+        source: str,
+        payload: dict[str, Any],
+        room_id: str | None = None,
+        kalshi_env: str | None = None,
+    ) -> OpsEvent:
+        record = OpsEvent(
+            room_id=room_id,
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            severity=severity,
+            summary=summary,
+            source=source,
+            payload=payload,
+        )
         self.session.add(record)
         await self.session.flush()
         return record
@@ -2489,8 +2640,11 @@ class PlatformRepository:
         limit: int = 50,
         sources: list[str] | None = None,
         created_after: datetime | None = None,
+        kalshi_env: str | None = None,
     ) -> list[OpsEvent]:
         stmt = select(OpsEvent)
+        if kalshi_env is not None:
+            stmt = stmt.where(OpsEvent.kalshi_env == self._resolved_kalshi_env(kalshi_env))
         if sources:
             stmt = stmt.where(OpsEvent.source.in_(sources))
         if created_after is not None:
@@ -2514,9 +2668,9 @@ class PlatformRepository:
         stmt = select(Checkpoint).where(Checkpoint.stream_name == stream_name)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def get_total_capital_dollars(self) -> Decimal | None:
+    async def get_total_capital_dollars(self, *, kalshi_env: str | None = None) -> Decimal | None:
         """Return total portfolio value (cash + positions) from the latest reconcile checkpoint."""
-        checkpoint = await self.get_checkpoint("reconcile")
+        checkpoint = await self.get_checkpoint(self._env_stream_name("reconcile", kalshi_env=kalshi_env))
         if checkpoint is None:
             return None
         balance_payload = dict((checkpoint.payload or {}).get("balance") or {})
@@ -2550,9 +2704,14 @@ class PlatformRepository:
         import zoneinfo
         return datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
 
-    async def get_daily_portfolio_baseline_dollars(self, *, pacific_date: str | None = None) -> Decimal | None:
+    async def get_daily_portfolio_baseline_dollars(
+        self,
+        *,
+        pacific_date: str | None = None,
+        kalshi_env: str | None = None,
+    ) -> Decimal | None:
         date = pacific_date or self._pacific_today()
-        checkpoint = await self.get_checkpoint(f"daily_portfolio:{date}")
+        checkpoint = await self.get_checkpoint(self._env_stream_name("daily_portfolio", kalshi_env=kalshi_env, suffix=date))
         if checkpoint is None:
             return None
         raw = (checkpoint.payload or {}).get("total_capital_dollars")
@@ -2563,18 +2722,24 @@ class PlatformRepository:
         except ArithmeticError:
             return None
 
-    async def set_daily_portfolio_baseline_dollars(self, total_capital_dollars: Decimal, *, pacific_date: str | None = None) -> None:
+    async def set_daily_portfolio_baseline_dollars(
+        self,
+        total_capital_dollars: Decimal,
+        *,
+        pacific_date: str | None = None,
+        kalshi_env: str | None = None,
+    ) -> None:
         date = pacific_date or self._pacific_today()
         await self.set_checkpoint(
-            f"daily_portfolio:{date}",
+            self._env_stream_name("daily_portfolio", kalshi_env=kalshi_env, suffix=date),
             cursor=None,
             payload={"total_capital_dollars": str(total_capital_dollars), "date": date},
         )
 
-    async def get_daily_pnl_dollars(self) -> Decimal | None:
+    async def get_daily_pnl_dollars(self, *, kalshi_env: str | None = None) -> Decimal | None:
         """Return today's P&L: current portfolio value minus start-of-day baseline (Pacific Time)."""
-        current = await self.get_total_capital_dollars()
-        baseline = await self.get_daily_portfolio_baseline_dollars()
+        current = await self.get_total_capital_dollars(kalshi_env=kalshi_env)
+        baseline = await self.get_daily_portfolio_baseline_dollars(kalshi_env=kalshi_env)
         if current is None or baseline is None:
             return None
         return (current - baseline).quantize(Decimal("0.01"))
@@ -2623,6 +2788,99 @@ class PlatformRepository:
             stmt = stmt.where(RawWeatherEvent.created_at <= created_before)
         stmt = stmt.order_by(RawWeatherEvent.created_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
+
+    async def get_web_user(self, user_id: str) -> WebUser | None:
+        stmt = select(WebUser).where(WebUser.id == user_id)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def get_web_user_by_email(self, email: str) -> WebUser | None:
+        stmt = select(WebUser).where(WebUser.email == email)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def create_web_user(
+        self,
+        *,
+        email: str,
+        password_hash: str,
+        password_salt: str,
+        is_active: bool = True,
+    ) -> WebUser:
+        user = WebUser(
+            email=email,
+            password_hash=password_hash,
+            password_salt=password_salt,
+            is_active=is_active,
+        )
+        self.session.add(user)
+        await self.session.flush()
+        return user
+
+    async def record_web_user_login(self, user_id: str, *, logged_in_at: datetime | None = None) -> WebUser | None:
+        user = await self.get_web_user(user_id)
+        if user is None:
+            return None
+        user.last_login_at = logged_in_at or datetime.now(UTC)
+        await self.session.flush()
+        return user
+
+    async def create_web_session(
+        self,
+        *,
+        user_id: str,
+        token_hash: str,
+        expires_at: datetime,
+        last_seen_at: datetime | None = None,
+    ) -> WebSession:
+        record = WebSession(
+            user_id=user_id,
+            token_hash=token_hash,
+            expires_at=expires_at,
+            last_seen_at=last_seen_at,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def get_web_session(self, session_id: str) -> WebSession | None:
+        stmt = select(WebSession).where(WebSession.id == session_id)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def get_web_session_by_token_hash(self, token_hash: str) -> WebSession | None:
+        stmt = select(WebSession).where(WebSession.token_hash == token_hash)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def touch_web_session(self, session_id: str, *, seen_at: datetime | None = None) -> WebSession | None:
+        record = await self.get_web_session(session_id)
+        if record is None:
+            return None
+        record.last_seen_at = seen_at or datetime.now(UTC)
+        await self.session.flush()
+        return record
+
+    async def delete_web_session(self, session_id: str) -> int:
+        from sqlalchemy import delete as sa_delete
+
+        stmt = sa_delete(WebSession).where(WebSession.id == session_id)
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return result.rowcount or 0
+
+    async def delete_web_session_by_token_hash(self, token_hash: str) -> int:
+        from sqlalchemy import delete as sa_delete
+
+        stmt = sa_delete(WebSession).where(WebSession.token_hash == token_hash)
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return result.rowcount or 0
+
+    async def prune_expired_web_sessions(self, *, now: datetime | None = None) -> int:
+        from sqlalchemy import delete as sa_delete
+
+        cutoff = now or datetime.now(UTC)
+        stmt = sa_delete(WebSession).where(WebSession.expires_at < cutoff)
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return result.rowcount or 0
 
     # ── Strategy presets ────────────────────────────────────────────────────
 
