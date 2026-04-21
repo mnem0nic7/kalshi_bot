@@ -13,6 +13,14 @@ from sqlalchemy import func, select
 from kalshi_bot.core.enums import RoomOrigin
 from kalshi_bot.db.models import FillRecord, OrderRecord, RiskVerdictRecord, Room, RoomResearchHealthRecord, RoomStrategyAuditRecord, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.services.strategy_regression import (
+    MIN_TRADE_COUNT as STRATEGY_MIN_TRADE_COUNT,
+    MIN_WIN_RATE_GAP as STRATEGY_MIN_WIN_RATE_GAP,
+    WINDOW_DAYS as DEFAULT_STRATEGY_WINDOW_DAYS,
+    _SKIP_STAND_DOWN_REASONS as STRATEGY_SKIP_STAND_DOWN_REASONS,
+    _thresholds_from_dict,
+    _would_have_traded,
+)
 
 if TYPE_CHECKING:
     from kalshi_bot.services.container import AppContainer
@@ -28,6 +36,11 @@ ROOM_TAB_LIMIT = 40
 POSITION_LIMIT = 100
 OPS_EVENT_LIMIT = 40
 RESEARCH_ACTIVE_STATUSES = {"active", "open"}
+STRATEGY_WINDOW_OPTIONS = (30, 90, DEFAULT_STRATEGY_WINDOW_DAYS)
+STRATEGY_EVENT_LIMIT = 80
+STRATEGY_EVENT_LOOKBACK_DAYS = 14
+STRATEGY_RESULT_HISTORY_LIMIT = 600
+STRATEGY_RESULT_TREND_POINTS = 12
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -1391,91 +1404,882 @@ async def _build_operations_tab(container: AppContainer) -> dict[str, Any]:
     }
 
 
-async def build_strategies_dashboard(container: AppContainer) -> dict[str, Any]:
+def _series_metadata_index(container: AppContainer) -> dict[str, dict[str, str]]:
+    metadata: dict[str, dict[str, str]] = {}
+    for template in container.weather_directory.templates():
+        metadata[template.series_ticker] = {
+            "label": template.label,
+            "location_name": template.location_name,
+        }
+    for mapping in container.weather_directory.all():
+        if mapping.series_ticker and mapping.series_ticker not in metadata:
+            metadata[mapping.series_ticker] = {
+                "label": mapping.label,
+                "location_name": mapping.location_name or mapping.label,
+            }
+    return metadata
+
+
+def _strategy_result_value(row: Any, field: str) -> Any:
+    if isinstance(row, dict):
+        return row.get(field)
+    return getattr(row, field, None)
+
+
+def _strategy_window_display(window_days: int) -> str:
+    return f"{window_days}d"
+
+
+def _ratio_display(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.0%}"
+
+
+def _bps_display(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.0f}bps"
+
+
+def _compact_number(value: int) -> str:
+    return f"{value:,d}"
+
+
+def _normalize_strategy_result_rows(rows: list[Any], strategies_by_id: dict[int, Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        strategy_id = _strategy_result_value(row, "strategy_id")
+        strategy = strategies_by_id.get(int(strategy_id)) if strategy_id is not None else None
+        strategy_name = strategy.name if strategy is not None else str(_strategy_result_value(row, "strategy_name") or "unknown")
+        total_pnl = _decimal_or_zero(_strategy_result_value(row, "total_pnl_dollars"))
+        trade_rate = _float_or_none(_strategy_result_value(row, "trade_rate"))
+        win_rate = _float_or_none(_strategy_result_value(row, "win_rate"))
+        avg_edge_bps = _float_or_none(_strategy_result_value(row, "avg_edge_bps"))
+        run_at = _strategy_result_value(row, "run_at")
+        normalized.append({
+            "strategy_id": int(strategy_id) if strategy_id is not None else None,
+            "strategy_name": strategy_name,
+            "series_ticker": str(_strategy_result_value(row, "series_ticker") or ""),
+            "rooms_evaluated": int(_strategy_result_value(row, "rooms_evaluated") or 0),
+            "trade_count": int(_strategy_result_value(row, "trade_count") or 0),
+            "win_count": int(_strategy_result_value(row, "win_count") or 0),
+            "trade_rate": trade_rate,
+            "trade_rate_display": _ratio_display(trade_rate),
+            "win_rate": win_rate,
+            "win_rate_display": _ratio_display(win_rate),
+            "total_pnl_dollars": total_pnl,
+            "total_pnl_value": float(total_pnl),
+            "total_pnl_display": _money_display(total_pnl, signed=True),
+            "avg_edge_bps": avg_edge_bps,
+            "avg_edge_bps_display": _bps_display(avg_edge_bps),
+            "run_at": _iso_or_none(run_at),
+        })
+    return normalized
+
+
+def _evaluate_strategy_city_rows(
+    *,
+    strategies: list[Any],
+    rooms: list[dict[str, Any]],
+    container: AppContainer,
+    run_at: datetime,
+    date_from: datetime,
+    date_to: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rooms_by_series: dict[str, list[dict[str, Any]]] = {}
+    for room in rooms:
+        payload = room.get("signal_payload") or {}
+        stand_down_reason = payload.get("stand_down_reason")
+        if stand_down_reason in STRATEGY_SKIP_STAND_DOWN_REASONS:
+            continue
+        mapping = container.weather_directory.resolve_market(room["market_ticker"])
+        if mapping is None or not mapping.series_ticker:
+            continue
+        rooms_by_series.setdefault(mapping.series_ticker, []).append(room)
+
+    result_rows: list[dict[str, Any]] = []
+    for strategy in strategies:
+        thresholds = _thresholds_from_dict(strategy.thresholds)
+        for series_ticker, city_rooms in rooms_by_series.items():
+            trade_count = 0
+            win_count = 0
+            total_pnl = Decimal("0")
+            edge_sum = 0.0
+
+            for room in city_rooms:
+                if not _would_have_traded(room, thresholds):
+                    continue
+                trade_count += 1
+                edge_sum += float(room["edge_bps"])
+
+                payload = room.get("signal_payload") or {}
+                eligibility = payload.get("eligibility") or {}
+                outcome = eligibility.get("settlement_result")
+                if outcome == "win":
+                    win_count += 1
+                counterfactual_pnl = payload.get("counterfactual_pnl_dollars")
+                pnl_value = _decimal_or_none(counterfactual_pnl)
+                if pnl_value is not None:
+                    total_pnl += pnl_value
+
+            rooms_evaluated = len(city_rooms)
+            trade_rate = (trade_count / rooms_evaluated) if rooms_evaluated > 0 else None
+            win_rate = (win_count / trade_count) if trade_count > 0 else None
+            avg_edge_bps = (edge_sum / trade_count) if trade_count > 0 else None
+            result_rows.append({
+                "strategy_id": strategy.id,
+                "strategy_name": strategy.name,
+                "run_at": run_at,
+                "date_from": date_from.date().isoformat(),
+                "date_to": date_to.date().isoformat(),
+                "series_ticker": series_ticker,
+                "rooms_evaluated": rooms_evaluated,
+                "trade_count": trade_count,
+                "win_count": win_count,
+                "total_pnl_dollars": total_pnl.quantize(Decimal("0.0001")),
+                "trade_rate": trade_rate,
+                "win_rate": win_rate,
+                "avg_edge_bps": avg_edge_bps,
+            })
+    return _normalize_strategy_result_rows(result_rows, {strategy.id: strategy for strategy in strategies}), {
+        "rooms_scanned": len(rooms),
+        "series_evaluated": len(rooms_by_series),
+    }
+
+
+def _threshold_value_display(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.2f}"
+    return str(value)
+
+
+def _threshold_label(key: str) -> str:
+    return key.replace("_", " ").strip().title()
+
+
+def _group_thresholds(thresholds: dict[str, Any]) -> list[dict[str, Any]]:
+    groups: list[tuple[str, str, list[tuple[str, Any]]]] = [
+        ("risk", "Risk", []),
+        ("trigger", "Trigger", []),
+        ("strategy", "Strategy", []),
+        ("capital", "Capital", []),
+        ("other", "Other", []),
+    ]
+    bucket_index = {key: idx for idx, (key, _, _) in enumerate(groups)}
+    for threshold_key, threshold_value in thresholds.items():
+        if threshold_key.startswith("risk_"):
+            target = bucket_index["risk"]
+        elif threshold_key.startswith("trigger_"):
+            target = bucket_index["trigger"]
+        elif threshold_key.startswith("strategy_"):
+            target = bucket_index["strategy"]
+        elif "capital" in threshold_key:
+            target = bucket_index["capital"]
+        else:
+            target = bucket_index["other"]
+        groups[target][2].append((threshold_key, threshold_value))
+
+    grouped: list[dict[str, Any]] = []
+    for _, label, items in groups:
+        if not items:
+            continue
+        grouped.append({
+            "label": label,
+            "items": [
+                {
+                    "key": key,
+                    "label": _threshold_label(key),
+                    "value": _threshold_value_display(value),
+                }
+                for key, value in sorted(items, key=lambda pair: pair[0])
+            ],
+        })
+    return grouped
+
+
+def _city_evidence_status(*, best_trade_count: int, gap_to_runner_up: float | None, has_best: bool) -> tuple[str, str]:
+    if not has_best:
+        return "no_data", "No evidence"
+    if best_trade_count < STRATEGY_MIN_TRADE_COUNT and (gap_to_runner_up is None or gap_to_runner_up < STRATEGY_MIN_WIN_RATE_GAP):
+        return "weak", "Weak evidence"
+    if best_trade_count < STRATEGY_MIN_TRADE_COUNT:
+        return "low_sample", "Low sample"
+    if gap_to_runner_up is None or gap_to_runner_up < STRATEGY_MIN_WIN_RATE_GAP:
+        return "narrow_gap", "Narrow gap"
+    return "strong", "Strong"
+
+
+def _strategy_event_view(event: Any) -> dict[str, Any]:
+    payload = dict(getattr(event, "payload", None) or {})
+    updated_at = _iso_or_none(getattr(event, "updated_at", None))
+    source = getattr(event, "source", "unknown")
+    if source == "strategy_regression":
+        return {
+            "kind": "promotion",
+            "summary": getattr(event, "summary", "Strategy promotion"),
+            "source": source,
+            "created_at": updated_at,
+            "series_ticker": payload.get("series_ticker"),
+            "previous_strategy": payload.get("previous_strategy"),
+            "new_strategy": payload.get("new_strategy"),
+            "win_rate": _float_or_none(payload.get("new_win_rate")),
+            "win_rate_display": _ratio_display(_float_or_none(payload.get("new_win_rate"))),
+            "trade_count": int(payload.get("trade_count") or 0),
+            "direction": "promoted",
+        }
+    if source == "strategy_eval":
+        old_bps = _float_or_none(payload.get("old_bps"))
+        new_bps = _float_or_none(payload.get("new_bps"))
+        return {
+            "kind": "threshold_adjustment",
+            "summary": getattr(event, "summary", "Threshold adjustment"),
+            "source": source,
+            "created_at": updated_at,
+            "direction": payload.get("direction"),
+            "old_bps": old_bps,
+            "new_bps": new_bps,
+            "change_display": (
+                f"{int(old_bps)}bps -> {int(new_bps)}bps"
+                if old_bps is not None and new_bps is not None
+                else "—"
+            ),
+            "win_rate": _float_or_none(payload.get("win_rate")),
+            "win_rate_display": _ratio_display(_float_or_none(payload.get("win_rate"))),
+            "trade_count": int(payload.get("total_contracts") or 0),
+        }
+    return {
+        "kind": "event",
+        "summary": getattr(event, "summary", "Strategy event"),
+        "source": source,
+        "created_at": updated_at,
+        "payload": payload,
+    }
+
+
+def _checkpoint_promotion_views(checkpoint: Any) -> list[dict[str, Any]]:
+    if checkpoint is None or not isinstance(getattr(checkpoint, "payload", None), dict):
+        return []
+    promotions = list(checkpoint.payload.get("promotions") or [])
+    created_at = _iso_or_none(getattr(checkpoint, "updated_at", None))
+    views: list[dict[str, Any]] = []
+    for promotion in promotions:
+        win_rate = _float_or_none(promotion.get("win_rate"))
+        views.append({
+            "kind": "promotion",
+            "summary": (
+                f"Strategy auto-promoted for {promotion.get('series_ticker')}: "
+                f"{promotion.get('previous') or 'none'} -> {promotion.get('promoted_to')}"
+            ),
+            "source": "strategy_regression",
+            "created_at": created_at,
+            "series_ticker": promotion.get("series_ticker"),
+            "previous_strategy": promotion.get("previous"),
+            "new_strategy": promotion.get("promoted_to"),
+            "win_rate": win_rate,
+            "win_rate_display": _ratio_display(win_rate),
+            "trade_count": int(promotion.get("trade_count") or 0),
+            "direction": "promoted",
+        })
+    return views
+
+
+def _city_sort_priority(city_row: dict[str, Any]) -> int:
+    status = city_row.get("assignment_status")
+    if status == "promotion_candidate":
+        return 0
+    if status == "divergent":
+        return 1
+    if status == "tentative":
+        return 2
+    if status == "aligned":
+        return 3
+    return 4
+
+
+def _build_strategy_research_sections(
+    *,
+    strategies: list[Any],
+    normalized_rows: list[dict[str, Any]],
+    assignments: list[Any],
+    series_metadata: dict[str, dict[str, str]],
+    selected_series_ticker: str | None,
+    selected_strategy_name: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    strategy_lookup = {strategy.name: strategy for strategy in strategies}
+    assignment_index = {assignment.series_ticker: assignment for assignment in assignments}
+    results_index: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in normalized_rows:
+        results_index.setdefault(row["series_ticker"], {})[row["strategy_name"]] = row
+
+    all_series = sorted(set(results_index) | set(assignment_index))
+    city_rows: list[dict[str, Any]] = []
+    strategy_leaders: Counter[str] = Counter()
+    strategy_assignment_counts: Counter[str] = Counter(assignment.strategy_name for assignment in assignments)
+
+    for series_ticker in all_series:
+        city_results = results_index.get(series_ticker, {})
+        ranked_rows = [
+            row
+            for row in city_results.values()
+            if row["trade_count"] > 0 and row["win_rate"] is not None
+        ]
+        ranked_rows.sort(
+            key=lambda row: (
+                row["win_rate"] if row["win_rate"] is not None else -1.0,
+                row["trade_count"],
+                row["total_pnl_value"],
+            ),
+            reverse=True,
+        )
+        best_row = ranked_rows[0] if ranked_rows else None
+        runner_up_row = ranked_rows[1] if len(ranked_rows) > 1 else None
+        if best_row is not None:
+            strategy_leaders[best_row["strategy_name"]] += 1
+
+        assignment = assignment_index.get(series_ticker)
+        assigned_name = assignment.strategy_name if assignment is not None else None
+        assigned_row = city_results.get(assigned_name) if assigned_name is not None else None
+        gap_to_runner_up = None
+        if best_row is not None and runner_up_row is not None:
+            gap_to_runner_up = best_row["win_rate"] - runner_up_row["win_rate"]
+        gap_to_assignment = None
+        if (
+            best_row is not None
+            and assigned_row is not None
+            and assigned_row["win_rate"] is not None
+            and best_row["strategy_name"] != assigned_name
+        ):
+            gap_to_assignment = best_row["win_rate"] - assigned_row["win_rate"]
+
+        evidence_status, evidence_label = _city_evidence_status(
+            best_trade_count=best_row["trade_count"] if best_row is not None else 0,
+            gap_to_runner_up=gap_to_runner_up,
+            has_best=best_row is not None,
+        )
+        clears_trade_count = best_row is not None and best_row["trade_count"] >= STRATEGY_MIN_TRADE_COUNT
+        clears_assignment_gap = (
+            assigned_name is None
+            or assigned_row is None
+            or assigned_row["win_rate"] is None
+            or (gap_to_assignment is not None and gap_to_assignment >= STRATEGY_MIN_WIN_RATE_GAP)
+        )
+        can_promote = bool(
+            best_row is not None
+            and best_row["strategy_name"] != assigned_name
+            and clears_trade_count
+            and clears_assignment_gap
+        )
+        if best_row is None:
+            assignment_status = "no_data"
+            assignment_label = "No data"
+        elif assigned_name == best_row["strategy_name"]:
+            assignment_status = "aligned" if evidence_status == "strong" else "tentative"
+            assignment_label = "Aligned" if evidence_status == "strong" else "Thin support"
+        elif can_promote:
+            assignment_status = "promotion_candidate"
+            assignment_label = "Promote"
+        else:
+            assignment_status = "divergent"
+            assignment_label = "Watch"
+
+        metric_cells: list[dict[str, Any]] = []
+        for strategy in strategies:
+            metric_row = city_results.get(strategy.name)
+            trade_count = metric_row["trade_count"] if metric_row is not None else 0
+            win_rate = metric_row["win_rate"] if metric_row is not None else None
+            metric_cells.append({
+                "strategy_name": strategy.name,
+                "selected": selected_strategy_name == strategy.name,
+                "is_assigned": assigned_name == strategy.name,
+                "is_best": best_row is not None and best_row["strategy_name"] == strategy.name,
+                "is_runner_up": runner_up_row is not None and runner_up_row["strategy_name"] == strategy.name,
+                "rooms_evaluated": metric_row["rooms_evaluated"] if metric_row is not None else 0,
+                "trade_count": trade_count,
+                "trade_rate": metric_row["trade_rate"] if metric_row is not None else None,
+                "trade_rate_display": metric_row["trade_rate_display"] if metric_row is not None else "—",
+                "win_rate": win_rate,
+                "win_rate_display": metric_row["win_rate_display"] if metric_row is not None else "—",
+                "total_pnl_dollars": metric_row["total_pnl_value"] if metric_row is not None else None,
+                "total_pnl_display": metric_row["total_pnl_display"] if metric_row is not None else "—",
+                "avg_edge_bps": metric_row["avg_edge_bps"] if metric_row is not None else None,
+                "avg_edge_bps_display": metric_row["avg_edge_bps_display"] if metric_row is not None else "—",
+                "has_data": metric_row is not None and (metric_row["rooms_evaluated"] > 0 or metric_row["trade_count"] > 0),
+            })
+
+        meta = series_metadata.get(series_ticker, {})
+        city_rows.append({
+            "series_ticker": series_ticker,
+            "city_label": meta.get("label") or series_ticker,
+            "location_name": meta.get("location_name") or meta.get("label") or series_ticker,
+            "selected": selected_series_ticker == series_ticker,
+            "assignment": {
+                "strategy_name": assigned_name,
+                "assigned_at": _iso_or_none(assignment.assigned_at) if assignment is not None else None,
+                "assigned_by": assignment.assigned_by if assignment is not None else None,
+            },
+            "best_strategy": best_row["strategy_name"] if best_row is not None else None,
+            "best_strategy_win_rate": best_row["win_rate"] if best_row is not None else None,
+            "best_strategy_win_rate_display": best_row["win_rate_display"] if best_row is not None else "—",
+            "runner_up_strategy": runner_up_row["strategy_name"] if runner_up_row is not None else None,
+            "runner_up_win_rate_display": runner_up_row["win_rate_display"] if runner_up_row is not None else "—",
+            "gap_to_runner_up": gap_to_runner_up,
+            "gap_to_runner_up_display": _ratio_display(gap_to_runner_up),
+            "gap_to_assignment": gap_to_assignment,
+            "gap_to_assignment_display": _ratio_display(gap_to_assignment),
+            "evidence_status": evidence_status,
+            "evidence_label": evidence_label,
+            "trade_count_sufficient": clears_trade_count,
+            "assignment_status": assignment_status,
+            "assignment_status_label": assignment_label,
+            "can_promote": can_promote,
+            "metrics": metric_cells,
+            "sort_priority": _city_sort_priority({"assignment_status": assignment_status}),
+        })
+
+    city_rows.sort(
+        key=lambda row: (
+            row["sort_priority"],
+            -(row["gap_to_assignment"] if row["gap_to_assignment"] is not None else -1.0),
+            -(row["gap_to_runner_up"] if row["gap_to_runner_up"] is not None else -1.0),
+            row["series_ticker"],
+        )
+    )
+
+    leaderboard: list[dict[str, Any]] = []
+    rows_by_strategy: dict[str, list[dict[str, Any]]] = {strategy.name: [] for strategy in strategies}
+    for row in normalized_rows:
+        rows_by_strategy.setdefault(row["strategy_name"], []).append(row)
+
+    for strategy in strategies:
+        strategy_rows = rows_by_strategy.get(strategy.name, [])
+        total_rooms = sum(row["rooms_evaluated"] for row in strategy_rows)
+        total_trades = sum(row["trade_count"] for row in strategy_rows)
+        total_wins = sum(row["win_count"] for row in strategy_rows)
+        total_pnl = sum((row["total_pnl_dollars"] for row in strategy_rows), Decimal("0"))
+        edge_numerator = sum((row["avg_edge_bps"] or 0.0) * row["trade_count"] for row in strategy_rows)
+        overall_win_rate = (total_wins / total_trades) if total_trades > 0 else None
+        overall_trade_rate = (total_trades / total_rooms) if total_rooms > 0 else None
+        overall_avg_edge = (edge_numerator / total_trades) if total_trades > 0 else None
+        leaderboard.append({
+            "name": strategy.name,
+            "description": strategy.description,
+            "selected": selected_strategy_name == strategy.name,
+            "thresholds": strategy.thresholds,
+            "threshold_groups": _group_thresholds(strategy.thresholds),
+            "overall_win_rate": overall_win_rate,
+            "overall_win_rate_display": _ratio_display(overall_win_rate),
+            "overall_trade_rate": overall_trade_rate,
+            "overall_trade_rate_display": _ratio_display(overall_trade_rate),
+            "total_pnl_dollars": float(total_pnl),
+            "total_pnl_display": _money_display(total_pnl, signed=True),
+            "avg_edge_bps": overall_avg_edge,
+            "avg_edge_bps_display": _bps_display(overall_avg_edge),
+            "total_rooms_evaluated": total_rooms,
+            "total_rooms_evaluated_display": _compact_number(total_rooms),
+            "total_trade_count": total_trades,
+            "total_trade_count_display": _compact_number(total_trades),
+            "cities_led": strategy_leaders.get(strategy.name, 0),
+            "assigned_city_count": strategy_assignment_counts.get(strategy.name, 0),
+        })
+
+    leaderboard.sort(
+        key=lambda row: (
+            row["overall_win_rate"] if row["overall_win_rate"] is not None else -1.0,
+            row["total_trade_count"],
+            row["total_pnl_dollars"],
+        ),
+        reverse=True,
+    )
+
+    best_strategy = leaderboard[0] if leaderboard else None
+    return leaderboard, city_rows, {
+        "best_strategy": best_strategy,
+        "strategy_lookup": strategy_lookup,
+    }
+
+
+def _trim_trend_points(series: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(series) <= STRATEGY_RESULT_TREND_POINTS:
+        return series
+    return series[-STRATEGY_RESULT_TREND_POINTS:]
+
+
+def _strategy_history_series(history_rows: list[dict[str, Any]], *, strategy_name: str) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in history_rows:
+        if row["strategy_name"] != strategy_name or row["run_at"] is None:
+            continue
+        bucket = grouped.setdefault(row["run_at"], {
+            "run_at": row["run_at"],
+            "trade_count": 0,
+            "win_count": 0,
+            "rooms_evaluated": 0,
+            "total_pnl_dollars": Decimal("0"),
+            "edge_numerator": 0.0,
+        })
+        bucket["trade_count"] += row["trade_count"]
+        bucket["win_count"] += row["win_count"]
+        bucket["rooms_evaluated"] += row["rooms_evaluated"]
+        bucket["total_pnl_dollars"] += row["total_pnl_dollars"]
+        bucket["edge_numerator"] += (row["avg_edge_bps"] or 0.0) * row["trade_count"]
+
+    points: list[dict[str, Any]] = []
+    for run_at, bucket in sorted(grouped.items(), key=lambda item: item[0]):
+        trade_count = bucket["trade_count"]
+        rooms_evaluated = bucket["rooms_evaluated"]
+        win_rate = (bucket["win_count"] / trade_count) if trade_count > 0 else None
+        trade_rate = (trade_count / rooms_evaluated) if rooms_evaluated > 0 else None
+        avg_edge_bps = (bucket["edge_numerator"] / trade_count) if trade_count > 0 else None
+        total_pnl = bucket["total_pnl_dollars"].quantize(Decimal("0.0001"))
+        points.append({
+            "run_at": run_at,
+            "win_rate": win_rate,
+            "trade_rate": trade_rate,
+            "avg_edge_bps": avg_edge_bps,
+            "total_pnl_dollars": float(total_pnl),
+            "total_pnl_display": _money_display(total_pnl, signed=True),
+        })
+    return _trim_trend_points(points)
+
+
+def _city_history_series(history_rows: list[dict[str, Any]], *, strategies: list[Any], series_ticker: str) -> list[dict[str, Any]]:
+    trend_series: list[dict[str, Any]] = []
+    for strategy in strategies:
+        points = [
+            {
+                "run_at": row["run_at"],
+                "win_rate": row["win_rate"],
+                "trade_rate": row["trade_rate"],
+                "avg_edge_bps": row["avg_edge_bps"],
+                "total_pnl_dollars": row["total_pnl_value"],
+                "total_pnl_display": row["total_pnl_display"],
+            }
+            for row in sorted(history_rows, key=lambda item: item["run_at"] or "")
+            if row["series_ticker"] == series_ticker and row["strategy_name"] == strategy.name and row["run_at"] is not None
+        ]
+        if not points:
+            continue
+        trend_series.append({
+            "strategy_name": strategy.name,
+            "points": _trim_trend_points(points),
+        })
+    return trend_series
+
+
+def _city_detail_context(
+    *,
+    selected_city: dict[str, Any],
+    strategies: list[Any],
+    strategy_lookup: dict[str, Any],
+    history_rows: list[dict[str, Any]],
+    strategy_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    selected_series_ticker = selected_city["series_ticker"]
+    ranking = sorted(
+        list(selected_city["metrics"]),
+        key=lambda row: (
+            row["win_rate"] if row["win_rate"] is not None else -1.0,
+            row["trade_count"],
+            row["total_pnl_dollars"] if row["total_pnl_dollars"] is not None else -10**9,
+        ),
+        reverse=True,
+    )
+    best_strategy_name = selected_city.get("best_strategy")
+    runner_up_name = selected_city.get("runner_up_strategy")
+    assigned_name = (selected_city.get("assignment") or {}).get("strategy_name")
+    assigned_metric = next((row for row in ranking if row["strategy_name"] == assigned_name), None)
+    best_metric = next((row for row in ranking if row["strategy_name"] == best_strategy_name), None)
+    runner_up_metric = next((row for row in ranking if row["strategy_name"] == runner_up_name), None)
+    threshold_comparison: list[dict[str, Any]] = []
+    for role, strategy_name in (("best", best_strategy_name), ("runner_up", runner_up_name)):
+        strategy = strategy_lookup.get(strategy_name) if strategy_name else None
+        if strategy is None:
+            continue
+        threshold_comparison.append({
+            "role": role,
+            "strategy_name": strategy.name,
+            "threshold_groups": _group_thresholds(strategy.thresholds),
+        })
+
+    city_events = [
+        event
+        for event in strategy_events
+        if event.get("series_ticker") == selected_series_ticker
+    ][:8]
+    gap_to_assignment = selected_city.get("gap_to_assignment")
+    promotion_rationale = {
+        "best_strategy": best_strategy_name,
+        "runner_up_strategy": runner_up_name,
+        "current_assignment": assigned_name,
+        "best_trade_count": best_metric.get("trade_count") if best_metric is not None else 0,
+        "best_trade_count_display": _compact_number(best_metric.get("trade_count") if best_metric is not None else 0),
+        "gap_to_runner_up": selected_city.get("gap_to_runner_up"),
+        "gap_to_runner_up_display": selected_city.get("gap_to_runner_up_display"),
+        "gap_to_current_assignment": gap_to_assignment,
+        "gap_to_current_assignment_display": selected_city.get("gap_to_assignment_display"),
+        "meets_trade_threshold": bool(best_metric is not None and best_metric["trade_count"] >= STRATEGY_MIN_TRADE_COUNT),
+        "meets_gap_threshold": (
+            assigned_name is None
+            or assigned_metric is None
+            or assigned_metric["win_rate"] is None
+            or (gap_to_assignment is not None and gap_to_assignment >= STRATEGY_MIN_WIN_RATE_GAP)
+        ),
+        "clears_promotion_rule": bool(selected_city.get("can_promote")),
+        "rule_trade_threshold": STRATEGY_MIN_TRADE_COUNT,
+        "rule_gap_threshold": STRATEGY_MIN_WIN_RATE_GAP,
+    }
+    return {
+        "type": "city",
+        "selected_series_ticker": selected_series_ticker,
+        "selected_strategy_name": None,
+        "city": selected_city,
+        "ranking": ranking,
+        "promotion_rationale": promotion_rationale,
+        "threshold_comparison": threshold_comparison,
+        "trend": {
+            "title": "Stored regression history",
+            "available": True,
+            "window_days": DEFAULT_STRATEGY_WINDOW_DAYS,
+            "note": (
+                f"Trend history uses stored {DEFAULT_STRATEGY_WINDOW_DAYS}d regression snapshots. "
+                "Current city metrics above reflect the selected window."
+            ),
+            "series": _city_history_series(history_rows, strategies=strategies, series_ticker=selected_series_ticker),
+        },
+        "recent_events": city_events,
+    }
+
+
+def _strategy_detail_context(
+    *,
+    selected_strategy: dict[str, Any],
+    city_rows: list[dict[str, Any]],
+    strategy_lookup: dict[str, Any],
+    history_rows: list[dict[str, Any]],
+    strategy_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    strategy = strategy_lookup[selected_strategy["name"]]
+    city_distribution = []
+    for city_row in city_rows:
+        metric = next((row for row in city_row["metrics"] if row["strategy_name"] == strategy.name), None)
+        if metric is None or not metric["has_data"]:
+            continue
+        city_distribution.append({
+            "series_ticker": city_row["series_ticker"],
+            "city_label": city_row["city_label"],
+            "win_rate": metric["win_rate"],
+            "win_rate_display": metric["win_rate_display"],
+            "trade_rate": metric["trade_rate"],
+            "trade_rate_display": metric["trade_rate_display"],
+            "trade_count": metric["trade_count"],
+            "trade_count_display": _compact_number(metric["trade_count"]),
+            "total_pnl_dollars": metric["total_pnl_dollars"],
+            "total_pnl_display": metric["total_pnl_display"],
+            "is_assigned": metric["is_assigned"],
+            "is_best": metric["is_best"],
+        })
+    city_distribution.sort(
+        key=lambda row: (
+            row["win_rate"] if row["win_rate"] is not None else -1.0,
+            row["trade_count"],
+            row["total_pnl_dollars"] if row["total_pnl_dollars"] is not None else -10**9,
+        ),
+        reverse=True,
+    )
+    strongest = city_distribution[:3]
+    weakest = list(reversed(city_distribution[-3:])) if city_distribution else []
+    related_events = [
+        event
+        for event in strategy_events
+        if event.get("new_strategy") == strategy.name or event.get("previous_strategy") == strategy.name
+    ][:8]
+    return {
+        "type": "strategy",
+        "selected_series_ticker": None,
+        "selected_strategy_name": strategy.name,
+        "strategy": {
+            **selected_strategy,
+            "threshold_groups": _group_thresholds(strategy.thresholds),
+        },
+        "strongest_cities": strongest,
+        "weakest_cities": weakest,
+        "city_distribution": city_distribution,
+        "trend": {
+            "title": "Stored regression history",
+            "available": True,
+            "window_days": DEFAULT_STRATEGY_WINDOW_DAYS,
+            "note": (
+                f"Trend history uses stored {DEFAULT_STRATEGY_WINDOW_DAYS}d regression snapshots. "
+                "Current leaderboard metrics above reflect the selected window."
+            ),
+            "points": _strategy_history_series(history_rows, strategy_name=strategy.name),
+        },
+        "recent_events": related_events,
+    }
+
+
+async def build_strategies_dashboard(
+    container: AppContainer,
+    *,
+    window_days: int = DEFAULT_STRATEGY_WINDOW_DAYS,
+    series_ticker: str | None = None,
+    strategy_name: str | None = None,
+) -> dict[str, Any]:
     now = datetime.now(UTC)
+    if window_days not in STRATEGY_WINDOW_OPTIONS:
+        window_days = DEFAULT_STRATEGY_WINDOW_DAYS
+
     async with container.session_factory() as session:
         repo = PlatformRepository(session)
         strategies = await repo.list_strategies(active_only=True)
-        latest_results = await repo.get_latest_strategy_results()
         assignments = await repo.list_city_strategy_assignments()
         regression_checkpoint = await repo.get_checkpoint("strategy_regression")
+        strategy_events_raw = await repo.list_ops_events(
+            limit=STRATEGY_EVENT_LIMIT,
+            sources=["strategy_regression", "strategy_eval"],
+            created_after=now - timedelta(days=STRATEGY_EVENT_LOOKBACK_DAYS),
+        )
+
+        snapshot_meta = {
+            "rooms_scanned": 0,
+            "series_evaluated": 0,
+            "source_mode": "stored_snapshot",
+        }
+        strategies_by_id = {strategy.id: strategy for strategy in strategies}
+        if window_days == DEFAULT_STRATEGY_WINDOW_DAYS:
+            latest_results = await repo.get_latest_strategy_results()
+            normalized_rows = _normalize_strategy_result_rows(latest_results, strategies_by_id)
+            if regression_checkpoint is not None and isinstance(regression_checkpoint.payload, dict):
+                snapshot_meta["rooms_scanned"] = int(regression_checkpoint.payload.get("rooms_scanned") or 0)
+                snapshot_meta["series_evaluated"] = int(regression_checkpoint.payload.get("series_evaluated") or 0)
+        else:
+            date_from = now - timedelta(days=window_days)
+            rooms = await repo.get_strategy_regression_rooms(date_from, now)
+            normalized_rows, live_meta = _evaluate_strategy_city_rows(
+                strategies=strategies,
+                rooms=rooms,
+                container=container,
+                run_at=now,
+                date_from=date_from,
+                date_to=now,
+            )
+            snapshot_meta.update(live_meta)
+            snapshot_meta["source_mode"] = "live_eval"
+
+        series_metadata = _series_metadata_index(container)
+        leaderboard, city_matrix, leaderboard_context = _build_strategy_research_sections(
+            strategies=strategies,
+            normalized_rows=normalized_rows,
+            assignments=assignments,
+            series_metadata=series_metadata,
+            selected_series_ticker=series_ticker,
+            selected_strategy_name=strategy_name,
+        )
+
+        best_strategy = leaderboard_context["best_strategy"]
+        selected_city = next((row for row in city_matrix if row["series_ticker"] == series_ticker), None)
+        selected_strategy = next((row for row in leaderboard if row["name"] == strategy_name), None)
+
+        history_rows: list[dict[str, Any]] = []
+        if selected_city is not None:
+            history = await repo.list_strategy_results_history(
+                series_ticker=selected_city["series_ticker"],
+                limit=STRATEGY_RESULT_HISTORY_LIMIT,
+            )
+            history_rows = _normalize_strategy_result_rows(history, strategies_by_id)
+            detail_context = _city_detail_context(
+                selected_city=selected_city,
+                strategies=strategies,
+                strategy_lookup=leaderboard_context["strategy_lookup"],
+                history_rows=history_rows,
+                strategy_events=[_strategy_event_view(event) for event in strategy_events_raw],
+            )
+        else:
+            if selected_strategy is None:
+                selected_strategy = best_strategy or (leaderboard[0] if leaderboard else None)
+            if selected_strategy is not None:
+                history = await repo.list_strategy_results_history(
+                    strategy_ids=[strategy_lookup.id for strategy_lookup in strategies if strategy_lookup.name == selected_strategy["name"]],
+                    limit=STRATEGY_RESULT_HISTORY_LIMIT,
+                )
+                history_rows = _normalize_strategy_result_rows(history, strategies_by_id)
+                detail_context = _strategy_detail_context(
+                    selected_strategy=selected_strategy,
+                    city_rows=city_matrix,
+                    strategy_lookup=leaderboard_context["strategy_lookup"],
+                    history_rows=history_rows,
+                    strategy_events=[_strategy_event_view(event) for event in strategy_events_raw],
+                )
+            else:
+                detail_context = {
+                    "type": "empty",
+                    "selected_series_ticker": None,
+                    "selected_strategy_name": None,
+                    "message": "No strategy data available yet.",
+                }
+
         await session.commit()
 
-    # Index results by (strategy_id, series_ticker)
-    results_index: dict[tuple[int, str], Any] = {
-        (r.strategy_id, r.series_ticker): r for r in latest_results
-    }
-    # Index assignments by series_ticker
-    assignment_index: dict[str, str] = {a.series_ticker: a.strategy_name for a in assignments}
+    strategy_events = [_strategy_event_view(event) for event in strategy_events_raw]
+    recent_promotions = strategy_events[:10]
+    if not any(event["kind"] == "promotion" for event in recent_promotions):
+        recent_promotions = (_checkpoint_promotion_views(regression_checkpoint) + recent_promotions)[:10]
 
-    # Collect all series tickers seen across results
-    all_series: set[str] = {r.series_ticker for r in latest_results}
-
-    strategy_rows = []
-    for strategy in strategies:
-        city_breakdown: list[dict[str, Any]] = []
-        total_trade_count = 0
-        win_numerator = 0.0
-        win_denominator = 0
-
-        for series_ticker in sorted(all_series):
-            result = results_index.get((strategy.id, series_ticker))
-            if result is None:
-                continue
-            win_rate_val = float(result.win_rate) if result.win_rate is not None else None
-            trade_count = result.trade_count or 0
-            total_trade_count += trade_count
-            if win_rate_val is not None and trade_count > 0:
-                win_numerator += win_rate_val * trade_count
-                win_denominator += trade_count
-
-            city_breakdown.append({
-                "series_ticker": series_ticker,
-                "rooms_evaluated": result.rooms_evaluated,
-                "trade_count": trade_count,
-                "win_count": result.win_count,
-                "trade_rate_display": f"{float(result.trade_rate):.0%}" if result.trade_rate is not None else "—",
-                "win_rate_display": f"{win_rate_val:.0%}" if win_rate_val is not None else "—",
-                "win_rate": win_rate_val,
-                "total_pnl_display": f"${float(result.total_pnl_dollars):+.2f}" if result.total_pnl_dollars is not None else "—",
-                "avg_edge_bps_display": f"{float(result.avg_edge_bps):.0f}" if result.avg_edge_bps is not None else "—",
-                "assigned": assignment_index.get(series_ticker) == strategy.name,
-                "run_at": result.run_at.isoformat() if result.run_at else None,
-            })
-
-        overall_win_rate = (win_numerator / win_denominator) if win_denominator > 0 else None
-        strategy_rows.append({
-            "name": strategy.name,
-            "description": strategy.description,
-            "thresholds": strategy.thresholds,
-            "total_trade_count": total_trade_count,
-            "overall_win_rate_display": f"{overall_win_rate:.0%}" if overall_win_rate is not None else "—",
-            "overall_win_rate": overall_win_rate,
-            "city_breakdown": city_breakdown,
-        })
-
-    # Summary
-    last_evaluated = None
-    corpus_rooms = 0
+    configured_series = set(series_metadata) or {row["series_ticker"] for row in city_matrix}
+    assigned_series = {assignment.series_ticker for assignment in assignments if assignment.series_ticker in configured_series}
+    last_regression_run = None
     if regression_checkpoint is not None and isinstance(regression_checkpoint.payload, dict):
-        last_evaluated = regression_checkpoint.payload.get("ran_at")
-        corpus_rooms = regression_checkpoint.payload.get("rooms_scanned", 0)
+        last_regression_run = regression_checkpoint.payload.get("ran_at")
 
-    best_strategy = max(
-        (s for s in strategy_rows if s["overall_win_rate"] is not None),
-        key=lambda s: s["overall_win_rate"],
-        default=None,
-    )
+    methodology_points = [
+        "Data comes from historical replay rooms, not live forward testing.",
+        f"Default view uses a rolling {DEFAULT_STRATEGY_WINDOW_DAYS}d regression snapshot.",
+        (
+            "Promotion logic currently requires enough simulated trades and a meaningful win-rate gap "
+            "before auto-assignment should be trusted."
+        ),
+        "Resolved-contract, longshot, and effectively-broken-book stand-down cases are excluded from regression.",
+        "Missing data means not enough evidence, not that a strategy failed.",
+    ]
+
+    summary = {
+        "window_days": window_days,
+        "window_display": _strategy_window_display(window_days),
+        "window_options": list(STRATEGY_WINDOW_OPTIONS),
+        "source_mode": snapshot_meta["source_mode"],
+        "last_regression_run": last_regression_run,
+        "rooms_scanned": snapshot_meta["rooms_scanned"],
+        "rooms_scanned_display": _compact_number(snapshot_meta["rooms_scanned"]),
+        "cities_evaluated": snapshot_meta["series_evaluated"] or sum(1 for row in city_matrix if row["best_strategy"] is not None),
+        "cities_evaluated_display": _compact_number(
+            snapshot_meta["series_evaluated"] or sum(1 for row in city_matrix if row["best_strategy"] is not None)
+        ),
+        "best_strategy_name": best_strategy["name"] if best_strategy is not None else "—",
+        "best_strategy_win_rate": best_strategy["overall_win_rate"] if best_strategy is not None else None,
+        "best_strategy_win_rate_display": best_strategy["overall_win_rate_display"] if best_strategy is not None else "—",
+        "recent_promotions_count": sum(1 for event in recent_promotions if event["kind"] == "promotion"),
+        "assignments_covered": len(assigned_series),
+        "assignments_total": len(configured_series),
+        "assignments_covered_display": f"{len(assigned_series)} / {len(configured_series) if configured_series else 0}",
+        "methodology_note": "Historical replay evidence only",
+    }
 
     return {
-        "as_of": now.isoformat(),
-        "corpus_rooms": corpus_rooms,
-        "last_evaluated": last_evaluated,
-        "best_strategy_name": best_strategy["name"] if best_strategy else "—",
-        "best_strategy_win_rate": best_strategy["overall_win_rate_display"] if best_strategy else "—",
-        "strategies": strategy_rows,
-        "assignments": [
-            {"series_ticker": a.series_ticker, "strategy_name": a.strategy_name, "assigned_by": a.assigned_by}
-            for a in assignments
-        ],
+        "summary": summary,
+        "leaderboard": leaderboard,
+        "city_matrix": city_matrix,
+        "detail_context": detail_context,
+        "recent_promotions": recent_promotions,
+        "methodology": {
+            "title": "How to read this tab",
+            "points": methodology_points,
+            "window_default_days": DEFAULT_STRATEGY_WINDOW_DAYS,
+            "promotion_trade_threshold": STRATEGY_MIN_TRADE_COUNT,
+            "promotion_gap_threshold": STRATEGY_MIN_WIN_RATE_GAP,
+        },
     }

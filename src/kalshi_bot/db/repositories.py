@@ -2483,8 +2483,19 @@ class PlatformRepository:
             risky_capital_max_ratio=risky_capital_max_ratio,
         )
 
-    async def list_ops_events(self, limit: int = 50) -> list[OpsEvent]:
-        result = await self.session.execute(select(OpsEvent).order_by(OpsEvent.updated_at.desc()).limit(limit))
+    async def list_ops_events(
+        self,
+        *,
+        limit: int = 50,
+        sources: list[str] | None = None,
+        created_after: datetime | None = None,
+    ) -> list[OpsEvent]:
+        stmt = select(OpsEvent)
+        if sources:
+            stmt = stmt.where(OpsEvent.source.in_(sources))
+        if created_after is not None:
+            stmt = stmt.where(OpsEvent.updated_at >= created_after)
+        result = await self.session.execute(stmt.order_by(OpsEvent.updated_at.desc()).limit(limit))
         return list(result.scalars())
 
     async def set_checkpoint(self, stream_name: str, cursor: str | None, payload: dict[str, Any]) -> Checkpoint:
@@ -2679,6 +2690,24 @@ class PlatformRepository:
             & (StrategyResultRecord.run_at == subq.c.max_run_at),
         )
         return list((await self.session.execute(stmt)).scalars())
+
+    async def list_strategy_results_history(
+        self,
+        *,
+        strategy_ids: list[int] | None = None,
+        series_ticker: str | None = None,
+        run_after: datetime | None = None,
+        limit: int = 500,
+    ) -> list[StrategyResultRecord]:
+        stmt = select(StrategyResultRecord)
+        if strategy_ids:
+            stmt = stmt.where(StrategyResultRecord.strategy_id.in_(strategy_ids))
+        if series_ticker is not None:
+            stmt = stmt.where(StrategyResultRecord.series_ticker == series_ticker)
+        if run_after is not None:
+            stmt = stmt.where(StrategyResultRecord.run_at >= run_after)
+        stmt = stmt.order_by(StrategyResultRecord.run_at.desc(), StrategyResultRecord.strategy_id.asc(), StrategyResultRecord.series_ticker.asc())
+        return list((await self.session.execute(stmt.limit(limit))).scalars())
 
     async def get_city_strategy_assignment(self, series_ticker: str) -> CityStrategyAssignment | None:
         stmt = select(CityStrategyAssignment).where(CityStrategyAssignment.series_ticker == series_ticker)

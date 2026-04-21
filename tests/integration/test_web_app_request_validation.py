@@ -336,3 +336,60 @@ def test_control_room_page_and_tab_endpoints_render_payloads(tmp_path, monkeypat
     assert tab_response.json()["tab"] == "rooms"
     assert missing_tab_response.status_code == 404
     get_settings.cache_clear()
+
+
+def test_dashboard_strategies_endpoint_accepts_window_and_selection_params(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    captured: dict[str, object] = {}
+
+    async def fake_build_strategies_dashboard(_container, *, window_days: int = 180, series_ticker: str | None = None, strategy_name: str | None = None):
+        captured["window_days"] = window_days
+        captured["series_ticker"] = series_ticker
+        captured["strategy_name"] = strategy_name
+        return {
+            "summary": {"window_days": window_days, "window_options": [30, 90, 180]},
+            "leaderboard": [],
+            "city_matrix": [],
+            "detail_context": {"selected_series_ticker": series_ticker, "selected_strategy_name": strategy_name, "type": "empty"},
+            "recent_promotions": [],
+            "methodology": {"points": []},
+        }
+
+    monkeypatch.setattr(web_app_module, "build_strategies_dashboard", fake_build_strategies_dashboard)
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/strategies?window_days=90&series_ticker=KXHIGHNY&strategy_name=moderate")
+
+    assert response.status_code == 200
+    assert captured == {"window_days": 90, "series_ticker": "KXHIGHNY", "strategy_name": "moderate"}
+    assert response.json()["summary"]["window_days"] == 90
+    get_settings.cache_clear()
+
+
+def test_dashboard_strategies_endpoint_rejects_invalid_window(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/strategies?window_days=15")
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid window_days"}
+    get_settings.cache_clear()

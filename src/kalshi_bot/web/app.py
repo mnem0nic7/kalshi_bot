@@ -36,6 +36,8 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.container import AppContainer
 from kalshi_bot.web.control_room import (
     CONTROL_ROOM_TABS,
+    DEFAULT_STRATEGY_WINDOW_DAYS,
+    STRATEGY_WINDOW_OPTIONS,
     build_control_room_bootstrap,
     build_control_room_summary,
     build_control_room_tab,
@@ -875,9 +877,21 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/dashboard/strategies")
-    async def dashboard_strategies(request: Request) -> JSONResponse:
+    async def dashboard_strategies(
+        request: Request,
+        window_days: int = DEFAULT_STRATEGY_WINDOW_DAYS,
+        series_ticker: str | None = None,
+        strategy_name: str | None = None,
+    ) -> JSONResponse:
+        if window_days not in STRATEGY_WINDOW_OPTIONS:
+            return JSONResponse({"error": "invalid window_days"}, status_code=400)
         app_container = container(request)
-        payload = await build_strategies_dashboard(app_container)
+        payload = await build_strategies_dashboard(
+            app_container,
+            window_days=window_days,
+            series_ticker=series_ticker,
+            strategy_name=strategy_name,
+        )
         return JSONResponse(jsonable_encoder(payload))
 
     @app.get("/api/dashboard/{kalshi_env}")
