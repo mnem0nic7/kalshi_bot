@@ -67,8 +67,8 @@ For each open weather market, compute `fair_yes_dollars` = modeled probability t
 
 ```
 edge_bps = |fair_yes_dollars − market_touch| × 10,000
-edge_bps ≥ 100 bps (1 cent)         ← risk_min_edge_bps
-confidence ≥ 0.60                   ← derived from delta_f and observation availability
+100 bps ≤ edge_bps ≤ 5000 bps       ← risk_min_edge_bps / risk_max_credible_edge_bps
+confidence ≥ 0.60                   ← risk_min_confidence; hard block in risk engine
 trade_regime == "standard"          ← near-threshold and longshot trades are blocked
 ```
 
@@ -285,16 +285,18 @@ Resolution-state detection: if `current_temp_f >= threshold`, the market is `LOC
 | 1 | Kill switch | `control.kill_switch_enabled` |
 | 2 | Signal eligibility | No recommended action, side, or price |
 | 3 | Resolution state | Market not UNRESOLVED |
-| 4 | Edge threshold | `edge_bps < risk_min_edge_bps` (100 bps) |
-| 5 | Market staleness | `market_observed_at` older than 30s |
-| 6 | Research staleness | `research_observed_at` older than 900s |
-| 7 | Order count cap | `count_fp > risk_max_order_count_fp` |
-| 8 | Position count cap | `current_position_count_fp >= risk_max_position_count_fp_per_ticker` |
-| 9 | Concurrent tickers | `open_ticker_count >= risk_max_concurrent_tickers` (10) |
-| 10 | Trade regime | regime in `{near_threshold, longshot_yes, longshot_no}` |
-| 11 | Order notional | `order_notional > total_capital × 5%` |
-| 12 | Position notional | `(position + order) > total_capital × 10%` |
-| 13 | Capital bucket | Risky bucket full, or safe reserve target not met |
+| 4 | Min edge | `edge_bps < risk_min_edge_bps` (100 bps) |
+| 5 | Max edge (credibility) | `edge_bps > risk_max_credible_edge_bps` (5000 bps) — model error signal |
+| 6 | Confidence floor | `signal.confidence < risk_min_confidence` (0.60) |
+| 7 | Market staleness | `market_observed_at` older than 30s |
+| 8 | Research staleness | `research_observed_at` older than 900s |
+| 9 | Order count cap | `count_fp > risk_max_order_count_fp` |
+| 10 | Position count cap | `current_position_count_fp >= risk_max_position_count_fp_per_ticker` |
+| 11 | Concurrent tickers | `open_ticker_count >= risk_max_concurrent_tickers` (10) |
+| 12 | Trade regime | regime in `{near_threshold, longshot_yes, longshot_no}` |
+| 13 | Order notional | `order_notional > total_capital × 5%` |
+| 14 | Position notional | `(position + order) > total_capital × 10%` |
+| 15 | Capital bucket | Risky bucket full, or safe reserve target not met |
 
 **Risk limits (current production defaults):**
 
@@ -537,6 +539,8 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `RISK_POSITION_PCT` | 0.10 | 10% of live balance per position |
 | `RISK_DAILY_LOSS_PCT` | 0.05 | 5% daily loss limit (self-improve gate) |
 | `RISK_MIN_EDGE_BPS` | 100 | Minimum 1-cent edge required |
+| `RISK_MAX_CREDIBLE_EDGE_BPS` | 5000 | Maximum credible edge; larger values indicate model error |
+| `RISK_MIN_CONFIDENCE` | 0.60 | Hard block below this confidence score |
 | `RISK_MAX_CONCURRENT_TICKERS` | 10 | Max open-position tickers |
 | `RISK_MAX_ORDER_NOTIONAL_DOLLARS` | None | Optional hard-cap override |
 | `RISK_MAX_POSITION_NOTIONAL_DOLLARS` | None | Optional hard-cap override |

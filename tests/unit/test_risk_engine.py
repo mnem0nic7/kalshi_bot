@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -299,6 +300,34 @@ def test_risk_engine_blocks_when_per_ticker_count_cap_reached() -> None:
     )
     assert verdict.status == RiskStatus.BLOCKED
     assert any("200" in r for r in verdict.reasons)
+
+
+def test_risk_engine_blocks_low_confidence_signal() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_confidence=0.60,
+    )
+    engine = DeterministicRiskEngine(settings)
+    low_conf_signal = replace(make_signal(edge_bps=200), confidence=0.45)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=low_conf_signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+        ),
+    )
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("confidence" in r for r in verdict.reasons)
 
 
 def test_risk_engine_blocks_runaway_edge_as_model_error() -> None:

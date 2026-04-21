@@ -121,6 +121,11 @@ class DeterministicRiskEngine:
                 f"Edge {signal.edge_bps}bps exceeds credibility limit of "
                 f"{self.settings.risk_max_credible_edge_bps}bps; likely model error."
             )
+        if signal.confidence < self.settings.risk_min_confidence:
+            block(
+                f"Signal confidence {signal.confidence:.2f} is below minimum "
+                f"{self.settings.risk_min_confidence:.2f}."
+            )
 
         if market_observed_at is None or (now - market_observed_at).total_seconds() > self.settings.risk_stale_market_seconds:
             block("Kalshi market data is stale.")
