@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     risk_max_order_notional_dollars: float | None = None
     risk_max_position_notional_dollars: float | None = None
     risk_daily_loss_limit_dollars: float | None = None
-    stop_loss_threshold_pct: float = 0.25
+    stop_loss_threshold_pct: float = 0.10
     stop_loss_profit_protection_threshold_pct: float = 0.15
     stop_loss_reentry_cooldown_seconds: int = 14400
     stop_loss_momentum_reentry_window_seconds: int = 300

@@ -38,19 +38,34 @@ def _sell_price(market_state: MarketState, side: str) -> Decimal | None:
     return (Decimal("1") - yes_ask).quantize(Decimal("0.0001"))
 
 
-def _loss_ratio(position: PositionRecord, mid: Decimal) -> float | None:
-    count = position.count_fp
-    avg = position.average_price_dollars
-    if count <= 0 or avg <= 0:
-        return None
-    cost_basis = count * avg
-    mark_value = count * mid
-    return float((cost_basis - mark_value) / cost_basis)
+def _side_price(mid_yes: Decimal, side: str) -> Decimal:
+    return mid_yes if side == "yes" else Decimal("1") - mid_yes
+
+
+def _peak_price_from_history(prices: list[MarketPriceHistory], side: str) -> Decimal | None:
+    """Return the day's highest side-appropriate mid price from price history."""
+    candidates = [
+        _side_price(row.mid_dollars, side)
+        for row in prices
+        if row.mid_dollars is not None
+    ]
+    return max(candidates) if candidates else None
+
+
+def _trailing_loss_ratio(peak: Decimal, current: Decimal) -> float:
+    """Drop from peak as a fraction of peak: (peak - current) / peak."""
+    if peak <= 0:
+        return 0.0
+    return float((peak - current) / peak)
 
 
 def _profit_ratio(position: PositionRecord, mid: Decimal) -> float | None:
-    ratio = _loss_ratio(position, mid)
-    return -ratio if ratio is not None else None
+    avg = position.average_price_dollars
+    if position.count_fp <= 0 or avg <= 0:
+        return None
+    cost_basis = position.count_fp * avg
+    mark_value = position.count_fp * mid
+    return float((mark_value - cost_basis) / cost_basis)
 
 
 def _momentum_slope(prices: list[MarketPriceHistory]) -> float | None:
@@ -97,6 +112,14 @@ class StopLossService:
             market_states = {ms.market_ticker: ms for ms in await repo.list_market_states(tickers)}
 
         now = datetime.now(UTC)
+        # Fetch a full trading day of price history for each held ticker.
+        today_window = timedelta(hours=24)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            price_histories = {}
+            for ticker in tickers:
+                price_histories[ticker] = await repo.fetch_recent_prices(ticker, window=today_window)
+
         for position in positions:
             ms = market_states.get(position.market_ticker)
             if ms is None:
@@ -106,7 +129,8 @@ class StopLossService:
             if mid is None:
                 continue
 
-            result = await self._evaluate_and_submit(position, ms, mid, now)
+            prices = price_histories.get(position.market_ticker, [])
+            result = await self._evaluate_and_submit(position, ms, mid, prices, now)
             if result is not None:
                 triggered.append(result)
 
@@ -117,6 +141,7 @@ class StopLossService:
         position: PositionRecord,
         ms: MarketState,
         mid: Decimal,
+        prices: list[MarketPriceHistory],
         now: datetime,
     ) -> dict[str, Any] | None:
         """Evaluate one position in its own committed transaction to make the cooldown checkpoint immediately visible."""
@@ -127,7 +152,6 @@ class StopLossService:
             submit_key = f"stop_loss_submit:{position.market_ticker}"
             submit_cp = await repo.get_checkpoint(submit_key)
             if submit_cp is not None:
-                # On order failure the checkpoint stores next_retry_at (absolute); prefer that.
                 next_retry = submit_cp.payload.get("next_retry_at")
                 if next_retry is not None:
                     if now < datetime.fromisoformat(next_retry):
@@ -139,16 +163,24 @@ class StopLossService:
                         if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
                             return None
 
-            # Trigger 1: loss-ratio threshold
-            ratio = _loss_ratio(position, mid)
-            if ratio is not None and ratio >= self.settings.stop_loss_threshold_pct:
-                sell_px = _sell_price(ms, position.side)
-                if sell_px is not None and sell_px > 0:
-                    result = await self._submit(repo, position, sell_px, mid, ratio, now, trigger="loss_ratio")
-                    await session.commit()
-                    return result
+            # Trigger 1: trailing stop — 10% drop from today's peak price.
+            # Uses day's price history so the stop trails upward as price rises.
+            peak = _peak_price_from_history(prices, position.side)
+            trailing_ratio: float | None = None
+            if peak is not None:
+                trailing_ratio = _trailing_loss_ratio(peak, _side_price(mid, position.side))
+                if trailing_ratio >= self.settings.stop_loss_threshold_pct:
+                    sell_px = _sell_price(ms, position.side)
+                    if sell_px is not None and sell_px > 0:
+                        result = await self._submit(
+                            repo, position, sell_px, mid, trailing_ratio, now,
+                            trigger="trailing_stop", peak=peak,
+                        )
+                        await session.commit()
+                        return result
 
-            # Trigger 2: adverse momentum (no P&L requirement)
+            # Trigger 2: adverse momentum (no P&L requirement — catches slow bleeds
+            # that haven't yet hit the trailing stop threshold).
             created_at = position.created_at
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=UTC)
@@ -156,12 +188,10 @@ class StopLossService:
             if hold_minutes < self.settings.stop_loss_momentum_min_hold_minutes:
                 return None
 
-            prices = await repo.fetch_recent_prices(position.market_ticker, window=timedelta(minutes=60))
             slope = _momentum_slope(prices)
             if slope is None:
                 return None
 
-            # adverse slope: YES falling for YES holder, YES rising for NO holder
             slope_against = slope if position.side == "yes" else -slope
             if slope_against >= self.settings.stop_loss_momentum_slope_threshold_cents_per_min:
                 return None
@@ -172,7 +202,10 @@ class StopLossService:
 
             profit = _profit_ratio(position, mid)
             trigger = "profit_protection" if (profit is not None and profit >= self.settings.stop_loss_profit_protection_threshold_pct) else "momentum"
-            result = await self._submit(repo, position, sell_px, mid, ratio, now, trigger=trigger, slope=slope)
+            result = await self._submit(
+                repo, position, sell_px, mid, trailing_ratio, now,
+                trigger=trigger, slope=slope, peak=peak,
+            )
             await session.commit()
             return result
 
@@ -185,8 +218,9 @@ class StopLossService:
         loss_ratio: float | None,
         now: datetime,
         *,
-        trigger: str = "loss_ratio",
+        trigger: str = "trailing_stop",
         slope: float | None = None,
+        peak: Decimal | None = None,
     ) -> dict[str, Any]:
         market_ticker = position.market_ticker
         shadow = self.settings.app_shadow_mode
@@ -199,7 +233,8 @@ class StopLossService:
             "average_price_dollars": str(position.average_price_dollars),
             "mid_mark": str(mid),
             "sell_price": str(sell_price),
-            "loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+            "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+            "peak_price": str(peak) if peak is not None else None,
             "shadow_mode": shadow,
             "action": action,
             "trigger": trigger,
@@ -239,7 +274,8 @@ class StopLossService:
 
         submit_payload: dict[str, Any] = {
             "submitted_at": now.isoformat(),
-            "loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+            "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+            "peak_price": str(peak) if peak is not None else None,
             "trigger": trigger,
         }
         if submit_failed:
@@ -256,19 +292,21 @@ class StopLossService:
             payload={
                 "stopped_at": now.isoformat(),
                 "stopped_side": position.side,
-                "loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+                "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+                "peak_price": str(peak) if peak is not None else None,
                 "trigger": trigger,
                 "reverse_evaluated": False,
             },
         )
 
         logger.warning(
-            "Stop loss %s [%s]: %s %s loss=%s slope=%s",
+            "Stop loss %s [%s]: %s %s trailing_loss=%s peak=%s slope=%s",
             "shadow" if shadow else "executed",
             trigger,
             market_ticker,
             position.side,
             f"{loss_ratio:.0%}" if loss_ratio is not None else "n/a",
+            str(peak) if peak is not None else "n/a",
             f"{slope:.3f}¢/min" if slope is not None else "n/a",
         )
         return event_payload

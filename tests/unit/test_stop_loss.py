@@ -9,7 +9,10 @@ from datetime import UTC, datetime, timedelta
 
 import numpy as np
 
-from kalshi_bot.services.stop_loss import _loss_ratio, _midpoint, _momentum_slope, _sell_price
+from kalshi_bot.services.stop_loss import (
+    _midpoint, _momentum_slope, _peak_price_from_history,
+    _sell_price, _side_price, _trailing_loss_ratio,
+)
 
 
 def _ms(yes_bid: str | None, yes_ask: str | None) -> MagicMock:
@@ -75,59 +78,55 @@ def test_sell_price_none_when_ask_missing_for_no():
     assert _sell_price(ms, "no") is None
 
 
-# ── loss ratio ───────────────────────────────────────────────────────────────
+# ── trailing loss ratio ──────────────────────────────────────────────────────
 
-def test_loss_ratio_no_loss():
-    pos = _pos("yes", "10", "0.60")
-    # mid same as avg → no loss
-    ratio = _loss_ratio(pos, Decimal("0.60"))
-    assert ratio == pytest.approx(0.0)
+def test_trailing_loss_ratio_no_drop():
+    # peak == current → 0% trailing loss
+    assert _trailing_loss_ratio(Decimal("0.80"), Decimal("0.80")) == pytest.approx(0.0)
 
 
-def test_loss_ratio_50_pct():
-    pos = _pos("yes", "10", "0.60")
-    # cost = 6.00, mark = 10 * 0.30 = 3.00, loss = 3.00 / 6.00 = 0.50
-    ratio = _loss_ratio(pos, Decimal("0.30"))
-    assert ratio == pytest.approx(0.50)
+def test_trailing_loss_ratio_10_pct():
+    # peak=0.80, current=0.72 → (0.80-0.72)/0.80 = 0.10
+    assert _trailing_loss_ratio(Decimal("0.80"), Decimal("0.72")) == pytest.approx(0.10)
 
 
-def test_loss_ratio_exact_threshold_triggers():
-    pos = _pos("yes", "5", "0.40")
-    # cost = 2.00, mark = 5 * 0.20 = 1.00, loss = 1.00/2.00 = 0.50
-    ratio = _loss_ratio(pos, Decimal("0.20"))
-    assert ratio is not None and ratio >= 0.50
+def test_trailing_loss_ratio_exceeds_threshold():
+    # peak=0.80, current=0.70 → 12.5% drop
+    ratio = _trailing_loss_ratio(Decimal("0.80"), Decimal("0.70"))
+    assert ratio > 0.10
 
 
-def test_loss_ratio_below_threshold():
-    pos = _pos("yes", "10", "0.60")
-    # mid = 0.40 → loss = (6.00 - 4.00) / 6.00 = 0.333
-    ratio = _loss_ratio(pos, Decimal("0.40"))
-    assert ratio is not None and ratio < 0.50
+def test_trailing_loss_ratio_zero_peak():
+    assert _trailing_loss_ratio(Decimal("0.00"), Decimal("0.50")) == 0.0
 
 
-def test_loss_ratio_none_on_zero_count():
-    pos = _pos("yes", "0", "0.60")
-    assert _loss_ratio(pos, Decimal("0.30")) is None
+# ── peak price from history ──────────────────────────────────────────────────
+
+def _ph(mid: str) -> MagicMock:
+    row = MagicMock()
+    row.mid_dollars = Decimal(mid)
+    return row
 
 
-def test_loss_ratio_none_on_zero_avg():
-    pos = _pos("yes", "10", "0.00")
-    assert _loss_ratio(pos, Decimal("0.30")) is None
+def test_peak_price_yes_side():
+    rows = [_ph("0.70"), _ph("0.85"), _ph("0.78")]
+    assert _peak_price_from_history(rows, "yes") == Decimal("0.85")
 
 
-def test_loss_ratio_profit_is_negative():
-    pos = _pos("yes", "10", "0.40")
-    # mid > avg → profit, loss_ratio negative
-    ratio = _loss_ratio(pos, Decimal("0.70"))
-    assert ratio is not None and ratio < 0.0
+def test_peak_price_no_side():
+    # NO side price = 1 - mid_yes; peak for NO is where mid_yes is lowest
+    rows = [_ph("0.30"), _ph("0.20"), _ph("0.25")]
+    # side prices: 0.70, 0.80, 0.75 → peak = 0.80
+    assert _peak_price_from_history(rows, "no") == Decimal("0.80")
 
 
-def test_loss_ratio_no_position():
-    pos = _pos("no", "10", "0.35")
-    # mid_no = 0.20, cost = 3.50, mark = 2.00, loss = 1.50/3.50 ≈ 0.43
-    ratio = _loss_ratio(pos, Decimal("0.20"))
-    assert ratio is not None
-    assert ratio == pytest.approx(1.50 / 3.50, rel=1e-4)
+def test_peak_price_none_on_empty():
+    assert _peak_price_from_history([], "yes") is None
+
+
+def test_peak_price_skips_none_mid():
+    rows = [_ph("0.70"), MagicMock(mid_dollars=None), _ph("0.85")]
+    assert _peak_price_from_history(rows, "yes") == Decimal("0.85")
 
 
 # ── momentum slope ───────────────────────────────────────────────────────────
