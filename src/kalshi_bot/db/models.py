@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from kalshi_bot.core.enums import DeploymentColor, RiskStatus, RoomOrigin, RoomStage
@@ -642,13 +642,15 @@ class StrategyResultRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     strategy_id: Mapped[int] = mapped_column(ForeignKey("strategies.id"), index=True)
     run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    date_from: Mapped[str] = mapped_column(String(16))
-    date_to: Mapped[str] = mapped_column(String(16))
+    date_from: Mapped[date] = mapped_column(Date)
+    date_to: Mapped[date] = mapped_column(Date)
     series_ticker: Mapped[str] = mapped_column(String(64), index=True)
     rooms_evaluated: Mapped[int] = mapped_column(Integer, default=0)
     trade_count: Mapped[int] = mapped_column(Integer, default=0)
+    resolved_trade_count: Mapped[int] = mapped_column(Integer, default=0)
+    unscored_trade_count: Mapped[int] = mapped_column(Integer, default=0)
     win_count: Mapped[int] = mapped_column(Integer, default=0)
-    total_pnl_dollars: Mapped[Decimal] = mapped_column(Numeric(12, 4), default=Decimal("0"))
+    total_pnl_dollars: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
     trade_rate: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
     win_rate: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
     avg_edge_bps: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)

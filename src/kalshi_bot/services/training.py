@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import RoleTrainingExample, RoomMessageRead, TrainingRoomBundle, TrainingRoomOutcome
 from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.services.counterfactuals import score_counterfactual_trade
 
 
 class TrainingExportService:
@@ -272,19 +273,8 @@ class TrainingExportService:
         trade_ticket: dict[str, Any] | None,
         settlement: dict[str, Any] | None,
     ) -> Decimal | None:
-        if trade_ticket is None or settlement is None:
-            return None
-        settlement_value = settlement.get("settlement_value_dollars")
-        side = trade_ticket.get("side")
-        yes_price = trade_ticket.get("yes_price_dollars")
-        count_fp = trade_ticket.get("count_fp")
-        if settlement_value in (None, "") or yes_price in (None, "") or count_fp in (None, "") or side not in {"yes", "no"}:
-            return None
-        settled_yes = Decimal(str(settlement_value))
-        price = Decimal(str(yes_price))
-        count = Decimal(str(count_fp))
-        pnl = (settled_yes - price) * count if side == "yes" else (price - settled_yes) * count
-        return pnl.quantize(Decimal("0.0001"))
+        outcome = score_counterfactual_trade(trade_ticket=trade_ticket, settlement=settlement)
+        return outcome.pnl_dollars if outcome is not None else None
 
     def _derive_outcome(
         self,

@@ -74,6 +74,28 @@ def test_weather_directory_supports_and_resolves_series_template_market() -> Non
     assert resolved.station_id == "KMDW"
 
 
+def test_weather_directory_resolves_series_template_stub_without_market_payload() -> None:
+    template = WeatherSeriesTemplate(
+        series_ticker="KXHIGHNY",
+        display_name="NYC Daily High",
+        location_name="New York City",
+        station_id="KNYC",
+        daily_summary_station_id="USW00094728",
+        latitude=40.7146,
+        longitude=-74.0071,
+    )
+    directory = WeatherMarketDirectory({}, {"KXHIGHNY": template})
+
+    resolved = directory.resolve_market_stub("KXHIGHNY-26APR11-T68")
+
+    assert resolved is not None
+    assert resolved.market_ticker == "KXHIGHNY-26APR11-T68"
+    assert resolved.series_ticker == "KXHIGHNY"
+    assert resolved.display_name == "NYC Daily High"
+    assert resolved.station_id == "KNYC"
+    assert resolved.threshold_f is None
+
+
 def test_example_weather_market_map_covers_all_current_high_temp_series() -> None:
     directory = WeatherMarketDirectory.from_file(Path("docs/examples/weather_markets.example.yaml"))
     series = {template.series_ticker for template in directory.templates()}

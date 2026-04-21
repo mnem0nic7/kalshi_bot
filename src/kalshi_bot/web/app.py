@@ -29,6 +29,7 @@ from kalshi_bot.core.schemas import (
     ShadowRunRequest,
     SelfImprovePromoteRequest,
     SelfImproveRollbackRequest,
+    StrategyAssignmentApprovalRequest,
     TrainingBuildRequest,
     TriggerRequest,
 )
@@ -37,6 +38,9 @@ from kalshi_bot.services.container import AppContainer
 from kalshi_bot.web.control_room import (
     CONTROL_ROOM_TABS,
     DEFAULT_STRATEGY_WINDOW_DAYS,
+    STRATEGY_APPROVAL_ASSIGNED_BY,
+    STRATEGY_APPROVAL_EVENT_KIND,
+    STRATEGY_APPROVAL_SOURCE,
     STRATEGY_WINDOW_OPTIONS,
     build_control_room_bootstrap,
     build_control_room_summary,
@@ -563,7 +567,10 @@ def create_app() -> FastAPI:
         try:
             return model_cls.model_validate(payload)
         except ValidationError as exc:
-            raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
+            raise HTTPException(
+                status_code=422,
+                detail=jsonable_encoder(exc.errors(include_url=False)),
+            ) from exc
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
@@ -893,6 +900,129 @@ def create_app() -> FastAPI:
             strategy_name=strategy_name,
         )
         return JSONResponse(jsonable_encoder(payload))
+
+    @app.post("/api/strategies/assignments/{series_ticker}/approve")
+    async def approve_strategy_assignment(series_ticker: str, request: Request) -> JSONResponse:
+        payload = await parse_json_model(request, StrategyAssignmentApprovalRequest)
+        app_container = container(request)
+        snapshot = await build_strategies_dashboard(
+            app_container,
+            window_days=DEFAULT_STRATEGY_WINDOW_DAYS,
+            series_ticker=series_ticker,
+        )
+        city_row = next(
+            (
+                row
+                for row in snapshot.get("city_matrix", [])
+                if row.get("series_ticker") == series_ticker
+            ),
+            None,
+        )
+        detail_context = snapshot.get("detail_context")
+        fresh_context = {
+            "city_row": city_row,
+            "detail_context": (
+                detail_context
+                if isinstance(detail_context, dict)
+                and detail_context.get("selected_series_ticker") == series_ticker
+                else None
+            ),
+        }
+        if city_row is None:
+            return JSONResponse(
+                {"error": "unknown_series_ticker", "series_ticker": series_ticker},
+                status_code=404,
+            )
+
+        recommendation = dict(city_row.get("recommendation") or {})
+        approved_strategy_name = recommendation.get("strategy_name")
+        approved_status = recommendation.get("status")
+        if (
+            approved_strategy_name != payload.expected_strategy_name
+            or approved_status != payload.expected_recommendation_status
+        ):
+            return JSONResponse(
+                {
+                    "error": "stale_recommendation",
+                    "series_ticker": series_ticker,
+                    "message": "Recommendation changed. Reload the latest 180d snapshot before approving.",
+                    **fresh_context,
+                },
+                status_code=409,
+            )
+        if not city_row.get("approval_eligible"):
+            return JSONResponse(
+                {
+                    "error": "approval_not_eligible",
+                    "series_ticker": series_ticker,
+                    "message": "Only strong and lean 180d recommendations can be approved.",
+                    **fresh_context,
+                },
+                status_code=409,
+            )
+
+        winning_metric = next(
+            (
+                row
+                for row in city_row.get("metrics", [])
+                if row.get("strategy_name") == approved_strategy_name
+            ),
+            None,
+        )
+
+        async with app_container.session_factory() as session:
+            repo = PlatformRepository(session)
+            previous_assignment = await repo.get_city_strategy_assignment(series_ticker)
+            await repo.set_city_strategy_assignment(
+                series_ticker,
+                str(approved_strategy_name),
+                assigned_by=STRATEGY_APPROVAL_ASSIGNED_BY,
+            )
+            await repo.log_ops_event(
+                severity="info",
+                summary=(
+                    f"Approved strategy assignment for {series_ticker}: "
+                    f"{previous_assignment.strategy_name if previous_assignment is not None else 'unassigned'} -> {approved_strategy_name}"
+                ),
+                source=STRATEGY_APPROVAL_SOURCE,
+                payload={
+                    "event_kind": STRATEGY_APPROVAL_EVENT_KIND,
+                    "series_ticker": series_ticker,
+                    "previous_strategy": previous_assignment.strategy_name if previous_assignment is not None else None,
+                    "new_strategy": approved_strategy_name,
+                    "recommendation_status": approved_status,
+                    "recommendation_label": recommendation.get("label"),
+                    "trade_count": int(winning_metric.get("trade_count") or 0) if winning_metric is not None else 0,
+                    "resolved_trade_count": int(winning_metric.get("resolved_trade_count") or 0)
+                    if winning_metric is not None
+                    else 0,
+                    "unscored_trade_count": int(winning_metric.get("unscored_trade_count") or 0)
+                    if winning_metric is not None
+                    else 0,
+                    "outcome_coverage_rate": winning_metric.get("outcome_coverage_rate")
+                    if winning_metric is not None
+                    else None,
+                    "gap_to_runner_up": city_row.get("gap_to_runner_up"),
+                    "new_win_rate": winning_metric.get("win_rate") if winning_metric is not None else None,
+                    "note": payload.note,
+                    "basis_run_at": (snapshot.get("summary") or {}).get("last_regression_run"),
+                    "assigned_by": STRATEGY_APPROVAL_ASSIGNED_BY,
+                },
+            )
+            assignment = await repo.get_city_strategy_assignment(series_ticker)
+            await session.commit()
+
+        return JSONResponse(
+            jsonable_encoder(
+                {
+                    "status": "approved",
+                    "series_ticker": series_ticker,
+                    "strategy_name": assignment.strategy_name if assignment is not None else approved_strategy_name,
+                    "assigned_by": assignment.assigned_by if assignment is not None else STRATEGY_APPROVAL_ASSIGNED_BY,
+                    "assigned_at": assignment.assigned_at if assignment is not None else None,
+                }
+            )
+        )
 
     @app.get("/api/dashboard/{kalshi_env}")
     async def dashboard_env(kalshi_env: str, request: Request) -> JSONResponse:

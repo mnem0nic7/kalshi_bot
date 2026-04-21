@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -2655,16 +2655,26 @@ class PlatformRepository:
 
     async def save_strategy_results(self, results: list[dict[str, Any]]) -> None:
         for row in results:
+            date_from = row["date_from"]
+            if isinstance(date_from, str):
+                date_from = date.fromisoformat(date_from)
+            date_to = row["date_to"]
+            if isinstance(date_to, str):
+                date_to = date.fromisoformat(date_to)
             record = StrategyResultRecord(
                 strategy_id=row["strategy_id"],
                 run_at=row["run_at"],
-                date_from=row["date_from"],
-                date_to=row["date_to"],
+                date_from=date_from,
+                date_to=date_to,
                 series_ticker=row["series_ticker"],
                 rooms_evaluated=row["rooms_evaluated"],
                 trade_count=row["trade_count"],
+                resolved_trade_count=row.get("resolved_trade_count", 0),
+                unscored_trade_count=row.get("unscored_trade_count", 0),
                 win_count=row["win_count"],
-                total_pnl_dollars=Decimal(str(row["total_pnl_dollars"])),
+                total_pnl_dollars=(
+                    Decimal(str(row["total_pnl_dollars"])) if row.get("total_pnl_dollars") is not None else None
+                ),
                 trade_rate=Decimal(str(row["trade_rate"])) if row.get("trade_rate") is not None else None,
                 win_rate=Decimal(str(row["win_rate"])) if row.get("win_rate") is not None else None,
                 avg_edge_bps=Decimal(str(row["avg_edge_bps"])) if row.get("avg_edge_bps") is not None else None,
@@ -2736,25 +2746,80 @@ class PlatformRepository:
         stmt = select(CityStrategyAssignment).order_by(CityStrategyAssignment.series_ticker)
         return list((await self.session.execute(stmt)).scalars())
 
+    async def clear_city_strategy_assignments(self, *, assigned_by: str | None = None) -> int:
+        from sqlalchemy import delete as sa_delete
+
+        stmt = sa_delete(CityStrategyAssignment)
+        if assigned_by is not None:
+            stmt = stmt.where(CityStrategyAssignment.assigned_by == assigned_by)
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return result.rowcount or 0
+
     async def get_strategy_regression_rooms(
         self, date_from: datetime, date_to: datetime
     ) -> list[dict[str, Any]]:
-        """Return historical replay rooms with signal and fill data for counterfactual eval."""
+        """Return canonical replay rows with the latest signal, ticket, and settlement evidence."""
+        latest_signal = (
+            select(
+                Signal.room_id.label("room_id"),
+                Signal.market_ticker.label("signal_market_ticker"),
+                Signal.edge_bps.label("edge_bps"),
+                Signal.fair_yes_dollars.label("fair_yes_dollars"),
+                Signal.payload.label("signal_payload"),
+                func.row_number().over(
+                    partition_by=Signal.room_id,
+                    order_by=(Signal.created_at.desc(), Signal.id.desc()),
+                ).label("rn"),
+            ).subquery()
+        )
+        latest_ticket = (
+            select(
+                TradeTicketRecord.room_id.label("room_id"),
+                TradeTicketRecord.side.label("ticket_side"),
+                TradeTicketRecord.yes_price_dollars.label("ticket_yes_price_dollars"),
+                TradeTicketRecord.count_fp.label("ticket_count_fp"),
+                TradeTicketRecord.status.label("ticket_status"),
+                func.row_number().over(
+                    partition_by=TradeTicketRecord.room_id,
+                    order_by=(TradeTicketRecord.created_at.desc(), TradeTicketRecord.id.desc()),
+                ).label("rn"),
+            ).subquery()
+        )
         stmt = (
             select(
-                Room.id.label("room_id"),
-                Room.market_ticker,
-                Signal.edge_bps,
-                Signal.fair_yes_dollars,
-                Signal.payload.label("signal_payload"),
+                HistoricalReplayRunRecord.room_id.label("room_id"),
+                HistoricalReplayRunRecord.market_ticker.label("market_ticker"),
+                HistoricalReplayRunRecord.series_ticker.label("series_ticker"),
+                latest_signal.c.edge_bps,
+                latest_signal.c.fair_yes_dollars,
+                latest_signal.c.signal_payload,
+                latest_ticket.c.ticket_side,
+                latest_ticket.c.ticket_yes_price_dollars,
+                latest_ticket.c.ticket_count_fp,
+                latest_ticket.c.ticket_status,
+                HistoricalSettlementLabelRecord.settlement_value_dollars,
+                HistoricalSettlementLabelRecord.kalshi_result,
             )
-            .join(Signal, Signal.room_id == Room.id)
+            .join(
+                latest_signal,
+                (latest_signal.c.room_id == HistoricalReplayRunRecord.room_id) & (latest_signal.c.rn == 1),
+            )
+            .outerjoin(
+                latest_ticket,
+                (latest_ticket.c.room_id == HistoricalReplayRunRecord.room_id) & (latest_ticket.c.rn == 1),
+            )
+            .outerjoin(
+                HistoricalSettlementLabelRecord,
+                HistoricalSettlementLabelRecord.market_ticker == HistoricalReplayRunRecord.market_ticker,
+            )
             .where(
-                Room.room_origin == "historical_replay",
-                Room.stage == "complete",
-                Room.created_at >= date_from,
-                Room.created_at <= date_to,
+                HistoricalReplayRunRecord.status == "completed",
+                HistoricalReplayRunRecord.room_id.is_not(None),
+                HistoricalReplayRunRecord.checkpoint_ts >= date_from,
+                HistoricalReplayRunRecord.checkpoint_ts <= date_to,
             )
+            .order_by(HistoricalReplayRunRecord.checkpoint_ts.asc(), HistoricalReplayRunRecord.market_ticker.asc())
         )
         rows = list((await self.session.execute(stmt)).mappings())
         return [dict(r) for r in rows]

@@ -538,12 +538,18 @@
   background: rgba(125, 178, 255, 0.06);
 }
 
-.strategy-matrix-row.is-candidate td {
+.strategy-matrix-row.is-strong-recommendation td {
   background: rgba(158, 240, 212, 0.05);
 }
 
-.strategy-matrix-row.is-thin td {
+.strategy-matrix-row.is-lean-recommendation td,
+.strategy-matrix-row.is-too-close td,
+.strategy-matrix-row.is-low-sample td {
   background: rgba(249, 215, 126, 0.05);
+}
+
+.strategy-matrix-row.is-no-outcomes td {
+  background: rgba(255, 255, 255, 0.02);
 }
 
 .strategy-matrix-link .muted-label {
@@ -690,6 +696,11 @@
   font-size: 0.82rem;
 }
 
+.strategy-event-note {
+  font-size: 0.84rem;
+  color: #dfe8f5;
+}
+
 .strategy-city-distribution {
   display: grid;
   gap: 0.5rem;
@@ -717,6 +728,82 @@
   display: grid;
   gap: 0.45rem;
   color: #dfe8f5;
+}
+
+.strategy-approval-card {
+  padding: 0.95rem;
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(249, 215, 126, 0.08), rgba(255, 255, 255, 0.03)),
+    rgba(10, 18, 32, 0.42);
+  border: 1px solid rgba(249, 215, 126, 0.16);
+}
+
+.strategy-approval-form {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.strategy-approval-textarea {
+  width: 100%;
+  min-height: 6.5rem;
+  padding: 0.8rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(7, 13, 24, 0.68);
+  color: #eef4fd;
+  font: inherit;
+  resize: vertical;
+}
+
+.strategy-approval-textarea:focus {
+  outline: none;
+  border-color: rgba(249, 215, 126, 0.48);
+  box-shadow: 0 0 0 3px rgba(249, 215, 126, 0.14);
+}
+
+.strategy-approval-actions {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.strategy-approval-message {
+  padding: 0.72rem 0.8rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 0.9rem;
+}
+
+.strategy-approval-message.is-good {
+  background: rgba(88, 205, 161, 0.14);
+  border-color: rgba(88, 205, 161, 0.24);
+  color: #c6f7e7;
+}
+
+.strategy-approval-message.is-warning {
+  background: rgba(249, 215, 126, 0.12);
+  border-color: rgba(249, 215, 126, 0.2);
+  color: #f6e6b2;
+}
+
+.strategy-approval-message.is-bad {
+  background: rgba(255, 117, 117, 0.12);
+  border-color: rgba(255, 117, 117, 0.2);
+  color: #ffc2c2;
+}
+
+.strategy-approval-message.is-neutral {
+  background: rgba(255, 255, 255, 0.05);
+  color: #dfe8f5;
+}
+
+.strategy-approval-hint {
+  margin: 0;
+  padding: 0.72rem 0.8rem;
+  border-radius: 12px;
+  background: rgba(249, 215, 126, 0.1);
+  border: 1px solid rgba(249, 215, 126, 0.16);
+  color: #f6e6b2;
 }
 
 @media (max-width: 800px) {

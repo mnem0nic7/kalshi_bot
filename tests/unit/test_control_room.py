@@ -1,3 +1,4 @@
+from pathlib import Path
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ import pytest
 
 import kalshi_bot.web.control_room as control_room_module
 from kalshi_bot.web.control_room import _classify_room, _recent_room_outcomes, _series_filter_options
+from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
 def test_recent_room_outcomes_excludes_running_rooms_from_resolved_total() -> None:
@@ -574,6 +576,59 @@ class _FakeStrategyWeatherDirectory:
         return self._resolved.get(market_ticker)
 
 
+def _strategy_result_row(
+    *,
+    strategy_id: int,
+    run_at: datetime,
+    series_ticker: str,
+    rooms_evaluated: int,
+    trade_count: int,
+    resolved_trade_count: int,
+    win_count: int,
+    total_pnl_dollars: Decimal | None,
+    trade_rate: Decimal | None,
+    win_rate: Decimal | None,
+    avg_edge_bps: Decimal | None,
+    unscored_trade_count: int | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        strategy_id=strategy_id,
+        run_at=run_at,
+        series_ticker=series_ticker,
+        rooms_evaluated=rooms_evaluated,
+        trade_count=trade_count,
+        resolved_trade_count=resolved_trade_count,
+        unscored_trade_count=unscored_trade_count if unscored_trade_count is not None else max(0, trade_count - resolved_trade_count),
+        win_count=win_count,
+        total_pnl_dollars=total_pnl_dollars,
+        trade_rate=trade_rate,
+        win_rate=win_rate,
+        avg_edge_bps=avg_edge_bps,
+    )
+
+
+def _replay_room(
+    *,
+    market_ticker: str,
+    edge_bps: int,
+    settlement_value_dollars: str | None,
+    ticket_yes_price_dollars: str | None,
+    series_ticker: str | None = None,
+) -> dict[str, object]:
+    return {
+        "market_ticker": market_ticker,
+        "series_ticker": series_ticker,
+        "edge_bps": edge_bps,
+        "fair_yes_dollars": Decimal("0.6200"),
+        "signal_payload": {"eligibility": {"market_spread_bps": 10, "remaining_payout_dollars": "0.90"}},
+        "ticket_side": "yes" if ticket_yes_price_dollars is not None else None,
+        "ticket_yes_price_dollars": ticket_yes_price_dollars,
+        "ticket_count_fp": "1.00" if ticket_yes_price_dollars is not None else None,
+        "settlement_value_dollars": settlement_value_dollars,
+        "kalshi_result": "yes" if settlement_value_dollars == "1.0000" else "no" if settlement_value_dollars == "0.0000" else None,
+    }
+
+
 @pytest.mark.asyncio
 async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 4, 21, 18, 0, tzinfo=UTC)
@@ -605,11 +660,22 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
         async def list_ops_events(self, *, limit: int, sources: list[str] | None = None, created_after=None) -> list[SimpleNamespace]:
             assert "strategy_regression" in (sources or [])
             assert "strategy_eval" in (sources or [])
+            assert "strategy_review" in (sources or [])
             return [
                 SimpleNamespace(
                     source="strategy_regression",
                     summary="Strategy auto-promoted for KXHIGHNY: aggressive -> moderate",
-                    payload={"series_ticker": "KXHIGHNY", "previous_strategy": "aggressive", "new_strategy": "moderate", "new_win_rate": 0.75, "trade_count": 24},
+                    payload={
+                        "series_ticker": "KXHIGHNY",
+                        "previous_strategy": "aggressive",
+                        "new_strategy": "moderate",
+                        "new_win_rate": 0.75,
+                        "trade_count": 24,
+                        "resolved_trade_count": 24,
+                        "unscored_trade_count": 0,
+                        "gap_to_runner_up": 0.15,
+                        "clears_promotion_rule": True,
+                    },
                     updated_at=now,
                 ),
                 SimpleNamespace(
@@ -618,14 +684,34 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
                     payload={"direction": "loosened", "old_bps": 50, "new_bps": 40, "win_rate": 0.63, "total_contracts": 82},
                     updated_at=now,
                 ),
+                SimpleNamespace(
+                    source="strategy_review",
+                    summary="Approved strategy assignment for KXHIGHNY: aggressive -> moderate",
+                    payload={
+                        "event_kind": "assignment_approval",
+                        "series_ticker": "KXHIGHNY",
+                        "previous_strategy": "aggressive",
+                        "new_strategy": "moderate",
+                        "recommendation_status": "strong_recommendation",
+                        "recommendation_label": "Strong recommendation",
+                        "trade_count": 24,
+                        "resolved_trade_count": 24,
+                        "unscored_trade_count": 0,
+                        "gap_to_runner_up": 0.15,
+                        "outcome_coverage_rate": 1.0,
+                        "new_win_rate": 0.75,
+                        "note": "Observed enough evidence in the latest 180d snapshot.",
+                    },
+                    updated_at=now,
+                ),
             ]
 
         async def get_latest_strategy_results(self) -> list[SimpleNamespace]:
             return [
-                SimpleNamespace(strategy_id=1, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=40, trade_count=20, win_count=12, total_pnl_dollars=Decimal("5.00"), trade_rate=Decimal("0.5000"), win_rate=Decimal("0.6000"), avg_edge_bps=Decimal("75.0")),
-                SimpleNamespace(strategy_id=2, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=40, trade_count=24, win_count=18, total_pnl_dollars=Decimal("8.40"), trade_rate=Decimal("0.6000"), win_rate=Decimal("0.7500"), avg_edge_bps=Decimal("68.0")),
-                SimpleNamespace(strategy_id=1, run_at=now, series_ticker="KXHIGHCHI", rooms_evaluated=44, trade_count=10, win_count=4, total_pnl_dollars=Decimal("-1.20"), trade_rate=Decimal("0.2273"), win_rate=Decimal("0.4000"), avg_edge_bps=Decimal("58.0")),
-                SimpleNamespace(strategy_id=2, run_at=now, series_ticker="KXHIGHCHI", rooms_evaluated=44, trade_count=26, win_count=15, total_pnl_dollars=Decimal("2.80"), trade_rate=Decimal("0.5909"), win_rate=Decimal("0.5769"), avg_edge_bps=Decimal("52.0")),
+                _strategy_result_row(strategy_id=1, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=40, trade_count=20, resolved_trade_count=20, win_count=12, total_pnl_dollars=Decimal("5.00"), trade_rate=Decimal("0.5000"), win_rate=Decimal("0.6000"), avg_edge_bps=Decimal("75.0")),
+                _strategy_result_row(strategy_id=2, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=40, trade_count=24, resolved_trade_count=24, win_count=18, total_pnl_dollars=Decimal("8.40"), trade_rate=Decimal("0.6000"), win_rate=Decimal("0.7500"), avg_edge_bps=Decimal("68.0")),
+                _strategy_result_row(strategy_id=1, run_at=now, series_ticker="KXHIGHCHI", rooms_evaluated=44, trade_count=10, resolved_trade_count=10, win_count=4, total_pnl_dollars=Decimal("-1.20"), trade_rate=Decimal("0.2273"), win_rate=Decimal("0.4000"), avg_edge_bps=Decimal("58.0")),
+                _strategy_result_row(strategy_id=2, run_at=now, series_ticker="KXHIGHCHI", rooms_evaluated=44, trade_count=26, resolved_trade_count=26, win_count=15, total_pnl_dollars=Decimal("2.80"), trade_rate=Decimal("0.5909"), win_rate=Decimal("0.5769"), avg_edge_bps=Decimal("52.0")),
             ]
 
         async def list_strategy_results_history(
@@ -640,10 +726,10 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
             if strategy_ids == [2]:
                 earlier = now.replace(day=20)
                 return [
-                    SimpleNamespace(strategy_id=2, run_at=earlier, series_ticker="KXHIGHNY", rooms_evaluated=32, trade_count=18, win_count=12, total_pnl_dollars=Decimal("5.20"), trade_rate=Decimal("0.5625"), win_rate=Decimal("0.6667"), avg_edge_bps=Decimal("60.0")),
-                    SimpleNamespace(strategy_id=2, run_at=earlier, series_ticker="KXHIGHCHI", rooms_evaluated=30, trade_count=20, win_count=11, total_pnl_dollars=Decimal("1.10"), trade_rate=Decimal("0.6667"), win_rate=Decimal("0.5500"), avg_edge_bps=Decimal("49.0")),
-                    SimpleNamespace(strategy_id=2, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=40, trade_count=24, win_count=18, total_pnl_dollars=Decimal("8.40"), trade_rate=Decimal("0.6000"), win_rate=Decimal("0.7500"), avg_edge_bps=Decimal("68.0")),
-                    SimpleNamespace(strategy_id=2, run_at=now, series_ticker="KXHIGHCHI", rooms_evaluated=44, trade_count=26, win_count=15, total_pnl_dollars=Decimal("2.80"), trade_rate=Decimal("0.5909"), win_rate=Decimal("0.5769"), avg_edge_bps=Decimal("52.0")),
+                    _strategy_result_row(strategy_id=2, run_at=earlier, series_ticker="KXHIGHNY", rooms_evaluated=32, trade_count=18, resolved_trade_count=18, win_count=12, total_pnl_dollars=Decimal("5.20"), trade_rate=Decimal("0.5625"), win_rate=Decimal("0.6667"), avg_edge_bps=Decimal("60.0")),
+                    _strategy_result_row(strategy_id=2, run_at=earlier, series_ticker="KXHIGHCHI", rooms_evaluated=30, trade_count=20, resolved_trade_count=20, win_count=11, total_pnl_dollars=Decimal("1.10"), trade_rate=Decimal("0.6667"), win_rate=Decimal("0.5500"), avg_edge_bps=Decimal("49.0")),
+                    _strategy_result_row(strategy_id=2, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=40, trade_count=24, resolved_trade_count=24, win_count=18, total_pnl_dollars=Decimal("8.40"), trade_rate=Decimal("0.6000"), win_rate=Decimal("0.7500"), avg_edge_bps=Decimal("68.0")),
+                    _strategy_result_row(strategy_id=2, run_at=now, series_ticker="KXHIGHCHI", rooms_evaluated=44, trade_count=26, resolved_trade_count=26, win_count=15, total_pnl_dollars=Decimal("2.80"), trade_rate=Decimal("0.5909"), win_rate=Decimal("0.5769"), avg_edge_bps=Decimal("52.0")),
                 ]
             return []
 
@@ -658,15 +744,28 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
 
     assert set(payload) == {"summary", "leaderboard", "city_matrix", "detail_context", "recent_promotions", "methodology"}
     assert payload["summary"]["window_days"] == 180
+    assert payload["summary"]["recommendation_mode"] == "recommendation_only"
     assert payload["summary"]["best_strategy_name"] == "moderate"
+    assert payload["summary"]["strong_recommendations_count"] == 2
+    assert payload["summary"]["lean_recommendations_count"] == 0
     assert payload["detail_context"]["type"] == "strategy"
     city_row = next(row for row in payload["city_matrix"] if row["series_ticker"] == "KXHIGHNY")
     assert city_row["best_strategy"] == "moderate"
     assert city_row["assignment"]["strategy_name"] == "aggressive"
-    assert city_row["assignment_status"] == "promotion_candidate"
-    assert city_row["can_promote"] is True
+    assert city_row["recommendation"]["strategy_name"] == "moderate"
+    assert city_row["recommendation"]["status"] == "strong_recommendation"
+    assert city_row["assignment_context_status"] == "differs_from_recommendation"
+    assert city_row["approval_eligible"] is True
+    assert city_row["approval_label"] == "Ready to approve"
+    assert city_row["approval_window_days"] == 180
+    assert city_row["can_promote"] is False
+    assert city_row["best_outcome_coverage_display"] == "24/24 scored"
     assert payload["recent_promotions"][0]["kind"] == "promotion"
+    assert payload["recent_promotions"][0]["resolved_trade_count"] == 24
+    assert any(event["kind"] == "assignment_approval" for event in payload["recent_promotions"])
+    assert payload["summary"]["recent_approvals_count"] == 1
     assert payload["leaderboard"][0]["name"] == "moderate"
+    assert payload["leaderboard"][0]["outcome_coverage_display"] == "50/50 scored"
 
 
 @pytest.mark.asyncio
@@ -694,14 +793,10 @@ async def test_build_strategies_dashboard_live_window_builds_city_detail(monkeyp
 
         async def get_strategy_regression_rooms(self, date_from: datetime, date_to: datetime) -> list[dict[str, object]]:
             assert (date_to - date_from).days >= 29
-            base_payload = {
-                "eligibility": {"market_spread_bps": 10, "remaining_payout_dollars": 0.90, "settlement_result": "win"},
-                "counterfactual_pnl_dollars": "1.20",
-            }
             return [
-                {"market_ticker": "KXHIGHNY-ROOM-1", "edge_bps": 55, "fair_yes_dollars": Decimal("0.62"), "signal_payload": base_payload},
-                {"market_ticker": "KXHIGHNY-ROOM-2", "edge_bps": 35, "fair_yes_dollars": Decimal("0.58"), "signal_payload": base_payload},
-                {"market_ticker": "KXHIGHCHI-ROOM-1", "edge_bps": 25, "fair_yes_dollars": Decimal("0.52"), "signal_payload": base_payload},
+                _replay_room(market_ticker="KXHIGHNY-26APR18-T68", edge_bps=55, ticket_yes_price_dollars="0.40", settlement_value_dollars="1.0000", series_ticker="KXHIGHNY"),
+                _replay_room(market_ticker="KXHIGHNY-26APR18-T61", edge_bps=35, ticket_yes_price_dollars="0.45", settlement_value_dollars="0.0000", series_ticker="KXHIGHNY"),
+                _replay_room(market_ticker="KXHIGHCHI-26APR18-T65", edge_bps=25, ticket_yes_price_dollars="0.41", settlement_value_dollars="1.0000", series_ticker="KXHIGHCHI"),
             ]
 
         async def list_strategy_results_history(
@@ -715,10 +810,10 @@ async def test_build_strategies_dashboard_live_window_builds_city_detail(monkeyp
             if series_ticker == "KXHIGHNY":
                 earlier = now.replace(day=20)
                 return [
-                    SimpleNamespace(strategy_id=1, run_at=earlier, series_ticker="KXHIGHNY", rooms_evaluated=12, trade_count=8, win_count=4, total_pnl_dollars=Decimal("1.00"), trade_rate=Decimal("0.6667"), win_rate=Decimal("0.5000"), avg_edge_bps=Decimal("40.0")),
-                    SimpleNamespace(strategy_id=2, run_at=earlier, series_ticker="KXHIGHNY", rooms_evaluated=12, trade_count=6, win_count=4, total_pnl_dollars=Decimal("1.40"), trade_rate=Decimal("0.5000"), win_rate=Decimal("0.6667"), avg_edge_bps=Decimal("48.0")),
-                    SimpleNamespace(strategy_id=1, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=14, trade_count=10, win_count=6, total_pnl_dollars=Decimal("1.80"), trade_rate=Decimal("0.7143"), win_rate=Decimal("0.6000"), avg_edge_bps=Decimal("44.0")),
-                    SimpleNamespace(strategy_id=2, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=14, trade_count=8, win_count=6, total_pnl_dollars=Decimal("2.20"), trade_rate=Decimal("0.5714"), win_rate=Decimal("0.7500"), avg_edge_bps=Decimal("51.0")),
+                    _strategy_result_row(strategy_id=1, run_at=earlier, series_ticker="KXHIGHNY", rooms_evaluated=12, trade_count=8, resolved_trade_count=8, win_count=4, total_pnl_dollars=Decimal("1.00"), trade_rate=Decimal("0.6667"), win_rate=Decimal("0.5000"), avg_edge_bps=Decimal("40.0")),
+                    _strategy_result_row(strategy_id=2, run_at=earlier, series_ticker="KXHIGHNY", rooms_evaluated=12, trade_count=6, resolved_trade_count=6, win_count=4, total_pnl_dollars=Decimal("1.40"), trade_rate=Decimal("0.5000"), win_rate=Decimal("0.6667"), avg_edge_bps=Decimal("48.0")),
+                    _strategy_result_row(strategy_id=1, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=14, trade_count=10, resolved_trade_count=10, win_count=6, total_pnl_dollars=Decimal("1.80"), trade_rate=Decimal("0.7143"), win_rate=Decimal("0.6000"), avg_edge_bps=Decimal("44.0")),
+                    _strategy_result_row(strategy_id=2, run_at=now, series_ticker="KXHIGHNY", rooms_evaluated=14, trade_count=8, resolved_trade_count=8, win_count=6, total_pnl_dollars=Decimal("2.20"), trade_rate=Decimal("0.5714"), win_rate=Decimal("0.7500"), avg_edge_bps=Decimal("51.0")),
                 ]
             return []
 
@@ -727,14 +822,165 @@ async def test_build_strategies_dashboard_live_window_builds_city_detail(monkeyp
 
     container = SimpleNamespace(
         session_factory=_FakeSessionFactory(),
-        weather_directory=_FakeStrategyWeatherDirectory(),
+        weather_directory=WeatherMarketDirectory.from_file(Path("docs/examples/weather_markets.example.yaml")),
     )
 
     payload = await control_room_module.build_strategies_dashboard(container, window_days=30, series_ticker="KXHIGHNY")
 
     assert payload["summary"]["window_days"] == 30
     assert payload["summary"]["source_mode"] == "live_eval"
+    assert payload["summary"]["cities_evaluated"] == 2
     assert payload["detail_context"]["type"] == "city"
     assert payload["detail_context"]["selected_series_ticker"] == "KXHIGHNY"
-    assert payload["detail_context"]["promotion_rationale"]["best_strategy"] in {"aggressive", "moderate"}
+    assert payload["detail_context"]["city"]["approval_eligible"] is False
+    assert payload["detail_context"]["approval"]["eligible"] is False
+    assert payload["detail_context"]["recommendation_rationale"]["best_strategy"] in {"aggressive", "moderate"}
+    assert payload["detail_context"]["recommendation_rationale"]["best_outcome_coverage_display"].endswith("scored")
+    assert payload["detail_context"]["recommendation_rationale"]["recommendation_status"] == "low_sample"
+    assert payload["detail_context"]["recommendation_rationale"]["writes_assignment"] is False
     assert payload["detail_context"]["trend"]["window_days"] == 180
+
+
+@pytest.mark.asyncio
+async def test_build_strategies_dashboard_uses_neutral_summary_when_no_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 4, 21, 18, 0, tzinfo=UTC)
+
+    class FakeRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def list_strategies(self, *, active_only: bool = True) -> list[SimpleNamespace]:
+            assert active_only is True
+            return [
+                SimpleNamespace(id=1, name="aggressive", description="Loose filters", thresholds=_strategy_thresholds(min_edge_bps=20)),
+                SimpleNamespace(id=2, name="moderate", description="Balanced filters", thresholds=_strategy_thresholds(min_edge_bps=40)),
+            ]
+
+        async def list_city_strategy_assignments(self) -> list[SimpleNamespace]:
+            return []
+
+        async def get_checkpoint(self, stream_name: str) -> SimpleNamespace:
+            assert stream_name == "strategy_regression"
+            return SimpleNamespace(payload={"ran_at": now.isoformat(), "rooms_scanned": 12, "series_evaluated": 0, "promotions": []}, updated_at=now)
+
+        async def list_ops_events(self, *, limit: int, sources: list[str] | None = None, created_after=None) -> list[SimpleNamespace]:
+            return []
+
+        async def get_latest_strategy_results(self) -> list[SimpleNamespace]:
+            return [
+                _strategy_result_row(
+                    strategy_id=1,
+                    run_at=now,
+                    series_ticker="KXHIGHNY",
+                    rooms_evaluated=12,
+                    trade_count=6,
+                    resolved_trade_count=0,
+                    unscored_trade_count=6,
+                    win_count=0,
+                    total_pnl_dollars=None,
+                    trade_rate=Decimal("0.5000"),
+                    win_rate=None,
+                    avg_edge_bps=Decimal("41.0"),
+                ),
+                _strategy_result_row(
+                    strategy_id=2,
+                    run_at=now,
+                    series_ticker="KXHIGHNY",
+                    rooms_evaluated=12,
+                    trade_count=4,
+                    resolved_trade_count=0,
+                    unscored_trade_count=4,
+                    win_count=0,
+                    total_pnl_dollars=None,
+                    trade_rate=Decimal("0.3333"),
+                    win_rate=None,
+                    avg_edge_bps=Decimal("53.0"),
+                ),
+            ]
+
+        async def list_strategy_results_history(
+            self,
+            *,
+            strategy_ids: list[int] | None = None,
+            series_ticker: str | None = None,
+            run_after=None,
+            limit: int = 500,
+        ) -> list[SimpleNamespace]:
+            return []
+
+    monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
+
+    container = SimpleNamespace(
+        session_factory=_FakeSessionFactory(),
+        weather_directory=_FakeStrategyWeatherDirectory(),
+    )
+
+    payload = await control_room_module.build_strategies_dashboard(container)
+
+    assert payload["summary"]["best_strategy_name"] == "—"
+    assert payload["summary"]["best_strategy_win_rate"] is None
+    assert payload["summary"]["cities_evaluated"] == 1
+    assert payload["summary"]["strong_recommendations_count"] == 0
+    assert payload["summary"]["lean_recommendations_count"] == 0
+    assert payload["leaderboard"][0]["total_pnl_display"] == "—"
+    assert payload["city_matrix"][0]["evidence_status"] == "no_outcomes"
+    assert payload["city_matrix"][0]["recommendation"]["status"] == "no_outcomes"
+    assert payload["detail_context"]["type"] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_build_strategies_dashboard_excludes_legacy_unscored_promotions(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 4, 21, 18, 0, tzinfo=UTC)
+
+    class FakeRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def list_strategies(self, *, active_only: bool = True) -> list[SimpleNamespace]:
+            assert active_only is True
+            return [
+                SimpleNamespace(id=1, name="aggressive", description="Loose filters", thresholds=_strategy_thresholds(min_edge_bps=20)),
+                SimpleNamespace(id=2, name="moderate", description="Balanced filters", thresholds=_strategy_thresholds(min_edge_bps=40)),
+            ]
+
+        async def list_city_strategy_assignments(self) -> list[SimpleNamespace]:
+            return []
+
+        async def get_checkpoint(self, stream_name: str) -> SimpleNamespace:
+            assert stream_name == "strategy_regression"
+            return SimpleNamespace(payload={"ran_at": now.isoformat(), "rooms_scanned": 10, "series_evaluated": 1, "promotions": []}, updated_at=now)
+
+        async def list_ops_events(self, *, limit: int, sources: list[str] | None = None, created_after=None) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    source="strategy_regression",
+                    summary="Strategy auto-promoted for KXHIGHNY: none -> aggressive",
+                    payload={"event_kind": "promotion", "series_ticker": "KXHIGHNY", "new_strategy": "aggressive", "new_win_rate": 0.0, "trade_count": 24},
+                    updated_at=now,
+                )
+            ]
+
+        async def get_latest_strategy_results(self) -> list[SimpleNamespace]:
+            return []
+
+        async def list_strategy_results_history(
+            self,
+            *,
+            strategy_ids: list[int] | None = None,
+            series_ticker: str | None = None,
+            run_after=None,
+            limit: int = 500,
+        ) -> list[SimpleNamespace]:
+            return []
+
+    monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
+
+    container = SimpleNamespace(
+        session_factory=_FakeSessionFactory(),
+        weather_directory=_FakeStrategyWeatherDirectory(),
+    )
+
+    payload = await control_room_module.build_strategies_dashboard(container)
+
+    assert payload["summary"]["recent_promotions_count"] == 0
+    assert payload["recent_promotions"] == []

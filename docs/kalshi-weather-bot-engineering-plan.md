@@ -85,7 +85,7 @@ Used when only the NWS point forecast (rounded integer °F) is available.
 
 **Layer 2 — Gaussian CDF (primary).**
 ```
-sigma_f = seasonal_sigma(month)     ← 1.0°F (summer) to 4.5°F (winter)
+sigma_f = seasonal_sigma(month)     ← Jan=3.0, Feb=3.5, Mar=4.0, Apr=6.0, May–Nov=2.8–4.0, Dec=3.0 (empirically derived)
 P = Φ(delta_f / sigma_f)
 ```
 Used when the NWS `forecastGridData` endpoint returns unrounded Celsius values. The gridpoint payload gives sub-degree resolution and is available for all configured stations.
@@ -610,7 +610,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 
 - [ ] ≥ 2 weeks of continuous autonomous demo trading (no manual interventions)
 - [ ] ≥ 20 resolved trades in demo with positive P&L overall
-- [ ] Historical intelligence calibration check: model calibration error < 500 bps across all active cities (computable from `historical_intelligence_run_records` — validates that `fair_yes_dollars` estimates are not materially biased, not just lucky)
+- [ ] σ calibration gate: run `python scripts/calibrate_sigma.py` — median bps error < 2000 bps across all city/month cells with ≥ 5 samples (the 2000 bps threshold accounts for the structural sensitivity of near-50% contracts; σ values in `weather/scoring.py` were derived from 2911 market-days of empirical data and should be re-run after each full season of new data)
 - [ ] Zero unreconciled positions or order mismatches during demo period
 - [ ] No stop-loss exits due to model error (only market-move exits acceptable)
 - [ ] Kill switch and shadow mode tested end-to-end in demo

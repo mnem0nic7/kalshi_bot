@@ -387,7 +387,26 @@ class DaemonService:
                 },
             )
             await session.commit()
-        await self.reconcile_once()
+        try:
+            await self.reconcile_once()
+        except Exception as exc:
+            logger.warning("settlement follow-up reconcile failed", exc_info=True)
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                await repo.log_ops_event(
+                    severity="warning",
+                    summary="Settlement follow-up reconcile failed",
+                    source="daemon",
+                    payload={
+                        "app_color": self.settings.app_color,
+                        "error": str(exc),
+                        "unsettled_count": summary.get("unsettled_count"),
+                        "status_counts": summary.get("status_counts"),
+                        "settlement_backfill": settlement_backfill,
+                    },
+                )
+                await session.commit()
+            summary = {**summary, "reconcile_error": str(exc)}
         if settlement_backfill is not None:
             summary["settlement_backfill"] = settlement_backfill
         return summary

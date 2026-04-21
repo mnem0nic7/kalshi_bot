@@ -46,10 +46,25 @@ class WeatherMarketDirectory:
     def templates(self) -> list[WeatherSeriesTemplate]:
         return list(self._series_templates.values())
 
+    def template_for_market_ticker(self, market_ticker: str) -> WeatherSeriesTemplate | None:
+        for template in self._series_templates.values():
+            if template.supports_market_ticker(market_ticker):
+                return template
+        return None
+
     def supports_market_ticker(self, market_ticker: str) -> bool:
         if market_ticker in self._mappings:
             return True
-        return any(template.supports_market_ticker(market_ticker) for template in self._series_templates.values())
+        return self.template_for_market_ticker(market_ticker) is not None
+
+    def resolve_market_stub(self, market_ticker: str) -> WeatherMarketMapping | None:
+        mapping = self.get(market_ticker)
+        if mapping is not None:
+            return mapping
+        template = self.template_for_market_ticker(market_ticker)
+        if template is None:
+            return None
+        return template.resolve_market_stub(market_ticker)
 
     def resolve_market(self, market_ticker: str, market: dict | None = None) -> WeatherMarketMapping | None:
         mapping = self.get(market_ticker)

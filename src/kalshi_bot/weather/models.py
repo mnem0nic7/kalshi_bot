@@ -71,6 +71,29 @@ class WeatherSeriesTemplate(BaseModel):
     def supports_market_ticker(self, market_ticker: str) -> bool:
         return market_ticker == self.series_ticker or market_ticker.startswith(f"{self.series_ticker}-")
 
+    def resolve_market_stub(self, market_ticker: str) -> WeatherMarketMapping | None:
+        if not self.supports_market_ticker(market_ticker):
+            return None
+        return WeatherMarketMapping(
+            market_ticker=market_ticker,
+            market_type="weather",
+            display_name=self.label,
+            description=self.description,
+            research_queries=list(self.research_queries),
+            research_urls=list(self.research_urls),
+            station_id=self.station_id,
+            daily_summary_station_id=self.daily_summary_station_id,
+            location_name=self.location_name,
+            timezone_name=self.timezone_name,
+            latitude=self.latitude,
+            longitude=self.longitude,
+            threshold_f=None,
+            operator=">=",
+            metric=self.metric,
+            settlement_source=self.settlement_source,
+            series_ticker=self.series_ticker,
+        )
+
     def resolve_market(self, market: dict) -> WeatherMarketMapping | None:
         ticker = str(market.get("ticker") or "")
         if not ticker or not self.supports_market_ticker(ticker):

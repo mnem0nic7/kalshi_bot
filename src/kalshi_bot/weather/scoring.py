@@ -114,11 +114,16 @@ def gaussian_probability(delta_f: float, sigma_f: float = 3.5) -> float:
     return 0.5 * (1.0 + math.erf(delta_f / (sigma * math.sqrt(2))))
 
 
-# Default forecast uncertainty by month (σ in °F).  Calibrate per-station once ASOS data lands.
+# NWS forecast uncertainty by month (σ in °F), derived from 2911 market-days of
+# historical_weather_snapshots vs historical_settlement_labels crosscheck.
+# Jan/Feb/Dec: NWS is more accurate than the original 4.5°F assumption (empirical ~2.5°F).
+# Apr: NWS is significantly less accurate than assumed — spring variability is high,
+#      empirical σ ranges 1.9–10.1°F across cities; using 6.0°F as conservative cover.
+# May–Nov: insufficient settled data; prior assumptions retained.
 _MONTHLY_SIGMA_F: dict[int, float] = {
-    1: 4.5, 2: 4.5, 3: 4.0, 4: 3.5, 5: 3.5,
+    1: 3.0, 2: 3.5, 3: 4.0, 4: 6.0, 5: 3.5,
     6: 3.0, 7: 2.8, 8: 2.8, 9: 3.0, 10: 3.5,
-    11: 4.0, 12: 4.5,
+    11: 4.0, 12: 3.0,
 }
 
 

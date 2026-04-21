@@ -789,6 +789,26 @@ class SelfImproveRollbackRequest(BaseModel):
     reason: str = "manual_rollback"
 
 
+class StrategyAssignmentApprovalRequest(BaseModel):
+    expected_strategy_name: str
+    expected_recommendation_status: str
+    note: str
+
+    @field_validator("expected_strategy_name", "expected_recommendation_status", "note", mode="before")
+    @classmethod
+    def strip_text_fields(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("note")
+    @classmethod
+    def validate_note(cls, value: str) -> str:
+        if not value:
+            raise ValueError("Note is required")
+        return value
+
+
 class TradeDecisionContext(BaseModel):
     room_id: UUID
     market_ticker: str

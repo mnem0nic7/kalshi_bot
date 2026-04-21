@@ -39,6 +39,12 @@ class FakeReconciliationService:
         )
 
 
+class FailingReconciliationService(FakeReconciliationService):
+    async def reconcile(self, repo, *, subaccount=0, kalshi_env=""):
+        self.calls.append({"subaccount": subaccount, "kalshi_env": kalshi_env})
+        raise RuntimeError("Kalshi API timeout")
+
+
 class FakeAutoTriggerService:
     async def handle_market_update(self, market_ticker: str) -> None:
         return None
@@ -371,5 +377,58 @@ async def test_daemon_heartbeat_checkpoint_stays_fresh_while_follow_up_is_runnin
 
     shadow_campaign.release.set()
     await daemon._await_heartbeat_follow_up()
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_settlement_follow_up_reconcile_failure_logs_specific_warning(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-follow-up-error.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory({})
+    historical_training = FakeHistoricalTrainingService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FailingReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(status_counts={"awaiting_settlement": 1}),  # type: ignore[arg-type]
+        historical_training,  # type: ignore[arg-type]
+    )
+
+    payload = await daemon.heartbeat_once(run_follow_up=False)
+    daemon._schedule_heartbeat_follow_up(payload)
+    await daemon._await_heartbeat_follow_up()
+
+    async with session_factory() as session:
+        summaries = [
+            row.summary
+            for row in (
+                await session.execute(select(OpsEvent).where(OpsEvent.source == "daemon").order_by(OpsEvent.updated_at.asc()))
+            ).scalars()
+        ]
+        followup_checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_settlement_followup:blue"))
+        ).scalar_one()
+
+    assert historical_training.backfill_calls == 1
+    assert followup_checkpoint.payload["summary"]["status_counts"]["awaiting_settlement"] == 1
+    assert "Settlement follow-up reconcile triggered" in summaries
+    assert "Settlement follow-up reconcile failed" in summaries
+    assert "Daemon heartbeat follow-up error" not in summaries
 
     await engine.dispose()

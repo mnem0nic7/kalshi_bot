@@ -124,6 +124,13 @@ def _build_strategies_payload(
             "total_rooms_evaluated_display": "44",
             "total_trade_count": 26,
             "total_trade_count_display": "26",
+            "total_resolved_trade_count": 26,
+            "total_resolved_trade_count_display": "26",
+            "total_unscored_trade_count": 0,
+            "total_unscored_trade_count_display": "0",
+            "outcome_coverage_rate": 1.0,
+            "outcome_coverage_rate_display": "100%",
+            "outcome_coverage_display": "26/26 scored",
             "cities_led": 1,
             "assigned_city_count": 1,
         },
@@ -147,10 +154,20 @@ def _build_strategies_payload(
             "total_rooms_evaluated_display": "44",
             "total_trade_count": 20,
             "total_trade_count_display": "20",
+            "total_resolved_trade_count": 20,
+            "total_resolved_trade_count_display": "20",
+            "total_unscored_trade_count": 0,
+            "total_unscored_trade_count_display": "0",
+            "outcome_coverage_rate": 1.0,
+            "outcome_coverage_rate_display": "100%",
+            "outcome_coverage_display": "20/20 scored",
             "cities_led": 0,
             "assigned_city_count": 1,
         },
     ]
+    ny_recommendation_status = "strong_recommendation"
+    ny_recommendation_label = "Strong recommendation"
+    ny_approval_eligible = window_days == 180
     city_matrix = [
         {
             "series_ticker": "KXHIGHNY",
@@ -158,9 +175,13 @@ def _build_strategies_payload(
             "location_name": "New York City",
             "selected": selected_series_ticker == "KXHIGHNY",
             "assignment": {"strategy_name": "aggressive", "assigned_at": "2026-04-21T18:00:00+00:00", "assigned_by": "auto_regression"},
+            "assignment_context_status": "differs_from_recommendation",
             "best_strategy": "moderate",
             "best_strategy_win_rate": 0.75,
             "best_strategy_win_rate_display": "75%",
+            "best_resolved_trade_count": 12,
+            "best_resolved_trade_count_display": "12",
+            "best_outcome_coverage_display": "12/12 scored",
             "runner_up_strategy": "aggressive",
             "runner_up_win_rate_display": "60%",
             "gap_to_runner_up": 0.15,
@@ -168,15 +189,37 @@ def _build_strategies_payload(
             "gap_to_assignment": 0.15,
             "gap_to_assignment_display": "15%",
             "evidence_status": "strong",
-            "evidence_label": "Strong",
+            "evidence_label": "Strong recommendation",
             "trade_count_sufficient": True,
-            "assignment_status": "promotion_candidate",
-            "assignment_status_label": "Promote",
-            "can_promote": True,
+            "resolved_trade_count_sufficient": True,
+            "outcome_coverage_sufficient": True,
+            "gap_threshold_sufficient": True,
+            "lean_gap_sufficient": True,
+            "assignment_gap_sufficient": True,
+            "assignment_status": ny_recommendation_status,
+            "assignment_status_label": ny_recommendation_label,
+            "recommendation": {
+                "strategy_name": "moderate",
+                "status": ny_recommendation_status,
+                "label": ny_recommendation_label,
+                "resolved_trade_count": 12,
+                "resolved_trade_count_display": "12",
+                "outcome_coverage_rate": 1.0,
+                "outcome_coverage_rate_display": "100%",
+                "gap_to_runner_up": 0.15,
+                "gap_to_runner_up_display": "15%",
+                "writes_assignment": False,
+            },
+            "approval_eligible": ny_approval_eligible,
+            "approval_label": "Ready to approve" if ny_approval_eligible else "180d only",
+            "approval_window_days": 180,
+            "approval_requires_note": True,
+            "approval_reason": "Manual approval validates against the latest stored 180d snapshot.",
+            "can_promote": False,
             "sort_priority": 0,
             "metrics": [
-                {"strategy_name": "moderate", "selected": selected_strategy_name == "moderate", "is_assigned": False, "is_best": True, "is_runner_up": False, "rooms_evaluated": 20, "trade_count": 12, "trade_rate": 0.60, "trade_rate_display": "60%", "win_rate": 0.75, "win_rate_display": "75%", "total_pnl_dollars": 8.4, "total_pnl_display": "+$8.40", "avg_edge_bps": 68.0, "avg_edge_bps_display": "68bps", "has_data": True},
-                {"strategy_name": "aggressive", "selected": selected_strategy_name == "aggressive", "is_assigned": True, "is_best": False, "is_runner_up": True, "rooms_evaluated": 20, "trade_count": 10, "trade_rate": 0.50, "trade_rate_display": "50%", "win_rate": 0.60, "win_rate_display": "60%", "total_pnl_dollars": 5.0, "total_pnl_display": "+$5.00", "avg_edge_bps": 75.0, "avg_edge_bps_display": "75bps", "has_data": True},
+                {"strategy_name": "moderate", "selected": selected_strategy_name == "moderate", "is_assigned": False, "is_best": True, "is_runner_up": False, "rooms_evaluated": 20, "trade_count": 12, "resolved_trade_count": 12, "resolved_trade_count_display": "12", "unscored_trade_count": 0, "unscored_trade_count_display": "0", "outcome_coverage_rate": 1.0, "outcome_coverage_rate_display": "100%", "outcome_coverage_display": "12/12 scored", "trade_rate": 0.60, "trade_rate_display": "60%", "win_rate": 0.75, "win_rate_display": "75%", "win_rate_interval_lower": 0.55, "win_rate_interval_upper": 0.88, "win_rate_interval_display": "55%-88%", "total_pnl_dollars": 8.4, "total_pnl_display": "+$8.40", "avg_edge_bps": 68.0, "avg_edge_bps_display": "68bps", "has_data": True},
+                {"strategy_name": "aggressive", "selected": selected_strategy_name == "aggressive", "is_assigned": True, "is_best": False, "is_runner_up": True, "rooms_evaluated": 20, "trade_count": 10, "resolved_trade_count": 10, "resolved_trade_count_display": "10", "unscored_trade_count": 0, "unscored_trade_count_display": "0", "outcome_coverage_rate": 1.0, "outcome_coverage_rate_display": "100%", "outcome_coverage_display": "10/10 scored", "trade_rate": 0.50, "trade_rate_display": "50%", "win_rate": 0.60, "win_rate_display": "60%", "win_rate_interval_lower": 0.39, "win_rate_interval_upper": 0.78, "win_rate_interval_display": "39%-78%", "total_pnl_dollars": 5.0, "total_pnl_display": "+$5.00", "avg_edge_bps": 75.0, "avg_edge_bps_display": "75bps", "has_data": True},
             ],
         },
         {
@@ -185,9 +228,13 @@ def _build_strategies_payload(
             "location_name": "Chicago",
             "selected": selected_series_ticker == "KXHIGHCHI",
             "assignment": {"strategy_name": "moderate", "assigned_at": "2026-04-21T18:00:00+00:00", "assigned_by": "auto_regression"},
+            "assignment_context_status": "matches_recommendation",
             "best_strategy": "moderate",
             "best_strategy_win_rate": 0.58,
             "best_strategy_win_rate_display": "58%",
+            "best_resolved_trade_count": 14,
+            "best_resolved_trade_count_display": "14",
+            "best_outcome_coverage_display": "14/14 scored",
             "runner_up_strategy": "aggressive",
             "runner_up_win_rate_display": "40%",
             "gap_to_runner_up": 0.18,
@@ -195,26 +242,61 @@ def _build_strategies_payload(
             "gap_to_assignment": None,
             "gap_to_assignment_display": "—",
             "evidence_status": "strong",
-            "evidence_label": "Strong",
+            "evidence_label": "Strong recommendation",
             "trade_count_sufficient": True,
-            "assignment_status": "aligned",
-            "assignment_status_label": "Aligned",
+            "resolved_trade_count_sufficient": True,
+            "outcome_coverage_sufficient": True,
+            "gap_threshold_sufficient": True,
+            "lean_gap_sufficient": True,
+            "assignment_gap_sufficient": True,
+            "assignment_status": "strong_recommendation",
+            "assignment_status_label": "Strong recommendation",
+            "recommendation": {
+                "strategy_name": "moderate",
+                "status": "strong_recommendation",
+                "label": "Strong recommendation",
+                "resolved_trade_count": 14,
+                "resolved_trade_count_display": "14",
+                "outcome_coverage_rate": 1.0,
+                "outcome_coverage_rate_display": "100%",
+                "gap_to_runner_up": 0.18,
+                "gap_to_runner_up_display": "18%",
+                "writes_assignment": False,
+            },
+            "approval_eligible": False,
+            "approval_label": "Already assigned",
+            "approval_window_days": 180,
+            "approval_requires_note": True,
+            "approval_reason": "Canonical assignment already matches the current recommendation.",
             "can_promote": False,
             "sort_priority": 3,
             "metrics": [
-                {"strategy_name": "moderate", "selected": selected_strategy_name == "moderate", "is_assigned": True, "is_best": True, "is_runner_up": False, "rooms_evaluated": 24, "trade_count": 14, "trade_rate": 0.58, "trade_rate_display": "58%", "win_rate": 0.58, "win_rate_display": "58%", "total_pnl_dollars": 2.8, "total_pnl_display": "+$2.80", "avg_edge_bps": 52.0, "avg_edge_bps_display": "52bps", "has_data": True},
-                {"strategy_name": "aggressive", "selected": selected_strategy_name == "aggressive", "is_assigned": False, "is_best": False, "is_runner_up": True, "rooms_evaluated": 24, "trade_count": 10, "trade_rate": 0.42, "trade_rate_display": "42%", "win_rate": 0.40, "win_rate_display": "40%", "total_pnl_dollars": -1.2, "total_pnl_display": "-$1.20", "avg_edge_bps": 58.0, "avg_edge_bps_display": "58bps", "has_data": True},
+                {"strategy_name": "moderate", "selected": selected_strategy_name == "moderate", "is_assigned": True, "is_best": True, "is_runner_up": False, "rooms_evaluated": 24, "trade_count": 14, "resolved_trade_count": 14, "resolved_trade_count_display": "14", "unscored_trade_count": 0, "unscored_trade_count_display": "0", "outcome_coverage_rate": 1.0, "outcome_coverage_rate_display": "100%", "outcome_coverage_display": "14/14 scored", "trade_rate": 0.58, "trade_rate_display": "58%", "win_rate": 0.58, "win_rate_display": "58%", "win_rate_interval_lower": 0.36, "win_rate_interval_upper": 0.77, "win_rate_interval_display": "36%-77%", "total_pnl_dollars": 2.8, "total_pnl_display": "+$2.80", "avg_edge_bps": 52.0, "avg_edge_bps_display": "52bps", "has_data": True},
+                {"strategy_name": "aggressive", "selected": selected_strategy_name == "aggressive", "is_assigned": False, "is_best": False, "is_runner_up": True, "rooms_evaluated": 24, "trade_count": 10, "resolved_trade_count": 10, "resolved_trade_count_display": "10", "unscored_trade_count": 0, "unscored_trade_count_display": "0", "outcome_coverage_rate": 1.0, "outcome_coverage_rate_display": "100%", "outcome_coverage_display": "10/10 scored", "trade_rate": 0.42, "trade_rate_display": "42%", "win_rate": 0.40, "win_rate_display": "40%", "win_rate_interval_lower": 0.19, "win_rate_interval_upper": 0.64, "win_rate_interval_display": "19%-64%", "total_pnl_dollars": -1.2, "total_pnl_display": "-$1.20", "avg_edge_bps": 58.0, "avg_edge_bps_display": "58bps", "has_data": True},
             ],
         },
     ]
     if selected_series_ticker == "KXHIGHNY":
+        rationale = {"best_strategy": "moderate", "best_trade_count_display": "12", "best_resolved_trade_count_display": "12", "best_unscored_trade_count_display": "0", "best_outcome_coverage_display": "12/12 scored", "gap_to_runner_up_display": "15%", "gap_to_current_assignment_display": "15%", "winner_wilson_display": "55%-88%", "runner_up_wilson_display": "39%-78%", "recommendation_status": ny_recommendation_status, "recommendation_label": ny_recommendation_label, "meets_trade_threshold": True, "meets_coverage_threshold": True, "meets_gap_threshold": True, "meets_lean_gap_threshold": True, "clears_promotion_rule": False, "writes_assignment": False}
         detail_context = {
             "type": "city",
             "selected_series_ticker": "KXHIGHNY",
             "selected_strategy_name": None,
             "city": city_matrix[0],
             "ranking": city_matrix[0]["metrics"],
-            "promotion_rationale": {"best_strategy": "moderate", "best_trade_count_display": "12", "gap_to_runner_up_display": "15%", "gap_to_current_assignment_display": "15%", "meets_trade_threshold": True, "meets_gap_threshold": True, "clears_promotion_rule": True},
+            "promotion_rationale": rationale,
+            "recommendation_rationale": rationale,
+            "approval": {
+                "eligible": ny_approval_eligible,
+                "label": "Ready to approve" if ny_approval_eligible else "180d only",
+                "window_days": 180,
+                "requires_note": True,
+                "reason": "Manual approval validates against the latest stored 180d snapshot.",
+                "strategy_name": "moderate",
+                "recommendation_status": ny_recommendation_status,
+                "recommendation_label": ny_recommendation_label,
+                "assignment_context_status": "differs_from_recommendation",
+            },
             "threshold_comparison": [
                 {"strategy_name": "moderate", "role": "best", "threshold_groups": leaderboard[0]["threshold_groups"]},
                 {"strategy_name": "aggressive", "role": "runner_up", "threshold_groups": leaderboard[1]["threshold_groups"]},
@@ -228,7 +310,10 @@ def _build_strategies_payload(
                     {"strategy_name": "aggressive", "points": [{"run_at": "2026-04-20T18:00:00+00:00", "win_rate": 0.52}, {"run_at": "2026-04-21T18:00:00+00:00", "win_rate": 0.60}]},
                 ],
             },
-            "recent_events": [{"kind": "promotion", "summary": "Strategy auto-promoted for KXHIGHNY: aggressive -> moderate", "source": "strategy_regression", "created_at": "2026-04-21T18:00:00+00:00", "series_ticker": "KXHIGHNY", "win_rate_display": "75%", "trade_count": 12}],
+            "recent_events": [
+                {"kind": "promotion", "summary": "Strategy auto-promoted for KXHIGHNY: aggressive -> moderate", "source": "strategy_regression", "created_at": "2026-04-21T18:00:00+00:00", "series_ticker": "KXHIGHNY", "win_rate_display": "75%", "trade_count": 12},
+                {"kind": "assignment_approval", "summary": "Approved strategy assignment for KXHIGHNY: aggressive -> moderate", "source": "strategy_review", "created_at": "2026-04-21T18:30:00+00:00", "series_ticker": "KXHIGHNY", "win_rate_display": "75%", "trade_count": 12, "note": "Operator approved the current 180d winner."},
+            ],
         }
     else:
         selected = leaderboard[0] if selected_strategy_name != "aggressive" else leaderboard[1]
@@ -260,6 +345,9 @@ def _build_strategies_payload(
             "window_display": f"{window_days}d",
             "window_options": [30, 90, 180],
             "source_mode": "stored_snapshot" if window_days == 180 else "live_eval",
+            "recommendation_mode": "recommendation_only",
+            "manual_approval_enabled": True,
+            "approval_window_days": 180,
             "last_regression_run": "2026-04-21T18:00:00+00:00",
             "rooms_scanned": 84,
             "rooms_scanned_display": "84",
@@ -268,11 +356,14 @@ def _build_strategies_payload(
             "best_strategy_name": "moderate",
             "best_strategy_win_rate": 0.73,
             "best_strategy_win_rate_display": "73%",
+            "strong_recommendations_count": 2 if window_days == 180 else 0,
+            "lean_recommendations_count": 0,
             "recent_promotions_count": 1,
+            "recent_approvals_count": 1,
             "assignments_covered": 2,
             "assignments_total": 2,
             "assignments_covered_display": "2 / 2",
-            "methodology_note": "Historical replay evidence only",
+            "methodology_note": "Canonical outcomes, manual approval",
         },
         "leaderboard": leaderboard,
         "city_matrix": city_matrix,
@@ -280,6 +371,7 @@ def _build_strategies_payload(
         "recent_promotions": [
             {"kind": "promotion", "summary": "Strategy auto-promoted for KXHIGHNY: aggressive -> moderate", "source": "strategy_regression", "created_at": "2026-04-21T18:00:00+00:00", "series_ticker": "KXHIGHNY", "win_rate_display": "75%", "trade_count": 12},
             {"kind": "threshold_adjustment", "summary": "Auto-adjusted risk_min_edge_bps 50->40", "source": "strategy_eval", "created_at": "2026-04-21T18:00:00+00:00", "change_display": "50bps -> 40bps", "win_rate_display": "63%", "trade_count": 82},
+            {"kind": "assignment_approval", "summary": "Approved strategy assignment for KXHIGHNY: aggressive -> moderate", "source": "strategy_review", "created_at": "2026-04-21T18:30:00+00:00", "series_ticker": "KXHIGHNY", "win_rate_display": "75%", "trade_count": 12, "note": "Operator approved the current 180d winner."},
         ],
         "methodology": {
             "title": "How to read this tab",
@@ -287,6 +379,10 @@ def _build_strategies_payload(
                 "Data comes from historical replay rooms, not live forward testing.",
                 "Default view uses a rolling 180d regression snapshot.",
             ],
+            "recommendation_trade_threshold": 20,
+            "recommendation_outcome_coverage_threshold": 0.95,
+            "recommendation_lean_gap_threshold": 0.01,
+            "recommendation_strong_gap_threshold": 0.02,
             "promotion_trade_threshold": 20,
             "promotion_gap_threshold": 0.05,
         },
@@ -579,6 +675,15 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert "180d" in (page.locator("#strategies-summary").text_content(timeout=15_000) or "")
                 assert "moderate" in (page.locator("#strategies-leaderboard").text_content(timeout=15_000) or "")
 
+                page.locator('#strategies-city-matrix button[data-series-ticker="KXHIGHNY"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-detail h3')?.textContent?.includes('KXHIGHNY')",
+                    timeout=15_000,
+                )
+                detail_text = page.locator("#strategies-detail").text_content(timeout=15_000) or ""
+                assert "Recommendation Rationale" in detail_text
+                assert "Approve Recommendation" in detail_text
+
                 page.locator('#strategies-window-filter button[data-window-days="90"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-summary')?.textContent?.includes('90d')",
@@ -590,8 +695,9 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                     "() => document.querySelector('#strategies-detail h3')?.textContent?.includes('KXHIGHNY')",
                     timeout=15_000,
                 )
-                detail_text = page.locator("#strategies-detail").text_content(timeout=15_000) or ""
-                assert "Promotion Rationale" in detail_text
-                assert "Stored regression history" in detail_text
+                detail_text_90d = page.locator("#strategies-detail").text_content(timeout=15_000) or ""
+                assert "Recommendation Rationale" in detail_text_90d
+                assert "Approve Recommendation" not in detail_text_90d
+                assert "Stored regression history" in detail_text_90d
             finally:
                 browser.close()

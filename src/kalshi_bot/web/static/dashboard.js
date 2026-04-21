@@ -69,6 +69,9 @@
     sortKey: "priority",
     fetching: false,
     dirty: false,
+    approvalSubmitting: false,
+    approvalMessage: null,
+    approvalNotes: {},
   };
 
   if (strategyState.payload && strategyState.payload.summary) {
@@ -337,11 +340,55 @@
     return el("span", ["dash-stat-detail", extraClass || "", "muted-label"].join(" ").trim(), text);
   }
 
+  function recommendationTone(status) {
+    if (status === "strong_recommendation") return "good";
+    if (status === "lean_recommendation") return "warning";
+    if (status === "too_close") return "warning";
+    if (status === "low_sample") return "warning";
+    return "neutral";
+  }
+
+  function recommendationModeLabel(mode, summary) {
+    if (mode === "recommendation_only" && summary && summary.manual_approval_enabled) return "Manual approval";
+    if (mode === "recommendation_only") return "Recommendation only";
+    return mode || "—";
+  }
+
+  function setApprovalMessage(seriesTicker, tone, text) {
+    strategyState.approvalMessage = seriesTicker && text ? { seriesTicker, tone: tone || "neutral", text } : null;
+  }
+
+  function approvalMessageNode(seriesTicker) {
+    const message = strategyState.approvalMessage;
+    if (!message || message.seriesTicker !== seriesTicker) return null;
+    return el(
+      "div",
+      `strategy-approval-message is-${message.tone || "neutral"}`,
+      message.text,
+    );
+  }
+
+  function responseErrorMessage(body, fallbackText) {
+    if (body && typeof body.message === "string" && body.message) return body.message;
+    if (body && Array.isArray(body.detail) && body.detail.length) {
+      const first = body.detail[0];
+      if (first && typeof first.msg === "string") return first.msg;
+    }
+    return fallbackText;
+  }
+
   function renderStrategiesSummary(summary) {
     const container = document.getElementById("strategies-summary");
     if (!container) return;
     const windowValue = strategyStatValue(summary.window_display || "—");
     const windowDetail = strategyStatDetail(summary.source_mode === "live_eval" ? "Live replay evaluation" : "Stored regression snapshot");
+
+    const modeValue = strategyStatValue(recommendationModeLabel(summary.recommendation_mode || "—", summary));
+    const modeDetail = strategyStatDetail(
+      summary.manual_approval_enabled
+        ? `Regression stays recommendation-only; ${summary.approval_window_days || 180}d city approvals are manual`
+        : "Assignments are not mutated from this tab",
+    );
 
     const lastValue = strategyStatValue("—");
     if (summary.last_regression_run) {
@@ -358,25 +405,38 @@
     const citiesValue = strategyStatValue(summary.cities_evaluated_display || "0");
     const citiesDetail = strategyStatDetail("Cities with usable evidence");
 
+    const strongValue = strategyStatValue(String(summary.strong_recommendations_count || 0), "value-positive");
+    const strongDetail = strategyStatDetail("Strong recommendations");
+
+    const leanValue = strategyStatValue(String(summary.lean_recommendations_count || 0));
+    const leanDetail = strategyStatDetail("Lean recommendations");
+
     const bestValue = strategyStatValue(summary.best_strategy_name || "—");
     const bestDetail = strategyStatDetail(summary.best_strategy_win_rate_display || "—");
 
     const promosValue = strategyStatValue(String(summary.recent_promotions_count || 0));
-    const promosDetail = strategyStatDetail("Recent promotions");
+    const promosDetail = strategyStatDetail("Historical promotions only");
+
+    const approvalsValue = strategyStatValue(String(summary.recent_approvals_count || 0));
+    const approvalsDetail = strategyStatDetail("Manual approvals in recent history");
 
     const assignValue = strategyStatValue(summary.assignments_covered_display || "—");
-    const assignDetail = strategyStatDetail("Assignments covered");
+    const assignDetail = strategyStatDetail("Canonical assignments covered");
 
     const methodValue = strategyStatValue(summary.methodology_note || "—", "strategy-summary-note");
     const methodDetail = strategyStatDetail("Read the methodology before acting");
 
     clearNode(container, [
       createSummaryStat("Window", windowValue, windowDetail),
+      createSummaryStat("Mode", modeValue, modeDetail),
       createSummaryStat("Last Regression Run", lastValue, lastDetail),
       createSummaryStat("Rooms Scanned", roomsValue, roomsDetail),
       createSummaryStat("Cities Evaluated", citiesValue, citiesDetail),
+      createSummaryStat("Strong Recs", strongValue, strongDetail),
+      createSummaryStat("Lean Recs", leanValue, leanDetail),
       createSummaryStat("Best Overall Strategy", bestValue, bestDetail),
       createSummaryStat("Recent Promotions", promosValue, promosDetail),
+      createSummaryStat("Recent Approvals", approvalsValue, approvalsDetail),
       createSummaryStat("Assignments Covered", assignValue, assignDetail),
       createSummaryStat("Methodology Note", methodValue, methodDetail),
     ]);
@@ -472,6 +532,8 @@
         metricListItem("Avg edge", item.avg_edge_bps_display || "—"),
         metricListItem("Rooms", item.total_rooms_evaluated_display || "0"),
         metricListItem("Sim trades", item.total_trade_count_display || "0"),
+        metricListItem("Scored trades", item.total_resolved_trade_count_display || "0"),
+        metricListItem("Outcome coverage", item.outcome_coverage_display || "—"),
       );
 
       const details = el("details", "strategy-threshold-details");
@@ -494,12 +556,14 @@
       wrapper.append(el("span", "muted-label", "No data"));
       return wrapper;
     }
-    const lines = [
-      `Win ${metric.win_rate_display}`,
-      `Trade ${metric.trade_rate_display}`,
-      `P/L ${metric.total_pnl_display}`,
-      `Edge ${metric.avg_edge_bps_display}`,
-      `Rooms ${metric.rooms_evaluated}`,
+      const lines = [
+        `Win ${metric.win_rate_display}`,
+        `Wilson ${metric.win_rate_interval_display || "—"}`,
+        `Trade ${metric.trade_rate_display}`,
+        `Scored ${metric.outcome_coverage_display}`,
+        `P/L ${metric.total_pnl_display}`,
+        `Edge ${metric.avg_edge_bps_display}`,
+        `Rooms ${metric.rooms_evaluated}`,
     ];
     lines.forEach((line) => wrapper.append(el("span", null, line)));
     return wrapper;
@@ -543,16 +607,18 @@
     const table = el("table", "positions-table strategy-matrix-table");
     const thead = el("thead");
     const headRow = el("tr");
-    ["City", "Assigned", "Winner", "Runner-up", "Gap", "Evidence"].forEach((label) => headRow.append(el("th", null, label)));
+    ["City", "Assignment", "Recommendation", "Runner-up", "Gap", "Evidence"].forEach((label) => headRow.append(el("th", null, label)));
     strategyNames.forEach((name) => headRow.append(el("th", null, name)));
     thead.appendChild(headRow);
     table.appendChild(thead);
 
     const tbody = el("tbody");
     rows.forEach((row) => {
+      const recommendation = row.recommendation || {};
+      const recommendationStatus = recommendation.status || "no_outcomes";
       const tr = el(
         "tr",
-        `strategy-matrix-row${row.selected ? " is-selected" : ""}${row.assignment_status === "promotion_candidate" ? " is-candidate" : ""}${row.assignment_status === "tentative" ? " is-thin" : ""}`,
+        `strategy-matrix-row${row.selected ? " is-selected" : ""} is-${recommendationStatus.replace(/_/g, "-")}`,
       );
       const cityTd = el("td");
       const cityButton = el("button", "strategy-matrix-link");
@@ -566,11 +632,39 @@
       cityTd.appendChild(cityButton);
       tr.appendChild(cityTd);
 
-      tr.appendChild(el("td", null, ""));
-      tr.lastChild.appendChild(row.assignment && row.assignment.strategy_name ? pill(row.assignment.strategy_name, row.assignment_status === "aligned" ? "good" : "neutral") : pill("Unassigned", "warning"));
+      const assignmentCell = el("td");
+      const assignmentWrap = el("div", "strategy-matrix-cell");
+      const assignmentStatus = row.assignment_context_status || "unassigned";
+      const assignmentTone = assignmentStatus === "matches_recommendation" ? "good" : "neutral";
+      assignmentWrap.appendChild(
+        row.assignment && row.assignment.strategy_name ? pill(row.assignment.strategy_name, assignmentTone) : pill("Unassigned", "neutral"),
+      );
+      assignmentWrap.appendChild(
+        el(
+          "span",
+          "muted-label",
+          assignmentStatus === "matches_recommendation"
+            ? "Matches recommendation"
+            : assignmentStatus === "differs_from_recommendation"
+            ? "Differs from recommendation"
+            : "Unassigned",
+        ),
+      );
+      assignmentCell.appendChild(assignmentWrap);
+      tr.appendChild(assignmentCell);
 
-      tr.appendChild(el("td", null, ""));
-      tr.lastChild.appendChild(row.best_strategy ? pill(row.best_strategy, "good") : pill("—", "neutral"));
+      const recommendationCell = el("td");
+      const recommendationWrap = el("div", "strategy-matrix-cell is-best");
+      recommendationWrap.appendChild(
+        recommendation.strategy_name ? pill(recommendation.strategy_name, recommendationTone(recommendationStatus)) : pill("—", "neutral"),
+      );
+      recommendationWrap.appendChild(el("span", "muted-label", recommendation.label || "No recommendation"));
+      recommendationWrap.appendChild(el("span", "mono", recommendation.gap_to_runner_up_display ? `Gap ${recommendation.gap_to_runner_up_display}` : "Gap —"));
+      if (row.approval_eligible) {
+        recommendationWrap.appendChild(pill(row.approval_label || "Ready to approve", recommendationTone(recommendationStatus)));
+      }
+      recommendationCell.appendChild(recommendationWrap);
+      tr.appendChild(recommendationCell);
 
       tr.appendChild(el("td", null, ""));
       tr.lastChild.appendChild(row.runner_up_strategy ? pill(row.runner_up_strategy, "neutral") : pill("—", "neutral"));
@@ -580,7 +674,7 @@
       tr.lastChild.appendChild(
         pill(
           row.evidence_label || "—",
-          row.evidence_status === "strong" ? "good" : row.evidence_status === "no_data" ? "neutral" : "warning",
+          recommendationTone(recommendationStatus),
         ),
       );
 
@@ -708,8 +802,22 @@
     events.forEach((event) => {
       const row = el("article", "strategy-event-row");
       const header = el("div", "strategy-event-header");
+      const eventLabel =
+        event.kind === "promotion"
+          ? "promotion"
+          : event.kind === "threshold_adjustment"
+          ? "tuning"
+          : event.kind === "assignment_approval"
+          ? "approval"
+          : "event";
+      const eventTone =
+        event.kind === "promotion"
+          ? "good"
+          : event.kind === "assignment_approval"
+          ? "neutral"
+          : "warning";
       header.append(
-        pill(event.kind === "promotion" ? "promotion" : event.kind === "threshold_adjustment" ? "tuning" : "event", event.kind === "promotion" ? "good" : "warning"),
+        pill(eventLabel, eventTone),
         el("strong", null, event.summary || "Strategy event"),
       );
       row.appendChild(header);
@@ -728,18 +836,169 @@
       const extras = [];
       if (event.win_rate_display && event.win_rate_display !== "—") extras.push(`win ${event.win_rate_display}`);
       if (event.trade_count) extras.push(`trades ${event.trade_count}`);
+      if (event.outcome_coverage_display && event.outcome_coverage_display !== "—") extras.push(event.outcome_coverage_display);
+      if (event.gap_to_runner_up_display && event.gap_to_runner_up_display !== "—") extras.push(`gap ${event.gap_to_runner_up_display}`);
       if (event.change_display) extras.push(event.change_display);
       if (extras.length) row.appendChild(el("div", "strategy-event-extra mono", extras.join(" · ")));
+      if (event.note) row.appendChild(el("div", "strategy-event-note", `Note: ${event.note}`));
       list.appendChild(row);
     });
     clearNode(container, [list]);
+  }
+
+  async function submitStrategyApproval(detail) {
+    const city = detail && detail.city ? detail.city : null;
+    const approval = detail && detail.approval ? detail.approval : null;
+    const recommendation = city && city.recommendation ? city.recommendation : null;
+    if (!city || !approval || !approval.eligible || !recommendation || strategyState.approvalSubmitting) return;
+
+    const note = (strategyState.approvalNotes[city.series_ticker] || "").trim();
+    if (!note) {
+      setApprovalMessage(city.series_ticker, "bad", "Approval note is required.");
+      renderStrategiesDetail(strategyState.payload && strategyState.payload.detail_context ? strategyState.payload.detail_context : {});
+      return;
+    }
+
+    strategyState.approvalSubmitting = true;
+    setApprovalMessage(city.series_ticker, "neutral", "Submitting approval...");
+    renderStrategiesDetail(strategyState.payload && strategyState.payload.detail_context ? strategyState.payload.detail_context : {});
+
+    try {
+      const response = await fetch(`/api/strategies/assignments/${encodeURIComponent(city.series_ticker)}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expected_strategy_name: recommendation.strategy_name,
+          expected_recommendation_status: recommendation.status,
+          note,
+        }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.ok) {
+        strategyState.approvalNotes[city.series_ticker] = "";
+        setApprovalMessage(
+          city.series_ticker,
+          "good",
+          `Assignment approved for ${city.series_ticker}: ${body.strategy_name || recommendation.strategy_name}.`,
+        );
+        await loadStrategies({
+          windowDays: strategyState.windowDays,
+          seriesTicker: city.series_ticker,
+          strategyName: null,
+          preserveApprovalMessage: true,
+        });
+        return;
+      }
+      if (response.status === 409) {
+        setApprovalMessage(
+          city.series_ticker,
+          "warning",
+          responseErrorMessage(body, "Recommendation changed. Reloaded the latest 180d snapshot."),
+        );
+        await loadStrategies({
+          windowDays: strategyState.windowDays,
+          seriesTicker: city.series_ticker,
+          strategyName: null,
+          preserveApprovalMessage: true,
+        });
+        return;
+      }
+      setApprovalMessage(
+        city.series_ticker,
+        "bad",
+        responseErrorMessage(body, "Approval failed. Try refreshing the strategy snapshot."),
+      );
+    } catch (_) {
+      setApprovalMessage(city.series_ticker, "bad", "Approval request failed. Check the dashboard connection and try again.");
+    } finally {
+      strategyState.approvalSubmitting = false;
+      renderStrategiesDetail(strategyState.payload && strategyState.payload.detail_context ? strategyState.payload.detail_context : {});
+    }
+  }
+
+  function renderApprovalCard(detail) {
+    const city = detail.city || {};
+    const approval = detail.approval || {};
+    if (!approval.eligible) return null;
+
+    const recommendation = city.recommendation || {};
+    const noteValue = strategyState.approvalNotes[city.series_ticker] || "";
+    const card = el("section", "strategy-detail-section strategy-approval-card");
+    card.append(el("h4", null, "Approve Recommendation"));
+    card.append(
+      el(
+        "p",
+        "muted-label",
+        `This writes the latest ${approval.window_days || 180}d recommendation into canonical city assignments and records your note for audit.`,
+      ),
+    );
+
+    const summary = el("div", "strategy-detail-metrics");
+    summary.append(
+      metricListItem("Recommended strategy", approval.strategy_name || recommendation.strategy_name || "—"),
+      metricListItem("Recommendation tier", approval.recommendation_label || recommendation.label || "—"),
+      metricListItem("Assignment status", approval.assignment_context_status || city.assignment_context_status || "—"),
+      metricListItem("Scored evidence", city.best_outcome_coverage_display || "—"),
+      metricListItem("Gap to runner-up", city.gap_to_runner_up_display || "—"),
+      metricListItem("Actionability", approval.label || "Ready to approve"),
+    );
+    card.appendChild(summary);
+
+    if (recommendation.status === "lean_recommendation") {
+      card.append(
+        el(
+          "p",
+          "strategy-approval-hint",
+          "Lean recommendations are actionable, but the edge over the runner-up is still narrow. Add note context that explains why you are comfortable approving it now.",
+        ),
+      );
+    }
+
+    if (approval.reason) {
+      card.append(el("p", "muted-label", approval.reason));
+    }
+
+    const form = el("div", "strategy-approval-form");
+    const label = el("label", "muted-label", "Operator note");
+    label.setAttribute("for", `strategy-approval-note-${city.series_ticker}`);
+    const textarea = el("textarea", "strategy-approval-textarea");
+    textarea.id = `strategy-approval-note-${city.series_ticker}`;
+    textarea.rows = 4;
+    textarea.placeholder = "Why does this recommendation make sense to approve right now?";
+    textarea.value = noteValue;
+    textarea.addEventListener("input", () => {
+      strategyState.approvalNotes[city.series_ticker] = textarea.value;
+      if (strategyState.approvalMessage && strategyState.approvalMessage.seriesTicker === city.series_ticker) {
+        setApprovalMessage(null, null, null);
+      }
+    });
+    form.append(label, textarea);
+
+    const actions = el("div", "strategy-approval-actions");
+    const button = el(
+      "button",
+      "dash-button primary-button",
+      strategyState.approvalSubmitting ? "Approving..." : `Approve ${approval.strategy_name || recommendation.strategy_name || "recommendation"}`,
+    );
+    button.type = "button";
+    button.disabled = strategyState.approvalSubmitting;
+    button.addEventListener("click", () => {
+      submitStrategyApproval(detail);
+    });
+    actions.appendChild(button);
+    form.appendChild(actions);
+
+    const messageNode = approvalMessageNode(city.series_ticker);
+    if (messageNode) form.appendChild(messageNode);
+    card.appendChild(form);
+    return card;
   }
 
   function renderCityDetail(detail) {
     const container = document.getElementById("strategies-detail");
     const meta = document.getElementById("strategies-detail-meta");
     if (!container) return;
-    if (meta) meta.textContent = detail.city ? `${detail.city.series_ticker} · assignment vs winner` : "City evidence";
+    if (meta) meta.textContent = detail.city ? `${detail.city.series_ticker} · recommendation evidence` : "City evidence";
 
     const children = [];
     const city = detail.city || {};
@@ -749,29 +1008,46 @@
     children.push(header);
 
     const metaGrid = el("div", "strategy-detail-metrics");
+    const recommendation = city.recommendation || {};
     metaGrid.append(
       metricListItem("Assigned", city.assignment && city.assignment.strategy_name ? city.assignment.strategy_name : "Unassigned"),
-      metricListItem("Winner", city.best_strategy || "—"),
+      metricListItem("Recommended", recommendation.strategy_name || city.best_strategy || "—"),
       metricListItem("Runner-up", city.runner_up_strategy || "—"),
+      metricListItem("Scored evidence", city.best_outcome_coverage_display || "—"),
       metricListItem("Gap", city.gap_to_runner_up_display || "—"),
-      metricListItem("Evidence", city.evidence_label || "—"),
+      metricListItem("Status", recommendation.label || city.evidence_label || "—"),
     );
     children.push(metaGrid);
+    const standaloneApprovalMessage = approvalMessageNode(city.series_ticker);
+    if (standaloneApprovalMessage && !(detail.approval && detail.approval.eligible)) {
+      children.push(standaloneApprovalMessage);
+    }
 
-    const rationale = detail.promotion_rationale || {};
+    const rationale = detail.recommendation_rationale || detail.promotion_rationale || {};
     const rationaleCard = el("section", "strategy-detail-section");
-    rationaleCard.append(el("h4", null, "Promotion Rationale"));
+    rationaleCard.append(el("h4", null, "Recommendation Rationale"));
     const rationaleGrid = el("div", "strategy-detail-metrics");
     rationaleGrid.append(
+      metricListItem("Recommendation", rationale.recommendation_label || "—"),
       metricListItem("Best trade count", rationale.best_trade_count_display || "0"),
+      metricListItem("Resolved trades", rationale.best_resolved_trade_count_display || "0"),
+      metricListItem("Unscored trades", rationale.best_unscored_trade_count_display || "0"),
+      metricListItem("Outcome coverage", rationale.best_outcome_coverage_display || "—"),
       metricListItem("Gap to runner-up", rationale.gap_to_runner_up_display || "—"),
       metricListItem("Gap to assignment", rationale.gap_to_current_assignment_display || "—"),
-      metricListItem("Trade rule", rationale.meets_trade_threshold ? "Pass" : "Below threshold", rationale.meets_trade_threshold ? "value-positive" : "value-negative"),
-      metricListItem("Gap rule", rationale.meets_gap_threshold ? "Pass" : "Below threshold", rationale.meets_gap_threshold ? "value-positive" : "value-negative"),
-      metricListItem("Auto-promote", rationale.clears_promotion_rule ? "Yes" : "Not yet", rationale.clears_promotion_rule ? "value-positive" : "value-neutral"),
+      metricListItem("Winner Wilson", rationale.winner_wilson_display || "—"),
+      metricListItem("Runner-up Wilson", rationale.runner_up_wilson_display || "—"),
+      metricListItem("Resolved rule", rationale.meets_trade_threshold ? "Pass" : "Below threshold", rationale.meets_trade_threshold ? "value-positive" : "value-negative"),
+      metricListItem("Coverage rule", rationale.meets_coverage_threshold ? "Pass" : "Below threshold", rationale.meets_coverage_threshold ? "value-positive" : "value-negative"),
+      metricListItem("Strong gap", rationale.meets_gap_threshold ? "Pass" : "Below threshold", rationale.meets_gap_threshold ? "value-positive" : "value-negative"),
+      metricListItem("Lean gap", rationale.meets_lean_gap_threshold ? "Pass" : "Below threshold", rationale.meets_lean_gap_threshold ? "value-positive" : "value-neutral"),
+      metricListItem("Writes assignment", rationale.writes_assignment ? "Yes" : "No", rationale.writes_assignment ? "value-positive" : "value-neutral"),
     );
     rationaleCard.appendChild(rationaleGrid);
     children.push(rationaleCard);
+
+    const approvalCard = renderApprovalCard(detail);
+    if (approvalCard) children.push(approvalCard);
 
     const rankingSection = el("section", "strategy-detail-section");
     rankingSection.append(el("h4", null, "Strategy Ranking"));
@@ -779,7 +1055,7 @@
     const rankingTable = el("table", "positions-table strategy-detail-table");
     const rankingHead = el("thead");
     const rankingHeadRow = el("tr");
-    ["Strategy", "Win Rate", "Trade Rate", "Trades", "P/L", "Edge", "Status"].forEach((label) => rankingHeadRow.append(el("th", null, label)));
+    ["Strategy", "Win Rate", "Wilson", "Trade Rate", "Trades", "Scored", "Coverage", "P/L", "Edge", "Status"].forEach((label) => rankingHeadRow.append(el("th", null, label)));
     rankingHead.appendChild(rankingHeadRow);
     rankingTable.appendChild(rankingHead);
     const rankingBody = el("tbody");
@@ -788,8 +1064,11 @@
       tr.append(
         el("td", "mono", item.strategy_name),
         el("td", `mono ${item.is_best ? "value-positive" : ""}`.trim(), item.win_rate_display || "—"),
+        el("td", "mono", item.win_rate_interval_display || "—"),
         el("td", "mono", item.trade_rate_display || "—"),
         el("td", "mono", String(item.trade_count || 0)),
+        el("td", "mono", item.resolved_trade_count_display || "0"),
+        el("td", "mono", item.outcome_coverage_display || "—"),
         el("td", `mono ${item.total_pnl_dollars > 0 ? "value-positive" : item.total_pnl_dollars < 0 ? "value-negative" : ""}`.trim(), item.total_pnl_display || "—"),
         el("td", "mono", item.avg_edge_bps_display || "—"),
         el("td", null, ""),
@@ -829,7 +1108,7 @@
     children.push(trendSection);
 
     const eventSection = el("section", "strategy-detail-section");
-    eventSection.append(el("h4", null, "Recent Strategy Events"));
+    eventSection.append(el("h4", null, "Recent Strategy Changes"));
     const eventContainer = el("div");
     renderEventList(eventContainer, detail.recent_events || [], "No recent city-specific strategy events.");
     eventSection.appendChild(eventContainer);
@@ -850,7 +1129,7 @@
       const row = el("div", "strategy-city-row");
       const text = el("div", "strategy-city-row-text");
       text.append(el("strong", "mono", item.series_ticker), el("span", "muted-label", item.city_label));
-      const metrics = el("span", "mono", `${item.win_rate_display} · ${item.trade_count_display} trades · ${item.total_pnl_display}`);
+      const metrics = el("span", "mono", `${item.win_rate_display} · ${item.resolved_trade_count_display || "0"} scored · ${item.total_pnl_display}`);
       row.append(text, metrics);
       list.appendChild(row);
     });
@@ -875,8 +1154,10 @@
     metricGrid.append(
       metricListItem("Win rate", strategy.overall_win_rate_display || "—", strategy.overall_win_rate >= 0.6 ? "value-positive" : strategy.overall_win_rate <= 0.35 ? "value-negative" : ""),
       metricListItem("Trade rate", strategy.overall_trade_rate_display || "—"),
+      metricListItem("Outcome coverage", strategy.outcome_coverage_display || "—"),
       metricListItem("Total P/L", strategy.total_pnl_display || "—", strategy.total_pnl_dollars > 0 ? "value-positive" : strategy.total_pnl_dollars < 0 ? "value-negative" : ""),
       metricListItem("Avg edge", strategy.avg_edge_bps_display || "—"),
+      metricListItem("Scored trades", strategy.total_resolved_trade_count_display || "0"),
       metricListItem("Cities led", String(strategy.cities_led || 0)),
       metricListItem("Assigned cities", String(strategy.assigned_city_count || 0)),
     );
@@ -910,7 +1191,7 @@
       const distTable = el("table", "positions-table strategy-detail-table");
       const distHead = el("thead");
       const distHeadRow = el("tr");
-      ["City", "Win Rate", "Trade Rate", "Trades", "P/L", "Flags"].forEach((label) => distHeadRow.append(el("th", null, label)));
+      ["City", "Win Rate", "Trade Rate", "Trades", "Scored", "Coverage", "P/L", "Flags"].forEach((label) => distHeadRow.append(el("th", null, label)));
       distHead.appendChild(distHeadRow);
       distTable.appendChild(distHead);
       const distBody = el("tbody");
@@ -921,6 +1202,8 @@
           el("td", "mono", item.win_rate_display || "—"),
           el("td", "mono", item.trade_rate_display || "—"),
           el("td", "mono", item.trade_count_display || "0"),
+          el("td", "mono", item.resolved_trade_count_display || "0"),
+          el("td", "mono", item.outcome_coverage_display || "—"),
           el("td", `mono ${item.total_pnl_dollars > 0 ? "value-positive" : item.total_pnl_dollars < 0 ? "value-negative" : ""}`.trim(), item.total_pnl_display || "—"),
           el("td", null, ""),
         );
@@ -965,7 +1248,7 @@
 
   function renderRecentStrategyChanges(recentPromotions) {
     const container = document.getElementById("strategies-recent");
-    renderEventList(container, recentPromotions || [], "No recent promotions or threshold tuning events.");
+    renderEventList(container, recentPromotions || [], "No recent approvals, promotions, or threshold tuning events.");
   }
 
   function renderMethodology(methodology) {
@@ -984,7 +1267,7 @@
     const note = el(
       "p",
       "muted-label",
-      `Promotion rule: at least ${methodology && methodology.promotion_trade_threshold != null ? methodology.promotion_trade_threshold : "?"} simulated trades and roughly ${(methodology && methodology.promotion_gap_threshold != null ? methodology.promotion_gap_threshold * 100 : "?")}% win-rate separation.`,
+      `Recommendation tiers: at least ${methodology && methodology.recommendation_trade_threshold != null ? methodology.recommendation_trade_threshold : "?"} resolved trades, ${(methodology && methodology.recommendation_outcome_coverage_threshold != null ? methodology.recommendation_outcome_coverage_threshold * 100 : "?")}% outcome coverage, and ${(methodology && methodology.recommendation_lean_gap_threshold != null ? methodology.recommendation_lean_gap_threshold * 100 : "?")}%–${(methodology && methodology.recommendation_strong_gap_threshold != null ? methodology.recommendation_strong_gap_threshold * 100 : "?")}% win-rate separation. Auto-assignment stays paused, but the latest 180d winner can be manually approved with a required note.`,
     );
     children.push(note);
     clearNode(container, children);
@@ -1009,6 +1292,9 @@
 
   async function loadStrategies(options) {
     if (strategyState.fetching) return;
+    if (!options || !options.preserveApprovalMessage) {
+      setApprovalMessage(null, null, null);
+    }
     const next = {
       windowDays: options && options.windowDays ? options.windowDays : strategyState.windowDays,
       seriesTicker: options && Object.prototype.hasOwnProperty.call(options, "seriesTicker") ? options.seriesTicker : strategyState.selectedSeriesTicker,
