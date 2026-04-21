@@ -605,7 +605,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | Low-temp and precipitation markets | Medium | Probability model supports it; needs station mappings |
 | Live P&L streaming in control room | Low | Current UI shows snapshots; no SSE P&L stream |
 | End-to-end backtest with fees/slippage | Medium | Historical intelligence replays but doesn't simulate fill costs |
-| Per-city strategy differentiation | In progress | `CityStrategyAssignmentRecord` schema exists; logistic regression assignment pending |
+| Per-city strategy differentiation | Deferred | Ship with global pack; self-improvement pipeline promotes city-specific heuristics autonomously post-launch |
 | Production go-live | Pending | Run demo for ≥ 2 weeks with positive paper results before switching `KALSHI_ENV=production` |
 
 ### Go-live checklist
