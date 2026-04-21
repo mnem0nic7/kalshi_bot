@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_safe_capital_reserve_ratio: float = 0.0
     risk_risky_capital_max_ratio: float = 0.0
-    risk_stale_market_seconds: int = 30
+    risk_stale_market_seconds: int = 60
     risk_stale_weather_seconds: int = 900
     risk_min_edge_bps: int = 100
     risk_max_credible_edge_bps: int = 5000
