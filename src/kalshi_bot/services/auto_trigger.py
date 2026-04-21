@@ -81,28 +81,48 @@ class AutoTriggerService:
 
             reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{market_ticker}")
             if reentry_cp is not None:
-                # Momentum-based re-entry: require sustained directional momentum
-                # for stop_loss_momentum_reentry_window_seconds before allowing back in.
-                prices = await repo.fetch_recent_prices(
-                    market_ticker,
-                    window=timedelta(seconds=self.settings.stop_loss_momentum_reentry_window_seconds),
-                )
-                points = [
-                    (row.observed_at.timestamp(), float(row.mid_dollars))
-                    for row in prices
-                    if row.mid_dollars is not None
-                ]
-                if len(points) < 5:
-                    await session.commit()
-                    return
-                xs = np.array([p[0] for p in points])
-                ys = np.array([p[1] for p in points])
-                xs = xs - xs[0]
-                slope = float(np.polyfit(xs, ys, 1)[0]) * 100 * 60  # $/s → ¢/min
-                if abs(slope) < abs(self.settings.stop_loss_momentum_slope_threshold_cents_per_min):
-                    await session.commit()
-                    return
-                # Momentum is clear — allow re-entry (checkpoint remains; overwritten on next stop-loss)
+                stopped_at_str = reentry_cp.payload.get("stopped_at")
+                try:
+                    stopped_at = datetime.fromisoformat(stopped_at_str) if stopped_at_str else None
+                except (ValueError, TypeError):
+                    stopped_at = None
+
+                now_utc = datetime.now(UTC)
+                elapsed = (now_utc - stopped_at).total_seconds() if stopped_at is not None else float("inf")
+
+                if elapsed >= self.settings.stop_loss_reentry_cooldown_seconds:
+                    # 4h elapsed — cooldown lifted, allow re-entry unconditionally.
+                    pass
+                elif not reentry_cp.payload.get("reverse_evaluated"):
+                    # First trigger after stop-loss: allow one room to evaluate the opposite
+                    # side. The signal engine will trade whichever side now has edge.
+                    await repo.set_checkpoint(
+                        f"stop_loss_reentry:{market_ticker}",
+                        cursor=None,
+                        payload={**reentry_cp.payload, "reverse_evaluated": True},
+                    )
+                else:
+                    # Within cooldown window: require sustained momentum confirmation.
+                    prices = await repo.fetch_recent_prices(
+                        market_ticker,
+                        window=timedelta(seconds=self.settings.stop_loss_momentum_reentry_window_seconds),
+                    )
+                    points = [
+                        (row.observed_at.timestamp(), float(row.mid_dollars))
+                        for row in prices
+                        if row.mid_dollars is not None
+                    ]
+                    if len(points) < 5:
+                        await session.commit()
+                        return
+                    xs = np.array([p[0] for p in points])
+                    ys = np.array([p[1] for p in points])
+                    xs = xs - xs[0]
+                    slope = float(np.polyfit(xs, ys, 1)[0]) * 100 * 60  # $/s → ¢/min
+                    if abs(slope) < abs(self.settings.stop_loss_momentum_slope_threshold_cents_per_min):
+                        await session.commit()
+                        return
+                    # Momentum confirmed — allow re-entry.
 
             checkpoint = await repo.get_checkpoint(f"auto_trigger:{market_ticker}")
             if checkpoint is not None:

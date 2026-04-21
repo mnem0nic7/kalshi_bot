@@ -10,6 +10,15 @@ from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
 
+_GOOD_SNAPSHOT = {
+    "market_ticker": "WX-TEST",
+    "market": {
+        "yes_bid_dollars": "0.4400",
+        "yes_ask_dollars": "0.4800",
+        "no_ask_dollars": "0.5600",
+    },
+}
+
 
 class FakeSupervisor:
     def __init__(self) -> None:
@@ -52,7 +61,7 @@ async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> 
         await repo.ensure_deployment_control("blue")
         await repo.upsert_market_state(
             "WX-TEST",
-            snapshot={"market_ticker": "WX-TEST"},
+            snapshot=_GOOD_SNAPSHOT,
             yes_bid_dollars="0.4400",  # type: ignore[arg-type]
             yes_ask_dollars="0.4800",  # type: ignore[arg-type]
             last_trade_dollars=None,
@@ -110,7 +119,7 @@ async def test_auto_trigger_skips_when_color_is_inactive(tmp_path) -> None:
         control.active_color = "green"
         await repo.upsert_market_state(
             "WX-TEST",
-            snapshot={"market_ticker": "WX-TEST"},
+            snapshot=_GOOD_SNAPSHOT,
             yes_bid_dollars="0.4400",  # type: ignore[arg-type]
             yes_ask_dollars="0.4800",  # type: ignore[arg-type]
             last_trade_dollars=None,

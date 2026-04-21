@@ -255,8 +255,10 @@ class StopLossService:
             cursor=None,
             payload={
                 "stopped_at": now.isoformat(),
+                "stopped_side": position.side,
                 "loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
                 "trigger": trigger,
+                "reverse_evaluated": False,
             },
         )
 

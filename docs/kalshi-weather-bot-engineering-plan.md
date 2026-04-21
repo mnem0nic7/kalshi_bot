@@ -145,7 +145,13 @@ Three exit triggers checked every 60 seconds:
 | Adverse momentum | Held ≥ 30 min AND slope ≤ −0.2 ¢/min | 5-min momentum check required |
 | Profit protection | Unrealized gain ≥ 15% AND slope ≤ −0.2 ¢/min | 5-min momentum check required |
 
-**Re-entry gate**: After any stop-loss exit, a `stop_loss_reentry` checkpoint is set. Auto-trigger will not open a new room for that ticker until a 5-minute price history shows sustained directional momentum (|slope| ≥ 0.2 ¢/min in the favorable direction). The checkpoint is overwritten on the next stop-loss exit, not deleted.
+**Re-entry gate**: After any stop-loss exit, a `stop_loss_reentry` checkpoint is set. Re-entry rules (in priority order):
+
+1. **Reverse-side evaluation (immediate)**: One room is triggered immediately after a stop-loss to evaluate the opposite side. If the price move that caused the stop-loss has created a favorable edge on the other side (e.g., a YES stop-loss followed by falling prices → NO edge), this room trades it. Marked `reverse_evaluated: true` after firing.
+2. **4-hour timeout**: After `stop_loss_reentry_cooldown_seconds` (4h) from the stop-loss timestamp, re-entry is allowed unconditionally.
+3. **Momentum confirmation**: Within the 4h window (after reverse evaluation), re-entry requires a 5-minute price history with |slope| ≥ 0.2 ¢/min.
+
+Each daily weather contract has a unique ticker (e.g., `KXHIGHTBOS-26APR21-T55`), so yesterday's stop-loss checkpoint never affects today's contract — daily reset is implicit in the ticker structure. The checkpoint is overwritten on the next stop-loss exit on the same ticker.
 
 **Submit cooldown**: 300 seconds between stop-loss order submissions on the same ticker, to prevent thrashing.
 
