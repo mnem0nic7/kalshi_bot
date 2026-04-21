@@ -344,7 +344,7 @@ Runs the full 8-role suite using Gemini 2.5 models. LLM output informs the SUPER
 
 ### 6.7 Auto-Trigger (`services/auto_trigger.py`)
 
-Disabled by default (`trigger_enable_auto_rooms = False`). When enabled:
+Enabled in all running environments (`TRIGGER_ENABLE_AUTO_ROOMS=true`). This is a fully autonomous system — no manual room triggers. All rooms originate from the auto-trigger on live orderbook events. When triggered:
 
 1. Receives market ticker updates from the WebSocket stream.
 2. Skips tickers not in the weather directory.
@@ -600,13 +600,16 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 
 ### Go-live checklist
 
-- [ ] Demo paper trading shows positive edge over ≥ 2 weeks / ≥ 20 resolved trades
-- [ ] Zero unreconciled positions or order mismatches during paper period
+- [ ] ≥ 2 weeks of continuous autonomous demo trading (no manual interventions)
+- [ ] ≥ 20 resolved trades in demo with positive P&L overall
+- [ ] Historical intelligence calibration check: model calibration error < 500 bps across all active cities (computable from `historical_intelligence_run_records` — validates that `fair_yes_dollars` estimates are not materially biased, not just lucky)
+- [ ] Zero unreconciled positions or order mismatches during demo period
+- [ ] No stop-loss exits due to model error (only market-move exits acceptable)
 - [ ] Kill switch and shadow mode tested end-to-end in demo
 - [ ] Production RSA key loaded and verified
 - [ ] `APP_SHADOW_MODE=false` and `APP_ENABLE_KILL_SWITCH=false` confirmed in production env
 - [ ] `KALSHI_ENV=production` set
-- [ ] Daily review ritual established for first 2 weeks
+- [ ] Daily review ritual established for first 2 weeks post-launch
 
 ---
 
