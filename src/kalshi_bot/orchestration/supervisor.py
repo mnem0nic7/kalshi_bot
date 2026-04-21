@@ -246,6 +246,36 @@ class WorkflowSupervisor:
                     self.research_coordinator.ensure_fresh_dossier(room.market_ticker, reason="room_start"),
                 )
                 market = market_response.get("market", market_response)
+                close_time_raw = market.get("close_time")
+                if close_time_raw is not None:
+                    try:
+                        close_time = datetime.fromisoformat(str(close_time_raw).replace("Z", "+00:00"))
+                        if close_time.tzinfo is None:
+                            close_time = close_time.replace(tzinfo=UTC)
+                        if datetime.now(UTC) >= close_time:
+                            await repo.append_message(
+                                room_id,
+                                RoomMessageCreate(
+                                    role=AgentRole.SUPERVISOR,
+                                    kind=MessageKind.OBSERVATION,
+                                    stage=RoomStage.COMPLETE,
+                                    content=(
+                                        f"Market {room.market_ticker} closed at {close_time.isoformat()}. "
+                                        "Skipping room — no new entries after market close."
+                                    ),
+                                    payload={"close_time": close_time.isoformat(), "final_status": "market_closed"},
+                                ),
+                            )
+                            await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+                            await session.commit()
+                            ROOM_RUNS_TOTAL.labels(status="success").inc()
+                            return
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            "Could not parse close_time for %s: %r — proceeding without close guard",
+                            room.market_ticker,
+                            close_time_raw,
+                        )
                 mapping = self.weather_directory.resolve_market(room.market_ticker, market)
                 weather_bundle = (
                     await self.weather.build_market_snapshot(mapping)
@@ -618,6 +648,7 @@ class WorkflowSupervisor:
                             market_observed_at=market_state.observed_at,
                             research_observed_at=dossier.freshness.refreshed_at,
                             current_position_notional_dollars=current_position_notional,
+                            current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
                             portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                         )
                         verdict = self.risk_engine.evaluate(

@@ -271,3 +271,62 @@ def test_risk_engine_safe_trade_is_not_blocked_when_risky_bucket_is_full() -> No
     assert verdict.status == RiskStatus.APPROVED
     assert verdict.capital_bucket == "safe"
     assert verdict.resized_by_bucket is False
+
+
+def test_risk_engine_blocks_when_per_ticker_count_cap_reached() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=500,
+        risk_max_position_count_fp_per_ticker=200,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            current_position_count_fp=Decimal("200.00"),
+        ),
+    )
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("200" in r for r in verdict.reasons)
+
+
+def test_risk_engine_allows_when_under_per_ticker_count_cap() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=500,
+        risk_max_position_count_fp_per_ticker=200,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            current_position_count_fp=Decimal("199.00"),
+        ),
+    )
+    assert verdict.status == RiskStatus.APPROVED

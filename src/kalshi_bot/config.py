@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     stop_loss_momentum_slope_threshold_cents_per_min: float = -0.5
     stop_loss_momentum_min_hold_minutes: int = 30
     risk_max_order_count_fp: float = 500.0
+    risk_max_position_count_fp_per_ticker: float = 200.0
     risk_safe_capital_reserve_ratio: float = 0.70
     risk_risky_capital_max_ratio: float = 0.30
     risk_stale_market_seconds: int = 30

@@ -20,6 +20,7 @@ class RiskContext:
     research_observed_at: datetime | None
     decision_time: datetime | None = None
     current_position_notional_dollars: Decimal = Decimal("0")
+    current_position_count_fp: Decimal = Decimal("0")
     portfolio_bucket_snapshot: PortfolioBucketSnapshot | None = None
 
 
@@ -122,6 +123,12 @@ class DeterministicRiskEngine:
 
         if float(ticket.count_fp) > self.settings.risk_max_order_count_fp:
             block("Ticket size exceeds max order count.")
+
+        if float(context.current_position_count_fp) >= self.settings.risk_max_position_count_fp_per_ticker:
+            block(
+                f"Position in {room.market_ticker} already at {context.current_position_count_fp} contracts "
+                f"(max {self.settings.risk_max_position_count_fp_per_ticker:.0f})."
+            )
 
         if float(order_notional) > active_thresholds.risk_max_order_notional_dollars:
             block("Ticket notional exceeds max order notional.")
