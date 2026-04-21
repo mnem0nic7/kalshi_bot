@@ -111,11 +111,13 @@ class MarketStreamService:
     ) -> int:
         processed = 0
         pending_tasks: set[asyncio.Task] = set()
+        backoff = 2.0
         while True:
             try:
                 self._reset_connection_state()
                 await self.websocket_client.connect()
                 await self._subscribe(market_tickers, include_private=include_private)
+                backoff = 2.0  # reset after successful connect + first message
                 async for message in self.websocket_client.iter_messages():
                     async with self.session_factory() as session:
                         repo = PlatformRepository(session)
@@ -148,7 +150,8 @@ class MarketStreamService:
                 await self.websocket_client.close()
                 if max_messages is not None:
                     raise
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
 
     async def _subscribe(self, market_tickers: list[str], *, include_private: bool) -> None:
         await self.websocket_client.subscribe(["market_lifecycle_v2"])
