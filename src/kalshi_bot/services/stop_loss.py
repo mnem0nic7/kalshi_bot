@@ -48,6 +48,11 @@ def _loss_ratio(position: PositionRecord, mid: Decimal) -> float | None:
     return float((cost_basis - mark_value) / cost_basis)
 
 
+def _profit_ratio(position: PositionRecord, mid: Decimal) -> float | None:
+    ratio = _loss_ratio(position, mid)
+    return -ratio if ratio is not None else None
+
+
 def _momentum_slope(prices: list[MarketPriceHistory]) -> float | None:
     """Return YES midpoint slope in ¢/min via linear regression, or None if < 5 valid points."""
     points = [
@@ -165,7 +170,9 @@ class StopLossService:
             if sell_px is None or sell_px <= 0:
                 return None
 
-            result = await self._submit(repo, position, sell_px, mid, ratio, now, trigger="momentum", slope=slope)
+            profit = _profit_ratio(position, mid)
+            trigger = "profit_protection" if (profit is not None and profit >= self.settings.stop_loss_profit_protection_threshold_pct) else "momentum"
+            result = await self._submit(repo, position, sell_px, mid, ratio, now, trigger=trigger, slope=slope)
             await session.commit()
             return result
 
@@ -250,9 +257,6 @@ class StopLossService:
                 "stopped_at": now.isoformat(),
                 "loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
                 "trigger": trigger,
-                "reentry_blocked_until": (
-                    now + timedelta(seconds=self.settings.stop_loss_reentry_cooldown_seconds)
-                ).isoformat(),
             },
         )
 

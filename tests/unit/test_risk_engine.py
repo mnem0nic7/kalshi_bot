@@ -149,7 +149,7 @@ def test_risk_engine_blocks_stale_data() -> None:
     assert any("stale" in reason.lower() for reason in verdict.reasons)
 
 
-def test_risk_engine_resizes_risky_trade_to_bucket_remaining() -> None:
+def test_risk_engine_blocks_near_threshold_regime() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         risk_min_edge_bps=50,
@@ -185,10 +185,8 @@ def test_risk_engine_resizes_risky_trade_to_bucket_remaining() -> None:
         ),
     )
 
-    assert verdict.status == RiskStatus.APPROVED
-    assert verdict.resized_by_bucket is True
-    assert verdict.approved_count_fp == Decimal("4.00")
-    assert verdict.approved_notional_dollars == Decimal("2.0000")
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("near_threshold" in reason for reason in verdict.reasons)
 
 
 def test_risk_engine_blocks_risky_trade_when_bucket_has_no_room() -> None:

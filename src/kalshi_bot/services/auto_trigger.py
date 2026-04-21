@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
+import numpy as np
+
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
@@ -79,12 +81,28 @@ class AutoTriggerService:
 
             reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{market_ticker}")
             if reentry_cp is not None:
-                stopped_at = reentry_cp.payload.get("stopped_at")
-                if stopped_at is not None:
-                    stopped_dt = datetime.fromisoformat(stopped_at)
-                    if datetime.now(UTC) - stopped_dt < timedelta(seconds=self.settings.stop_loss_reentry_cooldown_seconds):
-                        await session.commit()
-                        return
+                # Momentum-based re-entry: require sustained directional momentum
+                # for stop_loss_momentum_reentry_window_seconds before allowing back in.
+                prices = await repo.fetch_recent_prices(
+                    market_ticker,
+                    window=timedelta(seconds=self.settings.stop_loss_momentum_reentry_window_seconds),
+                )
+                points = [
+                    (row.observed_at.timestamp(), float(row.mid_dollars))
+                    for row in prices
+                    if row.mid_dollars is not None
+                ]
+                if len(points) < 5:
+                    await session.commit()
+                    return
+                xs = np.array([p[0] for p in points])
+                ys = np.array([p[1] for p in points])
+                xs = xs - xs[0]
+                slope = float(np.polyfit(xs, ys, 1)[0]) * 100 * 60  # $/s → ¢/min
+                if abs(slope) < abs(self.settings.stop_loss_momentum_slope_threshold_cents_per_min):
+                    await session.commit()
+                    return
+                # Momentum is clear — allow re-entry (checkpoint remains; overwritten on next stop-loss)
 
             checkpoint = await repo.get_checkpoint(f"auto_trigger:{market_ticker}")
             if checkpoint is not None:

@@ -279,12 +279,15 @@ class WorkflowSupervisor:
                     safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
                     risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
                 )
+                all_positions = await repo.list_positions(limit=500, kalshi_env=room.kalshi_env, subaccount=self.settings.kalshi_subaccount)
+                open_ticker_count = len({p.market_ticker for p in all_positions})
                 risk_context = RiskContext(
                     market_observed_at=None,
                     research_observed_at=None,
                     current_position_notional_dollars=current_position_notional,
                     current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
                     portfolio_bucket_snapshot=portfolio_bucket_snapshot,
+                    open_ticker_count=open_ticker_count,
                 )
                 verdict = self.risk_engine.evaluate(
                     room=room,
@@ -842,12 +845,15 @@ class WorkflowSupervisor:
                             safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
                             risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
                         )
+                        all_positions = await repo.list_positions(limit=500, kalshi_env=room.kalshi_env, subaccount=self.settings.kalshi_subaccount)
+                        open_ticker_count = len({p.market_ticker for p in all_positions})
                         risk_context = RiskContext(
                             market_observed_at=market_state.observed_at,
                             research_observed_at=dossier.freshness.refreshed_at,
                             current_position_notional_dollars=current_position_notional,
                             current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
                             portfolio_bucket_snapshot=portfolio_bucket_snapshot,
+                            open_ticker_count=open_ticker_count,
                         )
                         verdict = self.risk_engine.evaluate(
                             room=room,

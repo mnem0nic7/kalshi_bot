@@ -22,6 +22,7 @@ class RiskContext:
     current_position_notional_dollars: Decimal = Decimal("0")
     current_position_count_fp: Decimal = Decimal("0")
     portfolio_bucket_snapshot: PortfolioBucketSnapshot | None = None
+    open_ticker_count: int = 0
 
 
 def _quantize_money(value: Any) -> Decimal:
@@ -128,6 +129,18 @@ class DeterministicRiskEngine:
             block(
                 f"Position in {room.market_ticker} already at {context.current_position_count_fp} contracts "
                 f"(max {self.settings.risk_max_position_count_fp_per_ticker:.0f})."
+            )
+
+        if context.open_ticker_count >= self.settings.risk_max_concurrent_tickers:
+            block(
+                f"Portfolio already has {context.open_ticker_count} open tickers "
+                f"(max {self.settings.risk_max_concurrent_tickers})."
+            )
+
+        non_standard_regime = signal.trade_regime in ("near_threshold", "longshot_yes", "longshot_no")
+        if non_standard_regime:
+            block(
+                f"Trade regime '{signal.trade_regime}' is not permitted; only standard-regime trades are allowed."
             )
 
         if float(order_notional) > active_thresholds.risk_max_order_notional_dollars:

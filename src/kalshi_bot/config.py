@@ -84,24 +84,27 @@ class Settings(BaseSettings):
     llm_trading_enabled: bool = False
 
     trigger_broken_book_retry_seconds: int = 30
-    risk_order_pct: float = 0.10
+    risk_order_pct: float = 0.05
     risk_position_pct: float = 0.10
     risk_max_order_notional_dollars: float = 50.0
-    risk_max_position_notional_dollars: float = 250.0
-    risk_daily_loss_limit_dollars: float = 100.0
-    stop_loss_threshold_pct: float = 0.50
+    risk_max_position_notional_dollars: float = 100.0
+    risk_daily_loss_limit_dollars: float = 50.0
+    risk_max_concurrent_tickers: int = 10
+    stop_loss_threshold_pct: float = 0.25
+    stop_loss_profit_protection_threshold_pct: float = 0.15
     stop_loss_reentry_cooldown_seconds: int = 14400
+    stop_loss_momentum_reentry_window_seconds: int = 300
     stop_loss_submit_cooldown_seconds: int = 300
     stop_loss_check_interval_seconds: int = 60
-    stop_loss_momentum_slope_threshold_cents_per_min: float = -0.5
+    stop_loss_momentum_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_min_hold_minutes: int = 30
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
-    risk_safe_capital_reserve_ratio: float = 0.70
-    risk_risky_capital_max_ratio: float = 0.30
+    risk_safe_capital_reserve_ratio: float = 0.0
+    risk_risky_capital_max_ratio: float = 0.0
     risk_stale_market_seconds: int = 30
     risk_stale_weather_seconds: int = 900
-    risk_min_edge_bps: int = 50
+    risk_min_edge_bps: int = 100
     strategy_min_remaining_payout_bps: int = 300
     strategy_quality_edge_buffer_bps: int = 25
 
