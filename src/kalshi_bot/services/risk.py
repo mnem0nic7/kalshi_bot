@@ -126,6 +126,17 @@ class DeterministicRiskEngine:
                 f"Signal confidence {signal.confidence:.2f} is below minimum "
                 f"{self.settings.risk_min_confidence:.2f}."
             )
+        min_price = Decimal(str(self.settings.risk_min_contract_price_dollars))
+        contract_price = (
+            ticket.yes_price_dollars
+            if ticket.side.value == "yes"
+            else Decimal("1.0000") - ticket.yes_price_dollars
+        )
+        if contract_price < min_price:
+            block(
+                f"Contract price {contract_price} is below minimum {min_price}; "
+                f"market has priced this as nearly impossible."
+            )
 
         if market_observed_at is None or (now - market_observed_at).total_seconds() > self.settings.risk_stale_market_seconds:
             block("Kalshi market data is stale.")

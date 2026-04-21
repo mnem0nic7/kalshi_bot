@@ -110,6 +110,7 @@ class Settings(BaseSettings):
     risk_min_edge_bps: int = 100
     risk_max_credible_edge_bps: int = 5000
     risk_min_confidence: float = 0.60
+    risk_min_contract_price_dollars: float = 0.05
     strategy_min_remaining_payout_bps: int = 300
     strategy_quality_edge_buffer_bps: int = 25
 
