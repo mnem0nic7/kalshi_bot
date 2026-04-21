@@ -46,7 +46,7 @@ wait_for_service_health() {
 docker compose -f "${compose_file}" ${compose_env_file} stop "app_${color}" "daemon_${color}" 2>/dev/null || true
 docker compose -f "${compose_file}" ${compose_env_file} rm -f "app_${color}" "daemon_${color}" 2>/dev/null || true
 
-docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps "app_${color}" "daemon_${color}"
+docker compose -f "${compose_file}" ${compose_env_file} up -d --build --no-deps "app_${color}" "daemon_${color}"
 wait_for_service_health "app_${color}" 180
 
 # Stop and remove nginx explicitly before recreating to avoid removal-in-progress errors
