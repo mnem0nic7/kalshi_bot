@@ -19,10 +19,11 @@ logger = logging.getLogger(__name__)
 
 def _midpoint(market_state: MarketState, side: str) -> Decimal | None:
     yes_bid = market_state.yes_bid_dollars
-    yes_ask = market_state.yes_ask_dollars
-    if yes_bid is None or yes_ask is None:
+    if yes_bid is None:
         return None
-    mid_yes = (yes_bid + yes_ask) / Decimal("2")
+    yes_ask = market_state.yes_ask_dollars
+    # When ask side is dry, use bid as the conservative mark rather than skipping entirely.
+    mid_yes = (yes_bid + yes_ask) / Decimal("2") if yes_ask is not None else yes_bid
     if side == "yes":
         return mid_yes
     return Decimal("1") - mid_yes
@@ -121,11 +122,17 @@ class StopLossService:
             submit_key = f"stop_loss_submit:{position.market_ticker}"
             submit_cp = await repo.get_checkpoint(submit_key)
             if submit_cp is not None:
-                last = submit_cp.payload.get("submitted_at")
-                if last is not None:
-                    last_dt = datetime.fromisoformat(last)
-                    if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
+                # On order failure the checkpoint stores next_retry_at (absolute); prefer that.
+                next_retry = submit_cp.payload.get("next_retry_at")
+                if next_retry is not None:
+                    if now < datetime.fromisoformat(next_retry):
                         return None
+                else:
+                    last = submit_cp.payload.get("submitted_at")
+                    if last is not None:
+                        last_dt = datetime.fromisoformat(last)
+                        if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
+                            return None
 
             # Trigger 1: loss-ratio threshold
             ratio = _loss_ratio(position, mid)
@@ -193,6 +200,7 @@ class StopLossService:
         if slope is not None:
             event_payload["momentum_slope_cents_per_min"] = round(slope, 4)
 
+        submit_failed = False
         if not shadow:
             try:
                 order_resp = await self.kalshi.create_order({
@@ -208,6 +216,7 @@ class StopLossService:
             except Exception as exc:
                 logger.warning("stop_loss order submit failed for %s: %s", market_ticker, exc)
                 event_payload["submit_error"] = str(exc)
+                submit_failed = True
 
         await repo.log_ops_event(
             severity="warning",
@@ -221,10 +230,18 @@ class StopLossService:
             payload=event_payload,
         )
 
+        submit_payload: dict[str, Any] = {
+            "submitted_at": now.isoformat(),
+            "loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+            "trigger": trigger,
+        }
+        if submit_failed:
+            # Back off 30 min on order failure to avoid spamming an illiquid book.
+            submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
         await repo.set_checkpoint(
             f"stop_loss_submit:{market_ticker}",
             cursor=None,
-            payload={"submitted_at": now.isoformat(), "loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None, "trigger": trigger},
+            payload=submit_payload,
         )
         await repo.set_checkpoint(
             f"stop_loss_reentry:{market_ticker}",

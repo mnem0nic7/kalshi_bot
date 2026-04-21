@@ -45,9 +45,16 @@ def test_midpoint_none_when_bid_missing():
     assert _midpoint(ms, "yes") is None
 
 
-def test_midpoint_none_when_ask_missing():
-    ms = _ms("0.50", None)
-    assert _midpoint(ms, "yes") is None
+def test_midpoint_falls_back_to_bid_when_ask_missing_yes():
+    # When ask side is dry, use bid as the conservative mark.
+    ms = _ms("0.03", None)
+    assert _midpoint(ms, "yes") == Decimal("0.03")
+
+
+def test_midpoint_falls_back_to_bid_when_ask_missing_no():
+    ms = _ms("0.03", None)
+    # mid_no = 1 - yes_bid = 0.97
+    assert _midpoint(ms, "no") == Decimal("0.97")
 
 
 # ── sell price ───────────────────────────────────────────────────────────────
