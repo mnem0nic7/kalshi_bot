@@ -14,7 +14,6 @@ from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.models import MarketState
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
-from kalshi_bot.services.signal import market_quotes
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -224,11 +223,11 @@ class AutoTriggerService:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
     def _book_is_broken(self, market_state: MarketState) -> bool:
-        quotes = market_quotes(market_state.snapshot)
-        yes_ask = quotes.get("yes_ask")
-        no_ask = quotes.get("no_ask")
-        if yes_ask is None or no_ask is None:
+        yes_ask = market_state.yes_ask_dollars
+        yes_bid = market_state.yes_bid_dollars
+        if yes_ask is None or yes_bid is None:
             return True
+        no_ask = Decimal("1") - yes_bid
         return (
             (yes_ask >= Decimal("0.9900") and no_ask >= Decimal("0.9400"))
             or (no_ask >= Decimal("0.9900") and yes_ask >= Decimal("0.9400"))
