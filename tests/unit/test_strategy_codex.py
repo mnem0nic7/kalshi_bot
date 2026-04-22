@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +12,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import StrategyCodexRunRequest, StrategyThresholdPreset
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
-from kalshi_bot.services.strategy_codex import StrategyCodexService
+from kalshi_bot.services.strategy_codex import StrategyCodexService, _json_safe
 from kalshi_bot.services.strategy_regression import (
     STRATEGY_PRESETS,
     RegressionStrategySpec,
@@ -142,6 +144,24 @@ def test_strategy_codex_service_reports_unavailable_without_strategy_providers()
 
     assert service.is_available() is False
     assert service._provider_options() == []
+
+
+def test_strategy_codex_json_safe_normalizes_decimal_payloads() -> None:
+    payload = {
+        "kind": "suggest",
+        "backtest": {
+            "candidate_metrics": {"total_pnl_dollars": Decimal("2.5000")},
+            "candidate_result_rows": [{"total_pnl_dollars": Decimal("1.2500")}],
+            "strongest_cities": [{"total_pnl_dollars": Decimal("0.7500")}],
+        },
+    }
+
+    encoded = _json_safe(payload)
+    decoded = json.loads(json.dumps(encoded))
+
+    assert decoded["backtest"]["candidate_metrics"]["total_pnl_dollars"] == 2.5
+    assert decoded["backtest"]["candidate_result_rows"][0]["total_pnl_dollars"] == 1.25
+    assert decoded["backtest"]["strongest_cities"][0]["total_pnl_dollars"] == 0.75
 
 
 @pytest.mark.asyncio

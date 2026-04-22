@@ -3027,6 +3027,9 @@ class PlatformRepository:
 
     async def save_strategy_results(self, results: list[dict[str, Any]]) -> None:
         for row in results:
+            run_at = row["run_at"]
+            if isinstance(run_at, str):
+                run_at = datetime.fromisoformat(run_at)
             date_from = row["date_from"]
             if isinstance(date_from, str):
                 date_from = date.fromisoformat(date_from)
@@ -3035,7 +3038,7 @@ class PlatformRepository:
                 date_to = date.fromisoformat(date_to)
             record = StrategyResultRecord(
                 strategy_id=row["strategy_id"],
-                run_at=row["run_at"],
+                run_at=run_at,
                 date_from=date_from,
                 date_to=date_to,
                 series_ticker=row["series_ticker"],

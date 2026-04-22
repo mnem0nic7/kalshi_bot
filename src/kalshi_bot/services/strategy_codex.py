@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -79,6 +80,10 @@ def _ordered_unique(values: list[str | None]) -> list[str]:
         seen.add(cleaned)
         ordered.append(cleaned)
     return ordered
+
+
+def _json_safe(value: Any) -> Any:
+    return jsonable_encoder(value)
 
 
 class StrategyCodexService:
@@ -366,7 +371,7 @@ class StrategyCodexService:
                 await session.commit()
                 return
             payload = dict(run.payload or {})
-            payload["result"] = result
+            payload["result"] = _json_safe(result)
             await repo.update_strategy_codex_run(
                 run_id,
                 status="completed",

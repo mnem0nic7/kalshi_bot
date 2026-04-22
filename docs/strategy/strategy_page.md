@@ -195,3 +195,4 @@ Strategy presets are seeded at startup from `STRATEGY_PRESETS` in `src/kalshi_bo
 - Strategy presets are currently defined at seed time; there is no UI for creating a new preset from scratch without going through Evaluation Lab.
 - The 180d window is the only one used for approval eligibility; shorter windows (30d / 90d) are display-only.
 - No alerting when a city drifts from `aligned` to `drifted_assignment` between regression runs.
+- **Strategies page reads demo data only.** The `web_strategies` service connects to `postgres_demo`. Historical replay, regression snapshots, and city assignments all live there. As production accumulates real trade history, regression should eventually run against production data and city assignments should propagate from production results.

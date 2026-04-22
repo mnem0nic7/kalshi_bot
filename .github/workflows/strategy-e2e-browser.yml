@@ -1,0 +1,57 @@
+name: Strategy E2E Browser
+
+"on":
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/strategy-e2e-browser.yml"
+      - "src/kalshi_bot/web/**"
+      - "src/kalshi_bot/services/strategy_*"
+      - "src/kalshi_bot/db/**"
+      - "src/kalshi_bot/weather/**"
+      - "tests/browser/**"
+
+permissions:
+  contents: read
+
+jobs:
+  strategy-e2e-browser:
+    name: Playwright Strategy E2E Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PLAYWRIGHT_ARTIFACTS_DIR: .tmp/playwright-artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Install Chromium
+        run: |
+          set -euo pipefail
+          python -m playwright install --with-deps chromium
+
+      - name: Run strategy browser E2E
+        run: |
+          set -euo pipefail
+          mkdir -p "${PLAYWRIGHT_ARTIFACTS_DIR}"
+          python -m pytest -q tests/browser/test_strategy_e2e.py
+
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-e2e-playwright-artifacts
+          path: .tmp/playwright-artifacts
+          if-no-files-found: ignore
