@@ -617,7 +617,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 |---|---|---|
 | `RISK_ORDER_PCT` | 0.05 | 5% of live balance per order |
 | `RISK_POSITION_PCT` | 0.10 | 10% of live balance per position |
-| `RISK_DAILY_LOSS_PCT` | 0.05 | 5% daily loss limit (self-improve gate) |
+| `RISK_DAILY_LOSS_PCT` | 0.20 | 20% daily loss limit (self-improve gate) |
 | `RISK_MIN_EDGE_BPS` | 500 | Minimum edge required; self-improvement pipeline can tune in range [5, 500] bps |
 | `RISK_MAX_CREDIBLE_EDGE_BPS` | 5000 | Maximum credible edge; larger values indicate model error |
 | `RISK_MIN_CONFIDENCE` | 0.70 | Hard block below this confidence score; 0.70–0.80 gets 50% size, 0.80–0.90 gets 75%, ≥0.90 gets 100% |
