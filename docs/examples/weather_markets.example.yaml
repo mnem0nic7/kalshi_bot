@@ -236,21 +236,17 @@ series_templates:
     latitude: 37.620
     longitude: -122.365
     settlement_source: NWS Climatological Report (Daily) for San Francisco
-    # Marine climate: SFO is far more predictable than the continental April average (σ=6°F).
-    # Empirical σ at KSFO is ~2–3°F year-round due to ocean thermal inertia and marine layer.
+    # Sparse σ anchors — only specify cells with documented climate basis.
+    # JJA: marine layer / "June Gloom" suppresses daily-high variability to ~2°F. Well-documented.
+    # MAM/SON transition months: marine layer still influential, moderate confidence.
+    # DJF: frontal systems dominate; no strong prior — leave to DB-fit or global table.
+    # reviewed_at: 2026-04-22
     sigma_f_by_month:
-      1: 2.5
-      2: 2.5
-      3: 2.5
-      4: 2.5
-      5: 2.5
-      6: 2.0
-      7: 2.0
-      8: 2.0
-      9: 2.5
-      10: 2.5
-      11: 2.5
-      12: 2.5
+      5: 2.5   # May — marine layer building, moderate prior
+      6: 2.0   # June — peak marine layer / June Gloom
+      7: 2.0   # July — peak marine layer
+      8: 2.0   # August — peak marine layer
+      9: 2.5   # September — marine layer fading, moderate prior
     research_queries:
       - San Francisco high temperature forecast today site:weather.gov
       - San Francisco airport daily high temperature forecast site:weather.gov
