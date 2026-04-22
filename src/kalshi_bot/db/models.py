@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from kalshi_bot.core.enums import DeploymentColor, RiskStatus, RoomOrigin, RoomStage
@@ -711,3 +711,42 @@ class StrategyCodexRunRecord(Base, IdMixin, TimestampMixin):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class StationSigmaParams(Base):
+    """Per-(station, season) sigma_base fit. Lead correction lives in GlobalLeadFactor."""
+
+    __tablename__ = "station_sigma_params"
+    __table_args__ = (
+        UniqueConstraint("station", "season_bucket", "version", name="uq_station_sigma_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    station: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    season_bucket: Mapped[str] = mapped_column(String(4), nullable=False)  # DJF/MAM/JJA/SON
+    sigma_base_f: Mapped[float] = mapped_column(Float, nullable=False)
+    mean_bias_f: Mapped[float] = mapped_column(Float, nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    sigma_se_f: Mapped[float] = mapped_column(Float, nullable=False)
+    residual_skewness: Mapped[float | None] = mapped_column(Float, nullable=True)
+    crps_improvement_vs_global: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    version: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class GlobalLeadFactor(Base):
+    """Global lead-time σ scaling factor, fit across all stations and seasons."""
+
+    __tablename__ = "global_lead_factor"
+    __table_args__ = (
+        UniqueConstraint("lead_bucket", "version", name="uq_lead_factor_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lead_bucket: Mapped[str] = mapped_column(String(8), nullable=False)  # D-0, D-1, D-2+
+    factor: Mapped[float] = mapped_column(Float, nullable=False)  # normalised: D-0 = 1.0
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    fitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    version: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
