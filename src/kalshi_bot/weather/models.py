@@ -24,6 +24,7 @@ class WeatherMarketMapping(BaseModel):
     metric: str = "daily_high_f"
     settlement_source: str = "Kalshi market rules"
     series_ticker: str | None = None
+    sigma_f_by_month: dict[int, float] | None = None
 
     @property
     def label(self) -> str:
@@ -63,6 +64,7 @@ class WeatherSeriesTemplate(BaseModel):
     metric: str = "daily_high_f"
     settlement_source: str = "NWS Climatological Report (Daily)"
     allowed_strike_types: list[Literal["greater", "less"]] = Field(default_factory=lambda: ["greater", "less"])
+    sigma_f_by_month: dict[int, float] | None = None
 
     @property
     def label(self) -> str:
@@ -92,6 +94,7 @@ class WeatherSeriesTemplate(BaseModel):
             metric=self.metric,
             settlement_source=self.settlement_source,
             series_ticker=self.series_ticker,
+            sigma_f_by_month=self.sigma_f_by_month,
         )
 
     def resolve_market(self, market: dict) -> WeatherMarketMapping | None:
@@ -135,4 +138,5 @@ class WeatherSeriesTemplate(BaseModel):
             metric=self.metric,
             settlement_source=self.settlement_source,
             series_ticker=self.series_ticker,
+            sigma_f_by_month=self.sigma_f_by_month,
         )

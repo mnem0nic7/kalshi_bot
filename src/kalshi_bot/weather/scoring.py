@@ -131,6 +131,14 @@ def nws_forecast_sigma_f(month: int) -> float:
     return _MONTHLY_SIGMA_F.get(month, 3.5)
 
 
+def sigma_f_for_mapping(mapping: Any, month: int) -> float:
+    """Return the calibrated σ for a market mapping, using per-station overrides when available."""
+    overrides = getattr(mapping, "sigma_f_by_month", None)
+    if overrides and month in overrides:
+        return float(overrides[month])
+    return nws_forecast_sigma_f(month)
+
+
 def extract_gridpoint_max_temp_f(
     gridpoint_payload: dict[str, Any],
     target_date: date | None = None,
@@ -276,7 +284,7 @@ def score_weather_market(
         if using_gridpoint:
             # Layer 2: Gaussian CDF with calibrated monthly σ.
             month = datetime.now(UTC).month
-            sigma = nws_forecast_sigma_f(month)
+            sigma = sigma_f_for_mapping(mapping, month)
             probability = gaussian_probability(delta_f, sigma_f=sigma)
         else:
             # Layer 1 fallback: logistic with adaptive spread.
