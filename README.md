@@ -154,6 +154,7 @@ Add these GitHub Secrets before running them:
 - `LIVE_KALSHI_PRIVATE_KEY_PEM`
 - `POSTGRES_PASSWORD`
 - `GEMINI_KEY` or `GEMINI_API_KEY`
+- `CODEX_HOME_HOST` (optional, defaults to `/root/.codex` for Docker-mounted Codex auth)
 - `DEPLOY_HOST`
 - `DEPLOY_USER`
 - `DEPLOY_SSH_KEY`

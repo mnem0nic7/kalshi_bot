@@ -7,6 +7,7 @@ x-common-env-base: &common-env-base
   APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
   APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
   APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+  CODEX_AUTH_JSON_PATH: ${CODEX_AUTH_JSON_PATH_CONTAINER:-/root/.codex/auth.json}
   POSTGRES_PORT: 5432
   POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
   POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -43,10 +44,14 @@ x-demo-key-volumes: &demo-key-volumes
 x-production-key-volumes: &production-key-volumes
   - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
 
+x-codex-volumes: &codex-volumes
+  - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
+
 x-app-common: &app-common
   <<: *build
   env_file: [../.env]
   expose: ["8000"]
+  volumes: *codex-volumes
   healthcheck:
     test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
     interval: 30s
@@ -57,7 +62,9 @@ x-app-common: &app-common
 
 x-demo-app-base: &demo-app-base
   <<: *app-common
-  volumes: *demo-key-volumes
+  volumes:
+    - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
+    - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
   depends_on:
     postgres_demo:
       condition: service_healthy
@@ -66,7 +73,9 @@ x-demo-app-base: &demo-app-base
 
 x-production-app-base: &production-app-base
   <<: *app-common
-  volumes: *production-key-volumes
+  volumes:
+    - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+    - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
   depends_on:
     postgres_production:
       condition: service_healthy
@@ -77,11 +86,14 @@ x-daemon-common: &daemon-common
   <<: *build
   command: ["python", "-m", "kalshi_bot.cli", "daemon"]
   env_file: [../.env]
+  volumes: *codex-volumes
   restart: unless-stopped
 
 x-demo-daemon-base: &demo-daemon-base
   <<: *daemon-common
-  volumes: *demo-key-volumes
+  volumes:
+    - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
+    - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
   depends_on:
     postgres_demo:
       condition: service_healthy
@@ -90,7 +102,9 @@ x-demo-daemon-base: &demo-daemon-base
 
 x-production-daemon-base: &production-daemon-base
   <<: *daemon-common
-  volumes: *production-key-volumes
+  volumes:
+    - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+    - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
   depends_on:
     postgres_production:
       condition: service_healthy
