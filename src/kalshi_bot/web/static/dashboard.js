@@ -484,7 +484,11 @@
   async function refreshEnv(env) {
     try {
       const resp = await fetch(`/api/dashboard/${env}`);
-      if (!resp.ok) return;
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        if (redirectToLoginIfRequired(resp, body)) return;
+        return;
+      }
       const data = await resp.json();
       const panel = document.querySelector(`.dash-panel[data-env="${env}"]`);
       if (!panel) return;
@@ -573,6 +577,20 @@
       if (first && typeof first.msg === "string") return first.msg;
     }
     return fallbackText;
+  }
+
+  function authRequiredLoginUrl(body) {
+    if (!body || body.error !== "auth_required") return null;
+    if (typeof body.login_url === "string" && body.login_url) return body.login_url;
+    return "/login";
+  }
+
+  function redirectToLoginIfRequired(response, body) {
+    if (!response || response.status !== 401) return false;
+    const loginUrl = authRequiredLoginUrl(body);
+    if (!loginUrl) return false;
+    window.location.assign(loginUrl);
+    return true;
   }
 
   function renderStrategiesSummary(payload) {
@@ -1169,7 +1187,11 @@
     if (!runId) return;
     try {
       const response = await fetch(`/api/strategies/codex/runs/${encodeURIComponent(runId)}`);
-      if (!response.ok) return;
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        if (redirectToLoginIfRequired(response, body)) return;
+        return;
+      }
       const body = await response.json();
       strategyState.codexRunId = body.id || runId;
       strategyState.codexRunDetail = body;
@@ -1220,6 +1242,7 @@
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
+        if (redirectToLoginIfRequired(response, body)) return;
         showCodexMessage(
           "bad",
           responseErrorMessage(body, `Strategy lab run failed to start (HTTP ${response.status}).`),
@@ -1261,6 +1284,7 @@
       const response = await fetch(`/api/strategies/codex/runs/${encodeURIComponent(runId)}/accept`, { method: "POST" });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
+        if (redirectToLoginIfRequired(response, body)) return;
         showCodexMessage("bad", responseErrorMessage(body, "Strategy suggestion could not be saved."));
         return;
       }
@@ -1288,6 +1312,7 @@
       const response = await fetch(`/api/strategies/${encodeURIComponent(strategyName)}/activate`, { method: "POST" });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
+        if (redirectToLoginIfRequired(response, body)) return;
         showCodexMessage("bad", responseErrorMessage(body, "Strategy activation failed."));
         return;
       }
@@ -2101,6 +2126,7 @@
         }),
       });
       const body = await response.json().catch(() => ({}));
+      if (redirectToLoginIfRequired(response, body)) return;
       if (response.ok) {
         strategyState.approvalNotes[city.series_ticker] = "";
         setApprovalMessage(
@@ -2695,7 +2721,11 @@
     if (reviewMeta) reviewMeta.textContent = "Loading decision brief...";
     try {
       const response = await fetch(`/api/dashboard/strategies?${strategyQueryParams(next)}`);
-      if (!response.ok) return;
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        if (redirectToLoginIfRequired(response, body)) return;
+        return;
+      }
       const payload = await response.json();
       renderStrategies(payload);
     } catch (_) {

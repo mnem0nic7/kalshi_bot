@@ -948,6 +948,54 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 browser.close()
 
 
+def test_strategy_lab_redirects_to_login_when_session_expires(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with _serve_dashboard(monkeypatch, tmp_path) as base_url:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                page.goto(base_url, wait_until="load", timeout=15_000)
+                page.locator('.dash-tab[data-env="strategies"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-focus-cities')?.hidden === false",
+                    timeout=15_000,
+                )
+                page.locator('#strategies-cities-detail [data-testid="strategy-open-evaluation-lab"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-focus-strategies')?.hidden === false",
+                    timeout=15_000,
+                )
+                page.evaluate(
+                    """
+                    (loginUrl) => {
+                      const originalFetch = window.fetch.bind(window);
+                      window.fetch = async (input, init) => {
+                        const url = typeof input === "string" ? input : input.url;
+                        const method = String((init && init.method) || "GET").toUpperCase();
+                        if (method === "POST" && url.includes("/api/strategies/codex/runs")) {
+                          return new Response(
+                            JSON.stringify({ error: "auth_required", login_url: loginUrl }),
+                            {
+                              status: 401,
+                              headers: { "Content-Type": "application/json" },
+                            },
+                          );
+                        }
+                        return originalFetch(input, init);
+                      };
+                    }
+                    """,
+                    "/login?next=%2F",
+                )
+
+                page.locator('#strategies-codex-lab [data-testid="strategy-codex-run"]').click(timeout=15_000)
+                page.wait_for_url("**/login?next=%2F", timeout=15_000)
+            finally:
+                browser.close()
+
+
 def test_single_site_shell_renders_static_site_label(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with _serve_dashboard(monkeypatch, tmp_path, site_kind="demo") as base_url:
         with sync_playwright() as pw:
