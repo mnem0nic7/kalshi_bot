@@ -6,7 +6,7 @@ compose_file="infra/docker-compose.yml"
 compose_env_file="--env-file .env"
 
 build_migrate_image() {
-  docker compose -f "${compose_file}" ${compose_env_file} build migrate >/dev/null
+  docker compose -f "${compose_file}" ${compose_env_file} build migrate_demo >/dev/null
 }
 
 service_health() {
@@ -39,8 +39,10 @@ wait_for_service_health() {
 }
 
 run_migrate() {
+  local env_name="$1"
+  shift
   build_migrate_image
-  docker compose -f "${compose_file}" ${compose_env_file} run --rm --no-deps migrate "$@"
+  docker compose -f "${compose_file}" ${compose_env_file} run --rm --no-deps "migrate_${env_name}" "$@"
 }
 
 run_control() {
@@ -57,12 +59,15 @@ run_control() {
     docker compose -f "${compose_file}" ${compose_env_file} exec -T "${secondary_service}" "${cmd[@]}"
     return
   fi
-  run_migrate "${cmd[@]}"
+  run_migrate "${env_name}" "${cmd[@]}"
 }
 
 docker compose -f "${compose_file}" ${compose_env_file} config >/dev/null
-docker compose -f "${compose_file}" ${compose_env_file} up -d postgres
-run_migrate
+docker compose -f "${compose_file}" ${compose_env_file} up -d postgres_demo postgres_production
+wait_for_service_health postgres_demo 60
+wait_for_service_health postgres_production 60
+run_migrate demo
+run_migrate production
 docker compose -f "${compose_file}" ${compose_env_file} up -d --build \
   app_demo_blue app_demo_green daemon_demo_blue daemon_demo_green \
   app_production_blue app_production_green daemon_production_blue daemon_production_green \

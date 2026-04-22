@@ -1,8 +1,102 @@
+x-build: &build
+  build:
+    context: ..
+    dockerfile: infra/docker/Dockerfile
+
+x-common-env-base: &common-env-base
+  APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
+  APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
+  APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+  LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+  DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
+  DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
+
+x-demo-env: &demo-env
+  <<: *common-env-base
+  POSTGRES_HOST: postgres_demo
+
+x-production-env: &production-env
+  <<: *common-env-base
+  POSTGRES_HOST: postgres_production
+
+x-demo-web-env: &demo-web-env
+  <<: *demo-env
+  WEB_DEMO_HOST: ${WEB_DEMO_HOST:-demo.ai-al.site}
+  WEB_PRODUCTION_HOST: ${WEB_PRODUCTION_HOST:-prod.ai-al.site}
+  WEB_STRATEGIES_HOST: ${WEB_STRATEGIES_HOST:-strategy.ai-al.site}
+  WEB_AUTH_COOKIE_DOMAIN: ${WEB_AUTH_COOKIE_DOMAIN:-.ai-al.site}
+
+x-production-web-env: &production-web-env
+  <<: *production-env
+  WEB_DEMO_HOST: ${WEB_DEMO_HOST:-demo.ai-al.site}
+  WEB_PRODUCTION_HOST: ${WEB_PRODUCTION_HOST:-prod.ai-al.site}
+  WEB_STRATEGIES_HOST: ${WEB_STRATEGIES_HOST:-strategy.ai-al.site}
+  WEB_AUTH_COOKIE_DOMAIN: ${WEB_AUTH_COOKIE_DOMAIN:-.ai-al.site}
+
+x-key-volumes: &key-volumes
+  - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+  - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
+
+x-app-common: &app-common
+  <<: *build
+  env_file: [../.env]
+  volumes: *key-volumes
+  expose: ["8000"]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+  restart: unless-stopped
+
+x-demo-app-base: &demo-app-base
+  <<: *app-common
+  depends_on:
+    postgres_demo:
+      condition: service_healthy
+    migrate_demo:
+      condition: service_completed_successfully
+
+x-production-app-base: &production-app-base
+  <<: *app-common
+  depends_on:
+    postgres_production:
+      condition: service_healthy
+    migrate_production:
+      condition: service_completed_successfully
+
+x-daemon-common: &daemon-common
+  <<: *build
+  command: ["python", "-m", "kalshi_bot.cli", "daemon"]
+  env_file: [../.env]
+  volumes: *key-volumes
+  restart: unless-stopped
+
+x-demo-daemon-base: &demo-daemon-base
+  <<: *daemon-common
+  depends_on:
+    postgres_demo:
+      condition: service_healthy
+    migrate_demo:
+      condition: service_completed_successfully
+
+x-production-daemon-base: &production-daemon-base
+  <<: *daemon-common
+  depends_on:
+    postgres_production:
+      condition: service_healthy
+    migrate_production:
+      condition: service_completed_successfully
+
 services:
-  postgres:
+  postgres_demo:
     image: pgvector/pgvector:pg16
-    env_file:
-      - ../.env
+    env_file: [../.env]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -12,449 +106,159 @@ services:
       timeout: 5s
       retries: 20
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_DEMO_PORT:-5432}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_demo_data:/var/lib/postgresql/data
 
-  migrate:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    command: ["alembic", "upgrade", "head"]
-    env_file:
-      - ../.env
+  postgres_production:
+    image: pgvector/pgvector:pg16
+    env_file: [../.env]
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
-      KALSHI_ENV: ${KALSHI_ENV:-demo}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-kalshi_bot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "127.0.0.1:${POSTGRES_PRODUCTION_PORT:-5433}:5432"
     volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
+      - postgres_production_data:/var/lib/postgresql/data
+
+  migrate_demo:
+    <<: *build
+    command: ["alembic", "upgrade", "head"]
+    env_file: [../.env]
+    environment:
+      <<: *demo-env
+      KALSHI_ENV: demo
+    volumes: *key-volumes
+    depends_on:
+      postgres_demo:
+        condition: service_healthy
+    restart: "no"
+
+  migrate_production:
+    <<: *build
+    command: ["alembic", "upgrade", "head"]
+    env_file: [../.env]
+    environment:
+      <<: *production-env
+      KALSHI_ENV: production
+    volumes: *key-volumes
+    depends_on:
+      postgres_production:
+        condition: service_healthy
     restart: "no"
 
   app_demo_blue:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    env_file:
-      - ../.env
+    <<: *demo-app-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+      <<: *demo-env
       KALSHI_ENV: demo
       APP_COLOR: blue
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
-    expose:
-      - "8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
 
   app_demo_green:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    env_file:
-      - ../.env
+    <<: *demo-app-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+      <<: *demo-env
       KALSHI_ENV: demo
       APP_COLOR: green
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
-    expose:
-      - "8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
 
   app_production_blue:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    env_file:
-      - ../.env
+    <<: *production-app-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+      <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: blue
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
-    expose:
-      - "8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
 
   app_production_green:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    env_file:
-      - ../.env
+    <<: *production-app-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+      <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: green
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
-    expose:
-      - "8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
 
   daemon_demo_blue:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    command: ["python", "-m", "kalshi_bot.cli", "daemon"]
-    env_file:
-      - ../.env
+    <<: *demo-daemon-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+      <<: *demo-env
       KALSHI_ENV: demo
       APP_COLOR: blue
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     healthcheck:
       test: ["CMD", "python", "-m", "kalshi_bot.cli", "health-check", "daemon", "--color", "blue"]
-      interval: 30s
+      interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 75s
-    restart: unless-stopped
+      start_period: 90s
 
   daemon_demo_green:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    command: ["python", "-m", "kalshi_bot.cli", "daemon"]
-    env_file:
-      - ../.env
+    <<: *demo-daemon-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+      <<: *demo-env
       KALSHI_ENV: demo
       APP_COLOR: green
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     healthcheck:
       test: ["CMD", "python", "-m", "kalshi_bot.cli", "health-check", "daemon", "--color", "green"]
-      interval: 30s
+      interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 75s
-    restart: unless-stopped
+      start_period: 90s
 
   daemon_production_blue:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    command: ["python", "-m", "kalshi_bot.cli", "daemon"]
-    env_file:
-      - ../.env
+    <<: *production-daemon-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+      <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: blue
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     healthcheck:
       test: ["CMD", "python", "-m", "kalshi_bot.cli", "health-check", "daemon", "--color", "blue"]
-      interval: 30s
+      interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 75s
-    restart: unless-stopped
+      start_period: 90s
 
   daemon_production_green:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    command: ["python", "-m", "kalshi_bot.cli", "daemon"]
-    env_file:
-      - ../.env
+    <<: *production-daemon-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
+      <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: green
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     healthcheck:
       test: ["CMD", "python", "-m", "kalshi_bot.cli", "health-check", "daemon", "--color", "green"]
-      interval: 30s
+      interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 75s
-    restart: unless-stopped
+      start_period: 90s
 
   web_demo:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    env_file:
-      - ../.env
+    <<: *demo-app-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
-      APP_COLOR: blue
+      <<: *demo-web-env
+      APP_COLOR: ${WEB_APP_COLOR:-blue}
       KALSHI_ENV: demo
       WEB_SITE_KIND: demo
-      WEB_DEMO_HOST: ${WEB_DEMO_HOST:-demo.ai-al.site}
-      WEB_PRODUCTION_HOST: ${WEB_PRODUCTION_HOST:-prod.ai-al.site}
-      WEB_STRATEGIES_HOST: ${WEB_STRATEGIES_HOST:-strategy.ai-al.site}
-      WEB_AUTH_COOKIE_DOMAIN: ${WEB_AUTH_COOKIE_DOMAIN:-.ai-al.site}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
-    expose:
-      - "8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
 
   web_production:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    env_file:
-      - ../.env
+    <<: *production-app-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
-      APP_COLOR: blue
+      <<: *production-web-env
+      APP_COLOR: ${WEB_APP_COLOR:-blue}
       KALSHI_ENV: production
       WEB_SITE_KIND: production
-      WEB_DEMO_HOST: ${WEB_DEMO_HOST:-demo.ai-al.site}
-      WEB_PRODUCTION_HOST: ${WEB_PRODUCTION_HOST:-prod.ai-al.site}
-      WEB_STRATEGIES_HOST: ${WEB_STRATEGIES_HOST:-strategy.ai-al.site}
-      WEB_AUTH_COOKIE_DOMAIN: ${WEB_AUTH_COOKIE_DOMAIN:-.ai-al.site}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
-    expose:
-      - "8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
 
   web_strategies:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    env_file:
-      - ../.env
+    <<: *demo-app-base
     environment:
-      APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
-      APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
-      APP_SHADOW_MODE: ${APP_SHADOW_MODE:-false}
-      APP_COLOR: blue
+      <<: *demo-web-env
+      APP_COLOR: ${WEB_APP_COLOR:-blue}
       KALSHI_ENV: demo
       WEB_SITE_KIND: strategies
-      WEB_DEMO_HOST: ${WEB_DEMO_HOST:-demo.ai-al.site}
-      WEB_PRODUCTION_HOST: ${WEB_PRODUCTION_HOST:-prod.ai-al.site}
-      WEB_STRATEGIES_HOST: ${WEB_STRATEGIES_HOST:-strategy.ai-al.site}
-      WEB_AUTH_COOKIE_DOMAIN: ${WEB_AUTH_COOKIE_DOMAIN:-.ai-al.site}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-      DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-      DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
-      - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
-    expose:
-      - "8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
 
   caddy:
     image: caddy:2.9-alpine
-    env_file:
-      - ../.env
+    env_file: [../.env]
     environment:
       WEB_DEMO_HOST: ${WEB_DEMO_HOST:-demo.ai-al.site}
       WEB_PRODUCTION_HOST: ${WEB_PRODUCTION_HOST:-prod.ai-al.site}
@@ -471,7 +275,7 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     healthcheck:
-      test: ["CMD", "caddy", "version"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2019/config/ >/dev/null 2>&1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -479,6 +283,7 @@ services:
     restart: unless-stopped
 
 volumes:
-  postgres_data:
+  postgres_demo_data:
+  postgres_production_data:
   caddy_data:
   caddy_config:
