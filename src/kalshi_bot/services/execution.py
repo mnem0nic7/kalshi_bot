@@ -5,6 +5,8 @@ import logging
 from decimal import Decimal
 from typing import Any
 
+import httpx
+
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import ExecReceiptPayload, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
@@ -75,7 +77,22 @@ class ExecutionService:
         }
         if self.settings.kalshi_subaccount:
             payload["subaccount"] = self.settings.kalshi_subaccount
-        response = await self.kalshi.create_order(payload)
+        try:
+            response = await self.kalshi.create_order(payload)
+        except httpx.HTTPStatusError as exc:
+            try:
+                body = exc.response.json()
+            except Exception:
+                body = exc.response.text
+            logger.error(
+                "order rejected for %s status=%d body=%s payload=%s",
+                ticket.market_ticker, exc.response.status_code, body, payload,
+            )
+            return ExecReceiptPayload(
+                status=f"rejected_{exc.response.status_code}",
+                client_order_id=client_order_id,
+                details={"http_status": exc.response.status_code, "body": body, "payload": payload},
+            )
         order = response.get("order", {})
         return ExecReceiptPayload(
             status=order.get("status", "submitted"),

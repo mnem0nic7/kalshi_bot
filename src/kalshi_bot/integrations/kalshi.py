@@ -15,7 +15,11 @@ import websockets
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+import logging
+
 from kalshi_bot.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -126,6 +130,12 @@ class KalshiClient:
                 headers=headers,
             )
             if response.status_code != 429 or attempt == max_retries:
+                if response.is_error:
+                    try:
+                        body = response.json()
+                    except Exception:
+                        body = response.text
+                    logger.warning("Kalshi %s %s → %d: %s", method, path, response.status_code, body)
                 response.raise_for_status()
                 return response.json()
             retry_after = response.headers.get("Retry-After")
