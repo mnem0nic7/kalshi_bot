@@ -645,6 +645,7 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert payload["recent_trade_proposals"][0]["market_ticker"] == "KXHIGHCHI-26APR17-T79"
     assert payload["recent_trade_proposals"][0]["risk_status"] == "blocked"
     assert payload["recent_trade_proposals"][0]["risk_reasons"] == ["Book effectively broken."]
+    assert payload["recent_trade_proposals"][0]["updated_at"] == now.isoformat()
     assert container.kalshi.get_market.await_count == 2
     assert container.watchdog_service.get_status.await_args.kwargs["kalshi_env"] == "demo"
     assert container.agent_pack_service.get_pack_for_color.await_args.args[1] == "green"

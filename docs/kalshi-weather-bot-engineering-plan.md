@@ -370,7 +370,7 @@ Enabled in all running environments (`TRIGGER_ENABLE_AUTO_ROOMS=true`). This is 
 2. Skips tickers not in the weather directory.
 3. Checks spread ≤ `trigger_max_spread_bps` (1200 bps) and both sides quoted.
 4. Enforces per-ticker cooldown (300s normal, 30s after broken-book event). **Bypass:** if the YES mid price has moved ≥ `trigger_price_move_bypass_bps` (1500 bps) since the last trigger, the cooldown is overridden — the move magnitude itself justifies a fresh evaluation.
-5. Enforces `trigger_max_concurrent_rooms` (4) limit.
+5. Enforces `trigger_max_concurrent_rooms` (12) limit.
 6. Checks `stop_loss_reentry` checkpoint: if set, requires 5-minute sustained directional momentum (|slope| ≥ 0.2 ¢/min) before opening.
 7. Creates a room and runs it via supervisor.
 
@@ -684,7 +684,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `TRIGGER_ENABLE_AUTO_ROOMS` | `true` | Master switch for autonomous room creation from orderbook events |
 | `TRIGGER_COOLDOWN_SECONDS` | 300 | Per-ticker cooldown between trigger evaluations (30s after broken-book events) |
 | `TRIGGER_MAX_SPREAD_BPS` | 1200 | Reject trigger if bid/ask spread exceeds this |
-| `TRIGGER_MAX_CONCURRENT_ROOMS` | 4 | Hard cap on simultaneously running rooms |
+| `TRIGGER_MAX_CONCURRENT_ROOMS` | 12 | Hard cap on simultaneously running rooms |
 | `TRIGGER_PRICE_MOVE_BYPASS_BPS` | 1500 | If YES mid moves ≥ this many bps since last trigger, bypass the cooldown |
 
 ---

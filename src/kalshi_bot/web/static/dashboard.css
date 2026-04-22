@@ -320,6 +320,15 @@
   gap: 0.35rem;
 }
 
+.proposal-market-cell {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.proposal-updated-at {
+  font-size: 0.82rem;
+}
+
 .proposal-risk-cell {
   display: grid;
   gap: 0.35rem;

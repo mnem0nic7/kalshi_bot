@@ -64,6 +64,7 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "risk_status_tone": "bad",
             "risk_reasons": ["Spread too wide for entry."],
             "approved_notional_dollars": None,
+            "updated_at": "2026-04-22T21:05:00+00:00",
         },
         {
             "market_ticker": "KXHIGHNY-26APR23-T75",
@@ -77,6 +78,7 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "risk_status_tone": "good",
             "risk_reasons": [],
             "approved_notional_dollars": "5.0000",
+            "updated_at": "2026-04-22T21:03:00+00:00",
         },
     ]
 
@@ -812,6 +814,8 @@ def test_recent_trade_proposals_render_at_bottom_of_demo_and_production(
                 assert "0.0400" in demo_text
                 assert "blocked" in demo_text
                 assert "Spread too wide for entry." in demo_text
+                demo_timestamp = page.locator('#panel-demo [data-testid="recent-trade-proposals"] [data-timestamp="2026-04-22T21:05:00+00:00"]').first
+                assert demo_timestamp.count() == 1
 
                 page.locator('.dash-tab[data-env="production"]').click(timeout=15_000)
                 page.wait_for_selector('#panel-production [data-testid="recent-trade-proposals"]', timeout=15_000)
@@ -819,6 +823,8 @@ def test_recent_trade_proposals_render_at_bottom_of_demo_and_production(
                 assert "KXHIGHNY-26APR23-T75" in production_text
                 assert "5.0000" in production_text
                 assert "Spread too wide for entry." in production_text
+                production_timestamp = page.locator('#panel-production [data-testid="recent-trade-proposals"] [data-timestamp="2026-04-22T21:03:00+00:00"]').first
+                assert production_timestamp.count() == 1
             finally:
                 browser.close()
 

@@ -224,7 +224,14 @@
           <tbody>
             {% for item in recent_trade_proposals %}
             <tr>
-              <td class="mono">{{ item.market_ticker }}</td>
+              <td class="mono">
+                <div class="proposal-market-cell">
+                  <span>{{ item.market_ticker }}</span>
+                  {% if item.updated_at %}
+                  <span class="muted-label proposal-updated-at" data-timestamp="{{ item.updated_at }}" title="{{ item.updated_at }}">{{ item.updated_at }}</span>
+                  {% endif %}
+                </div>
+              </td>
               <td><span class="status-pill {% if item.side_tone == 'good' %}status-good{% elif item.side_tone == 'warning' %}status-warning{% elif item.side_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.side }}</span></td>
               <td class="mono">{{ item.yes_price_dollars }}</td>
               <td class="mono">{{ item.count_fp }}</td>

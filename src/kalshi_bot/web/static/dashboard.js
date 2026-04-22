@@ -527,6 +527,16 @@
     const tbody = el("tbody");
     proposals.forEach((proposal) => {
       const tr = el("tr");
+      const marketTd = el("td", "mono");
+      const marketWrap = el("div", "proposal-market-cell");
+      marketWrap.appendChild(el("span", null, proposal.market_ticker || "—"));
+      if (proposal.updated_at) {
+        const timeNode = el("span", "muted-label proposal-updated-at", formatAge(proposal.updated_at));
+        timeNode.dataset.timestamp = proposal.updated_at;
+        timeNode.title = proposal.updated_at;
+        marketWrap.appendChild(timeNode);
+      }
+      marketTd.appendChild(marketWrap);
       const sideTd = el("td");
       const sideTone = proposal.side_tone || (proposal.side === "yes" ? "good" : proposal.side === "no" ? "warning" : "neutral");
       sideTd.appendChild(el("span", `status-pill ${statusPillClass(sideTone)}`, proposal.side || "—"));
@@ -543,7 +553,7 @@
       }
       riskTd.appendChild(riskWrap);
       tr.append(
-        el("td", "mono", proposal.market_ticker || "—"),
+        marketTd,
         sideTd,
         el("td", "mono", proposal.yes_price_dollars || "—"),
         el("td", "mono", proposal.count_fp || "—"),

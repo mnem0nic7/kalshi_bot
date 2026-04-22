@@ -103,6 +103,10 @@ class StopLossService:
         # Load positions and market states in one read session
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            if control.active_color != self.settings.app_color:
+                await session.commit()
+                return triggered
             positions = await repo.list_positions(
                 limit=500,
                 kalshi_env=self.settings.kalshi_env,
