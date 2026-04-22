@@ -160,6 +160,26 @@ class WideChicagoKalshi:
         return None
 
 
+async def _seed_reconcile_balance(
+    repo: PlatformRepository,
+    *,
+    kalshi_env: str,
+    total_capital_dollars: Decimal = Decimal("1000.00"),
+) -> None:
+    cash_cents = int(total_capital_dollars * Decimal("100"))
+    await repo.set_checkpoint(
+        f"reconcile:{kalshi_env}",
+        None,
+        {
+            "balance": {
+                "balance": cash_cents,
+                "portfolio_value": 0,
+            },
+            "reconciled_at": "2026-04-10T00:00:00+00:00",
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     database_url = f"sqlite+aiosqlite:///{tmp_path}/app.db"
@@ -167,6 +187,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         database_url=database_url,
         app_color="blue",
         app_shadow_mode=False,
+        llm_trading_enabled=True,
         risk_min_edge_bps=10,
         risk_max_order_notional_dollars=50,
         risk_max_position_notional_dollars=100,
@@ -233,6 +254,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     async with session_factory() as session:
         repo = PlatformRepository(session)
         await repo.ensure_deployment_control(settings.app_color)
+        await _seed_reconcile_balance(repo, kalshi_env=settings.kalshi_env)
         room = await repo.create_room(
             RoomCreate(name="Test Room", market_ticker="WX-TEST"),
             active_color="blue",
@@ -271,6 +293,7 @@ async def test_supervisor_stands_down_on_resolved_contract_before_risk(tmp_path)
         database_url=database_url,
         app_color="blue",
         app_shadow_mode=False,
+        llm_trading_enabled=True,
         risk_min_edge_bps=10,
         risk_max_order_notional_dollars=50,
         risk_max_position_notional_dollars=100,
@@ -338,6 +361,7 @@ async def test_supervisor_stands_down_on_resolved_contract_before_risk(tmp_path)
     async with session_factory() as session:
         repo = PlatformRepository(session)
         await repo.ensure_deployment_control(settings.app_color)
+        await _seed_reconcile_balance(repo, kalshi_env=settings.kalshi_env)
         room = await repo.create_room(
             RoomCreate(name="Resolved Room", market_ticker="KXHIGHCHI-26APR11-T51"),
             active_color="blue",
@@ -377,9 +401,12 @@ async def test_supervisor_executes_bucket_resized_trade_size(tmp_path) -> None:
         database_url=database_url,
         app_color="blue",
         app_shadow_mode=False,
+        llm_trading_enabled=True,
         risk_min_edge_bps=10,
+        risk_order_pct=1.0,
+        risk_position_pct=1.0,
         risk_max_order_notional_dollars=50,
-        risk_max_position_notional_dollars=20,
+        risk_max_position_notional_dollars=100,
         risk_max_order_count_fp=20,
     )
     engine = create_engine(settings)
@@ -411,7 +438,7 @@ async def test_supervisor_executes_bucket_resized_trade_size(tmp_path) -> None:
         settings,
         session_factory,
         FakeKalshi(),  # type: ignore[arg-type]
-        NearThresholdWeather(),  # type: ignore[arg-type]
+        FakeWeather(),  # type: ignore[arg-type]
         directory,
         providers,  # type: ignore[arg-type]
         signal_engine,
@@ -428,7 +455,7 @@ async def test_supervisor_executes_bucket_resized_trade_size(tmp_path) -> None:
         settings=settings,
         session_factory=session_factory,
         kalshi=FakeKalshi(),  # type: ignore[arg-type]
-        weather=NearThresholdWeather(),  # type: ignore[arg-type]
+        weather=FakeWeather(),  # type: ignore[arg-type]
         weather_directory=directory,
         agent_pack_service=agent_pack_service,
         signal_engine=signal_engine,
@@ -443,6 +470,11 @@ async def test_supervisor_executes_bucket_resized_trade_size(tmp_path) -> None:
     async with session_factory() as session:
         repo = PlatformRepository(session)
         await repo.ensure_deployment_control(settings.app_color)
+        await _seed_reconcile_balance(
+            repo,
+            kalshi_env=settings.kalshi_env,
+            total_capital_dollars=Decimal("20.00"),
+        )
         seed_room = await repo.create_room(
             RoomCreate(name="Seed Risky", market_ticker="OTHER-RISK"),
             active_color="blue",
@@ -456,15 +488,15 @@ async def test_supervisor_executes_bucket_resized_trade_size(tmp_path) -> None:
             fair_yes_dollars=Decimal("0.5000"),
             edge_bps=80,
             confidence=0.6,
-            summary="Seed risky signal",
-            payload={"trade_regime": "near_threshold", "capital_bucket": "risky"},
+            summary="Seed safe signal",
+            payload={"trade_regime": "standard", "capital_bucket": "safe"},
         )
         await repo.upsert_position(
             market_ticker="OTHER-RISK",
             subaccount=settings.kalshi_subaccount,
             kalshi_env=settings.kalshi_env,
             side="yes",
-            count_fp=Decimal("10.00"),
+            count_fp=Decimal("43.00"),
             average_price_dollars=Decimal("0.4000"),
             raw={"seeded": True},
         )
@@ -492,10 +524,10 @@ async def test_supervisor_executes_bucket_resized_trade_size(tmp_path) -> None:
     assert signal is not None
     assert orders
     assert trade_ticket.count_fp == Decimal("20.00")
-    assert risk_verdict.approved_count_fp == Decimal("4.44")
+    assert risk_verdict.approved_count_fp == Decimal("5.00")
     assert risk_verdict.payload["resized_by_bucket"] is True
-    assert risk_verdict.payload["capital_bucket"] == "risky"
-    assert orders[0].count_fp == Decimal("4.44")
-    assert signal.payload["capital_bucket"] == "risky"
+    assert risk_verdict.payload["capital_bucket"] == "safe"
+    assert orders[0].count_fp == Decimal("5.00")
+    assert signal.payload["capital_bucket"] == "safe"
 
     await engine.dispose()

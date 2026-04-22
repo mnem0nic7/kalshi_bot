@@ -39,6 +39,7 @@ class TrainingExportService:
             fills = await repo.list_fills_for_room(room_id)
             memory_note = await repo.get_latest_memory_note_for_room(room_id)
             dossier_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="research_dossier_snapshot")
+            dossier_record = await repo.get_research_dossier(room.market_ticker)
             delta_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="research_delta")
             market_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="market_snapshot")
             weather_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="weather_bundle")
@@ -75,7 +76,11 @@ class TrainingExportService:
             exclude_reason=(strategy_audit.exclude_reason if strategy_audit is not None else None),
             messages=messages,
             signal=self._signal_dict(signal) if signal is not None else None,
-            research_dossier=dossier_artifact.payload if dossier_artifact is not None else None,
+            research_dossier=(
+                dossier_artifact.payload
+                if dossier_artifact is not None
+                else (dossier_record.payload if dossier_record is not None else None)
+            ),
             research_delta=delta_artifact.payload if delta_artifact is not None else None,
             market_snapshot=market_artifact.payload if market_artifact is not None else None,
             weather_bundle=weather_artifact.payload if weather_artifact is not None else None,

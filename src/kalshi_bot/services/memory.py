@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from typing import Any
+
 from kalshi_bot.core.schemas import AgentPackMemoryConfig, AgentPackRoleConfig, MemoryNotePayload, RoomMessageRead
 from kalshi_bot.db.models import Room
 
 
 class MemoryService:
+    def __init__(self, providers: Any | None = None) -> None:
+        self.providers = providers
+
     async def build_note(
         self,
         room: Room,

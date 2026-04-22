@@ -33,9 +33,9 @@ def test_runtime_scripts_rebuild_migrate_image_before_using_it() -> None:
     start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
     watchdog = Path("infra/scripts/watchdog-run-once.sh").read_text(encoding="utf-8")
 
-    assert 'docker compose -f "${compose_file}" ${compose_env_file} build migrate >/dev/null' in start_stack
+    assert 'docker compose -f "${compose_file}" ${compose_env_file} build "migrate_${env_name}" >/dev/null' in start_stack
     assert "run_migrate" in start_stack
-    assert 'docker compose -f "${compose_file}" build migrate >/dev/null' in watchdog
+    assert 'docker compose -f "${compose_file}" build "migrate_${env_name}" >/dev/null' in watchdog
 
 
 def test_runtime_scripts_refresh_caddy_after_app_recreate() -> None:

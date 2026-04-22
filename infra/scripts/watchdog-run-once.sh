@@ -4,7 +4,8 @@ set -euo pipefail
 compose_file="infra/docker-compose.yml"
 
 build_migrate_image() {
-  docker compose -f "${compose_file}" build migrate >/dev/null
+  local env_name="$1"
+  docker compose -f "${compose_file}" build "migrate_${env_name}" >/dev/null
 }
 
 container_status() {
@@ -32,8 +33,8 @@ run_control() {
     docker compose -f "${compose_file}" exec -T "${secondary_service}" "${cmd[@]}"
     return
   fi
-  build_migrate_image
-  docker compose -f "${compose_file}" run --rm --no-deps migrate "${cmd[@]}"
+  build_migrate_image "${env_name}"
+  docker compose -f "${compose_file}" run --rm --no-deps "migrate_${env_name}" "${cmd[@]}"
 }
 
 record_action() {

@@ -6,7 +6,8 @@ compose_file="infra/docker-compose.yml"
 compose_env_file="--env-file .env"
 
 build_migrate_image() {
-  docker compose -f "${compose_file}" ${compose_env_file} build migrate_demo >/dev/null
+  local env_name="$1"
+  docker compose -f "${compose_file}" ${compose_env_file} build "migrate_${env_name}" >/dev/null
 }
 
 service_health() {
@@ -41,7 +42,7 @@ wait_for_service_health() {
 run_migrate() {
   local env_name="$1"
   shift
-  build_migrate_image
+  build_migrate_image "${env_name}"
   docker compose -f "${compose_file}" ${compose_env_file} run --rm --no-deps "migrate_${env_name}" "$@"
 }
 

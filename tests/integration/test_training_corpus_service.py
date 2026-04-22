@@ -86,12 +86,33 @@ class FakeWeather:
         return None
 
 
+async def _seed_reconcile_balance(
+    repo: PlatformRepository,
+    *,
+    kalshi_env: str,
+    total_capital_dollars: Decimal = Decimal("1000.00"),
+) -> None:
+    cash_cents = int(total_capital_dollars * Decimal("100"))
+    await repo.set_checkpoint(
+        f"reconcile:{kalshi_env}",
+        None,
+        {
+            "balance": {
+                "balance": cash_cents,
+                "portfolio_value": 0,
+            },
+            "reconciled_at": "2026-04-10T00:00:00+00:00",
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/training-corpus.db",
         app_color="blue",
         app_shadow_mode=True,
+        llm_trading_enabled=True,
         training_min_complete_rooms=2,
         training_min_market_diversity=2,
         training_min_settled_rooms=1,
@@ -170,6 +191,7 @@ async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_p
     async with session_factory() as session:
         repo = PlatformRepository(session)
         await repo.ensure_deployment_control("blue", initial_kill_switch_enabled=False)
+        await _seed_reconcile_balance(repo, kalshi_env=settings.kalshi_env)
         room_one = await repo.create_room(
             RoomCreate(name="Room One", market_ticker="WX-ONE"),
             active_color="blue",

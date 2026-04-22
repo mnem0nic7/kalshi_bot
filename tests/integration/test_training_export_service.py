@@ -90,6 +90,26 @@ class FakeWeather:
         return None
 
 
+async def _seed_reconcile_balance(
+    repo: PlatformRepository,
+    *,
+    kalshi_env: str,
+    total_capital_dollars: Decimal = Decimal("1000.00"),
+) -> None:
+    cash_cents = int(total_capital_dollars * Decimal("100"))
+    await repo.set_checkpoint(
+        f"reconcile:{kalshi_env}",
+        None,
+        {
+            "balance": {
+                "balance": cash_cents,
+                "portfolio_value": 0,
+            },
+            "reconciled_at": "2026-04-10T00:00:00+00:00",
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_training_export_service_builds_room_bundle_and_role_examples(tmp_path) -> None:
     database_url = f"sqlite+aiosqlite:///{tmp_path}/app.db"
@@ -97,6 +117,7 @@ async def test_training_export_service_builds_room_bundle_and_role_examples(tmp_
         database_url=database_url,
         app_color="blue",
         app_shadow_mode=False,
+        llm_trading_enabled=True,
         risk_min_edge_bps=10,
         risk_max_order_notional_dollars=50,
         risk_max_position_notional_dollars=100,
@@ -164,6 +185,7 @@ async def test_training_export_service_builds_room_bundle_and_role_examples(tmp_
     async with session_factory() as session:
         repo = PlatformRepository(session)
         await repo.ensure_deployment_control(settings.app_color)
+        await _seed_reconcile_balance(repo, kalshi_env=settings.kalshi_env)
         room = await repo.create_room(
             RoomCreate(name="Training Room", market_ticker="WX-TEST"),
             active_color="blue",
