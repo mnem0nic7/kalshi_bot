@@ -85,6 +85,10 @@
   ];
   const ACTIONABLE_RECOMMENDATION_STATUSES = new Set(["strong_recommendation", "lean_recommendation"]);
   const LOW_CONFIDENCE_RECOMMENDATION_STATUSES = new Set(["too_close", "low_sample"]);
+  const CODEX_PROVIDER_MODEL_FALLBACKS = {
+    gemini: ["gemini-2.5-pro", "gemini-2.5-flash"],
+    codex: ["gpt-4o"],
+  };
 
   function reviewPriority(status) {
     const index = REVIEW_QUEUE_ORDER.indexOf(status || "");
@@ -1043,7 +1047,12 @@
   }
 
   function codexSuggestedModels(provider) {
-    const rawModels = provider && Array.isArray(provider.suggested_models) ? provider.suggested_models : [];
+    const providerId = provider && provider.id ? String(provider.id || "").trim().toLowerCase() : "";
+    const rawModels = [
+      ...(provider && Array.isArray(provider.suggested_models) ? provider.suggested_models : []),
+      provider && provider.default_model ? provider.default_model : null,
+      ...((providerId && CODEX_PROVIDER_MODEL_FALLBACKS[providerId]) || []),
+    ];
     const seen = new Set();
     const ordered = [];
     rawModels.forEach((modelName) => {
@@ -1211,7 +1220,14 @@
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
-        showCodexMessage("bad", responseErrorMessage(body, "Strategy lab run failed to start."));
+        showCodexMessage(
+          "bad",
+          responseErrorMessage(body, `Strategy lab run failed to start (HTTP ${response.status}).`),
+        );
+        return;
+      }
+      if (!body.run_id) {
+        showCodexMessage("bad", "Strategy lab run failed to start because the server returned an incomplete response.");
         return;
       }
       strategyState.codexRunId = body.run_id || null;
@@ -1223,8 +1239,13 @@
         explicitSelection: strategyState.explicitSelection,
       });
       await fetchCodexRunDetail(body.run_id, { refreshAfterComplete: true });
-    } catch (_) {
-      showCodexMessage("bad", "Strategy lab run failed to start.");
+    } catch (error) {
+      showCodexMessage(
+        "bad",
+        error instanceof Error && error.message
+          ? `Strategy lab run failed to start. ${error.message}`
+          : "Strategy lab run failed to start.",
+      );
     } finally {
       strategyState.codexSubmitting = false;
       if (strategyState.payload) renderStrategies(strategyState.payload);
@@ -1393,43 +1414,33 @@
     const modelLabel = el("label", "muted-label", "Model");
     modelLabel.setAttribute("for", "strategies-codex-model");
     const suggestedModels = codexSuggestedModels(activeProvider);
-    if (suggestedModels.length) {
-      const modelSelect = setTestId(el("select", "strategy-codex-select"), "strategy-codex-model");
-      modelSelect.id = "strategies-codex-model";
-      modelSelect.disabled = !lab.available || strategyState.codexSubmitting;
-      const modelOptions = (
-        strategyState.codexModel && !suggestedModels.includes(strategyState.codexModel)
-          ? [strategyState.codexModel, ...suggestedModels]
-          : suggestedModels
-      );
-      modelOptions.forEach((modelName, index) => {
+    const modelOptions = (
+      strategyState.codexModel && !suggestedModels.includes(strategyState.codexModel)
+        ? [strategyState.codexModel, ...suggestedModels]
+        : suggestedModels
+    );
+    const modelInput = setTestId(el("input", "strategy-codex-model-input"), "strategy-codex-model");
+    modelInput.id = "strategies-codex-model";
+    modelInput.type = "text";
+    modelInput.autocomplete = "off";
+    modelInput.spellcheck = false;
+    modelInput.disabled = !lab.available || strategyState.codexSubmitting;
+    modelInput.value = strategyState.codexModel || "";
+    modelInput.placeholder = activeProvider && activeProvider.default_model ? activeProvider.default_model : "Enter model id";
+    modelInput.addEventListener("input", () => {
+      strategyState.codexModel = modelInput.value || "";
+    });
+    if (modelOptions.length) {
+      modelInput.setAttribute("list", "strategies-codex-model-options");
+      const modelSuggestions = document.createElement("datalist");
+      modelSuggestions.id = "strategies-codex-model-options";
+      modelOptions.forEach((modelName) => {
         const optionNode = document.createElement("option");
         optionNode.value = modelName;
-        optionNode.textContent = (
-          index === 0
-          && strategyState.codexModel
-          && modelName === strategyState.codexModel
-          && !suggestedModels.includes(modelName)
-        )
-          ? `${modelName} (current)`
-          : modelName;
-        optionNode.selected = modelName === (strategyState.codexModel || "");
-        modelSelect.appendChild(optionNode);
+        modelSuggestions.appendChild(optionNode);
       });
-      modelSelect.addEventListener("change", () => {
-        strategyState.codexModel = modelSelect.value || "";
-      });
-      modelBlock.append(modelLabel, modelSelect);
+      modelBlock.append(modelLabel, modelInput, modelSuggestions);
     } else {
-      const modelInput = setTestId(el("input", "strategy-codex-model-input"), "strategy-codex-model");
-      modelInput.id = "strategies-codex-model";
-      modelInput.type = "text";
-      modelInput.disabled = !lab.available || strategyState.codexSubmitting;
-      modelInput.value = strategyState.codexModel || "";
-      modelInput.placeholder = activeProvider && activeProvider.default_model ? activeProvider.default_model : "Enter model id";
-      modelInput.addEventListener("input", () => {
-        strategyState.codexModel = modelInput.value || "";
-      });
       modelBlock.append(modelLabel, modelInput);
     }
     providerRow.appendChild(modelBlock);

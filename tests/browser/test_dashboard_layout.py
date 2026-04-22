@@ -836,10 +836,20 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert "balanced-plus" in codex_text
                 assert page.locator("#strategies-codex-provider").input_value(timeout=15_000) == "gemini"
                 assert page.locator("#strategies-codex-model").input_value(timeout=15_000) == "gemini-2.5-pro"
-                model_options = page.locator("#strategies-codex-model option").evaluate_all(
+                assert page.locator("#strategies-codex-model").get_attribute("list", timeout=15_000) == "strategies-codex-model-options"
+                model_options = page.locator("#strategies-codex-model-options option").evaluate_all(
                     "(nodes) => nodes.map((node) => node.value)"
                 )
                 assert model_options == ["gemini-2.5-pro", "gemini-2.5-flash"]
+                provider_row_box = page.locator("#strategies-codex-lab .strategy-codex-provider-row").bounding_box()
+                provider_box = page.locator("#strategies-codex-provider").bounding_box()
+                model_box = page.locator("#strategies-codex-model").bounding_box()
+                assert provider_row_box is not None
+                assert provider_box is not None
+                assert model_box is not None
+                provider_row_right = provider_row_box["x"] + provider_row_box["width"] + 2
+                assert provider_box["x"] + provider_box["width"] <= provider_row_right
+                assert model_box["x"] + model_box["width"] <= provider_row_right
                 page.locator('#strategies-focus-switch button[data-focus-mode="cities"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-focus-cities')?.hidden === false",
