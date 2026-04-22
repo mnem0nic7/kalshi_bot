@@ -15,7 +15,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage
 from kalshi_bot.core.fixed_point import as_decimal, make_client_order_id, quantize_count
 from kalshi_bot.core.metrics import ACTIVE_ROOMS, ORDERS_TOTAL, ROOM_RUNS_TOTAL
-from kalshi_bot.core.schemas import ExecReceiptPayload, MemoryNotePayload, RoomMessageCreate, RoomMessageRead, TradeTicket
+from kalshi_bot.core.schemas import ExecReceiptPayload, MemoryNotePayload, RiskVerdictPayload, RoomMessageCreate, RoomMessageRead, TradeTicket
 from kalshi_bot.db.models import Room
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
@@ -295,13 +295,14 @@ class WorkflowSupervisor:
                 position_cap = float(total_capital) * self.settings.risk_position_pct
                 daily_pnl = await repo.get_daily_pnl_dollars(kalshi_env=room.kalshi_env)
                 loss_sensitivity_active = False
-                if (
-                    daily_pnl is not None
-                    and float(total_capital) > 0
-                    and self.settings.risk_daily_loss_sensitivity_pct > 0
-                ):
+                daily_loss_hard_blocked = False
+                daily_loss_ratio = 0.0
+                if daily_pnl is not None and float(total_capital) > 0:
                     daily_loss_ratio = float(-daily_pnl) / float(total_capital)
-                    loss_sensitivity_active = daily_loss_ratio >= self.settings.risk_daily_loss_sensitivity_pct
+                    if self.settings.risk_daily_loss_pct > 0 and daily_loss_ratio >= self.settings.risk_daily_loss_pct:
+                        daily_loss_hard_blocked = True
+                    elif self.settings.risk_daily_loss_sensitivity_pct > 0:
+                        loss_sensitivity_active = daily_loss_ratio >= self.settings.risk_daily_loss_sensitivity_pct
 
                 effective_edge_bps = thresholds.risk_min_edge_bps
                 effective_order_cap = dynamic_order_cap
@@ -345,14 +346,23 @@ class WorkflowSupervisor:
                     portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                     open_ticker_count=open_ticker_count,
                 )
-                verdict = self.risk_engine.evaluate(
-                    room=room,
-                    control=control,
-                    ticket=ticket,
-                    signal=signal,
-                    context=risk_context,
-                    thresholds=effective_thresholds,
-                )
+                if daily_loss_hard_blocked:
+                    verdict = RiskVerdictPayload(
+                        status=RiskStatus.BLOCKED,
+                        reasons=[
+                            f"Daily loss circuit breaker: {daily_loss_ratio:.1%} loss "
+                            f">= {self.settings.risk_daily_loss_pct:.0%} hard limit."
+                        ],
+                    )
+                else:
+                    verdict = self.risk_engine.evaluate(
+                        room=room,
+                        control=control,
+                        ticket=ticket,
+                        signal=signal,
+                        context=risk_context,
+                        thresholds=effective_thresholds,
+                    )
                 await repo.save_risk_verdict(
                     room_id=room.id,
                     ticket_id=ticket_record.id,
@@ -928,14 +938,29 @@ class WorkflowSupervisor:
                             portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                             open_ticker_count=open_ticker_count,
                         )
-                        verdict = self.risk_engine.evaluate(
-                            room=room,
-                            control=control,
-                            ticket=ticket,
-                            signal=signal,
-                            context=risk_context,
-                            thresholds=effective_thresholds,
-                        )
+                        daily_pnl_llm = await repo.get_daily_pnl_dollars(kalshi_env=room.kalshi_env)
+                        _daily_loss_ratio_llm = 0.0
+                        _daily_hard_blocked_llm = False
+                        if daily_pnl_llm is not None and _cap > 0 and self.settings.risk_daily_loss_pct > 0:
+                            _daily_loss_ratio_llm = float(-daily_pnl_llm) / _cap
+                            _daily_hard_blocked_llm = _daily_loss_ratio_llm >= self.settings.risk_daily_loss_pct
+                        if _daily_hard_blocked_llm:
+                            verdict = RiskVerdictPayload(
+                                status=RiskStatus.BLOCKED,
+                                reasons=[
+                                    f"Daily loss circuit breaker: {_daily_loss_ratio_llm:.1%} loss "
+                                    f">= {self.settings.risk_daily_loss_pct:.0%} hard limit."
+                                ],
+                            )
+                        else:
+                            verdict = self.risk_engine.evaluate(
+                                room=room,
+                                control=control,
+                                ticket=ticket,
+                                signal=signal,
+                                context=risk_context,
+                                thresholds=effective_thresholds,
+                            )
                         await repo.save_risk_verdict(
                             room_id=room.id,
                             ticket_id=ticket_record.id,

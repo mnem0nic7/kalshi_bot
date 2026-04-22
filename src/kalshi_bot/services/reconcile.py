@@ -170,9 +170,9 @@ class ReconciliationService:
             pacific_date=pacific_today,
             kalshi_env=kalshi_env,
         )
-        if existing_baseline is None:
+        if existing_baseline is None or existing_baseline == Decimal("0"):
             total_capital = await repo.get_total_capital_dollars(kalshi_env=kalshi_env)
-            if total_capital is not None:
+            if total_capital is not None and total_capital > Decimal("0"):
                 await repo.set_daily_portfolio_baseline_dollars(
                     total_capital,
                     pacific_date=pacific_today,

@@ -277,8 +277,8 @@ async def test_strategy_regression_runs_with_template_only_weather_directory(mon
         async def list_strategies(self, *, active_only: bool = True) -> list[SimpleNamespace]:
             assert active_only is True
             return [
-                SimpleNamespace(id=1, name="aggressive", thresholds=next(p["thresholds"] for p in STRATEGY_PRESETS if p["name"] == "aggressive")),
-                SimpleNamespace(id=2, name="moderate", thresholds=next(p["thresholds"] for p in STRATEGY_PRESETS if p["name"] == "moderate")),
+                SimpleNamespace(id=1, name="aggressive", description=None, thresholds=next(p["thresholds"] for p in STRATEGY_PRESETS if p["name"] == "aggressive")),
+                SimpleNamespace(id=2, name="moderate", description=None, thresholds=next(p["thresholds"] for p in STRATEGY_PRESETS if p["name"] == "moderate")),
             ]
 
         async def get_strategy_regression_rooms(self, date_from: datetime, date_to: datetime) -> list[dict[str, object]]:
@@ -433,8 +433,8 @@ async def test_strategy_regression_tracks_unscored_trades_without_promoting(monk
         async def list_strategies(self, *, active_only: bool = True) -> list[SimpleNamespace]:
             assert active_only is True
             return [
-                SimpleNamespace(id=1, name="aggressive", thresholds=next(p["thresholds"] for p in STRATEGY_PRESETS if p["name"] == "aggressive")),
-                SimpleNamespace(id=2, name="moderate", thresholds=next(p["thresholds"] for p in STRATEGY_PRESETS if p["name"] == "moderate")),
+                SimpleNamespace(id=1, name="aggressive", description=None, thresholds=next(p["thresholds"] for p in STRATEGY_PRESETS if p["name"] == "aggressive")),
+                SimpleNamespace(id=2, name="moderate", description=None, thresholds=next(p["thresholds"] for p in STRATEGY_PRESETS if p["name"] == "moderate")),
             ]
 
         async def get_strategy_regression_rooms(self, date_from: datetime, date_to: datetime) -> list[dict[str, object]]:
