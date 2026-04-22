@@ -2716,4 +2716,12 @@
   setLastRefreshed();
   setInterval(refreshAll, REFRESH_MS);
   setInterval(refreshTimestamps, 15_000);
+
+  const refreshBtn = document.getElementById("dash-refresh-btn");
+  if (refreshBtn) {
+    refreshBtn.addEventListener("click", () => {
+      refreshBtn.disabled = true;
+      refreshAll().finally(() => { refreshBtn.disabled = false; });
+    });
+  }
 })();
