@@ -3097,7 +3097,7 @@ class HistoricalTrainingService:
                     portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
                         kalshi_env=room.kalshi_env,
                         subaccount=self.settings.kalshi_subaccount,
-                        total_capital_dollars=Decimal(str(thresholds.risk_max_position_notional_dollars)),
+                        total_capital_dollars=Decimal(str(thresholds.risk_max_position_notional_dollars or replay_capital or 500)),
                         safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
                         risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
                     )
