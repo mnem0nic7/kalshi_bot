@@ -131,7 +131,9 @@ def test_strategy_codex_service_prefers_gemini_when_available() -> None:
     assert service.is_available() is True
     assert service._preferred_provider_id() == "gemini"
     assert service._default_model_for_provider("gemini") == "gemini-2.5-pro"
-    assert service._provider_options()[0]["id"] == "gemini"
+    provider_options = service._provider_options()
+    assert provider_options[0]["id"] == "gemini"
+    assert provider_options[0]["suggested_models"] == ["gemini-2.5-pro", "gemini-2.5-flash"]
 
 
 def test_strategy_codex_service_reports_unavailable_without_strategy_providers() -> None:

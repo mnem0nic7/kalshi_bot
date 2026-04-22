@@ -816,6 +816,13 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert "Evidence interpretation" in detail_text
                 assert "Approval" in detail_text
                 assert page.locator("#strategies-cities-detail textarea").is_visible()
+                comparison_card_positions = page.locator("#strategies-cities-detail .strategy-comparison-card").evaluate_all(
+                    "(nodes) => nodes.slice(0, 2).map((node) => ({ left: Math.round(node.getBoundingClientRect().left), clientWidth: node.clientWidth, scrollWidth: node.scrollWidth }))"
+                )
+                assert len(comparison_card_positions) == 2
+                if viewport_name == "narrow":
+                    assert comparison_card_positions[0]["left"] == comparison_card_positions[1]["left"]
+                assert all(item["scrollWidth"] <= item["clientWidth"] + 2 for item in comparison_card_positions)
                 page.locator('#strategies-cities-detail [data-testid="strategy-open-evaluation-lab"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-focus-strategies')?.hidden === false",
@@ -829,6 +836,10 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert "balanced-plus" in codex_text
                 assert page.locator("#strategies-codex-provider").input_value(timeout=15_000) == "gemini"
                 assert page.locator("#strategies-codex-model").input_value(timeout=15_000) == "gemini-2.5-pro"
+                model_options = page.locator("#strategies-codex-model option").evaluate_all(
+                    "(nodes) => nodes.map((node) => node.value)"
+                )
+                assert model_options == ["gemini-2.5-pro", "gemini-2.5-flash"]
                 page.locator('#strategies-focus-switch button[data-focus-mode="cities"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-focus-cities')?.hidden === false",

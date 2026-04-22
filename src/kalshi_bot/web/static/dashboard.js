@@ -1042,6 +1042,19 @@
     return selectedProvider;
   }
 
+  function codexSuggestedModels(provider) {
+    const rawModels = provider && Array.isArray(provider.suggested_models) ? provider.suggested_models : [];
+    const seen = new Set();
+    const ordered = [];
+    rawModels.forEach((modelName) => {
+      const cleaned = String(modelName || "").trim();
+      if (!cleaned || seen.has(cleaned)) return;
+      seen.add(cleaned);
+      ordered.push(cleaned);
+    });
+    return ordered;
+  }
+
   function humanizeThresholdKey(key) {
     return String(key || "")
       .split("_")
@@ -1379,25 +1392,46 @@
     const modelBlock = el("div", "strategy-codex-provider-block");
     const modelLabel = el("label", "muted-label", "Model");
     modelLabel.setAttribute("for", "strategies-codex-model");
-    const modelInput = setTestId(el("input", "strategy-codex-model-input"), "strategy-codex-model");
-    modelInput.id = "strategies-codex-model";
-    modelInput.type = "text";
-    modelInput.disabled = !lab.available || strategyState.codexSubmitting;
-    modelInput.value = strategyState.codexModel || "";
-    modelInput.placeholder = activeProvider && activeProvider.default_model ? activeProvider.default_model : "Enter model id";
-    const modelListId = "strategies-codex-model-list";
-    modelInput.setAttribute("list", modelListId);
-    modelInput.addEventListener("input", () => {
-      strategyState.codexModel = modelInput.value || "";
-    });
-    const modelList = document.createElement("datalist");
-    modelList.id = modelListId;
-    (activeProvider && Array.isArray(activeProvider.suggested_models) ? activeProvider.suggested_models : []).forEach((modelName) => {
-      const optionNode = document.createElement("option");
-      optionNode.value = modelName;
-      modelList.appendChild(optionNode);
-    });
-    modelBlock.append(modelLabel, modelInput, modelList);
+    const suggestedModels = codexSuggestedModels(activeProvider);
+    if (suggestedModels.length) {
+      const modelSelect = setTestId(el("select", "strategy-codex-select"), "strategy-codex-model");
+      modelSelect.id = "strategies-codex-model";
+      modelSelect.disabled = !lab.available || strategyState.codexSubmitting;
+      const modelOptions = (
+        strategyState.codexModel && !suggestedModels.includes(strategyState.codexModel)
+          ? [strategyState.codexModel, ...suggestedModels]
+          : suggestedModels
+      );
+      modelOptions.forEach((modelName, index) => {
+        const optionNode = document.createElement("option");
+        optionNode.value = modelName;
+        optionNode.textContent = (
+          index === 0
+          && strategyState.codexModel
+          && modelName === strategyState.codexModel
+          && !suggestedModels.includes(modelName)
+        )
+          ? `${modelName} (current)`
+          : modelName;
+        optionNode.selected = modelName === (strategyState.codexModel || "");
+        modelSelect.appendChild(optionNode);
+      });
+      modelSelect.addEventListener("change", () => {
+        strategyState.codexModel = modelSelect.value || "";
+      });
+      modelBlock.append(modelLabel, modelSelect);
+    } else {
+      const modelInput = setTestId(el("input", "strategy-codex-model-input"), "strategy-codex-model");
+      modelInput.id = "strategies-codex-model";
+      modelInput.type = "text";
+      modelInput.disabled = !lab.available || strategyState.codexSubmitting;
+      modelInput.value = strategyState.codexModel || "";
+      modelInput.placeholder = activeProvider && activeProvider.default_model ? activeProvider.default_model : "Enter model id";
+      modelInput.addEventListener("input", () => {
+        strategyState.codexModel = modelInput.value || "";
+      });
+      modelBlock.append(modelLabel, modelInput);
+    }
     providerRow.appendChild(modelBlock);
     controls.appendChild(providerRow);
 

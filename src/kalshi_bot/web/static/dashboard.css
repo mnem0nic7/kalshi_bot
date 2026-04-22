@@ -849,6 +849,7 @@
 .strategy-threshold-group {
   display: grid;
   gap: 0.45rem;
+  min-width: 0;
   padding: 0.75rem;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.03);
@@ -865,13 +866,25 @@
 .strategy-threshold-list {
   margin: 0;
   display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
   gap: 0.25rem 0.75rem;
 }
 
 .strategy-threshold-list dt,
 .strategy-threshold-list dd {
   margin: 0;
+}
+
+.strategy-threshold-list dt {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.strategy-threshold-list dd {
+  justify-self: end;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .strategy-matrix-table {
@@ -1005,12 +1018,14 @@
 .strategy-comparison-grid {
   display: grid;
   gap: 0.85rem;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+  align-items: start;
 }
 
 .strategy-comparison-card {
   display: grid;
   gap: 0.65rem;
+  min-width: 0;
   padding: 0.85rem;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.03);
