@@ -269,7 +269,7 @@ class WorkflowSupervisor:
                 yes_price_dollars=signal.target_yes_price_dollars,
                 count_fp=count_fp,
                 capital_bucket=signal.capital_bucket,
-                time_in_force="gtc",
+                time_in_force="immediate_or_cancel",
             )
             if signal.size_factor < Decimal("1.00"):
                 scaled = quantize_count(ticket.count_fp * signal.size_factor)
