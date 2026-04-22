@@ -594,6 +594,7 @@ async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: 
         select(
             RiskVerdictRecord.ticket_id.label("ticket_id"),
             RiskVerdictRecord.status.label("risk_status"),
+            RiskVerdictRecord.reasons.label("risk_reasons"),
             RiskVerdictRecord.approved_notional_dollars.label("approved_notional_dollars"),
             func.row_number()
             .over(partition_by=RiskVerdictRecord.ticket_id, order_by=RiskVerdictRecord.updated_at.desc())
@@ -610,6 +611,7 @@ async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: 
             TradeTicketRecord.status.label("status"),
             TradeTicketRecord.updated_at.label("updated_at"),
             latest_risk.c.risk_status,
+            latest_risk.c.risk_reasons,
             latest_risk.c.approved_notional_dollars,
         )
         .select_from(TradeTicketRecord)
@@ -633,6 +635,7 @@ async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: 
         side = str(row.side or "")
         status = str(row.status or "")
         risk_status = str(row.risk_status or "") if row.risk_status is not None else None
+        risk_reasons = [str(reason) for reason in (row.risk_reasons or []) if str(reason or "").strip()]
         rows.append(
             {
                 "market_ticker": str(row.market_ticker or ""),
@@ -644,6 +647,7 @@ async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: 
                 "status_tone": _trade_proposal_tone(status),
                 "risk_status": risk_status,
                 "risk_status_tone": _trade_proposal_tone(risk_status),
+                "risk_reasons": risk_reasons,
                 "approved_notional_dollars": str(approved_notional.quantize(Decimal("0.0001"))) if approved_notional is not None else None,
                 "updated_at": _iso_or_none(row.updated_at),
             }

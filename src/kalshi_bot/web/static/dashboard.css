@@ -320,6 +320,19 @@
   gap: 0.35rem;
 }
 
+.proposal-risk-cell {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.proposal-risk-reasons {
+  color: #b8c7da;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .position-flag {
   display: inline-flex;
   align-items: center;

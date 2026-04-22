@@ -354,6 +354,7 @@ async def test_recent_trade_proposal_views_formats_rows() -> None:
                 count_fp=Decimal("12.50"),
                 status="proposed",
                 risk_status="blocked",
+                risk_reasons=["Spread too wide for entry.", "Remaining payout below threshold."],
                 approved_notional_dollars=None,
                 updated_at=now,
             ),
@@ -364,6 +365,7 @@ async def test_recent_trade_proposal_views_formats_rows() -> None:
                 count_fp=Decimal("8.00"),
                 status="proposed",
                 risk_status="approved",
+                risk_reasons=[],
                 approved_notional_dollars=Decimal("1.6800"),
                 updated_at=now,
             ),
@@ -383,6 +385,7 @@ async def test_recent_trade_proposal_views_formats_rows() -> None:
             "status_tone": "neutral",
             "risk_status": "blocked",
             "risk_status_tone": "bad",
+            "risk_reasons": ["Spread too wide for entry.", "Remaining payout below threshold."],
             "approved_notional_dollars": None,
             "updated_at": now.isoformat(),
         },
@@ -396,6 +399,7 @@ async def test_recent_trade_proposal_views_formats_rows() -> None:
             "status_tone": "neutral",
             "risk_status": "approved",
             "risk_status_tone": "good",
+            "risk_reasons": [],
             "approved_notional_dollars": "1.6800",
             "updated_at": now.isoformat(),
         },
@@ -610,6 +614,7 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
                     "status_tone": "neutral",
                     "risk_status": "blocked",
                     "risk_status_tone": "bad",
+                    "risk_reasons": ["Book effectively broken."],
                     "approved_notional_dollars": None,
                     "updated_at": now.isoformat(),
                 }
@@ -639,6 +644,7 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert payload["positions_summary"]["capital_buckets"]["risky_limit_display"] == "$75.00"
     assert payload["recent_trade_proposals"][0]["market_ticker"] == "KXHIGHCHI-26APR17-T79"
     assert payload["recent_trade_proposals"][0]["risk_status"] == "blocked"
+    assert payload["recent_trade_proposals"][0]["risk_reasons"] == ["Book effectively broken."]
     assert container.kalshi.get_market.await_count == 2
     assert container.watchdog_service.get_status.await_args.kwargs["kalshi_env"] == "demo"
     assert container.agent_pack_service.get_pack_for_color.await_args.args[1] == "green"

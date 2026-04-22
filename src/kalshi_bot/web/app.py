@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -660,7 +660,7 @@ def create_app() -> FastAPI:
         domain = container_type_settings.web_auth_cookie_domain
         return domain.strip() if isinstance(domain, str) and domain.strip() else None
 
-    def set_session_cookie(response: RedirectResponse, request: Request, token: str) -> None:
+    def set_session_cookie(response: Response, request: Request, token: str) -> None:
         app_container = container(request)
         cookie_kwargs: dict[str, Any] = {
             "key": app_container.settings.web_auth_cookie_name,
@@ -730,6 +730,7 @@ def create_app() -> FastAPI:
 
         cookie_token = request.cookies.get(settings.web_auth_cookie_name)
         clear_cookie = False
+        refresh_cookie_token: str | None = None
         if cookie_token:
             token_hash = hash_session_token(cookie_token)
             async with app_container.session_factory() as session:
@@ -747,9 +748,15 @@ def create_app() -> FastAPI:
                         await repo.delete_web_session(session_record.id)
                         clear_cookie = True
                     else:
-                        await repo.touch_web_session(session_record.id, seen_at=now)
+                        refreshed_expires_at = now + timedelta(seconds=settings.web_auth_session_ttl_seconds)
+                        session_record = await repo.touch_web_session(
+                            session_record.id,
+                            seen_at=now,
+                            expires_at=refreshed_expires_at,
+                        )
                         request.state.current_user = user
                         request.state.current_session = session_record
+                        refresh_cookie_token = cookie_token
                 await session.commit()
 
         if path in {"/login", "/register"}:
@@ -760,6 +767,8 @@ def create_app() -> FastAPI:
                 )
             else:
                 response = await call_next(request)
+            if refresh_cookie_token is not None and getattr(request.state, "current_user", None) is not None:
+                set_session_cookie(response, request, refresh_cookie_token)
             if clear_cookie:
                 clear_session_cookie(response, request)
             return response
@@ -774,6 +783,8 @@ def create_app() -> FastAPI:
             return auth_required_response(request, clear_cookie=clear_cookie)
 
         response = await call_next(request)
+        if refresh_cookie_token is not None:
+            set_session_cookie(response, request, refresh_cookie_token)
         if clear_cookie:
             clear_session_cookie(response, request)
         return response

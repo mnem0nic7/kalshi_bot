@@ -2930,11 +2930,19 @@ class PlatformRepository:
         stmt = select(WebSession).where(WebSession.token_hash == token_hash)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def touch_web_session(self, session_id: str, *, seen_at: datetime | None = None) -> WebSession | None:
+    async def touch_web_session(
+        self,
+        session_id: str,
+        *,
+        seen_at: datetime | None = None,
+        expires_at: datetime | None = None,
+    ) -> WebSession | None:
         record = await self.get_web_session(session_id)
         if record is None:
             return None
         record.last_seen_at = seen_at or datetime.now(UTC)
+        if expires_at is not None:
+            record.expires_at = expires_at
         await self.session.flush()
         return record
 

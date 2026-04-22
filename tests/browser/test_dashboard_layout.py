@@ -62,6 +62,7 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "status_tone": "neutral",
             "risk_status": "blocked",
             "risk_status_tone": "bad",
+            "risk_reasons": ["Spread too wide for entry."],
             "approved_notional_dollars": None,
         },
         {
@@ -74,6 +75,7 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "status_tone": "neutral",
             "risk_status": "approved",
             "risk_status_tone": "good",
+            "risk_reasons": [],
             "approved_notional_dollars": "5.0000",
         },
     ]
@@ -809,12 +811,14 @@ def test_recent_trade_proposals_render_at_bottom_of_demo_and_production(
                 assert "KXHIGHTPHX-26APR23-T92" in demo_text
                 assert "0.0400" in demo_text
                 assert "blocked" in demo_text
+                assert "Spread too wide for entry." in demo_text
 
                 page.locator('.dash-tab[data-env="production"]').click(timeout=15_000)
                 page.wait_for_selector('#panel-production [data-testid="recent-trade-proposals"]', timeout=15_000)
                 production_text = page.locator('#panel-production [data-testid="recent-trade-proposals"]').text_content(timeout=15_000) or ""
                 assert "KXHIGHNY-26APR23-T75" in production_text
                 assert "5.0000" in production_text
+                assert "Spread too wide for entry." in production_text
             finally:
                 browser.close()
 

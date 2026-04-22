@@ -229,7 +229,14 @@
               <td class="mono">{{ item.yes_price_dollars }}</td>
               <td class="mono">{{ item.count_fp }}</td>
               <td><span class="status-pill {% if item.status_tone == 'good' %}status-good{% elif item.status_tone == 'warning' %}status-warning{% elif item.status_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.status }}</span></td>
-              <td><span class="status-pill {% if item.risk_status_tone == 'good' %}status-good{% elif item.risk_status_tone == 'warning' %}status-warning{% elif item.risk_status_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.risk_status or "—" }}</span></td>
+              <td>
+                <div class="proposal-risk-cell">
+                  <span class="status-pill {% if item.risk_status_tone == 'good' %}status-good{% elif item.risk_status_tone == 'warning' %}status-warning{% elif item.risk_status_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.risk_status or "—" }}</span>
+                  {% if item.risk_status == "blocked" and item.risk_reasons %}
+                  <div class="proposal-risk-reasons">{{ item.risk_reasons | join(" ") }}</div>
+                  {% endif %}
+                </div>
+              </td>
               <td class="mono">{{ item.approved_notional_dollars or "—" }}</td>
             </tr>
             {% endfor %}

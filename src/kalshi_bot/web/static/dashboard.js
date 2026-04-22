@@ -71,6 +71,13 @@
     return "status-neutral";
   }
 
+  function proposalRiskReasonText(proposal) {
+    if (!proposal || proposal.risk_status !== "blocked" || !Array.isArray(proposal.risk_reasons) || !proposal.risk_reasons.length) {
+      return "";
+    }
+    return proposal.risk_reasons.map((reason) => String(reason || "").trim()).filter(Boolean).join(" ");
+  }
+
   function parseBootstrap() {
     const node = document.getElementById("strategies-bootstrap");
     if (!node) return null;
@@ -528,7 +535,13 @@
       statusTd.appendChild(el("span", `status-pill ${statusPillClass(statusTone)}`, proposal.status || "—"));
       const riskTd = el("td");
       const riskTone = proposal.risk_status_tone || tradeProposalTone(proposal.risk_status);
-      riskTd.appendChild(el("span", `status-pill ${statusPillClass(riskTone)}`, proposal.risk_status || "—"));
+      const riskWrap = el("div", "proposal-risk-cell");
+      riskWrap.appendChild(el("span", `status-pill ${statusPillClass(riskTone)}`, proposal.risk_status || "—"));
+      const riskReasonText = proposalRiskReasonText(proposal);
+      if (riskReasonText) {
+        riskWrap.appendChild(el("div", "proposal-risk-reasons", riskReasonText));
+      }
+      riskTd.appendChild(riskWrap);
       tr.append(
         el("td", "mono", proposal.market_ticker || "—"),
         sideTd,

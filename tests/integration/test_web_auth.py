@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime, timedelta
+
 from fastapi.testclient import TestClient
 
 from kalshi_bot.config import get_settings
+from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.web.auth import hash_session_token
 from kalshi_bot.web.app import create_app
 
 
 ALLOWED_EMAIL = "m7.ga.77@gmail.com"
 PASSWORD = "s3cure-passphrase"
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _create_auth_enabled_app(tmp_path, monkeypatch):
@@ -161,4 +170,49 @@ def test_register_uses_shared_cookie_domain_when_configured(tmp_path, monkeypatc
 
     assert response.status_code == 303
     assert "Domain=.ai-al.site" in response.headers["set-cookie"]
+    get_settings.cache_clear()
+
+
+def test_authenticated_api_request_refreshes_session_expiry_and_cookie(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("WEB_AUTH_SESSION_TTL_SECONDS", "60")
+    app = _create_auth_enabled_app(tmp_path, monkeypatch)
+    settings = get_settings()
+
+    with TestClient(app) as client:
+        register_response = client.post(
+            "/register",
+            data={"email": ALLOWED_EMAIL, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        assert register_response.status_code == 303
+        cookie_token = client.cookies.get(settings.web_auth_cookie_name)
+        assert cookie_token
+
+        async def shorten_session_expiry() -> datetime:
+            async with app.state.container.session_factory() as session:
+                repo = PlatformRepository(session)
+                session_record = await repo.get_web_session_by_token_hash(hash_session_token(cookie_token))
+                assert session_record is not None
+                session_record.expires_at = datetime.now(UTC) + timedelta(seconds=5)
+                await session.commit()
+                return session_record.expires_at
+
+        shortened_expiry = asyncio.run(shorten_session_expiry())
+
+        response = client.get("/api/dashboard/strategies")
+
+        async def read_session_expiry() -> datetime:
+            async with app.state.container.session_factory() as session:
+                repo = PlatformRepository(session)
+                session_record = await repo.get_web_session_by_token_hash(hash_session_token(cookie_token))
+                assert session_record is not None
+                await session.commit()
+                return session_record.expires_at
+
+        refreshed_expiry = asyncio.run(read_session_expiry())
+
+    assert response.status_code == 200
+    assert f"{settings.web_auth_cookie_name}=" in response.headers.get("set-cookie", "")
+    assert "Max-Age=60" in response.headers.get("set-cookie", "")
+    assert _as_utc(refreshed_expiry) > _as_utc(shortened_expiry) + timedelta(seconds=30)
     get_settings.cache_clear()
