@@ -2,7 +2,7 @@
 
 **Version:** 2.0
 **Audience:** Coding team
-**Last updated:** April 21, 2026
+**Last updated:** April 22, 2026
 
 ---
 
@@ -159,7 +159,7 @@ Three exit triggers checked every 60 seconds. Each evaluation first verifies tha
 
 1. **Reverse-side evaluation (immediate)**: One room is triggered immediately after a stop-loss to evaluate the opposite side. If the price move that caused the stop-loss has created a favorable edge on the other side (e.g., a YES stop-loss followed by falling prices → NO edge), this room trades it. Marked `reverse_evaluated: true` after firing.
 2. **4-hour timeout**: After `stop_loss_reentry_cooldown_seconds` (4h) from the stop-loss timestamp, re-entry is allowed unconditionally.
-3. **Momentum confirmation**: Within the 4h window (after reverse evaluation), re-entry requires a 5-minute price history with |slope| ≥ 0.2 ¢/min.
+3. **Momentum confirmation**: Within the 4h window (after reverse evaluation), re-entry requires a 5-minute price history with a *directional* slope confirming recovery: slope_yes > +0.2 ¢/min for a stopped YES position, or slope_yes < −0.2 ¢/min for a stopped NO position.
 
 Each daily weather contract has a unique ticker (e.g., `KXHIGHTBOS-26APR21-T55`), so yesterday's stop-loss checkpoint never affects today's contract — daily reset is implicit in the ticker structure. The checkpoint is overwritten on the next stop-loss exit on the same ticker.
 
@@ -397,7 +397,12 @@ Three-stage workflow triggered manually via the control room or on a configured 
 
 1. **Critique**: Selects recent rooms from the training corpus, bundles their messages + signals + verdicts, sends to an LLM critic, and proposes changes to agent pack configuration (e.g., edge buffer adjustments, model assignments).
 2. **Evaluate**: Replays the holdout set (20% of training rooms) under the candidate pack. Promotes if win-rate improvement ≥ 2% and no critical regression > 1%.
-3. **Promote**: Assigns the candidate pack to the inactive deployment color. The next blue/green failover or manual switch activates it.
+3. **Promote**: Writes a pending pack-promotion checkpoint for the inactive deployment color, restarts that color, and lets its daemon apply the candidate pack on startup before canary rooms begin.
+
+Canary rollout is bounded:
+
+- `self_improve_canary_min_rooms` and `self_improve_canary_min_seconds` define the minimum evidence window before promotion
+- `self_improve_canary_max_seconds` defines the maximum time a staged canary may remain `running` before the status surface marks it `stalled`
 
 **Readiness gates for training corpus:**
 
@@ -425,7 +430,9 @@ Three-stage workflow triggered manually via the control room or on a configured 
 - `GET /readyz` — container health check
 - `GET /metrics` — Prometheus scrape endpoint
 
-**Control room tabs:** Summary · Rooms · Agent Packs · Self-Improve · Historical Intelligence · Watchdog · Strategies
+**Control room layout:** Top summary strip plus lazy-loaded `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations` tabs.
+The summary bootstrap avoids live all-city discovery and uses lightweight room snapshots so `/` and `/api/control-room/summary` stay responsive as configured cities and room history grow.
+The `Research` tab includes an 180d-only assignment review queue for canonical city strategy assignments, including `drifted_assignment`, `evidence_weakened`, `ready_for_approval`, `aligned`, and `waiting_for_evidence` states plus the latest approval note in city detail.
 
 **Prometheus metrics:**
 - `kalshi_orders_placed_total{market, side}`
@@ -510,7 +517,7 @@ Both colors run simultaneously. Only the active color holds the execution lock. 
 
 Runs in both daemon containers. Checks every `daemon_heartbeat_interval_seconds` (60s):
 - **App health**: HTTP GET to `http://app_{color}:8000/readyz`
-- **Daemon health**: heartbeat checkpoint freshness (`daemon_heartbeat:{color}`)
+- **Daemon health**: heartbeat checkpoint freshness (`daemon_heartbeat:{kalshi_env}:{color}`)
 
 Actions on failure:
 1. Inactive color unhealthy → restart it.
@@ -578,6 +585,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `STOP_LOSS_REENTRY_COOLDOWN_SECONDS` | 14400 | 4h max; overridden by momentum re-entry gate |
 | `STOP_LOSS_MOMENTUM_REENTRY_WINDOW_SECONDS` | 300 | 5-min window for momentum re-entry check |
 | `STOP_LOSS_SUBMIT_COOLDOWN_SECONDS` | 300 | Min 5 min between stop-loss submissions |
+| `SELF_IMPROVE_CANARY_MAX_SECONDS` | 21600 | Max staged-canary lifetime before status becomes `stalled` |
 
 ---
 
@@ -623,12 +631,12 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 ### Go-live checklist
 
 - [ ] ≥ 2 weeks of continuous autonomous demo trading (no manual interventions)
-- [ ] ≥ 20 resolved trades in demo with ≥ 70% win rate and positive P&L overall
+- [ ] ≥ 20 resolved trades in demo with ≥ 70% win rate and positive P&L overall (win = realized P&L positive: sell price beat entry for stopped-out positions; contract settled on our side for positions held to expiry — tracked by `get_fill_win_rate_30d()`)
 - [ ] σ calibration gate: run `python scripts/calibrate_sigma.py` — median bps error < 2700 bps across all city/month cells with ≥ 5 samples (the 2500 bps threshold accounts for structural sensitivity of near-50% contracts; σ values in `weather/scoring.py` were derived from 2911 market-days of empirical data and should be re-run after each full season of new data)
 - [ ] Zero unreconciled positions or order mismatches during demo period
-- [ ] No stop-loss exits due to model error (only market-move exits acceptable)
+- [ ] No stop-loss exits with `possible_model_error=true` (trailing_loss_ratio > 30% within first 2 hours of hold — ops events are tagged automatically; review the ops log before go-live)
 - [ ] Kill switch and shadow mode tested end-to-end in demo
-- [ ] Production RSA key loaded and verified
+- [ ] Production RSA key loaded and verified (`chmod 600 <key_path>` — startup raises `PermissionError` if group/other-readable)
 - [ ] `APP_SHADOW_MODE=false` and `APP_ENABLE_KILL_SWITCH=false` confirmed in production env
 - [ ] `KALSHI_ENV=production` set
 - [ ] Daily review ritual established for first 2 weeks post-launch

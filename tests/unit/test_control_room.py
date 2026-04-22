@@ -762,15 +762,24 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
     assert set(payload) == {"summary", "leaderboard", "city_matrix", "detail_context", "recent_promotions", "methodology"}
     assert payload["summary"]["window_days"] == 180
     assert payload["summary"]["recommendation_mode"] == "recommendation_only"
+    assert payload["summary"]["review_available"] is True
+    assert payload["summary"]["review_window_days"] == 180
     assert payload["summary"]["best_strategy_name"] == "moderate"
     assert payload["summary"]["strong_recommendations_count"] == 2
     assert payload["summary"]["lean_recommendations_count"] == 0
+    assert payload["summary"]["ready_for_approval_count"] == 0
+    assert payload["summary"]["needs_review_count"] == 1
+    assert payload["summary"]["drifted_assignments_count"] == 1
+    assert payload["summary"]["evidence_weakened_count"] == 0
+    assert payload["summary"]["aligned_assignments_count"] == 1
     assert payload["detail_context"]["type"] == "strategy"
     city_row = next(row for row in payload["city_matrix"] if row["series_ticker"] == "KXHIGHNY")
     assert city_row["best_strategy"] == "moderate"
     assert city_row["assignment"]["strategy_name"] == "aggressive"
     assert city_row["recommendation"]["strategy_name"] == "moderate"
     assert city_row["recommendation"]["status"] == "strong_recommendation"
+    assert city_row["review"]["status"] == "drifted_assignment"
+    assert city_row["review"]["needs_review"] is True
     assert city_row["assignment_context_status"] == "differs_from_recommendation"
     assert city_row["approval_eligible"] is True
     assert city_row["approval_label"] == "Ready to approve"
@@ -783,6 +792,44 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
     assert payload["summary"]["recent_approvals_count"] == 1
     assert payload["leaderboard"][0]["name"] == "moderate"
     assert payload["leaderboard"][0]["outcome_coverage_display"] == "50/50 scored"
+
+
+def test_city_review_state_classifies_all_review_states() -> None:
+    assert control_room_module._city_review_state(
+        window_days=180,
+        assigned_name=None,
+        recommendation={"strategy_name": "moderate", "status": "strong_recommendation"},
+    ) == {
+        "status": "ready_for_approval",
+        "label": "Ready for approval",
+        "reason": "This city is unassigned and the latest 180d winner is eligible for manual approval.",
+        "needs_review": False,
+        "basis_window_days": 180,
+    }
+    assert control_room_module._city_review_state(
+        window_days=180,
+        assigned_name="aggressive",
+        recommendation={"strategy_name": "moderate", "status": "strong_recommendation"},
+    )["status"] == "drifted_assignment"
+    assert control_room_module._city_review_state(
+        window_days=180,
+        assigned_name="moderate",
+        recommendation={"strategy_name": "moderate", "status": "strong_recommendation"},
+    )["status"] == "aligned"
+    weakened = control_room_module._city_review_state(
+        window_days=180,
+        assigned_name="moderate",
+        recommendation={"strategy_name": "moderate", "status": "low_sample"},
+    )
+    assert weakened["status"] == "evidence_weakened"
+    assert weakened["needs_review"] is True
+    waiting = control_room_module._city_review_state(
+        window_days=180,
+        assigned_name=None,
+        recommendation={"strategy_name": "moderate", "status": "low_sample"},
+    )
+    assert waiting["status"] == "waiting_for_evidence"
+    assert waiting["needs_review"] is False
 
 
 @pytest.mark.asyncio
@@ -846,11 +893,15 @@ async def test_build_strategies_dashboard_live_window_builds_city_detail(monkeyp
 
     assert payload["summary"]["window_days"] == 30
     assert payload["summary"]["source_mode"] == "live_eval"
+    assert payload["summary"]["review_available"] is False
+    assert payload["summary"]["ready_for_approval_count"] is None
     assert payload["summary"]["cities_evaluated"] == 2
     assert payload["detail_context"]["type"] == "city"
     assert payload["detail_context"]["selected_series_ticker"] == "KXHIGHNY"
     assert payload["detail_context"]["city"]["approval_eligible"] is False
+    assert payload["detail_context"]["city"]["review"]["status"] is None
     assert payload["detail_context"]["approval"]["eligible"] is False
+    assert payload["detail_context"]["review"]["available"] is False
     assert payload["detail_context"]["recommendation_rationale"]["best_strategy"] in {"aggressive", "moderate"}
     assert payload["detail_context"]["recommendation_rationale"]["best_outcome_coverage_display"].endswith("scored")
     assert payload["detail_context"]["recommendation_rationale"]["recommendation_status"] == "low_sample"

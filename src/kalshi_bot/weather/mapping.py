@@ -19,7 +19,11 @@ class WeatherMarketDirectory:
     @classmethod
     def from_file(cls, path: Path) -> "WeatherMarketDirectory":
         if not path.exists():
-            return cls({})
+            raise FileNotFoundError(
+                f"Weather market map not found: {path}\n"
+                "Set WEATHER_MARKET_MAP_PATH to a valid YAML file. "
+                "See docs/examples/weather_markets.example.yaml for the format."
+            )
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if isinstance(raw, list):
             items = raw

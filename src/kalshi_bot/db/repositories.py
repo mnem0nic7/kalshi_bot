@@ -768,6 +768,14 @@ class PlatformRepository:
         result = await self.session.execute(stmt)
         return result.rowcount or 0
 
+    async def vacuum_memory_notes(self, *, older_than_days: int) -> int:
+        """Delete memory notes (and their cascade-linked embeddings) older than the retention window."""
+        from sqlalchemy import delete as sa_delete
+        cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+        stmt = sa_delete(MemoryNoteRecord).where(MemoryNoteRecord.created_at < cutoff)
+        result = await self.session.execute(stmt)
+        return result.rowcount or 0
+
     async def get_latest_trade_ticket_for_room(self, room_id: str) -> TradeTicketRecord | None:
         stmt = (
             select(TradeTicketRecord)
@@ -1120,17 +1128,51 @@ class PlatformRepository:
         return settled
 
     async def get_fill_win_rate_30d(self, *, kalshi_env: str | None = None) -> dict[str, Any]:
-        """Return 30-day rolling win rate by contract count."""
+        """Return 30-day rolling realized P&L win rate by contract count.
+
+        A position is a win if:
+        - It was sold (stop-loss or manual exit) at a better price than entry, OR
+        - It was held to settlement and the market resolved on our side.
+        Settlement-based result is used only when no sell fill exists for the ticker+side.
+        """
         cutoff = datetime.now(UTC) - timedelta(days=30)
         env = self._resolved_kalshi_env(kalshi_env)
         stmt = select(FillRecord).where(
             FillRecord.kalshi_env == env,
             FillRecord.created_at >= cutoff,
-            FillRecord.settlement_result.in_(["win", "loss"]),
         )
-        fills = list((await self.session.execute(stmt)).scalars())
-        won = sum(float(f.count_fp) for f in fills if f.settlement_result == "win")
-        total = sum(float(f.count_fp) for f in fills)
+        all_fills = list((await self.session.execute(stmt)).scalars())
+
+        # Group by (market_ticker, side)
+        buys: dict[tuple[str, str], list[FillRecord]] = {}
+        sells: dict[tuple[str, str], list[FillRecord]] = {}
+        for fill in all_fills:
+            key = (fill.market_ticker, fill.side)
+            if fill.action == "buy":
+                buys.setdefault(key, []).append(fill)
+            elif fill.action == "sell":
+                sells.setdefault(key, []).append(fill)
+
+        won = 0.0
+        total = 0.0
+        for key, buy_fills in buys.items():
+            _ticker, side = key
+            sell_fills = sells.get(key, [])
+            for buy_fill in buy_fills:
+                count = float(buy_fill.count_fp)
+                total += count
+                if sell_fills:
+                    # Realized exit: weight-average sell price across any partial fills.
+                    sell_count = sum(float(s.count_fp) for s in sell_fills)
+                    if sell_count > 0:
+                        avg_sell = sum(float(s.yes_price_dollars) * float(s.count_fp) for s in sell_fills) / sell_count
+                        buy_px = float(buy_fill.yes_price_dollars)
+                        profitable = avg_sell > buy_px if side == "yes" else avg_sell < buy_px
+                        if profitable:
+                            won += count
+                elif buy_fill.settlement_result == "win":
+                    won += count
+
         return {"won_contracts": won, "total_contracts": total}
 
     async def get_position(

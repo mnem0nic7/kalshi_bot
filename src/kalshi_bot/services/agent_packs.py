@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from kalshi_bot.config import Settings
@@ -169,16 +169,30 @@ class AgentPackService:
         evaluation_run_id: str | None,
         promotion_event_id: str,
         previous_version: str | None = None,
+        kalshi_env: str = "demo",
     ) -> dict[str, Any]:
-        await self.assign_pack_to_color(repo, color=inactive_color, version=candidate_version)
+        # Write the pack assignment as a pending checkpoint rather than directly modifying
+        # deployment_control.notes — the daemon on the inactive color applies it at startup,
+        # making promotion safe across concurrent watchdog failovers.
+        await repo.set_checkpoint(
+            f"pending_pack_promotion:{kalshi_env}:{inactive_color}",
+            cursor=None,
+            payload={
+                "candidate_version": candidate_version,
+                "promotion_event_id": promotion_event_id,
+                "staged_at": datetime.now(UTC).isoformat(),
+            },
+        )
         control = await repo.get_deployment_control()
         notes = self._notes(control)
         notes["candidate_version"] = candidate_version
+        started_at = datetime.now(UTC)
         notes["canary"] = {
             "status": "running",
             "color": inactive_color,
             "version": candidate_version,
-            "started_at": datetime.now(UTC).isoformat(),
+            "started_at": started_at.isoformat(),
+            "expires_at": (started_at + timedelta(seconds=self.settings.self_improve_canary_max_seconds)).isoformat(),
             "required_rooms": self.settings.self_improve_canary_min_rooms,
             "min_seconds": self.settings.self_improve_canary_min_seconds,
             "evaluation_run_id": evaluation_run_id,

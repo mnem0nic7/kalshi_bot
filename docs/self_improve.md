@@ -1,6 +1,6 @@
 # Self Improve
 
-This system can run Gemini-first agent packs, critique recent shadow or demo rooms, evaluate a candidate pack on a holdout slice, stage the candidate on the inactive blue or green color, and roll back if canary or live guardrails fail.
+This system can run Gemini-first agent packs, critique recent shadow or demo rooms, evaluate a candidate pack on a holdout slice, stage the candidate on the inactive blue or green color through a pending-promotion checkpoint, and roll back if canary or live guardrails fail.
 
 ## Runtime Model Routing
 
@@ -76,7 +76,7 @@ Two workflows support the control plane:
    - `self-improve critique`
    - `self-improve eval`
    - `self-improve promote` when the holdout summary passes
-3. Restarts only the inactive color after staging so canary shadow rooms can begin.
+3. Restarts only the inactive color after staging so its daemon can apply the pending pack checkpoint on startup and begin canary shadow rooms.
 
 `Rollback Agent Pack` is manual-only and restores the previous pack version on the server.
 
@@ -92,11 +92,13 @@ Required GitHub Secrets:
 
 After a candidate is staged:
 
-- the inactive color receives the candidate pack version
+- a `pending_pack_promotion:<kalshi_env>:<color>` checkpoint is written instead of immediately mutating the inactive color assignment
+- the inactive `daemon_<color>` applies that checkpoint on startup before entering the main loop
 - the inactive `daemon_<color>` begins generating canary shadow rooms during heartbeats
-- once both thresholds are satisfied:
+- the canary remains `running` until both thresholds are satisfied:
   - `SELF_IMPROVE_CANARY_MIN_ROOMS`
   - `SELF_IMPROVE_CANARY_MIN_SECONDS`
+- if the staged canary sits longer than `SELF_IMPROVE_CANARY_MAX_SECONDS`, `self-improve status` marks it `stalled` so operators do not mistake an abandoned rollout for an active one
 - the system flips the active color and starts a live-monitor window
 
 Guardrails that trigger automatic rollback:
@@ -125,6 +127,7 @@ Important runtime envs:
 - `SELF_IMPROVE_MAX_CRITICAL_REGRESSION`
 - `SELF_IMPROVE_CANARY_MIN_ROOMS`
 - `SELF_IMPROVE_CANARY_MIN_SECONDS`
+- `SELF_IMPROVE_CANARY_MAX_SECONDS`
 - `SELF_IMPROVE_LIVE_MONITOR_SECONDS`
 - `SELF_IMPROVE_RESEARCH_GATE_FAILURE_THRESHOLD`
 - `SELF_IMPROVE_BLOCKED_ORDER_THRESHOLD`

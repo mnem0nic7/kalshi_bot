@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -31,6 +32,9 @@ class SelfImproveResult:
     payload: dict[str, Any]
 
 
+logger = logging.getLogger(__name__)
+
+
 class SelfImproveService:
     def __init__(
         self,
@@ -48,6 +52,34 @@ class SelfImproveService:
         self.agent_pack_service = agent_pack_service
         self.risk_engine = risk_engine
 
+    async def apply_pending_pack_promotion(self, *, app_color: str) -> dict[str, Any] | None:
+        """Apply a pending pack promotion checkpoint at daemon startup.
+
+        Called before the main loop begins so that a failover mid-staging never
+        leaves the newly-active color on a stale pack version.
+        """
+        cp_key = f"pending_pack_promotion:{self.settings.kalshi_env}:{app_color}"
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            cp = await repo.get_checkpoint(cp_key)
+            if cp is None:
+                return None
+            candidate_version = cp.payload.get("candidate_version")
+            if not candidate_version:
+                return None
+            await self.agent_pack_service.assign_pack_to_color(
+                repo, color=app_color, version=candidate_version
+            )
+            # Clear the pending checkpoint so subsequent startups skip it.
+            await repo.set_checkpoint(cp_key, cursor=None, payload={"applied": True, "candidate_version": candidate_version})
+            await session.commit()
+        logger.info(
+            "Applied pending pack promotion %s to color %s at startup",
+            candidate_version,
+            app_color,
+        )
+        return {"applied_version": candidate_version, "color": app_color}
+
     async def get_status(self) -> dict[str, Any]:
         if self.training_corpus_service is None:
             raise RuntimeError("Training corpus service is not configured")
@@ -61,6 +93,14 @@ class SelfImproveService:
             await self.agent_pack_service.ensure_initialized(repo)
             control = await repo.get_deployment_control()
             notes = dict(control.notes.get("agent_packs") or {})
+            canary = notes.get("canary")
+            if (
+                canary is not None
+                and canary.get("status") == "running"
+                and canary.get("expires_at") is not None
+                and datetime.now(UTC) > datetime.fromisoformat(canary["expires_at"])
+            ):
+                notes["canary"] = {**canary, "status": "stalled"}
             packs = [record.payload for record in await repo.list_agent_packs(limit=10)]
             critiques = await repo.list_critique_runs(limit=5)
             evaluations = await repo.list_evaluation_runs(limit=5)
@@ -291,6 +331,7 @@ class SelfImproveService:
                 evaluation_run_id=evaluation_run_id,
                 promotion_event_id=promotion.id,
                 previous_version=previous_pack.version,
+                kalshi_env=self.settings.kalshi_env,
             )
             await session.commit()
         return SelfImproveResult(

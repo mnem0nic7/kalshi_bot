@@ -216,76 +216,132 @@
   >
     <div class="strategies-toolbar panel">
       <div class="strategies-toolbar-block">
+        <span class="muted-label">Focus</span>
+        <div class="strategies-focus-switch" id="strategies-focus-switch" role="tablist" aria-label="Strategies focus view"></div>
+      </div>
+      <div class="strategies-toolbar-block">
         <span class="muted-label">Window</span>
         <div class="strategies-window-filter" id="strategies-window-filter" role="tablist" aria-label="Strategy research window"></div>
       </div>
-      <div class="strategies-toolbar-block">
-        <label class="muted-label" for="strategies-city-sort">City sort</label>
-        <select id="strategies-city-sort" class="strategies-sort-select">
-          <option value="priority">Recommendation priority</option>
-          <option value="series">Series</option>
-          <option value="gap">Win-rate gap</option>
-          <option value="best_win_rate">Best win rate</option>
-        </select>
-      </div>
-      <a class="strategies-methodology-link" href="#strategy-methodology">Methodology</a>
     </div>
 
     <div class="dash-summary strategies-summary" id="strategies-summary"></div>
 
-    <div class="strategies-primary-grid">
-      <article class="dash-card">
-        <div class="dash-card-header">
-          <div class="dash-card-title-block">
-            <h2>Strategy Leaderboard</h2>
-            <span class="muted-label" id="strategies-leaderboard-meta">Preset comparison across the selected window</span>
+    <section class="strategies-focus-panel" id="strategies-focus-review">
+      <div class="strategies-review-grid">
+        <article class="dash-card" id="strategies-review-queue-card" hidden>
+          <div class="dash-card-header">
+            <div class="dash-card-title-block">
+              <h2>Assignment Review Queue</h2>
+              <span class="muted-label" id="strategies-review-queue-meta">The latest 180d assignment review workflow</span>
+            </div>
           </div>
-        </div>
-        <div id="strategies-leaderboard"></div>
-      </article>
+          <div id="strategies-review-queue"></div>
+        </article>
 
-      <article class="dash-card">
-        <div class="dash-card-header">
-          <div class="dash-card-title-block">
-            <h2>Detail Drilldown</h2>
-            <span class="muted-label" id="strategies-detail-meta">Select a strategy card or city row to inspect recommendation evidence.</span>
+        <article class="dash-card strategies-detail-card">
+          <div class="dash-card-header">
+            <div class="dash-card-title-block">
+              <h2>Decision Brief</h2>
+              <span class="muted-label" id="strategies-review-detail-meta">Loading decision brief...</span>
+            </div>
           </div>
-        </div>
-        <div id="strategies-detail"></div>
-      </article>
-    </div>
+          <div id="strategies-review-detail"></div>
+        </article>
+      </div>
+    </section>
 
-    <article class="dash-card">
-      <div class="dash-card-header">
-        <div class="dash-card-title-block">
-          <h2>City Comparison Matrix</h2>
-          <span class="muted-label" id="strategies-matrix-meta">Recommendations, runner-up gaps, and per-strategy metrics by city</span>
+    <section class="strategies-focus-panel" id="strategies-focus-cities" hidden>
+      <div class="strategies-subtoolbar panel">
+        <div class="strategies-toolbar-block">
+          <label class="muted-label" for="strategies-city-search">City search</label>
+          <input
+            id="strategies-city-search"
+            class="strategies-search-input"
+            type="search"
+            placeholder="Search series or city"
+            autocomplete="off"
+          />
+        </div>
+        <div class="strategies-toolbar-block">
+          <label class="muted-label" for="strategies-city-sort">City sort</label>
+          <select id="strategies-city-sort" class="strategies-sort-select">
+            <option value="priority">Recommendation priority</option>
+            <option value="series">Series</option>
+            <option value="gap">Win-rate gap</option>
+            <option value="best_win_rate">Best win rate</option>
+          </select>
         </div>
       </div>
-      <div class="table-wrap" id="strategies-city-matrix"></div>
-    </article>
 
-    <div class="strategies-lower-grid">
-      <article class="dash-card">
-        <div class="dash-card-header">
-          <div class="dash-card-title-block">
-            <h2>Recent Strategy Changes</h2>
-            <span class="muted-label">Historical promotions and threshold tuning</span>
+      <div class="strategies-primary-grid strategies-cities-grid">
+        <article class="dash-card">
+          <div class="dash-card-header">
+            <div class="dash-card-title-block">
+              <h2>City Comparison Matrix</h2>
+              <span class="muted-label" id="strategies-matrix-meta">Recommendations, runner-up gaps, and best-city evidence</span>
+            </div>
           </div>
-        </div>
-        <div id="strategies-recent"></div>
-      </article>
+          <div class="table-wrap" id="strategies-city-matrix"></div>
+        </article>
 
-      <article class="dash-card" id="strategy-methodology">
-        <div class="dash-card-header">
-          <div class="dash-card-title-block">
-            <h2>Methodology</h2>
-            <span class="muted-label">Interpret the research before acting on it</span>
+        <article class="dash-card strategies-detail-card">
+          <div class="dash-card-header">
+            <div class="dash-card-title-block">
+              <h2>Selection Detail</h2>
+              <span class="muted-label" id="strategies-cities-detail-meta">Select a city row to inspect recommendation evidence.</span>
+            </div>
           </div>
-        </div>
-        <div id="strategies-methodology"></div>
-      </article>
-    </div>
+          <div id="strategies-cities-detail"></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="strategies-focus-panel" id="strategies-focus-strategies" hidden>
+      <div class="strategies-primary-grid">
+        <article class="dash-card">
+          <div class="dash-card-header">
+            <div class="dash-card-title-block">
+              <h2>Strategy Leaderboard</h2>
+              <span class="muted-label" id="strategies-leaderboard-meta">Preset comparison across the selected window</span>
+            </div>
+          </div>
+          <div id="strategies-leaderboard"></div>
+        </article>
+
+        <article class="dash-card strategies-detail-card">
+          <div class="dash-card-header">
+            <div class="dash-card-title-block">
+              <h2>Detail Drilldown</h2>
+              <span class="muted-label" id="strategies-detail-meta">Select a strategy card or city row to inspect recommendation evidence.</span>
+            </div>
+          </div>
+          <div id="strategies-detail"></div>
+        </article>
+      </div>
+
+      <div class="strategies-lower-grid">
+        <article class="dash-card">
+          <div class="dash-card-header">
+            <div class="dash-card-title-block">
+              <h2>Recent Strategy Changes</h2>
+              <span class="muted-label">Historical promotions and threshold tuning</span>
+            </div>
+          </div>
+          <div id="strategies-recent"></div>
+        </article>
+
+        <article class="dash-card" id="strategy-methodology">
+          <div class="dash-card-header">
+            <div class="dash-card-title-block">
+              <h2>Methodology</h2>
+              <span class="muted-label">Interpret the research before acting on it</span>
+            </div>
+          </div>
+          <div id="strategies-methodology"></div>
+        </article>
+      </div>
+    </section>
 
     <script id="strategies-bootstrap" type="application/json">{{ strategies | tojson }}</script>
   </section>

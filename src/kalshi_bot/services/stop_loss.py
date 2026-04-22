@@ -242,6 +242,16 @@ class StopLossService:
         shadow = self.settings.app_shadow_mode
         action = f"stop_loss_{trigger}_shadow" if shadow else f"stop_loss_{trigger}"
 
+        created_at = position.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        hold_minutes = (now - created_at).total_seconds() / 60
+        possible_model_error = (
+            loss_ratio is not None
+            and loss_ratio > 0.30
+            and hold_minutes < 120
+        )
+
         event_payload: dict[str, Any] = {
             "market_ticker": market_ticker,
             "side": position.side,
@@ -251,9 +261,11 @@ class StopLossService:
             "sell_price": str(sell_price),
             "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
             "peak_price": str(peak) if peak is not None else None,
+            "hold_minutes": round(hold_minutes, 1),
             "shadow_mode": shadow,
             "action": action,
             "trigger": trigger,
+            "possible_model_error": possible_model_error,
         }
         if slope is not None:
             event_payload["momentum_slope_cents_per_min"] = round(slope, 4)
@@ -316,7 +328,7 @@ class StopLossService:
         )
 
         logger.warning(
-            "Stop loss %s [%s]: %s %s trailing_loss=%s peak=%s slope=%s",
+            "Stop loss %s [%s]: %s %s trailing_loss=%s peak=%s slope=%s hold=%.0fmin%s",
             "shadow" if shadow else "executed",
             trigger,
             market_ticker,
@@ -324,5 +336,7 @@ class StopLossService:
             f"{loss_ratio:.0%}" if loss_ratio is not None else "n/a",
             str(peak) if peak is not None else "n/a",
             f"{slope:.3f}¢/min" if slope is not None else "n/a",
+            hold_minutes,
+            " [POSSIBLE MODEL ERROR]" if possible_model_error else "",
         )
         return event_payload

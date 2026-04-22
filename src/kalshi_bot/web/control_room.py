@@ -1802,8 +1802,88 @@ def _checkpoint_promotion_views(checkpoint: Any) -> list[dict[str, Any]]:
 
 
 def _city_sort_priority(city_row: dict[str, Any]) -> int:
+    review = city_row.get("review") or {}
+    review_status = review.get("status")
+    if review_status == "drifted_assignment":
+        return 0
+    if review_status == "ready_for_approval":
+        return 1
+    if review_status == "evidence_weakened":
+        return 2
+    if review_status == "aligned":
+        return 3
+    if review_status == "waiting_for_evidence":
+        return 4
     recommendation = city_row.get("recommendation") or {}
     return _recommendation_sort_priority(str(recommendation.get("status") or "no_outcomes"))
+
+
+def _city_review_state(
+    *,
+    window_days: int,
+    assigned_name: str | None,
+    recommendation: dict[str, Any],
+) -> dict[str, Any]:
+    basis_window_days = STRATEGY_APPROVAL_WINDOW_DAYS
+    if window_days != basis_window_days:
+        return {
+            "status": None,
+            "label": f"{basis_window_days}d only",
+            "reason": "Assignment review is based only on the latest stored 180d snapshot.",
+            "needs_review": False,
+            "basis_window_days": basis_window_days,
+        }
+
+    recommendation_status = str(recommendation.get("status") or "no_outcomes")
+    recommendation_name = recommendation.get("strategy_name")
+    if assigned_name is None and recommendation_status in STRATEGY_APPROVAL_ELIGIBLE_STATUSES and recommendation_name:
+        return {
+            "status": "ready_for_approval",
+            "label": "Ready for approval",
+            "reason": "This city is unassigned and the latest 180d winner is eligible for manual approval.",
+            "needs_review": False,
+            "basis_window_days": basis_window_days,
+        }
+    if assigned_name is None:
+        return {
+            "status": "waiting_for_evidence",
+            "label": "Waiting for evidence",
+            "reason": "This city is still unassigned because the latest 180d evidence is not yet strong enough to approve.",
+            "needs_review": False,
+            "basis_window_days": basis_window_days,
+        }
+    if recommendation_status in STRATEGY_APPROVAL_ELIGIBLE_STATUSES and recommendation_name == assigned_name:
+        return {
+            "status": "aligned",
+            "label": "Aligned",
+            "reason": "The current canonical assignment still matches the latest eligible 180d recommendation.",
+            "needs_review": False,
+            "basis_window_days": basis_window_days,
+        }
+    if recommendation_status in STRATEGY_APPROVAL_ELIGIBLE_STATUSES and recommendation_name:
+        return {
+            "status": "drifted_assignment",
+            "label": "Drifted assignment",
+            "reason": (
+                f"The current canonical assignment ({assigned_name}) no longer matches the latest "
+                f"180d recommendation ({recommendation_name})."
+            ),
+            "needs_review": True,
+            "basis_window_days": basis_window_days,
+        }
+    if recommendation_status == "too_close":
+        reason = "The current assignment remains set, but the latest 180d winner is now too close to the runner-up."
+    elif recommendation_status == "low_sample":
+        reason = "The current assignment remains set, but the latest 180d snapshot is below the resolved-trade threshold."
+    else:
+        reason = "The current assignment remains set, but the latest 180d snapshot has no scored outcome evidence."
+    return {
+        "status": "evidence_weakened",
+        "label": "Evidence weakened",
+        "reason": reason,
+        "needs_review": True,
+        "basis_window_days": basis_window_days,
+    }
 
 
 def _city_approval_state(
@@ -1927,6 +2007,11 @@ def _build_strategy_research_sections(
             if assigned_name == recommendation["strategy_name"]
             else "differs_from_recommendation"
         )
+        review = _city_review_state(
+            window_days=window_days,
+            assigned_name=assigned_name,
+            recommendation=recommendation,
+        )
         approval_state = _city_approval_state(
             window_days=window_days,
             recommendation=recommendation,
@@ -2020,10 +2105,11 @@ def _build_strategy_research_sections(
             "assignment_status": recommendation["status"],
             "assignment_status_label": recommendation["label"],
             "recommendation": recommendation,
+            "review": review,
             "can_promote": False,
             **approval_state,
             "metrics": metric_cells,
-            "sort_priority": _city_sort_priority({"recommendation": recommendation}),
+            "sort_priority": _city_sort_priority({"recommendation": recommendation, "review": review}),
         })
 
     city_rows.sort(
@@ -2097,9 +2183,15 @@ def _build_strategy_research_sections(
         (row.get("recommendation") or {}).get("status") or "no_outcomes"
         for row in city_rows
     )
+    review_counts = Counter(
+        (row.get("review") or {}).get("status")
+        for row in city_rows
+        if (row.get("review") or {}).get("status")
+    )
     return leaderboard, city_rows, {
         "best_strategy": best_strategy,
         "recommendation_counts": dict(recommendation_counts),
+        "review_counts": dict(review_counts),
         "strategy_lookup": strategy_lookup,
     }
 
@@ -2193,6 +2285,7 @@ def _city_detail_context(
     strategy_lookup: dict[str, Any],
     history_rows: list[dict[str, Any]],
     strategy_events: list[dict[str, Any]],
+    window_days: int,
 ) -> dict[str, Any]:
     selected_series_ticker = selected_city["series_ticker"]
     ranking = sorted(list(selected_city["metrics"]), key=_strategy_result_rank_key, reverse=True)
@@ -2218,8 +2311,13 @@ def _city_detail_context(
         for event in strategy_events
         if event.get("series_ticker") == selected_series_ticker
     ][:8]
+    latest_approval_event = next(
+        (event for event in city_events if event.get("kind") == "assignment_approval"),
+        None,
+    )
     gap_to_assignment = selected_city.get("gap_to_assignment")
     recommendation = selected_city.get("recommendation") or {}
+    review = selected_city.get("review") or {}
     recommendation_rationale = {
         "best_strategy": best_strategy_name,
         "runner_up_strategy": runner_up_name,
@@ -2277,6 +2375,59 @@ def _city_detail_context(
         "recommendation_label": recommendation.get("label"),
         "assignment_context_status": selected_city.get("assignment_context_status"),
     }
+    if review.get("status") == "ready_for_approval":
+        next_action_label = "Approve current recommendation"
+        next_action_copy = "Approve the current 180d winner to create the canonical assignment for this city."
+    elif review.get("status") == "drifted_assignment":
+        next_action_label = "Replace current assignment"
+        next_action_copy = (
+            "Approve the latest 180d winner to replace the current canonical assignment with the new recommendation."
+        )
+    elif review.get("status") == "evidence_weakened":
+        next_action_label = "Review required"
+        next_action_copy = "No eligible replacement is available right now. Keep this city under review until stronger evidence returns."
+    elif review.get("status") == "aligned":
+        next_action_label = "No action required"
+        next_action_copy = "The current canonical assignment still matches the latest eligible 180d recommendation."
+    else:
+        next_action_label = "Wait for evidence"
+        next_action_copy = "No eligible 180d recommendation is ready to approve for this city yet."
+    review_context = {
+        "available": window_days == STRATEGY_APPROVAL_WINDOW_DAYS,
+        "status": review.get("status"),
+        "label": review.get("label"),
+        "reason": review.get("reason"),
+        "needs_review": bool(review.get("needs_review")),
+        "basis_window_days": review.get("basis_window_days"),
+        "current_assignment": {
+            "strategy_name": assigned_name,
+            "assigned_at": (selected_city.get("assignment") or {}).get("assigned_at"),
+            "assigned_by": (selected_city.get("assignment") or {}).get("assigned_by"),
+        },
+        "latest_recommendation": {
+            "strategy_name": recommendation.get("strategy_name"),
+            "status": recommendation.get("status"),
+            "label": recommendation.get("label"),
+            "gap_to_runner_up": selected_city.get("gap_to_runner_up"),
+            "gap_to_runner_up_display": selected_city.get("gap_to_runner_up_display"),
+            "resolved_trade_count": recommendation.get("resolved_trade_count"),
+            "resolved_trade_count_display": recommendation.get("resolved_trade_count_display"),
+            "outcome_coverage_rate": recommendation.get("outcome_coverage_rate"),
+            "outcome_coverage_display": selected_city.get("best_outcome_coverage_display"),
+        },
+        "last_approval_event": (
+            {
+                "created_at": latest_approval_event.get("created_at"),
+                "note": latest_approval_event.get("note"),
+                "previous_strategy": latest_approval_event.get("previous_strategy"),
+                "new_strategy": latest_approval_event.get("new_strategy"),
+            }
+            if latest_approval_event is not None
+            else None
+        ),
+        "next_action_label": next_action_label,
+        "next_action_copy": next_action_copy,
+    }
     return {
         "type": "city",
         "selected_series_ticker": selected_series_ticker,
@@ -2285,6 +2436,7 @@ def _city_detail_context(
         "ranking": ranking,
         "promotion_rationale": recommendation_rationale,
         "recommendation_rationale": recommendation_rationale,
+        "review": review_context,
         "approval": approval_context,
         "threshold_comparison": threshold_comparison,
         "trend": {
@@ -2450,6 +2602,7 @@ async def build_strategies_dashboard(
                 strategy_lookup=leaderboard_context["strategy_lookup"],
                 history_rows=history_rows,
                 strategy_events=strategy_events,
+                window_days=window_days,
             )
         else:
             if selected_strategy is None:
@@ -2493,12 +2646,15 @@ async def build_strategies_dashboard(
         "Canonical replay outcomes come from persisted trade tickets and settlement labels, not raw signal payloads.",
         f"Default view uses a rolling {DEFAULT_STRATEGY_WINDOW_DAYS}d regression snapshot.",
         "Regression stays recommendation-only; auto-assignment remains paused during calibration.",
+        "The assignment review queue is driven only by the latest stored 180d evidence, not by 30d or 90d research views.",
         "Manual approval is available only for the latest 180d strong or lean recommendation, and it always requires an operator note.",
         "Recommendation tiers require resolved-trade evidence, strong outcome coverage, and a measurable gap to the runner-up.",
         "Resolved-contract, longshot, and effectively-broken-book stand-down cases are excluded from regression.",
         "Missing data means not enough evidence, not that a strategy failed.",
     ]
     recommendation_counts = leaderboard_context.get("recommendation_counts") or {}
+    review_counts = leaderboard_context.get("review_counts") or {}
+    review_available = window_days == STRATEGY_APPROVAL_WINDOW_DAYS
 
     summary = {
         "window_days": window_days,
@@ -2508,6 +2664,8 @@ async def build_strategies_dashboard(
         "recommendation_mode": STRATEGY_RECOMMENDATION_MODE,
         "manual_approval_enabled": True,
         "approval_window_days": STRATEGY_APPROVAL_WINDOW_DAYS,
+        "review_available": review_available,
+        "review_window_days": STRATEGY_APPROVAL_WINDOW_DAYS if review_available else None,
         "last_regression_run": last_regression_run,
         "rooms_scanned": snapshot_meta["rooms_scanned"],
         "rooms_scanned_display": _compact_number(snapshot_meta["rooms_scanned"]),
@@ -2520,6 +2678,15 @@ async def build_strategies_dashboard(
         "best_strategy_win_rate_display": best_strategy["overall_win_rate_display"] if best_strategy is not None else "—",
         "strong_recommendations_count": int(recommendation_counts.get("strong_recommendation") or 0),
         "lean_recommendations_count": int(recommendation_counts.get("lean_recommendation") or 0),
+        "ready_for_approval_count": int(review_counts.get("ready_for_approval") or 0) if review_available else None,
+        "needs_review_count": (
+            int(review_counts.get("drifted_assignment") or 0) + int(review_counts.get("evidence_weakened") or 0)
+        )
+        if review_available
+        else None,
+        "drifted_assignments_count": int(review_counts.get("drifted_assignment") or 0) if review_available else None,
+        "evidence_weakened_count": int(review_counts.get("evidence_weakened") or 0) if review_available else None,
+        "aligned_assignments_count": int(review_counts.get("aligned") or 0) if review_available else None,
         "recent_promotions_count": sum(1 for event in strategy_events if event["kind"] == "promotion"),
         "recent_approvals_count": sum(1 for event in strategy_events if event["kind"] == "assignment_approval"),
         "assignments_covered": len(assigned_series),

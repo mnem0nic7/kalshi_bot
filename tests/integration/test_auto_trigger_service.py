@@ -76,7 +76,7 @@ async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> 
     async with session_factory() as session:
         repo = PlatformRepository(session)
         rooms = await repo.list_rooms(limit=10)
-        checkpoint = await repo.get_checkpoint("auto_trigger:WX-TEST")
+        checkpoint = await repo.get_checkpoint("auto_trigger:demo:WX-TEST")
         await session.commit()
 
     assert len(rooms) == 1

@@ -116,6 +116,9 @@ class DaemonService:
                     "kalshi_env": self.settings.kalshi_env,
                 },
             )
+            purged = await repo.vacuum_memory_notes(older_than_days=self.settings.daemon_memory_note_retention_days)
+            if purged:
+                logger.info("Vacuumed %d memory notes older than %d days", purged, self.settings.daemon_memory_note_retention_days)
             await session.commit()
         result = asdict(summary)
         if summary.settlements_count > 0 and self.strategy_eval_service is not None:
@@ -187,6 +190,7 @@ class DaemonService:
         should_auto_trigger = self.settings.trigger_enable_auto_rooms if auto_trigger is None else auto_trigger
         self._auto_trigger_enabled_for_run = should_auto_trigger
 
+        await self.self_improve_service.apply_pending_pack_promotion(app_color=self.settings.app_color)
         await self._recover_orphaned_rooms()
         if self.settings.daemon_start_with_reconcile:
             await self.reconcile_once()

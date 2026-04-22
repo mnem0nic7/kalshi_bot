@@ -364,10 +364,15 @@
 .strategies-toolbar {
   display: flex;
   align-items: flex-end;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 0.9rem;
   padding: 0.9rem 1rem;
   flex-wrap: wrap;
+}
+
+.strategies-focus-panel {
+  display: grid;
+  gap: 1rem;
 }
 
 .strategies-toolbar-block {
@@ -376,12 +381,14 @@
   min-width: 0;
 }
 
+.strategies-focus-switch,
 .strategies-window-filter {
   display: inline-flex;
   gap: 0.45rem;
   flex-wrap: wrap;
 }
 
+.strategy-focus-pill,
 .strategy-filter-pill {
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.04);
@@ -392,12 +399,22 @@
   cursor: pointer;
 }
 
+.strategy-focus-pill.is-active,
 .strategy-filter-pill.is-active {
   background: rgba(249, 215, 126, 0.2);
   color: #f9d77e;
   border-color: rgba(249, 215, 126, 0.36);
 }
 
+.strategies-subtoolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+  padding: 0.9rem 1rem;
+}
+
+.strategies-search-input,
 .strategies-sort-select {
   min-width: 180px;
   border-radius: 12px;
@@ -407,18 +424,102 @@
   padding: 0.55rem 0.7rem;
 }
 
-.strategies-methodology-link {
-  color: #f9d77e;
-  font-weight: 700;
+.strategies-search-input {
+  min-width: min(320px, 72vw);
 }
 
 .strategies-summary {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.dash-card[hidden] {
+  display: none !important;
+}
+
+.strategy-review-group {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.strategy-review-group + .strategy-review-group {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.strategy-review-group-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.strategy-review-group-header h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.strategy-review-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.strategy-review-item {
+  display: grid;
+  gap: 0.65rem;
+  width: 100%;
+  padding: 0.95rem 1rem;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02)),
+    rgba(10, 18, 32, 0.42);
+  color: #eef4fd;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.strategy-review-item:hover {
+  border-color: rgba(125, 178, 255, 0.22);
+}
+
+.strategy-review-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.85rem;
+  align-items: flex-start;
+}
+
+.strategy-review-title {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.strategy-review-pills {
+  display: inline-flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.strategy-review-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.85rem;
+  font-size: 0.82rem;
+  color: #c6d4e7;
+}
+
 .strategy-summary-note {
   font-size: 1.1rem;
   line-height: 1.2;
+}
+
+.strategies-review-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(320px, 0.95fr) minmax(0, 1.15fr);
 }
 
 .strategies-primary-grid {
@@ -427,10 +528,18 @@
   grid-template-columns: minmax(320px, 0.95fr) minmax(0, 1.25fr);
 }
 
+.strategies-cities-grid {
+  grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.9fr);
+}
+
 .strategies-lower-grid {
   display: grid;
   gap: 1rem;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.strategies-detail-card {
+  min-height: 100%;
 }
 
 .strategy-card-grid {
@@ -556,7 +665,7 @@
 }
 
 .strategy-matrix-table {
-  min-width: 1240px;
+  min-width: 900px;
 }
 
 .strategy-matrix-row.is-selected td {
@@ -624,6 +733,37 @@
   display: grid;
   gap: 0.7rem;
   padding-top: 0.2rem;
+}
+
+.strategy-review-card,
+.strategy-decision-brief {
+  padding: 0.95rem;
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(125, 178, 255, 0.08), rgba(255, 255, 255, 0.03)),
+    rgba(10, 18, 32, 0.42);
+  border: 1px solid rgba(125, 178, 255, 0.16);
+}
+
+.strategy-review-status-row {
+  display: inline-flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.strategy-review-next-action,
+.strategy-review-audit-note {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.8rem;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.strategy-review-next-action p,
+.strategy-review-audit-note p {
+  margin: 0;
 }
 
 .strategy-detail-table {
@@ -848,6 +988,7 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .strategies-review-grid,
   .strategies-primary-grid,
   .strategies-lower-grid,
   .strategy-comparison-grid,
@@ -878,5 +1019,13 @@
   .strategy-city-row {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .strategy-review-top {
+    flex-direction: column;
+  }
+
+  .strategy-review-pills {
+    justify-content: flex-start;
   }
 }

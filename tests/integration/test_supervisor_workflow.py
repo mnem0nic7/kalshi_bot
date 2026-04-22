@@ -182,7 +182,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     signal_engine = WeatherSignalEngine(settings)
     risk_engine = DeterministicRiskEngine(settings)
     execution_service = ExecutionService(settings, FakeKalshi())  # type: ignore[arg-type]
-    memory_service = MemoryService(providers)  # type: ignore[arg-type]
+    memory_service = MemoryService()  # type: ignore[arg-type]
     directory = WeatherMarketDirectory(
         {
             "WX-TEST": WeatherMarketMapping(
@@ -286,7 +286,7 @@ async def test_supervisor_stands_down_on_resolved_contract_before_risk(tmp_path)
     signal_engine = WeatherSignalEngine(settings)
     risk_engine = DeterministicRiskEngine(settings)
     execution_service = ExecutionService(settings, WideChicagoKalshi())  # type: ignore[arg-type]
-    memory_service = MemoryService(providers)  # type: ignore[arg-type]
+    memory_service = MemoryService()  # type: ignore[arg-type]
     directory = WeatherMarketDirectory(
         {
             "KXHIGHCHI-26APR11-T51": WeatherMarketMapping(
@@ -392,7 +392,7 @@ async def test_supervisor_executes_bucket_resized_trade_size(tmp_path) -> None:
     signal_engine = WeatherSignalEngine(settings)
     risk_engine = DeterministicRiskEngine(settings)
     execution_service = ExecutionService(settings, FakeKalshi())  # type: ignore[arg-type]
-    memory_service = MemoryService(providers)  # type: ignore[arg-type]
+    memory_service = MemoryService()  # type: ignore[arg-type]
     directory = WeatherMarketDirectory(
         {
             "WX-NEAR": WeatherMarketMapping(

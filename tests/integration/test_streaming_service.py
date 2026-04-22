@@ -84,7 +84,7 @@ async def test_streaming_service_processes_messages_and_persists_state(tmp_path)
         market_state = (await session.execute(select(MarketState).where(MarketState.market_ticker == "WX-TEST"))).scalar_one()
         order = (await session.execute(select(OrderRecord).where(OrderRecord.client_order_id == "client-1"))).scalar_one()
         fill = (await session.execute(select(FillRecord).where(FillRecord.trade_id == "trade-1"))).scalar_one()
-        checkpoint = (await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws:blue:4"))).scalar_one()
+        checkpoint = (await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws:demo:blue:4"))).scalar_one()
 
     assert str(market_state.yes_bid_dollars) == "0.4400"
     assert str(market_state.yes_ask_dollars) == "0.4800"
@@ -232,7 +232,7 @@ async def test_streaming_service_handles_interleaved_market_sequences_by_sid(tmp
 
         alpha = (await session.execute(select(MarketState).where(MarketState.market_ticker == "WX-ALPHA"))).scalar_one()
         beta = (await session.execute(select(MarketState).where(MarketState.market_ticker == "WX-BETA"))).scalar_one()
-        checkpoint = (await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws:blue:4"))).scalar_one()
+        checkpoint = (await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws:demo:blue:4"))).scalar_one()
 
     assert str(alpha.yes_bid_dollars) == "0.4400"
     assert str(beta.yes_bid_dollars) == "0.3300"

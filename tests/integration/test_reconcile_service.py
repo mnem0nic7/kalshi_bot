@@ -88,9 +88,9 @@ async def test_reconciliation_service_persists_exchange_state(tmp_path) -> None:
 
     async with session_factory() as session:
         repo = PlatformRepository(session)
-        summary = await service.reconcile(repo)
+        summary = await service.reconcile(repo, kalshi_env="demo")
         positions = await repo.list_positions()
-        checkpoint = await repo.get_checkpoint("reconcile")
+        checkpoint = await repo.get_checkpoint("reconcile:demo")
         await session.commit()
 
     assert summary.positions_count == 1

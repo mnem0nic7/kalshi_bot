@@ -77,6 +77,9 @@ class FakeSelfImproveService:
 
         return SelfImproveResult(status="idle", payload={})
 
+    async def apply_pending_pack_promotion(self, *, app_color: str) -> None:
+        return None
+
 
 class FakeTrainingCorpusService:
     def __init__(self, *, status_counts: dict[str, int] | None = None) -> None:
@@ -178,10 +181,10 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
             await session.execute(select(OpsEvent).where(OpsEvent.source == "daemon").order_by(OpsEvent.updated_at.desc()))
         ).scalar_one()
         heartbeat_checkpoint = (
-            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:blue"))
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:demo:blue"))
         ).scalar_one()
         reconcile_checkpoint = (
-            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_reconcile:blue"))
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_reconcile:demo:blue"))
         ).scalar_one()
 
     assert result["completed"] == "stream"
@@ -250,11 +253,18 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
     class CountingReconciliationService(FakeReconciliationService):
         def __init__(self) -> None:
             super().__init__()
-            self.calls = 0
+            self.call_count = 0
 
         async def reconcile(self, repo, *, subaccount=0, kalshi_env=""):
-            self.calls += 1
-            return await super().reconcile(repo, subaccount=subaccount, kalshi_env=kalshi_env)
+            self.call_count += 1
+            return ReconcileSummary(
+                balances_seen=True,
+                positions_count=0,
+                orders_count=0,
+                fills_count=0,
+                settlements_count=0,
+                historical_cutoff_seen=True,
+            )
 
     reconcile_service = CountingReconciliationService()
     historical_training = FakeHistoricalTrainingService()
@@ -278,12 +288,12 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
 
     async with session_factory() as session:
         followup_checkpoint = (
-            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_settlement_followup:blue"))
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_settlement_followup:demo:blue"))
         ).scalar_one()
         await session.commit()
 
     assert result["completed"] == "stream"
-    assert reconcile_service.calls == 1
+    assert reconcile_service.call_count == 1
     assert historical_training.backfill_calls == 1
     assert followup_checkpoint.payload["summary"]["status_counts"]["awaiting_settlement"] == 1
     assert followup_checkpoint.payload["settlement_backfill"]["backfilled_count"] == 1
@@ -369,7 +379,7 @@ async def test_daemon_heartbeat_checkpoint_stays_fresh_while_follow_up_is_runnin
 
     async with session_factory() as session:
         checkpoint = (
-            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:blue"))
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:demo:blue"))
         ).scalar_one()
 
     assert shadow_campaign.calls == 1
@@ -422,7 +432,7 @@ async def test_daemon_settlement_follow_up_reconcile_failure_logs_specific_warni
             ).scalars()
         ]
         followup_checkpoint = (
-            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_settlement_followup:blue"))
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_settlement_followup:demo:blue"))
         ).scalar_one()
 
     assert historical_training.backfill_calls == 1

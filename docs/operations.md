@@ -86,7 +86,7 @@ The behavior is controlled by:
 - `DAEMON_HEARTBEAT_INTERVAL_SECONDS`
 - `DAEMON_START_WITH_RECONCILE`
 
-The daemon also monitors staged agent-pack canaries and live-monitor windows. When a candidate pack is staged on the inactive color, that color's daemon automatically produces shadow rooms during heartbeats until the canary either passes or rolls back.
+The daemon also monitors staged agent-pack canaries and live-monitor windows. When a candidate pack is staged on the inactive color, the rollout is recorded first as `pending_pack_promotion:<env>:<color>`, then that color's daemon applies the new pack on startup before producing canary shadow rooms during heartbeats. If the canary sits longer than `SELF_IMPROVE_CANARY_MAX_SECONDS`, `self-improve status` and the control room mark it `stalled` instead of pretending rollout is still in progress.
 
 For manual room execution:
 
@@ -106,10 +106,12 @@ kalshi-bot-cli shadow-campaign run --limit 3
 The control room index page now uses a top-tabbed dashboard layout with a summary strip at the top and lazy-loaded `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations` tabs.
 It still offers the same operator actions like `Run Shadow Room`, grouped dataset builds, kill-switch and color promotion controls, but the heavy historical and training views now stay out of the initial page load until their tab is opened.
 The summary strip and bootstrap path now compute `Research Confidence` from cached research dossiers instead of live all-city discovery, and the `Room Outcomes` card uses lightweight room outcome snapshots instead of full room-bundle exports. `/` and `/api/control-room/summary` should stay fast even after expanding to every configured city and a larger 24-hour room history.
+The `Research` tab now includes an `Assignment Review Queue` driven only by the latest stored 180d strategy snapshot. It groups cities into `ready_for_approval`, `drifted_assignment`, `evidence_weakened`, `aligned`, and `waiting_for_evidence`, and the city detail drilldown shows the current canonical assignment, the latest recommendation, and the latest approval note.
 The top summary strip should be read as operator truth, not raw internals:
 
 - `System Status` shows the actual operator state like `KILL SWITCH ON`, `HEALTHY`, or `DEGRADED`; active color is supporting context, not the headline
 - `Active Deployment` foregrounds the active color, while watchdog freshness is shown as relative time
+- the 30d win-rate stat uses realized contract outcomes by contract count: profitable exits count as wins immediately, and settlement labels are used only when no sell fill exists
 - `Room Outcomes` uses resolved rooms only in the `succeeded/total` headline; running rooms are shown separately so in-flight work does not make the denominator misleading
 - `Quality Debt` detail now breaks out `stale`, `missed`, and `weak` counts so the visible breakdown reconciles to the total
 
@@ -156,6 +158,8 @@ Historical status should be interpreted in layers:
 - `replay_corpus` tells you what has actually been materialized and is safe to use for readiness or intelligence
 
 If `source_replay_coverage` is ahead of `replay_corpus`, run the historical repair refresh path before trusting the dashboard or the intelligence outputs.
+
+Historical market snapshots with missing bid/ask are still stored when they are the best as-of evidence available. Treat those rows as expired-book audit coverage: replay rooms built from them should stand down rather than fabricate executable quotes.
 
 Settlement status also has to be read more carefully now:
 
@@ -271,6 +275,8 @@ The GitHub Actions control-plane workflows are:
 - `.github/workflows/rollback-agent-pack.yml`
 
 `self-improve.yml` stages only the inactive color after a passing evaluation. The live color changes only after the canary finishes and the DB-backed rollout monitor promotes it.
+The staged pack is now applied through a pending checkpoint that the restarted inactive daemon consumes on startup, which keeps rollout safe across watchdog restarts and blue/green failovers.
+If the staged canary does not progress within `SELF_IMPROVE_CANARY_MAX_SECONDS`, the status surface marks it `stalled` and operators should inspect or roll it back instead of assuming rollout is still advancing.
 
 For Docker deployments that need both environments available, `infra/docker-compose.yml` now mounts separate live and demo PEMs into the containers and relies on:
 

@@ -2504,6 +2504,15 @@ class HistoricalTrainingService:
                     mismatch_count += 1
                 elif crosscheck["status"] == self.SETTLEMENT_MISSING:
                     missing_count += 1
+                yes_bid = _parse_decimal(market.get("yes_bid_dollars"))
+                if yes_bid is None:
+                    logger.warning(
+                        "Historical snapshot for %s (%s) has no bid/ask data — "
+                        "market likely expired before order book was captured; "
+                        "snapshot stored but will produce stand-down rooms in replay",
+                        mapping.market_ticker,
+                        local_day,
+                    )
                 await repo.upsert_historical_market_snapshot(
                     market_ticker=mapping.market_ticker,
                     series_ticker=mapping.series_ticker,
@@ -2515,7 +2524,7 @@ class HistoricalTrainingService:
                     source_hash=_hash_payload(market),
                     close_ts=close_ts,
                     settlement_ts=settlement_ts,
-                    yes_bid_dollars=_parse_decimal(market.get("yes_bid_dollars")),
+                    yes_bid_dollars=yes_bid,
                     yes_ask_dollars=_parse_decimal(market.get("yes_ask_dollars")),
                     no_ask_dollars=_parse_decimal(market.get("no_ask_dollars")),
                     last_price_dollars=_parse_decimal(market.get("last_price_dollars")),

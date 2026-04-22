@@ -148,6 +148,7 @@ class Settings(BaseSettings):
     daemon_heartbeat_interval_seconds: int = 60
     daemon_market_history_interval_seconds: int = 60
     daemon_market_history_retention_hours: int = 24
+    daemon_memory_note_retention_days: int = 90
     daemon_start_with_reconcile: bool = True
     self_improve_window_days: int = 14
     self_improve_holdout_ratio: float = 0.2
@@ -155,6 +156,7 @@ class Settings(BaseSettings):
     self_improve_max_critical_regression: float = 0.01
     self_improve_canary_min_rooms: int = 25
     self_improve_canary_min_seconds: int = 7200
+    self_improve_canary_max_seconds: int = 21600  # 6h — canary stalled if not promoted within this window
     self_improve_live_monitor_seconds: int = 86400
     self_improve_research_gate_failure_threshold: float = 0.6
     self_improve_blocked_order_threshold: float = 0.8

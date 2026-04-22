@@ -136,6 +136,7 @@ Read more: `docs/operations.md`, `docs/training.md`
 Because readiness is gated by corpus volume and label quality, not just by plumbing. We need enough complete rooms, enough diversity, enough trade-positive examples, and enough settled rooms before critique, evaluation, or promotion should be trusted.
 
 If settled coverage is low, the right move is usually to keep shadow collection and reconciliation running rather than lowering the threshold.
+Even after a candidate is staged, the canary is not meant to run forever. If `self-improve status` shows `stalled`, the inactive color did not finish the canary within the max window, so inspect the rollout and either promote or roll back instead of assuming the staged pack is still progressing.
 
 Read more: `docs/self_improve.md`, `docs/training.md`
 
@@ -155,9 +156,11 @@ Then use the top tabs deliberately:
 
 - `Overview` for deployment state, runtime health, blockers, next actions, and pack controls
 - `Training & Historical` for quality debt, historical coverage, pipeline progress, and backlog
-- `Research` for active versus closed dossiers, confidence, expiry, and refresh actions
+- `Research` for active versus closed dossiers, confidence, expiry, refresh actions, and the 180d-only `Assignment Review Queue`
 - `Rooms` for grouped recent room outcomes plus quick room and shadow-run actions
 - `Operations` for positions, ops events, and dangerous operator controls
+
+The assignment review queue is intentionally not a live 30d or 90d view. It is the manual review surface for canonical strategy assignments, so it uses only the latest stored 180d evidence and flags cities as `ready_for_approval`, `drifted_assignment`, `evidence_weakened`, `aligned`, or `waiting_for_evidence`. The city drilldown also shows the most recent approval note so you can see why the current assignment exists.
 
 If the next bottleneck is not obvious from that panel, something is missing in the status surface and we should improve it.
 
@@ -165,7 +168,7 @@ Read more: `docs/training.md`, `docs/operations.md`
 
 ## How do blue/green deploys and the watchdog work?
 
-Both colors run on the same host, but only the active color can own the execution path. The watchdog monitors app and daemon health, restarts unhealthy colors, and can fail over the active color if needed.
+Both colors run on the same host, but only the active color can own the execution path. The watchdog monitors app and daemon health, restarts unhealthy colors, and can fail over the active color if needed. Staged agent-pack promotions are checkpointed now too, so the restarted inactive daemon can apply the candidate pack on startup before canary rooms begin.
 
 Boot, restart, and recovery stay host-native through systemd plus Docker Compose.
 

@@ -103,6 +103,14 @@ def _build_strategies_payload(
     selected_series_ticker: str | None = None,
     selected_strategy_name: str | None = None,
 ) -> dict[str, object]:
+    review_available = window_days == 180
+    inactive_review = {
+        "status": None,
+        "label": "180d only",
+        "reason": "Assignment review is based only on the latest stored 180d snapshot.",
+        "needs_review": False,
+        "basis_window_days": 180,
+    }
     leaderboard = [
         {
             "name": "moderate",
@@ -167,7 +175,21 @@ def _build_strategies_payload(
     ]
     ny_recommendation_status = "strong_recommendation"
     ny_recommendation_label = "Strong recommendation"
-    ny_approval_eligible = window_days == 180
+    ny_review = {
+        "status": "drifted_assignment",
+        "label": "Drifted assignment",
+        "reason": "The current canonical assignment (aggressive) no longer matches the latest 180d recommendation (moderate).",
+        "needs_review": True,
+        "basis_window_days": 180,
+    } if review_available else inactive_review
+    chi_review = {
+        "status": "aligned",
+        "label": "Aligned",
+        "reason": "The current canonical assignment still matches the latest eligible 180d recommendation.",
+        "needs_review": False,
+        "basis_window_days": 180,
+    } if review_available else inactive_review
+    ny_approval_eligible = review_available
     city_matrix = [
         {
             "series_ticker": "KXHIGHNY",
@@ -210,13 +232,14 @@ def _build_strategies_payload(
                 "gap_to_runner_up_display": "15%",
                 "writes_assignment": False,
             },
+            "review": ny_review,
             "approval_eligible": ny_approval_eligible,
             "approval_label": "Ready to approve" if ny_approval_eligible else "180d only",
             "approval_window_days": 180,
             "approval_requires_note": True,
             "approval_reason": "Manual approval validates against the latest stored 180d snapshot.",
             "can_promote": False,
-            "sort_priority": 0,
+            "sort_priority": 0 if review_available else 1,
             "metrics": [
                 {"strategy_name": "moderate", "selected": selected_strategy_name == "moderate", "is_assigned": False, "is_best": True, "is_runner_up": False, "rooms_evaluated": 20, "trade_count": 12, "resolved_trade_count": 12, "resolved_trade_count_display": "12", "unscored_trade_count": 0, "unscored_trade_count_display": "0", "outcome_coverage_rate": 1.0, "outcome_coverage_rate_display": "100%", "outcome_coverage_display": "12/12 scored", "trade_rate": 0.60, "trade_rate_display": "60%", "win_rate": 0.75, "win_rate_display": "75%", "win_rate_interval_lower": 0.55, "win_rate_interval_upper": 0.88, "win_rate_interval_display": "55%-88%", "total_pnl_dollars": 8.4, "total_pnl_display": "+$8.40", "avg_edge_bps": 68.0, "avg_edge_bps_display": "68bps", "has_data": True},
                 {"strategy_name": "aggressive", "selected": selected_strategy_name == "aggressive", "is_assigned": True, "is_best": False, "is_runner_up": True, "rooms_evaluated": 20, "trade_count": 10, "resolved_trade_count": 10, "resolved_trade_count_display": "10", "unscored_trade_count": 0, "unscored_trade_count_display": "0", "outcome_coverage_rate": 1.0, "outcome_coverage_rate_display": "100%", "outcome_coverage_display": "10/10 scored", "trade_rate": 0.50, "trade_rate_display": "50%", "win_rate": 0.60, "win_rate_display": "60%", "win_rate_interval_lower": 0.39, "win_rate_interval_upper": 0.78, "win_rate_interval_display": "39%-78%", "total_pnl_dollars": 5.0, "total_pnl_display": "+$5.00", "avg_edge_bps": 75.0, "avg_edge_bps_display": "75bps", "has_data": True},
@@ -263,13 +286,14 @@ def _build_strategies_payload(
                 "gap_to_runner_up_display": "18%",
                 "writes_assignment": False,
             },
+            "review": chi_review,
             "approval_eligible": False,
             "approval_label": "Already assigned",
             "approval_window_days": 180,
             "approval_requires_note": True,
             "approval_reason": "Canonical assignment already matches the current recommendation.",
             "can_promote": False,
-            "sort_priority": 3,
+            "sort_priority": 3 if review_available else 1,
             "metrics": [
                 {"strategy_name": "moderate", "selected": selected_strategy_name == "moderate", "is_assigned": True, "is_best": True, "is_runner_up": False, "rooms_evaluated": 24, "trade_count": 14, "resolved_trade_count": 14, "resolved_trade_count_display": "14", "unscored_trade_count": 0, "unscored_trade_count_display": "0", "outcome_coverage_rate": 1.0, "outcome_coverage_rate_display": "100%", "outcome_coverage_display": "14/14 scored", "trade_rate": 0.58, "trade_rate_display": "58%", "win_rate": 0.58, "win_rate_display": "58%", "win_rate_interval_lower": 0.36, "win_rate_interval_upper": 0.77, "win_rate_interval_display": "36%-77%", "total_pnl_dollars": 2.8, "total_pnl_display": "+$2.80", "avg_edge_bps": 52.0, "avg_edge_bps_display": "52bps", "has_data": True},
                 {"strategy_name": "aggressive", "selected": selected_strategy_name == "aggressive", "is_assigned": False, "is_best": False, "is_runner_up": True, "rooms_evaluated": 24, "trade_count": 10, "resolved_trade_count": 10, "resolved_trade_count_display": "10", "unscored_trade_count": 0, "unscored_trade_count_display": "0", "outcome_coverage_rate": 1.0, "outcome_coverage_rate_display": "100%", "outcome_coverage_display": "10/10 scored", "trade_rate": 0.42, "trade_rate_display": "42%", "win_rate": 0.40, "win_rate_display": "40%", "win_rate_interval_lower": 0.19, "win_rate_interval_upper": 0.64, "win_rate_interval_display": "19%-64%", "total_pnl_dollars": -1.2, "total_pnl_display": "-$1.20", "avg_edge_bps": 58.0, "avg_edge_bps_display": "58bps", "has_data": True},
@@ -286,6 +310,31 @@ def _build_strategies_payload(
             "ranking": city_matrix[0]["metrics"],
             "promotion_rationale": rationale,
             "recommendation_rationale": rationale,
+            "review": {
+                "available": review_available,
+                "status": ny_review["status"],
+                "label": ny_review["label"],
+                "reason": ny_review["reason"],
+                "needs_review": ny_review["needs_review"],
+                "basis_window_days": 180,
+                "current_assignment": {"strategy_name": "aggressive", "assigned_at": "2026-04-21T18:00:00+00:00", "assigned_by": "auto_regression"},
+                "latest_recommendation": {
+                    "strategy_name": "moderate",
+                    "status": ny_recommendation_status,
+                    "label": ny_recommendation_label,
+                    "gap_to_runner_up_display": "15%",
+                    "resolved_trade_count_display": "12",
+                    "outcome_coverage_display": "12/12 scored",
+                },
+                "last_approval_event": {
+                    "created_at": "2026-04-21T18:30:00+00:00",
+                    "note": "Operator approved the current 180d winner.",
+                    "previous_strategy": "aggressive",
+                    "new_strategy": "moderate",
+                } if review_available else None,
+                "next_action_label": "Replace current assignment",
+                "next_action_copy": "Approve the latest 180d winner to replace the current canonical assignment with the new recommendation.",
+            },
             "approval": {
                 "eligible": ny_approval_eligible,
                 "label": "Ready to approve" if ny_approval_eligible else "180d only",
@@ -348,6 +397,8 @@ def _build_strategies_payload(
             "recommendation_mode": "recommendation_only",
             "manual_approval_enabled": True,
             "approval_window_days": 180,
+            "review_available": review_available,
+            "review_window_days": 180 if review_available else None,
             "last_regression_run": "2026-04-21T18:00:00+00:00",
             "rooms_scanned": 84,
             "rooms_scanned_display": "84",
@@ -358,6 +409,11 @@ def _build_strategies_payload(
             "best_strategy_win_rate_display": "73%",
             "strong_recommendations_count": 2 if window_days == 180 else 0,
             "lean_recommendations_count": 0,
+            "ready_for_approval_count": 0 if review_available else None,
+            "needs_review_count": 1 if review_available else None,
+            "drifted_assignments_count": 1 if review_available else None,
+            "evidence_weakened_count": 0 if review_available else None,
+            "aligned_assignments_count": 1 if review_available else None,
             "recent_promotions_count": 1,
             "recent_approvals_count": 1,
             "assignments_covered": 2,
@@ -674,34 +730,71 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 page.goto(base_url, wait_until="load", timeout=15_000)
                 page.locator('.dash-tab[data-env="strategies"]').click(timeout=15_000)
                 page.wait_for_selector("#strategies-summary", timeout=15_000)
-                page.wait_for_selector("#strategies-leaderboard .strategy-card", timeout=15_000)
+                page.wait_for_selector("#strategies-focus-review", timeout=15_000)
                 assert "180d" in (page.locator("#strategies-summary").text_content(timeout=15_000) or "")
-                assert "moderate" in (page.locator("#strategies-leaderboard").text_content(timeout=15_000) or "")
-
-                page.locator('#strategies-city-matrix button[data-series-ticker="KXHIGHNY"]').click(timeout=15_000)
+                assert page.locator("#strategies-review-queue-card").is_visible()
+                assert "Drifted assignment" in (page.locator("#strategies-review-queue").text_content(timeout=15_000) or "")
                 page.wait_for_function(
-                    "() => document.querySelector('#strategies-detail h3')?.textContent?.includes('KXHIGHNY')",
+                    "() => document.querySelector('#strategies-review-detail h3')?.textContent?.includes('KXHIGHNY')",
                     timeout=15_000,
                 )
-                detail_text = page.locator("#strategies-detail").text_content(timeout=15_000) or ""
+                detail_text = page.locator("#strategies-review-detail").text_content(timeout=15_000) or ""
+                assert "Decision Brief" in detail_text
+                assert "Latest approval note" in detail_text
                 assert "Recommendation Rationale" in detail_text
-                assert "Approve Recommendation" in detail_text
+                assert page.locator("#strategies-review-detail textarea").is_visible()
+
+                page.locator('#strategies-focus-switch button[data-focus-mode="cities"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-focus-cities')?.hidden === false",
+                    timeout=15_000,
+                )
+                page.wait_for_selector("#strategies-city-matrix table", timeout=15_000)
+                header_text = page.locator("#strategies-city-matrix thead").text_content(timeout=15_000) or ""
+                assert "Best Strategy" in header_text
+                assert "moderate" not in header_text
+                assert "aggressive" not in header_text
+                city_detail_text = page.locator("#strategies-cities-detail").text_content(timeout=15_000) or ""
+                assert "KXHIGHNY" in city_detail_text
+
+                page.locator("#strategies-city-search").fill("Chicago", timeout=15_000)
+                page.wait_for_function(
+                    "() => (document.querySelector('#strategies-city-matrix tbody')?.textContent || '').includes('Chicago')",
+                    timeout=15_000,
+                )
+                matrix_text = page.locator("#strategies-city-matrix tbody").text_content(timeout=15_000) or ""
+                assert "Chicago" in matrix_text
+                assert "New York City" not in matrix_text
+                page.locator("#strategies-city-search").fill("", timeout=15_000)
 
                 page.locator('#strategies-window-filter button[data-window-days="90"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-summary')?.textContent?.includes('90d')",
                     timeout=15_000,
                 )
-
                 page.locator('#strategies-city-matrix button[data-series-ticker="KXHIGHNY"]').click(timeout=15_000)
                 page.wait_for_function(
-                    "() => document.querySelector('#strategies-detail h3')?.textContent?.includes('KXHIGHNY')",
+                    "() => document.querySelector('#strategies-cities-detail h3')?.textContent?.includes('KXHIGHNY')",
                     timeout=15_000,
                 )
-                detail_text_90d = page.locator("#strategies-detail").text_content(timeout=15_000) or ""
+                assert "Review Queue" not in (page.locator("#strategies-focus-switch").text_content(timeout=15_000) or "")
+                detail_text_90d = page.locator("#strategies-cities-detail").text_content(timeout=15_000) or ""
+                assert "Assignment Review" not in detail_text_90d
                 assert "Recommendation Rationale" in detail_text_90d
-                assert "Approve Recommendation" not in detail_text_90d
+                assert "Latest approval note" not in detail_text_90d
+                assert page.locator("#strategies-cities-detail textarea").count() == 0
                 assert "Stored regression history" in detail_text_90d
+
+                page.locator('#strategies-focus-switch button[data-focus-mode="strategies"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-focus-strategies')?.hidden === false",
+                    timeout=15_000,
+                )
+                page.wait_for_selector("#strategies-leaderboard .strategy-card", timeout=15_000)
+                assert "moderate" in (page.locator("#strategies-leaderboard").text_content(timeout=15_000) or "")
+                assert "Stored regression history" in (page.locator("#strategies-detail").text_content(timeout=15_000) or "")
+                assert page.locator("#strategies-recent").is_visible()
+                assert page.locator("#strategies-methodology").is_visible()
             finally:
                 browser.close()
 

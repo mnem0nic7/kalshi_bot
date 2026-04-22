@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from time import time
 from typing import Any
@@ -24,6 +25,12 @@ class KalshiCredentials:
 
 class KalshiSigner:
     def __init__(self, private_key_path: Path) -> None:
+        mode = os.stat(private_key_path).st_mode & 0o777
+        if mode & 0o077:
+            raise PermissionError(
+                f"RSA private key {private_key_path} has unsafe permissions ({oct(mode)}). "
+                "Run: chmod 600 <key_path>"
+            )
         key_bytes = private_key_path.read_bytes()
         self.private_key = serialization.load_pem_private_key(key_bytes, password=None)
 

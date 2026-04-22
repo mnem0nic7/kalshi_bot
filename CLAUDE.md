@@ -68,10 +68,10 @@ Each role calls `providers.rewrite_with_metadata()` which routes to Gemini (prim
 Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In tests, SQLite is used via a JSON-compatible type wrapper (no pgvector). Alembic migrations live in `alembic/`.
 
 ### Control room (`web/`)
-FastAPI app with server-rendered Jinja2 templates, SSE transcript stream, and REST endpoints. The top-level summary strip (`/api/control-room/summary`) is designed to be fast — it avoids live market discovery and uses lightweight room snapshots.
+FastAPI app with server-rendered Jinja2 templates, SSE transcript stream, and REST endpoints. The top-level summary strip (`/api/control-room/summary`) is designed to be fast — it avoids live market discovery and uses lightweight room snapshots. The `Research` view also exposes an 180d-only assignment review queue (`ready_for_approval`, `drifted_assignment`, `evidence_weakened`, `aligned`, `waiting_for_evidence`), and city detail includes the latest approval note plus next-action copy. The operator win-rate card uses `PlatformRepository.get_fill_win_rate_30d()` and treats wins as realized-P&L-positive exits first, falling back to settlement results only when no sell fill exists for that ticker and side.
 
 ### Blue/green deployment
-A DB-backed single-writer lock enforces that only the active color (`app_color` setting) can acquire the execution lock. The kill switch (`app_enable_kill_switch`) clears the execution lock and blocks new live orders.
+A DB-backed single-writer lock enforces that only the active color (`app_color` setting) can acquire the execution lock. The kill switch (`app_enable_kill_switch`) clears the execution lock and blocks new live orders. Self-improve staging is checkpoint-based: promotions write `pending_pack_promotion:{kalshi_env}:{color}`, and the target color's daemon applies it at startup so watchdog restarts or failovers do not strand an old pack assignment. Canary state has a max lifetime and becomes `stalled` after `SELF_IMPROVE_CANARY_MAX_SECONDS`.
 
 ### Historical data layers (four separate concerns)
 1. `source_replay_coverage` — strict-as-of replay sources
@@ -87,6 +87,7 @@ A DB-backed single-writer lock enforces that only the active color (`app_color` 
 - `GEMINI_KEY` or `GEMINI_API_KEY` — primary LLM provider
 - `APP_SHADOW_MODE=true` — prevents live order submission (default on)
 - `APP_COLOR` — `blue` or `green` for blue/green deployment
+- `SELF_IMPROVE_CANARY_MAX_SECONDS` — max staged-canary lifetime before status becomes `stalled`
 - `WEATHER_MARKET_MAP_PATH` — path to market config YAML (default: `docs/examples/weather_markets.example.yaml`)
 
 ## Safety rules

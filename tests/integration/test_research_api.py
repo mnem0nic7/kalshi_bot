@@ -216,12 +216,12 @@ def test_status_api_includes_runtime_health(tmp_path, monkeypatch) -> None:
                 repo = PlatformRepository(session)
                 await repo.ensure_deployment_control("blue", initial_active_color="blue")
                 await repo.set_checkpoint(
-                    "daemon_heartbeat:blue",
+                    "daemon_heartbeat:demo:blue",
                     None,
                     {"heartbeat_at": datetime.now(UTC).isoformat()},
                 )
                 await repo.set_checkpoint(
-                    "daemon_heartbeat:green",
+                    "daemon_heartbeat:demo:green",
                     None,
                     {"heartbeat_at": (datetime.now(UTC) - timedelta(seconds=500)).isoformat()},
                 )

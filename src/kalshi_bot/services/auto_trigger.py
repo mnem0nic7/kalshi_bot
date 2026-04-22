@@ -124,7 +124,13 @@ class AutoTriggerService:
                     ys = np.array([p[1] for p in points])
                     xs = xs - xs[0]
                     slope = float(np.polyfit(xs, ys, 1)[0]) * 100 * 60  # $/s → ¢/min
-                    if abs(slope) < abs(self.settings.stop_loss_momentum_slope_threshold_cents_per_min):
+                    threshold = abs(self.settings.stop_loss_momentum_slope_threshold_cents_per_min)
+                    stopped_side = reentry_cp.payload.get("stopped_side", "yes")
+                    # Directional: require price moving back toward the stopped side.
+                    # stopped_side="yes" → need slope > +threshold (YES recovering).
+                    # stopped_side="no"  → need slope < −threshold (YES falling = NO recovering).
+                    recovery = slope > threshold if stopped_side == "yes" else slope < -threshold
+                    if not recovery:
                         await session.commit()
                         return
                     # Momentum confirmed — allow re-entry.
@@ -141,9 +147,16 @@ class AutoTriggerService:
                     )
                     if datetime.now(UTC) - last_trigger_time < timedelta(seconds=cooldown):
                         # Bypass cooldown if mid price has moved enough since last trigger.
+                        # If market state is stale (WebSocket down), skip the bypass — enforce full cooldown.
+                        stale_cutoff = timedelta(seconds=self.settings.risk_stale_market_seconds)
+                        state_is_fresh = (
+                            market_state is not None
+                            and market_state.observed_at is not None
+                            and (datetime.now(UTC) - market_state.observed_at) <= stale_cutoff
+                        )
                         last_mid_raw = checkpoint.payload.get("last_trigger_mid")
                         bypassed = False
-                        if last_mid_raw is not None and self.settings.trigger_price_move_bypass_bps > 0:
+                        if state_is_fresh and last_mid_raw is not None and self.settings.trigger_price_move_bypass_bps > 0:
                             current_mid = self._mid_dollars(market_state)
                             if current_mid is not None:
                                 move_bps = int(abs(current_mid - Decimal(str(last_mid_raw))) * Decimal("10000"))
