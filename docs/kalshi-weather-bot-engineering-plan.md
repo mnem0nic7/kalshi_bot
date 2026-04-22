@@ -304,7 +304,7 @@ Resolution-state detection: if `current_temp_f >= threshold`, the market is `LOC
 | 4 | Min edge | `edge_bps < risk_min_edge_bps` (500 bps) |
 | 5 | Max edge (credibility) | `edge_bps > risk_max_credible_edge_bps` (5000 bps) — model error signal |
 | 6 | Confidence floor | `signal.confidence < risk_min_confidence` (0.70) |
-| 7 | Contract price floor | contract price < `risk_min_contract_price_dollars` (0.05) — market pricing it as nearly impossible |
+| 7 | Contract price floor | contract price < `risk_min_contract_price_dollars` (0.25) — market pricing it as nearly impossible |
 | 7b | Probability extremity | `fair_yes` between 25% and 75% — too close to coin-flip; forecast noise exceeds edge signal (`risk_min_probability_extremity_pct=25.0`, disabled by default, enable in production) |
 | 8 | Market staleness | `market_observed_at` older than 60s |
 | 9 | Research staleness | `research_observed_at` older than 900s |
@@ -621,7 +621,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `RISK_MIN_EDGE_BPS` | 500 | Minimum edge required; self-improvement pipeline can tune in range [5, 500] bps |
 | `RISK_MAX_CREDIBLE_EDGE_BPS` | 5000 | Maximum credible edge; larger values indicate model error |
 | `RISK_MIN_CONFIDENCE` | 0.70 | Hard block below this confidence score; 0.70–0.80 gets 50% size, 0.80–0.90 gets 75%, ≥0.90 gets 100% |
-| `RISK_MIN_CONTRACT_PRICE_DOLLARS` | 0.05 | Hard block if the traded side costs less than 5¢ |
+| `RISK_MIN_CONTRACT_PRICE_DOLLARS` | 0.25 | Hard block if the traded side costs less than 25¢ |
 | `RISK_MIN_PROBABILITY_EXTREMITY_PCT` | 0.0 (prod: 25.0) | Block trades where fair_yes is within this many pct-points of 50%; set 25.0 in production |
 | `RISK_MAX_CONCURRENT_TICKERS` | 10 | Max open-position tickers |
 | `RISK_MAX_ORDER_COUNT_FP` | 500 | Hard contract count cap per order (guard #10) |

@@ -337,7 +337,7 @@ def test_risk_engine_blocks_below_minimum_contract_price() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         risk_min_edge_bps=50,
-        risk_min_contract_price_dollars=0.05,
+        risk_min_contract_price_dollars=0.25,
     )
     engine = DeterministicRiskEngine(settings)
     verdict = engine.evaluate(
@@ -347,7 +347,7 @@ def test_risk_engine_blocks_below_minimum_contract_price() -> None:
             market_ticker="WX-TEST",
             action=TradeAction.BUY,
             side=ContractSide.YES,
-            yes_price_dollars=Decimal("0.0200"),  # 2 cents — market says nearly impossible
+            yes_price_dollars=Decimal("0.2000"),  # 20 cents — still below the tightened 25-cent floor
             count_fp=Decimal("500.00"),
         ),
         signal=make_signal(edge_bps=300),
@@ -358,6 +358,7 @@ def test_risk_engine_blocks_below_minimum_contract_price() -> None:
     )
     assert verdict.status == RiskStatus.BLOCKED
     assert any("nearly impossible" in r for r in verdict.reasons)
+    assert any("0.25" in r for r in verdict.reasons)
 
 
 def test_risk_engine_blocks_runaway_edge_as_model_error() -> None:

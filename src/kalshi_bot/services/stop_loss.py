@@ -17,6 +17,14 @@ from kalshi_bot.integrations.kalshi import KalshiClient
 logger = logging.getLogger(__name__)
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _midpoint(market_state: MarketState, side: str) -> Decimal | None:
     yes_bid = market_state.yes_bid_dollars
     yes_ask = market_state.yes_ask_dollars
@@ -139,11 +147,12 @@ class StopLossService:
             if ms is None:
                 continue
 
-            if ms.observed_at is None or (now - ms.observed_at) > stale_cutoff:
+            observed_at = _as_utc(ms.observed_at)
+            if observed_at is None or (now - observed_at) > stale_cutoff:
                 logger.warning(
                     "stop_loss skipping %s: market state stale (observed_at=%s)",
                     position.market_ticker,
-                    ms.observed_at,
+                    observed_at,
                 )
                 continue
 
@@ -277,22 +286,35 @@ class StopLossService:
             event_payload["momentum_slope_cents_per_min"] = round(slope, 4)
 
         submit_failed = False
+        submit_payload: dict[str, Any] = {
+            "submitted_at": now.isoformat(),
+            "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+            "peak_price": str(peak) if peak is not None else None,
+            "trigger": trigger,
+        }
         if not shadow:
             try:
-                order_resp = await self.kalshi.create_order({
+                order_request: dict[str, Any] = {
                     "ticker": market_ticker,
                     "side": position.side,
                     "action": "sell",
-                    "yes_price_dollars": f"{sell_price:.4f}",
-                    "count": str(int(position.count_fp)),
-                    "time_in_force": "ioc",
                     "client_order_id": str(uuid4()),
-                })
+                    "count_fp": f"{position.count_fp:.2f}",
+                    "yes_price_dollars": f"{sell_price:.4f}",
+                    "time_in_force": "immediate_or_cancel",
+                    "self_trade_prevention_type": "taker_at_cross",
+                }
+                if self.settings.kalshi_subaccount:
+                    order_request["subaccount"] = self.settings.kalshi_subaccount
+                order_resp = await self.kalshi.create_order(order_request)
+                event_payload["order_request"] = order_request
                 event_payload["order_response"] = order_resp
             except Exception as exc:
                 logger.warning("stop_loss order submit failed for %s: %s", market_ticker, exc)
                 event_payload["submit_error"] = str(exc)
                 submit_failed = True
+                # Back off on outright submit errors to avoid spamming an illiquid book.
+                submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
 
         await repo.log_ops_event(
             severity="warning",
@@ -306,36 +328,28 @@ class StopLossService:
             payload=event_payload,
         )
 
-        submit_payload: dict[str, Any] = {
-            "submitted_at": now.isoformat(),
-            "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
-            "peak_price": str(peak) if peak is not None else None,
-            "trigger": trigger,
-        }
-        if submit_failed:
-            # Back off 30 min on order failure to avoid spamming an illiquid book.
-            submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
         await repo.set_checkpoint(
             f"stop_loss_submit:{self.settings.kalshi_env}:{market_ticker}",
             cursor=None,
             payload=submit_payload,
         )
-        await repo.set_checkpoint(
-            f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}",
-            cursor=None,
-            payload={
-                "stopped_at": now.isoformat(),
-                "stopped_side": position.side,
-                "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
-                "peak_price": str(peak) if peak is not None else None,
-                "trigger": trigger,
-                "reverse_evaluated": False,
-            },
-        )
+        if not submit_failed:
+            await repo.set_checkpoint(
+                f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}",
+                cursor=None,
+                payload={
+                    "stopped_at": now.isoformat(),
+                    "stopped_side": position.side,
+                    "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+                    "peak_price": str(peak) if peak is not None else None,
+                    "trigger": trigger,
+                    "reverse_evaluated": False,
+                },
+            )
 
         logger.warning(
             "Stop loss %s [%s]: %s %s trailing_loss=%s peak=%s slope=%s hold=%.0fmin%s",
-            "shadow" if shadow else "executed",
+            "shadow" if shadow else ("submit_failed" if submit_failed else "submitted"),
             trigger,
             market_ticker,
             position.side,
