@@ -65,7 +65,13 @@ jobs:
             "cd ${app_dir_quoted} && git pull --ff-only"
 
           ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml --env-file .env run --rm migrate"
+            "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml --env-file .env up -d postgres_demo postgres_production"
+
+          ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml --env-file .env run --rm --build --no-deps migrate_demo"
+
+          ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml --env-file .env run --rm --build --no-deps migrate_production"
 
           for c in ${colors}; do
             ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
