@@ -1321,11 +1321,14 @@ def create_app() -> FastAPI:
             series_ticker=payload.series_ticker,
             strategy_name=payload.strategy_name,
         )
-        run = await app_container.strategy_codex_service.create_run(
-            request=payload,
-            dashboard_snapshot=snapshot,
-            trigger_source="manual",
-        )
+        try:
+            run = await app_container.strategy_codex_service.create_run(
+                request=payload,
+                dashboard_snapshot=snapshot,
+                trigger_source="manual",
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": "invalid_provider_config", "message": str(exc)}, status_code=400)
         asyncio.create_task(app_container.strategy_codex_service.execute_run(run["run_id"]))
         return JSONResponse(run)
 

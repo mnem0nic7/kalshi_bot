@@ -628,15 +628,31 @@
   gap: 0.35rem;
 }
 
+.strategy-codex-provider-row {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.strategy-codex-provider-block {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.strategy-codex-select,
+.strategy-codex-model-input,
 .strategy-codex-prompt {
   width: 100%;
-  min-height: 7rem;
   border-radius: 16px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   background: rgba(4, 10, 22, 0.68);
   color: #f5f8ff;
   padding: 0.85rem 0.95rem;
   font: inherit;
+}
+
+.strategy-codex-prompt {
+  min-height: 7rem;
   resize: vertical;
 }
 
@@ -1217,6 +1233,10 @@
   .strategy-codex-run-title {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .strategy-codex-provider-row {
+    grid-template-columns: 1fr;
   }
 }
 

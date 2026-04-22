@@ -11,7 +11,12 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.agents.codex_cli import CodexCLIProvider
-from kalshi_bot.agents.providers import ChatGPTCodexProvider, OpenAICompatibleProvider, build_codex_provider
+from kalshi_bot.agents.providers import (
+    ChatGPTCodexProvider,
+    NativeGeminiProvider,
+    OpenAICompatibleProvider,
+    ProviderRouter,
+)
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import (
     StrategyCodexEvaluationPayload,
@@ -23,11 +28,18 @@ from kalshi_bot.services.strategy_regression import RegressionStrategySpec, Stra
 
 logger = logging.getLogger(__name__)
 
-CODEX_PROVIDER_NAME = "codex-cli"
 CODEX_RUN_STALE_AFTER = timedelta(minutes=10)
 CODEX_RECENT_RUN_LIMIT = 8
 CODEX_CREATION_WINDOW_DAYS = 180
 CODEX_TRIGGER_SOURCES = {"manual", "nightly"}
+STRATEGY_LAB_SOURCE = "strategy_lab"
+LEGACY_STRATEGY_LAB_SOURCES = {"codex_cli", STRATEGY_LAB_SOURCE}
+STRATEGY_PROVIDER_PREFERENCE = ("gemini", "codex", "hosted")
+STRATEGY_PROVIDER_LABELS = {
+    "gemini": "Gemini",
+    "codex": "Codex",
+    "hosted": "Hosted",
+}
 
 
 def _ratio_display(value: float | None) -> str:
@@ -60,38 +72,131 @@ def _clean_text(value: str | None) -> str | None:
     return cleaned or None
 
 
+def _ordered_unique(values: list[str | None]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        cleaned = _clean_text(value)
+        if cleaned is None or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        ordered.append(cleaned)
+    return ordered
+
+
 class StrategyCodexService:
     def __init__(
         self,
         settings: Settings,
         session_factory: async_sessionmaker,
         strategy_regression_service: StrategyRegressionService,
+        providers: ProviderRouter | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.strategy_regression_service = strategy_regression_service
-        self.provider: CodexCLIProvider | OpenAICompatibleProvider | ChatGPTCodexProvider | None = None
-        self.provider_name = "unavailable"
-        self._refresh_provider()
+        self.providers = providers or ProviderRouter(settings)
+        self._owns_providers = providers is None
 
     async def close(self) -> None:
-        if self.provider is not None:
-            await self.provider.close()
+        if self._owns_providers:
+            await self.providers.close()
 
     def is_available(self) -> bool:
-        if self.provider is None:
-            self._refresh_provider()
-        return self.provider is not None
+        return bool(self._provider_options())
 
-    def _refresh_provider(self) -> None:
-        if self.provider is not None:
-            return
-        provider, provider_name = build_codex_provider(
-            self.settings,
-            timeout_seconds=max(self.settings.llm_request_timeout_seconds, 90.0),
-        )
-        self.provider = provider
-        self.provider_name = provider_name
+    @staticmethod
+    def _normalize_provider_id(provider_id: str | None) -> str | None:
+        if not provider_id:
+            return None
+        lowered = provider_id.strip().lower()
+        if lowered in {"codex", "codex-cli", "chatgpt-oauth", "apikey-from-auth-json", "apikey-from-env"}:
+            return "codex"
+        if lowered in {"gemini", "hosted"}:
+            return lowered
+        return None
+
+    def _provider_object(
+        self,
+        provider_id: str | None,
+    ) -> NativeGeminiProvider | CodexCLIProvider | ChatGPTCodexProvider | OpenAICompatibleProvider | None:
+        normalized = self._normalize_provider_id(provider_id)
+        if normalized == "gemini":
+            return self.providers.gemini
+        if normalized == "codex":
+            return self.providers.codex
+        if normalized == "hosted":
+            return self.providers.hosted
+        return None
+
+    def _default_model_for_provider(self, provider_id: str | None) -> str | None:
+        normalized = self._normalize_provider_id(provider_id)
+        if normalized == "gemini":
+            return self.settings.gemini_model_president
+        if normalized == "codex":
+            return self.settings.codex_model
+        if normalized == "hosted":
+            return self.settings.llm_hosted_model
+        return None
+
+    def _suggested_models_for_provider(self, provider_id: str | None) -> list[str]:
+        normalized = self._normalize_provider_id(provider_id)
+        if normalized == "gemini":
+            return _ordered_unique(
+                [
+                    self.settings.gemini_model_president,
+                    self.settings.gemini_model_trader,
+                    self.settings.gemini_model_researcher,
+                    self.settings.gemini_model_risk_officer,
+                    self.settings.gemini_model_ops_monitor,
+                    self.settings.gemini_model_memory_librarian,
+                    "gemini-2.5-pro",
+                    "gemini-2.5-flash",
+                ]
+            )
+        if normalized == "codex":
+            return _ordered_unique([self.settings.codex_model])
+        if normalized == "hosted":
+            return _ordered_unique([self.settings.llm_hosted_model])
+        return []
+
+    def _provider_options(self) -> list[dict[str, Any]]:
+        options: list[dict[str, Any]] = []
+        for provider_id in STRATEGY_PROVIDER_PREFERENCE:
+            if self._provider_object(provider_id) is None:
+                continue
+            options.append(
+                {
+                    "id": provider_id,
+                    "label": STRATEGY_PROVIDER_LABELS[provider_id],
+                    "default_model": self._default_model_for_provider(provider_id),
+                    "suggested_models": self._suggested_models_for_provider(provider_id),
+                }
+            )
+        return options
+
+    def _preferred_provider_id(self) -> str | None:
+        options = self._provider_options()
+        if not options:
+            return None
+        return str(options[0]["id"])
+
+    def _resolve_provider_config(
+        self,
+        *,
+        requested_provider: str | None,
+        requested_model: str | None,
+    ) -> tuple[str, NativeGeminiProvider | CodexCLIProvider | ChatGPTCodexProvider | OpenAICompatibleProvider, str]:
+        provider_id = self._normalize_provider_id(requested_provider) or self._preferred_provider_id()
+        if provider_id is None:
+            raise RuntimeError("No strategy lab provider is configured")
+        provider = self._provider_object(provider_id)
+        if provider is None:
+            raise ValueError(f"Strategy provider {provider_id} is unavailable")
+        model = _clean_text(requested_model) or self._default_model_for_provider(provider_id)
+        if model is None:
+            raise ValueError(f"No default model configured for {provider_id}")
+        return provider_id, provider, model
 
     async def mark_stale_runs_failed(self) -> int:
         stale_before = datetime.now(UTC) - CODEX_RUN_STALE_AFTER
@@ -99,7 +204,7 @@ class StrategyCodexService:
             repo = PlatformRepository(session)
             rows = await repo.fail_stale_strategy_codex_runs(
                 stale_before=stale_before,
-                error_text="Codex strategy run expired before completion.",
+                error_text="Strategy lab run expired before completion.",
             )
             await session.commit()
         return len(rows)
@@ -122,14 +227,17 @@ class StrategyCodexService:
                 "source_run_id": (strategy.strategy_metadata or {}).get("source_run_id"),
             }
             for strategy in strategies
-            if not strategy.is_active and strategy.source == "codex_cli"
+            if not strategy.is_active and strategy.source in LEGACY_STRATEGY_LAB_SOURCES
         ]
 
-        available = self.is_available()
+        provider_options = self._provider_options()
+        default_provider = provider_options[0] if provider_options else None
         return {
-            "available": available,
-            "provider": self.provider_name if available else "unavailable",
-            "model": self.settings.codex_model if available else None,
+            "available": bool(default_provider),
+            "provider": default_provider["id"] if default_provider else "unavailable",
+            "provider_label": default_provider["label"] if default_provider else "Unavailable",
+            "model": default_provider["default_model"] if default_provider else None,
+            "provider_options": provider_options,
             "creation_window_days": CODEX_CREATION_WINDOW_DAYS,
             "recent_runs": [self._compact_run_view(record) for record in recent_runs],
             "inactive_codex_strategies": inactive_codex_strategies,
@@ -142,10 +250,17 @@ class StrategyCodexService:
         dashboard_snapshot: dict[str, Any],
         trigger_source: str = "manual",
     ) -> dict[str, Any]:
-        if not self.is_available() or self.provider is None:
-            raise RuntimeError("Codex provider is not available")
+        if not self.is_available():
+            raise RuntimeError("Strategy lab provider is not available")
         if trigger_source not in CODEX_TRIGGER_SOURCES:
             raise ValueError(f"Unsupported codex trigger source: {trigger_source}")
+        provider_id, _provider, model = self._resolve_provider_config(
+            requested_provider=request.provider,
+            requested_model=request.model,
+        )
+        request_payload = request.model_dump(mode="json")
+        request_payload["provider"] = provider_id
+        request_payload["model"] = model
         compact_snapshot = self._compact_dashboard_snapshot(dashboard_snapshot)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -157,10 +272,10 @@ class StrategyCodexService:
                 series_ticker=request.series_ticker,
                 strategy_name=request.strategy_name,
                 operator_brief=request.operator_brief,
-                provider=CODEX_PROVIDER_NAME,
-                model=self.settings.codex_model,
+                provider=provider_id,
+                model=model,
                 payload={
-                    "request": request.model_dump(mode="json"),
+                    "request": request_payload,
                     "snapshot": compact_snapshot,
                 },
             )
@@ -212,9 +327,6 @@ class StrategyCodexService:
         return results
 
     async def execute_run(self, run_id: str) -> None:
-        if not self.is_available() or self.provider is None:
-            return
-
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             run = await repo.get_strategy_codex_run(run_id)
@@ -292,7 +404,7 @@ class StrategyCodexService:
             "series_ticker": run.series_ticker,
             "strategy_name": run.strategy_name,
             "operator_brief": run.operator_brief,
-            "provider": run.provider,
+            "provider": self._normalize_provider_id(run.provider) or run.provider,
             "model": run.model,
             "created_at": run.created_at.isoformat(),
             "updated_at": run.updated_at.isoformat(),
@@ -345,14 +457,14 @@ class StrategyCodexService:
             except ValidationError as exc:
                 raise ValueError("Completed run does not contain a valid suggestion candidate") from exc
 
-            requested_name = _clean_text(candidate_payload.name) or "codex-strategy"
+            requested_name = _clean_text(candidate_payload.name) or "strategy-lab"
             strategy_name = await self._unique_strategy_name(repo, requested_name)
             strategy = await repo.create_strategy(
                 name=strategy_name,
                 description=_clean_text(candidate_payload.description),
                 thresholds=candidate_payload.thresholds.model_dump(mode="json"),
                 is_active=False,
-                source="codex_cli",
+                source=STRATEGY_LAB_SOURCE,
                 metadata={
                     "labels": list(candidate_payload.labels),
                     "rationale": candidate_payload.rationale,
@@ -394,12 +506,19 @@ class StrategyCodexService:
             await session.commit()
 
         if run.mode == "evaluate":
-            return await self._evaluate_snapshot(run=run, snapshot=snapshot)
-        return await self._suggest_strategy(run=run, snapshot=snapshot, active_rows=active_rows)
+            _provider_id, provider, model = self._resolve_provider_config(
+                requested_provider=run.provider,
+                requested_model=run.model,
+            )
+            return await self._evaluate_snapshot(run=run, snapshot=snapshot, provider=provider, model=model)
+        _provider_id, provider, model = self._resolve_provider_config(
+            requested_provider=run.provider,
+            requested_model=run.model,
+        )
+        return await self._suggest_strategy(run=run, snapshot=snapshot, active_rows=active_rows, provider=provider, model=model)
 
-    async def _evaluate_snapshot(self, *, run, snapshot: dict[str, Any]) -> dict[str, Any]:
-        assert self.provider is not None
-        payload = await self.provider.complete_json(
+    async def _evaluate_snapshot(self, *, run, snapshot: dict[str, Any], provider, model: str) -> dict[str, Any]:
+        payload = await provider.complete_json(
             system_prompt=(
                 "You are a strategy evaluator for a Kalshi trading dashboard. "
                 "Review only the supplied strategy snapshot. "
@@ -416,7 +535,7 @@ class StrategyCodexService:
                 },
                 indent=2,
             ),
-            model=self.settings.codex_model,
+            model=model,
             temperature=0.2,
             schema_model=StrategyCodexEvaluationPayload,
         )
@@ -425,9 +544,8 @@ class StrategyCodexService:
             "evaluation": payload,
         }
 
-    async def _suggest_strategy(self, *, run, snapshot: dict[str, Any], active_rows: list[Any]) -> dict[str, Any]:
-        assert self.provider is not None
-        suggestion = await self.provider.complete_json(
+    async def _suggest_strategy(self, *, run, snapshot: dict[str, Any], active_rows: list[Any], provider, model: str) -> dict[str, Any]:
+        suggestion = await provider.complete_json(
             system_prompt=(
                 "You design one new threshold-based strategy preset for a Kalshi strategy regression dashboard. "
                 "Use only the current threshold schema. "
@@ -445,14 +563,14 @@ class StrategyCodexService:
                 },
                 indent=2,
             ),
-            model=self.settings.codex_model,
+            model=model,
             temperature=0.2,
             schema_model=StrategyCodexSuggestionPayload,
         )
         candidate = StrategyCodexSuggestionPayload.model_validate(suggestion)
         candidate_spec = RegressionStrategySpec(
             id=None,
-            name=_clean_text(candidate.name) or "codex-candidate",
+            name=_clean_text(candidate.name) or "strategy-candidate",
             description=_clean_text(candidate.description),
             thresholds=candidate.thresholds.model_dump(mode="json"),
         )
@@ -598,7 +716,7 @@ class StrategyCodexService:
         }
 
     async def _unique_strategy_name(self, repo: PlatformRepository, requested_name: str) -> str:
-        base_name = requested_name.strip()[:64] or "codex-strategy"
+        base_name = requested_name.strip()[:64] or "strategy-lab"
         candidate = base_name
         suffix = 2
         while await repo.get_strategy_by_name(candidate) is not None:
@@ -722,6 +840,8 @@ class StrategyCodexService:
             "window_days": record.window_days,
             "series_ticker": record.series_ticker,
             "strategy_name": record.strategy_name,
+            "provider": self._normalize_provider_id(record.provider) or record.provider,
+            "model": record.model,
             "created_at": record.created_at.isoformat(),
             "updated_at": record.updated_at.isoformat(),
             "summary": summary,

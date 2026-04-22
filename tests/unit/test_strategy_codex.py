@@ -6,11 +6,8 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-import kalshi_bot.services.strategy_codex as strategy_codex_module
-from kalshi_bot.agents.codex_cli import CodexCLIProvider
-from kalshi_bot.agents.providers import OpenAICompatibleProvider
 from kalshi_bot.config import Settings
-from kalshi_bot.core.schemas import StrategyThresholdPreset
+from kalshi_bot.core.schemas import StrategyCodexRunRequest, StrategyThresholdPreset
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.strategy_codex import StrategyCodexService
@@ -20,6 +17,16 @@ from kalshi_bot.services.strategy_regression import (
     StrategyRegressionService,
 )
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
+
+
+class FakeProviderRouter:
+    def __init__(self, *, gemini=None, codex=None, hosted=None) -> None:
+        self.gemini = gemini
+        self.codex = codex
+        self.hosted = hosted
+
+    async def close(self) -> None:
+        return None
 
 
 def _valid_thresholds() -> dict[str, object]:
@@ -112,54 +119,62 @@ async def test_strategy_codex_unique_strategy_name_uses_deterministic_suffixes()
     assert unique_name == "balanced-plus-3"
 
 
+def test_strategy_codex_service_prefers_gemini_when_available() -> None:
+    service = StrategyCodexService(
+        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-gemini.db"),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        FakeProviderRouter(gemini=object(), codex=object(), hosted=None),
+    )
+
+    assert service.is_available() is True
+    assert service._preferred_provider_id() == "gemini"
+    assert service._default_model_for_provider("gemini") == "gemini-2.5-pro"
+    assert service._provider_options()[0]["id"] == "gemini"
+
+
+def test_strategy_codex_service_reports_unavailable_without_strategy_providers() -> None:
+    service = StrategyCodexService(
+        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-none.db"),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        FakeProviderRouter(gemini=None, codex=None, hosted=None),
+    )
+
+    assert service.is_available() is False
+    assert service._provider_options() == []
+
+
 @pytest.mark.asyncio
-async def test_strategy_codex_service_uses_api_key_provider_when_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(CodexCLIProvider, "is_available", staticmethod(lambda: False))
-    service = StrategyCodexService(
-        Settings(
-            database_url="sqlite+aiosqlite:///./strategy-codex-fallback.db",
-            codex_api_key="test-key",
-            codex_auth_json_path="/nonexistent/auth.json",
-        ),
-        SimpleNamespace(),
-        SimpleNamespace(),
-    )
-
-    assert service.is_available() is True
-    assert service.provider_name == "apikey-from-env"
-    assert isinstance(service.provider, OpenAICompatibleProvider)
-
-    await service.close()
-
-
-def test_strategy_codex_service_rechecks_provider_after_startup_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeProvider:
-        async def close(self) -> None:
-            return None
-
-    calls = 0
-    fake_provider = FakeProvider()
-
-    def fake_build_provider(settings: Settings, *, timeout_seconds: float | None = None):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return None, "unavailable"
-        return fake_provider, "codex-cli"
-
-    monkeypatch.setattr(strategy_codex_module, "build_codex_provider", fake_build_provider)
+async def test_strategy_codex_create_run_persists_selected_provider_and_model(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-codex-provider.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
 
     service = StrategyCodexService(
-        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-recheck.db"),
+        settings,
+        session_factory,
         SimpleNamespace(),
-        SimpleNamespace(),
+        FakeProviderRouter(gemini=object(), codex=object(), hosted=object()),
     )
 
-    assert service.provider is None
-    assert service.provider_name == "unavailable"
-    assert service.is_available() is True
-    assert service.provider is fake_provider
-    assert service.provider_name == "codex-cli"
+    run = await service.create_run(
+        request=StrategyCodexRunRequest(mode="evaluate", window_days=180, provider="hosted", model="hosted-eval-v2"),
+        dashboard_snapshot={"summary": {"window_days": 180}, "leaderboard": [], "city_matrix": []},
+        trigger_source="manual",
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        record = await repo.get_strategy_codex_run(run["run_id"])
+        await session.commit()
+
+    assert record is not None
+    assert record.provider == "hosted"
+    assert record.model == "hosted-eval-v2"
+
+    await engine.dispose()
 
 
 def test_candidate_backtest_uses_dashboard_metric_shape() -> None:
@@ -260,11 +275,12 @@ async def test_strategy_codex_payloads_include_trigger_source(tmp_path) -> None:
         )
         await session.commit()
 
-    service = object.__new__(StrategyCodexService)
-    service.settings = settings
-    service.session_factory = session_factory
-    service.strategy_regression_service = SimpleNamespace()
-    service.provider = None
+    service = StrategyCodexService(
+        settings,
+        session_factory,
+        SimpleNamespace(),
+        FakeProviderRouter(gemini=None, codex=object(), hosted=None),
+    )
 
     dashboard_payload = await service.dashboard_payload()
     run_view = await service.get_run_view(run.id)

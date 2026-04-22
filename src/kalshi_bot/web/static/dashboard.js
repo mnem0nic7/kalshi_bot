@@ -233,6 +233,8 @@
     searchQuery: "",
     cityFilter: "all",
     codexMode: "evaluate",
+    codexProvider: null,
+    codexModel: "",
     codexRunId: null,
     codexPrompt: "",
     codexSubmitting: false,
@@ -1000,6 +1002,39 @@
     return payload && payload.codex_lab ? payload.codex_lab : {};
   }
 
+  function codexProviderOptions(payload) {
+    const lab = codexLabPayload(payload);
+    return Array.isArray(lab.provider_options) ? lab.provider_options : [];
+  }
+
+  function codexProviderLabel(providerId, payload) {
+    const option = codexProviderOptions(payload).find((item) => item.id === providerId);
+    if (option && option.label) return option.label;
+    if (providerId === "gemini") return "Gemini";
+    if (providerId === "codex") return "Codex";
+    if (providerId === "hosted") return "Hosted";
+    return providerId || "AI";
+  }
+
+  function syncCodexSelection(payload, options) {
+    const providerOptions = codexProviderOptions(payload);
+    if (!providerOptions.length) {
+      strategyState.codexProvider = null;
+      if (options && options.resetModel) strategyState.codexModel = "";
+      return null;
+    }
+    const requestedProvider = strategyState.codexProvider;
+    const selectedProvider = providerOptions.find((item) => item.id === requestedProvider)
+      || providerOptions.find((item) => item.id === codexLabPayload(payload).provider)
+      || providerOptions[0];
+    const providerChanged = strategyState.codexProvider !== selectedProvider.id;
+    strategyState.codexProvider = selectedProvider.id;
+    if (providerChanged || !strategyState.codexModel || (options && options.resetModel)) {
+      strategyState.codexModel = selectedProvider.default_model || "";
+    }
+    return selectedProvider;
+  }
+
   function humanizeThresholdKey(key) {
     return String(key || "")
       .split("_")
@@ -1030,6 +1065,8 @@
       window_days: run.window_days,
       series_ticker: run.series_ticker,
       strategy_name: run.strategy_name,
+      provider: run.provider || null,
+      model: run.model || null,
       created_at: run.created_at,
       updated_at: run.updated_at,
       summary: run.result && run.result.kind === "evaluate"
@@ -1069,6 +1106,7 @@
         available: false,
         provider: "unavailable",
         model: null,
+        provider_options: [],
         recent_runs: [],
         inactive_codex_strategies: [],
         creation_window_days: 180,
@@ -1147,16 +1185,18 @@
           series_ticker: strategyState.codexContextSeriesTicker,
           strategy_name: strategyState.codexContextStrategyName,
           operator_brief: (strategyState.codexPrompt || "").trim() || null,
+          provider: strategyState.codexProvider || null,
+          model: (strategyState.codexModel || "").trim() || null,
         }),
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
-        showCodexMessage("bad", responseErrorMessage(body, "Codex run failed to start."));
+        showCodexMessage("bad", responseErrorMessage(body, "Strategy lab run failed to start."));
         return;
       }
       strategyState.codexRunId = body.run_id || null;
       strategyState.codexRunDetail = null;
-      showCodexMessage("good", "Codex run queued.");
+      showCodexMessage("good", "Strategy lab run queued.");
       await loadStrategies({
         windowDays: strategyState.windowDays,
         focusMode: "strategies",
@@ -1164,7 +1204,7 @@
       });
       await fetchCodexRunDetail(body.run_id, { refreshAfterComplete: true });
     } catch (_) {
-      showCodexMessage("bad", "Codex run failed to start.");
+      showCodexMessage("bad", "Strategy lab run failed to start.");
     } finally {
       strategyState.codexSubmitting = false;
       if (strategyState.payload) renderStrategies(strategyState.payload);
@@ -1251,16 +1291,18 @@
     const meta = document.getElementById("strategies-codex-meta");
     if (!container) return;
     const lab = codexLabPayload(payload);
+    const activeProvider = syncCodexSelection(payload);
     const recentRuns = Array.isArray(lab.recent_runs) ? lab.recent_runs : [];
     const inactiveStrategies = Array.isArray(lab.inactive_codex_strategies) ? lab.inactive_codex_strategies : [];
     const selectedRun = strategyState.codexRunDetail && strategyState.codexRunDetail.id === strategyState.codexRunId
       ? strategyState.codexRunDetail
       : null;
-    const readyLabel = lab.provider === "codex-cli" ? "Codex CLI ready" : "Codex ready";
+    const activeProviderLabel = activeProvider ? activeProvider.label || codexProviderLabel(activeProvider.id, payload) : "AI";
+    const readyLabel = `${activeProviderLabel} ready`;
     if (meta) {
       meta.textContent = lab.available
-        ? `Using ${lab.provider || "codex-cli"}${lab.model ? ` · ${lab.model}` : ""} for async evaluation and suggestion runs.`
-        : "Codex is unavailable in this environment. The rest of the Strategies page still works normally.";
+        ? `Using ${activeProviderLabel}${strategyState.codexModel ? ` · ${strategyState.codexModel}` : ""} for async evaluation and suggestion runs.`
+        : "The strategy lab is unavailable in this environment. The rest of the Strategies page still works normally.";
     }
 
     const children = [];
@@ -1268,9 +1310,9 @@
     const topRow = el("div", "strategy-codex-top-row");
     const availability = el("div", "strategy-codex-availability");
     availability.appendChild(
-      pill(lab.available ? readyLabel : "Codex unavailable", lab.available ? "good" : "bad"),
+      pill(lab.available ? readyLabel : "Strategy lab unavailable", lab.available ? "good" : "bad"),
     );
-    if (lab.model) availability.appendChild(el("span", "muted-label mono", lab.model));
+    if (strategyState.codexModel) availability.appendChild(el("span", "muted-label mono", strategyState.codexModel));
     topRow.appendChild(availability);
 
     const modeSwitch = el("div", "strategy-codex-mode-switch");
@@ -1305,6 +1347,53 @@
     contextRow.appendChild(clearContextButton);
     controls.appendChild(contextRow);
 
+    const providerRow = el("div", "strategy-codex-provider-row");
+    const providerBlock = el("div", "strategy-codex-provider-block");
+    const providerLabel = el("label", "muted-label", "Provider");
+    providerLabel.setAttribute("for", "strategies-codex-provider");
+    const providerSelect = el("select", "strategy-codex-select");
+    providerSelect.id = "strategies-codex-provider";
+    providerSelect.disabled = !lab.available || strategyState.codexSubmitting;
+    codexProviderOptions(payload).forEach((option) => {
+      const optionNode = document.createElement("option");
+      optionNode.value = option.id;
+      optionNode.textContent = option.label || codexProviderLabel(option.id, payload);
+      optionNode.selected = option.id === strategyState.codexProvider;
+      providerSelect.appendChild(optionNode);
+    });
+    providerSelect.addEventListener("change", () => {
+      strategyState.codexProvider = providerSelect.value || null;
+      syncCodexSelection(payload, { resetModel: true });
+      if (strategyState.payload) renderStrategies(strategyState.payload);
+    });
+    providerBlock.append(providerLabel, providerSelect);
+    providerRow.appendChild(providerBlock);
+
+    const modelBlock = el("div", "strategy-codex-provider-block");
+    const modelLabel = el("label", "muted-label", "Model");
+    modelLabel.setAttribute("for", "strategies-codex-model");
+    const modelInput = el("input", "strategy-codex-model-input");
+    modelInput.id = "strategies-codex-model";
+    modelInput.type = "text";
+    modelInput.disabled = !lab.available || strategyState.codexSubmitting;
+    modelInput.value = strategyState.codexModel || "";
+    modelInput.placeholder = activeProvider && activeProvider.default_model ? activeProvider.default_model : "Enter model id";
+    const modelListId = "strategies-codex-model-list";
+    modelInput.setAttribute("list", modelListId);
+    modelInput.addEventListener("input", () => {
+      strategyState.codexModel = modelInput.value || "";
+    });
+    const modelList = document.createElement("datalist");
+    modelList.id = modelListId;
+    (activeProvider && Array.isArray(activeProvider.suggested_models) ? activeProvider.suggested_models : []).forEach((modelName) => {
+      const optionNode = document.createElement("option");
+      optionNode.value = modelName;
+      modelList.appendChild(optionNode);
+    });
+    modelBlock.append(modelLabel, modelInput, modelList);
+    providerRow.appendChild(modelBlock);
+    controls.appendChild(providerRow);
+
     const promptBlock = el("div", "strategy-codex-prompt-block");
     const promptLabel = el("label", "muted-label", "Operator brief");
     promptLabel.setAttribute("for", "strategies-codex-prompt");
@@ -1312,8 +1401,8 @@
     prompt.id = "strategies-codex-prompt";
     prompt.rows = 4;
     prompt.placeholder = strategyState.codexMode === "suggest"
-      ? "Optional: explain what kind of new threshold preset you want Codex to explore."
-      : "Optional: tell Codex what you want emphasized in the evaluation.";
+      ? "Optional: explain what kind of new threshold preset you want the strategy lab to explore."
+      : "Optional: tell the strategy lab what you want emphasized in the evaluation.";
     prompt.value = strategyState.codexPrompt || "";
     prompt.addEventListener("input", () => {
       strategyState.codexPrompt = prompt.value || "";
@@ -1353,7 +1442,7 @@
     const left = el("section", "strategy-codex-sidebar");
     left.append(el("h3", null, "Recent Runs"));
     if (!recentRuns.length) {
-      left.append(el("p", "empty-state", "No Codex runs yet."));
+      left.append(el("p", "empty-state", "No strategy lab runs yet."));
     } else {
       const runList = el("div", "strategy-codex-run-list");
       recentRuns.forEach((run) => {
@@ -1387,7 +1476,7 @@
     const draftsSection = el("div", "strategy-codex-drafts");
     draftsSection.append(el("h3", null, "Saved Inactive Presets"));
     if (!inactiveStrategies.length) {
-      draftsSection.append(el("p", "empty-state", "No inactive Codex-created presets yet."));
+      draftsSection.append(el("p", "empty-state", "No inactive strategy-lab presets yet."));
     } else {
       const draftList = el("div", "strategy-codex-draft-list");
       inactiveStrategies.forEach((item) => {
@@ -1416,7 +1505,7 @@
     const right = el("section", "strategy-codex-result");
     right.append(el("h3", null, "Run Detail"));
     if (!selectedRun) {
-      right.append(el("p", "empty-state", "Select a run to inspect the Codex result."));
+      right.append(el("p", "empty-state", "Select a run to inspect the result."));
     } else {
       const statusRow = el("div", "strategy-codex-status-row");
       statusRow.append(
@@ -1424,6 +1513,12 @@
         pill(codexTriggerSourceLabel(selectedRun.trigger_source), selectedRun.trigger_source === "nightly" ? "warning" : "neutral"),
         pill(selectedRun.status || "queued", selectedRun.status === "completed" ? "good" : selectedRun.status === "failed" ? "bad" : "warning"),
       );
+      if (selectedRun.provider) {
+        statusRow.appendChild(pill(codexProviderLabel(selectedRun.provider, payload), "neutral"));
+      }
+      if (selectedRun.model) {
+        statusRow.appendChild(el("span", "muted-label mono", selectedRun.model));
+      }
       right.appendChild(statusRow);
       if (selectedRun.error_text) {
         right.append(el("p", "strategy-codex-message is-bad", selectedRun.error_text));
@@ -2167,7 +2262,7 @@
     const header = el("div", "strategy-detail-header");
     header.append(el("h3", null, city.series_ticker || "City detail"));
     header.append(el("p", "muted-label", city.city_label || city.location_name || "City-level strategy comparison"));
-    const codexAction = el("button", "strategy-inline-action", "Open in Codex Lab");
+    const codexAction = el("button", "strategy-inline-action", "Open in Strategy Lab");
     codexAction.type = "button";
     codexAction.addEventListener("click", () => {
       openCodexLabContext({
@@ -2280,7 +2375,7 @@
     const header = el("div", "strategy-detail-header");
     header.append(el("h3", null, strategy.name || "Strategy detail"));
     if (strategy.description) header.append(el("p", "muted-label", strategy.description));
-    const codexAction = el("button", "strategy-inline-action", "Open in Codex Lab");
+    const codexAction = el("button", "strategy-inline-action", "Open in Strategy Lab");
     codexAction.type = "button";
     codexAction.addEventListener("click", () => {
       openCodexLabContext({

@@ -426,8 +426,23 @@ def _build_strategies_payload(
         "detail_context": detail_context,
         "codex_lab": {
             "available": True,
-            "provider": "codex-cli",
-            "model": "gpt-4o",
+            "provider": "gemini",
+            "provider_label": "Gemini",
+            "model": "gemini-2.5-pro",
+            "provider_options": [
+                {
+                    "id": "gemini",
+                    "label": "Gemini",
+                    "default_model": "gemini-2.5-pro",
+                    "suggested_models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+                },
+                {
+                    "id": "codex",
+                    "label": "Codex",
+                    "default_model": "gpt-4o",
+                    "suggested_models": ["gpt-4o"],
+                },
+            ],
             "creation_window_days": 180,
             "recent_runs": [
                 {
@@ -435,6 +450,8 @@ def _build_strategies_payload(
                     "mode": "suggest",
                     "status": "completed",
                     "trigger_source": "nightly",
+                    "provider": "gemini",
+                    "model": "gemini-2.5-pro",
                     "window_days": window_days,
                     "series_ticker": "KXHIGHNY",
                     "strategy_name": None,
@@ -448,6 +465,8 @@ def _build_strategies_payload(
                     "mode": "evaluate",
                     "status": "completed",
                     "trigger_source": "manual",
+                    "provider": "codex",
+                    "model": "gpt-4o",
                     "window_days": window_days,
                     "series_ticker": None,
                     "strategy_name": "moderate",
@@ -797,16 +816,19 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert "Evidence interpretation" in detail_text
                 assert "Approval" in detail_text
                 assert page.locator("#strategies-cities-detail textarea").is_visible()
-                page.locator('#strategies-cities-detail button:has-text("Open in Codex Lab")').click(timeout=15_000)
+                page.locator('#strategies-cities-detail button:has-text("Open in Strategy Lab")').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-focus-strategies')?.hidden === false",
                     timeout=15_000,
                 )
                 codex_text = page.locator("#strategies-codex-lab").text_content(timeout=15_000) or ""
-                assert "Codex CLI ready" in codex_text
+                assert "Gemini ready" in codex_text
+                assert "gemini-2.5-pro" in codex_text
                 assert "Nightly" in codex_text
                 assert "Saved Inactive Presets" in codex_text
                 assert "balanced-plus" in codex_text
+                assert page.locator("#strategies-codex-provider").input_value(timeout=15_000) == "gemini"
+                assert page.locator("#strategies-codex-model").input_value(timeout=15_000) == "gemini-2.5-pro"
                 page.locator('#strategies-focus-switch button[data-focus-mode="cities"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-focus-cities')?.hidden === false",

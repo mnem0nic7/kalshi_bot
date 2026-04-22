@@ -948,6 +948,8 @@ class StrategyCodexRunRequest(BaseModel):
     series_ticker: str | None = None
     strategy_name: str | None = None
     operator_brief: str | None = None
+    provider: str | None = None
+    model: str | None = None
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -963,13 +965,23 @@ class StrategyCodexRunRequest(BaseModel):
             raise ValueError("Mode must be evaluate or suggest")
         return value
 
-    @field_validator("series_ticker", "strategy_name", "operator_brief", mode="before")
+    @field_validator("series_ticker", "strategy_name", "operator_brief", "provider", "model", mode="before")
     @classmethod
     def strip_optional_text(cls, value: Any) -> Any:
         if isinstance(value, str):
             value = value.strip()
             return value or None
         return value
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.lower()
+        if normalized not in {"gemini", "codex", "hosted"}:
+            raise ValueError("Provider must be gemini, codex, or hosted")
+        return normalized
 
 
 class StrategyCodexEvaluationPayload(BaseModel):

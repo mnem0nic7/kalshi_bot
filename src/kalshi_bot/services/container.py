@@ -208,7 +208,12 @@ class AppContainer:
         stop_loss_service = StopLossService(settings, session_factory, kalshi)
         strategy_eval_service = StrategyEvaluationService(settings, session_factory, agent_pack_service)
         strategy_regression_service = StrategyRegressionService(settings, session_factory, weather_directory, agent_pack_service)
-        strategy_codex_service = StrategyCodexService(settings, session_factory, strategy_regression_service)
+        strategy_codex_service = StrategyCodexService(
+            settings,
+            session_factory,
+            strategy_regression_service,
+            providers,
+        )
         strategy_dashboard_service = StrategyDashboardService(
             session_factory=session_factory,
             weather_directory=weather_directory,
