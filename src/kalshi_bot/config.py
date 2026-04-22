@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     postgres_db: str = "kalshi_bot"
     postgres_user: str = "postgres"
     postgres_password: str | None = None
+    postgres_secondary_host: str | None = None
 
     kalshi_env: str = "demo"
     kalshi_read_api_key_id: str | None = Field(
@@ -207,6 +208,15 @@ class Settings(BaseSettings):
         self.database_url = (
             f"postgresql+asyncpg://{auth}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    @property
+    def secondary_database_url(self) -> str | None:
+        if not self.postgres_secondary_host:
+            return None
+        auth = quote(self.postgres_user, safe="")
+        if self.postgres_password:
+            auth = f"{auth}:{quote(self.postgres_password, safe='')}"
+        return f"postgresql+asyncpg://{auth}@{self.postgres_secondary_host}:{self.postgres_port}/{self.postgres_db}"
 
     @property
     def kalshi_rest_base_url(self) -> str:

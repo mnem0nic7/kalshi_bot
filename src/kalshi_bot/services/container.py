@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.agents.room_agents import AgentSuite
@@ -50,7 +50,9 @@ from kalshi_bot.weather.mapping import WeatherMarketDirectory
 class AppContainer:
     settings: Settings
     engine: AsyncEngine
+    secondary_engine: AsyncEngine | None
     session_factory: async_sessionmaker[AsyncSession]
+    secondary_session_factory: async_sessionmaker[AsyncSession] | None
     providers: ProviderRouter
     kalshi: KalshiClient
     kalshi_ws: KalshiWebSocketClient
@@ -91,6 +93,11 @@ class AppContainer:
         session_factory = create_session_factory(engine)
         if settings.app_auto_init_db:
             await init_models(engine)
+        secondary_engine: AsyncEngine | None = None
+        secondary_session_factory: async_sessionmaker[AsyncSession] | None = None
+        if settings.secondary_database_url:
+            secondary_engine = create_async_engine(settings.secondary_database_url, pool_pre_ping=True)
+            secondary_session_factory = create_session_factory(secondary_engine)
 
         providers = ProviderRouter(settings)
         kalshi = KalshiClient(settings)
@@ -245,7 +252,9 @@ class AppContainer:
         container = cls(
             settings=settings,
             engine=engine,
+            secondary_engine=secondary_engine,
             session_factory=session_factory,
+            secondary_session_factory=secondary_session_factory,
             providers=providers,
             kalshi=kalshi,
             kalshi_ws=kalshi_ws,
@@ -301,3 +310,5 @@ class AppContainer:
         await self.historical_training_service.close()
         await self.providers.close()
         await self.engine.dispose()
+        if self.secondary_engine is not None:
+            await self.secondary_engine.dispose()

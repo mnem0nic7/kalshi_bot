@@ -273,6 +273,12 @@ services:
       APP_COLOR: ${WEB_APP_COLOR:-blue}
       KALSHI_ENV: demo
       WEB_SITE_KIND: strategies
+      POSTGRES_SECONDARY_HOST: postgres_production
+    depends_on:
+      postgres_demo:
+        condition: service_healthy
+      postgres_production:
+        condition: service_healthy
 
   caddy:
     image: caddy:2.9-alpine

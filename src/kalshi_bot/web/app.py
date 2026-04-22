@@ -1471,6 +1471,24 @@ def create_app() -> FastAPI:
             assignment = await repo.get_city_strategy_assignment(series_ticker)
             await session.commit()
 
+        if app_container.secondary_session_factory is not None:
+            try:
+                async with app_container.secondary_session_factory() as sec_session:
+                    sec_repo = PlatformRepository(sec_session)
+                    await sec_repo.set_city_strategy_assignment(
+                        series_ticker,
+                        str(approved_strategy_name),
+                        assigned_by=STRATEGY_APPROVAL_ASSIGNED_BY,
+                    )
+                    await sec_session.commit()
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Secondary DB write failed for strategy assignment %s → %s",
+                    series_ticker,
+                    approved_strategy_name,
+                    exc_info=True,
+                )
+
         return JSONResponse(
             jsonable_encoder(
                 {
