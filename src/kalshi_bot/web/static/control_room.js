@@ -366,9 +366,18 @@
         sparkline: researchConfidence.sparkline || [],
       }),
       summaryCard({
+        label: "Active Rooms",
+        value: formatInteger(roomOutcomes.running || 0),
+        detail: roomOutcomes.running > 0 ? "rooms in progress" : "no rooms running",
+        pill: {
+          label: roomOutcomes.running > 0 ? "LIVE" : "IDLE",
+          tone: roomOutcomes.running > 0 ? "good" : "neutral",
+        },
+      }),
+      summaryCard({
         label: "Room Outcomes",
         value: `${formatInteger(roomOutcomes.succeeded || 0)}/${formatInteger(resolvedRoomCount)}`,
-        detail: `Resolved last ${formatInteger(roomOutcomes.window_hours || 24)}h · running ${formatInteger(roomOutcomes.running || 0)}`,
+        detail: `Resolved last ${formatInteger(roomOutcomes.window_hours || 24)}h`,
         subdetail: `blocked ${formatInteger(roomOutcomes.blocked || 0)} · stand down ${formatInteger(roomOutcomes.stand_down || 0)} · failed ${formatInteger(roomOutcomes.failed || 0)}`,
         critical: resolvedRoomCount > 0 && Number(roomOutcomes.succeeded || 0) === 0,
       }),
