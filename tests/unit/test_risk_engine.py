@@ -465,3 +465,66 @@ def test_risk_engine_approves_extreme_probability() -> None:
         context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
     )
     assert verdict.status == RiskStatus.APPROVED
+
+
+def test_risk_engine_blocks_when_pending_orders_reach_cap() -> None:
+    """Concurrent rooms with in-flight orders must not collectively exceed the position cap."""
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_position_count_fp_per_ticker=200,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+    # Filled position is 0 (no fills yet), but in-flight resting orders total 200 → at cap → block.
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            current_position_count_fp=Decimal("0"),
+            pending_order_count_fp=Decimal("200.00"),
+        ),
+    )
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("in-flight" in r for r in verdict.reasons)
+
+
+def test_risk_engine_combines_filled_and_pending_for_cap() -> None:
+    """Position cap check sums filled position and in-flight orders."""
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_position_count_fp_per_ticker=200,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+    # 100 filled + 100 pending = 200 → at cap → blocked
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            current_position_count_fp=Decimal("100.00"),
+            pending_order_count_fp=Decimal("100.00"),
+        ),
+    )
+    assert verdict.status == RiskStatus.BLOCKED

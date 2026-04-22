@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import dataclass
 import json
@@ -104,7 +105,6 @@ class KalshiClient:
         json: dict[str, Any] | None = None,
         write: bool = False,
     ) -> dict[str, Any]:
-        headers = self._auth_headers(method, path, write=write)
         filtered_params = (
             {
                 key: value
@@ -114,13 +114,25 @@ class KalshiClient:
             if params is not None
             else None
         )
-        response = await self.client.request(
-            method=method,
-            url=f"{self.settings.kalshi_rest_base_url}{path}",
-            params=filtered_params,
-            json=json,
-            headers=headers,
-        )
+        max_retries = 3
+        backoff = 5.0
+        for attempt in range(max_retries + 1):
+            headers = self._auth_headers(method, path, write=write)
+            response = await self.client.request(
+                method=method,
+                url=f"{self.settings.kalshi_rest_base_url}{path}",
+                params=filtered_params,
+                json=json,
+                headers=headers,
+            )
+            if response.status_code != 429 or attempt == max_retries:
+                response.raise_for_status()
+                return response.json()
+            retry_after = response.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else backoff
+            backoff = min(backoff * 2, 60.0)
+            await asyncio.sleep(wait)
+        # unreachable — loop always returns or raises
         response.raise_for_status()
         return response.json()
 

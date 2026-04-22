@@ -21,6 +21,7 @@ class RiskContext:
     decision_time: datetime | None = None
     current_position_notional_dollars: Decimal = Decimal("0")
     current_position_count_fp: Decimal = Decimal("0")
+    pending_order_count_fp: Decimal = Decimal("0")
     portfolio_bucket_snapshot: PortfolioBucketSnapshot | None = None
     open_ticker_count: int = 0
 
@@ -156,9 +157,10 @@ class DeterministicRiskEngine:
         if float(ticket.count_fp) > self.settings.risk_max_order_count_fp:
             block("Ticket size exceeds max order count.")
 
-        if float(context.current_position_count_fp) >= self.settings.risk_max_position_count_fp_per_ticker:
+        effective_position_count_fp = context.current_position_count_fp + context.pending_order_count_fp
+        if float(effective_position_count_fp) >= self.settings.risk_max_position_count_fp_per_ticker:
             block(
-                f"Position in {room.market_ticker} already at {context.current_position_count_fp} contracts "
+                f"Position + in-flight orders in {room.market_ticker} at {effective_position_count_fp} contracts "
                 f"(max {self.settings.risk_max_position_count_fp_per_ticker:.0f})."
             )
 

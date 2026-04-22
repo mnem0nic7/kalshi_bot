@@ -667,6 +667,28 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     print(json.dumps(rows, indent=2))
                     return 0
 
+        if args.command == "create-web-user":
+            from kalshi_bot.web.auth import hash_password, normalize_auth_email
+
+            email = normalize_auth_email(args.email)
+            password_hash, password_salt = hash_password(args.password)
+            existing = await repo.get_web_user_by_email(email)
+            if existing is not None:
+                existing.password_hash = password_hash
+                existing.password_salt = password_salt
+                existing.is_active = True
+                await session.commit()
+                print(json.dumps({"action": "updated", "email": email}))
+            else:
+                await repo.create_web_user(
+                    email=email,
+                    password_hash=password_hash,
+                    password_salt=password_salt,
+                )
+                await session.commit()
+                print(json.dumps({"action": "created", "email": email}))
+            return 0
+
         raise ValueError(f"Unknown command: {args.command}")
     finally:
         await container.close()
@@ -959,6 +981,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     intel = subparsers.add_parser("intel", help="Show current trading intel for configured markets")
     intel.add_argument("--market", dest="market", default=None, metavar="TICKER", help="Show intel for a single market ticker")
+
+    create_web_user = subparsers.add_parser("create-web-user", help="Create or reset a web UI user account")
+    create_web_user.add_argument("--email", required=True, help="User email address")
+    create_web_user.add_argument("--password", required=True, help="Plaintext password (hashed before storage)")
 
     return parser
 

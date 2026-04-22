@@ -1191,6 +1191,25 @@ class PlatformRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def get_pending_buy_count_fp(
+        self,
+        market_ticker: str,
+        side: str,
+        *,
+        kalshi_env: str | None = None,
+    ) -> Decimal:
+        """Sum count_fp of resting/submitted buy orders for this ticker+side (in-flight exposure)."""
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = select(func.coalesce(func.sum(OrderRecord.count_fp), 0)).where(
+            OrderRecord.kalshi_env == env,
+            OrderRecord.market_ticker == market_ticker,
+            OrderRecord.side == side,
+            OrderRecord.action == "buy",
+            OrderRecord.status.in_(["resting", "submitted"]),
+        )
+        result = await self.session.execute(stmt)
+        return Decimal(str(result.scalar() or 0))
+
     async def zero_settled_positions(
         self,
         *,

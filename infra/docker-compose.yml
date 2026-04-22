@@ -10,18 +10,18 @@ x-common-env-base: &common-env-base
   POSTGRES_PORT: 5432
   POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
   POSTGRES_USER: ${POSTGRES_USER:-postgres}
-  LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-  LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
-  DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
-  DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
 
 x-demo-env: &demo-env
   <<: *common-env-base
   POSTGRES_HOST: postgres_demo
+  DEMO_KALSHI_READ_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
+  DEMO_KALSHI_WRITE_PRIVATE_KEY_PATH: ${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}
 
 x-production-env: &production-env
   <<: *common-env-base
   POSTGRES_HOST: postgres_production
+  LIVE_KALSHI_READ_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
+  LIVE_KALSHI_WRITE_PRIVATE_KEY_PATH: ${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}
 
 x-demo-web-env: &demo-web-env
   <<: *demo-env
@@ -37,14 +37,15 @@ x-production-web-env: &production-web-env
   WEB_STRATEGIES_HOST: ${WEB_STRATEGIES_HOST:-strategy.ai-al.site}
   WEB_AUTH_COOKIE_DOMAIN: ${WEB_AUTH_COOKIE_DOMAIN:-.ai-al.site}
 
-x-key-volumes: &key-volumes
-  - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+x-demo-key-volumes: &demo-key-volumes
   - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
+
+x-production-key-volumes: &production-key-volumes
+  - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
 
 x-app-common: &app-common
   <<: *build
   env_file: [../.env]
-  volumes: *key-volumes
   expose: ["8000"]
   healthcheck:
     test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5).read()"]
@@ -56,6 +57,7 @@ x-app-common: &app-common
 
 x-demo-app-base: &demo-app-base
   <<: *app-common
+  volumes: *demo-key-volumes
   depends_on:
     postgres_demo:
       condition: service_healthy
@@ -64,6 +66,7 @@ x-demo-app-base: &demo-app-base
 
 x-production-app-base: &production-app-base
   <<: *app-common
+  volumes: *production-key-volumes
   depends_on:
     postgres_production:
       condition: service_healthy
@@ -74,11 +77,11 @@ x-daemon-common: &daemon-common
   <<: *build
   command: ["python", "-m", "kalshi_bot.cli", "daemon"]
   env_file: [../.env]
-  volumes: *key-volumes
   restart: unless-stopped
 
 x-demo-daemon-base: &demo-daemon-base
   <<: *daemon-common
+  volumes: *demo-key-volumes
   depends_on:
     postgres_demo:
       condition: service_healthy
@@ -87,6 +90,7 @@ x-demo-daemon-base: &demo-daemon-base
 
 x-production-daemon-base: &production-daemon-base
   <<: *daemon-common
+  volumes: *production-key-volumes
   depends_on:
     postgres_production:
       condition: service_healthy
@@ -133,7 +137,7 @@ services:
     environment:
       <<: *demo-env
       KALSHI_ENV: demo
-    volumes: *key-volumes
+    volumes: *demo-key-volumes
     depends_on:
       postgres_demo:
         condition: service_healthy
@@ -146,7 +150,7 @@ services:
     environment:
       <<: *production-env
       KALSHI_ENV: production
-    volumes: *key-volumes
+    volumes: *production-key-volumes
     depends_on:
       postgres_production:
         condition: service_healthy

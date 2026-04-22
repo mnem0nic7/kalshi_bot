@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -3267,6 +3268,7 @@ class HistoricalTrainingService:
             cursor = response.get("cursor")
             if not cursor or not page:
                 break
+            await asyncio.sleep(0.15)
         return markets
 
     async def _list_historical_markets(
@@ -3313,6 +3315,7 @@ class HistoricalTrainingService:
             pages += 1
             if not cursor:
                 break
+            await asyncio.sleep(0.15)
         return markets
 
     async def _daily_summary_crosscheck(
@@ -4758,6 +4761,7 @@ class HistoricalTrainingService:
                 pages += 1
                 if not cursor or not page:
                     break
+                await asyncio.sleep(0.15)
             raise
 
     def _market_day_from_ticker_or_close(self, market_ticker: str, close_at: datetime | None) -> str | None:

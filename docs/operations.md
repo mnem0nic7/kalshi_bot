@@ -46,6 +46,16 @@ Deploy finding from April 12, 2026:
 - if the `migrate` image is stale, `run --rm --no-deps migrate_demo` can report success while still stopping at the old head
 - after any migration change, rebuild or run with `--build` on the migrate service before trusting the DB version
 
+## Web UI user accounts
+
+User accounts are stored in Postgres (`web_users` table) and persist across container restarts. After a DB restore or wipe, recreate any lost account:
+
+```bash
+kalshi-bot-cli create-web-user --email <email> --password <password>
+```
+
+If the account already exists, this resets the password. The email must be in `WEB_AUTH_ALLOWED_REGISTRATION_EMAILS` for the `/register` UI flow, but the CLI command bypasses that check — use it for recovery only.
+
 ## CLI workflow
 
 Typical operational loop:

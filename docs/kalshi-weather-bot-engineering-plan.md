@@ -69,7 +69,7 @@ For each open weather market, compute `fair_yes_dollars` = modeled probability t
 
 ```
 edge_bps = |fair_yes_dollars − market_touch| × 10,000
-500 bps ≤ edge_bps ≤ 5000 bps       ← risk_min_edge_bps / risk_max_credible_edge_bps
+500 bps ≤ edge_bps ≤ 5000 bps       ← risk_min_edge_bps (default 500, self-improve range [5,500]) / risk_max_credible_edge_bps
 confidence ≥ 0.70                   ← risk_min_confidence; hard block in risk engine
 trade_regime == "standard"          ← near-threshold and longshot trades are blocked
 ```
@@ -136,7 +136,7 @@ A `size_factor` (0–1) is applied when entering market gates:
 - Spread > 60% of mid → reject entirely.
 - Volume < 50 contracts → reject (floor ensures meaningful book depth for IOC fills).
 - Adverse 60-minute momentum → reject.
-- Otherwise `size_factor` scales linearly from 0 at 50 contracts to 1.0 at 100+ contracts.
+- Otherwise `size_factor = 1.0` — no partial scaling; the 50-contract gate is a hard binary, not a ramp.
 
 ### 3.5 Execution style
 
@@ -232,12 +232,12 @@ Each daily weather contract has a unique ticker (e.g., `KXHIGHTBOS-26APR21-T55`)
 | ORM | SQLAlchemy async + Alembic | 13 migrations applied |
 | Kalshi client | Custom (`integrations/kalshi.py`) | RSA-PSS signing; REST + WebSocket with sequence tracking |
 | Weather client | Custom (`integrations/weather.py`) | NWS API, no key required |
-| LLM providers | Google Gemini 2.5 (primary) / OpenAI (fallback) / Ollama (local) | Routed per role via `agents/providers.py` |
+| LLM providers | Four slots routed via `agents/providers.py`: `gemini` (primary, Gemini 2.5 per-role models), `hosted` (`LLM_HOSTED_*`, generic OpenAI-compatible endpoint), `codex` (`CODEX_*`, separate key/URL for a second OpenAI-compatible provider), `local` (`LLM_LOCAL_*`, Ollama or any local OpenAI-compatible server) | Role assignments configured in agent pack |
 | WebSocket | `websockets` library | `ping_interval=20`, `ping_timeout=60`; exponential reconnect backoff |
 | HTTP | `httpx` async | All outbound calls |
 | Metrics | `prometheus_client` | Scraped at `/metrics` |
 | Logging | Structured JSON | All services |
-| Deploy | Docker Compose blue/green | nginx routes to active color; watchdog handles failover |
+| Deploy | Docker Compose blue/green | Caddy reverse proxy routes per-host to `web_demo`, `web_production`, `web_strategies`; watchdog handles failover |
 | Secrets | Environment / mounted key files | RSA PEM paths configured per env |
 
 ---
@@ -396,7 +396,7 @@ Enabled in all running environments (`TRIGGER_ENABLE_AUTO_ROOMS=true`). This is 
 Three-stage workflow triggered manually via the control room or on a configured schedule:
 
 1. **Critique**: Selects recent rooms from the training corpus, bundles their messages + signals + verdicts, sends to an LLM critic, and proposes changes to agent pack configuration (e.g., edge buffer adjustments, model assignments).
-2. **Evaluate**: Replays the holdout set (20% of training rooms) under the candidate pack. Promotes if win-rate improvement ≥ 2% and no critical regression > 1%.
+2. **Evaluate**: Replays the holdout set (20% of training rooms) under the candidate pack. Scores each room on a composite metric: `research_quality × 0.40 + directional_agreement × 0.25 + risk_compliance × 0.20 + memory_usefulness × 0.15`. Promotes if composite improvement ≥ `SELF_IMPROVE_MIN_IMPROVEMENT` (2%) AND no segment shows critical regression > `SELF_IMPROVE_MAX_CRITICAL_REGRESSION` (1%).
 3. **Promote**: Writes a pending pack-promotion checkpoint for the inactive deployment color, restarts that color, and lets its daemon apply the candidate pack on startup before canary rooms begin.
 
 Canary rollout is bounded:
@@ -430,7 +430,7 @@ Canary rollout is bounded:
 - `GET /readyz` — container health check
 - `GET /metrics` — Prometheus scrape endpoint
 
-**Control room layout:** Top summary strip plus lazy-loaded `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations` tabs.
+**Control room layout:** Top summary strip plus lazy-loaded `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations` tabs. The `web_strategies` site (`WEB_SITE_KIND=strategies`) renders a focused view of the `Research` tab — specifically the 180d assignment review queue and city strategy drilldown — without exposing the full trading control room.
 The summary bootstrap avoids live all-city discovery and uses lightweight room snapshots so `/` and `/api/control-room/summary` stay responsive as configured cities and room history grow.
 The `Research` tab includes an 180d-only assignment review queue for canonical city strategy assignments, including `drifted_assignment`, `evidence_weakened`, `ready_for_approval`, `aligned`, and `waiting_for_evidence` states plus the latest approval note in city detail.
 
@@ -445,7 +445,7 @@ The `Research` tab includes an 180d-only assignment review queue for canonical c
 
 ## 7. Data Model
 
-Full schema managed by Alembic (13 migrations). Key tables:
+Full schema managed by Alembic (16 migrations). Key tables:
 
 ```sql
 -- Trading lifecycle
@@ -479,9 +479,30 @@ historical_checkpoint_archive_records (market_ticker, checkpoint_ts, weather JSO
 historical_intelligence_run_records (id, run_at, heuristic_pack_id, segment_results JSON)
 heuristic_pack_records (id, version, status, configuration JSON)
 
+-- Web auth (migration 0015)
+web_users     (id, email, password_hash, password_salt, is_active, last_login_at)
+web_sessions  (id, user_id → web_users, token_hash, expires_at)
+
+-- Strategies / per-city assignment (migration 0013–0014)
+strategies                 (id, series_ticker, strategy_name, config JSON)
+strategy_results           (id, strategy_id, market_ticker, outcome JSON)
+city_strategy_assignments  (id, series_ticker, strategy_name, approved_at, approval_note)
+strategy_codex_runs        (id, series_ticker, run_at, payload JSON)
+
 -- Infrastructure
 deployment_control  (id, active_color, kill_switch_enabled, execution_lock_holder, notes JSON)
+                    -- notes keys: kill_switch_cleared_at (ISO timestamp set when kill switch is cleared;
+                    --   supervisor refuses to execute until daemon_reconcile checkpoint is newer than this)
 checkpoints         (name, cursor, payload JSON, updated_at)
+                    -- well-known name patterns:
+                    --   daemon_heartbeat:{kalshi_env}:{color}       — daemon liveness (60s cadence)
+                    --   daemon_reconcile:{kalshi_env}:{color}       — last successful reconcile timestamp
+                    --   daemon_settlement_followup:{kalshi_env}:{color} — settlement backfill cursor
+                    --   reconcile:{kalshi_env}                      — reconcile run cursor
+                    --   auto_trigger:{kalshi_env}:{ticker}          — per-ticker trigger cooldown state
+                    --   kalshi_ws:{kalshi_env}:{color}:{sid}        — WebSocket sequence tracking
+                    --   stop_loss_reentry:{ticker}                  — post-stop-loss re-entry gate
+                    --   pending_pack_promotion:{kalshi_env}:{color} — staged agent-pack awaiting daemon pickup
 ops_events          (id, severity, summary, source, payload JSON)
 ```
 
@@ -490,8 +511,8 @@ ops_events          (id, severity, summary, source, payload JSON)
 ## 8. Security & Compliance
 
 - **Kalshi is CFTC-regulated.** Algorithmic trading is explicitly permitted. The Developer Agreement governs API use — no scraping, no unauthorized data redistribution, no wash trading.
-- **RSA private keys** are mounted as read-only files; paths are configured per deployment color. Never committed to git. Separate keys for read and write operations.
-- **Demo and production credentials are completely separate.** Switched via `KALSHI_ENV` env var; no code changes required. The system prevents write operations against the wrong environment.
+- **RSA private keys** are mounted as read-only files (`:ro`); paths are configured per environment. Never committed to git. Separate keys for read and write operations.
+- **Demo and production credentials are completely isolated at the filesystem level.** Demo containers mount only `DEMO_KALSHI_KEY_PATH_HOST`; production containers mount only `LIVE_KALSHI_KEY_PATH_HOST`. The production key is never present in any demo container's filesystem, and vice versa. Environment selection is via `KALSHI_ENV`; no code changes required.
 - **Shadow mode** is the default. Live orders require explicitly setting `APP_SHADOW_MODE=false` in the environment.
 - **Kill switch** defaults to enabled. No live orders are possible until it is explicitly cleared via the control room.
 - **Deployment lock** ensures only the active color can submit orders, even if both containers are running.
@@ -504,18 +525,43 @@ ops_events          (id, severity, summary, source, payload JSON)
 ### Blue/Green Deployment
 
 ```
-postgres ←→ nginx (routes :80 to active color)
-              ├── app_blue  :8000  (FastAPI + control room)
-              ├── app_green :8000
-              ├── daemon_blue      (reconcile, stop-loss, historical pipeline)
-              └── daemon_green
+postgres_demo      ←─┐
+postgres_production ←─┤
+                      │
+          ┌───────────┼──────────────────────────────────┐
+          │           │  Trading containers               │
+          │  app_demo_blue  / app_demo_green    :8000     │
+          │  app_production_blue / _green       :8000     │
+          │  daemon_demo_blue  / daemon_demo_green        │
+          │  daemon_production_blue / _green              │
+          └───────────┬──────────────────────────────────┘
+                      │
+          ┌───────────┴──────────────────────────────────┐
+          │           Web (Caddy-facing)                  │
+          │  web_demo        (WEB_SITE_KIND=demo)         │
+          │  web_production  (WEB_SITE_KIND=production)   │
+          │  web_strategies  (WEB_SITE_KIND=strategies)   │
+          └───────────┬──────────────────────────────────┘
+                      │
+          ┌───────────┴──────────────────────────────────┐
+          │  Caddy  :80/:443                              │
+          │  demo.ai-al.site      → web_demo             │
+          │  prod.ai-al.site      → web_production       │
+          │  strategy.ai-al.site  → web_strategies       │
+          └──────────────────────────────────────────────┘
 ```
+
+`postgres_demo` (host port `POSTGRES_DEMO_PORT`, default 5432) and `postgres_production` (host port `POSTGRES_PRODUCTION_PORT`, default 5433) are completely isolated volumes — demo load or failures cannot affect the production DB.
+
+`migrate_demo` and `migrate_production` run Alembic per environment before any app or daemon container starts (`depends_on: service_completed_successfully`).
 
 Both colors run simultaneously. Only the active color holds the execution lock. Switching is atomic via `DeploymentControl.active_color` in the database.
 
+The three web containers (`web_demo`, `web_production`, `web_strategies`) each run a FastAPI app scoped to their environment (`KALSHI_ENV`) and site kind (`WEB_SITE_KIND`). `WEB_APP_COLOR` controls which color's data the web containers read from (default `blue`); update it alongside `active_color` when promoting.
+
 ### Watchdog
 
-Runs in both daemon containers. Checks every `daemon_heartbeat_interval_seconds` (60s):
+Runs in all daemon containers (demo/production × blue/green = four containers). Checks every `daemon_heartbeat_interval_seconds` (60s):
 - **App health**: HTTP GET to `http://app_{color}:8000/readyz`
 - **Daemon health**: heartbeat checkpoint freshness (`daemon_heartbeat:{kalshi_env}:{color}`)
 
@@ -553,10 +599,17 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `LLM_TRADING_ENABLED` | `false` | Not used in production; deterministic fast path only |
 | `GEMINI_API_KEY` | — | Primary LLM provider |
 | `WEATHER_MARKET_MAP_PATH` | `docs/examples/weather_markets.example.yaml` | Market → NWS mapping |
+| `WEATHER_USER_AGENT` | `kalshi-bot/0.1 (ops@example.com)` | NWS API requires a real app identifier + contact email; change before production |
 | `DEMO_KALSHI_API_KEY` | — | Demo API key ID |
 | `DEMO_KALSHI_READ_PRIVATE_KEY_PATH` | — | Demo RSA key path |
 | `LIVE_KALSHI_API_KEY` | — | Production API key ID |
 | `LIVE_KALSHI_READ_PRIVATE_KEY_PATH` | — | Production RSA key path |
+| `POSTGRES_DEMO_PORT` | `5432` | Host port for `postgres_demo` container |
+| `POSTGRES_PRODUCTION_PORT` | `5433` | Host port for `postgres_production` container |
+| `WEB_APP_COLOR` | `blue` | Color badge shown in the dashboard header for web containers; update alongside `active_color` on promotion |
+| `WEB_DEMO_HOST` | `demo.ai-al.site` | Caddy hostname for demo control room |
+| `WEB_PRODUCTION_HOST` | `prod.ai-al.site` | Caddy hostname for production control room |
+| `WEB_STRATEGIES_HOST` | `strategy.ai-al.site` | Caddy hostname for strategies dashboard |
 
 ### Risk parameters
 
@@ -565,14 +618,20 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `RISK_ORDER_PCT` | 0.05 | 5% of live balance per order |
 | `RISK_POSITION_PCT` | 0.10 | 10% of live balance per position |
 | `RISK_DAILY_LOSS_PCT` | 0.05 | 5% daily loss limit (self-improve gate) |
-| `RISK_MIN_EDGE_BPS` | 500 | Minimum edge required; self-improvement pipeline can tune down to 100 bps floor |
+| `RISK_MIN_EDGE_BPS` | 500 | Minimum edge required; self-improvement pipeline can tune in range [5, 500] bps |
 | `RISK_MAX_CREDIBLE_EDGE_BPS` | 5000 | Maximum credible edge; larger values indicate model error |
 | `RISK_MIN_CONFIDENCE` | 0.70 | Hard block below this confidence score; 0.70–0.80 gets 50% size, 0.80–0.90 gets 75%, ≥0.90 gets 100% |
 | `RISK_MIN_CONTRACT_PRICE_DOLLARS` | 0.05 | Hard block if the traded side costs less than 5¢ |
 | `RISK_MIN_PROBABILITY_EXTREMITY_PCT` | 0.0 (prod: 25.0) | Block trades where fair_yes is within this many pct-points of 50%; set 25.0 in production |
 | `RISK_MAX_CONCURRENT_TICKERS` | 10 | Max open-position tickers |
+| `RISK_MAX_ORDER_COUNT_FP` | 500 | Hard contract count cap per order (guard #10) |
+| `RISK_MAX_POSITION_COUNT_FP_PER_TICKER` | 200 | Max contracts held per ticker (guard #11) |
 | `RISK_MAX_ORDER_NOTIONAL_DOLLARS` | None | Optional hard-cap override |
 | `RISK_MAX_POSITION_NOTIONAL_DOLLARS` | None | Optional hard-cap override |
+| `RISK_DAILY_LOSS_LIMIT_DOLLARS` | None | Hard daily loss cap in dollars; disabled when unset |
+| `RISK_DAILY_LOSS_SENSITIVITY_PCT` | 0.10 | If today's loss ≥ this fraction of total capital, tighten subsequent trades |
+| `RISK_DAILY_LOSS_SENSITIVITY_EDGE_MULTIPLIER` | 2.0 | Multiply `risk_min_edge_bps` by this when sensitivity is active |
+| `RISK_DAILY_LOSS_SENSITIVITY_SIZE_MULTIPLIER` | 0.50 | Multiply max order notional by this when sensitivity is active |
 
 ### Stop-loss parameters
 
@@ -585,7 +644,48 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `STOP_LOSS_REENTRY_COOLDOWN_SECONDS` | 14400 | 4h max; overridden by momentum re-entry gate |
 | `STOP_LOSS_MOMENTUM_REENTRY_WINDOW_SECONDS` | 300 | 5-min window for momentum re-entry check |
 | `STOP_LOSS_SUBMIT_COOLDOWN_SECONDS` | 300 | Min 5 min between stop-loss submissions |
+
+### Self-improvement parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
 | `SELF_IMPROVE_CANARY_MAX_SECONDS` | 21600 | Max staged-canary lifetime before status becomes `stalled` |
+| `SELF_IMPROVE_WINDOW_DAYS` | 14 | How many days of rooms to include in critique and evaluation runs |
+| `SELF_IMPROVE_HOLDOUT_RATIO` | 0.2 | Fraction of training rooms reserved for evaluation holdout |
+| `SELF_IMPROVE_MIN_IMPROVEMENT` | 0.02 | Minimum win-rate improvement required to promote a candidate pack |
+| `SELF_IMPROVE_MAX_CRITICAL_REGRESSION` | 0.01 | Maximum allowed win-rate regression on any segment before promotion is blocked |
+| `SELF_IMPROVE_CANARY_MIN_ROOMS` | 25 | Minimum canary rooms before live promotion |
+| `SELF_IMPROVE_CANARY_MIN_SECONDS` | 7200 | Minimum canary duration (2h) before live promotion |
+
+### Training corpus readiness gates
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `TRAINING_MIN_COMPLETE_ROOMS` | 25 | Minimum complete rooms before critique/eval will run |
+| `TRAINING_MIN_SETTLED_ROOMS` | 10 | Minimum rooms with settled outcomes |
+| `TRAINING_MIN_MARKET_DIVERSITY` | 4 | Minimum unique series in corpus |
+| `TRAINING_MIN_TRADE_POSITIVE_ROOMS` | 8 | Minimum rooms that attempted a trade |
+| `TRAINING_GOOD_RESEARCH_THRESHOLD` | 0.70 | Research quality floor; rooms below this are excluded from training corpus |
+| `TRAINING_WINDOW_DAYS` | 30 | Lookback window for corpus assembly |
+
+### Daemon parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `DAEMON_RECONCILE_INTERVAL_SECONDS` | 60 | How often the daemon syncs positions/orders with Kalshi API |
+| `DAEMON_RECONCILE_STALE_KILL_SWITCH_SECONDS` | 300 | Auto-enable kill switch if reconcile checkpoint is older than this (~5 missed cycles) |
+| `DAEMON_HEARTBEAT_INTERVAL_SECONDS` | 60 | How often the daemon writes a liveness checkpoint |
+| `DAEMON_START_WITH_RECONCILE` | `true` | Run a reconcile immediately on daemon startup before entering the main loop |
+
+### Auto-trigger parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `TRIGGER_ENABLE_AUTO_ROOMS` | `true` | Master switch for autonomous room creation from orderbook events |
+| `TRIGGER_COOLDOWN_SECONDS` | 300 | Per-ticker cooldown between trigger evaluations (30s after broken-book events) |
+| `TRIGGER_MAX_SPREAD_BPS` | 1200 | Reject trigger if bid/ask spread exceeds this |
+| `TRIGGER_MAX_CONCURRENT_ROOMS` | 4 | Hard cap on simultaneously running rooms |
+| `TRIGGER_PRICE_MOVE_BYPASS_BPS` | 1500 | If YES mid moves ≥ this many bps since last trigger, bypass the cooldown |
 
 ---
 
@@ -597,13 +697,13 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 - [x] NWS weather ingestion (point forecast + gridpoint + METAR observation)
 - [x] Two-layer probability model (Logistic fallback + Gaussian CDF with seasonal sigma)
 - [x] Trade regime classification and signal quality review
-- [x] Deterministic risk engine (12 sequential guards)
+- [x] Deterministic risk engine (16 sequential guards)
 - [x] Percentage-based sizing from live account balance
 - [x] Shadow mode and kill switch with deployment color lock
 - [x] Blue/green deployment with watchdog and automatic failover
 - [x] Stop-loss service with loss threshold, momentum, and profit-protection exits
 - [x] Momentum-based re-entry gate after stop-loss
-- [x] Auto-trigger from live orderbook feed (disabled by default)
+- [x] Auto-trigger from live orderbook feed (enabled by default via `TRIGGER_ENABLE_AUTO_ROOMS=true`)
 - [x] 20-city weather market map
 - [x] 8-role LLM agent suite (Gemini 2.5-based, disabled by default)
 - [x] Research dossier system and semantic memory (pgvector)
@@ -612,8 +712,13 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 - [x] Historical intelligence (heuristic pack auto-calibration)
 - [x] FastAPI control room (rooms, agent packs, strategies, watchdog)
 - [x] Prometheus metrics + SSE room transcript stream
-- [x] Alembic migrations (13 applied)
+- [x] Alembic migrations (16 applied)
 - [x] Reconciliation daemon (positions, orders, market prices)
+- [x] Split Postgres per environment (`postgres_demo` / `postgres_production` with isolated volumes)
+- [x] Caddy reverse proxy replacing nginx (per-host routing to `web_demo`, `web_production`, `web_strategies`)
+- [x] Three-way web container split: demo control room, production control room, strategies dashboard
+- [x] Per-environment migrate services with `service_completed_successfully` gating on all app/daemon containers
+- [x] `.dockerignore` and two-stage Dockerfile pip layer caching (source-only rebuilds ~2s vs 25s)
 
 ### Known gaps and future work
 
@@ -623,22 +728,25 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | TimescaleDB hypertables | Low | Currently standard PostgreSQL; add if market_price_history table grows unwieldy |
 | Kelly-based dynamic sizing | Low | Current % of capital is simpler; true Kelly requires calibrated P_model variance estimates |
 | Low-temp and precipitation markets | Medium | Probability model supports it; needs station mappings |
-| Live P&L streaming in control room | Low | Current UI shows snapshots; no SSE P&L stream |
-| End-to-end backtest with fees/slippage | Medium | Historical intelligence replays but doesn't simulate fill costs |
-| Per-city strategy differentiation | Deferred | Ship with global pack; self-improvement pipeline promotes city-specific heuristics autonomously post-launch |
+| Live P&L streaming in control room | Low | 30d win-rate snapshot exists (`get_fill_win_rate_30d()` in summary strip); missing is a real-time SSE feed showing running unrealized P&L across open positions |
+| End-to-end backtest with fees/slippage | Medium | Historical intelligence replays but doesn't simulate fill costs; `is_taker` flag and actual fill prices are already stored per fill record, giving the data foundation — missing is a fee-rate constant and a simulation pass that subtracts fees from realized P&L before training corpus scoring |
+| Per-city strategy differentiation | In progress | Research assignment review queue built; canonical assignments (ready_for_approval, drifted_assignment, evidence_weakened, aligned, waiting_for_evidence) visible in dashboard Research tab; auto-application to live routing deferred to post-launch self-improvement pipeline |
 | Production go-live | Pending | Run demo for ≥ 2 weeks with positive paper results before switching `KALSHI_ENV=production` |
 
 ### Go-live checklist
 
 - [ ] ≥ 2 weeks of continuous autonomous demo trading (no manual interventions)
 - [ ] ≥ 20 resolved trades in demo with ≥ 70% win rate and positive P&L overall (win = realized P&L positive: sell price beat entry for stopped-out positions; contract settled on our side for positions held to expiry — tracked by `get_fill_win_rate_30d()`)
-- [ ] σ calibration gate: run `python scripts/calibrate_sigma.py` — median bps error < 2700 bps across all city/month cells with ≥ 5 samples (the 2500 bps threshold accounts for structural sensitivity of near-50% contracts; σ values in `weather/scoring.py` were derived from 2911 market-days of empirical data and should be re-run after each full season of new data)
+- [ ] σ calibration gate: run `python scripts/calibrate_sigma.py` from the **host virtualenv** (not inside a container) — median bps error < 2700 bps across all city/month cells with ≥ 5 samples (the 2500 bps threshold accounts for structural sensitivity of near-50% contracts; σ values in `weather/scoring.py` were derived from 2911 market-days of empirical data and should be re-run after each full season of new data)
 - [ ] Zero unreconciled positions or order mismatches during demo period
 - [ ] No stop-loss exits with `possible_model_error=true` (trailing_loss_ratio > 30% within first 2 hours of hold — ops events are tagged automatically; review the ops log before go-live)
 - [ ] Kill switch and shadow mode tested end-to-end in demo
-- [ ] Production RSA key loaded and verified (`chmod 600 <key_path>` — startup raises `PermissionError` if group/other-readable)
+- [ ] Production RSA key loaded and verified (`chmod 600 <key_path>` recommended; startup raises `PermissionError` if the key has any write bits set — group/other-writable — but allows 0o644 read-only mounts as used by Docker secrets)
+- [ ] `WEATHER_USER_AGENT` set to a real app identifier and contact email (e.g., `kalshi-bot/1.0 (your@email.com)`) — NWS API requires a valid User-Agent or will rate-limit; default placeholder `ops@example.com` should not reach production
+- [ ] `RISK_MIN_PROBABILITY_EXTREMITY_PCT=25.0` set in production env (guard #7b — blocks near-50% coin-flip trades; intentionally 0.0 in demo)
 - [ ] `APP_SHADOW_MODE=false` and `APP_ENABLE_KILL_SWITCH=false` confirmed in production env
 - [ ] `KALSHI_ENV=production` set
+- [ ] Auth cookie domain verified: `WEB_AUTH_COOKIE_DOMAIN` set to the correct shared domain (e.g., `.ai-al.site`) so sessions are valid across `web_demo`, `web_production`, and `web_strategies` — confirm in browser devtools that the `Set-Cookie` domain matches before exposing `web_production` externally
 - [ ] Daily review ritual established for first 2 weeks post-launch
 
 ---

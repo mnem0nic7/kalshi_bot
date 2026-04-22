@@ -329,11 +329,17 @@ class WorkflowSupervisor:
                 )
                 all_positions = await repo.list_positions(limit=500, kalshi_env=room.kalshi_env, subaccount=self.settings.kalshi_subaccount)
                 open_ticker_count = len({p.market_ticker for p in all_positions})
+                pending_order_count_fp = await repo.get_pending_buy_count_fp(
+                    room.market_ticker,
+                    ticket.side.value,
+                    kalshi_env=room.kalshi_env,
+                )
                 risk_context = RiskContext(
                     market_observed_at=None,
                     research_observed_at=None,
                     current_position_notional_dollars=current_position_notional,
                     current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
+                    pending_order_count_fp=pending_order_count_fp,
                     portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                     open_ticker_count=open_ticker_count,
                 )
@@ -904,11 +910,17 @@ class WorkflowSupervisor:
                         )
                         all_positions = await repo.list_positions(limit=500, kalshi_env=room.kalshi_env, subaccount=self.settings.kalshi_subaccount)
                         open_ticker_count = len({p.market_ticker for p in all_positions})
+                        pending_order_count_fp = await repo.get_pending_buy_count_fp(
+                            room.market_ticker,
+                            ticket.side.value,
+                            kalshi_env=room.kalshi_env,
+                        )
                         risk_context = RiskContext(
                             market_observed_at=market_state.observed_at,
                             research_observed_at=dossier.freshness.refreshed_at,
                             current_position_notional_dollars=current_position_notional,
                             current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
+                            pending_order_count_fp=pending_order_count_fp,
                             portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                             open_ticker_count=open_ticker_count,
                         )
