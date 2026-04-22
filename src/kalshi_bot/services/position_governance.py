@@ -37,6 +37,7 @@ POSITION_CLASSIFICATION_LABELS = {
 }
 
 _TERMINAL_UNFILLED_ORDER_STATUSES = {"cancelled", "canceled", "expired", "rejected", "failed"}
+_TERMINAL_FILLED_ORDER_STATUSES = {"filled", "executed"}
 
 
 def _normalize_side(value: Any) -> str | None:
@@ -47,10 +48,13 @@ def _normalize_side(value: Any) -> str | None:
 def _parse_dt(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
-    try:
-        parsed = datetime.fromisoformat(str(value))
-    except ValueError:
-        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
@@ -71,6 +75,13 @@ def _iso_or_none(value: datetime | None) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.astimezone(UTC).isoformat()
+
+
+def _datetime_on_or_after(value: Any, threshold: datetime | None) -> bool:
+    if threshold is None:
+        return False
+    parsed = _parse_dt(value)
+    return parsed is not None and parsed >= threshold
 
 
 def stop_loss_outcome_from_payloads(
@@ -366,7 +377,6 @@ async def refresh_stop_loss_checkpoints(
             order
             for order in orders_by_ticker.get(ticker, [])
             if order.action == "sell"
-            and (stopped_side is None or order.side == stopped_side)
             and (
                 (client_order_id and order.client_order_id == client_order_id)
                 or (kalshi_order_id and order.kalshi_order_id == kalshi_order_id)
@@ -374,23 +384,24 @@ async def refresh_stop_loss_checkpoints(
                     not client_order_id
                     and not kalshi_order_id
                     and submitted_at is not None
-                    and order.created_at >= submitted_at - timedelta(seconds=5)
+                    and _datetime_on_or_after(order.created_at, submitted_at - timedelta(seconds=5))
+                    and (stopped_side is None or order.side == stopped_side)
                 )
             )
         ]
         relevant_orders.sort(key=lambda item: item.created_at, reverse=True)
         latest_order = relevant_orders[0] if relevant_orders else None
+        latest_order_status = str(getattr(latest_order, "status", "") or "").strip().lower()
 
         relevant_fills = [
             fill
             for fill in fills_by_ticker.get(ticker, [])
             if fill.action == "sell"
-            and (stopped_side is None or fill.side == stopped_side)
             and (
                 (latest_order is not None and fill.order_id == latest_order.id)
                 or (
                     submitted_at is not None
-                    and fill.created_at >= submitted_at - timedelta(seconds=5)
+                    and _datetime_on_or_after(fill.created_at, submitted_at - timedelta(seconds=5))
                 )
             )
         ]
@@ -398,8 +409,13 @@ async def refresh_stop_loss_checkpoints(
         latest_fill = relevant_fills[0] if relevant_fills else None
         current_status = stop_loss_outcome_from_payloads(submit_payload, reentry_payload)
         repair_reason: str | None = None
+        order_exit_confirmed = (
+            latest_order is not None
+            and latest_order_status in _TERMINAL_FILLED_ORDER_STATUSES
+            and not open_position
+        )
 
-        if latest_fill is not None:
+        if latest_fill is not None or order_exit_confirmed:
             next_status = STOP_LOSS_OUTCOME_FILLED_EXIT
         elif submit_payload.get("submit_error"):
             next_status = STOP_LOSS_OUTCOME_SUBMIT_FAILED
@@ -409,7 +425,7 @@ async def refresh_stop_loss_checkpoints(
             STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED,
         }:
             next_status = current_status
-        elif latest_order is not None and str(latest_order.status).strip().lower() in _TERMINAL_UNFILLED_ORDER_STATUSES:
+        elif latest_order is not None and latest_order_status in _TERMINAL_UNFILLED_ORDER_STATUSES:
             next_status = STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED
         elif reentry_cp is not None and submit_cp is None and not client_order_id and not kalshi_order_id and open_position:
             next_status = STOP_LOSS_OUTCOME_SUBMIT_FAILED
