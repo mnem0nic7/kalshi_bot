@@ -19,7 +19,8 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def _create_auth_enabled_app(tmp_path, monkeypatch):
+def _create_auth_enabled_app(tmp_path, monkeypatch, *, kalshi_env: str = "demo"):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     map_path = tmp_path / "markets.yaml"
     map_path.write_text("markets: []\n", encoding="utf-8")
     db_path = tmp_path / "auth.db"
@@ -29,6 +30,7 @@ def _create_auth_enabled_app(tmp_path, monkeypatch):
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
     monkeypatch.setenv("WEB_AUTH_ENABLED", "true")
     monkeypatch.setenv("WEB_AUTH_ALLOWED_REGISTRATION_EMAILS", ALLOWED_EMAIL)
+    monkeypatch.setenv("KALSHI_ENV", kalshi_env)
     get_settings.cache_clear()
     return create_app()
 
@@ -171,6 +173,21 @@ def test_register_uses_shared_cookie_domain_when_configured(tmp_path, monkeypatc
     assert response.status_code == 303
     assert "Domain=.ai-al.site" in response.headers["set-cookie"]
     get_settings.cache_clear()
+
+
+def test_default_cookie_name_is_scoped_by_kalshi_env(tmp_path, monkeypatch) -> None:
+    demo_app = _create_auth_enabled_app(tmp_path / "demo", monkeypatch, kalshi_env="demo")
+    demo_settings = get_settings()
+    assert demo_settings.web_auth_cookie_name == "kalshi_bot_session_demo"
+    get_settings.cache_clear()
+
+    production_app = _create_auth_enabled_app(tmp_path / "production", monkeypatch, kalshi_env="production")
+    production_settings = get_settings()
+    assert production_settings.web_auth_cookie_name == "kalshi_bot_session_production"
+    get_settings.cache_clear()
+
+    assert demo_app is not None
+    assert production_app is not None
 
 
 def test_authenticated_api_request_refreshes_session_expiry_and_cookie(tmp_path, monkeypatch) -> None:

@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     app_auto_init_db: bool = False
     app_enable_kill_switch: bool = True
     web_auth_enabled: bool = True
-    web_auth_cookie_name: str = "kalshi_bot_session"
+    web_auth_cookie_name: str | None = None
     web_auth_cookie_domain: str | None = None
     web_auth_session_ttl_seconds: int = 1_209_600
     web_auth_allowed_registration_emails: str = "m7.ga.77@gmail.com"
@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     web_demo_host: str = "demo.ai-al.site"
     web_production_host: str = "prod.ai-al.site"
     web_strategies_host: str = "strategy.ai-al.site"
+
+    @model_validator(mode="after")
+    def default_web_auth_cookie_name(self) -> "Settings":
+        configured = str(self.web_auth_cookie_name or "").strip()
+        if configured:
+            self.web_auth_cookie_name = configured
+            return self
+
+        env_slug = "".join(ch if ch.isalnum() else "_" for ch in str(self.kalshi_env or "demo").strip().lower()) or "shared"
+        self.web_auth_cookie_name = f"kalshi_bot_session_{env_slug}"
+        return self
 
     database_url: str | None = None
     postgres_host: str = "localhost"
