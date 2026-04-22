@@ -272,8 +272,10 @@ def _read_codex_auth_json(settings: Settings) -> dict | None:
         return None
 
 
-def _build_codex_provider(
+def build_codex_provider(
     settings: Settings,
+    *,
+    timeout_seconds: float | None = None,
 ) -> tuple[OpenAICompatibleProvider | ChatGPTCodexProvider | CodexCLIProvider | None, str]:
     """Return (provider, description) based on codex auth configuration.
 
@@ -281,9 +283,10 @@ def _build_codex_provider(
     The CLI handles its own auth (reads ~/.codex/auth.json internally), so if
     the binary is present it is always preferred.
     """
+    effective_timeout = timeout_seconds if timeout_seconds is not None else settings.llm_request_timeout_seconds
     if CodexCLIProvider.is_available():
         logger.info("Codex provider: CLI binary (codex exec)")
-        return CodexCLIProvider(timeout_seconds=settings.llm_request_timeout_seconds), "codex-cli"
+        return CodexCLIProvider(model=settings.codex_model, timeout_seconds=effective_timeout), "codex-cli"
     data = _read_codex_auth_json(settings)
     if data is not None:
         auth_mode = data.get("auth_mode", "")
@@ -291,7 +294,7 @@ def _build_codex_provider(
             path = Path(settings.codex_auth_json_path).expanduser()
             mgr = ChatGPTAuthManager(path)
             logger.info("Codex provider: ChatGPT OAuth (auth.json auth_mode=chatgpt)")
-            return ChatGPTCodexProvider(mgr, settings.llm_request_timeout_seconds), "chatgpt-oauth"
+            return ChatGPTCodexProvider(mgr, effective_timeout), "chatgpt-oauth"
         if auth_mode in ("apikey", "api_key"):
             api_key = data.get("OPENAI_API_KEY") or data.get("api_key")
             if api_key:
@@ -299,7 +302,7 @@ def _build_codex_provider(
                 return (
                     OpenAICompatibleProvider(
                         ProviderConfig(base_url=settings.codex_base_url, model=settings.codex_model, api_key=api_key),
-                        timeout_seconds=settings.llm_request_timeout_seconds,
+                        timeout_seconds=effective_timeout,
                     ),
                     "apikey-from-auth-json",
                 )
@@ -308,7 +311,7 @@ def _build_codex_provider(
         return (
             OpenAICompatibleProvider(
                 ProviderConfig(base_url=settings.codex_base_url, model=settings.codex_model, api_key=settings.codex_api_key),
-                timeout_seconds=settings.llm_request_timeout_seconds,
+                timeout_seconds=effective_timeout,
             ),
             "apikey-from-env",
         )
@@ -339,7 +342,7 @@ class ProviderRouter:
             if settings.gemini_api_key
             else None
         )
-        self.codex, _codex_mode = _build_codex_provider(settings)
+        self.codex, _codex_mode = build_codex_provider(settings)
         self.hosted = (
             OpenAICompatibleProvider(
                 ProviderConfig(

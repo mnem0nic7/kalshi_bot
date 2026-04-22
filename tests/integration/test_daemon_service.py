@@ -738,6 +738,6 @@ async def test_daemon_heartbeat_skips_nightly_strategy_codex_when_codex_unavaila
         await session.commit()
 
     assert checkpoint.payload["reason"] == "codex_unavailable"
-    assert "Nightly strategy Codex skipped: Codex CLI unavailable" in summaries
+    assert "Nightly strategy Codex skipped: Codex provider unavailable" in summaries
 
     await engine.dispose()

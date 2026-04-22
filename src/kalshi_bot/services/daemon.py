@@ -552,7 +552,7 @@ class DaemonService:
             await self._set_nightly_codex_checkpoint(checkpoint_name, payload)
             await self._log_daemon_event(
                 severity="warning",
-                summary="Nightly strategy Codex skipped: Codex CLI unavailable",
+                summary="Nightly strategy Codex skipped: Codex provider unavailable",
                 payload=payload,
             )
             return payload

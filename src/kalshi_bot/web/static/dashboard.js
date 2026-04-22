@@ -1256,10 +1256,11 @@
     const selectedRun = strategyState.codexRunDetail && strategyState.codexRunDetail.id === strategyState.codexRunId
       ? strategyState.codexRunDetail
       : null;
+    const readyLabel = lab.provider === "codex-cli" ? "Codex CLI ready" : "Codex ready";
     if (meta) {
       meta.textContent = lab.available
         ? `Using ${lab.provider || "codex-cli"}${lab.model ? ` · ${lab.model}` : ""} for async evaluation and suggestion runs.`
-        : "Codex CLI is unavailable in this environment. The rest of the Strategies page still works normally.";
+        : "Codex is unavailable in this environment. The rest of the Strategies page still works normally.";
     }
 
     const children = [];
@@ -1267,7 +1268,7 @@
     const topRow = el("div", "strategy-codex-top-row");
     const availability = el("div", "strategy-codex-availability");
     availability.appendChild(
-      pill(lab.available ? "Codex CLI ready" : "Codex CLI unavailable", lab.available ? "good" : "bad"),
+      pill(lab.available ? readyLabel : "Codex unavailable", lab.available ? "good" : "bad"),
     );
     if (lab.model) availability.appendChild(el("span", "muted-label mono", lab.model));
     topRow.appendChild(availability);

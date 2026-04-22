@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.agents.codex_cli import CodexCLIProvider
+from kalshi_bot.agents.providers import ChatGPTCodexProvider, OpenAICompatibleProvider, build_codex_provider
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import (
     StrategyCodexEvaluationPayload,
@@ -69,21 +70,28 @@ class StrategyCodexService:
         self.settings = settings
         self.session_factory = session_factory
         self.strategy_regression_service = strategy_regression_service
-        self.provider = (
-            CodexCLIProvider(
-                model=settings.codex_model,
-                timeout_seconds=max(settings.llm_request_timeout_seconds, 90.0),
-            )
-            if CodexCLIProvider.is_available()
-            else None
-        )
+        self.provider: CodexCLIProvider | OpenAICompatibleProvider | ChatGPTCodexProvider | None = None
+        self.provider_name = "unavailable"
+        self._refresh_provider()
 
     async def close(self) -> None:
         if self.provider is not None:
             await self.provider.close()
 
     def is_available(self) -> bool:
+        if self.provider is None:
+            self._refresh_provider()
         return self.provider is not None
+
+    def _refresh_provider(self) -> None:
+        if self.provider is not None:
+            return
+        provider, provider_name = build_codex_provider(
+            self.settings,
+            timeout_seconds=max(self.settings.llm_request_timeout_seconds, 90.0),
+        )
+        self.provider = provider
+        self.provider_name = provider_name
 
     async def mark_stale_runs_failed(self) -> int:
         stale_before = datetime.now(UTC) - CODEX_RUN_STALE_AFTER
@@ -117,10 +125,11 @@ class StrategyCodexService:
             if not strategy.is_active and strategy.source == "codex_cli"
         ]
 
+        available = self.is_available()
         return {
-            "available": self.is_available(),
-            "provider": CODEX_PROVIDER_NAME if self.is_available() else "unavailable",
-            "model": self.settings.codex_model if self.is_available() else None,
+            "available": available,
+            "provider": self.provider_name if available else "unavailable",
+            "model": self.settings.codex_model if available else None,
             "creation_window_days": CODEX_CREATION_WINDOW_DAYS,
             "recent_runs": [self._compact_run_view(record) for record in recent_runs],
             "inactive_codex_strategies": inactive_codex_strategies,
@@ -133,8 +142,8 @@ class StrategyCodexService:
         dashboard_snapshot: dict[str, Any],
         trigger_source: str = "manual",
     ) -> dict[str, Any]:
-        if self.provider is None:
-            raise RuntimeError("Codex CLI is not available")
+        if not self.is_available() or self.provider is None:
+            raise RuntimeError("Codex provider is not available")
         if trigger_source not in CODEX_TRIGGER_SOURCES:
             raise ValueError(f"Unsupported codex trigger source: {trigger_source}")
         compact_snapshot = self._compact_dashboard_snapshot(dashboard_snapshot)
@@ -203,7 +212,7 @@ class StrategyCodexService:
         return results
 
     async def execute_run(self, run_id: str) -> None:
-        if self.provider is None:
+        if not self.is_available() or self.provider is None:
             return
 
         async with self.session_factory() as session:

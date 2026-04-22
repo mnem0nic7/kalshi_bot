@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+import kalshi_bot.services.strategy_codex as strategy_codex_module
+from kalshi_bot.agents.codex_cli import CodexCLIProvider
+from kalshi_bot.agents.providers import OpenAICompatibleProvider
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import StrategyThresholdPreset
 from kalshi_bot.db.repositories import PlatformRepository
@@ -107,6 +110,56 @@ async def test_strategy_codex_unique_strategy_name_uses_deterministic_suffixes()
     unique_name = await service._unique_strategy_name(FakeRepo(), "balanced-plus")
 
     assert unique_name == "balanced-plus-3"
+
+
+@pytest.mark.asyncio
+async def test_strategy_codex_service_uses_api_key_provider_when_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(CodexCLIProvider, "is_available", staticmethod(lambda: False))
+    service = StrategyCodexService(
+        Settings(
+            database_url="sqlite+aiosqlite:///./strategy-codex-fallback.db",
+            codex_api_key="test-key",
+            codex_auth_json_path="/nonexistent/auth.json",
+        ),
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    assert service.is_available() is True
+    assert service.provider_name == "apikey-from-env"
+    assert isinstance(service.provider, OpenAICompatibleProvider)
+
+    await service.close()
+
+
+def test_strategy_codex_service_rechecks_provider_after_startup_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeProvider:
+        async def close(self) -> None:
+            return None
+
+    calls = 0
+    fake_provider = FakeProvider()
+
+    def fake_build_provider(settings: Settings, *, timeout_seconds: float | None = None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None, "unavailable"
+        return fake_provider, "codex-cli"
+
+    monkeypatch.setattr(strategy_codex_module, "build_codex_provider", fake_build_provider)
+
+    service = StrategyCodexService(
+        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-recheck.db"),
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    assert service.provider is None
+    assert service.provider_name == "unavailable"
+    assert service.is_available() is True
+    assert service.provider is fake_provider
+    assert service.provider_name == "codex-cli"
 
 
 def test_candidate_backtest_uses_dashboard_metric_shape() -> None:
