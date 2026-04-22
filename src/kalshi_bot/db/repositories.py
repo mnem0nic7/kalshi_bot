@@ -667,7 +667,7 @@ class PlatformRepository:
         if not market_tickers:
             return {}
         stmt = (
-            select(Signal.market_ticker, Signal.payload)
+            select(Signal.market_ticker, Signal.payload, Signal.fair_yes_dollars, Signal.edge_bps, Signal.confidence)
             .join(Room, Signal.room_id == Room.id)
             .where(
                 Signal.market_ticker.in_(market_tickers),
@@ -677,9 +677,14 @@ class PlatformRepository:
         )
         results = await self.session.execute(stmt)
         payloads: dict[str, dict[str, Any]] = {}
-        for market_ticker, payload in results:
+        for market_ticker, payload, fair_yes_dollars, edge_bps, confidence in results:
             if market_ticker not in payloads:
-                payloads[str(market_ticker)] = dict(payload or {})
+                payloads[str(market_ticker)] = {
+                    "fair_yes_dollars": str(fair_yes_dollars),
+                    "edge_bps": edge_bps,
+                    "confidence": confidence,
+                    **dict(payload or {}),
+                }
         return payloads
 
     async def save_signal(
@@ -969,6 +974,25 @@ class PlatformRepository:
         )
         return list((await self.session.execute(stmt)).scalars())
 
+    async def list_orders_for_markets(
+        self,
+        market_tickers: list[str],
+        *,
+        kalshi_env: str | None = None,
+    ) -> list[OrderRecord]:
+        if not market_tickers:
+            return []
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = (
+            select(OrderRecord)
+            .where(
+                OrderRecord.kalshi_env == env,
+                OrderRecord.market_ticker.in_(market_tickers),
+            )
+            .order_by(OrderRecord.created_at.desc())
+        )
+        return list((await self.session.execute(stmt)).scalars())
+
     async def save_fill(
         self,
         *,
@@ -1103,6 +1127,25 @@ class PlatformRepository:
             .join(TradeTicketRecord, OrderRecord.trade_ticket_id == TradeTicketRecord.id)
             .where(TradeTicketRecord.room_id == room_id)
             .order_by(FillRecord.created_at.asc())
+        )
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def list_fills_for_markets(
+        self,
+        market_tickers: list[str],
+        *,
+        kalshi_env: str | None = None,
+    ) -> list[FillRecord]:
+        if not market_tickers:
+            return []
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = (
+            select(FillRecord)
+            .where(
+                FillRecord.kalshi_env == env,
+                FillRecord.market_ticker.in_(market_tickers),
+            )
+            .order_by(FillRecord.created_at.desc())
         )
         return list((await self.session.execute(stmt)).scalars())
 
@@ -2748,6 +2791,18 @@ class PlatformRepository:
     async def get_checkpoint(self, stream_name: str) -> Checkpoint | None:
         stmt = select(Checkpoint).where(Checkpoint.stream_name == stream_name)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_checkpoints(
+        self,
+        *,
+        prefix: str | None = None,
+        limit: int = 500,
+    ) -> list[Checkpoint]:
+        stmt = select(Checkpoint)
+        if prefix is not None:
+            stmt = stmt.where(Checkpoint.stream_name.like(f"{prefix}%"))
+        stmt = stmt.order_by(Checkpoint.stream_name.asc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
 
     async def get_total_capital_dollars(self, *, kalshi_env: str | None = None) -> Decimal | None:
         """Return total portfolio value (cash + positions) from the latest reconcile checkpoint."""

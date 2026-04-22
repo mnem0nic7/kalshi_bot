@@ -23,6 +23,7 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
+from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
 
 
 def _float_or_none(value: object) -> float | None:
@@ -667,6 +668,31 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     print(json.dumps(rows, indent=2))
                     return 0
 
+            if args.command == "repair-stop-loss-checkpoints":
+                refreshed = await refresh_stop_loss_checkpoints(
+                    repo,
+                    settings=container.settings,
+                    kalshi_env=container.settings.kalshi_env,
+                    subaccount=container.settings.kalshi_subaccount,
+                    market_tickers=args.market_tickers or None,
+                    log_repairs=True,
+                )
+                await session.commit()
+                print(
+                    json.dumps(
+                        [
+                            {
+                                "market_ticker": item.market_ticker,
+                                "outcome_status": item.outcome_status,
+                                "repaired": item.repaired,
+                            }
+                            for item in refreshed
+                        ],
+                        indent=2,
+                    )
+                )
+                return 0
+
         if args.command == "create-web-user":
             from kalshi_bot.web.auth import hash_password, normalize_auth_email
 
@@ -976,6 +1002,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     kill_switch = subparsers.add_parser("kill-switch")
     kill_switch.add_argument("state", choices=["on", "off"])
+
+    repair_stop_loss = subparsers.add_parser("repair-stop-loss-checkpoints")
+    repair_stop_loss.add_argument("market_tickers", nargs="*")
 
     subparsers.add_parser("status")
 

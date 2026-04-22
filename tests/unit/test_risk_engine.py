@@ -152,6 +152,37 @@ def test_risk_engine_blocks_stale_data() -> None:
     assert any("stale" in reason.lower() for reason in verdict.reasons)
 
 
+def test_risk_engine_blocks_same_ticker_add_ons_by_default() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=False,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            current_position_count_fp=Decimal("5.00"),
+            current_position_side="yes",
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("no pyramiding" in reason.lower() for reason in verdict.reasons)
+
+
 def test_risk_engine_blocks_near_threshold_regime() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
@@ -396,6 +427,7 @@ def test_risk_engine_allows_when_under_per_ticker_count_cap() -> None:
         risk_max_position_notional_dollars=500,
         risk_max_position_count_fp_per_ticker=200,
         risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=True,
     )
     engine = DeterministicRiskEngine(settings)
     verdict = engine.evaluate(

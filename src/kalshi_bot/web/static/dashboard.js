@@ -441,22 +441,54 @@
       const marketTd = el("td");
       const marketWrap = el("div", "position-market");
       marketWrap.appendChild(el("span", "mono", pos.market_ticker));
-      if (pos.model_quality_status === "warn") {
-        const flags = [];
-        const count = parseFloat(pos.count_fp || "0");
-        const cap = pos.recommended_size_cap_fp ? parseFloat(pos.recommended_size_cap_fp) : null;
-        if (pos.trade_regime === "near_threshold") flags.push("Near Threshold");
-        if (pos.trade_regime === "longshot_yes" || pos.trade_regime === "longshot_no") flags.push("Longshot");
-        if (pos.warn_only_blocked) flags.push("Broken Book");
-        if (cap != null && Number.isFinite(cap) && count > cap) flags.push("Oversized");
-        if (flags.length) {
-          const flagWrap = el("div", "position-flags");
-          if (Array.isArray(pos.model_quality_reasons) && pos.model_quality_reasons.length) {
-            flagWrap.title = pos.model_quality_reasons.join(" ");
-          }
-          flags.forEach((flag) => flagWrap.appendChild(el("span", "position-flag", flag)));
-          marketWrap.appendChild(flagWrap);
+      const metaPrimary = el("div", "position-meta");
+      if (pos.opened_at) {
+        const opened = el("span", "muted-label", "Opened ");
+        const stamp = el("span", null, pos.opened_at);
+        stamp.dataset.timestamp = pos.opened_at;
+        opened.appendChild(stamp);
+        metaPrimary.appendChild(opened);
+      }
+      metaPrimary.appendChild(
+        el("span", "muted-label", `${pos.entry_lot_count || 0} entry lot${(pos.entry_lot_count || 0) === 1 ? "" : "s"}`),
+      );
+      if (pos.latest_model_side) {
+        metaPrimary.appendChild(
+          el("span", "muted-label", `Model ${pos.latest_model_side} @ ${pos.latest_model_side_fair_display || "—"}`),
+        );
+      }
+      if (metaPrimary.childNodes.length) marketWrap.appendChild(metaPrimary);
+
+      const metaSecondary = el("div", "position-meta");
+      metaSecondary.appendChild(el("span", "muted-label", `Health ${pos.position_health_label || "Compliant"}`));
+      if (pos.stop_loss_status_label) {
+        metaSecondary.appendChild(el("span", "muted-label", `Stop loss ${pos.stop_loss_status_label}`));
+      }
+      if (pos.latest_model_edge_bps != null) {
+        metaSecondary.appendChild(el("span", "muted-label", `Edge ${pos.latest_model_edge_bps}bps`));
+      }
+      if (metaSecondary.childNodes.length) marketWrap.appendChild(metaSecondary);
+
+      const flags = [];
+      const count = parseFloat(pos.count_fp || "0");
+      const cap = pos.recommended_size_cap_fp ? parseFloat(pos.recommended_size_cap_fp) : null;
+      if (pos.trade_regime === "near_threshold") flags.push("Near Threshold");
+      if (pos.trade_regime === "longshot_yes" || pos.trade_regime === "longshot_no") flags.push("Longshot");
+      if (pos.warn_only_blocked) flags.push("Broken Book");
+      if (cap != null && Number.isFinite(cap) && count > cap) flags.push("Oversized");
+      (Array.isArray(pos.position_badges) ? pos.position_badges : []).forEach((badge) => {
+        if (!flags.includes(badge)) flags.push(badge);
+      });
+      if (flags.length) {
+        const flagWrap = el("div", "position-flags");
+        const tooltipBits = []
+          .concat(Array.isArray(pos.model_quality_reasons) ? pos.model_quality_reasons : [])
+          .concat(Array.isArray(pos.fresh_entry_reasons) ? pos.fresh_entry_reasons : []);
+        if (tooltipBits.length) {
+          flagWrap.title = tooltipBits.join(" ");
         }
+        flags.forEach((flag) => flagWrap.appendChild(el("span", "position-flag", flag)));
+        marketWrap.appendChild(flagWrap);
       }
       marketTd.appendChild(marketWrap);
       const sidePill = el("span", `status-pill ${pos.side === "yes" ? "status-good" : "status-warning"}`, pos.side);

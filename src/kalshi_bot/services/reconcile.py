@@ -9,8 +9,10 @@ from typing import Any
 _PACIFIC = zoneinfo.ZoneInfo("America/Los_Angeles")
 
 from kalshi_bot.core.fixed_point import as_decimal, quantize_count, quantize_price
+from kalshi_bot.config import get_settings
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
+from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
 
 
 def _first_present(payload: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
@@ -150,6 +152,12 @@ class ReconciliationService:
             )
 
         await repo.settle_fills(settlements, kalshi_env=kalshi_env)
+        await refresh_stop_loss_checkpoints(
+            repo,
+            settings=get_settings(),
+            kalshi_env=kalshi_env,
+            subaccount=subaccount,
+        )
 
         await repo.set_checkpoint(
             f"reconcile:{kalshi_env}",

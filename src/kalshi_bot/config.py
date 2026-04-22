@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     trigger_broken_book_retry_seconds: int = 30
     risk_order_pct: float = 0.05
     risk_position_pct: float = 0.10
-    risk_daily_loss_pct: float = 0.05
+    risk_daily_loss_pct: float = 0.20
     risk_daily_loss_sensitivity_pct: float = 0.10
     risk_daily_loss_sensitivity_edge_multiplier: float = 2.0
     risk_daily_loss_sensitivity_size_multiplier: float = 0.50
@@ -121,6 +121,7 @@ class Settings(BaseSettings):
     stop_loss_momentum_min_hold_minutes: int = 30
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
+    risk_allow_position_add_ons: bool = False
     risk_safe_capital_reserve_ratio: float = 0.0
     risk_risky_capital_max_ratio: float = 0.0
     risk_stale_market_seconds: int = 60

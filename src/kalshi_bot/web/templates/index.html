@@ -168,13 +168,33 @@
                 <td>
                   <div class="position-market">
                     <span class="mono">{{ pos.market_ticker }}</span>
-                    {% if pos.model_quality_status == "warn" %}
+                    <div class="position-meta">
+                      {% if pos.opened_at %}
+                      <span class="muted-label">Opened <span data-timestamp="{{ pos.opened_at }}">{{ pos.opened_at }}</span></span>
+                      {% endif %}
+                      <span class="muted-label">{{ pos.entry_lot_count }} entry lot{{ "s" if pos.entry_lot_count != 1 }}</span>
+                      {% if pos.latest_model_side %}
+                      <span class="muted-label">Model {{ pos.latest_model_side }} @ {{ pos.latest_model_side_fair_display }}</span>
+                      {% endif %}
+                    </div>
+                    <div class="position-meta">
+                      <span class="muted-label">Health {{ pos.position_health_label }}</span>
+                      {% if pos.stop_loss_status_label %}
+                      <span class="muted-label">Stop loss {{ pos.stop_loss_status_label }}</span>
+                      {% endif %}
+                      {% if pos.latest_model_edge_bps is not none %}
+                      <span class="muted-label">Edge {{ pos.latest_model_edge_bps }}bps</span>
+                      {% endif %}
+                    </div>
                     {% set oversized = pos.recommended_size_cap_fp and (pos.count_fp | float) > (pos.recommended_size_cap_fp | float) %}
-                    <div class="position-flags" {% if pos.model_quality_reasons %}title="{{ pos.model_quality_reasons | join(' ') }}"{% endif %}>
+                    {% set title_bits = (pos.model_quality_reasons or []) + (pos.fresh_entry_reasons or []) %}
+                    {% if pos.trade_regime == "near_threshold" or pos.trade_regime in ["longshot_yes", "longshot_no"] or pos.warn_only_blocked or oversized or pos.position_badges %}
+                    <div class="position-flags" {% if title_bits %}title="{{ title_bits | join(' ') }}"{% endif %}>
                       {% if pos.trade_regime == "near_threshold" %}<span class="position-flag">Near Threshold</span>{% endif %}
                       {% if pos.trade_regime in ["longshot_yes", "longshot_no"] %}<span class="position-flag">Longshot</span>{% endif %}
                       {% if pos.warn_only_blocked %}<span class="position-flag">Broken Book</span>{% endif %}
                       {% if oversized %}<span class="position-flag">Oversized</span>{% endif %}
+                      {% for badge in pos.position_badges or [] %}<span class="position-flag">{{ badge }}</span>{% endfor %}
                     </div>
                     {% endif %}
                   </div>

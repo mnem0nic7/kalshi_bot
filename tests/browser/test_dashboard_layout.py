@@ -45,6 +45,22 @@ def _build_positions(count: int) -> list[dict[str, object]]:
                 "unrealized_pnl_tone": "good",
                 "unrealized_pnl_display": "+$0.30",
                 "model_quality_reasons": [],
+                "fresh_entry_reasons": [],
+                "opened_at": "2026-04-22T20:00:00+00:00",
+                "entry_lot_count": 1,
+                "position_health_label": "Compliant",
+                "position_health_status": "compliant",
+                "position_badges": ["No Add-Ons"],
+                "stop_loss_status": None,
+                "stop_loss_status_label": None,
+                "reentry_blocked": False,
+                "add_on_blocked": True,
+                "latest_model_side": "yes",
+                "latest_model_fair_yes_dollars": "0.6000",
+                "latest_model_fair_yes_display": "$0.6000",
+                "latest_model_side_fair_dollars": "0.6000",
+                "latest_model_side_fair_display": "$0.6000",
+                "latest_model_edge_bps": 1200,
             }
         )
     return positions
@@ -825,6 +841,44 @@ def test_recent_trade_proposals_render_at_bottom_of_demo_and_production(
                 assert "Spread too wide for entry." in production_text
                 production_timestamp = page.locator('#panel-production [data-testid="recent-trade-proposals"] [data-timestamp="2026-04-22T21:03:00+00:00"]').first
                 assert production_timestamp.count() == 1
+            finally:
+                browser.close()
+
+
+def test_position_governance_badges_render_in_dashboard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    positions = _build_positions(1)
+    positions[0].update(
+        {
+            "market_ticker": "KXHIGHCHI-26APR23-T85",
+            "position_health_label": "Stop-Loss Impaired",
+            "position_badges": ["Stop-Loss Failed", "Re-entry Blocked", "No Add-Ons"],
+            "stop_loss_status_label": "Stop-Loss Failed",
+            "entry_lot_count": 2,
+            "opened_at": "2026-04-22T20:15:00+00:00",
+            "latest_model_side": "no",
+            "latest_model_side_fair_display": "$0.7300",
+            "latest_model_edge_bps": -600,
+        }
+    )
+    payloads = {
+        "demo": {**_build_env_payload("$1,250.00", positions_count=1), "positions": positions},
+        "production": _build_env_payload("$2,500.00", positions_count=1),
+    }
+    with _serve_dashboard(monkeypatch, tmp_path, payloads=payloads) as base_url:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                page.goto(base_url, wait_until="load", timeout=15_000)
+                page.wait_for_selector("#panel-demo .positions-table", timeout=15_000)
+                text = page.locator("#panel-demo .positions-table").text_content(timeout=15_000) or ""
+                assert "Stop-Loss Failed" in text
+                assert "Re-entry Blocked" in text
+                assert "No Add-Ons" in text
+                assert "Health Stop-Loss Impaired" in text
+                assert "2 entry lots" in text
             finally:
                 browser.close()
 

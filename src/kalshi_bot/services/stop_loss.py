@@ -13,6 +13,11 @@ from kalshi_bot.config import Settings
 from kalshi_bot.db.models import MarketPriceHistory, MarketState, PositionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
+from kalshi_bot.services.position_governance import (
+    STOP_LOSS_OUTCOME_FILLED_EXIT,
+    STOP_LOSS_OUTCOME_SUBMIT_FAILED,
+    STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +204,7 @@ class StopLossService:
             peak = _peak_price_from_history(prices, position.side)
             trailing_ratio: float | None = None
             if peak is not None:
-                trailing_ratio = _trailing_loss_ratio(peak, _side_price(mid, position.side))
+                trailing_ratio = _trailing_loss_ratio(peak, mid)
                 if trailing_ratio >= self.settings.stop_loss_threshold_pct:
                     sell_px = _sell_price(ms, position.side)
                     if sell_px is not None and sell_px > 0:
@@ -256,6 +261,9 @@ class StopLossService:
         market_ticker = position.market_ticker
         shadow = self.settings.app_shadow_mode
         action = f"stop_loss_{trigger}_shadow" if shadow else f"stop_loss_{trigger}"
+        peak_display = str(peak) if peak is not None else "n/a"
+        mark_display = str(mid)
+        sell_display = str(sell_price)
 
         created_at = position.created_at
         if created_at.tzinfo is None:
@@ -288,6 +296,8 @@ class StopLossService:
         submit_failed = False
         submit_payload: dict[str, Any] = {
             "submitted_at": now.isoformat(),
+            "stopped_at": now.isoformat(),
+            "stopped_side": position.side,
             "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
             "peak_price": str(peak) if peak is not None else None,
             "trigger": trigger,
@@ -309,12 +319,25 @@ class StopLossService:
                 order_resp = await self.kalshi.create_order(order_request)
                 event_payload["order_request"] = order_request
                 event_payload["order_response"] = order_resp
+                order_data = dict(order_resp.get("order") or {})
+                submit_payload.update(
+                    {
+                        "client_order_id": order_request["client_order_id"],
+                        "order_status": order_data.get("status"),
+                        "kalshi_order_id": order_data.get("order_id"),
+                        "outcome_status": STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
+                    }
+                )
             except Exception as exc:
                 logger.warning("stop_loss order submit failed for %s: %s", market_ticker, exc)
                 event_payload["submit_error"] = str(exc)
                 submit_failed = True
+                submit_payload["submit_error"] = str(exc)
+                submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_SUBMIT_FAILED
                 # Back off on outright submit errors to avoid spamming an illiquid book.
                 submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
+        else:
+            submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_FILLED_EXIT
 
         await repo.log_ops_event(
             severity="warning",
@@ -322,6 +345,7 @@ class StopLossService:
                 f"Stop loss {'(shadow) ' if shadow else ''}triggered [{trigger}]: "
                 f"{market_ticker} {position.side}"
                 + (f" loss={loss_ratio:.0%}" if loss_ratio is not None else "")
+                + f" peak={peak_display} mark={mark_display} sell={sell_display}"
                 + (f" slope={slope:.3f}¢/min" if slope is not None else "")
             ),
             source="stop_loss",
@@ -340,21 +364,27 @@ class StopLossService:
                 payload={
                     "stopped_at": now.isoformat(),
                     "stopped_side": position.side,
+                    "client_order_id": submit_payload.get("client_order_id"),
+                    "kalshi_order_id": submit_payload.get("kalshi_order_id"),
+                    "order_status": submit_payload.get("order_status"),
                     "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
                     "peak_price": str(peak) if peak is not None else None,
                     "trigger": trigger,
+                    "outcome_status": submit_payload.get("outcome_status"),
                     "reverse_evaluated": False,
                 },
             )
 
         logger.warning(
-            "Stop loss %s [%s]: %s %s trailing_loss=%s peak=%s slope=%s hold=%.0fmin%s",
+            "Stop loss %s [%s]: %s %s trailing_loss=%s peak=%s mark=%s sell=%s slope=%s hold=%.0fmin%s",
             "shadow" if shadow else ("submit_failed" if submit_failed else "submitted"),
             trigger,
             market_ticker,
             position.side,
             f"{loss_ratio:.0%}" if loss_ratio is not None else "n/a",
-            str(peak) if peak is not None else "n/a",
+            peak_display,
+            mark_display,
+            sell_display,
             f"{slope:.3f}¢/min" if slope is not None else "n/a",
             hold_minutes,
             " [POSSIBLE MODEL ERROR]" if possible_model_error else "",

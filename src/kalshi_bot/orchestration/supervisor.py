@@ -342,6 +342,7 @@ class WorkflowSupervisor:
                     research_observed_at=research_observed_at,
                     current_position_notional_dollars=current_position_notional,
                     current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
+                    current_position_side=open_position.side if open_position is not None else None,
                     pending_order_count_fp=pending_order_count_fp,
                     portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                     open_ticker_count=open_ticker_count,
@@ -676,6 +677,7 @@ class WorkflowSupervisor:
                         "strategy_mode": signal.strategy_mode.value,
                         "trade_regime": signal.trade_regime,
                         "capital_bucket": signal.capital_bucket,
+                        "recommended_side": signal.recommended_side.value if signal.recommended_side is not None else None,
                         "forecast_delta_f": signal.forecast_delta_f,
                         "confidence_band": signal.confidence_band,
                         "model_quality_status": signal.model_quality_status,
@@ -721,6 +723,30 @@ class WorkflowSupervisor:
                     },
                 )
                 await session.commit()
+                held_position = await repo.get_position(
+                    room.market_ticker,
+                    self.settings.kalshi_subaccount,
+                    kalshi_env=room.kalshi_env,
+                )
+                if (
+                    held_position is not None
+                    and signal.recommended_side is not None
+                    and held_position.side != signal.recommended_side.value
+                ):
+                    await repo.log_ops_event(
+                        severity="warning",
+                        summary=f"Latest signal flipped away from held side for {room.market_ticker}",
+                        source="position_governance",
+                        payload={
+                            "market_ticker": room.market_ticker,
+                            "held_side": held_position.side,
+                            "recommended_side": signal.recommended_side.value,
+                            "fair_yes_dollars": str(signal.fair_yes_dollars),
+                        },
+                        kalshi_env=room.kalshi_env,
+                        room_id=room.id,
+                    )
+                    await session.commit()
 
                 # Market structure gates run after signal save; mutate signal in-place on failure.
                 # The existing no-ticket → stand_down path at the end of the agent sequence
@@ -934,6 +960,7 @@ class WorkflowSupervisor:
                             research_observed_at=dossier.freshness.refreshed_at,
                             current_position_notional_dollars=current_position_notional,
                             current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
+                            current_position_side=open_position.side if open_position is not None else None,
                             pending_order_count_fp=pending_order_count_fp,
                             portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                             open_ticker_count=open_ticker_count,

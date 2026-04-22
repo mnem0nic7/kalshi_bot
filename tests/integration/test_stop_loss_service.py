@@ -146,6 +146,7 @@ async def test_stop_loss_uses_fractional_count_fp_payload_and_sets_reentry_check
             cp.stream_name: cp
             for cp in (await session.execute(select(Checkpoint))).scalars()
         }
+        ops_events = list((await session.execute(select(OpsEvent))).scalars())
         await session.commit()
 
     assert len(triggered) == 1
@@ -164,6 +165,12 @@ async def test_stop_loss_uses_fractional_count_fp_payload_and_sets_reentry_check
     assert "count" not in kalshi.calls[0]
     assert "stop_loss_submit:demo:KXHIGHTSFO-26APR23-T70" in checkpoints
     assert "stop_loss_reentry:demo:KXHIGHTSFO-26APR23-T70" in checkpoints
+    assert checkpoints["stop_loss_submit:demo:KXHIGHTSFO-26APR23-T70"].payload["outcome_status"] == "submitted_pending_fill"
+    assert checkpoints["stop_loss_reentry:demo:KXHIGHTSFO-26APR23-T70"].payload["client_order_id"] == kalshi.calls[0]["client_order_id"]
+    assert any(
+        event.summary == "Stop loss triggered [trailing_stop]: KXHIGHTSFO-26APR23-T70 yes loss=86% peak=0.9200 mark=0.1300 sell=0.1200"
+        for event in ops_events
+    )
 
     await engine.dispose()
 
@@ -229,7 +236,74 @@ async def test_stop_loss_submit_failure_sets_retry_without_reentry_checkpoint(tm
     assert len(triggered) == 1
     submit_cp = checkpoints["stop_loss_submit:demo:KXHIGHTSFO-26APR23-T71"]
     assert submit_cp.payload["next_retry_at"]
+    assert submit_cp.payload["outcome_status"] == "submit_failed"
     assert "stop_loss_reentry:demo:KXHIGHTSFO-26APR23-T71" not in checkpoints
     assert any(event.payload.get("submit_error") == "stop-loss submit failed" for event in ops_events)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stop_loss_no_side_uses_no_mark_in_trailing_ratio_and_summary(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/stop_loss_no_side.db",
+        app_color="blue",
+        kalshi_env="demo",
+        stop_loss_threshold_pct=0.10,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    kalshi = FakeKalshiClient()
+    service = StopLossService(settings, session_factory, kalshi)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_active_color="blue")
+        await repo.upsert_position(
+            market_ticker="KXHIGHTOKC-26APR23-T83",
+            subaccount=settings.kalshi_subaccount,
+            kalshi_env=settings.kalshi_env,
+            side="no",
+            count_fp=Decimal("13.31"),
+            average_price_dollars=Decimal("0.7489"),
+            raw={},
+        )
+        await repo.upsert_market_state(
+            "KXHIGHTOKC-26APR23-T83",
+            kalshi_env=settings.kalshi_env,
+            snapshot={"market_ticker": "KXHIGHTOKC-26APR23-T83"},
+            yes_bid_dollars=Decimal("0.2800"),
+            yes_ask_dollars=Decimal("0.3200"),
+            last_trade_dollars=Decimal("0.3000"),
+        )
+        base = datetime.now(UTC) - timedelta(minutes=5)
+        for offset_minutes, mid in enumerate(["0.2000", "0.2200", "0.2400", "0.2600", "0.2800"]):
+            await repo.record_market_price_snapshot(
+                market_ticker="KXHIGHTOKC-26APR23-T83",
+                kalshi_env=settings.kalshi_env,
+                yes_bid_dollars=Decimal(mid) - Decimal("0.0100"),
+                yes_ask_dollars=Decimal(mid) + Decimal("0.0100"),
+                mid_dollars=Decimal(mid),
+                last_trade_dollars=Decimal(mid),
+                volume=10,
+                observed_at=base + timedelta(minutes=offset_minutes),
+            )
+        await session.commit()
+
+    triggered = await service.check_once()
+
+    async with session_factory() as session:
+        ops_events = list((await session.execute(select(OpsEvent))).scalars())
+        await session.commit()
+
+    assert len(triggered) == 1
+    assert triggered[0]["trailing_loss_ratio"] == pytest.approx(0.125, abs=0.0001)
+    assert triggered[0]["mid_mark"] == "0.7000"
+    assert triggered[0]["sell_price"] == "0.6800"
+    assert any(
+        event.summary == "Stop loss triggered [trailing_stop]: KXHIGHTOKC-26APR23-T83 no loss=12% peak=0.8000 mark=0.7000 sell=0.6800"
+        for event in ops_events
+    )
 
     await engine.dispose()

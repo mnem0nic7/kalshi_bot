@@ -13,6 +13,12 @@ from sqlalchemy import func, select
 from kalshi_bot.core.enums import RoomOrigin
 from kalshi_bot.db.models import FillRecord, OrderRecord, RiskVerdictRecord, Room, RoomResearchHealthRecord, RoomStrategyAuditRecord, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.services.position_governance import (
+    classify_position_health,
+    latest_signal_fair_yes_dollars,
+    stop_loss_outcome_from_payloads,
+    stop_loss_stopped_at_from_payloads,
+)
 from kalshi_bot.services.strategy_regression import (
     LEAN_RECOMMENDATION_MIN_GAP as STRATEGY_LEAN_RECOMMENDATION_GAP,
     MIN_TRADE_COUNT as STRATEGY_MIN_TRADE_COUNT,
@@ -287,6 +293,28 @@ def _position_mark_price(position_side: str, market_state: Any | None) -> tuple[
     return None, None
 
 
+def _position_entry_summary(position: Any, fills: list[Any]) -> tuple[datetime | None, int]:
+    running = Decimal("0")
+    opened_at: datetime | None = None
+    entry_lot_count = 0
+    for fill in sorted(fills, key=lambda item: item.created_at):
+        if str(fill.side) != str(position.side):
+            continue
+        delta = _decimal_or_zero(fill.count_fp)
+        if str(fill.action) == "sell":
+            delta = -delta
+        if running <= 0 and delta > 0:
+            opened_at = fill.created_at
+            entry_lot_count = 0
+        if delta > 0:
+            entry_lot_count += 1
+        running += delta
+        if running <= 0:
+            opened_at = None
+            entry_lot_count = 0
+    return opened_at, entry_lot_count
+
+
 def _balance_summary(balance_checkpoint: Any | None, position_views: list[dict[str, Any]]) -> dict[str, Any]:
     checkpoint_payload = dict(getattr(balance_checkpoint, "payload", {}) or {})
     balance_payload = dict(checkpoint_payload.get("balance") or {})
@@ -471,6 +499,12 @@ def _position_view(
     live_market: Any | None = None,
     dossier: Any | None = None,
     signal_payload: dict[str, Any] | None = None,
+    *,
+    stop_loss_submit_payload: dict[str, Any] | None = None,
+    stop_loss_reentry_payload: dict[str, Any] | None = None,
+    opened_at: datetime | None = None,
+    entry_lot_count: int = 0,
+    settings: Any | None = None,
 ) -> dict[str, Any]:
     count = _decimal_or_zero(position.count_fp)
     avg_price = _decimal_or_zero(position.average_price_dollars)
@@ -482,6 +516,37 @@ def _position_view(
     unrealized_pnl = (current_value - notional).quantize(Decimal("0.01")) if current_value is not None else None
     recommended_size_cap_fp = _decimal_or_none(_dossier_value(dossier, "recommended_size_cap_fp"))
     model_quality_reasons = [str(reason) for reason in (_dossier_value(dossier, "model_quality_reasons", default=[]) or [])]
+    health: dict[str, Any] = {
+        "classification": "compliant",
+        "classification_label": "Compliant",
+        "latest_model_side": None,
+        "latest_model_fair_yes_dollars": None,
+        "latest_model_side_fair_dollars": None,
+        "implied_edge_bps": None,
+        "fresh_entry_allowed": True,
+        "fresh_entry_reasons": [],
+        "stop_loss_outcome_status": None,
+        "stop_loss_outcome_label": None,
+        "reentry_blocked": False,
+        "add_on_blocked": False,
+        "badges": [],
+    }
+    if settings is not None:
+        health = classify_position_health(
+            settings=settings,
+            position_side=str(position.side),
+            average_price_dollars=avg_price,
+            current_price_dollars=mark_price,
+            signal_payload=signal_payload,
+            stop_loss_outcome_status=stop_loss_outcome_from_payloads(
+                stop_loss_submit_payload,
+                stop_loss_reentry_payload,
+            ),
+            stop_loss_stopped_at=stop_loss_stopped_at_from_payloads(
+                stop_loss_submit_payload,
+                stop_loss_reentry_payload,
+            ),
+        )
     return {
         "market_ticker": position.market_ticker,
         "side": position.side,
@@ -505,6 +570,23 @@ def _position_view(
         "recommended_size_cap_fp": str(recommended_size_cap_fp) if recommended_size_cap_fp is not None else None,
         "warn_only_blocked": bool(_dossier_value(dossier, "warn_only_blocked", default=False)),
         "capital_bucket": _capital_bucket_from_signal_payload(signal_payload),
+        "opened_at": _iso_or_none(opened_at),
+        "entry_lot_count": entry_lot_count,
+        "position_health_status": health["classification"],
+        "position_health_label": health["classification_label"],
+        "position_badges": health["badges"],
+        "stop_loss_status": health["stop_loss_outcome_status"],
+        "stop_loss_status_label": health["stop_loss_outcome_label"],
+        "reentry_blocked": health["reentry_blocked"],
+        "add_on_blocked": health["add_on_blocked"],
+        "fresh_entry_allowed": health["fresh_entry_allowed"],
+        "fresh_entry_reasons": health["fresh_entry_reasons"],
+        "latest_model_side": health["latest_model_side"],
+        "latest_model_fair_yes_dollars": health["latest_model_fair_yes_dollars"],
+        "latest_model_fair_yes_display": _price_display(latest_signal_fair_yes_dollars(signal_payload)),
+        "latest_model_side_fair_dollars": health["latest_model_side_fair_dollars"],
+        "latest_model_side_fair_display": _price_display(_decimal_or_none(health["latest_model_side_fair_dollars"])),
+        "latest_model_edge_bps": health["implied_edge_bps"],
         "updated_at": _iso_or_none(position.updated_at),
     }
 
@@ -1409,6 +1491,10 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
             [position.market_ticker for position in positions],
             kalshi_env=kalshi_env,
         )
+        fills = await repo.list_fills_for_markets(
+            [position.market_ticker for position in positions],
+            kalshi_env=kalshi_env,
+        )
         balance_checkpoint = await repo.get_checkpoint(f"reconcile:{kalshi_env}")
         runtime_health = await container.watchdog_service.get_status(repo, kalshi_env=kalshi_env)
         pack = await container.agent_pack_service.get_pack_for_color(repo, control.active_color)
@@ -1417,6 +1503,8 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
             market_tickers=[position.market_ticker for position in positions],
             kalshi_env=kalshi_env,
         )
+        stop_loss_submit_checkpoints = await repo.list_checkpoints(prefix=f"stop_loss_submit:{kalshi_env}:")
+        stop_loss_reentry_checkpoints = await repo.list_checkpoints(prefix=f"stop_loss_reentry:{kalshi_env}:")
         total_capital = await repo.get_total_capital_dollars(kalshi_env=kalshi_env)
         daily_pnl_baseline = await repo.get_daily_portfolio_baseline_dollars(kalshi_env=kalshi_env)
         win_rate_data = await repo.get_fill_win_rate_30d(kalshi_env=kalshi_env)
@@ -1444,6 +1532,21 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         key=lambda e: severity_rank.get(e.severity, 3),
     )
     market_state_by_ticker = {item.market_ticker: item for item in market_states}
+    fills_by_ticker: dict[str, list[Any]] = {}
+    for fill in fills:
+        fills_by_ticker.setdefault(fill.market_ticker, []).append(fill)
+    entry_summary_by_ticker = {
+        position.market_ticker: _position_entry_summary(position, fills_by_ticker.get(position.market_ticker, []))
+        for position in positions
+    }
+    stop_loss_submit_by_ticker = {
+        checkpoint.stream_name.removeprefix(f"stop_loss_submit:{kalshi_env}:"): dict(checkpoint.payload or {})
+        for checkpoint in stop_loss_submit_checkpoints
+    }
+    stop_loss_reentry_by_ticker = {
+        checkpoint.stream_name.removeprefix(f"stop_loss_reentry:{kalshi_env}:"): dict(checkpoint.payload or {})
+        for checkpoint in stop_loss_reentry_checkpoints
+    }
     live_market_by_ticker = await _load_live_position_markets(container, positions)
     position_views = [
         _position_view(
@@ -1452,6 +1555,11 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
             live_market_by_ticker.get(position.market_ticker),
             dossier_by_ticker.get(position.market_ticker).payload if dossier_by_ticker.get(position.market_ticker) is not None else None,
             signal_payload_by_ticker.get(position.market_ticker),
+            stop_loss_submit_payload=stop_loss_submit_by_ticker.get(position.market_ticker),
+            stop_loss_reentry_payload=stop_loss_reentry_by_ticker.get(position.market_ticker),
+            opened_at=entry_summary_by_ticker.get(position.market_ticker, (None, 0))[0],
+            entry_lot_count=entry_summary_by_ticker.get(position.market_ticker, (None, 0))[1],
+            settings=container.settings,
         )
         for position in positions
     ]

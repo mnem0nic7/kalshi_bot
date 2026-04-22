@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -476,12 +476,61 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
             assert kalshi_env == "demo"
             return market_states
 
+        async def list_fills_for_markets(
+            self,
+            market_tickers: list[str],
+            *,
+            kalshi_env: str | None = None,
+        ) -> list[SimpleNamespace]:
+            assert market_tickers == [position.market_ticker for position in positions]
+            assert kalshi_env == "demo"
+            return [
+                SimpleNamespace(
+                    market_ticker="KXHIGHCHI-26APR17-T79",
+                    side="no",
+                    action="buy",
+                    count_fp=Decimal("24.00"),
+                    created_at=now - timedelta(hours=2),
+                ),
+                SimpleNamespace(
+                    market_ticker="KXHIGHTSFO-26APR17-T71",
+                    side="yes",
+                    action="buy",
+                    count_fp=Decimal("10.00"),
+                    created_at=now - timedelta(hours=3),
+                ),
+                SimpleNamespace(
+                    market_ticker="KXHIGHTSFO-26APR17-T71",
+                    side="yes",
+                    action="buy",
+                    count_fp=Decimal("15.00"),
+                    created_at=now - timedelta(hours=1),
+                ),
+            ]
+
         async def get_checkpoint(self, stream_name: str) -> SimpleNamespace:
             assert stream_name == "reconcile:demo"
             return SimpleNamespace(
                 payload={"balance": {"balance": 60582, "portfolio_value": 1600}},
                 updated_at=now,
             )
+
+        async def list_checkpoints(self, *, prefix: str | None = None, limit: int = 500) -> list[SimpleNamespace]:
+            assert limit == 500
+            if prefix == "stop_loss_submit:demo:":
+                return []
+            if prefix == "stop_loss_reentry:demo:":
+                return [
+                    SimpleNamespace(
+                        stream_name="stop_loss_reentry:demo:KXHIGHCHI-26APR17-T79",
+                        payload={
+                            "stopped_at": (now - timedelta(minutes=15)).isoformat(),
+                            "stopped_side": "no",
+                            "outcome_status": "submit_failed",
+                        },
+                    )
+                ]
+            return []
 
         async def get_research_dossier(self, market_ticker: str) -> SimpleNamespace | None:
             payloads = {
@@ -512,8 +561,18 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
             assert market_tickers == [position.market_ticker for position in positions]
             assert kalshi_env == "demo"
             return {
-                "KXHIGHCHI-26APR17-T79": {"capital_bucket": "safe", "trade_regime": "standard"},
-                "KXHIGHTSFO-26APR17-T71": {"capital_bucket": "risky", "trade_regime": "near_threshold"},
+                "KXHIGHCHI-26APR17-T79": {
+                    "capital_bucket": "safe",
+                    "trade_regime": "standard",
+                    "fair_yes_dollars": "0.6200",
+                    "recommended_side": "yes",
+                },
+                "KXHIGHTSFO-26APR17-T71": {
+                    "capital_bucket": "risky",
+                    "trade_regime": "standard",
+                    "fair_yes_dollars": "0.8100",
+                    "recommended_side": "yes",
+                },
             }
 
         async def list_active_rooms(
@@ -589,7 +648,16 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
         session_factory=_FakeSessionFactory(),
         watchdog_service=SimpleNamespace(get_status=AsyncMock(return_value={"updated_at": now.isoformat(), "colors": {}})),
         kalshi=SimpleNamespace(get_market=AsyncMock(side_effect=fake_get_market)),
-        settings=SimpleNamespace(app_color="blue", kalshi_subaccount=0, trigger_active_room_stale_seconds=1800),
+        settings=SimpleNamespace(
+            app_color="blue",
+            kalshi_subaccount=0,
+            trigger_active_room_stale_seconds=1800,
+            risk_min_contract_price_dollars=0.25,
+            risk_min_edge_bps=500,
+            risk_min_probability_extremity_pct=25.0,
+            stop_loss_reentry_cooldown_seconds=14400,
+            risk_allow_position_add_ons=False,
+        ),
         agent_pack_service=SimpleNamespace(
             get_pack_for_color=AsyncMock(return_value=SimpleNamespace()),
             runtime_thresholds=lambda _pack: SimpleNamespace(
@@ -637,10 +705,15 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert payload["positions"][0]["model_quality_status"] == "warn"
     assert payload["positions"][0]["warn_only_blocked"] is True
     assert payload["positions"][0]["capital_bucket"] == "safe"
+    assert payload["positions"][0]["position_health_status"] == "stop_loss_impaired"
+    assert "Stop-Loss Failed" in payload["positions"][0]["position_badges"]
     assert payload["positions"][1]["current_price_display"] == "$0.1600"
     assert payload["positions"][1]["unrealized_pnl_display"] == "$0.00"
     assert payload["positions"][1]["trade_regime"] == "near_threshold"
     assert payload["positions"][1]["recommended_size_cap_fp"] == "10.00"
+    assert payload["positions"][1]["position_health_status"] == "legacy_below_price_floor"
+    assert "Legacy" in payload["positions"][1]["position_badges"]
+    assert payload["positions"][1]["entry_lot_count"] == 2
     assert payload["positions_summary"]["capital_buckets"]["risky_limit_display"] == "$75.00"
     assert payload["recent_trade_proposals"][0]["market_ticker"] == "KXHIGHCHI-26APR17-T79"
     assert payload["recent_trade_proposals"][0]["risk_status"] == "blocked"

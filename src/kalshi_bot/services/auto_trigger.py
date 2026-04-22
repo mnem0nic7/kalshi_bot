@@ -14,6 +14,13 @@ from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.models import MarketState
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
+from kalshi_bot.services.position_governance import (
+    STOP_LOSS_OUTCOME_FILLED_EXIT,
+    STOP_LOSS_OUTCOME_SUBMIT_FAILED,
+    STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
+    refresh_stop_loss_checkpoints,
+    stop_loss_outcome_from_payloads,
+)
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -82,8 +89,54 @@ class AutoTriggerService:
                 await session.commit()
                 return
 
+            open_position = await repo.get_position(
+                market_ticker,
+                self.settings.kalshi_subaccount,
+                kalshi_env=self.settings.kalshi_env,
+            )
+            if open_position is not None and Decimal(str(open_position.count_fp)) > Decimal("0"):
+                await repo.log_ops_event(
+                    severity="warning",
+                    summary=f"Auto-trigger blocked for {market_ticker}: live position already open",
+                    source="auto_trigger",
+                    payload={"market_ticker": market_ticker, "reason": "open_position_governance"},
+                    kalshi_env=self.settings.kalshi_env,
+                )
+                await session.commit()
+                return
+
+            await refresh_stop_loss_checkpoints(
+                repo,
+                settings=self.settings,
+                kalshi_env=self.settings.kalshi_env,
+                subaccount=self.settings.kalshi_subaccount,
+                market_tickers=[market_ticker],
+                log_repairs=True,
+            )
+            submit_cp = await repo.get_checkpoint(f"stop_loss_submit:{self.settings.kalshi_env}:{market_ticker}")
+
             reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}")
             if reentry_cp is not None:
+                reentry_status = stop_loss_outcome_from_payloads(
+                    dict(getattr(submit_cp, "payload", {}) or {}),
+                    dict(reentry_cp.payload or {}),
+                )
+                if reentry_status in {
+                    STOP_LOSS_OUTCOME_SUBMIT_FAILED,
+                    STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
+                }:
+                    await repo.log_ops_event(
+                        severity="warning",
+                        summary=f"Auto-trigger blocked for {market_ticker}: stop-loss still unresolved",
+                        source="auto_trigger",
+                        payload={"market_ticker": market_ticker, "stop_loss_outcome_status": reentry_status},
+                        kalshi_env=self.settings.kalshi_env,
+                    )
+                    await session.commit()
+                    return
+                if reentry_status not in {None, STOP_LOSS_OUTCOME_FILLED_EXIT}:
+                    await session.commit()
+                    return
                 stopped_at_str = reentry_cp.payload.get("stopped_at")
                 try:
                     stopped_at = datetime.fromisoformat(stopped_at_str) if stopped_at_str else None
