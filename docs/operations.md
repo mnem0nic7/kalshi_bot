@@ -17,19 +17,25 @@
 
 ## Migrations
 
-For the Docker deployment flow:
+Demo and production each have their own Postgres instance (`postgres_demo` on host port 5432, `postgres_production` on 5433) and their own migrate service. Run migrations per environment:
 
 ```bash
-docker compose -f infra/docker-compose.yml up -d postgres
-docker compose -f infra/docker-compose.yml build migrate
-docker compose -f infra/docker-compose.yml run --rm --build --no-deps migrate
+# Docker — demo
+docker compose -f infra/docker-compose.yml up -d postgres_demo
+docker compose -f infra/docker-compose.yml run --rm --build --no-deps migrate_demo
+
+# Docker — production
+docker compose -f infra/docker-compose.yml up -d postgres_production
+docker compose -f infra/docker-compose.yml run --rm --build --no-deps migrate_production
 ```
 
-For local Python:
+`start-stack.sh` runs both automatically. For local Python development (targets demo by default via `.env`):
 
 ```bash
 alembic upgrade head
 ```
+
+All `app_*` and `daemon_*` containers gate on `migrate_<env>: service_completed_successfully`, so a direct `docker compose up -d` is safe — containers won't start until their env's schema is current.
 
 Always migrate before live promotion.
 Always migrate before enabling the watchdog timer on an already-running deployment, because the runtime now depends on the newer agent-pack tables and checkpoints.
@@ -37,8 +43,8 @@ Always migrate before enabling the watchdog timer on an already-running deployme
 Deploy finding from April 12, 2026:
 
 - rebuilding `app_*` or `daemon_*` alone is not enough when a new Alembic revision has been added
-- if the `migrate` image is stale, `run --rm --no-deps migrate` can report success while still stopping at the old head
-- after any migration change, rebuild or run with `--build` on the `migrate` service before trusting the DB version
+- if the `migrate` image is stale, `run --rm --no-deps migrate_demo` can report success while still stopping at the old head
+- after any migration change, rebuild or run with `--build` on the migrate service before trusting the DB version
 
 ## CLI workflow
 
@@ -278,14 +284,34 @@ The GitHub Actions control-plane workflows are:
 The staged pack is now applied through a pending checkpoint that the restarted inactive daemon consumes on startup, which keeps rollout safe across watchdog restarts and blue/green failovers.
 If the staged canary does not progress within `SELF_IMPROVE_CANARY_MAX_SECONDS`, the status surface marks it `stalled` and operators should inspect or roll it back instead of assuming rollout is still advancing.
 
-For Docker deployments that need both environments available, `infra/docker-compose.yml` now mounts separate live and demo PEMs into the containers and relies on:
+For Docker deployments that need both environments available, `infra/docker-compose.yml` mounts separate live and demo PEMs into the containers and relies on:
 
 - `LIVE_KALSHI_KEY_PATH_HOST`
 - `DEMO_KALSHI_KEY_PATH_HOST`
 - `LIVE_KALSHI_API_KEY`
 - `DEMO_KALSHI_API_KEY`
 
+Additional compose env vars added in the April 2026 architecture refactor:
+
+- `POSTGRES_DEMO_PORT` (default `5432`) — host port for the demo Postgres instance
+- `POSTGRES_PRODUCTION_PORT` (default `5433`) — host port for the production Postgres instance
+- `WEB_APP_COLOR` (default `blue`) — `APP_COLOR` seen by the three Caddy-facing web containers; update this when promoting to green so the dashboard header badge reflects the active color
+
+The `infra/docker-compose.yml` file uses YAML anchors to define shared service templates. Add new per-env settings to `x-demo-env` / `x-production-env` and shared settings to `x-common-env-base`. The Dockerfile uses a two-stage pip install so dependency layers are cached independently of source changes.
+
 ## Backups
 
-- `infra/scripts/backup.sh` creates a compressed `pg_dump`.
-- `infra/scripts/restore.sh` restores from a chosen dump file.
+`backup.sh` and `restore.sh` require an environment argument since demo and production now have separate Postgres instances:
+
+```bash
+# Backup
+infra/scripts/backup.sh demo                        # → backup-demo-<timestamp>.sql.gz
+infra/scripts/backup.sh production                  # → backup-production-<timestamp>.sql.gz
+infra/scripts/backup.sh demo /path/to/output.sql.gz # custom output path
+
+# Restore
+infra/scripts/restore.sh demo backup-demo-20260422T010000Z.sql.gz
+infra/scripts/restore.sh production backup-production-20260422T010000Z.sql.gz
+```
+
+Never restore a demo dump into the production instance or vice versa — the `kalshi_env` column values and execution lock state will be inconsistent.
