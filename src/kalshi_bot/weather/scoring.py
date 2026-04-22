@@ -241,6 +241,17 @@ def score_weather_market(
     obs_ts = parse_iso_datetime(observation_payload.get("properties", {}).get("timestamp"))
     settlement_date: date | None = obs_ts.date() if obs_ts is not None else None
 
+    # The Kalshi ticker encodes the settlement date (e.g. KXHIGHTBOS-26APR23-T58 → 2026-04-23).
+    # For D-1 rooms (run the day before settlement), obs_ts is today — using it as
+    # settlement_date means the model scores today's weather instead of tomorrow's.
+    # Override with the ticker-encoded date whenever it parses successfully.
+    _ticker_parts = mapping.market_ticker.split("-")
+    if len(_ticker_parts) >= 2:
+        try:
+            settlement_date = datetime.strptime(_ticker_parts[1], "%y%b%d").date()
+        except ValueError:
+            pass
+
     # Layer 2: precise gridpoint max temp (unrounded Celsius→F) via forecastGridData.
     # Falls back to Layer 1 (rounded daily period) when unavailable.
     gridpoint_max_f = (
