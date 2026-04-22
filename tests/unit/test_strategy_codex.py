@@ -20,10 +20,9 @@ from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
 class FakeProviderRouter:
-    def __init__(self, *, gemini=None, codex=None, hosted=None) -> None:
+    def __init__(self, *, gemini=None, codex=None) -> None:
         self.gemini = gemini
         self.codex = codex
-        self.hosted = hosted
 
     async def close(self) -> None:
         return None
@@ -124,7 +123,7 @@ def test_strategy_codex_service_prefers_gemini_when_available() -> None:
         Settings(database_url="sqlite+aiosqlite:///./strategy-codex-gemini.db"),
         SimpleNamespace(),
         SimpleNamespace(),
-        FakeProviderRouter(gemini=object(), codex=object(), hosted=None),
+        FakeProviderRouter(gemini=object(), codex=object()),
     )
 
     assert service.is_available() is True
@@ -138,7 +137,7 @@ def test_strategy_codex_service_reports_unavailable_without_strategy_providers()
         Settings(database_url="sqlite+aiosqlite:///./strategy-codex-none.db"),
         SimpleNamespace(),
         SimpleNamespace(),
-        FakeProviderRouter(gemini=None, codex=None, hosted=None),
+        FakeProviderRouter(gemini=None, codex=None),
     )
 
     assert service.is_available() is False
@@ -156,11 +155,11 @@ async def test_strategy_codex_create_run_persists_selected_provider_and_model(tm
         settings,
         session_factory,
         SimpleNamespace(),
-        FakeProviderRouter(gemini=object(), codex=object(), hosted=object()),
+        FakeProviderRouter(gemini=object(), codex=object()),
     )
 
     run = await service.create_run(
-        request=StrategyCodexRunRequest(mode="evaluate", window_days=180, provider="hosted", model="hosted-eval-v2"),
+        request=StrategyCodexRunRequest(mode="evaluate", window_days=180, provider="codex", model="gpt-4o"),
         dashboard_snapshot={"summary": {"window_days": 180}, "leaderboard": [], "city_matrix": []},
         trigger_source="manual",
     )
@@ -171,8 +170,8 @@ async def test_strategy_codex_create_run_persists_selected_provider_and_model(tm
         await session.commit()
 
     assert record is not None
-    assert record.provider == "hosted"
-    assert record.model == "hosted-eval-v2"
+    assert record.provider == "codex"
+    assert record.model == "gpt-4o"
 
     await engine.dispose()
 
@@ -279,7 +278,7 @@ async def test_strategy_codex_payloads_include_trigger_source(tmp_path) -> None:
         settings,
         session_factory,
         SimpleNamespace(),
-        FakeProviderRouter(gemini=None, codex=object(), hosted=None),
+        FakeProviderRouter(gemini=None, codex=object()),
     )
 
     dashboard_payload = await service.dashboard_payload()

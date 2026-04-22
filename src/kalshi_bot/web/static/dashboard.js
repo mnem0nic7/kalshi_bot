@@ -11,6 +11,11 @@
     return node;
   }
 
+  function setTestId(node, value) {
+    if (node && value) node.setAttribute("data-testid", value);
+    return node;
+  }
+
   function clearNode(node, children) {
     if (!node) return;
     node.replaceChildren(...children);
@@ -548,11 +553,13 @@
   function approvalMessageNode(seriesTicker) {
     const message = strategyState.approvalMessage;
     if (!message || message.seriesTicker !== seriesTicker) return null;
-    return el(
+    const node = el(
       "div",
       `strategy-approval-message is-${message.tone || "neutral"}`,
       message.text,
     );
+    node.dataset.seriesTicker = seriesTicker;
+    return setTestId(node, "strategy-approval-message");
   }
 
   function responseErrorMessage(body, fallbackText) {
@@ -1351,7 +1358,7 @@
     const providerBlock = el("div", "strategy-codex-provider-block");
     const providerLabel = el("label", "muted-label", "Provider");
     providerLabel.setAttribute("for", "strategies-codex-provider");
-    const providerSelect = el("select", "strategy-codex-select");
+    const providerSelect = setTestId(el("select", "strategy-codex-select"), "strategy-codex-provider");
     providerSelect.id = "strategies-codex-provider";
     providerSelect.disabled = !lab.available || strategyState.codexSubmitting;
     codexProviderOptions(payload).forEach((option) => {
@@ -1372,7 +1379,7 @@
     const modelBlock = el("div", "strategy-codex-provider-block");
     const modelLabel = el("label", "muted-label", "Model");
     modelLabel.setAttribute("for", "strategies-codex-model");
-    const modelInput = el("input", "strategy-codex-model-input");
+    const modelInput = setTestId(el("input", "strategy-codex-model-input"), "strategy-codex-model");
     modelInput.id = "strategies-codex-model";
     modelInput.type = "text";
     modelInput.disabled = !lab.available || strategyState.codexSubmitting;
@@ -1411,7 +1418,7 @@
     controls.appendChild(promptBlock);
 
     const actionRow = el("div", "strategy-codex-action-row");
-    const runButton = el(
+    const runButton = setTestId(el(
       "button",
       "dash-button primary-button",
       strategyState.codexSubmitting
@@ -1419,7 +1426,7 @@
         : strategyState.codexMode === "suggest"
         ? "Run Suggestion"
         : "Run Evaluation",
-    );
+    ), "strategy-codex-run");
     runButton.type = "button";
     runButton.disabled = !lab.available || strategyState.codexSubmitting;
     runButton.addEventListener("click", () => {
@@ -1427,13 +1434,13 @@
     });
     actionRow.appendChild(runButton);
     if (strategyState.codexMessage && strategyState.codexMessage.text) {
-      actionRow.appendChild(
-        el(
+      const message = el(
           "div",
           `strategy-codex-message is-${strategyState.codexMessage.tone || "neutral"}`,
           strategyState.codexMessage.text,
-        ),
-      );
+        );
+      setTestId(message, "strategy-codex-message");
+      actionRow.appendChild(message);
     }
     controls.appendChild(actionRow);
     children.push(controls);
@@ -1446,8 +1453,12 @@
     } else {
       const runList = el("div", "strategy-codex-run-list");
       recentRuns.forEach((run) => {
-        const button = el("button", `strategy-codex-run-item${run.id === strategyState.codexRunId ? " is-selected" : ""}`);
+        const button = setTestId(
+          el("button", `strategy-codex-run-item${run.id === strategyState.codexRunId ? " is-selected" : ""}`),
+          "strategy-codex-run-item",
+        );
         button.type = "button";
+        button.dataset.runId = run.id;
         button.disabled = strategyState.codexSubmitting;
         button.addEventListener("click", () => {
           strategyState.codexRunId = run.id;
@@ -1480,7 +1491,8 @@
     } else {
       const draftList = el("div", "strategy-codex-draft-list");
       inactiveStrategies.forEach((item) => {
-        const draft = el("article", "strategy-codex-draft-item");
+        const draft = setTestId(el("article", "strategy-codex-draft-item"), "strategy-codex-inactive-preset");
+        draft.dataset.strategyName = item.name;
         draft.append(el("strong", null, item.name));
         if (item.description) draft.append(el("p", "muted-label", item.description));
         if (Array.isArray(item.labels) && item.labels.length) {
@@ -1488,8 +1500,12 @@
           item.labels.forEach((label) => labels.appendChild(pill(label, "neutral")));
           draft.appendChild(labels);
         }
-        const activate = el("button", "dash-button secondary-button", "Activate");
+        const activate = setTestId(
+          el("button", "dash-button secondary-button", "Activate"),
+          "strategy-codex-activate-preset",
+        );
         activate.type = "button";
+        activate.dataset.strategyName = item.name;
         activate.disabled = strategyState.codexSubmitting;
         activate.addEventListener("click", () => {
           void activateCodexStrategy(item.name);
@@ -1502,7 +1518,7 @@
     left.appendChild(draftsSection);
     lower.appendChild(left);
 
-    const right = el("section", "strategy-codex-result");
+    const right = setTestId(el("section", "strategy-codex-result"), "strategy-codex-run-detail");
     right.append(el("h3", null, "Run Detail"));
     if (!selectedRun) {
       right.append(el("p", "empty-state", "Select a run to inspect the result."));
@@ -1521,7 +1537,7 @@
       }
       right.appendChild(statusRow);
       if (selectedRun.error_text) {
-        right.append(el("p", "strategy-codex-message is-bad", selectedRun.error_text));
+        right.append(setTestId(el("p", "strategy-codex-message is-bad", selectedRun.error_text), "strategy-codex-message"));
       }
       if (selectedRun.result && selectedRun.result.kind === "evaluate") {
         const evaluation = selectedRun.result.evaluation || {};
@@ -1590,7 +1606,10 @@
 
         const actions = el("div", "strategy-codex-result-actions");
         if (selectedRun.can_accept) {
-          const accept = el("button", "dash-button primary-button", "Accept As Inactive Preset");
+          const accept = setTestId(
+            el("button", "dash-button primary-button", "Accept As Inactive Preset"),
+            "strategy-codex-accept-suggestion",
+          );
           accept.type = "button";
           accept.disabled = strategyState.codexSubmitting;
           accept.addEventListener("click", () => {
@@ -1601,8 +1620,12 @@
           actions.appendChild(el("span", "muted-label", selectedRun.accept_disabled_reason));
         }
         if (selectedRun.can_activate && selectedRun.saved_strategy_name) {
-          const activate = el("button", "dash-button secondary-button", `Activate ${selectedRun.saved_strategy_name}`);
+          const activate = setTestId(
+            el("button", "dash-button secondary-button", `Activate ${selectedRun.saved_strategy_name}`),
+            "strategy-codex-activate-preset",
+          );
           activate.type = "button";
+          activate.dataset.strategyName = selectedRun.saved_strategy_name;
           activate.disabled = strategyState.codexSubmitting;
           activate.addEventListener("click", () => {
             void activateCodexStrategy(selectedRun.saved_strategy_name);
@@ -2210,8 +2233,9 @@
       }
       const label = el("label", "muted-label", "Operator note");
       label.setAttribute("for", `strategy-approval-note-${city.series_ticker}`);
-      const textarea = el("textarea", "strategy-approval-textarea");
+      const textarea = setTestId(el("textarea", "strategy-approval-textarea"), "strategy-approval-note");
       textarea.id = `strategy-approval-note-${city.series_ticker}`;
+      textarea.dataset.seriesTicker = city.series_ticker;
       textarea.rows = 4;
       textarea.placeholder = "Why does this recommendation make sense to approve right now?";
       textarea.value = noteValue;
@@ -2224,12 +2248,13 @@
       form.append(label, textarea);
 
       const actions = el("div", "strategy-approval-actions");
-      const button = el(
+      const button = setTestId(el(
         "button",
         "dash-button primary-button",
         strategyState.approvalSubmitting ? "Approving..." : `Approve ${approval.strategy_name || recommendation.strategy_name || "recommendation"}`,
-      );
+      ), "strategy-approval-submit");
       button.type = "button";
+      button.dataset.seriesTicker = city.series_ticker;
       button.disabled = strategyState.approvalSubmitting;
       button.addEventListener("click", () => {
         submitStrategyApproval(detail);
@@ -2262,8 +2287,9 @@
     const header = el("div", "strategy-detail-header");
     header.append(el("h3", null, city.series_ticker || "City detail"));
     header.append(el("p", "muted-label", city.city_label || city.location_name || "City-level strategy comparison"));
-    const codexAction = el("button", "strategy-inline-action", "Open in Strategy Lab");
+    const codexAction = setTestId(el("button", "strategy-inline-action", "Open in Evaluation Lab"), "strategy-open-evaluation-lab");
     codexAction.type = "button";
+    codexAction.dataset.seriesTicker = city.series_ticker || "";
     codexAction.addEventListener("click", () => {
       openCodexLabContext({
         seriesTicker: city.series_ticker || null,
@@ -2375,8 +2401,9 @@
     const header = el("div", "strategy-detail-header");
     header.append(el("h3", null, strategy.name || "Strategy detail"));
     if (strategy.description) header.append(el("p", "muted-label", strategy.description));
-    const codexAction = el("button", "strategy-inline-action", "Open in Strategy Lab");
+    const codexAction = setTestId(el("button", "strategy-inline-action", "Open in Evaluation Lab"), "strategy-open-evaluation-lab");
     codexAction.type = "button";
+    codexAction.dataset.strategyName = strategy.name || "";
     codexAction.addEventListener("click", () => {
       openCodexLabContext({
         seriesTicker: null,

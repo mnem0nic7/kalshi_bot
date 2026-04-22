@@ -12,9 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.agents.codex_cli import CodexCLIProvider
 from kalshi_bot.agents.providers import (
-    ChatGPTCodexProvider,
     NativeGeminiProvider,
-    OpenAICompatibleProvider,
     ProviderRouter,
 )
 from kalshi_bot.config import Settings
@@ -34,11 +32,10 @@ CODEX_CREATION_WINDOW_DAYS = 180
 CODEX_TRIGGER_SOURCES = {"manual", "nightly"}
 STRATEGY_LAB_SOURCE = "strategy_lab"
 LEGACY_STRATEGY_LAB_SOURCES = {"codex_cli", STRATEGY_LAB_SOURCE}
-STRATEGY_PROVIDER_PREFERENCE = ("gemini", "codex", "hosted")
+STRATEGY_PROVIDER_PREFERENCE = ("gemini", "codex")
 STRATEGY_PROVIDER_LABELS = {
     "gemini": "Gemini",
     "codex": "Codex",
-    "hosted": "Hosted",
 }
 
 
@@ -110,16 +107,16 @@ class StrategyCodexService:
         if not provider_id:
             return None
         lowered = provider_id.strip().lower()
-        if lowered in {"codex", "codex-cli", "chatgpt-oauth", "apikey-from-auth-json", "apikey-from-env"}:
+        if lowered in {"codex", "codex-cli"}:
             return "codex"
-        if lowered in {"gemini", "hosted"}:
+        if lowered == "gemini":
             return lowered
         return None
 
     def _provider_object(
         self,
         provider_id: str | None,
-    ) -> NativeGeminiProvider | CodexCLIProvider | ChatGPTCodexProvider | OpenAICompatibleProvider | None:
+    ) -> NativeGeminiProvider | CodexCLIProvider | None:
         normalized = self._normalize_provider_id(provider_id)
         if normalized == "gemini":
             return self.providers.gemini
@@ -186,7 +183,7 @@ class StrategyCodexService:
         *,
         requested_provider: str | None,
         requested_model: str | None,
-    ) -> tuple[str, NativeGeminiProvider | CodexCLIProvider | ChatGPTCodexProvider | OpenAICompatibleProvider, str]:
+    ) -> tuple[str, NativeGeminiProvider | CodexCLIProvider, str]:
         provider_id = self._normalize_provider_id(requested_provider) or self._preferred_provider_id()
         if provider_id is None:
             raise RuntimeError("No strategy lab provider is configured")

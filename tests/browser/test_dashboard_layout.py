@@ -816,7 +816,7 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert "Evidence interpretation" in detail_text
                 assert "Approval" in detail_text
                 assert page.locator("#strategies-cities-detail textarea").is_visible()
-                page.locator('#strategies-cities-detail button:has-text("Open in Strategy Lab")').click(timeout=15_000)
+                page.locator('#strategies-cities-detail [data-testid="strategy-open-evaluation-lab"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-focus-strategies')?.hidden === false",
                     timeout=15_000,

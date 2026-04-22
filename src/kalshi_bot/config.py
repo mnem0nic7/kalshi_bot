@@ -67,13 +67,7 @@ class Settings(BaseSettings):
     llm_hosted_base_url: str = "https://api.openai.com/v1"
     llm_hosted_api_key: str | None = None
     llm_hosted_model: str = "gpt-4o"
-    codex_api_key: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("CODEX_API_KEY", "OPENAI_API_KEY"),
-    )
-    codex_base_url: str = "https://api.openai.com/v1"
     codex_model: str = "gpt-4o"
-    codex_auth_json_path: str = "~/.codex/auth.json"
     llm_local_base_url: str = "http://localhost:11434/v1"
     llm_local_api_key: str = "dummy"
     llm_local_model: str = "llama3.1:8b"
