@@ -19,11 +19,13 @@ logger = logging.getLogger(__name__)
 
 def _midpoint(market_state: MarketState, side: str) -> Decimal | None:
     yes_bid = market_state.yes_bid_dollars
-    if yes_bid is None:
-        return None
     yes_ask = market_state.yes_ask_dollars
-    # When ask side is dry, use bid as the conservative mark rather than skipping entirely.
-    mid_yes = (yes_bid + yes_ask) / Decimal("2") if yes_ask is not None else yes_bid
+    # Require both sides: a missing ask means the book is broken (market maker withdrew,
+    # likely near settlement). A stale $0.01 bid next to a missing ask would produce a
+    # fake 99% loss signal on a position that's actually winning.
+    if yes_bid is None or yes_ask is None:
+        return None
+    mid_yes = (yes_bid + yes_ask) / Decimal("2")
     if side == "yes":
         return mid_yes
     return Decimal("1") - mid_yes
