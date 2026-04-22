@@ -3290,6 +3290,7 @@ class HistoricalTrainingService:
             response = await self.kalshi.list_historical_markets(
                 limit=self.settings.historical_import_page_size,
                 cursor=cursor,
+                series_ticker=template.series_ticker,
             )
             page = response.get("markets", [])
             if not page:

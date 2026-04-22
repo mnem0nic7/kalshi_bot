@@ -1327,3 +1327,111 @@ async def test_list_recent_markets_filters_closed_markets_without_invalid_status
         "KXHIGHNY-26APR10-T72",
     ]
     assert "status" not in service.kalshi.calls[0]
+
+
+# ---------------------------------------------------------------------------
+# Prerequisite 0: _list_historical_markets series_ticker filter
+# ADR: docs/adrs/001-historical-markets-series-filter.md
+# ---------------------------------------------------------------------------
+
+class _DummyKalshiHistorical:
+    """Minimal Kalshi stub capturing all list_historical_markets calls."""
+
+    def __init__(self, pages: list[dict]) -> None:
+        self._pages = list(pages)
+        self.calls: list[dict] = []
+
+    async def list_historical_markets(self, **params) -> dict:
+        self.calls.append(dict(params))
+        if self._pages:
+            return self._pages.pop(0)
+        return {"markets": [], "cursor": None}
+
+
+def _make_template(series_ticker: str = "KXHIGHNY") -> "WeatherSeriesTemplate":
+    return WeatherSeriesTemplate(
+        series_ticker=series_ticker,
+        station_id="KNYC",
+        daily_summary_station_id="USW00094728",
+        location_name="New York City",
+        timezone_name="America/New_York",
+        latitude=40.7146,
+        longitude=-74.0071,
+        metric="daily_high_temp_f",
+        settlement_source="NWS daily summary",
+    )
+
+
+def _market(ticker: str, strike_type: str = "greater", strike: float = 70.0) -> dict:
+    return {
+        "ticker": ticker,
+        "status": "settled",
+        "result": "yes",
+        "strike_type": strike_type,
+        "floor_strike": strike if strike_type == "greater" else None,
+        "cap_strike": strike if strike_type == "less" else None,
+        "close_time": "2026-04-10T23:00:00-05:00",
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_historical_markets_passes_series_ticker() -> None:
+    """series_ticker must be forwarded to the API so the server filters results.
+
+    Without this parameter, list_historical_markets paginates globally
+    (newest-first across all series) and exhausts the page budget before
+    reaching older history for a specific series.
+    """
+    kalshi = _DummyKalshiHistorical([
+        {"markets": [_market("KXHIGHNY-26APR10-T70")], "cursor": None},
+    ])
+    service = object.__new__(HistoricalTrainingService)
+    service.kalshi = kalshi
+    service.settings = SimpleNamespace(
+        historical_import_page_size=500,
+        historical_import_max_pages=25,
+    )
+    template = _make_template("KXHIGHNY")
+
+    await HistoricalTrainingService._list_historical_markets(
+        service,
+        template,
+        date_from=datetime(2026, 4, 10, tzinfo=UTC).date(),
+        date_to=datetime(2026, 4, 10, tzinfo=UTC).date(),
+    )
+
+    assert len(kalshi.calls) >= 1
+    assert kalshi.calls[0]["series_ticker"] == "KXHIGHNY", (
+        "series_ticker must be passed on every page request; "
+        "without it the API returns global results and exhausts the page budget"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_historical_markets_no_cross_series_contamination() -> None:
+    """Results from a different series must not appear in the returned list
+    even if the API returns them (defence-in-depth via client-side prefix check).
+    """
+    ny_market = _market("KXHIGHNY-26APR10-T70")
+    chi_market = _market("KXHIGHCHI-26APR10-T65")  # different series
+    kalshi = _DummyKalshiHistorical([
+        {"markets": [ny_market, chi_market], "cursor": None},
+    ])
+    service = object.__new__(HistoricalTrainingService)
+    service.kalshi = kalshi
+    service.settings = SimpleNamespace(
+        historical_import_page_size=500,
+        historical_import_max_pages=25,
+    )
+    template = _make_template("KXHIGHNY")
+
+    markets = await HistoricalTrainingService._list_historical_markets(
+        service,
+        template,
+        date_from=datetime(2026, 4, 10, tzinfo=UTC).date(),
+        date_to=datetime(2026, 4, 10, tzinfo=UTC).date(),
+    )
+
+    tickers = [m["ticker"] for m in markets]
+    assert "KXHIGHCHI-26APR10-T65" not in tickers, "Cross-series market must be excluded"
+    assert "KXHIGHNY-26APR10-T70" in tickers
