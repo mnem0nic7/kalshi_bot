@@ -259,7 +259,7 @@
             id="strategies-city-search"
             class="strategies-search-input"
             type="search"
-            placeholder="Search series or city"
+            placeholder="Search city or strategy"
             autocomplete="off"
           />
         </div>
@@ -267,10 +267,17 @@
           <label class="muted-label" for="strategies-city-sort">City sort</label>
           <select id="strategies-city-sort" class="strategies-sort-select">
             <option value="priority">Recommendation priority</option>
-            <option value="series">Series</option>
             <option value="gap">Win-rate gap</option>
+            <option value="assignment_gap">Gap to assignment</option>
+            <option value="resolved">Resolved trades</option>
+            <option value="coverage">Outcome coverage</option>
             <option value="best_win_rate">Best win rate</option>
+            <option value="series">Series</option>
           </select>
+        </div>
+        <div class="strategies-toolbar-block strategies-toolbar-block-wide">
+          <span class="muted-label">Filters</span>
+          <div class="strategies-city-filters" id="strategies-city-filters" role="tablist" aria-label="City analysis filters"></div>
         </div>
       </div>
 
@@ -278,18 +285,18 @@
         <article class="dash-card">
           <div class="dash-card-header">
             <div class="dash-card-title-block">
-              <h2>City Comparison Matrix</h2>
-              <span class="muted-label" id="strategies-matrix-meta">Recommendations, runner-up gaps, and best-city evidence</span>
+              <h2>Cross-City Analysis</h2>
+              <span class="muted-label" id="strategies-matrix-meta">Recommendations, mismatches, and city-level evidence across the selected window</span>
             </div>
           </div>
           <div class="table-wrap" id="strategies-city-matrix"></div>
         </article>
 
-        <article class="dash-card strategies-detail-card">
+        <article class="dash-card strategies-detail-card strategies-city-detail-card">
           <div class="dash-card-header">
             <div class="dash-card-title-block">
-              <h2>Selection Detail</h2>
-              <span class="muted-label" id="strategies-cities-detail-meta">Select a city row to inspect recommendation evidence.</span>
+              <h2>City Research Brief</h2>
+              <span class="muted-label" id="strategies-cities-detail-meta">Select a city row to inspect the current recommendation and supporting evidence.</span>
             </div>
           </div>
           <div id="strategies-cities-detail"></div>
@@ -298,6 +305,16 @@
     </section>
 
     <section class="strategies-focus-panel" id="strategies-focus-strategies" hidden>
+      <article class="dash-card strategy-codex-lab-card">
+        <div class="dash-card-header">
+          <div class="dash-card-title-block">
+            <h2>Codex Strategy Lab</h2>
+            <span class="muted-label" id="strategies-codex-meta">Use Codex CLI to evaluate the current landscape or propose a new threshold preset.</span>
+          </div>
+        </div>
+        <div id="strategies-codex-lab"></div>
+      </article>
+
       <div class="strategies-primary-grid">
         <article class="dash-card">
           <div class="dash-card-header">

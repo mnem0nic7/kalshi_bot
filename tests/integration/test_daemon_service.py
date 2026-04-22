@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import Checkpoint, OpsEvent
+from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.daemon import DaemonService
 from kalshi_bot.services.reconcile import ReconcileSummary
@@ -118,6 +120,90 @@ class FakeHistoricalPipelineService:
     async def daily(self):
         self.daily_calls += 1
         return {"status": "completed", "pipeline_kind": "daily"}
+
+
+class FakeStrategyRegressionService:
+    def __init__(self, session_factory, *, now_fn) -> None:
+        self.session_factory = session_factory
+        self.now_fn = now_fn
+        self.calls = 0
+
+    async def run_regression(self):
+        self.calls += 1
+        now = self.now_fn()
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.set_checkpoint(
+                "strategy_regression",
+                None,
+                {
+                    "ran_at": now.isoformat(),
+                    "rooms_scanned": 84,
+                    "series_evaluated": 2,
+                    "window_days": 180,
+                },
+            )
+            await session.commit()
+        return {"status": "ok", "ran_at": now.isoformat()}
+
+
+class FakeStrategyDashboardService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def build_dashboard(self, *, window_days=180, series_ticker=None, strategy_name=None, include_codex_lab=False):
+        self.calls.append(
+            {
+                "window_days": window_days,
+                "series_ticker": series_ticker,
+                "strategy_name": strategy_name,
+                "include_codex_lab": include_codex_lab,
+            }
+        )
+        return {
+            "summary": {"window_days": window_days, "window_display": f"{window_days}d"},
+            "leaderboard": [],
+            "city_matrix": [],
+            "detail_context": {"type": "empty", "selected_series_ticker": None, "selected_strategy_name": None},
+            "recent_promotions": [],
+            "methodology": {"points": []},
+        }
+
+
+class FakeStrategyCodexService:
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self.calls: list[dict[str, object]] = []
+
+    def is_available(self) -> bool:
+        return self.available
+
+    async def execute_modes_for_snapshot(
+        self,
+        *,
+        modes,
+        dashboard_snapshot,
+        window_days,
+        trigger_source="manual",
+        series_ticker=None,
+        strategy_name=None,
+        operator_brief=None,
+    ):
+        self.calls.append(
+            {
+                "modes": list(modes),
+                "dashboard_snapshot": dashboard_snapshot,
+                "window_days": window_days,
+                "trigger_source": trigger_source,
+                "series_ticker": series_ticker,
+                "strategy_name": strategy_name,
+                "operator_brief": operator_brief,
+            }
+        )
+        return [
+            {"id": "nightly-evaluate", "mode": "evaluate", "status": "completed", "trigger_source": trigger_source},
+            {"id": "nightly-suggest", "mode": "suggest", "status": "completed", "trigger_source": trigger_source},
+        ]
 
 
 class BlockingShadowCampaignService:
@@ -440,5 +526,218 @@ async def test_daemon_settlement_follow_up_reconcile_failure_logs_specific_warni
     assert "Settlement follow-up reconcile triggered" in summaries
     assert "Settlement follow-up reconcile failed" in summaries
     assert "Daemon heartbeat follow-up error" not in summaries
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_runs_nightly_strategy_codex_once_per_pacific_date(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-codex-nightly.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        strategy_codex_nightly_enabled=True,
+        strategy_codex_nightly_timezone="America/Los_Angeles",
+        strategy_codex_nightly_hour_local=1,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory({})
+    now_holder = {"value": datetime(2026, 4, 22, 10, 30, tzinfo=UTC)}
+    regression_service = FakeStrategyRegressionService(session_factory, now_fn=lambda: now_holder["value"])
+    dashboard_service = FakeStrategyDashboardService()
+    codex_service = FakeStrategyCodexService()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.set_checkpoint(
+            "strategy_regression",
+            None,
+            {"ran_at": "2026-04-22T07:30:00+00:00", "window_days": 180},
+        )
+        await session.commit()
+
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        strategy_regression_service=regression_service,  # type: ignore[arg-type]
+        strategy_codex_service=codex_service,  # type: ignore[arg-type]
+        strategy_dashboard_service=dashboard_service,  # type: ignore[arg-type]
+    )
+    daemon._utc_now = lambda: now_holder["value"]  # type: ignore[method-assign]
+
+    payload = await daemon.heartbeat_once()
+
+    assert regression_service.calls == 1
+    assert len(codex_service.calls) == 1
+    assert codex_service.calls[0]["modes"] == ["evaluate", "suggest"]
+    assert codex_service.calls[0]["trigger_source"] == "nightly"
+    assert dashboard_service.calls == [
+        {
+            "window_days": 180,
+            "series_ticker": None,
+            "strategy_name": None,
+            "include_codex_lab": False,
+        }
+    ]
+    assert payload["strategy_codex_nightly"]["status"] == "completed"
+    assert payload["strategy_codex_nightly"]["run_ids"] == ["nightly-evaluate", "nightly-suggest"]
+
+    async with session_factory() as session:
+        checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_strategy_codex_nightly:demo:blue"))
+        ).scalar_one()
+        await session.commit()
+
+    assert checkpoint.payload["local_date"] == "2026-04-22"
+
+    second_payload = await daemon.heartbeat_once()
+
+    assert len(codex_service.calls) == 1
+    assert "strategy_codex_nightly" not in second_payload
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_catches_up_nightly_strategy_codex_after_local_target_time(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-codex-catchup.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        strategy_codex_nightly_enabled=True,
+        strategy_codex_nightly_timezone="America/Los_Angeles",
+        strategy_codex_nightly_hour_local=1,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory({})
+    now_holder = {"value": datetime(2026, 4, 22, 7, 30, tzinfo=UTC)}
+    regression_service = FakeStrategyRegressionService(session_factory, now_fn=lambda: now_holder["value"])
+    dashboard_service = FakeStrategyDashboardService()
+    codex_service = FakeStrategyCodexService()
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.set_checkpoint(
+            "strategy_regression",
+            None,
+            {"ran_at": "2026-04-22T07:00:00+00:00", "window_days": 180},
+        )
+        await session.commit()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        strategy_regression_service=regression_service,  # type: ignore[arg-type]
+        strategy_codex_service=codex_service,  # type: ignore[arg-type]
+        strategy_dashboard_service=dashboard_service,  # type: ignore[arg-type]
+    )
+    daemon._utc_now = lambda: now_holder["value"]  # type: ignore[method-assign]
+
+    first_payload = await daemon.heartbeat_once()
+    assert "strategy_codex_nightly" not in first_payload
+    assert regression_service.calls == 0
+    assert codex_service.calls == []
+
+    now_holder["value"] = datetime(2026, 4, 22, 12, 0, tzinfo=UTC)
+    second_payload = await daemon.heartbeat_once()
+
+    assert regression_service.calls == 1
+    assert len(codex_service.calls) == 1
+    assert second_payload["strategy_codex_nightly"]["status"] == "completed"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_skips_nightly_strategy_codex_when_codex_unavailable(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-codex-unavailable.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        strategy_codex_nightly_enabled=True,
+        strategy_codex_nightly_timezone="America/Los_Angeles",
+        strategy_codex_nightly_hour_local=1,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory({})
+    now_holder = {"value": datetime(2026, 4, 22, 10, 30, tzinfo=UTC)}
+    regression_service = FakeStrategyRegressionService(session_factory, now_fn=lambda: now_holder["value"])
+    dashboard_service = FakeStrategyDashboardService()
+    codex_service = FakeStrategyCodexService(available=False)
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.set_checkpoint(
+            "strategy_regression",
+            None,
+            {"ran_at": "2026-04-22T10:00:00+00:00", "window_days": 180},
+        )
+        await session.commit()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        strategy_regression_service=regression_service,  # type: ignore[arg-type]
+        strategy_codex_service=codex_service,  # type: ignore[arg-type]
+        strategy_dashboard_service=dashboard_service,  # type: ignore[arg-type]
+    )
+    daemon._utc_now = lambda: now_holder["value"]  # type: ignore[method-assign]
+
+    payload = await daemon.heartbeat_once()
+
+    assert regression_service.calls == 0
+    assert codex_service.calls == []
+    assert dashboard_service.calls == []
+    assert payload["strategy_codex_nightly"]["reason"] == "codex_unavailable"
+
+    async with session_factory() as session:
+        checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_strategy_codex_nightly:demo:blue"))
+        ).scalar_one()
+        summaries = [
+            row.summary
+            for row in (
+                await session.execute(select(OpsEvent).where(OpsEvent.source == "daemon").order_by(OpsEvent.updated_at.asc()))
+            ).scalars()
+        ]
+        await session.commit()
+
+    assert checkpoint.payload["reason"] == "codex_unavailable"
+    assert "Nightly strategy Codex skipped: Codex CLI unavailable" in summaries
 
     await engine.dispose()

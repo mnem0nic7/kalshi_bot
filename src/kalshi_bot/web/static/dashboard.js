@@ -61,7 +61,7 @@
     }
   }
 
-  const STRATEGY_FOCUS_MODES = ["review", "cities", "strategies"];
+  const STRATEGY_FOCUS_MODES = ["cities", "strategies", "review"];
   const REVIEW_QUEUE_ORDER = [
     "drifted_assignment",
     "ready_for_approval",
@@ -69,40 +69,130 @@
     "aligned",
     "waiting_for_evidence",
   ];
+  const STRATEGY_CITY_FILTERS = [
+    "all",
+    "actionable",
+    "needs_review",
+    "mismatch",
+    "unassigned",
+    "low_confidence",
+    "no_outcomes",
+  ];
+  const ACTIONABLE_RECOMMENDATION_STATUSES = new Set(["strong_recommendation", "lean_recommendation"]);
+  const LOW_CONFIDENCE_RECOMMENDATION_STATUSES = new Set(["too_close", "low_sample"]);
 
   function reviewPriority(status) {
     const index = REVIEW_QUEUE_ORDER.indexOf(status || "");
     return index === -1 ? REVIEW_QUEUE_ORDER.length : index;
   }
 
-  function strategyFocusLabel(mode) {
-    if (mode === "review") return "Review Queue";
+  function strategyFocusLabel(mode, count) {
     if (mode === "cities") return "Cities";
-    return "Strategies";
+    if (mode === "strategies") return "Strategies";
+    return count > 0 ? `Review Queue (${count})` : "Review Queue";
+  }
+
+  function strategyCityFilterLabel(filterKey) {
+    if (filterKey === "actionable") return "Actionable";
+    if (filterKey === "needs_review") return "Needs Review";
+    if (filterKey === "mismatch") return "Mismatch";
+    if (filterKey === "unassigned") return "Unassigned";
+    if (filterKey === "low_confidence") return "Low Confidence";
+    if (filterKey === "no_outcomes") return "No Outcomes";
+    return "All";
   }
 
   function normalizeStrategyFocusMode(mode, summary) {
     if (mode === "review" && !(summary && summary.review_available)) return "cities";
-    if (!STRATEGY_FOCUS_MODES.includes(mode || "")) return (summary && summary.review_available) ? "review" : "cities";
+    if (!STRATEGY_FOCUS_MODES.includes(mode || "")) return "cities";
     return mode;
   }
 
-  function cityMatchesSearch(row, query) {
-    if (!query) return true;
-    const haystack = [
-      row.series_ticker,
-      row.city_label,
-      row.location_name,
+  function citySearchText(row) {
+    const assignment = row && row.assignment ? row.assignment.strategy_name : "";
+    const recommendation = row && row.recommendation ? row.recommendation.strategy_name : "";
+    return [
+      row && row.series_ticker,
+      row && row.city_label,
+      row && row.location_name,
+      assignment,
+      recommendation,
+      row && row.best_strategy,
     ]
       .filter(Boolean)
       .join(" ")
       .toLowerCase();
-    return haystack.includes(query);
   }
 
-  function selectDefaultReviewCity(payload) {
+  function cityMatchesSearch(row, query) {
+    if (!query) return true;
+    return citySearchText(row).includes(query);
+  }
+
+  function cityMatchesFilter(row, filterKey, reviewAvailable) {
+    const recommendationStatus = row && row.recommendation ? row.recommendation.status : null;
+    const review = row && row.review ? row.review : {};
+    if (filterKey === "actionable") {
+      return ACTIONABLE_RECOMMENDATION_STATUSES.has(recommendationStatus);
+    }
+    if (filterKey === "needs_review") {
+      return Boolean(reviewAvailable && review && review.needs_review);
+    }
+    if (filterKey === "mismatch") {
+      return row && row.assignment_context_status === "differs_from_recommendation";
+    }
+    if (filterKey === "unassigned") {
+      return !(row && row.assignment && row.assignment.strategy_name);
+    }
+    if (filterKey === "low_confidence") {
+      return LOW_CONFIDENCE_RECOMMENDATION_STATUSES.has(recommendationStatus);
+    }
+    if (filterKey === "no_outcomes") {
+      return recommendationStatus === "no_outcomes";
+    }
+    return true;
+  }
+
+  function countCityFilters(rows, reviewAvailable) {
+    const counts = {
+      all: rows.length,
+      actionable: 0,
+      needs_review: 0,
+      mismatch: 0,
+      unassigned: 0,
+      low_confidence: 0,
+      no_outcomes: 0,
+    };
+    rows.forEach((row) => {
+      STRATEGY_CITY_FILTERS.forEach((filterKey) => {
+        if (filterKey === "all") return;
+        if (cityMatchesFilter(row, filterKey, reviewAvailable)) {
+          counts[filterKey] += 1;
+        }
+      });
+    });
+    return counts;
+  }
+
+  function analysisSummaryCounts(rows) {
+    return rows.reduce((acc, row) => {
+      const recommendationStatus = row && row.recommendation ? row.recommendation.status : null;
+      if (ACTIONABLE_RECOMMENDATION_STATUSES.has(recommendationStatus)) acc.actionable += 1;
+      if (row && row.assignment_context_status === "differs_from_recommendation") acc.mismatch += 1;
+      if (LOW_CONFIDENCE_RECOMMENDATION_STATUSES.has(recommendationStatus)) acc.lowConfidence += 1;
+      return acc;
+    }, { actionable: 0, mismatch: 0, lowConfidence: 0 });
+  }
+
+  function reviewQueueCount(rows, reviewAvailable) {
+    if (!reviewAvailable) return 0;
+    return rows.reduce((count, row) => {
+      return count + (row && row.review && row.review.status ? 1 : 0);
+    }, 0);
+  }
+
+  function cityRowsForReview(payload) {
     const rows = Array.isArray(payload && payload.city_matrix) ? payload.city_matrix.slice() : [];
-    if (!rows.length) return null;
     rows.sort((a, b) => {
       const reviewDiff = reviewPriority((a.review || {}).status) - reviewPriority((b.review || {}).status);
       if (reviewDiff !== 0) return reviewDiff;
@@ -112,6 +202,12 @@
       if (assignmentGapDiff !== 0) return assignmentGapDiff;
       return String(a.series_ticker || "").localeCompare(String(b.series_ticker || ""));
     });
+    return rows;
+  }
+
+  function selectDefaultReviewCity(payload) {
+    const rows = cityRowsForReview(payload);
+    if (!rows.length) return null;
     return rows[0] || null;
   }
 
@@ -130,9 +226,19 @@
     windowDays: 180,
     selectedSeriesTicker: null,
     selectedStrategyName: null,
+    codexContextSeriesTicker: null,
+    codexContextStrategyName: null,
     sortKey: "priority",
-    focusMode: "review",
+    focusMode: "cities",
     searchQuery: "",
+    cityFilter: "all",
+    codexMode: "evaluate",
+    codexRunId: null,
+    codexPrompt: "",
+    codexSubmitting: false,
+    codexRunDetail: null,
+    codexPollTimer: null,
+    codexMessage: null,
     fetching: false,
     dirty: false,
     approvalSubmitting: false,
@@ -143,10 +249,10 @@
 
   if (strategyState.payload && strategyState.payload.summary) {
     strategyState.windowDays = strategyState.payload.summary.window_days || 180;
-    strategyState.focusMode = strategyState.payload.summary.review_available ? "review" : "cities";
-    if (strategyState.payload.detail_context) {
+    strategyState.focusMode = "cities";
+    if (strategyState.payload.detail_context && strategyState.payload.detail_context.type === "city") {
       strategyState.selectedSeriesTicker = strategyState.payload.detail_context.selected_series_ticker || null;
-      strategyState.selectedStrategyName = strategyState.payload.detail_context.selected_strategy_name || null;
+      strategyState.codexContextSeriesTicker = strategyState.selectedSeriesTicker;
     }
   }
 
@@ -456,9 +562,12 @@
     return fallbackText;
   }
 
-  function renderStrategiesSummary(summary) {
+  function renderStrategiesSummary(payload) {
     const container = document.getElementById("strategies-summary");
     if (!container) return;
+    const summary = payload && payload.summary ? payload.summary : {};
+    const rows = Array.isArray(payload && payload.city_matrix) ? payload.city_matrix : [];
+    const counts = analysisSummaryCounts(rows);
     const windowValue = strategyStatValue(summary.window_display || "—");
     const windowDetail = strategyStatDetail(summary.source_mode === "live_eval" ? "Live replay evaluation" : "Stored regression snapshot");
 
@@ -471,30 +580,20 @@
     }
     const lastDetail = strategyStatDetail("Most recent stored regression");
 
-    const strongValue = strategyStatValue(String(summary.strong_recommendations_count || 0), "value-positive");
-    const strongDetail = strategyStatDetail("Strong recommendations");
+    const citiesValue = strategyStatValue(String(rows.length || 0));
+    const citiesDetail = strategyStatDetail("Cities evaluated in the active window");
 
-    const needsReviewValue = strategyStatValue(
-      summary.review_available ? String(summary.needs_review_count || 0) : "—",
-      summary.review_available && (summary.needs_review_count || 0) > 0 ? "value-negative" : "",
-    );
-    const needsReviewDetail = strategyStatDetail(
-      summary.review_available ? "Assignments that drifted or weakened" : `${summary.approval_window_days || 180}d only`,
-    );
+    const actionableValue = strategyStatValue(String(counts.actionable || 0), counts.actionable > 0 ? "value-positive" : "");
+    const actionableDetail = strategyStatDetail("Strong or lean recommendations");
 
-    const readyValue = strategyStatValue(
-      summary.review_available ? String(summary.ready_for_approval_count || 0) : "—",
-      summary.review_available && (summary.ready_for_approval_count || 0) > 0 ? "value-positive" : "",
-    );
-    const readyDetail = strategyStatDetail(
-      summary.review_available ? "Unassigned cities with an eligible 180d winner" : `${summary.approval_window_days || 180}d only`,
-    );
+    const mismatchValue = strategyStatValue(String(counts.mismatch || 0), counts.mismatch > 0 ? "value-negative" : "");
+    const mismatchDetail = strategyStatDetail("Assignments that differ from the latest recommendation");
+
+    const lowConfidenceValue = strategyStatValue(String(counts.lowConfidence || 0), counts.lowConfidence > 0 ? "value-negative" : "");
+    const lowConfidenceDetail = strategyStatDetail("Cities still blocked by sample size or runner-up proximity");
 
     const bestValue = strategyStatValue(summary.best_strategy_name || "—");
-    const bestDetail = strategyStatDetail(summary.best_strategy_win_rate_display || "—");
-
-    const approvalsValue = strategyStatValue(String(summary.recent_approvals_count || 0));
-    const approvalsDetail = strategyStatDetail("Manual approvals in recent history");
+    const bestDetail = strategyStatDetail(summary.best_strategy_win_rate_display || "Top overall win rate");
 
     const assignValue = strategyStatValue(summary.assignments_covered_display || "—");
     const assignDetail = strategyStatDetail("Canonical assignments covered");
@@ -502,11 +601,11 @@
     const stats = [
       createSummaryStat("Window", windowValue, windowDetail),
       createSummaryStat("Last Regression Run", lastValue, lastDetail),
-      createSummaryStat("Needs Review", needsReviewValue, needsReviewDetail),
-      createSummaryStat("Ready for Approval", readyValue, readyDetail),
-      createSummaryStat("Strong Recs", strongValue, strongDetail),
-      createSummaryStat("Best Overall Strategy", bestValue, bestDetail),
-      createSummaryStat("Recent Approvals", approvalsValue, approvalsDetail),
+      createSummaryStat("Cities Evaluated", citiesValue, citiesDetail),
+      createSummaryStat("Actionable Cities", actionableValue, actionableDetail),
+      createSummaryStat("Assignment Mismatches", mismatchValue, mismatchDetail),
+      createSummaryStat("Low-Confidence Cities", lowConfidenceValue, lowConfidenceDetail),
+      createSummaryStat("Best Strategy", bestValue, bestDetail),
       createSummaryStat("Assignments Covered", assignValue, assignDetail),
     ];
 
@@ -525,8 +624,6 @@
         if (strategyState.fetching || windowDays === strategyState.windowDays) return;
         loadStrategies({
           windowDays,
-          seriesTicker: strategyState.selectedSeriesTicker,
-          strategyName: strategyState.selectedSeriesTicker ? null : strategyState.selectedStrategyName,
           focusMode: strategyState.focusMode,
           explicitSelection: strategyState.explicitSelection,
         });
@@ -534,26 +631,6 @@
       return button;
     });
     clearNode(container, buttons);
-  }
-
-  function maybeSelectDefaultReviewCity(payload) {
-    if (!payload || !payload.summary || !payload.summary.review_available) return false;
-    if (strategyState.focusMode !== "review") return false;
-    if (strategyState.selectedSeriesTicker) return false;
-    const nextCity = selectDefaultReviewCity(payload);
-    if (!nextCity || !nextCity.series_ticker) return false;
-    const reviewMeta = document.getElementById("strategies-review-detail-meta");
-    const reviewContainer = document.getElementById("strategies-review-detail");
-    if (reviewMeta) reviewMeta.textContent = `Loading ${nextCity.series_ticker} decision brief...`;
-    if (reviewContainer) clearNode(reviewContainer, [el("p", "empty-state", "Loading decision brief...")]);
-    loadStrategies({
-      windowDays: strategyState.windowDays,
-      seriesTicker: nextCity.series_ticker,
-      strategyName: null,
-      focusMode: "review",
-      explicitSelection: false,
-    });
-    return true;
   }
 
   function renderFocusPanels(summary) {
@@ -567,31 +644,167 @@
     if (strategies) strategies.hidden = focusMode !== "strategies";
   }
 
-  function renderFocusSwitch(summary) {
+  function renderFocusSwitch(payload) {
     const container = document.getElementById("strategies-focus-switch");
     if (!container) return;
-    const allowedModes = (summary && summary.review_available)
+    const summary = payload && payload.summary ? payload.summary : {};
+    const allowedModes = summary.review_available
       ? STRATEGY_FOCUS_MODES
       : STRATEGY_FOCUS_MODES.filter((mode) => mode !== "review");
     strategyState.focusMode = normalizeStrategyFocusMode(strategyState.focusMode, summary || {});
+    const queueCount = reviewQueueCount(Array.isArray(payload && payload.city_matrix) ? payload.city_matrix : [], summary.review_available);
     const buttons = allowedModes.map((mode) => {
-      const button = el("button", `strategy-focus-pill${mode === strategyState.focusMode ? " is-active" : ""}`, strategyFocusLabel(mode));
+      const button = el(
+        "button",
+        `strategy-focus-pill${mode === strategyState.focusMode ? " is-active" : ""}`,
+        strategyFocusLabel(mode, queueCount),
+      );
       button.type = "button";
       button.dataset.focusMode = mode;
       button.setAttribute("aria-selected", mode === strategyState.focusMode ? "true" : "false");
       button.addEventListener("click", () => {
         if (strategyState.fetching) return;
         strategyState.focusMode = mode;
-        renderFocusSwitch(summary || {});
-        renderFocusPanels(summary || {});
-        if (mode === "review" && !strategyState.selectedSeriesTicker) {
-          if (maybeSelectDefaultReviewCity(strategyState.payload)) return;
-        }
         renderStrategies(strategyState.payload);
       });
       return button;
     });
     clearNode(container, buttons);
+  }
+
+  function syncStrategySelections(payload) {
+    const detail = payload && payload.detail_context ? payload.detail_context : {};
+    if (detail.type === "city" && detail.selected_series_ticker) {
+      strategyState.selectedSeriesTicker = detail.selected_series_ticker;
+      if (!strategyState.codexContextSeriesTicker) {
+        strategyState.codexContextSeriesTicker = detail.selected_series_ticker;
+      }
+      return;
+    }
+    if (detail.type === "strategy" && detail.selected_strategy_name) {
+      if (strategyState.focusMode === "strategies" || strategyState.explicitSelection) {
+        strategyState.selectedStrategyName = detail.selected_strategy_name;
+      }
+      if (!strategyState.codexContextStrategyName) {
+        strategyState.codexContextStrategyName = detail.selected_strategy_name;
+      }
+    }
+  }
+
+  function setDetailLoadingState(metaId, containerId, metaText, loadingText) {
+    const meta = document.getElementById(metaId);
+    const container = document.getElementById(containerId);
+    if (meta) meta.textContent = metaText;
+    if (container) clearNode(container, [el("p", "empty-state", loadingText)]);
+  }
+
+  function selectCitiesDetailTarget(rows) {
+    if (!rows.length) return null;
+    return rows.find((row) => row.series_ticker === strategyState.selectedSeriesTicker) || rows[0] || null;
+  }
+
+  function selectStrategyDetailTarget(payload) {
+    const leaderboard = Array.isArray(payload && payload.leaderboard) ? payload.leaderboard : [];
+    if (!leaderboard.length) return null;
+    return leaderboard.find((row) => row.name === strategyState.selectedStrategyName)
+      || leaderboard.find((row) => row.name === (payload.summary || {}).best_strategy_name)
+      || leaderboard[0]
+      || null;
+  }
+
+  function ensureCitiesDetail(payload, rows) {
+    if (strategyState.focusMode !== "cities") return false;
+    const targetRow = selectCitiesDetailTarget(rows);
+    if (!targetRow || !targetRow.series_ticker) {
+      strategyState.selectedSeriesTicker = null;
+      return false;
+    }
+    const detail = payload && payload.detail_context ? payload.detail_context : {};
+    if (strategyState.selectedSeriesTicker !== targetRow.series_ticker) {
+      strategyState.selectedSeriesTicker = targetRow.series_ticker;
+    }
+    if (detail.type === "city" && detail.selected_series_ticker === targetRow.series_ticker) {
+      return false;
+    }
+    setDetailLoadingState(
+      "strategies-cities-detail-meta",
+      "strategies-cities-detail",
+      `Loading ${targetRow.series_ticker} city research brief...`,
+      "Loading city research brief...",
+    );
+    loadStrategies({
+      windowDays: strategyState.windowDays,
+      seriesTicker: targetRow.series_ticker,
+      strategyName: null,
+      focusMode: "cities",
+      explicitSelection: false,
+    });
+    return true;
+  }
+
+  function ensureReviewDetail(payload) {
+    if (!payload || !payload.summary || !payload.summary.review_available) return false;
+    if (strategyState.focusMode !== "review") return false;
+    const reviewRows = cityRowsForReview(payload);
+    const targetRow = reviewRows.find((row) => row.series_ticker === strategyState.selectedSeriesTicker) || selectDefaultReviewCity(payload);
+    if (!targetRow || !targetRow.series_ticker) return false;
+    const detail = payload && payload.detail_context ? payload.detail_context : {};
+    if (strategyState.selectedSeriesTicker !== targetRow.series_ticker) {
+      strategyState.selectedSeriesTicker = targetRow.series_ticker;
+    }
+    if (detail.type === "city" && detail.selected_series_ticker === targetRow.series_ticker) {
+      return false;
+    }
+    setDetailLoadingState(
+      "strategies-review-detail-meta",
+      "strategies-review-detail",
+      `Loading ${targetRow.series_ticker} decision brief...`,
+      "Loading decision brief...",
+    );
+    loadStrategies({
+      windowDays: strategyState.windowDays,
+      seriesTicker: targetRow.series_ticker,
+      strategyName: null,
+      focusMode: "review",
+      explicitSelection: false,
+    });
+    return true;
+  }
+
+  function ensureStrategiesDetail(payload) {
+    if (strategyState.focusMode !== "strategies") return false;
+    const targetStrategy = selectStrategyDetailTarget(payload);
+    if (!targetStrategy || !targetStrategy.name) {
+      strategyState.selectedStrategyName = null;
+      return false;
+    }
+    const detail = payload && payload.detail_context ? payload.detail_context : {};
+    if (strategyState.selectedStrategyName !== targetStrategy.name) {
+      strategyState.selectedStrategyName = targetStrategy.name;
+    }
+    if (detail.type === "strategy" && detail.selected_strategy_name === targetStrategy.name) {
+      return false;
+    }
+    setDetailLoadingState(
+      "strategies-detail-meta",
+      "strategies-detail",
+      `Loading ${targetStrategy.name} strategy drilldown...`,
+      "Loading strategy drilldown...",
+    );
+    loadStrategies({
+      windowDays: strategyState.windowDays,
+      strategyName: targetStrategy.name,
+      seriesTicker: null,
+      focusMode: "strategies",
+      explicitSelection: Boolean(strategyState.explicitSelection),
+    });
+    return true;
+  }
+
+  function ensureFocusDetailSelection(payload, rows) {
+    if (strategyState.focusMode === "cities") return ensureCitiesDetail(payload, rows);
+    if (strategyState.focusMode === "review") return ensureReviewDetail(payload);
+    return ensureStrategiesDetail(payload);
   }
 
   function metricListItem(label, value, extraClass) {
@@ -729,7 +942,8 @@
     }
 
     const cards = leaderboard.map((item) => {
-      const card = el("article", `strategy-card${item.selected ? " is-selected" : ""}`);
+      const isSelected = item.name === strategyState.selectedStrategyName || (!strategyState.selectedStrategyName && item.selected);
+      const card = el("article", `strategy-card${isSelected ? " is-selected" : ""}`);
       const header = el("div", "strategy-card-header");
       const titleWrap = el("div", "strategy-card-title");
       const selectButton = el("button", "strategy-select-button");
@@ -752,34 +966,562 @@
       }
       header.append(titleWrap);
 
-      const counts = el("div", "strategy-card-counts");
-      counts.append(
-        pill(`${item.cities_led} lead${item.cities_led === 1 ? "" : "s"}`, "good"),
-        pill(`${item.assigned_city_count} assigned`, item.assigned_city_count ? "neutral" : "warning"),
-      );
-      header.appendChild(counts);
-
-      const metrics = el("div", "strategy-card-metrics");
-      metrics.append(
+      const primaryMetrics = el("div", "strategy-card-primary-metrics");
+      primaryMetrics.append(
         metricListItem("Win rate", item.overall_win_rate_display || "—", item.overall_win_rate >= 0.6 ? "value-positive" : item.overall_win_rate <= 0.35 ? "value-negative" : ""),
+        metricListItem("Cities led", String(item.cities_led || 0)),
+        metricListItem("Assigned cities", String(item.assigned_city_count || 0)),
+        metricListItem("Outcome coverage", item.outcome_coverage_display || "—"),
+        metricListItem("P/L", item.total_pnl_display || "—", item.total_pnl_dollars > 0 ? "value-positive" : item.total_pnl_dollars < 0 ? "value-negative" : ""),
+      );
+
+      const metrics = el("div", "strategy-card-metrics strategy-card-secondary-metrics");
+      metrics.append(
         metricListItem("Trade rate", item.overall_trade_rate_display || "—"),
-        metricListItem("Total P/L", item.total_pnl_display || "—", item.total_pnl_dollars > 0 ? "value-positive" : item.total_pnl_dollars < 0 ? "value-negative" : ""),
         metricListItem("Avg edge", item.avg_edge_bps_display || "—"),
         metricListItem("Rooms", item.total_rooms_evaluated_display || "0"),
         metricListItem("Sim trades", item.total_trade_count_display || "0"),
         metricListItem("Scored trades", item.total_resolved_trade_count_display || "0"),
-        metricListItem("Outcome coverage", item.outcome_coverage_display || "—"),
+        metricListItem("Unscored", item.total_unscored_trade_count_display || "0"),
       );
 
       const details = el("details", "strategy-threshold-details");
       const summary = el("summary", "muted-label", "Threshold snapshot");
       details.append(summary, renderThresholdGroups(item.threshold_groups || []));
 
-      card.append(header, metrics, details);
+      card.append(header, primaryMetrics, metrics, details);
       return card;
     });
     clearNode(container, [el("div", "strategy-card-grid")]);
     container.firstChild.replaceChildren(...cards);
+  }
+
+  function codexLabPayload(payload) {
+    return payload && payload.codex_lab ? payload.codex_lab : {};
+  }
+
+  function humanizeThresholdKey(key) {
+    return String(key || "")
+      .split("_")
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ");
+  }
+
+  function thresholdGroupsFromObject(thresholds) {
+    const groups = {
+      risk: { label: "Risk", items: [] },
+      trigger: { label: "Trigger", items: [] },
+      strategy: { label: "Strategy", items: [] },
+    };
+    Object.entries(thresholds || {}).forEach(([key, value]) => {
+      const groupKey = key.startsWith("risk_") ? "risk" : key.startsWith("trigger_") ? "trigger" : "strategy";
+      groups[groupKey].items.push({ label: humanizeThresholdKey(key), value: String(value) });
+    });
+    return Object.values(groups).filter((group) => group.items.length);
+  }
+
+  function compactCodexRun(run) {
+    if (!run) return null;
+    return {
+      id: run.id,
+      mode: run.mode,
+      status: run.status,
+      trigger_source: run.trigger_source || "manual",
+      window_days: run.window_days,
+      series_ticker: run.series_ticker,
+      strategy_name: run.strategy_name,
+      created_at: run.created_at,
+      updated_at: run.updated_at,
+      summary: run.result && run.result.kind === "evaluate"
+        ? ((run.result.evaluation || {}).summary || null)
+        : run.result && run.result.kind === "suggest"
+        ? (run.saved_strategy_name ? `Saved as inactive preset ${run.saved_strategy_name}.` : ((run.result.backtest || {}).summary || null))
+        : null,
+      saved_strategy_name: run.saved_strategy_name || null,
+    };
+  }
+
+  function codexTriggerSourceLabel(triggerSource) {
+    return triggerSource === "nightly" ? "Nightly" : "Manual";
+  }
+
+  function upsertInactiveCodexStrategy(run) {
+    if (!strategyState.payload || !strategyState.payload.codex_lab || !run || !run.saved_strategy_name || run.saved_strategy_active) return;
+    const codexLab = strategyState.payload.codex_lab;
+    const existing = Array.isArray(codexLab.inactive_codex_strategies) ? codexLab.inactive_codex_strategies.slice() : [];
+    if (existing.some((item) => item.name === run.saved_strategy_name)) return;
+    const candidate = run.result && run.result.candidate ? run.result.candidate : {};
+    existing.unshift({
+      name: run.saved_strategy_name,
+      description: candidate.description || null,
+      created_at: run.finished_at || run.updated_at || run.created_at,
+      labels: candidate.labels || [],
+      rationale: candidate.rationale || null,
+      source_run_id: run.id,
+    });
+    codexLab.inactive_codex_strategies = existing;
+  }
+
+  function mergeCodexRunIntoPayload(run) {
+    if (!strategyState.payload || !run) return;
+    if (!strategyState.payload.codex_lab) {
+      strategyState.payload.codex_lab = {
+        available: false,
+        provider: "unavailable",
+        model: null,
+        recent_runs: [],
+        inactive_codex_strategies: [],
+        creation_window_days: 180,
+      };
+    }
+    const codexLab = strategyState.payload.codex_lab;
+    const nextRuns = Array.isArray(codexLab.recent_runs) ? codexLab.recent_runs.slice() : [];
+    const compact = compactCodexRun(run);
+    const index = nextRuns.findIndex((item) => item.id === compact.id);
+    if (index >= 0) nextRuns[index] = compact;
+    else nextRuns.unshift(compact);
+    codexLab.recent_runs = nextRuns.slice(0, 8);
+    upsertInactiveCodexStrategy(run);
+  }
+
+  function stopCodexRunPolling() {
+    if (strategyState.codexPollTimer) {
+      window.clearTimeout(strategyState.codexPollTimer);
+      strategyState.codexPollTimer = null;
+    }
+  }
+
+  function scheduleCodexRunPolling(runId) {
+    stopCodexRunPolling();
+    strategyState.codexPollTimer = window.setTimeout(() => {
+      void fetchCodexRunDetail(runId, { refreshAfterComplete: true });
+    }, 2000);
+  }
+
+  async function fetchCodexRunDetail(runId, options) {
+    if (!runId) return;
+    try {
+      const response = await fetch(`/api/strategies/codex/runs/${encodeURIComponent(runId)}`);
+      if (!response.ok) return;
+      const body = await response.json();
+      strategyState.codexRunId = body.id || runId;
+      strategyState.codexRunDetail = body;
+      mergeCodexRunIntoPayload(body);
+      if (body.status === "queued" || body.status === "running") {
+        scheduleCodexRunPolling(body.id || runId);
+      } else {
+        stopCodexRunPolling();
+        if (options && options.refreshAfterComplete && strategyState.payload) {
+          await loadStrategies({
+            windowDays: strategyState.windowDays,
+            focusMode: strategyState.focusMode,
+            explicitSelection: strategyState.explicitSelection,
+          });
+        } else if (strategyState.payload) {
+          renderStrategies(strategyState.payload);
+        }
+      }
+    } catch (_) {
+      // skip transient polling failures
+    }
+  }
+
+  function showCodexMessage(tone, text) {
+    strategyState.codexMessage = text ? { tone: tone || "neutral", text } : null;
+  }
+
+  async function startCodexRun() {
+    const payload = strategyState.payload;
+    const codexLab = codexLabPayload(payload);
+    if (!payload || !codexLab.available || strategyState.codexSubmitting) return;
+    strategyState.codexSubmitting = true;
+    showCodexMessage("neutral", strategyState.codexMode === "suggest" ? "Starting suggestion run..." : "Starting evaluation run...");
+    if (strategyState.payload) renderStrategies(strategyState.payload);
+    try {
+      const response = await fetch("/api/strategies/codex/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: strategyState.codexMode,
+          window_days: strategyState.windowDays,
+          series_ticker: strategyState.codexContextSeriesTicker,
+          strategy_name: strategyState.codexContextStrategyName,
+          operator_brief: (strategyState.codexPrompt || "").trim() || null,
+        }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showCodexMessage("bad", responseErrorMessage(body, "Codex run failed to start."));
+        return;
+      }
+      strategyState.codexRunId = body.run_id || null;
+      strategyState.codexRunDetail = null;
+      showCodexMessage("good", "Codex run queued.");
+      await loadStrategies({
+        windowDays: strategyState.windowDays,
+        focusMode: "strategies",
+        explicitSelection: strategyState.explicitSelection,
+      });
+      await fetchCodexRunDetail(body.run_id, { refreshAfterComplete: true });
+    } catch (_) {
+      showCodexMessage("bad", "Codex run failed to start.");
+    } finally {
+      strategyState.codexSubmitting = false;
+      if (strategyState.payload) renderStrategies(strategyState.payload);
+    }
+  }
+
+  async function acceptCodexSuggestion(runId) {
+    if (!runId || strategyState.codexSubmitting) return;
+    strategyState.codexSubmitting = true;
+    showCodexMessage("neutral", "Saving suggested strategy...");
+    if (strategyState.payload) renderStrategies(strategyState.payload);
+    try {
+      const response = await fetch(`/api/strategies/codex/runs/${encodeURIComponent(runId)}/accept`, { method: "POST" });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showCodexMessage("bad", responseErrorMessage(body, "Strategy suggestion could not be saved."));
+        return;
+      }
+      showCodexMessage("good", `Saved ${body.strategy_name} as an inactive preset.`);
+      await loadStrategies({
+        windowDays: strategyState.windowDays,
+        focusMode: "strategies",
+        explicitSelection: strategyState.explicitSelection,
+      });
+      await fetchCodexRunDetail(runId);
+    } catch (_) {
+      showCodexMessage("bad", "Strategy suggestion could not be saved.");
+    } finally {
+      strategyState.codexSubmitting = false;
+      if (strategyState.payload) renderStrategies(strategyState.payload);
+    }
+  }
+
+  async function activateCodexStrategy(strategyName) {
+    if (!strategyName || strategyState.codexSubmitting) return;
+    strategyState.codexSubmitting = true;
+    showCodexMessage("neutral", `Activating ${strategyName}...`);
+    if (strategyState.payload) renderStrategies(strategyState.payload);
+    try {
+      const response = await fetch(`/api/strategies/${encodeURIComponent(strategyName)}/activate`, { method: "POST" });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showCodexMessage("bad", responseErrorMessage(body, "Strategy activation failed."));
+        return;
+      }
+      showCodexMessage("good", `${body.strategy_name} is now active.`);
+      await loadStrategies({
+        windowDays: strategyState.windowDays,
+        focusMode: "strategies",
+        explicitSelection: strategyState.explicitSelection,
+      });
+      if (strategyState.codexRunId) await fetchCodexRunDetail(strategyState.codexRunId);
+    } catch (_) {
+      showCodexMessage("bad", "Strategy activation failed.");
+    } finally {
+      strategyState.codexSubmitting = false;
+      if (strategyState.payload) renderStrategies(strategyState.payload);
+    }
+  }
+
+  function openCodexLabContext(options) {
+    if (options && Object.prototype.hasOwnProperty.call(options, "seriesTicker")) {
+      strategyState.codexContextSeriesTicker = options.seriesTicker || null;
+    }
+    if (options && Object.prototype.hasOwnProperty.call(options, "strategyName")) {
+      strategyState.codexContextStrategyName = options.strategyName || null;
+    }
+    if (options && Object.prototype.hasOwnProperty.call(options, "mode")) {
+      strategyState.codexMode = options.mode || strategyState.codexMode;
+    }
+    strategyState.focusMode = "strategies";
+    const strategiesTab = document.querySelector('.dash-tab[data-env="strategies"]');
+    if (strategiesTab && currentDashboardEnv() !== "strategies") {
+      strategiesTab.click();
+    } else if (strategyState.payload) {
+      renderStrategies(strategyState.payload);
+    }
+    const node = document.getElementById("strategies-codex-lab");
+    if (node) node.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function renderCodexLab(payload) {
+    const container = document.getElementById("strategies-codex-lab");
+    const meta = document.getElementById("strategies-codex-meta");
+    if (!container) return;
+    const lab = codexLabPayload(payload);
+    const recentRuns = Array.isArray(lab.recent_runs) ? lab.recent_runs : [];
+    const inactiveStrategies = Array.isArray(lab.inactive_codex_strategies) ? lab.inactive_codex_strategies : [];
+    const selectedRun = strategyState.codexRunDetail && strategyState.codexRunDetail.id === strategyState.codexRunId
+      ? strategyState.codexRunDetail
+      : null;
+    if (meta) {
+      meta.textContent = lab.available
+        ? `Using ${lab.provider || "codex-cli"}${lab.model ? ` · ${lab.model}` : ""} for async evaluation and suggestion runs.`
+        : "Codex CLI is unavailable in this environment. The rest of the Strategies page still works normally.";
+    }
+
+    const children = [];
+    const controls = el("section", "strategy-codex-controls");
+    const topRow = el("div", "strategy-codex-top-row");
+    const availability = el("div", "strategy-codex-availability");
+    availability.appendChild(
+      pill(lab.available ? "Codex CLI ready" : "Codex CLI unavailable", lab.available ? "good" : "bad"),
+    );
+    if (lab.model) availability.appendChild(el("span", "muted-label mono", lab.model));
+    topRow.appendChild(availability);
+
+    const modeSwitch = el("div", "strategy-codex-mode-switch");
+    ["evaluate", "suggest"].forEach((mode) => {
+      const button = el("button", `strategy-filter-pill${strategyState.codexMode === mode ? " is-active" : ""}`, mode === "evaluate" ? "Evaluate" : "Suggest");
+      button.type = "button";
+      button.disabled = strategyState.codexSubmitting;
+      button.addEventListener("click", () => {
+        if (strategyState.codexSubmitting || strategyState.codexMode === mode) return;
+        strategyState.codexMode = mode;
+        if (strategyState.payload) renderStrategies(strategyState.payload);
+      });
+      modeSwitch.appendChild(button);
+    });
+    topRow.appendChild(modeSwitch);
+    controls.appendChild(topRow);
+
+    const contextRow = el("div", "strategy-codex-context-row");
+    contextRow.append(
+      pill(`Window ${payload && payload.summary ? payload.summary.window_display || `${strategyState.windowDays}d` : `${strategyState.windowDays}d`}`, "neutral"),
+      strategyState.codexContextSeriesTicker ? pill(`City ${strategyState.codexContextSeriesTicker}`, "neutral") : pill("No city context", "neutral"),
+      strategyState.codexContextStrategyName ? pill(`Strategy ${strategyState.codexContextStrategyName}`, "neutral") : pill("No strategy context", "neutral"),
+    );
+    const clearContextButton = el("button", "strategy-inline-action", "Clear context");
+    clearContextButton.type = "button";
+    clearContextButton.disabled = strategyState.codexSubmitting;
+    clearContextButton.addEventListener("click", () => {
+      strategyState.codexContextSeriesTicker = null;
+      strategyState.codexContextStrategyName = null;
+      if (strategyState.payload) renderStrategies(strategyState.payload);
+    });
+    contextRow.appendChild(clearContextButton);
+    controls.appendChild(contextRow);
+
+    const promptBlock = el("div", "strategy-codex-prompt-block");
+    const promptLabel = el("label", "muted-label", "Operator brief");
+    promptLabel.setAttribute("for", "strategies-codex-prompt");
+    const prompt = el("textarea", "strategy-codex-prompt");
+    prompt.id = "strategies-codex-prompt";
+    prompt.rows = 4;
+    prompt.placeholder = strategyState.codexMode === "suggest"
+      ? "Optional: explain what kind of new threshold preset you want Codex to explore."
+      : "Optional: tell Codex what you want emphasized in the evaluation.";
+    prompt.value = strategyState.codexPrompt || "";
+    prompt.addEventListener("input", () => {
+      strategyState.codexPrompt = prompt.value || "";
+    });
+    promptBlock.append(promptLabel, prompt);
+    controls.appendChild(promptBlock);
+
+    const actionRow = el("div", "strategy-codex-action-row");
+    const runButton = el(
+      "button",
+      "dash-button primary-button",
+      strategyState.codexSubmitting
+        ? "Working..."
+        : strategyState.codexMode === "suggest"
+        ? "Run Suggestion"
+        : "Run Evaluation",
+    );
+    runButton.type = "button";
+    runButton.disabled = !lab.available || strategyState.codexSubmitting;
+    runButton.addEventListener("click", () => {
+      void startCodexRun();
+    });
+    actionRow.appendChild(runButton);
+    if (strategyState.codexMessage && strategyState.codexMessage.text) {
+      actionRow.appendChild(
+        el(
+          "div",
+          `strategy-codex-message is-${strategyState.codexMessage.tone || "neutral"}`,
+          strategyState.codexMessage.text,
+        ),
+      );
+    }
+    controls.appendChild(actionRow);
+    children.push(controls);
+
+    const lower = el("div", "strategy-codex-grid");
+    const left = el("section", "strategy-codex-sidebar");
+    left.append(el("h3", null, "Recent Runs"));
+    if (!recentRuns.length) {
+      left.append(el("p", "empty-state", "No Codex runs yet."));
+    } else {
+      const runList = el("div", "strategy-codex-run-list");
+      recentRuns.forEach((run) => {
+        const button = el("button", `strategy-codex-run-item${run.id === strategyState.codexRunId ? " is-selected" : ""}`);
+        button.type = "button";
+        button.disabled = strategyState.codexSubmitting;
+        button.addEventListener("click", () => {
+          strategyState.codexRunId = run.id;
+          void fetchCodexRunDetail(run.id);
+        });
+        const title = el("div", "strategy-codex-run-title");
+        title.append(
+          el("strong", null, run.mode === "suggest" ? "Suggestion" : "Evaluation"),
+          pill(codexTriggerSourceLabel(run.trigger_source), run.trigger_source === "nightly" ? "warning" : "neutral"),
+          pill(run.status || "queued", run.status === "completed" ? "good" : run.status === "failed" ? "bad" : "warning"),
+        );
+        button.appendChild(title);
+        const context = [run.window_days ? `${run.window_days}d` : null, run.series_ticker, run.strategy_name].filter(Boolean).join(" · ");
+        if (context) button.appendChild(el("div", "muted-label mono", context));
+        if (run.summary) button.appendChild(el("div", "strategy-codex-run-summary", run.summary));
+        if (run.created_at) {
+          const ts = el("span", "muted-label", formatAge(run.created_at));
+          ts.dataset.timestamp = run.created_at;
+          button.appendChild(ts);
+        }
+        runList.appendChild(button);
+      });
+      left.appendChild(runList);
+    }
+
+    const draftsSection = el("div", "strategy-codex-drafts");
+    draftsSection.append(el("h3", null, "Saved Inactive Presets"));
+    if (!inactiveStrategies.length) {
+      draftsSection.append(el("p", "empty-state", "No inactive Codex-created presets yet."));
+    } else {
+      const draftList = el("div", "strategy-codex-draft-list");
+      inactiveStrategies.forEach((item) => {
+        const draft = el("article", "strategy-codex-draft-item");
+        draft.append(el("strong", null, item.name));
+        if (item.description) draft.append(el("p", "muted-label", item.description));
+        if (Array.isArray(item.labels) && item.labels.length) {
+          const labels = el("div", "strategy-codex-chip-row");
+          item.labels.forEach((label) => labels.appendChild(pill(label, "neutral")));
+          draft.appendChild(labels);
+        }
+        const activate = el("button", "dash-button secondary-button", "Activate");
+        activate.type = "button";
+        activate.disabled = strategyState.codexSubmitting;
+        activate.addEventListener("click", () => {
+          void activateCodexStrategy(item.name);
+        });
+        draft.appendChild(activate);
+        draftList.appendChild(draft);
+      });
+      draftsSection.appendChild(draftList);
+    }
+    left.appendChild(draftsSection);
+    lower.appendChild(left);
+
+    const right = el("section", "strategy-codex-result");
+    right.append(el("h3", null, "Run Detail"));
+    if (!selectedRun) {
+      right.append(el("p", "empty-state", "Select a run to inspect the Codex result."));
+    } else {
+      const statusRow = el("div", "strategy-codex-status-row");
+      statusRow.append(
+        pill(selectedRun.mode === "suggest" ? "Suggestion" : "Evaluation", "neutral"),
+        pill(codexTriggerSourceLabel(selectedRun.trigger_source), selectedRun.trigger_source === "nightly" ? "warning" : "neutral"),
+        pill(selectedRun.status || "queued", selectedRun.status === "completed" ? "good" : selectedRun.status === "failed" ? "bad" : "warning"),
+      );
+      right.appendChild(statusRow);
+      if (selectedRun.error_text) {
+        right.append(el("p", "strategy-codex-message is-bad", selectedRun.error_text));
+      }
+      if (selectedRun.result && selectedRun.result.kind === "evaluate") {
+        const evaluation = selectedRun.result.evaluation || {};
+        right.append(el("p", null, evaluation.summary || "No evaluation summary returned."));
+        [["Strengths", evaluation.strengths || []], ["Risks", evaluation.risks || []], ["Opportunities", evaluation.opportunities || []], ["Recommended Actions", evaluation.recommended_actions || []]].forEach(([title, items]) => {
+          const section = el("section", "strategy-detail-section");
+          section.append(el("h4", null, title));
+          if (items.length) {
+            const list = el("ul", "strategy-methodology-list");
+            items.forEach((item) => list.appendChild(el("li", null, item)));
+            section.appendChild(list);
+          } else {
+            section.append(el("p", "empty-state", `No ${String(title).toLowerCase()} noted.`));
+          }
+          right.appendChild(section);
+        });
+      } else if (selectedRun.result && selectedRun.result.kind === "suggest") {
+        const candidate = selectedRun.result.candidate || {};
+        const backtest = selectedRun.result.backtest || {};
+        const header = el("section", "strategy-detail-section");
+        header.append(el("h4", null, candidate.name || "Suggested preset"));
+        if (candidate.description) header.append(el("p", "muted-label", candidate.description));
+        if (candidate.rationale) header.append(el("p", null, candidate.rationale));
+        if (Array.isArray(candidate.labels) && candidate.labels.length) {
+          const chipRow = el("div", "strategy-codex-chip-row");
+          candidate.labels.forEach((label) => chipRow.appendChild(pill(label, "neutral")));
+          header.appendChild(chipRow);
+        }
+        right.appendChild(header);
+
+        const metrics = el("div", "strategy-detail-metrics");
+        const candidateMetrics = backtest.candidate_metrics || {};
+        metrics.append(
+          metricListItem("Rank", backtest.candidate_rank ? `#${backtest.candidate_rank} / ${backtest.strategy_count || "—"}` : "—"),
+          metricListItem("Win rate", candidateMetrics.overall_win_rate_display || "—"),
+          metricListItem("Trade rate", candidateMetrics.overall_trade_rate_display || "—"),
+          metricListItem("Coverage", candidateMetrics.outcome_coverage_rate_display || "—"),
+          metricListItem("P/L", candidateMetrics.total_pnl_display || "—", candidateMetrics.total_pnl_dollars > 0 ? "value-positive" : candidateMetrics.total_pnl_dollars < 0 ? "value-negative" : ""),
+          metricListItem("Avg edge", candidateMetrics.avg_edge_bps_display || "—"),
+          metricListItem("Cities led", String(candidateMetrics.cities_led || 0)),
+          metricListItem("Scored trades", String(candidateMetrics.total_resolved_trade_count || 0)),
+        );
+        right.appendChild(metrics);
+
+        const thresholdSection = el("section", "strategy-detail-section");
+        thresholdSection.append(el("h4", null, "Threshold Snapshot"));
+        thresholdSection.append(renderThresholdGroups(thresholdGroupsFromObject(candidate.thresholds || {})));
+        right.appendChild(thresholdSection);
+
+        const backtestSection = el("section", "strategy-detail-section");
+        backtestSection.append(el("h4", null, "Deterministic Backtest"));
+        backtestSection.append(el("p", null, backtest.summary || "No deterministic backtest summary available."));
+        if (backtest.selected_city) {
+          backtestSection.append(
+            el(
+              "p",
+              "muted-label",
+              `${backtest.selected_city.series_ticker}: rank ${backtest.selected_city.candidate_rank || "—"}, leader ${backtest.selected_city.leader || "—"}, ${backtest.selected_city.candidate_win_rate_display || "—"} win rate.`,
+            ),
+          );
+        }
+        right.appendChild(backtestSection);
+
+        right.appendChild(renderListSection("Strongest Cities", backtest.strongest_cities || [], "No winning city splits yet."));
+        right.appendChild(renderListSection("Weakest Cities", backtest.weakest_cities || [], "No weak city splits yet."));
+
+        const actions = el("div", "strategy-codex-result-actions");
+        if (selectedRun.can_accept) {
+          const accept = el("button", "dash-button primary-button", "Accept As Inactive Preset");
+          accept.type = "button";
+          accept.disabled = strategyState.codexSubmitting;
+          accept.addEventListener("click", () => {
+            void acceptCodexSuggestion(selectedRun.id);
+          });
+          actions.appendChild(accept);
+        } else if (selectedRun.accept_disabled_reason) {
+          actions.appendChild(el("span", "muted-label", selectedRun.accept_disabled_reason));
+        }
+        if (selectedRun.can_activate && selectedRun.saved_strategy_name) {
+          const activate = el("button", "dash-button secondary-button", `Activate ${selectedRun.saved_strategy_name}`);
+          activate.type = "button";
+          activate.disabled = strategyState.codexSubmitting;
+          activate.addEventListener("click", () => {
+            void activateCodexStrategy(selectedRun.saved_strategy_name);
+          });
+          actions.appendChild(activate);
+        }
+        if (selectedRun.saved_strategy_name) {
+          actions.appendChild(el("span", "muted-label", selectedRun.saved_strategy_active ? `${selectedRun.saved_strategy_name} is active.` : `${selectedRun.saved_strategy_name} is saved as inactive.`));
+        }
+        if (actions.childNodes.length) right.appendChild(actions);
+      }
+    }
+    lower.appendChild(right);
+    children.push(lower);
+    clearNode(container, children);
   }
 
   function formatMetricCell(metric) {
@@ -813,6 +1555,17 @@
       if (sortKey === "gap") {
         return (b.gap_to_runner_up ?? -1) - (a.gap_to_runner_up ?? -1);
       }
+      if (sortKey === "assignment_gap") {
+        return (b.gap_to_assignment ?? -1) - (a.gap_to_assignment ?? -1);
+      }
+      if (sortKey === "resolved") {
+        return ((b.recommendation || {}).resolved_trade_count ?? b.best_resolved_trade_count ?? -1)
+          - ((a.recommendation || {}).resolved_trade_count ?? a.best_resolved_trade_count ?? -1);
+      }
+      if (sortKey === "coverage") {
+        return ((b.recommendation || {}).outcome_coverage_rate ?? -1)
+          - ((a.recommendation || {}).outcome_coverage_rate ?? -1);
+      }
       if (sortKey === "best_win_rate") {
         return (b.best_strategy_win_rate ?? -1) - (a.best_strategy_win_rate ?? -1);
       }
@@ -826,39 +1579,85 @@
     return clone;
   }
 
-  function renderStrategyMatrix(payload) {
+  function filteredCityRows(payload) {
+    const reviewAvailable = Boolean(payload && payload.summary && payload.summary.review_available);
+    const query = strategyState.searchQuery.trim().toLowerCase();
+    const rows = Array.isArray(payload && payload.city_matrix) ? payload.city_matrix : [];
+    return sortCityRows(rows, strategyState.sortKey)
+      .filter((row) => cityMatchesFilter(row, strategyState.cityFilter, reviewAvailable))
+      .filter((row) => cityMatchesSearch(row, query));
+  }
+
+  function renderCityFilters(payload) {
+    const container = document.getElementById("strategies-city-filters");
+    if (!container) return;
+    const summary = payload && payload.summary ? payload.summary : {};
+    const reviewAvailable = Boolean(summary.review_available);
+    const rows = Array.isArray(payload && payload.city_matrix) ? payload.city_matrix : [];
+    const counts = countCityFilters(rows, reviewAvailable);
+    const filters = reviewAvailable
+      ? STRATEGY_CITY_FILTERS
+      : STRATEGY_CITY_FILTERS.filter((filterKey) => filterKey !== "needs_review");
+    const buttons = filters.map((filterKey) => {
+      const button = el(
+        "button",
+        `strategy-city-filter${filterKey === strategyState.cityFilter ? " is-active" : ""}`,
+      );
+      button.type = "button";
+      button.dataset.cityFilter = filterKey;
+      button.setAttribute("aria-selected", filterKey === strategyState.cityFilter ? "true" : "false");
+      button.append(
+        el("span", null, strategyCityFilterLabel(filterKey)),
+        el("strong", "mono", String(counts[filterKey] || 0)),
+      );
+      button.addEventListener("click", () => {
+        if (strategyState.fetching || filterKey === strategyState.cityFilter) return;
+        strategyState.cityFilter = filterKey;
+        renderStrategies(strategyState.payload);
+      });
+      return button;
+    });
+    clearNode(container, buttons);
+  }
+
+  function renderStrategyMatrix(payload, rows) {
     const container = document.getElementById("strategies-city-matrix");
     const meta = document.getElementById("strategies-matrix-meta");
     if (!container) return;
     const query = strategyState.searchQuery.trim().toLowerCase();
-    const allRows = Array.isArray(payload.city_matrix) ? sortCityRows(payload.city_matrix, strategyState.sortKey) : [];
-    const rows = allRows.filter((row) => cityMatchesSearch(row, query));
-    if (!rows.length) {
-      clearNode(container, [el("p", "empty-state", query ? "No cities match the current search." : "No city comparison data yet.")]);
-      if (meta) meta.textContent = query ? `0 of ${allRows.length} cities match the current search` : "No city-level comparison data";
+    const allRows = Array.isArray(payload && payload.city_matrix) ? payload.city_matrix : [];
+    const visibleRows = Array.isArray(rows) ? rows : filteredCityRows(payload);
+    const filterActive = strategyState.cityFilter !== "all";
+    if (!visibleRows.length) {
+      clearNode(container, [el("p", "empty-state", (query || filterActive) ? "No cities match the current search or filter." : "No city comparison data yet.")]);
+      if (meta) {
+        meta.textContent = (query || filterActive)
+          ? `0 of ${allRows.length} cities match the active analysis filters`
+          : "No city-level comparison data";
+      }
       return;
     }
     if (meta) {
-      meta.textContent = query
-        ? `${rows.length} of ${allRows.length} cities match the current search`
-        : `${rows.length} city rows in the selected window`;
+      meta.textContent = (query || filterActive)
+        ? `${visibleRows.length} of ${allRows.length} cities match the active analysis filters`
+        : `${visibleRows.length} city rows in the selected window`;
     }
 
     const table = el("table", "positions-table strategy-matrix-table");
     const thead = el("thead");
     const headRow = el("tr");
-    ["City", "Assignment", "Recommendation", "Review", "Gap", "Resolved Trades", "Coverage", "Best Strategy"].forEach((label) => headRow.append(el("th", null, label)));
+    ["City", "Assignment", "Recommendation", "Review", "Gap", "Resolved", "Coverage", "Best Strategy"].forEach((label) => headRow.append(el("th", null, label)));
     thead.appendChild(headRow);
     table.appendChild(thead);
 
     const tbody = el("tbody");
-    rows.forEach((row) => {
+    visibleRows.forEach((row) => {
       const recommendation = row.recommendation || {};
       const recommendationStatus = recommendation.status || "no_outcomes";
       const review = row.review || {};
       const tr = el(
         "tr",
-        `strategy-matrix-row${row.selected ? " is-selected" : ""} is-${recommendationStatus.replace(/_/g, "-")}`,
+        `strategy-matrix-row${row.series_ticker === strategyState.selectedSeriesTicker ? " is-selected" : ""} is-${recommendationStatus.replace(/_/g, "-")}`,
       );
       const cityTd = el("td");
       const cityButton = el("button", "strategy-matrix-link");
@@ -906,20 +1705,13 @@
       );
       recommendationWrap.appendChild(el("span", "muted-label", recommendation.label || "No recommendation"));
       recommendationWrap.appendChild(el("span", "mono", recommendation.gap_to_runner_up_display ? `Gap ${recommendation.gap_to_runner_up_display}` : "Gap —"));
-      if (row.approval_eligible) {
-        recommendationWrap.appendChild(pill(row.approval_label || "Ready to approve", recommendationTone(recommendationStatus)));
-      }
       recommendationCell.appendChild(recommendationWrap);
       tr.appendChild(recommendationCell);
 
       const reviewCell = el("td");
       const reviewWrap = el("div", "strategy-matrix-cell");
-      if (review.status && review.label) {
+      if (payload && payload.summary && payload.summary.review_available && review.status && review.label) {
         reviewWrap.appendChild(pill(review.label, reviewTone(review.status)));
-      } else {
-        reviewWrap.appendChild(pill("180d only", "neutral"));
-      }
-      if (review.status) {
         reviewWrap.appendChild(
           el(
             "span",
@@ -933,6 +1725,8 @@
               : "Waiting",
           ),
         );
+      } else {
+        reviewWrap.appendChild(el("span", "muted-label", "—"));
       }
       reviewCell.appendChild(reviewWrap);
       tr.appendChild(reviewCell);
@@ -1189,37 +1983,40 @@
     }
   }
 
-  function renderCityDecisionBrief(detail) {
+  function cityEvidenceInterpretation(detail) {
+    const city = detail && detail.city ? detail.city : {};
+    const rationale = detail && (detail.recommendation_rationale || detail.promotion_rationale) ? (detail.recommendation_rationale || detail.promotion_rationale) : {};
+    const recommendation = city.recommendation || {};
+    const status = rationale.recommendation_status || recommendation.status || "";
+    if (status === "strong_recommendation") {
+      return "Evidence is actionable: the current winner clears the resolved-trade, coverage, and strong-gap thresholds against the runner-up.";
+    }
+    if (status === "lean_recommendation") {
+      return "Evidence is actionable but narrow: the current winner clears the resolved-trade and coverage gates, but only by the lean-gap threshold.";
+    }
+    if (status === "too_close") {
+      return "Evidence is still too close: the current winner has support, but the gap over the runner-up is not wide enough to act on confidently.";
+    }
+    if (status === "low_sample") {
+      return "Evidence is incomplete: this city still needs more resolved trades before the recommendation is strong enough to trust.";
+    }
+    return "Evidence is incomplete: this city does not yet have enough scored outcome history to produce a reliable winner.";
+  }
+
+  function renderCityResearchBrief(detail, title) {
     const city = detail.city || {};
     const approval = detail.approval || {};
     const review = detail.review || {};
     const recommendation = city.recommendation || {};
     const currentAssignment = review.current_assignment || city.assignment || {};
     const latestRecommendation = review.latest_recommendation || recommendation;
-    const card = el("section", "strategy-detail-section strategy-decision-brief");
-    card.append(el("h4", null, "Decision Brief"));
-
-    const metrics = el("div", "strategy-detail-metrics");
-    metrics.append(
-      metricListItem("Current assignment", currentAssignment.strategy_name || "Unassigned"),
-      metricListItem("Latest recommendation", latestRecommendation.strategy_name || recommendation.strategy_name || city.best_strategy || "—"),
-      metricListItem("Gap to runner-up", latestRecommendation.gap_to_runner_up_display || city.gap_to_runner_up_display || "—"),
-      metricListItem("Resolved trades", latestRecommendation.resolved_trade_count_display || city.best_resolved_trade_count_display || "0"),
-      metricListItem("Outcome coverage", latestRecommendation.outcome_coverage_display || city.best_outcome_coverage_display || "—"),
-      metricListItem("Status", recommendation.label || city.evidence_label || "—"),
-    );
-    if (review.available) {
-      metrics.append(
-        metricListItem("Review status", review.label || "—"),
-        metricListItem("Next action", review.next_action_label || "Wait for evidence"),
-      );
-    }
-    card.appendChild(metrics);
+    const card = el("section", "strategy-detail-section strategy-decision-brief strategy-research-brief");
+    card.append(el("h4", null, title || "City Research Brief"));
 
     const statusRow = el("div", "strategy-review-status-row");
     statusRow.append(
       currentAssignment.strategy_name ? pill(`Assigned ${currentAssignment.strategy_name}`, "neutral") : pill("Unassigned", "neutral"),
-      recommendation.strategy_name ? pill(`Latest ${recommendation.strategy_name}`, recommendationTone(recommendation.status)) : pill("No recommendation", "neutral"),
+      recommendation.strategy_name ? pill(`Recommended ${recommendation.strategy_name}`, recommendationTone(recommendation.status)) : pill("No recommendation", "neutral"),
     );
     if (review.available) {
       statusRow.append(pill(review.label || "Review", reviewTone(review.status)));
@@ -1228,6 +2025,28 @@
       statusRow.append(pill(approval.label || "Ready to approve", "good"));
     }
     card.appendChild(statusRow);
+
+    const metrics = el("div", "strategy-detail-metrics strategy-brief-metrics");
+    metrics.append(
+      metricListItem("Current assignment", currentAssignment.strategy_name || "Unassigned"),
+      metricListItem("Recommended strategy", latestRecommendation.strategy_name || recommendation.strategy_name || city.best_strategy || "—"),
+      metricListItem("Runner-up strategy", city.runner_up_strategy || "—"),
+      metricListItem("Gap to runner-up", latestRecommendation.gap_to_runner_up_display || city.gap_to_runner_up_display || "—"),
+      metricListItem("Gap to assignment", city.gap_to_assignment_display || "—"),
+      metricListItem("Resolved trades", latestRecommendation.resolved_trade_count_display || city.best_resolved_trade_count_display || "0"),
+      metricListItem("Outcome coverage", latestRecommendation.outcome_coverage_display || city.best_outcome_coverage_display || "—"),
+    );
+    if (review.available) {
+      metrics.append(metricListItem("Review state", review.label || "—"));
+    }
+    card.appendChild(metrics);
+
+    const interpretation = el("div", "strategy-brief-interpretation");
+    interpretation.append(
+      el("strong", null, "Evidence interpretation"),
+      el("p", null, cityEvidenceInterpretation(detail)),
+    );
+    card.appendChild(interpretation);
 
     if (review.available && review.reason) {
       card.append(el("p", "muted-label", review.reason));
@@ -1254,6 +2073,20 @@
       card.appendChild(note);
     }
 
+    return card;
+  }
+
+  function renderCityApprovalSection(detail) {
+    const city = detail.city || {};
+    const approval = detail.approval || {};
+    const review = detail.review || {};
+    const recommendation = city.recommendation || {};
+    const messageNode = approvalMessageNode(city.series_ticker);
+    if (!approval.eligible && !messageNode) return null;
+
+    const section = el("section", "strategy-detail-section strategy-approval-card");
+    section.append(el("h4", null, "Approval"));
+
     if (approval.eligible) {
       const noteValue = strategyState.approvalNotes[city.series_ticker] || "";
       const form = el("div", "strategy-approval-form");
@@ -1275,6 +2108,9 @@
       }
       if (approval.reason) {
         form.append(el("p", "muted-label", approval.reason));
+      }
+      if (review.available && review.next_action_label) {
+        form.append(el("p", "muted-label", `${review.next_action_label}.`));
       }
       const label = el("label", "muted-label", "Operator note");
       label.setAttribute("for", `strategy-approval-note-${city.series_ticker}`);
@@ -1305,24 +2141,23 @@
       actions.appendChild(button);
       form.appendChild(actions);
 
-      const messageNode = approvalMessageNode(city.series_ticker);
       if (messageNode) form.appendChild(messageNode);
-      card.appendChild(form);
+      section.appendChild(form);
     } else {
-      const standaloneMessage = approvalMessageNode(city.series_ticker);
-      if (standaloneMessage) card.appendChild(standaloneMessage);
+      section.appendChild(messageNode);
     }
 
-    return card;
+    return section;
   }
 
-  function renderCityDetail(detail, targetIds) {
+  function renderCityDetail(detail, targetIds, options) {
     const container = document.getElementById(targetIds.containerId);
     const meta = document.getElementById(targetIds.metaId);
     if (!container) return;
+    const briefTitle = options && options.briefTitle ? options.briefTitle : "City Research Brief";
     if (meta) {
       meta.textContent = detail.city
-        ? `${detail.city.series_ticker} · ${detail.review && detail.review.available ? "decision brief and recommendation evidence" : "recommendation evidence"}`
+        ? `${detail.city.series_ticker} · ${briefTitle.toLowerCase()} and recommendation evidence`
         : "City evidence";
     }
 
@@ -1331,31 +2166,19 @@
     const header = el("div", "strategy-detail-header");
     header.append(el("h3", null, city.series_ticker || "City detail"));
     header.append(el("p", "muted-label", city.city_label || city.location_name || "City-level strategy comparison"));
+    const codexAction = el("button", "strategy-inline-action", "Open in Codex Lab");
+    codexAction.type = "button";
+    codexAction.addEventListener("click", () => {
+      openCodexLabContext({
+        seriesTicker: city.series_ticker || null,
+        strategyName: null,
+      });
+    });
+    header.appendChild(codexAction);
     children.push(header);
-    children.push(renderCityDecisionBrief(detail));
-
-    const rationale = detail.recommendation_rationale || detail.promotion_rationale || {};
-    const rationaleCard = el("section", "strategy-detail-section");
-    rationaleCard.append(el("h4", null, "Recommendation Rationale"));
-    const rationaleGrid = el("div", "strategy-detail-metrics");
-    rationaleGrid.append(
-      metricListItem("Recommendation", rationale.recommendation_label || "—"),
-      metricListItem("Best trade count", rationale.best_trade_count_display || "0"),
-      metricListItem("Resolved trades", rationale.best_resolved_trade_count_display || "0"),
-      metricListItem("Unscored trades", rationale.best_unscored_trade_count_display || "0"),
-      metricListItem("Outcome coverage", rationale.best_outcome_coverage_display || "—"),
-      metricListItem("Gap to runner-up", rationale.gap_to_runner_up_display || "—"),
-      metricListItem("Gap to assignment", rationale.gap_to_current_assignment_display || "—"),
-      metricListItem("Winner Wilson", rationale.winner_wilson_display || "—"),
-      metricListItem("Runner-up Wilson", rationale.runner_up_wilson_display || "—"),
-      metricListItem("Resolved rule", rationale.meets_trade_threshold ? "Pass" : "Below threshold", rationale.meets_trade_threshold ? "value-positive" : "value-negative"),
-      metricListItem("Coverage rule", rationale.meets_coverage_threshold ? "Pass" : "Below threshold", rationale.meets_coverage_threshold ? "value-positive" : "value-negative"),
-      metricListItem("Strong gap", rationale.meets_gap_threshold ? "Pass" : "Below threshold", rationale.meets_gap_threshold ? "value-positive" : "value-negative"),
-      metricListItem("Lean gap", rationale.meets_lean_gap_threshold ? "Pass" : "Below threshold", rationale.meets_lean_gap_threshold ? "value-positive" : "value-neutral"),
-      metricListItem("Writes assignment", rationale.writes_assignment ? "Yes" : "No", rationale.writes_assignment ? "value-positive" : "value-neutral"),
-    );
-    rationaleCard.appendChild(rationaleGrid);
-    children.push(rationaleCard);
+    children.push(renderCityResearchBrief(detail, briefTitle));
+    const approvalSection = renderCityApprovalSection(detail);
+    if (approvalSection) children.push(approvalSection);
 
     const rankingSection = el("section", "strategy-detail-section");
     rankingSection.append(el("h4", null, "Strategy Ranking"));
@@ -1405,7 +2228,7 @@
     children.push(comparisonSection);
 
     const trendSection = el("section", "strategy-detail-section");
-    trendSection.append(el("h4", null, detail.trend && detail.trend.title ? detail.trend.title : "Trend"));
+    trendSection.append(el("h4", null, "Trend History"));
     if (detail.trend && detail.trend.note) trendSection.append(el("p", "muted-label", detail.trend.note));
     const trendSeries = (detail.trend && detail.trend.series ? detail.trend.series : []).map((item) => ({
       strategy_name: item.strategy_name,
@@ -1416,7 +2239,7 @@
     children.push(trendSection);
 
     const eventSection = el("section", "strategy-detail-section");
-    eventSection.append(el("h4", null, "Recent Strategy Changes"));
+    eventSection.append(el("h4", null, "Recent Events"));
     const eventContainer = el("div");
     renderEventList(eventContainer, detail.recent_events || [], "No recent city-specific strategy events.");
     eventSection.appendChild(eventContainer);
@@ -1456,18 +2279,28 @@
     const header = el("div", "strategy-detail-header");
     header.append(el("h3", null, strategy.name || "Strategy detail"));
     if (strategy.description) header.append(el("p", "muted-label", strategy.description));
+    const codexAction = el("button", "strategy-inline-action", "Open in Codex Lab");
+    codexAction.type = "button";
+    codexAction.addEventListener("click", () => {
+      openCodexLabContext({
+        seriesTicker: null,
+        strategyName: strategy.name || null,
+      });
+    });
+    header.appendChild(codexAction);
     children.push(header);
 
     const metricGrid = el("div", "strategy-detail-metrics");
     metricGrid.append(
       metricListItem("Win rate", strategy.overall_win_rate_display || "—", strategy.overall_win_rate >= 0.6 ? "value-positive" : strategy.overall_win_rate <= 0.35 ? "value-negative" : ""),
-      metricListItem("Trade rate", strategy.overall_trade_rate_display || "—"),
-      metricListItem("Outcome coverage", strategy.outcome_coverage_display || "—"),
-      metricListItem("Total P/L", strategy.total_pnl_display || "—", strategy.total_pnl_dollars > 0 ? "value-positive" : strategy.total_pnl_dollars < 0 ? "value-negative" : ""),
-      metricListItem("Avg edge", strategy.avg_edge_bps_display || "—"),
-      metricListItem("Scored trades", strategy.total_resolved_trade_count_display || "0"),
       metricListItem("Cities led", String(strategy.cities_led || 0)),
       metricListItem("Assigned cities", String(strategy.assigned_city_count || 0)),
+      metricListItem("Outcome coverage", strategy.outcome_coverage_display || "—"),
+      metricListItem("Total P/L", strategy.total_pnl_display || "—", strategy.total_pnl_dollars > 0 ? "value-positive" : strategy.total_pnl_dollars < 0 ? "value-negative" : ""),
+      metricListItem("Trade rate", strategy.overall_trade_rate_display || "—"),
+      metricListItem("Avg edge", strategy.avg_edge_bps_display || "—"),
+      metricListItem("Scored trades", strategy.total_resolved_trade_count_display || "0"),
+      metricListItem("Sim trades", strategy.total_trade_count_display || "0"),
     );
     children.push(metricGrid);
 
@@ -1542,7 +2375,7 @@
     const container = document.getElementById("strategies-review-detail");
     const meta = document.getElementById("strategies-review-detail-meta");
     if (!container) return;
-    if (!detail || detail.type !== "city") {
+    if (!detail || detail.type !== "city" || detail.selected_series_ticker !== strategyState.selectedSeriesTicker) {
       if (meta) meta.textContent = strategyState.fetching ? "Loading decision brief..." : "Select a city from the review queue to inspect the current decision brief.";
       clearNode(container, [el("p", "empty-state", strategyState.fetching ? "Loading decision brief..." : "No city decision brief selected yet.")]);
       return;
@@ -1550,6 +2383,8 @@
     renderCityDetail(detail, {
       containerId: "strategies-review-detail",
       metaId: "strategies-review-detail-meta",
+    }, {
+      briefTitle: "Decision Brief",
     });
   }
 
@@ -1566,12 +2401,29 @@
       clearNode(container, [el("p", "empty-state", "No strategy data available yet.")]);
       return;
     }
-    if (detail.type === "city") {
-      renderCityDetail(detail, targetIds);
+    if (focusMode === "cities") {
+      if (!strategyState.selectedSeriesTicker) {
+        if (meta) meta.textContent = "No city matches the current analysis filters";
+        clearNode(container, [el("p", "empty-state", "No city research brief is available for the current search or filter.")]);
+        return;
+      }
+      if (detail.type !== "city" || detail.selected_series_ticker !== strategyState.selectedSeriesTicker) {
+        if (meta) meta.textContent = strategyState.fetching ? "Loading city research brief..." : `Loading ${strategyState.selectedSeriesTicker} city research brief...`;
+        clearNode(container, [el("p", "empty-state", strategyState.fetching ? "Loading city research brief..." : "Loading city research brief...")]);
+        return;
+      }
+      renderCityDetail(detail, targetIds, {
+        briefTitle: "City Research Brief",
+      });
       return;
     }
-    if (detail.type === "strategy") {
+    if (focusMode === "strategies" && detail.type === "strategy" && detail.selected_strategy_name === strategyState.selectedStrategyName) {
       renderStrategyDetail(detail, targetIds);
+      return;
+    }
+    if (focusMode === "strategies") {
+      if (meta) meta.textContent = strategyState.fetching ? "Loading strategy drilldown..." : "Select a strategy card to inspect preset-level evidence.";
+      clearNode(container, [el("p", "empty-state", strategyState.fetching ? "Loading strategy drilldown..." : "No strategy drilldown selected yet.")]);
       return;
     }
     if (meta) meta.textContent = "No detail available yet";
@@ -1609,22 +2461,33 @@
     if (!payload) return;
     strategyState.payload = payload;
     strategyState.windowDays = payload.summary && payload.summary.window_days ? payload.summary.window_days : strategyState.windowDays;
-    strategyState.selectedSeriesTicker = payload.detail_context ? payload.detail_context.selected_series_ticker || null : null;
-    strategyState.selectedStrategyName = payload.detail_context ? payload.detail_context.selected_strategy_name || null : null;
     strategyState.focusMode = normalizeStrategyFocusMode(strategyState.focusMode, payload.summary || {});
+    if (!STRATEGY_CITY_FILTERS.includes(strategyState.cityFilter)) {
+      strategyState.cityFilter = "all";
+    }
+    if (!(payload.summary && payload.summary.review_available) && strategyState.cityFilter === "needs_review") {
+      strategyState.cityFilter = "all";
+    }
+    syncStrategySelections(payload);
     strategyState.dirty = false;
+    const visibleCityRows = filteredCityRows(payload);
+    ensureFocusDetailSelection(payload, visibleCityRows);
     renderFocusPanels(payload.summary || {});
-    renderFocusSwitch(payload.summary || {});
+    renderFocusSwitch(payload);
     renderWindowFilter(payload.summary || {});
-    renderStrategiesSummary(payload.summary || {});
+    renderStrategiesSummary(payload);
+    renderCodexLab(payload);
     renderReviewQueue(payload);
     renderStrategyLeaderboard(payload.leaderboard || []);
-    renderStrategyMatrix(payload);
+    renderCityFilters(payload);
+    renderStrategyMatrix(payload, visibleCityRows);
     renderStrategiesDetail(payload.detail_context || {});
     renderReviewDetail(payload.detail_context || {});
     renderRecentStrategyChanges(payload.recent_promotions || []);
     renderMethodology(payload.methodology || {});
-    if (!strategyState.explicitSelection && maybeSelectDefaultReviewCity(payload)) return;
+    if (strategyState.codexRunDetail && (strategyState.codexRunDetail.status === "queued" || strategyState.codexRunDetail.status === "running") && !strategyState.codexPollTimer) {
+      scheduleCodexRunPolling(strategyState.codexRunDetail.id);
+    }
     refreshTimestamps();
   }
 
@@ -1633,20 +2496,27 @@
     if (!options || !options.preserveApprovalMessage) {
       setApprovalMessage(null, null, null);
     }
-    const next = {
-      windowDays: options && options.windowDays ? options.windowDays : strategyState.windowDays,
-      seriesTicker: options && Object.prototype.hasOwnProperty.call(options, "seriesTicker") ? options.seriesTicker : strategyState.selectedSeriesTicker,
-      strategyName: options && Object.prototype.hasOwnProperty.call(options, "strategyName") ? options.strategyName : strategyState.selectedStrategyName,
-    };
     if (options && Object.prototype.hasOwnProperty.call(options, "focusMode")) {
       strategyState.focusMode = options.focusMode || strategyState.focusMode;
     }
     if (options && Object.prototype.hasOwnProperty.call(options, "explicitSelection")) {
       strategyState.explicitSelection = Boolean(options.explicitSelection);
     }
-    if (next.seriesTicker) next.strategyName = null;
-    if (!next.seriesTicker && !next.strategyName && strategyState.payload && strategyState.payload.detail_context) {
-      next.strategyName = strategyState.payload.detail_context.selected_strategy_name || null;
+    const focusMode = normalizeStrategyFocusMode(strategyState.focusMode, (strategyState.payload && strategyState.payload.summary) || {});
+    strategyState.focusMode = focusMode;
+    const next = {
+      windowDays: options && options.windowDays ? options.windowDays : strategyState.windowDays,
+      seriesTicker: null,
+      strategyName: null,
+    };
+    if (focusMode === "cities" || focusMode === "review") {
+      next.seriesTicker = options && Object.prototype.hasOwnProperty.call(options, "seriesTicker")
+        ? options.seriesTicker
+        : strategyState.selectedSeriesTicker;
+    } else if (focusMode === "strategies") {
+      next.strategyName = options && Object.prototype.hasOwnProperty.call(options, "strategyName")
+        ? options.strategyName
+        : strategyState.selectedStrategyName;
     }
     strategyState.fetching = true;
     const strategyMeta = document.getElementById("strategies-detail-meta");
@@ -1673,7 +2543,7 @@
     select.value = strategyState.sortKey;
     select.addEventListener("change", () => {
       strategyState.sortKey = select.value || "priority";
-      if (strategyState.payload) renderStrategyMatrix(strategyState.payload);
+      if (strategyState.payload) renderStrategies(strategyState.payload);
     });
   }
 
@@ -1683,7 +2553,7 @@
     input.value = strategyState.searchQuery;
     input.addEventListener("input", () => {
       strategyState.searchQuery = input.value || "";
-      if (strategyState.payload) renderStrategyMatrix(strategyState.payload);
+      if (strategyState.payload) renderStrategies(strategyState.payload);
     });
   }
 
@@ -1693,8 +2563,6 @@
       if (activeEnv === "strategies") {
         await loadStrategies({
           windowDays: strategyState.windowDays,
-          seriesTicker: strategyState.selectedSeriesTicker,
-          strategyName: strategyState.selectedSeriesTicker ? null : strategyState.selectedStrategyName,
           focusMode: strategyState.focusMode,
           explicitSelection: strategyState.explicitSelection,
         });
@@ -1710,8 +2578,6 @@
     if (activeEnv === "strategies" && strategyState.payload) {
       await loadStrategies({
         windowDays: strategyState.windowDays,
-        seriesTicker: strategyState.selectedSeriesTicker,
-        strategyName: strategyState.selectedSeriesTicker ? null : strategyState.selectedStrategyName,
         focusMode: strategyState.focusMode,
         explicitSelection: strategyState.explicitSelection,
       });

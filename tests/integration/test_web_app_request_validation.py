@@ -177,6 +177,14 @@ def _strategy_assignment_payload(
         "leaderboard": [],
         "city_matrix": [city_row],
         "detail_context": detail_context,
+        "codex_lab": {
+            "available": False,
+            "provider": "unavailable",
+            "model": None,
+            "recent_runs": [],
+            "inactive_codex_strategies": [],
+            "creation_window_days": 180,
+        },
         "recent_promotions": [],
         "methodology": {"points": []},
     }
@@ -829,4 +837,226 @@ def test_approve_strategy_assignment_requires_note(tmp_path, monkeypatch) -> Non
 
     assert response.status_code == 422
     assert response.json()["detail"][0]["msg"] == "Value error, Note is required"
+    get_settings.cache_clear()
+
+
+def test_create_strategy_codex_run_endpoint_schedules_background_execution(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    captured: dict[str, object] = {}
+
+    async def fake_build_strategies_dashboard(
+        _container,
+        *,
+        window_days: int = 180,
+        series_ticker: str | None = None,
+        strategy_name: str | None = None,
+    ):
+        captured["window_days"] = window_days
+        captured["series_ticker"] = series_ticker
+        captured["strategy_name"] = strategy_name
+        return _strategy_assignment_payload(series_ticker=series_ticker or "KXHIGHNY")
+
+    class FakeStrategyCodexService:
+        async def close(self) -> None:
+            return None
+
+        def is_available(self) -> bool:
+            return True
+
+        async def create_run(self, *, request, dashboard_snapshot, trigger_source="manual"):
+            captured["request"] = request
+            captured["dashboard_snapshot"] = dashboard_snapshot
+            captured["trigger_source"] = trigger_source
+            return {"run_id": "run-123", "status": "queued"}
+
+        async def execute_run(self, run_id: str) -> None:
+            captured["executed_run_id"] = run_id
+
+    real_create_task = asyncio.create_task
+
+    def fake_create_task(coro):
+        captured["scheduled_coro_name"] = coro.cr_code.co_name
+        return real_create_task(coro)
+
+    monkeypatch.setattr(web_app_module, "build_strategies_dashboard", fake_build_strategies_dashboard)
+    monkeypatch.setattr(web_app_module.asyncio, "create_task", fake_create_task)
+    app = create_app()
+
+    with TestClient(app) as client:
+        client.app.state.container.strategy_codex_service = FakeStrategyCodexService()  # type: ignore[assignment]
+        response = client.post(
+            "/api/strategies/codex/runs",
+            json={
+                "mode": "evaluate",
+                "window_days": 180,
+                "series_ticker": "KXHIGHNY",
+                "strategy_name": "moderate",
+                "operator_brief": "Focus on mismatches and weak coverage.",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"run_id": "run-123", "status": "queued"}
+    assert captured["window_days"] == 180
+    assert captured["series_ticker"] == "KXHIGHNY"
+    assert captured["strategy_name"] == "moderate"
+    assert captured["trigger_source"] == "manual"
+    assert captured["scheduled_coro_name"] == "execute_run"
+    request_payload = captured["request"]
+    assert request_payload.mode == "evaluate"
+    assert request_payload.window_days == 180
+    assert request_payload.series_ticker == "KXHIGHNY"
+    assert request_payload.strategy_name == "moderate"
+    assert request_payload.operator_brief == "Focus on mismatches and weak coverage."
+    assert captured["dashboard_snapshot"]["summary"]["window_days"] == 180
+    get_settings.cache_clear()
+
+
+def test_create_strategy_codex_run_endpoint_handles_unavailable_and_invalid_window(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    class FakeStrategyCodexService:
+        async def close(self) -> None:
+            return None
+
+        def is_available(self) -> bool:
+            return False
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        client.app.state.container.strategy_codex_service = FakeStrategyCodexService()  # type: ignore[assignment]
+        unavailable_response = client.post("/api/strategies/codex/runs", json={"mode": "evaluate", "window_days": 180})
+        invalid_window_response = client.post("/api/strategies/codex/runs", json={"mode": "evaluate", "window_days": 15})
+
+    assert unavailable_response.status_code == 503
+    assert unavailable_response.json() == {"error": "codex_unavailable"}
+    assert invalid_window_response.status_code == 400
+    assert invalid_window_response.json() == {"error": "invalid_window_days"}
+    get_settings.cache_clear()
+
+
+def test_get_strategy_codex_run_endpoint_returns_payload_or_404(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    class FakeStrategyCodexService:
+        async def close(self) -> None:
+            return None
+
+        async def get_run_view(self, run_id: str):
+            if run_id == "run-123":
+                return {"id": run_id, "status": "completed", "mode": "evaluate"}
+            return None
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        client.app.state.container.strategy_codex_service = FakeStrategyCodexService()  # type: ignore[assignment]
+        found_response = client.get("/api/strategies/codex/runs/run-123")
+        missing_response = client.get("/api/strategies/codex/runs/missing-run")
+
+    assert found_response.status_code == 200
+    assert found_response.json()["id"] == "run-123"
+    assert missing_response.status_code == 404
+    assert missing_response.json() == {"error": "unknown_run_id", "run_id": "missing-run"}
+    get_settings.cache_clear()
+
+
+def test_accept_strategy_codex_run_endpoint_maps_service_errors(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    class FakeStrategyCodexService:
+        async def close(self) -> None:
+            return None
+
+        async def accept_run(self, run_id: str):
+            if run_id == "missing":
+                raise KeyError(run_id)
+            if run_id == "invalid":
+                raise ValueError("Only completed suggestion runs can be accepted")
+            return {"status": "accepted", "strategy_name": "balanced-plus", "is_active": False}
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        client.app.state.container.strategy_codex_service = FakeStrategyCodexService()  # type: ignore[assignment]
+        success_response = client.post("/api/strategies/codex/runs/run-123/accept")
+        invalid_response = client.post("/api/strategies/codex/runs/invalid/accept")
+        missing_response = client.post("/api/strategies/codex/runs/missing/accept")
+
+    assert success_response.status_code == 200
+    assert success_response.json()["strategy_name"] == "balanced-plus"
+    assert invalid_response.status_code == 400
+    assert invalid_response.json() == {
+        "error": "invalid_run_state",
+        "message": "Only completed suggestion runs can be accepted",
+    }
+    assert missing_response.status_code == 404
+    assert missing_response.json() == {"error": "unknown_run_id", "run_id": "missing"}
+    get_settings.cache_clear()
+
+
+def test_activate_strategy_endpoint_maps_service_errors(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    class FakeStrategyCodexService:
+        async def close(self) -> None:
+            return None
+
+        async def activate_strategy(self, strategy_name: str):
+            if strategy_name == "missing":
+                raise KeyError(strategy_name)
+            return {"status": "activated", "strategy_name": strategy_name, "is_active": True}
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        client.app.state.container.strategy_codex_service = FakeStrategyCodexService()  # type: ignore[assignment]
+        success_response = client.post("/api/strategies/balanced-plus/activate")
+        missing_response = client.post("/api/strategies/missing/activate")
+
+    assert success_response.status_code == 200
+    assert success_response.json() == {
+        "status": "activated",
+        "strategy_name": "balanced-plus",
+        "is_active": True,
+    }
+    assert missing_response.status_code == 404
+    assert missing_response.json() == {"error": "unknown_strategy", "strategy_name": "missing"}
     get_settings.cache_clear()

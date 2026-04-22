@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 import logging
 import math
 from datetime import UTC, datetime, timedelta
@@ -74,6 +75,14 @@ STRATEGY_PRESETS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+@dataclass(slots=True)
+class RegressionStrategySpec:
+    id: int | None
+    name: str
+    description: str | None
+    thresholds: dict[str, Any]
 
 
 def _thresholds_from_dict(d: dict[str, Any]) -> RuntimeThresholds:
@@ -357,6 +366,64 @@ def _recommendation_decision(
     }
 
 
+def _aggregate_strategy_leaderboard(
+    *,
+    strategies: list[RegressionStrategySpec],
+    result_rows: list[dict[str, Any]],
+    city_results: dict[str, dict[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    rows_by_strategy: dict[str, list[dict[str, Any]]] = {strategy.name: [] for strategy in strategies}
+    for row in result_rows:
+        rows_by_strategy.setdefault(str(row["strategy_name"]), []).append(row)
+
+    strategy_leaders: Counter[str] = Counter()
+    for results_by_strategy in city_results.values():
+        ranked_rows = _rank_scored_strategy_rows(list(results_by_strategy.values()))
+        if ranked_rows:
+            strategy_leaders[ranked_rows[0]["strategy_name"]] += 1
+
+    leaderboard: list[dict[str, Any]] = []
+    for strategy in strategies:
+        strategy_rows = rows_by_strategy.get(strategy.name, [])
+        total_rooms = sum(int(row["rooms_evaluated"]) for row in strategy_rows)
+        total_trades = sum(int(row["trade_count"]) for row in strategy_rows)
+        total_resolved_trades = sum(int(row["resolved_trade_count"]) for row in strategy_rows)
+        total_unscored_trades = sum(int(row["unscored_trade_count"]) for row in strategy_rows)
+        total_wins = sum(int(row["win_count"]) for row in strategy_rows)
+        total_pnl = sum((row["total_pnl_dollars"] or Decimal("0")) for row in strategy_rows)
+        edge_numerator = sum((row["avg_edge_bps"] or 0.0) * int(row["trade_count"]) for row in strategy_rows)
+        overall_win_rate = (total_wins / total_resolved_trades) if total_resolved_trades > 0 else None
+        overall_trade_rate = (total_trades / total_rooms) if total_rooms > 0 else None
+        outcome_coverage_rate = (total_resolved_trades / total_trades) if total_trades > 0 else None
+        overall_avg_edge = (edge_numerator / total_trades) if total_trades > 0 else None
+        leaderboard.append({
+            "id": strategy.id,
+            "name": strategy.name,
+            "description": strategy.description,
+            "thresholds": strategy.thresholds,
+            "overall_win_rate": round(overall_win_rate, 4) if overall_win_rate is not None else None,
+            "overall_trade_rate": round(overall_trade_rate, 4) if overall_trade_rate is not None else None,
+            "total_pnl_dollars": float(total_pnl) if total_resolved_trades > 0 else None,
+            "avg_edge_bps": round(overall_avg_edge, 2) if overall_avg_edge is not None else None,
+            "total_rooms_evaluated": total_rooms,
+            "total_trade_count": total_trades,
+            "total_resolved_trade_count": total_resolved_trades,
+            "total_unscored_trade_count": total_unscored_trades,
+            "outcome_coverage_rate": round(outcome_coverage_rate, 4) if outcome_coverage_rate is not None else None,
+            "cities_led": strategy_leaders.get(strategy.name, 0),
+        })
+
+    leaderboard.sort(
+        key=lambda row: (
+            row["overall_win_rate"] if row["overall_win_rate"] is not None else -1.0,
+            row["total_resolved_trade_count"],
+            row["total_pnl_dollars"] if row["total_pnl_dollars"] is not None else float("-inf"),
+        ),
+        reverse=True,
+    )
+    return leaderboard
+
+
 class StrategyRegressionService:
     def __init__(
         self,
@@ -373,6 +440,88 @@ class StrategyRegressionService:
     async def seed_strategies(self, repo: PlatformRepository) -> None:
         await repo.seed_strategies(STRATEGY_PRESETS)
 
+    async def evaluate_strategy_specs(
+        self,
+        *,
+        strategies: list[RegressionStrategySpec],
+        window_days: int,
+        run_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        run_at = run_at or datetime.now(UTC)
+        date_from = run_at - timedelta(days=window_days)
+        date_to = run_at
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            rooms = await repo.get_strategy_regression_rooms(date_from, date_to)
+            await session.commit()
+        if not rooms:
+            return {"status": "no_rooms", "window_days": window_days}
+        return self.evaluate_strategy_specs_from_rooms(
+            strategies=strategies,
+            rooms=rooms,
+            run_at=run_at,
+            date_from=date_from,
+            date_to=date_to,
+            window_days=window_days,
+        )
+
+    def evaluate_strategy_specs_from_rooms(
+        self,
+        *,
+        strategies: list[RegressionStrategySpec],
+        rooms: list[dict[str, Any]],
+        run_at: datetime,
+        date_from: datetime,
+        date_to: datetime,
+        window_days: int,
+    ) -> dict[str, Any]:
+        rooms_by_series, diagnostics = _group_strategy_rooms_by_series(rooms, self.weather_directory)
+        result_rows: list[dict[str, Any]] = []
+        city_results: dict[str, dict[str, dict[str, Any]]] = {}
+
+        for strategy in strategies:
+            thresholds = _thresholds_from_dict(strategy.thresholds)
+            for series_ticker, city_rooms in rooms_by_series.items():
+                stats = self._evaluate_city(
+                    strategy_id=strategy.id,
+                    strategy_name=strategy.name,
+                    series_ticker=series_ticker,
+                    rooms=city_rooms,
+                    t=thresholds,
+                    run_at=run_at,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+                result_rows.append(stats)
+                city_results.setdefault(series_ticker, {})[strategy.name] = {
+                    "strategy_id": strategy.id,
+                    "strategy_name": strategy.name,
+                    "trade_count": stats["trade_count"],
+                    "resolved_trade_count": stats["resolved_trade_count"],
+                    "unscored_trade_count": stats["unscored_trade_count"],
+                    "win_count": stats["win_count"],
+                    "win_rate": stats["win_rate"],
+                    "total_pnl_dollars": stats["total_pnl_dollars"],
+                    "avg_edge_bps": stats["avg_edge_bps"],
+                }
+
+        leaderboard = _aggregate_strategy_leaderboard(
+            strategies=strategies,
+            result_rows=result_rows,
+            city_results=city_results,
+        )
+        return {
+            "status": "ok",
+            "window_days": window_days,
+            "run_at": run_at.isoformat(),
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "diagnostics": diagnostics,
+            "result_rows": result_rows,
+            "city_results": city_results,
+            "leaderboard": leaderboard,
+        }
+
     async def run_regression(self) -> dict[str, Any]:
         now = datetime.now(UTC)
         date_from = now - timedelta(days=WINDOW_DAYS)
@@ -380,7 +529,16 @@ class StrategyRegressionService:
 
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            strategies = await repo.list_strategies(active_only=True)
+            strategy_rows = await repo.list_strategies(active_only=True)
+            strategies = [
+                RegressionStrategySpec(
+                    id=strategy.id,
+                    name=strategy.name,
+                    description=strategy.description,
+                    thresholds=strategy.thresholds,
+                )
+                for strategy in strategy_rows
+            ]
             if not strategies:
                 return {"status": "no_strategies"}
 
@@ -388,25 +546,17 @@ class StrategyRegressionService:
             if not rooms:
                 return {"status": "no_rooms", "window_days": WINDOW_DAYS}
 
-            rooms_by_series, diagnostics = _group_strategy_rooms_by_series(rooms, self.weather_directory)
-
-            result_rows: list[dict[str, Any]] = []
-            city_results: dict[str, dict[str, dict[str, Any]]] = {}
-
-            for strategy in strategies:
-                t = _thresholds_from_dict(strategy.thresholds)
-                for series_ticker, city_rooms in rooms_by_series.items():
-                    stats = self._evaluate_city(strategy.id, series_ticker, city_rooms, t, now, date_from, date_to)
-                    result_rows.append(stats)
-                    city_results.setdefault(series_ticker, {})[strategy.name] = {
-                        "win_rate": stats["win_rate"],
-                        "trade_count": stats["trade_count"],
-                        "resolved_trade_count": stats["resolved_trade_count"],
-                        "unscored_trade_count": stats["unscored_trade_count"],
-                        "total_pnl_dollars": stats["total_pnl_dollars"],
-                        "strategy_id": strategy.id,
-                        "strategy_name": strategy.name,
-                    }
+            evaluation = self.evaluate_strategy_specs_from_rooms(
+                strategies=strategies,
+                rooms=rooms,
+                run_at=now,
+                date_from=date_from,
+                date_to=date_to,
+                window_days=WINDOW_DAYS,
+            )
+            diagnostics = evaluation["diagnostics"]
+            result_rows = evaluation["result_rows"]
+            city_results = evaluation["city_results"]
 
             await repo.save_strategy_results(result_rows)
 
@@ -501,7 +651,8 @@ class StrategyRegressionService:
 
     def _evaluate_city(
         self,
-        strategy_id: int,
+        strategy_id: int | None,
+        strategy_name: str,
         series_ticker: str,
         rooms: list[dict[str, Any]],
         t: RuntimeThresholds,
@@ -537,6 +688,7 @@ class StrategyRegressionService:
 
         return {
             "strategy_id": strategy_id,
+            "strategy_name": strategy_name,
             "run_at": run_at,
             "date_from": date_from.date().isoformat(),
             "date_to": date_to.date().isoformat(),

@@ -424,6 +424,50 @@ def _build_strategies_payload(
         "leaderboard": leaderboard,
         "city_matrix": city_matrix,
         "detail_context": detail_context,
+        "codex_lab": {
+            "available": True,
+            "provider": "codex-cli",
+            "model": "gpt-4o",
+            "creation_window_days": 180,
+            "recent_runs": [
+                {
+                    "id": "run-suggest-1",
+                    "mode": "suggest",
+                    "status": "completed",
+                    "trigger_source": "nightly",
+                    "window_days": window_days,
+                    "series_ticker": "KXHIGHNY",
+                    "strategy_name": None,
+                    "created_at": "2026-04-21T18:40:00+00:00",
+                    "updated_at": "2026-04-21T18:42:00+00:00",
+                    "summary": "Saved as inactive preset balanced-plus.",
+                    "saved_strategy_name": "balanced-plus",
+                },
+                {
+                    "id": "run-evaluate-1",
+                    "mode": "evaluate",
+                    "status": "completed",
+                    "trigger_source": "manual",
+                    "window_days": window_days,
+                    "series_ticker": None,
+                    "strategy_name": "moderate",
+                    "created_at": "2026-04-21T18:35:00+00:00",
+                    "updated_at": "2026-04-21T18:36:00+00:00",
+                    "summary": "Moderate still leads the active presets, but New York remains the biggest assignment mismatch.",
+                    "saved_strategy_name": None,
+                },
+            ],
+            "inactive_codex_strategies": [
+                {
+                    "name": "balanced-plus",
+                    "description": "A Codex-suggested preset that splits the difference between moderate and aggressive.",
+                    "created_at": "2026-04-21T18:42:00+00:00",
+                    "labels": ["city-specific", "gap-sensitive"],
+                    "rationale": "Designed to preserve moderate's coverage while adding slightly looser spread tolerance.",
+                    "source_run_id": "run-suggest-1",
+                }
+            ],
+        },
         "recent_promotions": [
             {"kind": "promotion", "summary": "Strategy auto-promoted for KXHIGHNY: aggressive -> moderate", "source": "strategy_regression", "created_at": "2026-04-21T18:00:00+00:00", "series_ticker": "KXHIGHNY", "win_rate_display": "75%", "trade_count": 12},
             {"kind": "threshold_adjustment", "summary": "Auto-adjusted risk_min_edge_bps 50->40", "source": "strategy_eval", "created_at": "2026-04-21T18:00:00+00:00", "change_display": "50bps -> 40bps", "win_rate_display": "63%", "trade_count": 82},
@@ -730,60 +774,122 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 page.goto(base_url, wait_until="load", timeout=15_000)
                 page.locator('.dash-tab[data-env="strategies"]').click(timeout=15_000)
                 page.wait_for_selector("#strategies-summary", timeout=15_000)
-                page.wait_for_selector("#strategies-focus-review", timeout=15_000)
-                assert "180d" in (page.locator("#strategies-summary").text_content(timeout=15_000) or "")
-                assert page.locator("#strategies-review-queue-card").is_visible()
-                assert "Drifted assignment" in (page.locator("#strategies-review-queue").text_content(timeout=15_000) or "")
                 page.wait_for_function(
-                    "() => document.querySelector('#strategies-review-detail h3')?.textContent?.includes('KXHIGHNY')",
+                    "() => document.querySelector('#strategies-focus-cities')?.hidden === false",
                     timeout=15_000,
                 )
-                detail_text = page.locator("#strategies-review-detail").text_content(timeout=15_000) or ""
-                assert "Decision Brief" in detail_text
-                assert "Latest approval note" in detail_text
-                assert "Recommendation Rationale" in detail_text
-                assert page.locator("#strategies-review-detail textarea").is_visible()
+                assert "180d" in (page.locator("#strategies-summary").text_content(timeout=15_000) or "")
+                focus_modes = page.locator("#strategies-focus-switch button").evaluate_all(
+                    "(nodes) => nodes.map((node) => node.dataset.focusMode)"
+                )
+                assert focus_modes == ["cities", "strategies", "review"]
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-cities-detail h3')?.textContent?.includes('KXHIGHNY')",
+                    timeout=15_000,
+                )
+                summary_text = page.locator("#strategies-summary").text_content(timeout=15_000) or ""
+                assert "Cities Evaluated" in summary_text
+                assert "Actionable Cities" in summary_text
+                assert "Assignment Mismatches" in summary_text
+                assert "Low-Confidence Cities" in summary_text
+                detail_text = page.locator("#strategies-cities-detail").text_content(timeout=15_000) or ""
+                assert "City Research Brief" in detail_text
+                assert "Evidence interpretation" in detail_text
+                assert "Approval" in detail_text
+                assert page.locator("#strategies-cities-detail textarea").is_visible()
+                page.locator('#strategies-cities-detail button:has-text("Open in Codex Lab")').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-focus-strategies')?.hidden === false",
+                    timeout=15_000,
+                )
+                codex_text = page.locator("#strategies-codex-lab").text_content(timeout=15_000) or ""
+                assert "Codex CLI ready" in codex_text
+                assert "Nightly" in codex_text
+                assert "Saved Inactive Presets" in codex_text
+                assert "balanced-plus" in codex_text
+                page.locator('#strategies-focus-switch button[data-focus-mode="cities"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-focus-cities')?.hidden === false",
+                    timeout=15_000,
+                )
+
+                page.wait_for_selector("#strategies-city-matrix table", timeout=15_000)
+                header_text = page.locator("#strategies-city-matrix thead").text_content(timeout=15_000) or ""
+                assert "Best Strategy" in header_text
+                assert "Resolved" in header_text
+                assert "moderate" not in header_text
+                assert "aggressive" not in header_text
+
+                assert "Actionable" in (page.locator('#strategies-city-filters button[data-city-filter="actionable"]').text_content(timeout=15_000) or "")
+                assert "2" in (page.locator('#strategies-city-filters button[data-city-filter="actionable"]').text_content(timeout=15_000) or "")
+                assert "1" in (page.locator('#strategies-city-filters button[data-city-filter="needs_review"]').text_content(timeout=15_000) or "")
+                assert "1" in (page.locator('#strategies-city-filters button[data-city-filter="mismatch"]').text_content(timeout=15_000) or "")
+
+                page.locator('#strategies-city-filters button[data-city-filter="no_outcomes"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => (document.querySelector('#strategies-city-matrix')?.textContent || '').includes('No cities match the current search or filter.')",
+                    timeout=15_000,
+                )
+                assert "No city research brief is available" in (page.locator("#strategies-cities-detail").text_content(timeout=15_000) or "")
+                page.locator('#strategies-city-filters button[data-city-filter="all"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-cities-detail h3')?.textContent?.includes('KXHIGHNY')",
+                    timeout=15_000,
+                )
+
+                page.locator("#strategies-city-search").fill("aggressive", timeout=15_000)
+                page.wait_for_function(
+                    "() => (document.querySelector('#strategies-city-matrix tbody')?.textContent || '').includes('New York City')",
+                    timeout=15_000,
+                )
+                matrix_text = page.locator("#strategies-city-matrix tbody").text_content(timeout=15_000) or ""
+                assert "New York City" in matrix_text
+                assert "Chicago" not in matrix_text
+                page.locator("#strategies-city-search").fill("", timeout=15_000)
+
+                page.locator('#strategies-focus-switch button[data-focus-mode="strategies"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-focus-strategies')?.hidden === false",
+                    timeout=15_000,
+                )
+                assert page.locator("#strategies-codex-lab").is_visible()
+                page.wait_for_selector("#strategies-leaderboard .strategy-card", timeout=15_000)
+                page.locator('#strategies-leaderboard button[data-strategy-name="aggressive"]').click(timeout=15_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#strategies-detail h3')?.textContent?.includes('aggressive')",
+                    timeout=15_000,
+                )
+                assert "Stored regression history" in (page.locator("#strategies-detail").text_content(timeout=15_000) or "")
+                assert page.locator("#strategies-recent").is_visible()
+                assert page.locator("#strategies-methodology").is_visible()
 
                 page.locator('#strategies-focus-switch button[data-focus-mode="cities"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-focus-cities')?.hidden === false",
                     timeout=15_000,
                 )
-                page.wait_for_selector("#strategies-city-matrix table", timeout=15_000)
-                header_text = page.locator("#strategies-city-matrix thead").text_content(timeout=15_000) or ""
-                assert "Best Strategy" in header_text
-                assert "moderate" not in header_text
-                assert "aggressive" not in header_text
-                city_detail_text = page.locator("#strategies-cities-detail").text_content(timeout=15_000) or ""
-                assert "KXHIGHNY" in city_detail_text
-
-                page.locator("#strategies-city-search").fill("Chicago", timeout=15_000)
                 page.wait_for_function(
-                    "() => (document.querySelector('#strategies-city-matrix tbody')?.textContent || '').includes('Chicago')",
+                    "() => document.querySelector('#strategies-cities-detail h3')?.textContent?.includes('KXHIGHNY')",
                     timeout=15_000,
                 )
-                matrix_text = page.locator("#strategies-city-matrix tbody").text_content(timeout=15_000) or ""
-                assert "Chicago" in matrix_text
-                assert "New York City" not in matrix_text
-                page.locator("#strategies-city-search").fill("", timeout=15_000)
 
                 page.locator('#strategies-window-filter button[data-window-days="90"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-summary')?.textContent?.includes('90d')",
                     timeout=15_000,
                 )
-                page.locator('#strategies-city-matrix button[data-series-ticker="KXHIGHNY"]').click(timeout=15_000)
                 page.wait_for_function(
                     "() => document.querySelector('#strategies-cities-detail h3')?.textContent?.includes('KXHIGHNY')",
                     timeout=15_000,
                 )
                 assert "Review Queue" not in (page.locator("#strategies-focus-switch").text_content(timeout=15_000) or "")
+                assert page.locator('#strategies-city-filters button[data-city-filter="needs_review"]').count() == 0
                 detail_text_90d = page.locator("#strategies-cities-detail").text_content(timeout=15_000) or ""
-                assert "Assignment Review" not in detail_text_90d
-                assert "Recommendation Rationale" in detail_text_90d
+                assert "City Research Brief" in detail_text_90d
+                assert "Evidence interpretation" in detail_text_90d
                 assert "Latest approval note" not in detail_text_90d
                 assert page.locator("#strategies-cities-detail textarea").count() == 0
-                assert "Stored regression history" in detail_text_90d
+                assert "Trend History" in detail_text_90d
 
                 page.locator('#strategies-focus-switch button[data-focus-mode="strategies"]').click(timeout=15_000)
                 page.wait_for_function(

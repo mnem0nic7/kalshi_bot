@@ -2525,12 +2525,13 @@ def _strategy_detail_context(
     }
 
 
-async def build_strategies_dashboard(
+async def build_strategies_dashboard_core(
     container: AppContainer,
     *,
     window_days: int = DEFAULT_STRATEGY_WINDOW_DAYS,
     series_ticker: str | None = None,
     strategy_name: str | None = None,
+    include_codex_lab: bool = True,
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
     if window_days not in STRATEGY_WINDOW_OPTIONS:
@@ -2694,8 +2695,7 @@ async def build_strategies_dashboard(
         "assignments_covered_display": f"{len(assigned_series)} / {len(configured_series) if configured_series else 0}",
         "methodology_note": "Canonical outcomes, manual approval",
     }
-
-    return {
+    payload = {
         "summary": summary,
         "leaderboard": leaderboard,
         "city_matrix": city_matrix,
@@ -2713,3 +2713,29 @@ async def build_strategies_dashboard(
             "promotion_gap_threshold": STRATEGY_STRONG_RECOMMENDATION_GAP,
         },
     }
+    if include_codex_lab and getattr(container, "strategy_codex_service", None) is not None:
+        payload["codex_lab"] = await container.strategy_codex_service.dashboard_payload()
+    return payload
+
+
+async def build_strategies_dashboard(
+    container: AppContainer,
+    *,
+    window_days: int = DEFAULT_STRATEGY_WINDOW_DAYS,
+    series_ticker: str | None = None,
+    strategy_name: str | None = None,
+) -> dict[str, Any]:
+    if not hasattr(container, "strategy_dashboard_service"):
+        return await build_strategies_dashboard_core(
+            container,
+            window_days=window_days,
+            series_ticker=series_ticker,
+            strategy_name=strategy_name,
+            include_codex_lab=True,
+        )
+    return await container.strategy_dashboard_service.build_dashboard(
+        window_days=window_days,
+        series_ticker=series_ticker,
+        strategy_name=strategy_name,
+        include_codex_lab=True,
+    )

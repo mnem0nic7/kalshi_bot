@@ -25,6 +25,7 @@ async def test_init_models_creates_core_tables(tmp_path) -> None:
     assert "rooms" in tables
     assert "deployment_control" in tables
     assert "ops_events" in tables
+    assert "strategy_codex_runs" in tables
 
 
 @pytest.mark.asyncio

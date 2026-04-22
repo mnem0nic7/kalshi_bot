@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -70,6 +70,7 @@ from kalshi_bot.db.models import (
     CityStrategyAssignment,
     Signal,
     StrategyRecord,
+    StrategyCodexRunRecord,
     StrategyResultRecord,
     TrainingDatasetBuildItemRecord,
     TrainingDatasetBuildRecord,
@@ -2935,12 +2936,37 @@ class PlatformRepository:
                     description=preset.get("description"),
                     thresholds=preset["thresholds"],
                     is_active=preset.get("is_active", True),
+                    source=preset.get("source", "builtin"),
+                    strategy_metadata=preset.get("metadata", {}),
                     created_at=datetime.now(UTC),
                 )
                 .on_conflict_do_nothing(index_elements=["name"])
             )
             await self.session.execute(stmt)
         await self.session.flush()
+
+    async def create_strategy(
+        self,
+        *,
+        name: str,
+        description: str | None,
+        thresholds: dict[str, Any],
+        is_active: bool = True,
+        source: str = "manual",
+        metadata: dict[str, Any] | None = None,
+    ) -> StrategyRecord:
+        record = StrategyRecord(
+            name=name,
+            description=description,
+            thresholds=thresholds,
+            is_active=is_active,
+            source=source,
+            strategy_metadata=dict(metadata or {}),
+            created_at=datetime.now(UTC),
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
 
     async def list_strategies(self, *, active_only: bool = True) -> list[StrategyRecord]:
         stmt = select(StrategyRecord)
@@ -2952,6 +2978,14 @@ class PlatformRepository:
     async def get_strategy_by_name(self, name: str) -> StrategyRecord | None:
         stmt = select(StrategyRecord).where(StrategyRecord.name == name)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def set_strategy_active(self, name: str, *, is_active: bool) -> StrategyRecord | None:
+        record = await self.get_strategy_by_name(name)
+        if record is None:
+            return None
+        record.is_active = is_active
+        await self.session.flush()
+        return record
 
     async def save_strategy_results(self, results: list[dict[str, Any]]) -> None:
         for row in results:
@@ -3123,3 +3157,93 @@ class PlatformRepository:
         )
         rows = list((await self.session.execute(stmt)).mappings())
         return [dict(r) for r in rows]
+
+    async def create_strategy_codex_run(
+        self,
+        *,
+        mode: str,
+        status: str,
+        trigger_source: str,
+        window_days: int,
+        series_ticker: str | None,
+        strategy_name: str | None,
+        operator_brief: str | None,
+        provider: str,
+        model: str | None,
+        payload: dict[str, Any],
+    ) -> StrategyCodexRunRecord:
+        record = StrategyCodexRunRecord(
+            mode=mode,
+            status=status,
+            trigger_source=trigger_source,
+            window_days=window_days,
+            series_ticker=series_ticker,
+            strategy_name=strategy_name,
+            operator_brief=operator_brief,
+            provider=provider,
+            model=model,
+            payload=payload,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def get_strategy_codex_run(self, run_id: str) -> StrategyCodexRunRecord | None:
+        return await self.session.get(StrategyCodexRunRecord, run_id)
+
+    async def update_strategy_codex_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        payload: dict[str, Any] | None = None,
+        error_text: str | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
+    ) -> StrategyCodexRunRecord:
+        record = await self.session.get(StrategyCodexRunRecord, run_id)
+        if record is None:
+            raise KeyError(f"Strategy codex run {run_id} not found")
+        if status is not None:
+            record.status = status
+        if payload is not None:
+            record.payload = payload
+        record.error_text = error_text
+        if started_at is not None:
+            record.started_at = started_at
+        if finished_at is not None:
+            record.finished_at = finished_at
+        await self.session.flush()
+        return record
+
+    async def list_strategy_codex_runs(self, *, limit: int = 10) -> list[StrategyCodexRunRecord]:
+        result = await self.session.execute(
+            select(StrategyCodexRunRecord).order_by(StrategyCodexRunRecord.created_at.desc()).limit(limit)
+        )
+        return list(result.scalars())
+
+    async def fail_stale_strategy_codex_runs(
+        self,
+        *,
+        stale_before: datetime,
+        error_text: str,
+    ) -> list[StrategyCodexRunRecord]:
+        result = await self.session.execute(
+            select(StrategyCodexRunRecord).where(
+                StrategyCodexRunRecord.status.in_(("queued", "running")),
+                or_(
+                    StrategyCodexRunRecord.started_at < stale_before,
+                    StrategyCodexRunRecord.started_at.is_(None) & (StrategyCodexRunRecord.created_at < stale_before),
+                ),
+            )
+        )
+        records = list(result.scalars())
+        if not records:
+            return []
+        finished_at = datetime.now(UTC)
+        for record in records:
+            record.status = "failed"
+            record.error_text = error_text
+            record.finished_at = finished_at
+        await self.session.flush()
+        return records

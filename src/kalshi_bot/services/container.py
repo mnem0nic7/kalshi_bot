@@ -35,6 +35,8 @@ from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.stop_loss import StopLossService
 from kalshi_bot.services.strategy_eval import StrategyEvaluationService
+from kalshi_bot.services.strategy_codex import StrategyCodexService
+from kalshi_bot.services.strategy_dashboard import StrategyDashboardService
 from kalshi_bot.services.strategy_regression import StrategyRegressionService
 from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
@@ -75,6 +77,8 @@ class AppContainer:
     shadow_training_service: ShadowTrainingService
     shadow_campaign_service: ShadowCampaignService
     self_improve_service: SelfImproveService
+    strategy_codex_service: StrategyCodexService
+    strategy_dashboard_service: StrategyDashboardService
     market_history_service: MarketHistoryService
     watchdog_service: WatchdogService
     agents: AgentSuite
@@ -204,6 +208,12 @@ class AppContainer:
         stop_loss_service = StopLossService(settings, session_factory, kalshi)
         strategy_eval_service = StrategyEvaluationService(settings, session_factory, agent_pack_service)
         strategy_regression_service = StrategyRegressionService(settings, session_factory, weather_directory, agent_pack_service)
+        strategy_codex_service = StrategyCodexService(settings, session_factory, strategy_regression_service)
+        strategy_dashboard_service = StrategyDashboardService(
+            session_factory=session_factory,
+            weather_directory=weather_directory,
+            strategy_codex_service=strategy_codex_service,
+        )
         daemon_service = DaemonService(
             settings,
             session_factory,
@@ -223,6 +233,8 @@ class AppContainer:
             market_history_service=market_history_service,
             strategy_eval_service=strategy_eval_service,
             strategy_regression_service=strategy_regression_service,
+            strategy_codex_service=strategy_codex_service,
+            strategy_dashboard_service=strategy_dashboard_service,
             stop_loss_service=stop_loss_service,
         )
         container = cls(
@@ -255,6 +267,8 @@ class AppContainer:
             shadow_training_service=shadow_training_service,
             shadow_campaign_service=shadow_campaign_service,
             self_improve_service=self_improve_service,
+            strategy_codex_service=strategy_codex_service,
+            strategy_dashboard_service=strategy_dashboard_service,
             market_history_service=market_history_service,
             watchdog_service=watchdog_service,
             agents=agents,
@@ -278,6 +292,7 @@ class AppContainer:
         await self.kalshi_ws.close()
         await self.kalshi.close()
         await self.weather.close()
+        await self.strategy_codex_service.close()
         await self.historical_training_service.close()
         await self.providers.close()
         await self.engine.dispose()

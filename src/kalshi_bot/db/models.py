@@ -661,6 +661,8 @@ class StrategyRecord(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     thresholds: Mapped[dict] = mapped_column(JSON, default=dict)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    source: Mapped[str] = mapped_column(String(64), default="builtin", index=True)
+    strategy_metadata: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
@@ -691,3 +693,21 @@ class CityStrategyAssignment(Base):
     strategy_name: Mapped[str] = mapped_column(String(64))
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     assigned_by: Mapped[str] = mapped_column(String(64), default="auto_regression")
+
+
+class StrategyCodexRunRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "strategy_codex_runs"
+
+    mode: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    trigger_source: Mapped[str] = mapped_column(String(32), default="manual", index=True)
+    window_days: Mapped[int] = mapped_column(Integer, index=True)
+    series_ticker: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    strategy_name: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    operator_brief: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider: Mapped[str] = mapped_column(String(64), default="codex-cli")
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)

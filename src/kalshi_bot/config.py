@@ -197,6 +197,9 @@ class Settings(BaseSettings):
     historical_pipeline_daily_run_seconds: int = 86400
     historical_pipeline_incremental_days: int = 7
     strategy_regression_daily_run_seconds: int = 86400
+    strategy_codex_nightly_enabled: bool = True
+    strategy_codex_nightly_timezone: str = "America/Los_Angeles"
+    strategy_codex_nightly_hour_local: int = 1
     historical_execution_confidence_min_market_days: int = 60
     historical_directional_confidence_min_full_market_days: int = 30
     historical_directional_confidence_min_holdout_market_days: int = 7

@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -24,8 +25,10 @@ from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.strategy_eval import StrategyEvaluationService
+from kalshi_bot.services.strategy_codex import StrategyCodexService
+from kalshi_bot.services.strategy_dashboard import StrategyDashboardService
 from kalshi_bot.services.stop_loss import StopLossService
-from kalshi_bot.services.strategy_regression import StrategyRegressionService
+from kalshi_bot.services.strategy_regression import StrategyRegressionService, WINDOW_DAYS as DEFAULT_STRATEGY_WINDOW_DAYS
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -55,6 +58,8 @@ class DaemonService:
         strategy_eval_service: StrategyEvaluationService | None = None,
         strategy_regression_service: StrategyRegressionService | None = None,
         stop_loss_service: StopLossService | None = None,
+        strategy_codex_service: StrategyCodexService | None = None,
+        strategy_dashboard_service: StrategyDashboardService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -74,6 +79,8 @@ class DaemonService:
         self.market_history_service = market_history_service
         self.strategy_eval_service = strategy_eval_service
         self.strategy_regression_service = strategy_regression_service
+        self.strategy_codex_service = strategy_codex_service
+        self.strategy_dashboard_service = strategy_dashboard_service
         self.stop_loss_service = stop_loss_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
@@ -306,6 +313,9 @@ class DaemonService:
             strategy_regression = await self._maybe_run_strategy_regression()
             if strategy_regression is not None:
                 payload["strategy_regression"] = strategy_regression
+            strategy_codex_nightly = await self._maybe_run_strategy_codex_nightly()
+            if strategy_codex_nightly is not None:
+                payload["strategy_codex_nightly"] = strategy_codex_nightly
             historical_pipeline = await self._maybe_run_historical_pipeline()
             if historical_pipeline is not None:
                 payload["historical_pipeline"] = historical_pipeline
@@ -500,7 +510,7 @@ class DaemonService:
         if self.strategy_regression_service is None:
             return None
         last_run_at = await self._checkpoint_time("strategy_regression")
-        now = datetime.now(UTC)
+        now = self._utc_now()
         min_interval = timedelta(seconds=max(3600, self.settings.strategy_regression_daily_run_seconds))
         if last_run_at is not None and now - last_run_at < min_interval:
             return None
@@ -509,6 +519,179 @@ class DaemonService:
         except Exception:
             logger.warning("strategy_regression failed", exc_info=True)
             return None
+
+    async def _maybe_run_strategy_codex_nightly(self) -> dict[str, Any] | None:
+        if not self.settings.strategy_codex_nightly_enabled:
+            return None
+        if self.strategy_regression_service is None or self.strategy_codex_service is None or self.strategy_dashboard_service is None:
+            return None
+
+        night_state = self._strategy_codex_nightly_state()
+        if not night_state["due"]:
+            return None
+
+        checkpoint_name = f"daemon_strategy_codex_nightly:{self.settings.kalshi_env}:{self.settings.app_color}"
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            checkpoint = await repo.get_checkpoint(checkpoint_name)
+            await session.commit()
+        if checkpoint is not None and isinstance(checkpoint.payload, dict):
+            if checkpoint.payload.get("local_date") == night_state["local_date"]:
+                return None
+
+        if not self.strategy_codex_service.is_available():
+            payload = {
+                "status": "skipped",
+                "reason": "codex_unavailable",
+                "local_date": night_state["local_date"],
+                "timezone": self.settings.strategy_codex_nightly_timezone,
+                "hour_local": self.settings.strategy_codex_nightly_hour_local,
+                "run_ids": [],
+                "regression_refreshed": False,
+            }
+            await self._set_nightly_codex_checkpoint(checkpoint_name, payload)
+            await self._log_daemon_event(
+                severity="warning",
+                summary="Nightly strategy Codex skipped: Codex CLI unavailable",
+                payload=payload,
+            )
+            return payload
+
+        regression_refreshed = False
+        regression_result = None
+        target_utc = night_state["target_local"].astimezone(UTC)
+        regression_run_at = await self._checkpoint_time("strategy_regression")
+        if regression_run_at is None or regression_run_at < target_utc:
+            try:
+                regression_result = await self.strategy_regression_service.run_regression()
+            except Exception as exc:
+                logger.warning("nightly strategy codex regression refresh failed", exc_info=True)
+                payload = {
+                    "status": "failed",
+                    "reason": "regression_refresh_failed",
+                    "error": str(exc),
+                    "local_date": night_state["local_date"],
+                    "timezone": self.settings.strategy_codex_nightly_timezone,
+                    "hour_local": self.settings.strategy_codex_nightly_hour_local,
+                    "run_ids": [],
+                    "regression_refreshed": regression_refreshed,
+                }
+                await self._set_nightly_codex_checkpoint(checkpoint_name, payload)
+                await self._log_daemon_event(
+                    severity="warning",
+                    summary="Nightly strategy Codex skipped: regression refresh failed",
+                    payload=payload,
+                )
+                return payload
+            regression_refreshed = True
+            regression_run_at = await self._checkpoint_time("strategy_regression")
+
+        if regression_run_at is None or regression_run_at < target_utc:
+            payload = {
+                "status": "skipped",
+                "reason": "fresh_regression_unavailable",
+                "local_date": night_state["local_date"],
+                "timezone": self.settings.strategy_codex_nightly_timezone,
+                "hour_local": self.settings.strategy_codex_nightly_hour_local,
+                "run_ids": [],
+                "regression_refreshed": regression_refreshed,
+                "regression_result": regression_result,
+            }
+            await self._set_nightly_codex_checkpoint(checkpoint_name, payload)
+            await self._log_daemon_event(
+                severity="warning",
+                summary="Nightly strategy Codex skipped: fresh 180d regression snapshot unavailable",
+                payload=payload,
+            )
+            return payload
+
+        try:
+            dashboard_snapshot = await self.strategy_dashboard_service.build_dashboard(
+                window_days=DEFAULT_STRATEGY_WINDOW_DAYS,
+                include_codex_lab=False,
+            )
+            run_views = await self.strategy_codex_service.execute_modes_for_snapshot(
+                modes=["evaluate", "suggest"],
+                dashboard_snapshot=dashboard_snapshot,
+                window_days=DEFAULT_STRATEGY_WINDOW_DAYS,
+                trigger_source="nightly",
+            )
+        except Exception as exc:
+            logger.warning("nightly strategy codex execution failed", exc_info=True)
+            payload = {
+                "status": "failed",
+                "reason": "nightly_execution_failed",
+                "error": str(exc),
+                "local_date": night_state["local_date"],
+                "timezone": self.settings.strategy_codex_nightly_timezone,
+                "hour_local": self.settings.strategy_codex_nightly_hour_local,
+                "run_ids": [],
+                "regression_refreshed": regression_refreshed,
+                "regression_result": regression_result,
+            }
+            await self._set_nightly_codex_checkpoint(checkpoint_name, payload)
+            await self._log_daemon_event(
+                severity="warning",
+                summary="Nightly strategy Codex failed during execution",
+                payload=payload,
+            )
+            return payload
+        run_ids = [run_view["id"] for run_view in run_views if run_view.get("id")]
+        run_statuses = [run_view.get("status") for run_view in run_views]
+        status = "completed" if run_statuses and all(item == "completed" for item in run_statuses) else "completed_with_failures"
+        payload = {
+            "status": status,
+            "local_date": night_state["local_date"],
+            "timezone": self.settings.strategy_codex_nightly_timezone,
+            "hour_local": self.settings.strategy_codex_nightly_hour_local,
+            "run_ids": run_ids,
+            "run_statuses": run_statuses,
+            "regression_refreshed": regression_refreshed,
+            "regression_result": regression_result,
+        }
+        await self._set_nightly_codex_checkpoint(checkpoint_name, payload)
+        return payload
+
+    async def _set_nightly_codex_checkpoint(self, stream_name: str, payload: dict[str, Any]) -> None:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.set_checkpoint(
+                stream_name,
+                None,
+                {
+                    **payload,
+                    "ran_at": self._now_iso(),
+                },
+            )
+            await session.commit()
+
+    async def _log_daemon_event(self, *, severity: str, summary: str, payload: dict[str, Any]) -> None:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.log_ops_event(
+                severity=severity,
+                summary=summary,
+                source="daemon",
+                payload=payload,
+            )
+            await session.commit()
+
+    def _strategy_codex_nightly_state(self) -> dict[str, Any]:
+        now = self._utc_now()
+        timezone = ZoneInfo(self.settings.strategy_codex_nightly_timezone)
+        local_now = now.astimezone(timezone)
+        target_local = local_now.replace(
+            hour=self.settings.strategy_codex_nightly_hour_local,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        return {
+            "due": local_now >= target_local,
+            "local_date": local_now.date().isoformat(),
+            "local_now": local_now,
+            "target_local": target_local,
+        }
 
     async def _checkpoint_time(self, stream_name: str) -> datetime | None:
         async with self.session_factory() as session:
@@ -535,3 +718,6 @@ class DaemonService:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(UTC).isoformat()
+
+    def _utc_now(self) -> datetime:
+        return datetime.now(UTC)

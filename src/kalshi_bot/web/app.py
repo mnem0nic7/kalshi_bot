@@ -32,6 +32,7 @@ from kalshi_bot.core.schemas import (
     SelfImprovePromoteRequest,
     SelfImproveRollbackRequest,
     StrategyAssignmentApprovalRequest,
+    StrategyCodexRunRequest,
     TrainingBuildRequest,
     TriggerRequest,
     WebLoginRequest,
@@ -1304,6 +1305,56 @@ def create_app() -> FastAPI:
             series_ticker=series_ticker,
             strategy_name=strategy_name,
         )
+        return JSONResponse(jsonable_encoder(payload))
+
+    @app.post("/api/strategies/codex/runs")
+    async def create_strategy_codex_run(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await parse_json_model(request, StrategyCodexRunRequest)
+        if payload.window_days not in STRATEGY_WINDOW_OPTIONS:
+            return JSONResponse({"error": "invalid_window_days"}, status_code=400)
+        if not app_container.strategy_codex_service.is_available():
+            return JSONResponse({"error": "codex_unavailable"}, status_code=503)
+        snapshot = await build_strategies_dashboard(
+            app_container,
+            window_days=payload.window_days,
+            series_ticker=payload.series_ticker,
+            strategy_name=payload.strategy_name,
+        )
+        run = await app_container.strategy_codex_service.create_run(
+            request=payload,
+            dashboard_snapshot=snapshot,
+            trigger_source="manual",
+        )
+        asyncio.create_task(app_container.strategy_codex_service.execute_run(run["run_id"]))
+        return JSONResponse(run)
+
+    @app.get("/api/strategies/codex/runs/{run_id}")
+    async def get_strategy_codex_run(run_id: str, request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await app_container.strategy_codex_service.get_run_view(run_id)
+        if payload is None:
+            return JSONResponse({"error": "unknown_run_id", "run_id": run_id}, status_code=404)
+        return JSONResponse(jsonable_encoder(payload))
+
+    @app.post("/api/strategies/codex/runs/{run_id}/accept")
+    async def accept_strategy_codex_run(run_id: str, request: Request) -> JSONResponse:
+        app_container = container(request)
+        try:
+            payload = await app_container.strategy_codex_service.accept_run(run_id)
+        except KeyError:
+            return JSONResponse({"error": "unknown_run_id", "run_id": run_id}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": "invalid_run_state", "message": str(exc)}, status_code=400)
+        return JSONResponse(jsonable_encoder(payload))
+
+    @app.post("/api/strategies/{strategy_name}/activate")
+    async def activate_strategy_preset(strategy_name: str, request: Request) -> JSONResponse:
+        app_container = container(request)
+        try:
+            payload = await app_container.strategy_codex_service.activate_strategy(strategy_name)
+        except KeyError:
+            return JSONResponse({"error": "unknown_strategy", "strategy_name": strategy_name}, status_code=404)
         return JSONResponse(jsonable_encoder(payload))
 
     @app.post("/api/strategies/assignments/{series_ticker}/approve")

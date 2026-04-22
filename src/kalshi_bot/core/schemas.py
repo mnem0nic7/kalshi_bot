@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kalshi_bot.core.enums import (
     AgentRole,
@@ -858,6 +858,151 @@ class StrategyAssignmentApprovalRequest(BaseModel):
     def validate_note(cls, value: str) -> str:
         if not value:
             raise ValueError("Note is required")
+        return value
+
+
+class StrategyThresholdPreset(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    risk_min_edge_bps: int
+    risk_max_order_notional_dollars: float
+    risk_max_position_notional_dollars: float
+    trigger_max_spread_bps: int
+    trigger_cooldown_seconds: int
+    strategy_quality_edge_buffer_bps: int
+    strategy_min_remaining_payout_bps: int
+    risk_safe_capital_reserve_ratio: float
+    risk_risky_capital_max_ratio: float
+
+    @field_validator(
+        "risk_min_edge_bps",
+        "trigger_max_spread_bps",
+        "trigger_cooldown_seconds",
+        "strategy_quality_edge_buffer_bps",
+        "strategy_min_remaining_payout_bps",
+        mode="before",
+    )
+    @classmethod
+    def validate_raw_ints(cls, value: Any) -> Any:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("Threshold must be an integer")
+        return value
+
+    @field_validator(
+        "risk_min_edge_bps",
+        "trigger_max_spread_bps",
+        "trigger_cooldown_seconds",
+        "strategy_quality_edge_buffer_bps",
+        "strategy_min_remaining_payout_bps",
+    )
+    @classmethod
+    def validate_non_negative_ints(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("Threshold must be non-negative")
+        return value
+
+    @field_validator(
+        "risk_max_order_notional_dollars",
+        "risk_max_position_notional_dollars",
+        "risk_safe_capital_reserve_ratio",
+        "risk_risky_capital_max_ratio",
+        mode="before",
+    )
+    @classmethod
+    def validate_raw_numeric_fields(cls, value: Any) -> Any:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("Threshold must be numeric")
+        return value
+
+    @field_validator("risk_max_order_notional_dollars", "risk_max_position_notional_dollars")
+    @classmethod
+    def validate_positive_dollars(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("Dollar threshold must be positive")
+        return value
+
+    @field_validator("strategy_min_remaining_payout_bps")
+    @classmethod
+    def validate_positive_remaining_payout(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("Remaining payout threshold must be positive")
+        return value
+
+    @field_validator("risk_safe_capital_reserve_ratio", "risk_risky_capital_max_ratio")
+    @classmethod
+    def validate_ratios(cls, value: float) -> float:
+        if value < 0 or value > 1:
+            raise ValueError("Capital ratios must be between 0 and 1")
+        return value
+
+    @model_validator(mode="after")
+    def validate_ratio_balance(self) -> "StrategyThresholdPreset":
+        if round(self.risk_safe_capital_reserve_ratio + self.risk_risky_capital_max_ratio, 6) != 1.0:
+            raise ValueError("Capital ratios must sum to 1.0")
+        return self
+
+
+class StrategyCodexRunRequest(BaseModel):
+    mode: str
+    window_days: int
+    series_ticker: str | None = None
+    strategy_name: str | None = None
+    operator_brief: str | None = None
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def strip_mode(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, value: str) -> str:
+        if value not in {"evaluate", "suggest"}:
+            raise ValueError("Mode must be evaluate or suggest")
+        return value
+
+    @field_validator("series_ticker", "strategy_name", "operator_brief", mode="before")
+    @classmethod
+    def strip_optional_text(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+
+class StrategyCodexEvaluationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    strengths: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    opportunities: list[str] = Field(default_factory=list)
+    recommended_actions: list[str] = Field(default_factory=list)
+
+
+class StrategyCodexSuggestionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str
+    labels: list[str] = Field(default_factory=list)
+    rationale: str
+    thresholds: StrategyThresholdPreset
+
+    @field_validator("name", "description", "rationale", mode="before")
+    @classmethod
+    def strip_required_text(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("name", "description", "rationale")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        if not value:
+            raise ValueError("Field is required")
         return value
 
 
