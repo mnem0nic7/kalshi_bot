@@ -232,6 +232,8 @@ class WorkflowSupervisor:
         control: Any,
         signal: StrategySignal,
         thresholds: Any,
+        market_observed_at: datetime | None = None,
+        research_observed_at: datetime | None = None,
     ) -> None:
         receipt = ExecReceiptPayload(status="no_trade", details={})
         final_status = "no_trade"
@@ -335,8 +337,8 @@ class WorkflowSupervisor:
                     kalshi_env=room.kalshi_env,
                 )
                 risk_context = RiskContext(
-                    market_observed_at=None,
-                    research_observed_at=None,
+                    market_observed_at=market_observed_at,
+                    research_observed_at=research_observed_at,
                     current_position_notional_dollars=current_position_notional,
                     current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
                     pending_order_count_fp=pending_order_count_fp,
@@ -723,6 +725,8 @@ class WorkflowSupervisor:
                         control=control,
                         signal=signal,
                         thresholds=thresholds,
+                        market_observed_at=market_state.observed_at,
+                        research_observed_at=dossier.freshness.refreshed_at,
                     )
                     return
 
