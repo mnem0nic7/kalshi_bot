@@ -154,7 +154,7 @@
             </span>
             {% endif %}
           </div>
-          <span class="muted-label">{{ env_data.positions | length }} position{{ "s" if env_data.positions | length != 1 }}</span>
+          <span class="muted-label positions-count-label">{{ env_data.positions | length }} position{{ "s" if env_data.positions | length != 1 }}</span>
         </div>
         {% if env_data.positions %}
         <div class="table-wrap">
@@ -205,6 +205,41 @@
       </article>
 
     </div>
+
+    {% set recent_trade_proposals = env_data.recent_trade_proposals or [] %}
+    <article class="dash-card dash-card-proposals" data-testid="recent-trade-proposals">
+      <div class="dash-card-header">
+        <div class="dash-card-title-block">
+          <h2>Recent Trade Proposals</h2>
+          <span class="muted-label">Latest proposed tickets and their risk verdicts</span>
+        </div>
+        <span class="muted-label trade-proposals-count-label">{{ recent_trade_proposals | length }} ticket{{ "s" if recent_trade_proposals | length != 1 }}</span>
+      </div>
+      {% if recent_trade_proposals %}
+      <div class="table-wrap">
+        <table class="positions-table">
+          <thead>
+            <tr><th>Market</th><th>Side</th><th>Yes Price</th><th>Contracts</th><th>Status</th><th>Risk</th><th>Approved Notional</th></tr>
+          </thead>
+          <tbody>
+            {% for item in recent_trade_proposals %}
+            <tr>
+              <td class="mono">{{ item.market_ticker }}</td>
+              <td><span class="status-pill {% if item.side_tone == 'good' %}status-good{% elif item.side_tone == 'warning' %}status-warning{% elif item.side_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.side }}</span></td>
+              <td class="mono">{{ item.yes_price_dollars }}</td>
+              <td class="mono">{{ item.count_fp }}</td>
+              <td><span class="status-pill {% if item.status_tone == 'good' %}status-good{% elif item.status_tone == 'warning' %}status-warning{% elif item.status_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.status }}</span></td>
+              <td><span class="status-pill {% if item.risk_status_tone == 'good' %}status-good{% elif item.risk_status_tone == 'warning' %}status-warning{% elif item.risk_status_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.risk_status or "—" }}</span></td>
+              <td class="mono">{{ item.approved_notional_dollars or "—" }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="empty-state">No recent proposed tickets.</p>
+      {% endif %}
+    </article>
   </section>
   {% endfor %}
 

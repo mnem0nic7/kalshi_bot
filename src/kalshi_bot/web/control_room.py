@@ -45,6 +45,7 @@ SUMMARY_ROOM_OUTCOME_LIMIT = 500
 ROOM_TAB_LIMIT = 40
 POSITION_LIMIT = 100
 OPS_EVENT_LIMIT = 40
+RECENT_TRADE_PROPOSAL_LIMIT = 10
 RESEARCH_ACTIVE_STATUSES = {"active", "open"}
 STRATEGY_WINDOW_OPTIONS = (30, 90, DEFAULT_STRATEGY_WINDOW_DAYS)
 STRATEGY_EVENT_LIMIT = 80
@@ -575,6 +576,79 @@ def _positions_summary(positions: list[Any], position_views: list[dict[str, Any]
         "total_unrealized_pnl_tone": _pnl_tone(total_unrealized),
         "has_pnl_summary": total_unrealized is not None,
     }
+
+
+def _trade_proposal_tone(status: Any) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "approved":
+        return "good"
+    if normalized == "blocked":
+        return "bad"
+    if normalized == "review":
+        return "warning"
+    return "neutral"
+
+
+async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: int = RECENT_TRADE_PROPOSAL_LIMIT) -> list[dict[str, Any]]:
+    latest_risk = (
+        select(
+            RiskVerdictRecord.ticket_id.label("ticket_id"),
+            RiskVerdictRecord.status.label("risk_status"),
+            RiskVerdictRecord.approved_notional_dollars.label("approved_notional_dollars"),
+            func.row_number()
+            .over(partition_by=RiskVerdictRecord.ticket_id, order_by=RiskVerdictRecord.updated_at.desc())
+            .label("rn"),
+        )
+        .subquery()
+    )
+    result = await session.execute(
+        select(
+            TradeTicketRecord.market_ticker.label("market_ticker"),
+            TradeTicketRecord.side.label("side"),
+            TradeTicketRecord.yes_price_dollars.label("yes_price_dollars"),
+            TradeTicketRecord.count_fp.label("count_fp"),
+            TradeTicketRecord.status.label("status"),
+            TradeTicketRecord.updated_at.label("updated_at"),
+            latest_risk.c.risk_status,
+            latest_risk.c.approved_notional_dollars,
+        )
+        .select_from(TradeTicketRecord)
+        .join(Room, TradeTicketRecord.room_id == Room.id)
+        .outerjoin(
+            latest_risk,
+            (latest_risk.c.ticket_id == TradeTicketRecord.id) & (latest_risk.c.rn == 1),
+        )
+        .where(
+            Room.kalshi_env == kalshi_env,
+            TradeTicketRecord.status == "proposed",
+        )
+        .order_by(TradeTicketRecord.updated_at.desc())
+        .limit(limit)
+    )
+    rows = []
+    for row in result.all():
+        yes_price = _decimal_or_zero(row.yes_price_dollars).quantize(Decimal("0.0001"))
+        count = _decimal_or_zero(row.count_fp).quantize(Decimal("0.01"))
+        approved_notional = _decimal_or_none(row.approved_notional_dollars)
+        side = str(row.side or "")
+        status = str(row.status or "")
+        risk_status = str(row.risk_status or "") if row.risk_status is not None else None
+        rows.append(
+            {
+                "market_ticker": str(row.market_ticker or ""),
+                "side": side,
+                "side_tone": "good" if side == "yes" else "warning" if side == "no" else "neutral",
+                "yes_price_dollars": str(yes_price),
+                "count_fp": str(count),
+                "status": status,
+                "status_tone": _trade_proposal_tone(status),
+                "risk_status": risk_status,
+                "risk_status_tone": _trade_proposal_tone(risk_status),
+                "approved_notional_dollars": str(approved_notional.quantize(Decimal("0.0001"))) if approved_notional is not None else None,
+                "updated_at": _iso_or_none(row.updated_at),
+            }
+        )
+    return rows
 
 
 def _capital_bucket_summary(snapshot: Any) -> dict[str, Any]:
@@ -1343,6 +1417,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         daily_pnl_baseline = await repo.get_daily_portfolio_baseline_dollars(kalshi_env=kalshi_env)
         win_rate_data = await repo.get_fill_win_rate_30d(kalshi_env=kalshi_env)
         broken_book_data = await repo.get_broken_book_rate_30d(kalshi_env=kalshi_env)
+        recent_trade_proposals = await _recent_trade_proposal_views(session, kalshi_env=kalshi_env)
         fallback_capital = thresholds.risk_max_position_notional_dollars
         if fallback_capital is None:
             fallback_capital = 0
@@ -1400,6 +1475,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         "broken_book_counts": f"{broken_book_data.get('broken_count', 0)} / {broken_book_data.get('total_count', 0)} rooms (30d)",
         "positions_summary": positions_summary,
         "positions": position_views,
+        "recent_trade_proposals": recent_trade_proposals,
         "alerts": [_ops_event_view(e) for e in alerts],
         "active_rooms": [_active_room_view(r) for r in active_rooms],
         "runtime_health": runtime_health,

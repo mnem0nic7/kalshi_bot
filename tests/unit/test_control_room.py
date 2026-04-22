@@ -343,6 +343,66 @@ async def test_build_control_room_bootstrap_skips_live_market_discovery(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_recent_trade_proposal_views_formats_rows() -> None:
+    now = datetime(2026, 4, 22, 20, 0, tzinfo=UTC)
+    session = _OutcomeSession(
+        [
+            SimpleNamespace(
+                market_ticker="KXHIGHNY-26APR23-T75",
+                side="yes",
+                yes_price_dollars=Decimal("0.4000"),
+                count_fp=Decimal("12.50"),
+                status="proposed",
+                risk_status="blocked",
+                approved_notional_dollars=None,
+                updated_at=now,
+            ),
+            SimpleNamespace(
+                market_ticker="KXHIGHCHI-26APR23-T68",
+                side="no",
+                yes_price_dollars=Decimal("0.2100"),
+                count_fp=Decimal("8.00"),
+                status="proposed",
+                risk_status="approved",
+                approved_notional_dollars=Decimal("1.6800"),
+                updated_at=now,
+            ),
+        ]
+    )
+
+    views = await control_room_module._recent_trade_proposal_views(session, kalshi_env="demo")
+
+    assert views == [
+        {
+            "market_ticker": "KXHIGHNY-26APR23-T75",
+            "side": "yes",
+            "side_tone": "good",
+            "yes_price_dollars": "0.4000",
+            "count_fp": "12.50",
+            "status": "proposed",
+            "status_tone": "neutral",
+            "risk_status": "blocked",
+            "risk_status_tone": "bad",
+            "approved_notional_dollars": None,
+            "updated_at": now.isoformat(),
+        },
+        {
+            "market_ticker": "KXHIGHCHI-26APR23-T68",
+            "side": "no",
+            "side_tone": "warning",
+            "yes_price_dollars": "0.2100",
+            "count_fp": "8.00",
+            "status": "proposed",
+            "status_tone": "neutral",
+            "risk_status": "approved",
+            "risk_status_tone": "good",
+            "approved_notional_dollars": "1.6800",
+            "updated_at": now.isoformat(),
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 4, 17, 17, 50, tzinfo=UTC)
     positions = [
@@ -535,6 +595,27 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
             ),
         ),
     )
+    monkeypatch.setattr(
+        control_room_module,
+        "_recent_trade_proposal_views",
+        AsyncMock(
+            return_value=[
+                {
+                    "market_ticker": "KXHIGHCHI-26APR17-T79",
+                    "side": "yes",
+                    "side_tone": "good",
+                    "yes_price_dollars": "0.0700",
+                    "count_fp": "71.42",
+                    "status": "proposed",
+                    "status_tone": "neutral",
+                    "risk_status": "blocked",
+                    "risk_status_tone": "bad",
+                    "approved_notional_dollars": None,
+                    "updated_at": now.isoformat(),
+                }
+            ]
+        ),
+    )
 
     payload = await control_room_module.build_env_dashboard(container, "demo")
 
@@ -556,6 +637,8 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert payload["positions"][1]["trade_regime"] == "near_threshold"
     assert payload["positions"][1]["recommended_size_cap_fp"] == "10.00"
     assert payload["positions_summary"]["capital_buckets"]["risky_limit_display"] == "$75.00"
+    assert payload["recent_trade_proposals"][0]["market_ticker"] == "KXHIGHCHI-26APR17-T79"
+    assert payload["recent_trade_proposals"][0]["risk_status"] == "blocked"
     assert container.kalshi.get_market.await_count == 2
     assert container.watchdog_service.get_status.await_args.kwargs["kalshi_env"] == "demo"
     assert container.agent_pack_service.get_pack_for_color.await_args.args[1] == "green"

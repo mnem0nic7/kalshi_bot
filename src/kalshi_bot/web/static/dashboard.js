@@ -56,6 +56,21 @@
     return el("span", ["status-pill", "alert-pill", map[tone] || ""].join(" ").trim(), text);
   }
 
+  function tradeProposalTone(status) {
+    const normalized = String(status || "").trim().toLowerCase();
+    if (normalized === "approved") return "good";
+    if (normalized === "blocked") return "bad";
+    if (normalized === "review") return "warning";
+    return "neutral";
+  }
+
+  function statusPillClass(tone) {
+    if (tone === "good") return "status-good";
+    if (tone === "bad") return "status-bad";
+    if (tone === "warning") return "status-warning";
+    return "status-neutral";
+  }
+
   function parseBootstrap() {
     const node = document.getElementById("strategies-bootstrap");
     if (!node) return null;
@@ -388,7 +403,7 @@
 
   function renderPositions(card, positions, summary) {
     const header = card.querySelector(".dash-card-header");
-    const countLabel = header.querySelector(".muted-label");
+    const countLabel = header.querySelector(".positions-count-label");
     if (countLabel) countLabel.textContent = `${positions.length} position${positions.length !== 1 ? "s" : ""}`;
 
     const empty = card.querySelector("p.empty-state");
@@ -473,6 +488,62 @@
     tableWrap.replaceChildren(table);
   }
 
+  function renderRecentTradeProposals(card, proposals) {
+    if (!card) return;
+    const countLabel = card.querySelector(".trade-proposals-count-label");
+    if (countLabel) countLabel.textContent = `${proposals.length} ticket${proposals.length !== 1 ? "s" : ""}`;
+
+    const empty = card.querySelector("p.empty-state");
+    if (!proposals.length) {
+      const wrap = card.querySelector(".table-wrap");
+      if (wrap) wrap.remove();
+      if (!empty) card.appendChild(el("p", "empty-state", "No recent proposed tickets."));
+      return;
+    }
+    if (empty) empty.remove();
+
+    let tableWrap = card.querySelector(".table-wrap");
+    if (!tableWrap) {
+      tableWrap = el("div", "table-wrap");
+      card.appendChild(tableWrap);
+    }
+
+    const table = el("table", "positions-table");
+    const thead = el("thead");
+    const headerRow = el("tr");
+    ["Market", "Side", "Yes Price", "Contracts", "Status", "Risk", "Approved Notional"].forEach((h) => {
+      headerRow.appendChild(el("th", null, h));
+    });
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+
+    const tbody = el("tbody");
+    proposals.forEach((proposal) => {
+      const tr = el("tr");
+      const sideTd = el("td");
+      const sideTone = proposal.side_tone || (proposal.side === "yes" ? "good" : proposal.side === "no" ? "warning" : "neutral");
+      sideTd.appendChild(el("span", `status-pill ${statusPillClass(sideTone)}`, proposal.side || "—"));
+      const statusTd = el("td");
+      const statusTone = proposal.status_tone || tradeProposalTone(proposal.status);
+      statusTd.appendChild(el("span", `status-pill ${statusPillClass(statusTone)}`, proposal.status || "—"));
+      const riskTd = el("td");
+      const riskTone = proposal.risk_status_tone || tradeProposalTone(proposal.risk_status);
+      riskTd.appendChild(el("span", `status-pill ${statusPillClass(riskTone)}`, proposal.risk_status || "—"));
+      tr.append(
+        el("td", "mono", proposal.market_ticker || "—"),
+        sideTd,
+        el("td", "mono", proposal.yes_price_dollars || "—"),
+        el("td", "mono", proposal.count_fp || "—"),
+        statusTd,
+        riskTd,
+        el("td", "mono", proposal.approved_notional_dollars || "—"),
+      );
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    tableWrap.replaceChildren(table);
+  }
+
   function renderCapitalBuckets(card, summary) {
     if (!card) return;
     const line = card.querySelector(".bucket-usage-line");
@@ -502,6 +573,7 @@
       renderAlerts(panel.querySelector(".dash-card-alerts"), data.alerts || []);
       renderCapitalBuckets(panel.querySelector(".dash-card-positions"), data.positions_summary || {});
       renderPositions(panel.querySelector(".dash-card-positions"), data.positions || [], data.positions_summary || {});
+      renderRecentTradeProposals(panel.querySelector(".dash-card-proposals"), data.recent_trade_proposals || []);
     } catch (_) {
       // skip on network error
     }

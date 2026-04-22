@@ -50,6 +50,35 @@ def _build_positions(count: int) -> list[dict[str, object]]:
     return positions
 
 
+def _build_recent_trade_proposals() -> list[dict[str, object]]:
+    return [
+        {
+            "market_ticker": "KXHIGHTPHX-26APR23-T92",
+            "side": "yes",
+            "side_tone": "good",
+            "yes_price_dollars": "0.0400",
+            "count_fp": "93.75",
+            "status": "proposed",
+            "status_tone": "neutral",
+            "risk_status": "blocked",
+            "risk_status_tone": "bad",
+            "approved_notional_dollars": None,
+        },
+        {
+            "market_ticker": "KXHIGHNY-26APR23-T75",
+            "side": "yes",
+            "side_tone": "good",
+            "yes_price_dollars": "0.4000",
+            "count_fp": "12.50",
+            "status": "proposed",
+            "status_tone": "neutral",
+            "risk_status": "approved",
+            "risk_status_tone": "good",
+            "approved_notional_dollars": "5.0000",
+        },
+    ]
+
+
 def _build_env_payload(
     cash_display: str,
     positions_count: int,
@@ -65,6 +94,7 @@ def _build_env_payload(
     total_unrealized_pnl_display: str = "+$7.20",
     total_unrealized_pnl_tone: str = "good",
     has_pnl_summary: bool = True,
+    recent_trade_proposals: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "portfolio": {
@@ -81,6 +111,7 @@ def _build_env_payload(
         "alerts": [],
         "active_rooms": [],
         "positions": _build_positions(positions_count),
+        "recent_trade_proposals": recent_trade_proposals or [],
         "positions_summary": {
             "capital_buckets": None,
             "total_current_value_dollars": total_value_dollars if total_value_is_marked else None,
@@ -747,6 +778,43 @@ def test_portfolio_card_shows_recent_pnl_line(
                 page.goto(base_url, wait_until="load", timeout=15_000)
                 page.wait_for_selector("#panel-demo .dash-stat-portfolio .dash-stat-detail", timeout=15_000)
                 assert _portfolio_recent_line(page) == "+$65.30 (9.96%) today (PT)"
+            finally:
+                browser.close()
+
+
+def test_recent_trade_proposals_render_at_bottom_of_demo_and_production(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payloads = {
+        "demo": _build_env_payload(
+            "$1,250.00",
+            positions_count=3,
+            recent_trade_proposals=_build_recent_trade_proposals(),
+        ),
+        "production": _build_env_payload(
+            "$2,500.00",
+            positions_count=1,
+            recent_trade_proposals=_build_recent_trade_proposals(),
+        ),
+    }
+    with _serve_dashboard(monkeypatch, tmp_path, payloads=payloads) as base_url:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                page.goto(base_url, wait_until="load", timeout=15_000)
+                page.wait_for_selector('#panel-demo [data-testid="recent-trade-proposals"]', timeout=15_000)
+                demo_text = page.locator('#panel-demo [data-testid="recent-trade-proposals"]').text_content(timeout=15_000) or ""
+                assert "Recent Trade Proposals" in demo_text
+                assert "KXHIGHTPHX-26APR23-T92" in demo_text
+                assert "0.0400" in demo_text
+                assert "blocked" in demo_text
+
+                page.locator('.dash-tab[data-env="production"]').click(timeout=15_000)
+                page.wait_for_selector('#panel-production [data-testid="recent-trade-proposals"]', timeout=15_000)
+                production_text = page.locator('#panel-production [data-testid="recent-trade-proposals"]').text_content(timeout=15_000) or ""
+                assert "KXHIGHNY-26APR23-T75" in production_text
+                assert "5.0000" in production_text
             finally:
                 browser.close()
 
