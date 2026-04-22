@@ -579,16 +579,35 @@
     return fallbackText;
   }
 
+  function currentPageLoginPath() {
+    const path = `${window.location.pathname || "/"}${window.location.search || ""}${window.location.hash || ""}`;
+    return path && !path.startsWith("/login") ? path : "/";
+  }
+
+  function fallbackLoginUrl() {
+    return `/login?next=${encodeURIComponent(currentPageLoginPath())}`;
+  }
+
   function authRequiredLoginUrl(body) {
-    if (!body || body.error !== "auth_required") return null;
-    if (typeof body.login_url === "string" && body.login_url) return body.login_url;
-    return "/login";
+    const fallbackUrl = fallbackLoginUrl();
+    if (!body || body.error !== "auth_required") return fallbackUrl;
+    if (typeof body.login_url !== "string" || !body.login_url) return fallbackUrl;
+    try {
+      const url = new URL(body.login_url, window.location.origin);
+      if (url.origin !== window.location.origin || url.pathname !== "/login") return fallbackUrl;
+      const nextPath = url.searchParams.get("next");
+      if (!nextPath || nextPath.startsWith("/api/")) {
+        url.searchParams.set("next", currentPageLoginPath());
+      }
+      return `${url.pathname}${url.search}${url.hash}`;
+    } catch (_) {
+      return fallbackUrl;
+    }
   }
 
   function redirectToLoginIfRequired(response, body) {
     if (!response || response.status !== 401) return false;
     const loginUrl = authRequiredLoginUrl(body);
-    if (!loginUrl) return false;
     window.location.assign(loginUrl);
     return true;
   }
