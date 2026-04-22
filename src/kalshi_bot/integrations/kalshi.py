@@ -26,7 +26,7 @@ class KalshiCredentials:
 class KalshiSigner:
     def __init__(self, private_key_path: Path) -> None:
         mode = os.stat(private_key_path).st_mode & 0o777
-        if mode & 0o077:
+        if mode & 0o022:
             raise PermissionError(
                 f"RSA private key {private_key_path} has unsafe permissions ({oct(mode)}). "
                 "Run: chmod 600 <key_path>"
