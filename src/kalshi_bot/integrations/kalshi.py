@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-from time import time
+from time import monotonic, time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -20,6 +20,29 @@ import logging
 from kalshi_bot.config import Settings
 
 logger = logging.getLogger(__name__)
+
+
+class _TokenBucket:
+    """Async token bucket — limits average request rate to `rate` per second."""
+
+    def __init__(self, rate: float, burst: int) -> None:
+        self._rate = rate
+        self._burst = float(burst)
+        self._tokens = float(burst)
+        self._last = monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = monotonic()
+                self._tokens = min(self._burst, self._tokens + (now - self._last) * self._rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            await asyncio.sleep(wait)
 
 
 @dataclass(slots=True)
@@ -56,6 +79,7 @@ class KalshiClient:
         self.read_credentials = self._load_credentials(write=False)
         self.write_credentials = self._load_credentials(write=True)
         self._signers: dict[tuple[str, bool], KalshiSigner] = {}
+        self._rate_limiter = _TokenBucket(rate=8.0, burst=16)
 
     def _load_credentials(self, *, write: bool) -> KalshiCredentials | None:
         key_id = self.settings.api_key_id(write=write)
@@ -120,6 +144,7 @@ class KalshiClient:
         )
         max_retries = 3
         backoff = 5.0
+        await self._rate_limiter.acquire()
         for attempt in range(max_retries + 1):
             headers = self._auth_headers(method, path, write=write)
             response = await self.client.request(
