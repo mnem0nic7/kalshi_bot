@@ -1176,6 +1176,25 @@ class PlatformRepository:
 
         return {"won_contracts": won, "total_contracts": total}
 
+    async def get_broken_book_rate_30d(self, *, kalshi_env: str | None = None) -> dict[str, Any]:
+        cutoff = datetime.now(UTC) - timedelta(days=30)
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = (
+            select(
+                func.count().filter(
+                    RoomStrategyAuditRecord.stand_down_reason == "book_effectively_broken"
+                ).label("broken_count"),
+                func.count().label("total_count"),
+            )
+            .join(Room, Room.id == RoomStrategyAuditRecord.room_id)
+            .where(
+                Room.kalshi_env == env,
+                RoomStrategyAuditRecord.created_at >= cutoff,
+            )
+        )
+        row = (await self.session.execute(stmt)).one()
+        return {"broken_count": int(row.broken_count), "total_count": int(row.total_count)}
+
     async def get_position(
         self,
         market_ticker: str,

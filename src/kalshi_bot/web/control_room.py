@@ -171,6 +171,15 @@ def _win_rate_display(win_rate_data: dict) -> str:
     return f"{pct}%"
 
 
+def _broken_book_rate_display(data: dict) -> str:
+    total = data.get("total_count", 0)
+    if not total:
+        return "—"
+    broken = data.get("broken_count", 0)
+    pct = int(round(100 * broken / total))
+    return f"{pct}%"
+
+
 def _percent_change(change: Decimal | None, baseline: Decimal | None) -> Decimal | None:
     if change is None or baseline is None or baseline <= 0:
         return None
@@ -1333,6 +1342,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         total_capital = await repo.get_total_capital_dollars(kalshi_env=kalshi_env)
         daily_pnl_baseline = await repo.get_daily_portfolio_baseline_dollars(kalshi_env=kalshi_env)
         win_rate_data = await repo.get_fill_win_rate_30d(kalshi_env=kalshi_env)
+        broken_book_data = await repo.get_broken_book_rate_30d(kalshi_env=kalshi_env)
         fallback_capital = thresholds.risk_max_position_notional_dollars
         if fallback_capital is None:
             fallback_capital = 0
@@ -1386,6 +1396,8 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         "daily_pnl_tone": _pnl_tone(daily_pnl),
         "win_rate_display": _win_rate_display(win_rate_data),
         "win_rate_contracts": f"{int(win_rate_data.get('won_contracts', 0))}W / {int(win_rate_data.get('total_contracts', 0))}T",
+        "broken_book_rate": _broken_book_rate_display(broken_book_data),
+        "broken_book_counts": f"{broken_book_data.get('broken_count', 0)} / {broken_book_data.get('total_count', 0)} rooms (30d)",
         "positions_summary": positions_summary,
         "positions": position_views,
         "alerts": [_ops_event_view(e) for e in alerts],

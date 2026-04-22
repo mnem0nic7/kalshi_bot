@@ -477,6 +477,10 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
             assert kalshi_env == "demo"
             return {"won_contracts": 47.0, "total_contracts": 68.0}
 
+        async def get_broken_book_rate_30d(self, *, kalshi_env: str | None = None) -> dict:
+            assert kalshi_env == "demo"
+            return {"broken_count": 189, "total_count": 257}
+
         async def portfolio_bucket_snapshot(
             self,
             *,

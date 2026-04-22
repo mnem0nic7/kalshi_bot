@@ -3070,13 +3070,17 @@ class HistoricalTrainingService:
                 rationale_ids.append(president_record.id)
 
                 await repo.update_room_stage(room.id, RoomStage.PROPOSING)
+                replay_order_cap = thresholds.risk_max_order_notional_dollars
+                if replay_order_cap is None:
+                    replay_capital = await repo.get_total_capital_dollars(kalshi_env=room.kalshi_env)
+                    replay_order_cap = float(replay_capital or 0) * self.settings.risk_order_pct or 25.0
                 trader_message, ticket, client_order_id, trader_usage = await self.agents.trader_message(
                     signal=signal,
                     room_id=room.id,
                     market_ticker=room.market_ticker,
                     rationale_ids=rationale_ids.copy(),
                     role_config=self.agent_pack_service.role_config(pack, AgentRole.TRADER),
-                    max_order_notional_dollars=thresholds.risk_max_order_notional_dollars,
+                    max_order_notional_dollars=replay_order_cap,
                 )
                 trader_record = await repo.append_message(room.id, trader_message)
                 role_models[AgentRole.TRADER.value] = trader_usage
