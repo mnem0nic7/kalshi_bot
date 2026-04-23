@@ -129,7 +129,13 @@ class Settings(BaseSettings):
     stop_loss_submit_cooldown_seconds: int = 300
     stop_loss_check_interval_seconds: int = 60
     stop_loss_momentum_slope_threshold_cents_per_min: float = -0.2
+    stop_loss_momentum_reentry_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_min_hold_minutes: int = 30
+    # Adverse-direction slope threshold for entry Gate 3 (¢/min, stored negative).
+    # Condition: slope_against < threshold → block. Default 0.0 = current behaviour (any adverse slope blocks).
+    # Set to -999.0 during Step 2 calibration replay to bypass Gate 3; do not tune between
+    # Step 1 and Step 3 deploys — this key is removed when the multiplicative weight mechanism lands.
+    momentum_entry_slope_threshold_cents_per_min: float = 0.0
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False

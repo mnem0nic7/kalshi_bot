@@ -176,12 +176,13 @@ class AutoTriggerService:
                     ys = np.array([p[1] for p in points])
                     xs = xs - xs[0]
                     slope = float(np.polyfit(xs, ys, 1)[0]) * 100 * 60  # $/s → ¢/min
-                    threshold = abs(self.settings.stop_loss_momentum_slope_threshold_cents_per_min)
+                    # Threshold stored negative (adverse-direction convention); negate for recovery direction.
+                    reentry_threshold = self.settings.stop_loss_momentum_reentry_slope_threshold_cents_per_min
                     stopped_side = reentry_cp.payload.get("stopped_side", "yes")
                     # Directional: require price moving back toward the stopped side.
-                    # stopped_side="yes" → need slope > +threshold (YES recovering).
-                    # stopped_side="no"  → need slope < −threshold (YES falling = NO recovering).
-                    recovery = slope > threshold if stopped_side == "yes" else slope < -threshold
+                    # stopped_side="yes" → need slope > -threshold (YES recovering).
+                    # stopped_side="no"  → need slope < threshold (YES falling = NO recovering).
+                    recovery = (slope > -reentry_threshold) if stopped_side == "yes" else (slope < reentry_threshold)
                     if not recovery:
                         await session.commit()
                         return

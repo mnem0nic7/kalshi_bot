@@ -198,16 +198,13 @@ class WorkflowSupervisor:
                 xs = np.array([p[0] for p in valid_points])
                 ys = np.array([p[1] for p in valid_points])
                 xs = xs - xs[0]
-                slope = np.polyfit(xs, ys, 1)[0]
-                if signal.recommended_side == ContractSide.YES and slope < 0:
+                slope_per_s = np.polyfit(xs, ys, 1)[0]
+                slope_cpmin = slope_per_s * 100 * 60  # $/s → ¢/min
+                slope_against = slope_cpmin if signal.recommended_side == ContractSide.YES else -slope_cpmin
+                if slope_against < self.settings.momentum_entry_slope_threshold_cents_per_min:
                     return _reject(
                         StandDownReason.MOMENTUM_AGAINST_TRADE,
-                        f"Price momentum (slope={slope:.6f}/s) is against YES trade",
-                    )
-                if signal.recommended_side == ContractSide.NO and slope > 0:
-                    return _reject(
-                        StandDownReason.MOMENTUM_AGAINST_TRADE,
-                        f"Price momentum (slope={slope:.6f}/s) is against NO trade",
+                        f"Price momentum ({slope_cpmin:.3f} ¢/min) is against {signal.recommended_side.value.upper()} trade",
                     )
 
         # Gate 4: volume check and size_factor — only gate if volume is explicitly reported
