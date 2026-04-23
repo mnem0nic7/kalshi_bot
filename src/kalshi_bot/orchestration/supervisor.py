@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage
+from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage, StrategyCode
 from kalshi_bot.core.fixed_point import as_decimal, make_client_order_id, quantize_count
 from kalshi_bot.core.metrics import ACTIVE_ROOMS, ORDERS_TOTAL, ROOM_RUNS_TOTAL
 from kalshi_bot.core.schemas import ExecReceiptPayload, MemoryNotePayload, RiskVerdictPayload, RoomMessageCreate, RoomMessageRead, TradeTicket
@@ -256,6 +256,7 @@ class WorkflowSupervisor:
                     settings=self.settings,
                     signal=signal,
                     max_order_notional_dollars=dynamic_order_cap,
+                    total_capital_dollars=total_capital,
                 )
                 if count_fp is None or count_fp <= Decimal("0"):
                     eligible = False
@@ -277,7 +278,12 @@ class WorkflowSupervisor:
 
             if ticket is not None:
                 client_order_id = make_client_order_id(room.id, room.market_ticker, ticket.nonce)
-                ticket_record = await repo.save_trade_ticket(room.id, ticket, client_order_id)
+                ticket_record = await repo.save_trade_ticket(
+                    room.id,
+                    ticket,
+                    client_order_id,
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                )
                 open_position = await repo.get_position(
                     room.market_ticker,
                     self.settings.kalshi_subaccount,
@@ -337,6 +343,10 @@ class WorkflowSupervisor:
                     ticket.side.value,
                     kalshi_env=room.kalshi_env,
                 )
+                strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                    kalshi_env=room.kalshi_env,
+                )
                 risk_context = RiskContext(
                     market_observed_at=market_observed_at,
                     research_observed_at=research_observed_at,
@@ -346,6 +356,8 @@ class WorkflowSupervisor:
                     pending_order_count_fp=pending_order_count_fp,
                     portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                     open_ticker_count=open_ticker_count,
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                    strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
                 )
                 if daily_loss_hard_blocked:
                     verdict = RiskVerdictPayload(
@@ -906,7 +918,13 @@ class WorkflowSupervisor:
                             else:
                                 ticket = ticket.model_copy(update={"count_fp": scaled})
                     if ticket is not None and client_order_id is not None:
-                        ticket_record = await repo.save_trade_ticket(room.id, ticket, client_order_id, message_id=trader_record.id)
+                        ticket_record = await repo.save_trade_ticket(
+                            room.id,
+                            ticket,
+                            client_order_id,
+                            message_id=trader_record.id,
+                            strategy_code=StrategyCode.DIRECTIONAL.value,
+                        )
                         open_position = await repo.get_position(
                             room.market_ticker,
                             self.settings.kalshi_subaccount,
@@ -955,6 +973,10 @@ class WorkflowSupervisor:
                             ticket.side.value,
                             kalshi_env=room.kalshi_env,
                         )
+                        strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
+                            strategy_code=StrategyCode.DIRECTIONAL.value,
+                            kalshi_env=room.kalshi_env,
+                        )
                         risk_context = RiskContext(
                             market_observed_at=market_state.observed_at,
                             research_observed_at=dossier.freshness.refreshed_at,
@@ -964,6 +986,8 @@ class WorkflowSupervisor:
                             pending_order_count_fp=pending_order_count_fp,
                             portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                             open_ticker_count=open_ticker_count,
+                            strategy_code=StrategyCode.DIRECTIONAL.value,
+                            strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
                         )
                         daily_pnl_llm = await repo.get_daily_pnl_dollars(kalshi_env=room.kalshi_env)
                         _daily_loss_ratio_llm = 0.0

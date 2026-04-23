@@ -1362,6 +1362,123 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": "invalid_run_state", "message": str(exc)}, status_code=400)
         return JSONResponse(jsonable_encoder(payload))
 
+    @app.get("/api/strategies/calibration")
+    async def strategies_calibration(
+        request: Request,
+        series_ticker: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        bucket_by: str = "overall",
+        n_buckets: int = 10,
+    ) -> JSONResponse:
+        """Per-strategy-A signal calibration: Brier, log-loss, reliability curve.
+
+        Query params:
+        - series_ticker: filter to one series (e.g. KXHIGHNY)
+        - date_from / date_to: ISO dates (YYYY-MM-DD)
+        - bucket_by: "overall" (default), "series", or "month"
+        - n_buckets: reliability-curve bucket count (default 10)
+        """
+        from datetime import date as _date
+
+        if bucket_by not in {"overall", "series", "month"}:
+            return JSONResponse({"error": "invalid_bucket_by"}, status_code=400)
+        if n_buckets < 2 or n_buckets > 50:
+            return JSONResponse({"error": "invalid_n_buckets"}, status_code=400)
+        try:
+            df = _date.fromisoformat(date_from) if date_from else None
+            dt = _date.fromisoformat(date_to) if date_to else None
+        except ValueError:
+            return JSONResponse({"error": "invalid_date_format"}, status_code=400)
+
+        app_container = container(request)
+        service = app_container.signal_calibration_service
+        if bucket_by == "overall":
+            summary = await service.compute_overall(
+                date_from=df, date_to=dt, series_ticker=series_ticker, n_buckets=n_buckets,
+            )
+            return JSONResponse(jsonable_encoder({"bucket_by": "overall", "result": summary.to_dict()}))
+        if bucket_by == "series":
+            summaries = await service.compute_per_series(
+                date_from=df, date_to=dt, n_buckets=n_buckets,
+            )
+        else:
+            summaries = await service.compute_per_month(
+                date_from=df, date_to=dt, series_ticker=series_ticker, n_buckets=n_buckets,
+            )
+        return JSONResponse(
+            jsonable_encoder({"bucket_by": bucket_by, "results": [s.to_dict() for s in summaries]})
+        )
+
+    @app.get("/api/strategies/cleanup/discount-sweep")
+    async def strategies_cleanup_discount_sweep(
+        request: Request,
+        discounts: str = "0,0.5,1,2",
+        lookback_days: int = 30,
+        latency_budget_seconds: int = 10,
+    ) -> JSONResponse:
+        """Strategy C discount sensitivity sweep (P1-3).
+
+        Replays persisted shadow StrategyCRoom signals against alternative
+        discount levels and reports fill_rate + avg_net_ev per candidate.
+        Used to decide whether the default 1¢ discount is sized correctly.
+        """
+        try:
+            candidates = [float(x) for x in discounts.split(",") if x.strip()]
+        except ValueError:
+            return JSONResponse({"error": "invalid_discounts"}, status_code=400)
+        if not candidates:
+            return JSONResponse({"error": "empty_discounts"}, status_code=400)
+        if any(d < 0 or d > 100 for d in candidates):
+            return JSONResponse({"error": "discount_out_of_range"}, status_code=400)
+        if lookback_days < 1 or lookback_days > 365:
+            return JSONResponse({"error": "invalid_lookback_days"}, status_code=400)
+        if latency_budget_seconds < 1 or latency_budget_seconds > 600:
+            return JSONResponse({"error": "invalid_latency_budget_seconds"}, status_code=400)
+
+        app_container = container(request)
+        payload = await app_container.strategy_cleanup_service.sweep_discount_sensitivity(
+            discount_cents_candidates=candidates,
+            lookback_days=lookback_days,
+            latency_budget_seconds=latency_budget_seconds,
+        )
+        return JSONResponse(jsonable_encoder(payload))
+
+    @app.get("/api/strategies/promotions")
+    async def strategies_promotions(
+        request: Request,
+        strategy: str | None = None,
+        limit: int = 25,
+    ) -> JSONResponse:
+        """Strategy promotion audit log (P2-3). Read-only surface; rows are
+        inserted via the ``record-strategy-promotion`` CLI."""
+        if limit < 1 or limit > 500:
+            return JSONResponse({"error": "invalid_limit"}, status_code=400)
+        app_container = container(request)
+        async with app_container.session_factory() as session:
+            repo = PlatformRepository(session)
+            events = await repo.list_strategy_promotions(
+                strategy=strategy,
+                kalshi_env=app_container.settings.kalshi_env,
+                limit=limit,
+            )
+        return JSONResponse(jsonable_encoder({
+            "events": [
+                {
+                    "id": e.id,
+                    "strategy": e.strategy,
+                    "from_state": e.from_state,
+                    "to_state": e.to_state,
+                    "actor": e.actor,
+                    "evidence_ref": e.evidence_ref,
+                    "notes": e.notes,
+                    "kalshi_env": e.kalshi_env,
+                    "created_at": e.created_at.isoformat(),
+                }
+                for e in events
+            ],
+        }))
+
     @app.post("/api/strategies/{strategy_name}/activate")
     async def activate_strategy_preset(strategy_name: str, request: Request) -> JSONResponse:
         app_container = container(request)

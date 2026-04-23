@@ -132,6 +132,7 @@ class TradeTicketRecord(Base, IdMixin, TimestampMixin):
     time_in_force: Mapped[str] = mapped_column(String(64))
     client_order_id: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="proposed")
+    strategy_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -161,6 +162,7 @@ class OrderRecord(Base, IdMixin, TimestampMixin):
     action: Mapped[str] = mapped_column(String(16))
     yes_price_dollars: Mapped[Decimal] = mapped_column(Numeric(10, 4))
     count_fp: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    strategy_code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -178,6 +180,7 @@ class FillRecord(Base, IdMixin, TimestampMixin):
     count_fp: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     is_taker: Mapped[bool] = mapped_column(Boolean, default=True)
     settlement_result: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    strategy_code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -693,6 +696,35 @@ class CityStrategyAssignment(Base):
     strategy_name: Mapped[str] = mapped_column(String(64))
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     assigned_by: Mapped[str] = mapped_column(String(64), default="auto_regression")
+
+
+class StrategyPromotionEvent(Base):
+    """Audit log row for a strategy shadow→live (or live→shadow) transition.
+
+    P2-3 — inserted via the ``record-strategy-promotion`` CLI so the operator's
+    intent, identity, and evidence reference are captured alongside the
+    environment change. Intentionally not a per-row foreign key to
+    ``strategies.name`` — the strategy column accepts short codes (A, C, ARB)
+    and may reference strategies that were never persisted as StrategyRecord.
+    """
+
+    __tablename__ = "strategy_promotion_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    strategy: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    from_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    evidence_ref: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    kalshi_env: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
 
 
 class StrategyCodexRunRecord(Base, IdMixin, TimestampMixin):

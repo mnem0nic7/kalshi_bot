@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     postgres_user: str = "postgres"
     postgres_password: str | None = None
     postgres_secondary_host: str | None = None
+    strategy_regression_read_source: str = "primary"
 
     kalshi_env: str = "demo"
     kalshi_read_api_key_id: str | None = Field(
@@ -112,6 +113,15 @@ class Settings(BaseSettings):
     risk_max_order_notional_dollars: float | None = None
     risk_max_position_notional_dollars: float | None = None
     risk_daily_loss_limit_dollars: float | None = None
+    # P2-2: edge-scaled (fractional-Kelly) sizing. Off by default until
+    # calibration (see /api/strategies/calibration) confirms the fair-value
+    # signal is well-calibrated. When on, the Kelly notional is capped by the
+    # existing flat-percentage limits so this can only ever reduce risk.
+    risk_edge_scaled_sizing_enabled: bool = False
+    risk_edge_scaled_kelly_multiplier: float = 0.25  # quarter-Kelly
+    # Per-strategy dollar-denominated hard-loss cap. Empty = no per-strategy cap.
+    # Example env var value: '{"A": 500, "C": 100}' (JSON-parsed by pydantic-settings).
+    risk_daily_loss_dollars_by_strategy: dict[str, float] = Field(default_factory=dict)
     stop_loss_threshold_pct: float = 0.10
     stop_loss_profit_protection_threshold_pct: float = 0.15
     stop_loss_reentry_cooldown_seconds: int = 14400
@@ -166,6 +176,14 @@ class Settings(BaseSettings):
     # Addition 3: Monotonicity Arb Scanner (§4.3)
     monotonicity_arb_enabled: bool = False
     monotonicity_arb_shadow_only: bool = True
+    # Live execution of the two-leg arb requires an atomic executor that can
+    # place leg 1, place leg 2, and unwind leg 1 if leg 2 fails. That executor
+    # is NOT built yet — see services/monotonicity_scanner.py docstring.
+    # This flag is an explicit acknowledgement that the atomic path exists
+    # before the risk gate will allow a non-shadow outcome. Flipping shadow_only
+    # to False without this flag is rejected with 'risk_blocked', not silently
+    # downgraded to shadow.
+    monotonicity_arb_atomic_execution_ready: bool = False
     monotonicity_arb_min_net_edge_cents: int = 2
     monotonicity_arb_max_notional_dollars: float = 25.0
     monotonicity_arb_max_proposals_per_minute: int = 5

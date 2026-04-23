@@ -102,3 +102,9 @@ class RoomOrigin(StrEnum):
     SHADOW = "shadow"
     LIVE = "live"
     HISTORICAL_REPLAY = "historical_replay"
+
+
+class StrategyCode(StrEnum):
+    DIRECTIONAL = "A"  # Strategy A — directional weather taker
+    CLEANUP = "C"  # Strategy C — resolution-lag cleanup
+    MONOTONICITY_ARB = "ARB"  # Monotonicity arbitrage scanner

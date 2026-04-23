@@ -341,6 +341,75 @@ def test_evaluate_arb_risk_notional_cap() -> None:
 
 
 # ---------------------------------------------------------------------------
+# P1-2: atomicity gate — live execution is refused until a two-leg executor
+# with rollback on leg-2 failure exists.
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_arb_risk_shadow_off_without_atomic_flag_is_blocked() -> None:
+    """Flipping shadow_only alone must NOT silently downgrade to shadow.
+
+    An operator who toggles shadow_only=False without reading the atomicity
+    contract deserves an explicit 'risk_blocked' with a pointer, not a green
+    light that masquerades as safe shadow execution.
+    """
+    violation = _make_violation()
+    settings = _settings(
+        monotonicity_arb_shadow_only=False,
+        monotonicity_arb_atomic_execution_ready=False,
+    )
+    outcome, reason = evaluate_arb_risk(violation, control=_control(), settings=settings)
+    assert outcome == "risk_blocked"
+    assert reason is not None
+    assert "atomic" in reason.lower()
+
+
+def test_evaluate_arb_risk_shadow_off_with_atomic_flag_is_still_blocked_today() -> None:
+    """Even with both flags set, live execution is blocked until the executor
+    ships. This prevents a partially-configured environment from placing a
+    naked leg 1 with no unwind path."""
+    violation = _make_violation()
+    settings = _settings(
+        monotonicity_arb_shadow_only=False,
+        monotonicity_arb_atomic_execution_ready=True,
+    )
+    outcome, reason = evaluate_arb_risk(violation, control=_control(), settings=settings)
+    assert outcome == "risk_blocked"
+    assert reason is not None
+    assert "executor" in reason.lower() or "not yet implemented" in reason.lower()
+
+
+def test_evaluate_arb_risk_shadow_only_stays_shadow_regardless_of_atomic_flag() -> None:
+    """shadow_only=True wins even if someone also sets atomic_execution_ready=True."""
+    violation = _make_violation()
+    settings = _settings(
+        monotonicity_arb_shadow_only=True,
+        monotonicity_arb_atomic_execution_ready=True,
+    )
+    outcome, reason = evaluate_arb_risk(violation, control=_control(), settings=settings)
+    assert outcome == "shadow"
+    assert reason is None
+
+
+def test_evaluate_arb_risk_kill_switch_preempts_atomic_flag() -> None:
+    """Kill switch remains the hardest gate; it overrides every other flag."""
+    violation = _make_violation()
+    settings = _settings(
+        monotonicity_arb_shadow_only=False,
+        monotonicity_arb_atomic_execution_ready=True,
+    )
+    outcome, reason = evaluate_arb_risk(violation, control=_control(kill_switch=True), settings=settings)
+    assert outcome == "risk_blocked"
+    assert "kill switch" in (reason or "").lower()
+
+
+def test_settings_default_atomic_execution_ready_is_false() -> None:
+    """Safe default: atomic flag must be False out of the box so deployments
+    cannot accidentally run with the gate already permissive."""
+    assert Settings().monotonicity_arb_atomic_execution_ready is False
+
+
+# ---------------------------------------------------------------------------
 # scan_for_violations end-to-end
 # ---------------------------------------------------------------------------
 

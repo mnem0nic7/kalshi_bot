@@ -31,6 +31,7 @@ from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.signal import WeatherSignalEngine
+from kalshi_bot.services.signal_calibration import SignalCalibrationService
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.stop_loss import StopLossService
@@ -55,6 +56,8 @@ class AppContainer:
     secondary_engine: AsyncEngine | None
     session_factory: async_sessionmaker[AsyncSession]
     secondary_session_factory: async_sessionmaker[AsyncSession] | None
+    regression_read_session_factory: async_sessionmaker[AsyncSession]
+    regression_read_source: str
     providers: ProviderRouter
     kalshi: KalshiClient
     kalshi_ws: KalshiWebSocketClient
@@ -63,6 +66,7 @@ class AppContainer:
     weather_directory: WeatherMarketDirectory
     agent_pack_service: AgentPackService
     signal_engine: WeatherSignalEngine
+    signal_calibration_service: SignalCalibrationService
     risk_engine: DeterministicRiskEngine
     execution_service: ExecutionService
     memory_service: MemoryService
@@ -103,6 +107,28 @@ class AppContainer:
             secondary_engine = create_async_engine(settings.secondary_database_url, pool_pre_ping=True)
             secondary_session_factory = create_session_factory(secondary_engine)
 
+        requested_read_source = (settings.strategy_regression_read_source or "primary").lower()
+        if requested_read_source not in {"primary", "secondary"}:
+            logger.error(
+                "Unknown strategy_regression_read_source=%r; falling back to 'primary'",
+                settings.strategy_regression_read_source,
+            )
+            requested_read_source = "primary"
+        if requested_read_source == "secondary" and secondary_session_factory is None:
+            logger.error(
+                "strategy_regression_read_source=secondary but no secondary DB configured "
+                "(set POSTGRES_SECONDARY_HOST); falling back to primary"
+            )
+            regression_read_session_factory = session_factory
+            regression_read_source_active = "primary"
+        elif requested_read_source == "secondary":
+            regression_read_session_factory = secondary_session_factory
+            regression_read_source_active = "secondary"
+            logger.info("Regression reads: using secondary DB")
+        else:
+            regression_read_session_factory = session_factory
+            regression_read_source_active = "primary"
+
         providers = ProviderRouter(settings)
         kalshi = KalshiClient(settings)
         kalshi_ws = KalshiWebSocketClient(settings, kalshi)
@@ -113,6 +139,7 @@ class AppContainer:
             logger.warning("Market map validation: %s", warning)
         agent_pack_service = AgentPackService(settings)
         signal_engine = WeatherSignalEngine(settings)
+        signal_calibration_service = SignalCalibrationService(session_factory)
         risk_engine = DeterministicRiskEngine(settings)
         execution_service = ExecutionService(settings, kalshi)
         memory_service = MemoryService()
@@ -218,7 +245,13 @@ class AppContainer:
         auto_trigger_service = AutoTriggerService(settings, session_factory, weather_directory, agent_pack_service, supervisor)
         stop_loss_service = StopLossService(settings, session_factory, kalshi)
         strategy_eval_service = StrategyEvaluationService(settings, session_factory, agent_pack_service)
-        strategy_regression_service = StrategyRegressionService(settings, session_factory, weather_directory, agent_pack_service)
+        strategy_regression_service = StrategyRegressionService(
+            settings,
+            session_factory,
+            weather_directory,
+            agent_pack_service,
+            read_session_factory=regression_read_session_factory,
+        )
         strategy_codex_service = StrategyCodexService(
             settings,
             session_factory,
@@ -273,6 +306,8 @@ class AppContainer:
             secondary_engine=secondary_engine,
             session_factory=session_factory,
             secondary_session_factory=secondary_session_factory,
+            regression_read_session_factory=regression_read_session_factory,
+            regression_read_source=regression_read_source_active,
             providers=providers,
             kalshi=kalshi,
             kalshi_ws=kalshi_ws,
@@ -281,6 +316,7 @@ class AppContainer:
             weather_directory=weather_directory,
             agent_pack_service=agent_pack_service,
             signal_engine=signal_engine,
+            signal_calibration_service=signal_calibration_service,
             risk_engine=risk_engine,
             execution_service=execution_service,
             memory_service=memory_service,

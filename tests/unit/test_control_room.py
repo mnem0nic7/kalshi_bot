@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 import kalshi_bot.web.control_room as control_room_module
-from kalshi_bot.web.control_room import _classify_room, _recent_room_outcomes, _series_filter_options
+from kalshi_bot.web.control_room import (
+    _classify_room,
+    _recent_room_outcomes,
+    _series_filter_options,
+    _win_loss_magnitude_display,
+)
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -1220,3 +1225,47 @@ async def test_build_strategies_dashboard_excludes_legacy_unscored_promotions(mo
 
     assert payload["summary"]["recent_promotions_count"] == 0
     assert payload["recent_promotions"] == []
+
+
+# ---------------------------------------------------------------------------
+# P2-1: loss-magnitude + Sharpe display
+# ---------------------------------------------------------------------------
+
+
+def test_win_loss_magnitude_display_formats_money_and_sharpe() -> None:
+    win_rate_data = {
+        "avg_win_dollars": 5.00,
+        "avg_loss_dollars": -4.00,
+        "stdev_dollars": 4.32,
+        "sharpe_per_trade": 0.463,
+    }
+    out = _win_loss_magnitude_display(win_rate_data)
+    assert out["avg_win_display"] == "+$5.00"
+    assert out["avg_loss_display"] == "-$4.00"
+    assert out["stdev_display"] == "$4.32"
+    assert out["sharpe_display"] == "+0.46"
+
+
+def test_win_loss_magnitude_display_uses_em_dash_for_missing_values() -> None:
+    out = _win_loss_magnitude_display({
+        "avg_win_dollars": None,
+        "avg_loss_dollars": None,
+        "stdev_dollars": None,
+        "sharpe_per_trade": None,
+    })
+    assert out == {
+        "avg_win_display": "—",
+        "avg_loss_display": "—",
+        "stdev_display": "—",
+        "sharpe_display": "—",
+    }
+
+
+def test_win_loss_magnitude_display_formats_negative_sharpe() -> None:
+    out = _win_loss_magnitude_display({
+        "avg_win_dollars": 1.0,
+        "avg_loss_dollars": -8.0,
+        "stdev_dollars": 5.0,
+        "sharpe_per_trade": -0.7,
+    })
+    assert out["sharpe_display"] == "-0.70"

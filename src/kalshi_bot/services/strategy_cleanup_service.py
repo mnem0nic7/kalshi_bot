@@ -22,6 +22,11 @@ from kalshi_bot.db.models import CliStationVariance, DeploymentControl, MarketPr
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
+from kalshi_bot.services.counterfactuals import (
+    strategy_c_fee_cents,
+    strategy_c_gross_edge_cents,
+    strategy_c_target_cents,
+)
 from kalshi_bot.services.risk import evaluate_cleanup_risk
 from kalshi_bot.services.strategy_cleanup import (
     CleanupSignal,
@@ -154,6 +159,129 @@ class StrategyCleanupService:
                             break
 
         return filled / len(rooms)
+
+    async def sweep_discount_sensitivity(
+        self,
+        *,
+        discount_cents_candidates: list[float],
+        lookback_days: int = 30,
+        latency_budget_seconds: int = 10,
+    ) -> dict[str, Any]:
+        """Estimate fill rate × net EV per candidate discount (P1-3).
+
+        For each candidate discount d ∈ ``discount_cents_candidates`` (fractional
+        OK — e.g. 0.5), replays every shadow ``StrategyCRoom`` in the window
+        against its persisted ``MarketPriceHistory`` with an *alternative* target
+        price at d cents above/below settlement. A signal counts as filled when
+        at least one price snapshot within ``latency_budget_seconds`` crossed
+        the alt target on the correct side.
+
+        Net EV per filled contract assumes fill at the alt target:
+            gross = 100 - target (cents)
+            fee   = kalshi taker fee at target
+            net   = gross - fee
+
+        Returns one row per candidate with fill_count, fill_rate, avg_net_ev,
+        and total_net_ev_dollars (net_ev × fills — a rough total per-shadow-
+        signal lower bound assuming 1 contract per fill). Also returns the
+        sweep window metadata and a ``status`` marker so callers can detect
+        "not enough data" explicitly.
+        """
+        from datetime import timedelta
+
+        if not discount_cents_candidates:
+            raise ValueError("discount_cents_candidates must be non-empty")
+
+        cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
+        async with self._session_factory() as session:
+            rooms_stmt = (
+                select(StrategyCRoom)
+                .where(
+                    StrategyCRoom.execution_outcome == "shadow",
+                    StrategyCRoom.decision_time >= cutoff,
+                    StrategyCRoom.target_price_cents > 0,
+                )
+            )
+            rooms = (await session.execute(rooms_stmt)).scalars().all()
+
+            if len(rooms) < 10:
+                return {
+                    "status": "insufficient_data",
+                    "n_signals": len(rooms),
+                    "lookback_days": lookback_days,
+                    "latency_budget_seconds": latency_budget_seconds,
+                    "rows": [],
+                }
+
+            # Preload the price snapshots window once per room to avoid running
+            # one query per (room, candidate) — that's a quadratic blowup.
+            snapshots_by_room: dict[str, list[MarketPriceHistory]] = {}
+            for room in rooms:
+                window_end = room.decision_time + timedelta(seconds=latency_budget_seconds)
+                price_stmt = (
+                    select(MarketPriceHistory)
+                    .where(
+                        MarketPriceHistory.market_ticker == room.ticker,
+                        MarketPriceHistory.observed_at >= room.decision_time,
+                        MarketPriceHistory.observed_at <= window_end,
+                    )
+                    .limit(50)
+                )
+                snapshots_by_room[room.room_id] = list(
+                    (await session.execute(price_stmt)).scalars().all()
+                )
+
+        rows: list[dict[str, Any]] = []
+        for discount_cents in discount_cents_candidates:
+            filled = 0
+            total_net_ev_cents = 0.0
+            for room in rooms:
+                target_cents = strategy_c_target_cents(
+                    resolution_state=room.resolution_state,
+                    discount_cents=discount_cents,
+                )
+                target_dollars = target_cents / 100.0
+                is_yes = str(room.resolution_state).lower().endswith("yes")
+                was_filled = False
+                for snap in snapshots_by_room[room.room_id]:
+                    if is_yes:
+                        ask = snap.yes_ask_dollars
+                        if ask is not None and float(ask) <= target_dollars:
+                            was_filled = True
+                            break
+                    else:
+                        bid = snap.yes_bid_dollars
+                        # NO ask ≈ 1 - YES bid
+                        if bid is not None and (1.0 - float(bid)) <= target_dollars:
+                            was_filled = True
+                            break
+                if was_filled:
+                    filled += 1
+                    gross = strategy_c_gross_edge_cents(
+                        resolution_state=room.resolution_state,
+                        discount_cents=discount_cents,
+                    )
+                    fee = strategy_c_fee_cents(target_dollars)
+                    total_net_ev_cents += gross - fee
+
+            fill_rate = filled / len(rooms)
+            avg_net_ev_cents = total_net_ev_cents / len(rooms)
+            rows.append({
+                "discount_cents": discount_cents,
+                "n_signals": len(rooms),
+                "fill_count": filled,
+                "fill_rate": fill_rate,
+                "avg_net_ev_cents": avg_net_ev_cents,
+                "total_net_ev_dollars": total_net_ev_cents / 100.0,
+            })
+
+        return {
+            "status": "ok",
+            "n_signals": len(rooms),
+            "lookback_days": lookback_days,
+            "latency_budget_seconds": latency_budget_seconds,
+            "rows": rows,
+        }
 
     async def get_status(self) -> dict[str, Any]:
         """Return aggregate Strategy C metrics from StrategyCRoom records."""

@@ -69,6 +69,7 @@ from kalshi_bot.db.models import (
     RoomStrategyAuditRecord,
     CityStrategyAssignment,
     Signal,
+    StrategyPromotionEvent,
     StrategyRecord,
     StrategyCodexRunRecord,
     StrategyResultRecord,
@@ -791,7 +792,15 @@ class PlatformRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def save_trade_ticket(self, room_id: str, ticket: TradeTicket, client_order_id: str, message_id: str | None = None) -> TradeTicketRecord:
+    async def save_trade_ticket(
+        self,
+        room_id: str,
+        ticket: TradeTicket,
+        client_order_id: str,
+        message_id: str | None = None,
+        *,
+        strategy_code: str | None = None,
+    ) -> TradeTicketRecord:
         record = TradeTicketRecord(
             room_id=room_id,
             message_id=message_id,
@@ -802,6 +811,7 @@ class PlatformRepository:
             count_fp=ticket.count_fp,
             time_in_force=ticket.time_in_force,
             client_order_id=client_order_id,
+            strategy_code=strategy_code,
             payload=ticket.model_dump(mode="json"),
         )
         self.session.add(record)
@@ -855,7 +865,13 @@ class PlatformRepository:
         raw: dict[str, Any],
         kalshi_order_id: str | None = None,
         kalshi_env: str | None = None,
+        strategy_code: str | None = None,
     ) -> OrderRecord:
+        resolved_strategy = await self._resolve_strategy_code_for_order(
+            strategy_code=strategy_code,
+            ticket_id=ticket_id,
+            client_order_id=client_order_id,
+        )
         record = OrderRecord(
             trade_ticket_id=ticket_id,
             client_order_id=client_order_id,
@@ -866,12 +882,37 @@ class PlatformRepository:
             action=action,
             yes_price_dollars=yes_price_dollars,
             count_fp=count_fp,
+            strategy_code=resolved_strategy,
             raw=raw,
             kalshi_order_id=kalshi_order_id,
         )
         self.session.add(record)
         await self.session.flush()
         return record
+
+    async def _resolve_strategy_code_for_order(
+        self,
+        *,
+        strategy_code: str | None,
+        ticket_id: str | None,
+        client_order_id: str | None,
+    ) -> str | None:
+        """Strategy code flows from the ticket if caller didn't specify one."""
+        if strategy_code is not None:
+            return strategy_code
+        if ticket_id is not None:
+            stmt = select(TradeTicketRecord.strategy_code).where(TradeTicketRecord.id == ticket_id)
+            found = (await self.session.execute(stmt)).scalar_one_or_none()
+            if found is not None:
+                return found
+        if client_order_id is not None:
+            stmt = select(TradeTicketRecord.strategy_code).where(
+                TradeTicketRecord.client_order_id == client_order_id
+            )
+            found = (await self.session.execute(stmt)).scalar_one_or_none()
+            if found is not None:
+                return found
+        return None
 
     async def upsert_order(
         self,
@@ -887,8 +928,14 @@ class PlatformRepository:
         ticket_id: str | None = None,
         kalshi_order_id: str | None = None,
         kalshi_env: str | None = None,
+        strategy_code: str | None = None,
     ) -> OrderRecord:
         from kalshi_bot.db.models import OrderRecord as _OR
+        resolved_strategy = await self._resolve_strategy_code_for_order(
+            strategy_code=strategy_code,
+            ticket_id=ticket_id,
+            client_order_id=client_order_id,
+        )
         record_id = str(uuid4())
         now = datetime.now(UTC)
         env = self._resolved_kalshi_env(kalshi_env)
@@ -903,6 +950,7 @@ class PlatformRepository:
             "action": action,
             "yes_price_dollars": yes_price_dollars,
             "count_fp": count_fp,
+            "strategy_code": resolved_strategy,
             "raw": raw,
             "kalshi_order_id": kalshi_order_id,
             "created_at": now,
@@ -943,15 +991,22 @@ class PlatformRepository:
                     existing.trade_ticket_id = ticket_id
                 if kalshi_order_id and not existing.kalshi_order_id:
                     existing.kalshi_order_id = kalshi_order_id
+                if resolved_strategy and not existing.strategy_code:
+                    existing.strategy_code = resolved_strategy
             await self.session.flush()
             return existing
 
-        # COALESCE keeps an already-set kalshi_order_id rather than overwriting with NULL
+        # COALESCE keeps an already-set kalshi_order_id / strategy_code rather than overwriting with NULL
         coalesce_kalshi_id = func.coalesce(stmt.excluded.kalshi_order_id, _OR.kalshi_order_id)
+        coalesce_strategy = func.coalesce(stmt.excluded.strategy_code, _OR.strategy_code)
         await self.session.execute(
             stmt.on_conflict_do_update(
                 index_elements=["kalshi_env", "client_order_id"],
-                set_={**update_values, "kalshi_order_id": coalesce_kalshi_id},
+                set_={
+                    **update_values,
+                    "kalshi_order_id": coalesce_kalshi_id,
+                    "strategy_code": coalesce_strategy,
+                },
             )
         )
         await self.session.flush()
@@ -1006,22 +1061,57 @@ class PlatformRepository:
         trade_id: str | None = None,
         is_taker: bool = True,
         kalshi_env: str | None = None,
+        strategy_code: str | None = None,
     ) -> FillRecord:
+        env = self._resolved_kalshi_env(kalshi_env)
+        resolved_strategy = await self._resolve_strategy_code_for_fill(
+            strategy_code=strategy_code,
+            order_id=order_id,
+            kalshi_order_id=raw.get("order_id") if isinstance(raw, dict) else None,
+            kalshi_env=env,
+        )
         record = FillRecord(
             order_id=order_id,
             trade_id=trade_id,
-            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            kalshi_env=env,
             market_ticker=market_ticker,
             side=side,
             action=action,
             yes_price_dollars=yes_price_dollars,
             count_fp=count_fp,
+            strategy_code=resolved_strategy,
             raw=raw,
             is_taker=is_taker,
         )
         self.session.add(record)
         await self.session.flush()
         return record
+
+    async def _resolve_strategy_code_for_fill(
+        self,
+        *,
+        strategy_code: str | None,
+        order_id: str | None,
+        kalshi_order_id: str | None,
+        kalshi_env: str | None,
+    ) -> str | None:
+        """Strategy code flows from the associated order when the caller doesn't specify one."""
+        if strategy_code is not None:
+            return strategy_code
+        if order_id is not None:
+            stmt = select(OrderRecord.strategy_code).where(OrderRecord.id == order_id)
+            found = (await self.session.execute(stmt)).scalar_one_or_none()
+            if found is not None:
+                return found
+        if kalshi_order_id is not None and kalshi_env is not None:
+            stmt = select(OrderRecord.strategy_code).where(
+                OrderRecord.kalshi_env == kalshi_env,
+                OrderRecord.kalshi_order_id == kalshi_order_id,
+            )
+            found = (await self.session.execute(stmt)).scalar_one_or_none()
+            if found is not None:
+                return found
+        return None
 
     async def upsert_fill(
         self,
@@ -1036,8 +1126,15 @@ class PlatformRepository:
         trade_id: str | None = None,
         is_taker: bool = True,
         kalshi_env: str | None = None,
+        strategy_code: str | None = None,
     ) -> FillRecord:
         env = self._resolved_kalshi_env(kalshi_env)
+        resolved_strategy = await self._resolve_strategy_code_for_fill(
+            strategy_code=strategy_code,
+            order_id=order_id,
+            kalshi_order_id=raw.get("order_id") if isinstance(raw, dict) else None,
+            kalshi_env=env,
+        )
         if trade_id is not None:
             observed_at = datetime.now(UTC)
             insert_values = {
@@ -1050,6 +1147,7 @@ class PlatformRepository:
                 "action": action,
                 "yes_price_dollars": yes_price_dollars,
                 "count_fp": count_fp,
+                "strategy_code": resolved_strategy,
                 "raw": raw,
                 "is_taker": is_taker,
                 "created_at": observed_at,
@@ -1074,6 +1172,7 @@ class PlatformRepository:
                             "action": excluded.action,
                             "yes_price_dollars": excluded.yes_price_dollars,
                             "count_fp": excluded.count_fp,
+                            "strategy_code": func.coalesce(excluded.strategy_code, FillRecord.strategy_code),
                             "raw": excluded.raw,
                             "is_taker": excluded.is_taker,
                             "updated_at": observed_at,
@@ -1104,6 +1203,7 @@ class PlatformRepository:
                 action=action,
                 yes_price_dollars=yes_price_dollars,
                 count_fp=count_fp,
+                strategy_code=resolved_strategy,
                 raw=raw,
                 is_taker=is_taker,
             )
@@ -1115,6 +1215,8 @@ class PlatformRepository:
             record.action = action
             record.yes_price_dollars = yes_price_dollars
             record.count_fp = count_fp
+            if resolved_strategy and not record.strategy_code:
+                record.strategy_code = resolved_strategy
             record.raw = raw
             record.is_taker = is_taker
         await self.session.flush()
@@ -1171,13 +1273,34 @@ class PlatformRepository:
             await self.session.flush()
         return settled
 
-    async def get_fill_win_rate_30d(self, *, kalshi_env: str | None = None) -> dict[str, Any]:
-        """Return 30-day rolling realized P&L win rate by contract count.
+    async def get_fill_win_rate_30d(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        strategy_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Return 30-day rolling realized P&L metrics.
 
         A position is a win if:
         - It was sold (stop-loss or manual exit) at a better price than entry, OR
         - It was held to settlement and the market resolved on our side.
         Settlement-based result is used only when no sell fill exists for the ticker+side.
+
+        When ``strategy_code`` is provided, only fills attributed to that strategy
+        are counted. Fills with a NULL ``strategy_code`` are excluded from filtered
+        queries (treat as unknown-attribution).
+
+        Returned keys:
+        - ``won_contracts``, ``total_contracts``: legacy count-weighted win/loss totals.
+        - ``trade_count``, ``win_count``, ``loss_count``: per-trade counts (each
+          buy fill = one trade observation, regardless of contract count).
+        - ``avg_win_dollars``, ``avg_loss_dollars``: mean P&L of winning / losing
+          trades, each weighted by contract count inside the trade. None when
+          there are no trades of that kind.
+        - ``stdev_dollars``: population stdev of per-trade P&L (unweighted).
+          None when fewer than two trades.
+        - ``sharpe_per_trade``: mean(p&l) / stdev(p&l) over the sample (P2-1
+          rolling Sharpe proxy). None when stdev is zero or fewer than two trades.
         """
         cutoff = datetime.now(UTC) - timedelta(days=30)
         env = self._resolved_kalshi_env(kalshi_env)
@@ -1185,6 +1308,8 @@ class PlatformRepository:
             FillRecord.kalshi_env == env,
             FillRecord.created_at >= cutoff,
         )
+        if strategy_code is not None:
+            stmt = stmt.where(FillRecord.strategy_code == strategy_code)
         all_fills = list((await self.session.execute(stmt)).scalars())
 
         # Group by (market_ticker, side)
@@ -1199,25 +1324,153 @@ class PlatformRepository:
 
         won = 0.0
         total = 0.0
+        trade_pnls: list[float] = []  # per-trade dollar P&L (one observation per buy fill)
         for key, buy_fills in buys.items():
             _ticker, side = key
             sell_fills = sells.get(key, [])
+            # Shared weighted-average sell price for the (ticker, side) group.
+            avg_sell: float | None = None
+            if sell_fills:
+                sell_count = sum(float(s.count_fp) for s in sell_fills)
+                if sell_count > 0:
+                    avg_sell = sum(
+                        float(s.yes_price_dollars) * float(s.count_fp) for s in sell_fills
+                    ) / sell_count
             for buy_fill in buy_fills:
                 count = float(buy_fill.count_fp)
+                buy_px = float(buy_fill.yes_price_dollars)
                 total += count
-                if sell_fills:
+                pnl: float | None = None
+                profitable = False
+                if avg_sell is not None:
                     # Realized exit: weight-average sell price across any partial fills.
-                    sell_count = sum(float(s.count_fp) for s in sell_fills)
-                    if sell_count > 0:
-                        avg_sell = sum(float(s.yes_price_dollars) * float(s.count_fp) for s in sell_fills) / sell_count
-                        buy_px = float(buy_fill.yes_price_dollars)
-                        profitable = avg_sell > buy_px if side == "yes" else avg_sell < buy_px
-                        if profitable:
-                            won += count
-                elif buy_fill.settlement_result == "win":
+                    if side == "yes":
+                        pnl = (avg_sell - buy_px) * count
+                    else:
+                        pnl = (buy_px - avg_sell) * count
+                    profitable = pnl > 0
+                elif buy_fill.settlement_result is not None:
+                    # Settled without a sell fill. Payoff is $1 on win, $0 on loss.
+                    # For YES side: entry cost = buy_px, for NO side: entry cost = 1 - buy_px.
+                    won_leg = buy_fill.settlement_result == "win"
+                    if side == "yes":
+                        pnl = ((1.0 if won_leg else 0.0) - buy_px) * count
+                    else:
+                        pnl = ((1.0 if won_leg else 0.0) - (1.0 - buy_px)) * count
+                    profitable = won_leg
+                if profitable:
                     won += count
+                if pnl is not None:
+                    trade_pnls.append(pnl)
 
-        return {"won_contracts": won, "total_contracts": total}
+        trade_count = len(trade_pnls)
+        wins_pnl = [p for p in trade_pnls if p > 0]
+        losses_pnl = [p for p in trade_pnls if p < 0]
+        avg_win_dollars = (sum(wins_pnl) / len(wins_pnl)) if wins_pnl else None
+        avg_loss_dollars = (sum(losses_pnl) / len(losses_pnl)) if losses_pnl else None
+
+        stdev_dollars: float | None = None
+        sharpe_per_trade: float | None = None
+        if trade_count >= 2:
+            mean_pnl = sum(trade_pnls) / trade_count
+            variance = sum((p - mean_pnl) ** 2 for p in trade_pnls) / trade_count
+            stdev = variance ** 0.5
+            stdev_dollars = stdev
+            if stdev > 0:
+                sharpe_per_trade = mean_pnl / stdev
+
+        return {
+            "won_contracts": won,
+            "total_contracts": total,
+            "trade_count": trade_count,
+            "win_count": len(wins_pnl),
+            "loss_count": len(losses_pnl),
+            "avg_win_dollars": avg_win_dollars,
+            "avg_loss_dollars": avg_loss_dollars,
+            "stdev_dollars": stdev_dollars,
+            "sharpe_per_trade": sharpe_per_trade,
+        }
+
+    async def get_daily_realized_pnl_dollars_by_strategy(
+        self,
+        *,
+        strategy_code: str,
+        kalshi_env: str | None = None,
+        now: datetime | None = None,
+    ) -> Decimal:
+        """Conservative realized daily P&L for one strategy in the last 24 hours.
+
+        Powers the per-strategy hard-loss cap. Intentionally narrow: counts only
+        BUY fills whose settlement is already known, matched-pair BUY→SELL
+        (stop-loss exits) on the same rolling window, and standalone SELL fills
+        (treated as pure proceeds — the offsetting BUY is assumed to be older
+        than the 24-hour window and therefore already accounted for).
+
+        Open unsettled BUYs contribute zero so the cap cannot be tripped by
+        unrealized marks. A negative return means losses; compare magnitude
+        against the configured cap.
+        """
+        cutoff = (now or datetime.now(UTC)) - timedelta(hours=24)
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = select(FillRecord).where(
+            FillRecord.kalshi_env == env,
+            FillRecord.strategy_code == strategy_code,
+            FillRecord.created_at >= cutoff,
+        )
+        fills = list((await self.session.execute(stmt)).scalars())
+        pnl = Decimal("0")
+
+        # Index sells per (ticker, side) so matched-pair exits can net against
+        # a buy from the same window.
+        sells_by_key: dict[tuple[str, str], list[FillRecord]] = {}
+        matched_sell_ids: set[str] = set()
+        for fill in fills:
+            if fill.action == "sell":
+                sells_by_key.setdefault((fill.market_ticker, fill.side), []).append(fill)
+
+        for buy in fills:
+            if buy.action != "buy":
+                continue
+            cost_per_contract = (
+                buy.yes_price_dollars
+                if buy.side == "yes"
+                else Decimal("1") - buy.yes_price_dollars
+            )
+            cost_total = cost_per_contract * buy.count_fp
+
+            key = (buy.market_ticker, buy.side)
+            matched_sells = [s for s in sells_by_key.get(key, []) if s.id not in matched_sell_ids]
+            if matched_sells:
+                # Match the earliest unused sell. Partial matching is rare in practice
+                # and would only skew the figure by a fraction of a cent.
+                sell = matched_sells[0]
+                matched_sell_ids.add(sell.id)
+                sell_per_contract = (
+                    sell.yes_price_dollars
+                    if sell.side == "yes"
+                    else Decimal("1") - sell.yes_price_dollars
+                )
+                pnl += sell_per_contract * sell.count_fp - cost_total
+            elif buy.settlement_result == "win":
+                pnl += buy.count_fp - cost_total
+            elif buy.settlement_result == "loss":
+                pnl -= cost_total
+            # else: unsettled + unmatched buy → unrealized, contributes nothing
+
+        # Standalone sells whose corresponding buy fell out of the 24h window
+        # still produced proceeds today. Treat those as pure positive cashflow.
+        for sells in sells_by_key.values():
+            for sell in sells:
+                if sell.id in matched_sell_ids:
+                    continue
+                sell_per_contract = (
+                    sell.yes_price_dollars
+                    if sell.side == "yes"
+                    else Decimal("1") - sell.yes_price_dollars
+                )
+                pnl += sell_per_contract * sell.count_fp
+
+        return pnl.quantize(Decimal("0.01"))
 
     async def get_broken_book_rate_30d(self, *, kalshi_env: str | None = None) -> dict[str, Any]:
         cutoff = datetime.now(UTC) - timedelta(days=30)
@@ -3185,6 +3438,55 @@ class PlatformRepository:
 
     async def list_city_strategy_assignments(self) -> list[CityStrategyAssignment]:
         stmt = select(CityStrategyAssignment).order_by(CityStrategyAssignment.series_ticker)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def record_strategy_promotion(
+        self,
+        *,
+        strategy: str,
+        from_state: str,
+        to_state: str,
+        actor: str,
+        evidence_ref: str | None = None,
+        notes: str | None = None,
+        kalshi_env: str | None = None,
+    ) -> StrategyPromotionEvent:
+        """Append one row to the strategy promotion audit log (P2-3)."""
+        if not strategy or not strategy.strip():
+            raise ValueError("strategy must be non-empty")
+        if not actor or not actor.strip():
+            raise ValueError("actor must be non-empty")
+        if from_state == to_state:
+            raise ValueError("from_state and to_state must differ")
+        record = StrategyPromotionEvent(
+            id=str(uuid4()),
+            strategy=strategy.strip(),
+            from_state=from_state.strip(),
+            to_state=to_state.strip(),
+            actor=actor.strip(),
+            evidence_ref=evidence_ref,
+            notes=notes,
+            kalshi_env=self._resolved_kalshi_env(kalshi_env) if kalshi_env is not None else None,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def list_strategy_promotions(
+        self,
+        *,
+        strategy: str | None = None,
+        kalshi_env: str | None = None,
+        limit: int = 50,
+    ) -> list[StrategyPromotionEvent]:
+        stmt = select(StrategyPromotionEvent)
+        if strategy is not None:
+            stmt = stmt.where(StrategyPromotionEvent.strategy == strategy)
+        if kalshi_env is not None:
+            stmt = stmt.where(
+                StrategyPromotionEvent.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+            )
+        stmt = stmt.order_by(StrategyPromotionEvent.created_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
     async def clear_city_strategy_assignments(self, *, assigned_by: str | None = None) -> int:

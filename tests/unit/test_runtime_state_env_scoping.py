@@ -150,8 +150,10 @@ async def test_reconcile_checkpoints_and_fill_metrics_are_env_scoped(tmp_path) -
     assert production_capital == Decimal("925")
     assert demo_baseline == Decimal("512.00")
     assert production_baseline == Decimal("925.00")
-    assert demo_win_rate == {"won_contracts": 2.0, "total_contracts": 2.0}
-    assert production_win_rate == {"won_contracts": 0, "total_contracts": 3.0}
+    assert demo_win_rate["won_contracts"] == 2.0
+    assert demo_win_rate["total_contracts"] == 2.0
+    assert production_win_rate["won_contracts"] == 0
+    assert production_win_rate["total_contracts"] == 3.0
     await engine.dispose()
 
 

@@ -178,6 +178,23 @@ def _win_rate_display(win_rate_data: dict) -> str:
     return f"{pct}%"
 
 
+def _win_loss_magnitude_display(win_rate_data: dict) -> dict[str, str]:
+    """Format avg win / avg loss / stdev / Sharpe proxy for the win-rate card (P2-1)."""
+    def _money(value: float | None, *, signed: bool) -> str:
+        if value is None:
+            return "—"
+        return _money_display(Decimal(str(value)), signed=signed)
+
+    sharpe = win_rate_data.get("sharpe_per_trade")
+    sharpe_display = "—" if sharpe is None else f"{sharpe:+.2f}"
+    return {
+        "avg_win_display": _money(win_rate_data.get("avg_win_dollars"), signed=True),
+        "avg_loss_display": _money(win_rate_data.get("avg_loss_dollars"), signed=True),
+        "stdev_display": _money(win_rate_data.get("stdev_dollars"), signed=False),
+        "sharpe_display": sharpe_display,
+    }
+
+
 def _broken_book_rate_display(data: dict) -> str:
     total = data.get("total_count", 0)
     if not total:
@@ -1381,6 +1398,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
     payload["daily_pnl_display"] = _money_display(daily_pnl, signed=True)
     payload["daily_pnl_tone"] = _pnl_tone(daily_pnl)
     payload["strategy_c"] = await _strategy_c_summary(container)
+    payload["regression_read_source"] = getattr(container, "regression_read_source", "primary")
     return payload
 
 
@@ -1700,6 +1718,12 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         "daily_pnl_tone": _pnl_tone(daily_pnl),
         "win_rate_display": _win_rate_display(win_rate_data),
         "win_rate_contracts": f"{int(win_rate_data.get('won_contracts', 0))}W / {int(win_rate_data.get('total_contracts', 0))}T",
+        "win_rate_trades": (
+            f"{int(win_rate_data.get('win_count', 0))}W / "
+            f"{int(win_rate_data.get('loss_count', 0))}L / "
+            f"{int(win_rate_data.get('trade_count', 0))}T"
+        ),
+        **_win_loss_magnitude_display(win_rate_data),
         "broken_book_rate": _broken_book_rate_display(broken_book_data),
         "broken_book_counts": f"{broken_book_data.get('broken_count', 0)} / {broken_book_data.get('total_count', 0)} rooms (30d)",
         "positions_summary": positions_summary,
@@ -2854,7 +2878,14 @@ async def build_strategies_dashboard_core(
     if window_days not in STRATEGY_WINDOW_OPTIONS:
         window_days = DEFAULT_STRATEGY_WINDOW_DAYS
 
-    async with container.session_factory() as session:
+    # Reads go through the regression read factory so operators can point the
+    # strategies dashboard at production data while regression snapshots still
+    # land locally. Falls back to the primary session factory for test stubs
+    # that predate the split.
+    read_session_factory = getattr(
+        container, "regression_read_session_factory", container.session_factory
+    )
+    async with read_session_factory() as session:
         repo = PlatformRepository(session)
         strategies = await repo.list_strategies(active_only=True)
         assignments = await repo.list_city_strategy_assignments()
