@@ -132,6 +132,7 @@ class TradeTicketRecord(Base, IdMixin, TimestampMixin):
     time_in_force: Mapped[str] = mapped_column(String(64))
     client_order_id: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="proposed")
+    strategy_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -161,6 +162,7 @@ class OrderRecord(Base, IdMixin, TimestampMixin):
     action: Mapped[str] = mapped_column(String(16))
     yes_price_dollars: Mapped[Decimal] = mapped_column(Numeric(10, 4))
     count_fp: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    strategy_code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -178,6 +180,7 @@ class FillRecord(Base, IdMixin, TimestampMixin):
     count_fp: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     is_taker: Mapped[bool] = mapped_column(Boolean, default=True)
     settlement_result: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    strategy_code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
