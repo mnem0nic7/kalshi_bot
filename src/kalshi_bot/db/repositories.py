@@ -1278,7 +1278,7 @@ class PlatformRepository:
         kalshi_env: str | None = None,
         strategy_code: str | None = None,
     ) -> dict[str, Any]:
-        """Return 30-day rolling realized P&L win rate by contract count.
+        """Return 30-day rolling realized P&L metrics.
 
         A position is a win if:
         - It was sold (stop-loss or manual exit) at a better price than entry, OR
@@ -1288,6 +1288,18 @@ class PlatformRepository:
         When ``strategy_code`` is provided, only fills attributed to that strategy
         are counted. Fills with a NULL ``strategy_code`` are excluded from filtered
         queries (treat as unknown-attribution).
+
+        Returned keys:
+        - ``won_contracts``, ``total_contracts``: legacy count-weighted win/loss totals.
+        - ``trade_count``, ``win_count``, ``loss_count``: per-trade counts (each
+          buy fill = one trade observation, regardless of contract count).
+        - ``avg_win_dollars``, ``avg_loss_dollars``: mean P&L of winning / losing
+          trades, each weighted by contract count inside the trade. None when
+          there are no trades of that kind.
+        - ``stdev_dollars``: population stdev of per-trade P&L (unweighted).
+          None when fewer than two trades.
+        - ``sharpe_per_trade``: mean(p&l) / stdev(p&l) over the sample (P2-1
+          rolling Sharpe proxy). None when stdev is zero or fewer than two trades.
         """
         cutoff = datetime.now(UTC) - timedelta(days=30)
         env = self._resolved_kalshi_env(kalshi_env)
@@ -1311,25 +1323,72 @@ class PlatformRepository:
 
         won = 0.0
         total = 0.0
+        trade_pnls: list[float] = []  # per-trade dollar P&L (one observation per buy fill)
         for key, buy_fills in buys.items():
             _ticker, side = key
             sell_fills = sells.get(key, [])
+            # Shared weighted-average sell price for the (ticker, side) group.
+            avg_sell: float | None = None
+            if sell_fills:
+                sell_count = sum(float(s.count_fp) for s in sell_fills)
+                if sell_count > 0:
+                    avg_sell = sum(
+                        float(s.yes_price_dollars) * float(s.count_fp) for s in sell_fills
+                    ) / sell_count
             for buy_fill in buy_fills:
                 count = float(buy_fill.count_fp)
+                buy_px = float(buy_fill.yes_price_dollars)
                 total += count
-                if sell_fills:
+                pnl: float | None = None
+                profitable = False
+                if avg_sell is not None:
                     # Realized exit: weight-average sell price across any partial fills.
-                    sell_count = sum(float(s.count_fp) for s in sell_fills)
-                    if sell_count > 0:
-                        avg_sell = sum(float(s.yes_price_dollars) * float(s.count_fp) for s in sell_fills) / sell_count
-                        buy_px = float(buy_fill.yes_price_dollars)
-                        profitable = avg_sell > buy_px if side == "yes" else avg_sell < buy_px
-                        if profitable:
-                            won += count
-                elif buy_fill.settlement_result == "win":
+                    if side == "yes":
+                        pnl = (avg_sell - buy_px) * count
+                    else:
+                        pnl = (buy_px - avg_sell) * count
+                    profitable = pnl > 0
+                elif buy_fill.settlement_result is not None:
+                    # Settled without a sell fill. Payoff is $1 on win, $0 on loss.
+                    # For YES side: entry cost = buy_px, for NO side: entry cost = 1 - buy_px.
+                    won_leg = buy_fill.settlement_result == "win"
+                    if side == "yes":
+                        pnl = ((1.0 if won_leg else 0.0) - buy_px) * count
+                    else:
+                        pnl = ((1.0 if won_leg else 0.0) - (1.0 - buy_px)) * count
+                    profitable = won_leg
+                if profitable:
                     won += count
+                if pnl is not None:
+                    trade_pnls.append(pnl)
 
-        return {"won_contracts": won, "total_contracts": total}
+        trade_count = len(trade_pnls)
+        wins_pnl = [p for p in trade_pnls if p > 0]
+        losses_pnl = [p for p in trade_pnls if p < 0]
+        avg_win_dollars = (sum(wins_pnl) / len(wins_pnl)) if wins_pnl else None
+        avg_loss_dollars = (sum(losses_pnl) / len(losses_pnl)) if losses_pnl else None
+
+        stdev_dollars: float | None = None
+        sharpe_per_trade: float | None = None
+        if trade_count >= 2:
+            mean_pnl = sum(trade_pnls) / trade_count
+            variance = sum((p - mean_pnl) ** 2 for p in trade_pnls) / trade_count
+            stdev = variance ** 0.5
+            stdev_dollars = stdev
+            if stdev > 0:
+                sharpe_per_trade = mean_pnl / stdev
+
+        return {
+            "won_contracts": won,
+            "total_contracts": total,
+            "trade_count": trade_count,
+            "win_count": len(wins_pnl),
+            "loss_count": len(losses_pnl),
+            "avg_win_dollars": avg_win_dollars,
+            "avg_loss_dollars": avg_loss_dollars,
+            "stdev_dollars": stdev_dollars,
+            "sharpe_per_trade": sharpe_per_trade,
+        }
 
     async def get_daily_realized_pnl_dollars_by_strategy(
         self,

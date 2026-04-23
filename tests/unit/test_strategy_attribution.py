@@ -292,13 +292,171 @@ async def test_win_rate_segregates_by_strategy_code(repo_factory, room_id):
         await session.flush()
 
         overall = await repo.get_fill_win_rate_30d(kalshi_env="demo")
-        assert overall == {"won_contracts": 10.0, "total_contracts": 15.0}
+        assert overall["won_contracts"] == 10.0
+        assert overall["total_contracts"] == 15.0
 
         only_a = await repo.get_fill_win_rate_30d(kalshi_env="demo", strategy_code="A")
-        assert only_a == {"won_contracts": 10.0, "total_contracts": 10.0}
+        assert only_a["won_contracts"] == 10.0
+        assert only_a["total_contracts"] == 10.0
 
         only_c = await repo.get_fill_win_rate_30d(kalshi_env="demo", strategy_code="C")
-        assert only_c == {"won_contracts": 0.0, "total_contracts": 5.0}
+        assert only_c["won_contracts"] == 0.0
+        assert only_c["total_contracts"] == 5.0
 
         no_arb_yet = await repo.get_fill_win_rate_30d(kalshi_env="demo", strategy_code="ARB")
-        assert no_arb_yet == {"won_contracts": 0.0, "total_contracts": 0.0}
+        assert no_arb_yet["won_contracts"] == 0.0
+        assert no_arb_yet["total_contracts"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# P2-1: loss-magnitude + Sharpe fields on the win-rate card
+# ---------------------------------------------------------------------------
+
+
+async def _seed_buy_with_settlement(
+    repo,
+    *,
+    market_ticker: str,
+    yes_price: str,
+    count: str,
+    trade_id: str,
+    settlement_result: str,
+    side: str = "yes",
+):
+    fill = await repo.upsert_fill(
+        market_ticker=market_ticker,
+        side=side,
+        action="buy",
+        yes_price_dollars=Decimal(yes_price),
+        count_fp=Decimal(count),
+        raw={},
+        trade_id=trade_id,
+        kalshi_env="demo",
+        strategy_code="A",
+    )
+    fill.settlement_result = settlement_result
+    return fill
+
+
+@pytest.mark.asyncio
+async def test_win_rate_empty_has_null_magnitudes(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        result = await repo.get_fill_win_rate_30d(kalshi_env="demo")
+        assert result["trade_count"] == 0
+        assert result["avg_win_dollars"] is None
+        assert result["avg_loss_dollars"] is None
+        assert result["stdev_dollars"] is None
+        assert result["sharpe_per_trade"] is None
+
+
+@pytest.mark.asyncio
+async def test_win_rate_all_wins_have_no_loss_magnitude(repo_factory, room_id):
+    """When every trade wins, avg_loss_dollars is None, not zero."""
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        # Two YES buys at $0.40 × 10 each, both settle YES → P&L = (1-0.40)*10 = $6.00 each
+        await _seed_buy_with_settlement(
+            repo, market_ticker="KXHIGHNY-26APR23-T68",
+            yes_price="0.4000", count="10.00", trade_id="t1", settlement_result="win",
+        )
+        await _seed_buy_with_settlement(
+            repo, market_ticker="KXHIGHCHI-26APR23-T82",
+            yes_price="0.4000", count="10.00", trade_id="t2", settlement_result="win",
+        )
+        await session.flush()
+
+        result = await repo.get_fill_win_rate_30d(kalshi_env="demo")
+        assert result["trade_count"] == 2
+        assert result["win_count"] == 2
+        assert result["loss_count"] == 0
+        assert result["avg_win_dollars"] == pytest.approx(6.0)
+        assert result["avg_loss_dollars"] is None
+        # Stdev of [6.0, 6.0] is zero → Sharpe is None (guard against div-by-zero)
+        assert result["stdev_dollars"] == pytest.approx(0.0)
+        assert result["sharpe_per_trade"] is None
+
+
+@pytest.mark.asyncio
+async def test_win_rate_all_losses_have_no_win_magnitude(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        # Two YES buys at $0.60 × 5, both settle NO → P&L = (0 - 0.60) * 5 = -$3.00 each
+        await _seed_buy_with_settlement(
+            repo, market_ticker="KXHIGHNY-26APR23-T68",
+            yes_price="0.6000", count="5.00", trade_id="t1", settlement_result="loss",
+        )
+        await _seed_buy_with_settlement(
+            repo, market_ticker="KXHIGHCHI-26APR23-T82",
+            yes_price="0.6000", count="5.00", trade_id="t2", settlement_result="loss",
+        )
+        await session.flush()
+
+        result = await repo.get_fill_win_rate_30d(kalshi_env="demo")
+        assert result["trade_count"] == 2
+        assert result["win_count"] == 0
+        assert result["loss_count"] == 2
+        assert result["avg_win_dollars"] is None
+        assert result["avg_loss_dollars"] == pytest.approx(-3.0)
+
+
+@pytest.mark.asyncio
+async def test_win_rate_mixed_outcomes_report_both_magnitudes_and_sharpe(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        # Trade 1: YES buy at $0.40 × 10, wins → P&L = +$6.00
+        # Trade 2: YES buy at $0.80 × 5, loses → P&L = -$4.00
+        # Trade 3: YES buy at $0.50 × 8, wins → P&L = +$4.00
+        await _seed_buy_with_settlement(
+            repo, market_ticker="KXHIGHNY-26APR23-T68",
+            yes_price="0.4000", count="10.00", trade_id="t1", settlement_result="win",
+        )
+        await _seed_buy_with_settlement(
+            repo, market_ticker="KXHIGHCHI-26APR23-T82",
+            yes_price="0.8000", count="5.00", trade_id="t2", settlement_result="loss",
+        )
+        await _seed_buy_with_settlement(
+            repo, market_ticker="KXHIGHAUS-26APR23-T90",
+            yes_price="0.5000", count="8.00", trade_id="t3", settlement_result="win",
+        )
+        await session.flush()
+
+        result = await repo.get_fill_win_rate_30d(kalshi_env="demo")
+        assert result["trade_count"] == 3
+        assert result["win_count"] == 2
+        assert result["loss_count"] == 1
+        # avg win = (6 + 4) / 2 = 5.0
+        assert result["avg_win_dollars"] == pytest.approx(5.0)
+        # avg loss = -4.0 / 1 = -4.0
+        assert result["avg_loss_dollars"] == pytest.approx(-4.0)
+        # stdev over [6, -4, 4]: mean=2, var=((6-2)^2+(-4-2)^2+(4-2)^2)/3 = (16+36+4)/3 = 56/3 ≈ 18.667
+        # stdev ≈ sqrt(18.667) ≈ 4.320
+        assert result["stdev_dollars"] == pytest.approx(4.320, abs=0.01)
+        # sharpe = mean / stdev = 2.0 / 4.320 ≈ 0.463
+        assert result["sharpe_per_trade"] == pytest.approx(0.463, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_win_rate_for_no_side_accounts_for_complement_price(repo_factory, room_id):
+    """NO side stores yes_price_dollars; entry cost is (1 - yes_price).
+    A NO buy at yes_price=0.40 that settles NO should report P&L = 0.40 × count."""
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        # NO buy at yes_price=0.40 means we paid $0.60 per NO contract.
+        # Settles NO (our side wins) → payoff $1, P&L = (1 - 0.60) * 10 = $4.00
+        await _seed_buy_with_settlement(
+            repo, market_ticker="KXHIGHNY-26APR23-T68",
+            yes_price="0.4000", count="10.00", trade_id="t1",
+            settlement_result="win", side="no",
+        )
+        await session.flush()
+
+        result = await repo.get_fill_win_rate_30d(kalshi_env="demo")
+        assert result["trade_count"] == 1
+        assert result["win_count"] == 1
+        assert result["avg_win_dollars"] == pytest.approx(4.0)
