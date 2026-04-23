@@ -6,6 +6,35 @@ exists: buy YES T_i + buy NO T_j. Payoff is ≥ $1 in all scenarios; cost is < $
 
 Scanner runs every N seconds over open KXHIGH* markets, groups by (station, event_date),
 and emits MonotonicityArbProposal objects for each detected violation.
+
+Atomicity contract (P1-2)
+-------------------------
+The "risk-free" claim depends on BOTH legs of the pair filling at the quoted
+prices. Kalshi does not provide native atomic multi-leg orders, so a live
+implementation must:
+
+1. Place leg 1 (buy YES on the lower threshold).
+2. Wait for fill confirmation — on failure/timeout, cancel and abort.
+3. Place leg 2 (buy NO on the higher threshold) only after leg 1 filled.
+4. If leg 2 fails to fill within a short timeout, **immediately unwind leg 1
+   by selling back to the resting bid**. Document and account for unwind
+   slippage and timing risk.
+5. Persist the leg-pair as a single logical unit (both leg order_ids + the
+   terminal state: both_filled / leg1_unwound / stuck_partial).
+
+Until that executor exists, ``evaluate_arb_risk`` returns ``"risk_blocked"``
+for any configuration that would attempt live execution. Scanner remains free
+to run in shadow mode, which never calls ExecutionService; the operator sees
+proposals in the control room and can monitor detection quality without
+exposure.
+
+Flag sequence to eventually enable live:
+- ``monotonicity_arb_enabled = True``
+- ``monotonicity_arb_shadow_only = False``
+- ``monotonicity_arb_atomic_execution_ready = True``  (acknowledges the above)
+
+Even with all three set, today the gate still returns ``"risk_blocked"``
+because the atomic executor is a separate follow-up.
 """
 from __future__ import annotations
 
@@ -254,7 +283,13 @@ def evaluate_arb_risk(
     """Return (execution_outcome, suppression_reason) for a monotonicity arb violation.
 
     Applies: kill switch, enabled flag, shadow-only flag, notional cap.
-    Returns 'shadow', 'risk_blocked', or 'suppressed' with an optional reason.
+    Returns one of ``"shadow"``, ``"risk_blocked"`` with an optional reason.
+
+    Live execution is not yet available — see the module docstring for the
+    atomicity contract. When ``monotonicity_arb_shadow_only=False`` the gate
+    returns ``"risk_blocked"`` instead of silently downgrading to shadow, so
+    an operator flipping the flag without a two-leg executor sees an explicit
+    refusal rather than a misleading green light.
     """
     if control.kill_switch_enabled:
         return "risk_blocked", "Global kill switch is enabled."
@@ -273,7 +308,22 @@ def evaluate_arb_risk(
     if settings.monotonicity_arb_shadow_only:
         return "shadow", None
 
-    return "shadow", None  # live execution path reserved for operator opt-in
+    # Live execution demands an atomic two-leg executor with rollback on
+    # leg-2 failure. Until that lands, block rather than silently downgrade.
+    if not settings.monotonicity_arb_atomic_execution_ready:
+        return "risk_blocked", (
+            "Live monotonicity arb requires monotonicity_arb_atomic_execution_ready=True "
+            "and a two-leg executor that unwinds leg 1 on leg-2 failure. "
+            "Flip shadow_only back on or implement the atomic executor first."
+        )
+
+    # Even with the readiness flag set, the atomic executor is not yet built.
+    # Refuse live execution so a misconfigured environment cannot place naked
+    # legs. Remove this gate only in the same commit that ships the executor.
+    return "risk_blocked", (
+        "monotonicity_arb_atomic_execution_ready=True but atomic executor is not yet "
+        "implemented. See services/monotonicity_scanner.py docstring."
+    )
 
 
 def size_proposal(

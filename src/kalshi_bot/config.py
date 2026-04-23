@@ -170,6 +170,14 @@ class Settings(BaseSettings):
     # Addition 3: Monotonicity Arb Scanner (§4.3)
     monotonicity_arb_enabled: bool = False
     monotonicity_arb_shadow_only: bool = True
+    # Live execution of the two-leg arb requires an atomic executor that can
+    # place leg 1, place leg 2, and unwind leg 1 if leg 2 fails. That executor
+    # is NOT built yet — see services/monotonicity_scanner.py docstring.
+    # This flag is an explicit acknowledgement that the atomic path exists
+    # before the risk gate will allow a non-shadow outcome. Flipping shadow_only
+    # to False without this flag is rejected with 'risk_blocked', not silently
+    # downgraded to shadow.
+    monotonicity_arb_atomic_execution_ready: bool = False
     monotonicity_arb_min_net_edge_cents: int = 2
     monotonicity_arb_max_notional_dollars: float = 25.0
     monotonicity_arb_max_proposals_per_minute: int = 5
