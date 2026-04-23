@@ -128,13 +128,14 @@ class Settings(BaseSettings):
     risk_stale_weather_seconds: int = 900
     risk_min_edge_bps: int = 500
     risk_max_credible_edge_bps: int = 5000
-    risk_min_confidence: float = 0.70
+    risk_min_confidence: float = 0.60
     risk_min_contract_price_dollars: float = 0.25
     # Probability distance from 50%: 25.0 means fair_yes must be <0.25 or >0.75.
     # Set to 0.0 to disable (only in tests or when the pipeline has city-specific calibration).
     risk_min_probability_extremity_pct: float = 25.0
     strategy_min_remaining_payout_bps: int = 300
     strategy_quality_edge_buffer_bps: int = 25
+    sigma_lead_correction_enabled: bool = True
 
     memory_embedding_dimensions: int = 16
     sse_poll_interval_seconds: float = 1.0

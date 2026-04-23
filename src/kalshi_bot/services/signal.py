@@ -10,7 +10,7 @@ from kalshi_bot.core.enums import ContractSide, StandDownReason, StrategyMode, T
 from kalshi_bot.core.fixed_point import as_decimal, quantize_price
 from kalshi_bot.core.schemas import ResearchFreshness, TradeEligibilityVerdict
 from kalshi_bot.weather.models import WeatherMarketMapping
-from kalshi_bot.weather.scoring import WeatherSignalSnapshot, confidence_band_for, score_weather_market
+from kalshi_bot.weather.scoring import SigmaContext, WeatherSignalSnapshot, confidence_band_for, score_weather_market
 
 NO_TRADE_SUMMARY_SENTENCE = "No taker trade clears the configured edge threshold."
 ADVISORY_SIZE_CAP_FP = Decimal("10.00")
@@ -189,7 +189,7 @@ def remaining_payout_dollars(side: ContractSide, yes_price_dollars: Decimal) -> 
 
 
 def _confidence_size_factor(confidence: float) -> Decimal:
-    """Three-tier position sizing: 0.70–0.80 → 50%, 0.80–0.90 → 75%, 0.90+ → 100%."""
+    """Three-tier position sizing: below 0.80 → 50%, 0.80–0.90 → 75%, 0.90+ → 100%."""
     if confidence >= 0.90:
         return Decimal("1.00")
     if confidence >= 0.80:
@@ -250,7 +250,7 @@ def _model_quality_review(
 
     if signal.trade_regime == "near_threshold":
         recommended_size_cap_fp = ADVISORY_SIZE_CAP_FP
-        if signal.confidence < 0.70:
+        if signal.confidence < settings.risk_min_confidence:
             reasons.append("Near-threshold setup carries low confidence and should be sized conservatively.")
 
     if signal.trade_regime in {"longshot_yes", "longshot_no"}:
@@ -585,12 +585,27 @@ class WeatherSignalEngine:
         weather_bundle: dict[str, Any],
         *,
         min_edge_bps: int | None = None,
+        sigma_params: dict | None = None,
+        lead_factors: dict | None = None,
     ) -> StrategySignal:
+        sigma_ctx: SigmaContext | None = None
+        if sigma_params is not None or lead_factors is not None:
+            from kalshi_bot.weather.sigma_calibration import season_for_month
+            from datetime import UTC, datetime
+            month = datetime.now(UTC).month
+            sigma_ctx = SigmaContext(
+                station=getattr(mapping, "station_id", None),
+                season_bucket=season_for_month(month),
+                sigma_params=sigma_params,
+                lead_factors=lead_factors,
+                lead_correction_enabled=self.settings.sigma_lead_correction_enabled,
+            )
         weather = score_weather_market(
             mapping,
             weather_bundle.get("forecast", {}),
             weather_bundle.get("observation", {}),
             forecast_grid_payload=weather_bundle.get("forecast_grid") or None,
+            sigma_ctx=sigma_ctx,
         )
         effective_min_edge_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
         recommendation_action, recommendation_side, target_yes, edge_bps = _trade_recommendation(

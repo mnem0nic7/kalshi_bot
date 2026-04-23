@@ -131,11 +131,55 @@ def nws_forecast_sigma_f(month: int) -> float:
     return _MONTHLY_SIGMA_F.get(month, 3.5)
 
 
-def sigma_f_for_mapping(mapping: Any, month: int) -> float:
-    """Return the calibrated σ for a market mapping, using per-station overrides when available."""
+@dataclass(slots=True)
+class SigmaContext:
+    """Pre-loaded DB-fit parameters for σ resolution. All fields optional — None → skip that layer."""
+    station: str | None = None
+    season_bucket: str | None = None
+    lead_hours: float | None = None
+    sigma_params: dict | None = None   # keyed by (station, season_bucket)
+    lead_factors: dict | None = None   # keyed by lead_bucket
+    lead_correction_enabled: bool = True
+
+
+# Minimum sample counts for DB-fit to win over each fallback layer (§4.2.3).
+_DB_BEATS_GLOBAL_MIN_N = 100
+_DB_BEATS_YAML_MIN_N = 200
+
+
+def sigma_f_for_mapping(
+    mapping: Any,
+    month: int,
+    *,
+    ctx: "SigmaContext | None" = None,
+) -> float:
+    """Return the calibrated σ for a market mapping, three-layer resolver.
+
+    Layer priority:
+    1. DB-fit (station, season_bucket): requires sample_count ≥ threshold AND CRPS improvement > 0.
+       Threshold is 200 when a YAML anchor exists for this month, 100 otherwise.
+    2. YAML anchor: mapping.sigma_f_by_month[month].
+    3. Global fallback: nws_forecast_sigma_f(month).
+    """
     overrides = getattr(mapping, "sigma_f_by_month", None)
-    if overrides and month in overrides:
-        return float(overrides[month])
+    yaml_sigma = float(overrides[month]) if (overrides and month in overrides) else None
+
+    if ctx is not None and ctx.sigma_params is not None and ctx.station and ctx.season_bucket:
+        params = ctx.sigma_params.get((ctx.station, ctx.season_bucket))
+        if params is not None:
+            n = params.get("sample_count", 0)
+            crps_ok = (params.get("crps_improvement_vs_global") or 0.0) > 0.0
+            min_n = _DB_BEATS_YAML_MIN_N if yaml_sigma is not None else _DB_BEATS_GLOBAL_MIN_N
+            if n >= min_n and crps_ok:
+                sigma = float(params["sigma_base_f"])
+                if ctx.lead_correction_enabled and ctx.lead_factors and ctx.lead_hours is not None:
+                    from kalshi_bot.weather.sigma_calibration import lead_bucket_for_hours
+                    bucket = lead_bucket_for_hours(ctx.lead_hours)
+                    sigma *= ctx.lead_factors.get(bucket, 1.0)
+                return max(sigma, 0.5)
+
+    if yaml_sigma is not None:
+        return yaml_sigma
     return nws_forecast_sigma_f(month)
 
 
@@ -232,6 +276,8 @@ def score_weather_market(
     forecast_payload: dict[str, Any],
     observation_payload: dict[str, Any],
     forecast_grid_payload: dict[str, Any] | None = None,
+    *,
+    sigma_ctx: "SigmaContext | None" = None,
 ) -> WeatherSignalSnapshot:
     if not mapping.supports_structured_weather or mapping.threshold_f is None:
         raise RuntimeError(f"{mapping.market_ticker} is missing structured weather configuration")
@@ -294,8 +340,43 @@ def score_weather_market(
             delta_f = -delta_f
         if using_gridpoint:
             # Layer 2: Gaussian CDF with calibrated monthly σ.
-            month = datetime.now(UTC).month
-            sigma = sigma_f_for_mapping(mapping, month)
+            # asof_ts = max(obs_ts, forecast_updated_ts) — matches the training definition.
+            now_utc = datetime.now(UTC)
+            month = (settlement_date or now_utc.date()).month
+            forecast_updated_ts = parse_iso_datetime(forecast_payload.get("properties", {}).get("updated"))
+            candidates = [t for t in (obs_ts, forecast_updated_ts) if t is not None]
+            asof_ts = max(candidates) if candidates else now_utc
+            resolved_ctx = sigma_ctx
+            if resolved_ctx is None:
+                from kalshi_bot.weather.sigma_calibration import season_for_month
+                resolved_ctx = SigmaContext(
+                    station=getattr(mapping, "station_id", None),
+                    season_bucket=season_for_month(month),
+                )
+            elif resolved_ctx.season_bucket is None and resolved_ctx.station is None:
+                from kalshi_bot.weather.sigma_calibration import season_for_month
+                resolved_ctx = SigmaContext(
+                    station=getattr(mapping, "station_id", None),
+                    season_bucket=season_for_month(month),
+                    lead_hours=resolved_ctx.lead_hours,
+                    sigma_params=resolved_ctx.sigma_params,
+                    lead_factors=resolved_ctx.lead_factors,
+                    lead_correction_enabled=resolved_ctx.lead_correction_enabled,
+                )
+            if resolved_ctx.lead_hours is None and settlement_date is not None:
+                settlement_noon = datetime(
+                    settlement_date.year, settlement_date.month, settlement_date.day, 12, 0, 0, tzinfo=UTC
+                )
+                lead_h = (settlement_noon - asof_ts).total_seconds() / 3600
+                resolved_ctx = SigmaContext(
+                    station=resolved_ctx.station,
+                    season_bucket=resolved_ctx.season_bucket,
+                    lead_hours=lead_h,
+                    sigma_params=resolved_ctx.sigma_params,
+                    lead_factors=resolved_ctx.lead_factors,
+                    lead_correction_enabled=resolved_ctx.lead_correction_enabled,
+                )
+            sigma = sigma_f_for_mapping(mapping, month, ctx=resolved_ctx)
             probability = gaussian_probability(delta_f, sigma_f=sigma)
         else:
             # Layer 1 fallback: logistic with adaptive spread.

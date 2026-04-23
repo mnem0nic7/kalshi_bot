@@ -3,6 +3,8 @@
 Coverage:
 - fit_sigma_base: synthetic residuals with known σ recovers within 5%
 - fit_lead_factors: D-0 normalisation, monotonicity, insufficient-data guard
+- sigma_f_for_mapping resolver: correct layer selected for all (DB/YAML/global) × (n, CRPS) combos
+- lead_correction kill switch (SigmaContext.lead_correction_enabled)
 - _crps_normal: baseline values + global < fit comparison
 - season_for_month / lead_bucket_for_hours: boundary conditions
 - persist/load round-trip via SQLite in-memory DB
@@ -17,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kalshi_bot.weather.scoring import SigmaContext, sigma_f_for_mapping, nws_forecast_sigma_f
 from kalshi_bot.weather.sigma_calibration import (
     LEAD_BUCKETS,
     SEASON_BUCKETS,
@@ -346,3 +349,220 @@ async def test_load_active_lead_factors_maps_correctly() -> None:
 
     result = await load_active_lead_factors(session)
     assert result == {"D-1": 1.35}
+
+
+# ---------------------------------------------------------------------------
+# sigma_f_for_mapping — three-layer resolver (§4.2.3)
+# ---------------------------------------------------------------------------
+
+class _FakeMapping:
+    """Minimal mapping stub for resolver tests."""
+    def __init__(self, station_id: str = "KBOS", sigma_f_by_month: dict | None = None) -> None:
+        self.station_id = station_id
+        self.sigma_f_by_month = sigma_f_by_month or {}
+
+
+def _db_params(n: int, crps_improvement: float, sigma: float = 2.0) -> dict:
+    return {
+        "sigma_base_f": sigma,
+        "mean_bias_f": 0.0,
+        "sample_count": n,
+        "crps_improvement_vs_global": crps_improvement,
+    }
+
+
+# --- Layer 3 (global fallback) ---
+
+def test_resolver_no_ctx_returns_global() -> None:
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7)
+    assert result == nws_forecast_sigma_f(7)
+
+
+def test_resolver_no_ctx_yaml_anchor_wins() -> None:
+    mapping = _FakeMapping(sigma_f_by_month={7: 1.5})
+    result = sigma_f_for_mapping(mapping, month=7)
+    assert result == 1.5
+
+
+def test_resolver_empty_sigma_params_falls_back_to_global() -> None:
+    ctx = SigmaContext(station="KBOS", season_bucket="JJA", sigma_params={}, lead_factors={})
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == nws_forecast_sigma_f(7)
+
+
+# --- n < 100: DB-fit too shallow even with positive CRPS ---
+
+def test_resolver_db_fit_n_below_100_falls_back_to_global() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=80, crps_improvement=0.05)},
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == nws_forecast_sigma_f(7)
+
+
+def test_resolver_db_fit_n_below_100_yaml_still_wins() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=80, crps_improvement=0.05)},
+    )
+    mapping = _FakeMapping(sigma_f_by_month={7: 1.5})
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == 1.5
+
+
+# --- 100 ≤ n < 200: DB-fit beats global but not YAML ---
+
+def test_resolver_db_fit_n_100_beats_global() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=100, crps_improvement=0.05, sigma=2.1)},
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == pytest.approx(2.1)
+
+
+def test_resolver_db_fit_n_150_yaml_still_beats_db() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=150, crps_improvement=0.05, sigma=2.1)},
+    )
+    mapping = _FakeMapping(sigma_f_by_month={7: 1.5})
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == 1.5
+
+
+# --- n ≥ 200: DB-fit beats both global and YAML ---
+
+def test_resolver_db_fit_n_200_beats_yaml() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=200, crps_improvement=0.05, sigma=2.1)},
+    )
+    mapping = _FakeMapping(sigma_f_by_month={7: 1.5})
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == pytest.approx(2.1)
+
+
+# --- CRPS gate: negative improvement blocks DB-fit regardless of n ---
+
+def test_resolver_db_fit_crps_negative_n_200_falls_back_to_yaml() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=300, crps_improvement=-0.01, sigma=2.1)},
+    )
+    mapping = _FakeMapping(sigma_f_by_month={7: 1.5})
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == 1.5
+
+
+def test_resolver_db_fit_crps_negative_no_yaml_falls_back_to_global() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=300, crps_improvement=-0.01, sigma=2.1)},
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == nws_forecast_sigma_f(7)
+
+
+def test_resolver_db_fit_crps_zero_blocked() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=200, crps_improvement=0.0, sigma=2.1)},
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == nws_forecast_sigma_f(7)
+
+
+# --- Lead factor application ---
+
+def test_resolver_lead_factor_applied_when_correction_enabled() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=200, crps_improvement=0.05, sigma=2.0)},
+        lead_factors={"D-0": 1.0, "D-1": 1.5, "D-2+": 2.0},
+        lead_hours=30.0,   # falls into D-1 bucket
+        lead_correction_enabled=True,
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == pytest.approx(2.0 * 1.5)  # sigma_base × D-1 factor
+
+
+def test_resolver_lead_factor_not_applied_when_correction_disabled() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=200, crps_improvement=0.05, sigma=2.0)},
+        lead_factors={"D-0": 1.0, "D-1": 1.5, "D-2+": 2.0},
+        lead_hours=30.0,
+        lead_correction_enabled=False,   # kill switch
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == pytest.approx(2.0)  # no lead factor applied
+
+
+def test_resolver_lead_factor_missing_bucket_defaults_to_one() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=200, crps_improvement=0.05, sigma=2.0)},
+        lead_factors={"D-0": 1.0},   # D-1 missing
+        lead_hours=30.0,              # falls into D-1
+        lead_correction_enabled=True,
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == pytest.approx(2.0)  # missing factor → 1.0 default
+
+
+def test_resolver_lead_hours_none_skips_lead_factor() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=200, crps_improvement=0.05, sigma=2.0)},
+        lead_factors={"D-0": 1.0, "D-1": 1.5},
+        lead_hours=None,              # no lead info
+        lead_correction_enabled=True,
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == pytest.approx(2.0)
+
+
+# --- Station / season mismatch ---
+
+def test_resolver_wrong_station_falls_back_to_global() -> None:
+    ctx = SigmaContext(
+        station="KLAX", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=200, crps_improvement=0.05, sigma=2.0)},
+    )
+    mapping = _FakeMapping(station_id="KLAX")
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == nws_forecast_sigma_f(7)
+
+
+def test_resolver_wrong_season_falls_back_to_global() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="DJF",   # wrong season for July
+        sigma_params={("KBOS", "JJA"): _db_params(n=200, crps_improvement=0.05, sigma=2.0)},
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result == nws_forecast_sigma_f(7)
+
+
+# --- Minimum sigma floor ---
+
+def test_resolver_sigma_clamped_to_minimum() -> None:
+    ctx = SigmaContext(
+        station="KBOS", season_bucket="JJA",
+        sigma_params={("KBOS", "JJA"): _db_params(n=200, crps_improvement=0.05, sigma=0.001)},
+    )
+    mapping = _FakeMapping()
+    result = sigma_f_for_mapping(mapping, month=7, ctx=ctx)
+    assert result >= 0.5
