@@ -1,8 +1,8 @@
 # Kalshi Weather Trading Bot — Engineering Plan
 
-**Version:** 2.0
+**Version:** 2.1
 **Audience:** Coding team
-**Last updated:** April 22, 2026
+**Last updated:** April 23, 2026
 
 ---
 
@@ -11,6 +11,8 @@
 A Python async service that trades Kalshi's daily-resolving weather contracts (temperature highs) using probabilistic fair-value estimates derived from free NWS/NOAA data. The system is **deliberately selective**: it only opens positions when modeled probability diverges materially from market price and model confidence is high. Target profile is high win-rate, low volume — not market-making.
 
 The core trading loop is **fully deterministic**: signal → risk → execution runs without any LLM involvement (`llm_trading_enabled = False`, permanently). The LLM agent suite (8 roles backed by Gemini 2.5) is scaffolding that is not used in production. A self-improvement pipeline critiques completed rooms and proposes updated agent packs; a historical intelligence pipeline mines 365 days of archived weather and market data to tune heuristics.
+
+**v2.1 additions (Path A):** Three new edge sources added behind shadow-first feature flags: (1) Strategy C — resolution-lag cleanup for locked contracts, (2) Per-station σ calibration with three-layer architecture (static defaults → regression overlay → YAML sparse overrides), (3) Monotonicity Arb Scanner — taker-only arb on orderbook monotonicity violations across KXHIGH* threshold markets.
 
 ### Why this setup wins
 
@@ -167,6 +169,69 @@ Each daily weather contract has a unique ticker (e.g., `KXHIGHTBOS-26APR21-T55`)
 
 ---
 
+### 3.7 Strategy C — Resolution-Lag Cleanup (Addition 1, §4.1)
+
+**Thesis.** By afternoon on settlement day, the ASOS observation directly confirms whether the high has already exceeded the threshold. Markets settle 1–3 hours after the meteorological observation with no mechanism to accelerate settlement — a structural lag. Locked contracts can often still be purchased at prices below 97–99¢.
+
+**Lock-confirmation gate (three layers):**
+- **Part A — Threshold confirmation**: `observed_max_f ≥ threshold_f` for `LOCKED_YES` (or the inverse for `LOCKED_NO`), confirmed by at least `strategy_c_required_consecutive_confirmations` (default 2) consecutive ASOS readings.
+- **Part B — Forecast agreement**: If a gridpoint forecast is available, it must be within `strategy_c_max_forecast_residual_f` (8°F) of the observed value; large disagreements indicate the ASOS sensor may be anomalous.
+- **Part C — Observation freshness**: Observation timestamp must be within `strategy_c_max_observation_age_minutes` (30 min) of sweep time.
+
+**Edge model.** Locked-YES signals target `ask_yes ≤ 1 - strategy_c_locked_yes_discount_cents/100`. Fair value is 1.00 with a small discount for execution risk. Signals with `edge_cents < strategy_c_min_edge_cents` are suppressed.
+
+**Risk gates.** `evaluate_cleanup_risk()` in `risk.py` checks: kill switch, `strategy_c_enabled` flag, per-trade notional cap (`strategy_c_max_order_notional_dollars`, default $50), per-position notional cap, and opposite-side guard (no adding to an existing opposing position).
+
+**Shadow-only default.** `strategy_c_shadow_only=True`. All signals and outcomes are persisted to `strategy_c_rooms` for audit. The service sweeps on a configurable cadence and records `execution_outcome` as `shadow`, `risk_blocked`, or `suppressed`.
+
+**Counterfactual fill-rate harness.** `compute_counterfactual_fill_rate()` estimates what fraction of shadow signals would have filled by joining `strategy_c_rooms` to `market_price_history` within a latency budget. Returns `None` (not 0%) when fewer than 10 shadow signals exist.
+
+**CLI commands.** `shadow-c-sweep` (one-shot sweep), `strategy-c-status` (aggregate metrics).
+
+---
+
+### 3.8 Per-Station σ Calibration (Addition 2, §4.2)
+
+**Thesis.** The Gaussian CDF model uses a single seasonal σ per month for all cities. Coastal cities, inland cities, and high-elevation cities have genuinely different day-to-day forecast error distributions.
+
+**Three-layer σ architecture:**
+
+1. **Static defaults** (`weather/scoring.py`) — seasonal σ table: Jan=3.0°F, Feb=3.5°F, Mar–Apr=4.0–6.0°F, etc. Fallback when no per-station data exists.
+2. **Regression overlay** (`station_sigma_params` table) — empirically fitted per-station, per-month σ values derived from historical Open-Meteo forecast vs. ASOS observation errors. Applied when `station_sigma_override_enabled=True` (default `False`).
+3. **YAML sparse overrides** — operator can pin individual station/month cells in the market map YAML. YAML overrides take precedence over regression values.
+
+**Resolution.** `sigma_f = yaml_override ?? regression_sigma ?? static_default`.
+
+**Calibration cadence.** The historical intelligence pipeline recomputes regression σ values from the rolling 90-day error window and updates `station_sigma_params` automatically.
+
+---
+
+### 3.9 Monotonicity Arb Scanner (Addition 3, §4.3)
+
+**Thesis.** For a station/day, `P(high > T)` must be non-increasing in T. When the orderbook violates that — the higher-threshold YES bid exceeds the lower-threshold YES ask — a risk-free arb exists.
+
+**Trade structure.** Buy YES on the lower-threshold ticker + buy NO on the higher-threshold ticker. Guaranteed gross payout ≥ $1.00 in all three scenarios:
+
+| Scenario | YES T_i | NO T_j | Gross payout |
+|---|---|---|---|
+| high > T_j | Win | Lose | $1.00 |
+| T_i < high ≤ T_j | Win | Win | $2.00 |
+| high ≤ T_i | Lose | Win | $1.00 |
+
+If total cost < $1.00 after fees, the trade is a true arb with positive expected value in every scenario.
+
+**Detection (two-step).** Fast pass: `bid_yes(T_j) - ask_yes(T_i) > 4¢ + min_edge_cents` (safe-side 2¢/leg fee estimate). Re-validate with actual `no_ask_dollars` to compute real net edge. Only pairs passing re-validation are emitted as proposals.
+
+**Fee calculation.** `ceil(0.07 · C · P · (1−P) · 100) / 100` per leg, evaluated at each leg's actual price.
+
+**Risk gates.** Kill switch, `monotonicity_arb_enabled`, notional cap (`monotonicity_arb_max_notional_dollars`, default $25 per pair).
+
+**Shadow-only default.** `monotonicity_arb_shadow_only=True`. Proposals written to `monotonicity_arb_proposals` for audit.
+
+**CLI commands.** `monotonicity-scan` (one-shot scan), `monotonicity-status` (aggregate metrics).
+
+---
+
 ## 4. System Architecture
 
 ```
@@ -183,16 +248,18 @@ Each daily weather contract has a unique ticker (e.g., `KXHIGHTBOS-26APR21-T55`)
   │   rooms, messages, signals, orders, fills, positions, market_state │
   │   market_price_history, checkpoints, research_dossiers, memories   │
   │   agent_packs, heuristic_packs, historical_snapshots, strategies   │
+  │   strategy_c_rooms, cli_reconciliation, cli_station_variance       │
+  │   station_sigma_params, monotonicity_arb_proposals                 │
   └────────────────────────────────┬───────────────────────────────────┘
                                    │
-              ┌────────────────────┼────────────────────┐
-              │                    │                    │
-              ▼                    ▼                    ▼
+     ┌──────────────────────────────┼──────────────────────────────────┐
+     │                             │                                    │
+     ▼                             ▼                                    ▼
   ┌───────────────────┐  ┌─────────────────┐  ┌──────────────────────┐
   │  Auto-Trigger     │  │  Stop-Loss      │  │  Historical Pipeline  │
   │  (orderbook feed  │  │  Service        │  │  + Intelligence       │
-  │   → room create)  │  │  (position mon) │  │  (daily heuristic     │
-  └────────┬──────────┘  └─────────────────┘  │   calibration)       │
+  │   → room create)  │  │  (position mon) │  │  (daily heuristic +  │
+  └────────┬──────────┘  └─────────────────┘  │   σ calibration)     │
            │                                   └──────────────────────┘
            ▼
   ┌────────────────────────────────────────────────────────────────────┐
@@ -204,20 +271,33 @@ Each daily weather contract has a unique ticker (e.g., `KXHIGHTBOS-26APR21-T55`)
   │   researcher → president → trader → risk officer → exec clerk       │
   │   → auditor → ops monitor → memory librarian                       │
   └────────────────────────────────────────────────────────────────────┘
-              │
-              ▼
+           │
+           ▼
   ┌────────────────────────────────────────────────────────────────────┐
   │                   Execution Service                                 │
   │   RSA-signed Kalshi client · deployment lock check · kill switch   │
   │   shadow mode · order state → fill tracking via WebSocket          │
   └────────────────────────────────────────────────────────────────────┘
-              │
-              ▼
+           │
+           ▼
   ┌────────────────────────────────────────────────────────────────────┐
   │                FastAPI Control Room (web/)                          │
   │   Rooms, Agent Packs, Self-Improve, Historical, Watchdog, Strategy │
   │   SSE transcript stream · Prometheus /metrics · /readyz            │
+  │   Strategy C summary strip · Monotonicity Arb status               │
   └────────────────────────────────────────────────────────────────────┘
+
+  ─── v2.1 additions (periodic, run in daemon alongside above) ────────
+
+  ┌──────────────────────────────┐  ┌──────────────────────────────────┐
+  │  StrategyCleanupService      │  │  MonotonicityArbScannerService   │
+  │  (Strategy C, §3.7)          │  │  (Addition 3, §3.9)              │
+  │  - ASOS lock confirmation    │  │  - Groups KXHIGH* by station/day │
+  │  - 3-gate filter (A/B/C)     │  │  - Two-step violation detection  │
+  │  - evaluate_cleanup_risk()   │  │  - evaluate_arb_risk()           │
+  │  - shadow → strategy_c_rooms │  │  - shadow → arb_proposals        │
+  │  - Cadence: configurable     │  │  - Cadence: 60s                  │
+  └──────────────────────────────┘  └──────────────────────────────────┘
 ```
 
 ---
@@ -229,7 +309,7 @@ Each daily weather contract has a unique ticker (e.g., `KXHIGHTBOS-26APR21-T55`)
 | Language | Python 3.12 async | asyncio throughout |
 | Web framework | FastAPI + Jinja2 | Control room UI + REST API |
 | Database | PostgreSQL 16 + pgvector | Relational orders/positions; vector similarity for semantic memory |
-| ORM | SQLAlchemy async + Alembic | 13 migrations applied |
+| ORM | SQLAlchemy async + Alembic | 19 migrations applied |
 | Kalshi client | Custom (`integrations/kalshi.py`) | RSA-PSS signing; REST + WebSocket with sequence tracking |
 | Weather client | Custom (`integrations/weather.py`) | NWS API, no key required |
 | LLM providers | Four slots routed via `agents/providers.py`: `gemini` (primary, Gemini 2.5 per-role models), `hosted` (`LLM_HOSTED_*`, generic OpenAI-compatible endpoint), `codex` (`CODEX_*`, separate key/URL for a second OpenAI-compatible provider), `local` (`LLM_LOCAL_*`, Ollama or any local OpenAI-compatible server) | Role assignments configured in agent pack |
@@ -237,6 +317,7 @@ Each daily weather contract has a unique ticker (e.g., `KXHIGHTBOS-26APR21-T55`)
 | HTTP | `httpx` async | All outbound calls |
 | Metrics | `prometheus_client` | Scraped at `/metrics` |
 | Logging | Structured JSON | All services |
+| Testing | `hypothesis` (property-based) | Required for all paired-leg arb strategies (§5.2); added in v2.1 dev dependencies |
 | Deploy | Docker Compose blue/green | Caddy reverse proxy routes per-host to `web_demo`, `web_production`, `web_strategies`; watchdog handles failover |
 | Secrets | Environment / mounted key files | RSA PEM paths configured per env |
 
@@ -433,6 +514,7 @@ Canary rollout is bounded:
 **Control room layout:** Top summary strip plus lazy-loaded `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations` tabs. The `web_strategies` site (`WEB_SITE_KIND=strategies`) renders a focused view of the `Research` tab — specifically the 180d assignment review queue and city strategy drilldown — without exposing the full trading control room.
 The summary bootstrap avoids live all-city discovery and uses lightweight room snapshots so `/` and `/api/control-room/summary` stay responsive as configured cities and room history grow.
 The `Research` tab includes an 180d-only assignment review queue for canonical city strategy assignments, including `drifted_assignment`, `evidence_weakened`, `ready_for_approval`, `aligned`, and `waiting_for_evidence` states plus the latest approval note in city detail.
+The summary strip now includes a `strategy_c` sub-object with shadow graduation metrics (signal precision, fill rate, per-station variance, race rate) and live post-graduation metrics (fill rate, realized edge, win rate on fills).
 
 **Prometheus metrics:**
 - `kalshi_orders_placed_total{market, side}`
@@ -443,9 +525,52 @@ The `Research` tab includes an 180d-only assignment review queue for canonical c
 
 ---
 
+### 6.11 Strategy C — StrategyCleanupService (`services/strategy_cleanup_service.py`)
+
+Periodic service injected into `DaemonService` and `AppContainer`. Key methods:
+
+- `sweep()` — evaluates all configured `WeatherMarketDirectory` mappings in one pass. For each mapping: fetches NWS observation + Kalshi market data concurrently, computes lock state via `LockStateTracker.observe()`, evaluates all three gates (A/B/C) via `evaluate_cleanup_signal()`, runs `evaluate_cleanup_risk()` against the live `DeploymentControl`, persists a `StrategyCRoom` record with `execution_outcome`.
+- `compute_counterfactual_fill_rate(lookback_days, latency_budget_seconds)` — joins shadow `strategy_c_rooms` to `market_price_history` to estimate fill rate. Returns `None` (not 0.0) when fewer than 10 shadow signals exist.
+- `get_status()` — aggregate signal counts for the control room summary strip.
+
+Observation timestamps are extracted from the NWS response (`properties.timestamp`) so Part C freshness check reflects actual data age, not fetch time.
+
+---
+
+### 6.12 Per-Station σ Calibration (`services/historical_pipeline.py`, `db/models.py`)
+
+`station_sigma_params` table stores per-station, per-month σ values. The historical intelligence pipeline fits these from the rolling 90-day Open-Meteo forecast vs. ASOS observation error distribution. Resolution order in `score_weather_market()`:
+
+```
+sigma_f = yaml_override(station, month) ?? station_sigma_params(station, month) ?? SEASONAL_SIGMA[month]
+```
+
+Setting `station_sigma_override_enabled=True` activates the regression overlay. The YAML sparse override format allows per-cell pinning without touching code.
+
+---
+
+### 6.13 Monotonicity Arb Scanner (`services/monotonicity_scanner.py`, `services/monotonicity_scanner_service.py`)
+
+Two-module split:
+
+**`monotonicity_scanner.py`** (pure functions, no I/O):
+- `group_markets_by_station_date(markets)` — groups KXHIGH* market dicts by `(station, event_date)`, sorted by threshold ascending.
+- `detect_violations(group, station, event_date, min_net_edge_cents)` — two-step detection: fast bid_yes pass + ask_no re-validation. Computes actual per-leg Kalshi fee (`ceil(0.07·C·P·(1-P)·100)/100`).
+- `evaluate_arb_risk(violation, control, settings)` — kill switch, enabled flag, notional cap.
+- `scan_for_violations(markets, control, settings)` — full pipeline returning `list[ArbProposal]`.
+- Ticker parsing: `_parse_station_date_threshold(ticker)` handles `KXHIGH{STATION}-{YYMONDD}-T{N}` format.
+
+**`monotonicity_scanner_service.py`** (orchestration layer):
+- `sweep()` — fetches open KXHIGH* markets from Kalshi (`list_markets(status=open, series_ticker=KXHIGH)`), runs `scan_for_violations()`, persists `MonotonicityArbProposal` records.
+- `get_status()` — aggregate metrics for operator review.
+
+Property-based tests using `hypothesis` assert positive net PnL across all 3 outcome scenarios for any pair with total cost < $1.00.
+
+---
+
 ## 7. Data Model
 
-Full schema managed by Alembic (16 migrations). Key tables:
+Full schema managed by Alembic (19 migrations). Key tables:
 
 ```sql
 -- Trading lifecycle
@@ -488,6 +613,23 @@ strategies                 (id, series_ticker, strategy_name, config JSON)
 strategy_results           (id, strategy_id, market_ticker, outcome JSON)
 city_strategy_assignments  (id, series_ticker, strategy_name, approved_at, approval_note)
 strategy_codex_runs        (id, series_ticker, run_at, payload JSON)
+
+-- v2.1 additions (migrations 0017–0019)
+station_sigma_params    (station, month, sigma_f, sample_count, last_fitted_at)
+                        -- per-station monthly σ from 90-day Open-Meteo error regression
+cli_reconciliation      (station, observation_date, asos_observed_max, cli_value, delta_degf)
+                        -- ASOS vs. CLI published-high reconciliation for variance tracking
+cli_station_variance    (station, sample_count, p95_abs_delta_degf, last_refreshed_at)
+                        -- rolling P95 of |ASOS - CLI| per station; consumed by Part B gate
+strategy_c_rooms        (room_id, ticker, station, decision_time, resolution_state, fair_value_dollars,
+                         modeled_edge_cents, target_price_cents, contracts_requested, execution_outcome,
+                         settlement_outcome, outcome_pnl_dollars)
+                        -- per-decision audit trail for Strategy C; execution_outcome ∈ {shadow, risk_blocked, suppressed}
+monotonicity_arb_proposals (proposal_id, station, event_date, ticker_low, ticker_high,
+                            threshold_low_f, threshold_high_f, ask_yes_low_cents, ask_no_high_cents,
+                            total_cost_cents, gross_edge_cents, fee_estimate_cents, net_edge_cents,
+                            contracts_proposed, execution_outcome, suppression_reason, detected_at)
+                        -- per-proposal audit trail for Addition 3; execution_outcome ∈ {shadow, risk_blocked}
 
 -- Infrastructure
 deployment_control  (id, active_color, kill_switch_enabled, execution_lock_holder, notes JSON)
@@ -579,8 +721,10 @@ Actions on failure:
 | Reconcile | 60s | Sync positions/orders with Kalshi API |
 | Market history | 60s | Append mid-price to `market_price_history` (24h retention) |
 | Stop-loss check | 60s | Evaluate open positions for exit triggers |
+| Strategy C sweep | configurable | Lock-confirmation cleanup signals; default `strategy_c_cadence_idle_seconds=3600` |
+| Monotonicity arb scan | 60s | Scan open KXHIGH* markets for monotonicity violations |
 | Historical pipeline | Daily | Incremental 7-day market + weather ingest |
-| Historical intelligence | Daily | Heuristic pack evaluation + auto-promote |
+| Historical intelligence | Daily | Heuristic pack evaluation + auto-promote + σ recalibration |
 
 ---
 
@@ -677,6 +821,40 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `DAEMON_HEARTBEAT_INTERVAL_SECONDS` | 60 | How often the daemon writes a liveness checkpoint |
 | `DAEMON_START_WITH_RECONCILE` | `true` | Run a reconcile immediately on daemon startup before entering the main loop |
 
+### Strategy C parameters (Addition 1)
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `STRATEGY_C_ENABLED` | `false` | Master switch; must also clear kill switch before live orders |
+| `STRATEGY_C_SHADOW_ONLY` | `true` | Shadow-only mode; flip to `false` after operator sign-off |
+| `STRATEGY_C_CADENCE_IDLE_SECONDS` | `3600` | Sweep interval far from threshold |
+| `STRATEGY_C_CADENCE_APPROACH_SECONDS` | `900` | Sweep interval when within `approach_margin_f` (5°F) |
+| `STRATEGY_C_CADENCE_NEAR_THRESHOLD_SECONDS` | `150` | Sweep interval when within `near_threshold_margin_f` (2°F) |
+| `STRATEGY_C_REQUIRED_CONSECUTIVE_CONFIRMATIONS` | `2` | Min consecutive ASOS readings above threshold |
+| `STRATEGY_C_MAX_OBSERVATION_AGE_MINUTES` | `30` | Part C freshness gate |
+| `STRATEGY_C_MAX_FORECAST_RESIDUAL_F` | `8.0` | Part B divergence gate |
+| `STRATEGY_C_MAX_CLI_VARIANCE_DEGF` | `1.5` | Part B CLI variance gate |
+| `STRATEGY_C_MIN_EDGE_CENTS` | `2` | Minimum edge to emit a signal |
+| `STRATEGY_C_MAX_ORDER_NOTIONAL_DOLLARS` | `50.0` | Per-trade cap |
+| `STRATEGY_C_MAX_POSITION_NOTIONAL_DOLLARS` | `50.0` | Per-position cap |
+
+### Per-station σ calibration parameters (Addition 2)
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `STATION_SIGMA_OVERRIDE_ENABLED` | `false` | Activates regression overlay; enable after first calibration run |
+
+### Monotonicity Arb Scanner parameters (Addition 3)
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `MONOTONICITY_ARB_ENABLED` | `false` | Master switch |
+| `MONOTONICITY_ARB_SHADOW_ONLY` | `true` | Shadow-only mode; flip after operator sign-off |
+| `MONOTONICITY_ARB_MIN_NET_EDGE_CENTS` | `2` | Minimum net edge (after fees) to emit a proposal |
+| `MONOTONICITY_ARB_MAX_NOTIONAL_DOLLARS` | `25.0` | Max notional per pair |
+| `MONOTONICITY_ARB_MAX_PROPOSALS_PER_MINUTE` | `5` | Rate limit on proposal emission |
+| `MONOTONICITY_ARB_CADENCE_SECONDS` | `60` | Scan interval |
+
 ### Auto-trigger parameters
 
 | Parameter | Default | Notes |
@@ -712,13 +890,19 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 - [x] Historical intelligence (heuristic pack auto-calibration)
 - [x] FastAPI control room (rooms, agent packs, strategies, watchdog)
 - [x] Prometheus metrics + SSE room transcript stream
-- [x] Alembic migrations (16 applied)
+- [x] Alembic migrations (19 applied)
 - [x] Reconciliation daemon (positions, orders, market prices)
 - [x] Split Postgres per environment (`postgres_demo` / `postgres_production` with isolated volumes)
 - [x] Caddy reverse proxy replacing nginx (per-host routing to `web_demo`, `web_production`, `web_strategies`)
 - [x] Three-way web container split: demo control room, production control room, strategies dashboard
 - [x] Per-environment migrate services with `service_completed_successfully` gating on all app/daemon containers
 - [x] `.dockerignore` and two-stage Dockerfile pip layer caching (source-only rebuilds ~2s vs 25s)
+- [x] **v2.1** Strategy C — Resolution-Lag Cleanup (shadow mode, `strategy_c_enabled=False` default)
+- [x] **v2.1** Per-station σ calibration — three-layer architecture (static → regression → YAML override)
+- [x] **v2.1** Monotonicity Arb Scanner — two-step detection, property-based tests, shadow mode (`monotonicity_arb_enabled=False` default)
+- [x] **v2.1** `hypothesis` property-based testing for all paired-leg strategies
+- [x] **v2.1** CLI commands: `shadow-c-sweep`, `strategy-c-status`, `monotonicity-scan`, `monotonicity-status`
+- [x] **v2.1** Strategy C control room summary strip (shadow graduation metrics + live post-graduation metrics)
 
 ### Known gaps and future work
 
@@ -731,6 +915,10 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | Live P&L streaming in control room | Low | 30d win-rate snapshot exists (`get_fill_win_rate_30d()` in summary strip); missing is a real-time SSE feed showing running unrealized P&L across open positions |
 | End-to-end backtest with fees/slippage | Medium | Historical intelligence replays but doesn't simulate fill costs; `is_taker` flag and actual fill prices are already stored per fill record, giving the data foundation — missing is a fee-rate constant and a simulation pass that subtracts fees from realized P&L before training corpus scoring |
 | Per-city strategy differentiation | In progress | Research assignment review queue built; canonical assignments (ready_for_approval, drifted_assignment, evidence_weakened, aligned, waiting_for_evidence) visible in dashboard Research tab; auto-application to live routing deferred to post-launch self-improvement pipeline |
+| Strategy C live graduation | Pending | Shadow run must complete 30 days with metrics meeting §4.1.6; requires operator sign-off before `strategy_c_shadow_only=false` |
+| Monotonicity arb live graduation | Pending | Shadow run must complete 30 days; backtest against 90 days of `market_price_history` must show zero losing arbs |
+| σ calibration activation | Pending | Enable `station_sigma_override_enabled=true` after first regression fit and CRPS improvement confirmed in production metrics |
+| Path B additions | Future | NGR A/B testing, Bayesian Kelly sizing — separate spec to be written after Path A metrics are observed |
 | Production go-live | Pending | Run demo for ≥ 2 weeks with positive paper results before switching `KALSHI_ENV=production` |
 
 ### Go-live checklist
