@@ -113,6 +113,12 @@ class Settings(BaseSettings):
     risk_max_order_notional_dollars: float | None = None
     risk_max_position_notional_dollars: float | None = None
     risk_daily_loss_limit_dollars: float | None = None
+    # P2-2: edge-scaled (fractional-Kelly) sizing. Off by default until
+    # calibration (see /api/strategies/calibration) confirms the fair-value
+    # signal is well-calibrated. When on, the Kelly notional is capped by the
+    # existing flat-percentage limits so this can only ever reduce risk.
+    risk_edge_scaled_sizing_enabled: bool = False
+    risk_edge_scaled_kelly_multiplier: float = 0.25  # quarter-Kelly
     # Per-strategy dollar-denominated hard-loss cap. Empty = no per-strategy cap.
     # Example env var value: '{"A": 500, "C": 100}' (JSON-parsed by pydantic-settings).
     risk_daily_loss_dollars_by_strategy: dict[str, float] = Field(default_factory=dict)
