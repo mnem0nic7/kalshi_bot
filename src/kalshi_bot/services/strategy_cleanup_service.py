@@ -18,10 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import WeatherResolutionState
-from kalshi_bot.db.models import CliStationVariance, DeploymentControl, StrategyCRoom
+from kalshi_bot.db.models import CliStationVariance, DeploymentControl, MarketPriceHistory, StrategyCRoom
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
+from kalshi_bot.services.risk import evaluate_cleanup_risk
 from kalshi_bot.services.strategy_cleanup import (
     CleanupSignal,
     LockState,
@@ -30,7 +31,7 @@ from kalshi_bot.services.strategy_cleanup import (
 )
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
-from kalshi_bot.weather.scoring import extract_current_temp_f
+from kalshi_bot.weather.scoring import extract_current_temp_f, parse_iso_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ class StrategyCleanupService:
             return []
 
         cli_variances = await self._load_cli_variances()
+        control = await self._load_control()
         mappings = self._weather_directory.all()
 
         signals: list[CleanupSignal] = []
@@ -73,9 +75,15 @@ class StrategyCleanupService:
             except Exception:
                 logger.exception("strategy_c: error evaluating %s", mapping.market_ticker)
                 continue
-            if signal is not None:
-                signals.append(signal)
-                await self._persist_signal(signal)
+            if signal is None:
+                continue
+            signals.append(signal)
+            if signal.suppression_reason is None:
+                verdict = evaluate_cleanup_risk(signal, control=control, settings=self._settings)
+                outcome = "shadow" if verdict.status.value == "approved" else "risk_blocked"
+            else:
+                outcome = "suppressed"
+            await self._persist_signal(signal, execution_outcome=outcome)
 
         logger.info(
             "strategy_c: sweep complete — %d evaluated, %d actionable",
@@ -83,6 +91,69 @@ class StrategyCleanupService:
             sum(1 for s in signals if s.suppression_reason is None),
         )
         return signals
+
+    async def compute_counterfactual_fill_rate(
+        self,
+        *,
+        lookback_days: int = 30,
+        latency_budget_seconds: int = 10,
+    ) -> float | None:
+        """Estimate the fraction of shadow signals that would have filled.
+
+        A signal is counted as "would have filled" if at least one
+        MarketPriceHistory snapshot within latency_budget_seconds of
+        decision_time shows a price at or below the target:
+          - YES side:  yes_ask_dollars <= target_price_cents / 100
+          - NO  side:  no_ask_dollars  <= target_price_cents / 100
+
+        Returns None when fewer than 10 shadow signals exist — avoids
+        reporting 0% when there is simply no data yet.
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
+        async with self._session_factory() as session:
+            rooms_stmt = (
+                select(StrategyCRoom)
+                .where(
+                    StrategyCRoom.execution_outcome == "shadow",
+                    StrategyCRoom.decision_time >= cutoff,
+                    StrategyCRoom.target_price_cents > 0,
+                )
+            )
+            rooms = (await session.execute(rooms_stmt)).scalars().all()
+
+            if len(rooms) < 10:
+                return None
+
+            filled = 0
+            for room in rooms:
+                target_dollars = room.target_price_cents / 100.0
+                window_end = room.decision_time + timedelta(seconds=latency_budget_seconds)
+                price_stmt = (
+                    select(MarketPriceHistory)
+                    .where(
+                        MarketPriceHistory.market_ticker == room.ticker,
+                        MarketPriceHistory.observed_at >= room.decision_time,
+                        MarketPriceHistory.observed_at <= window_end,
+                    )
+                    .limit(50)
+                )
+                snapshots = (await session.execute(price_stmt)).scalars().all()
+                for snap in snapshots:
+                    if room.resolution_state.endswith("yes"):
+                        ask = snap.yes_ask_dollars
+                        if ask is not None and float(ask) <= target_dollars:
+                            filled += 1
+                            break
+                    else:
+                        # NO ask ≈ 1 - YES bid (NO contracts priced as complement)
+                        bid = snap.yes_bid_dollars
+                        if bid is not None and (1.0 - float(bid)) <= target_dollars:
+                            filled += 1
+                            break
+
+        return filled / len(rooms)
 
     async def get_status(self) -> dict[str, Any]:
         """Return aggregate Strategy C metrics from StrategyCRoom records."""
@@ -135,6 +206,11 @@ class StrategyCleanupService:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    async def _load_control(self) -> DeploymentControl:
+        async with self._session_factory() as session:
+            repo = PlatformRepository(session)
+            return await repo.get_deployment_control()
+
     async def _load_cli_variances(self) -> dict[str, float]:
         async with self._session_factory() as session:
             rows = (await session.execute(select(CliStationVariance))).scalars().all()
@@ -159,6 +235,11 @@ class StrategyCleanupService:
             logger.debug("strategy_c: no temperature reading for %s", mapping.station_id)
             return None
 
+        # Use actual observation timestamp so Part C freshness gate is meaningful.
+        obs_ts = parse_iso_datetime(
+            observation_raw.get("properties", {}).get("timestamp")
+        ) or now
+
         # Compute resolution state from raw ASOS observation.
         if mapping.operator in (">", ">=") and current_temp_f >= mapping.threshold_f:
             resolution_state = WeatherResolutionState.LOCKED_YES
@@ -169,7 +250,7 @@ class StrategyCleanupService:
 
         lock_state = self._lock_tracker.observe(
             station=mapping.station_id,
-            observation_ts=now,
+            observation_ts=obs_ts,
             observed_max_f=current_temp_f,
             threshold_f=mapping.threshold_f,
             gridpoint_forecast_f=None,
@@ -190,10 +271,9 @@ class StrategyCleanupService:
             reference_time=now,
         )
 
-    async def _persist_signal(self, signal: CleanupSignal) -> None:
-        execution_outcome = "suppressed" if signal.suppression_reason else "shadow"
+    async def _persist_signal(self, signal: CleanupSignal, *, execution_outcome: str) -> None:
         contracts_requested = 0
-        if not signal.suppression_reason and signal.target_price_cents > 0:
+        if execution_outcome == "shadow" and signal.target_price_cents > 0:
             unit_cost = signal.target_price_cents / 100.0
             contracts_requested = max(1, int(
                 self._settings.strategy_c_max_order_notional_dollars / unit_cost

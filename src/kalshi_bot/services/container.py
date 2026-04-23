@@ -254,6 +254,7 @@ class AppContainer:
             market_history_service=market_history_service,
             strategy_eval_service=strategy_eval_service,
             strategy_regression_service=strategy_regression_service,
+            strategy_cleanup_service=strategy_cleanup_service,
             strategy_codex_service=strategy_codex_service,
             strategy_dashboard_service=strategy_dashboard_service,
             stop_loss_service=stop_loss_service,

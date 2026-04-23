@@ -1233,6 +1233,122 @@ def _overview_payload(
     }
 
 
+async def _strategy_c_summary(container: AppContainer) -> dict[str, Any]:
+    """Shadow + live metrics for Strategy C (§4.1.6).
+
+    Shadow metrics (criterion 8 graduation gates):
+      signal_count_per_day, counterfactual_fill_rate, signal_precision,
+      race_rate, per_station_variance.
+
+    Live post-graduation metrics (five from §4.1.6):
+      signal_count, fill_rate, race_rate, realized_edge_median_cents,
+      realized_edge_p10_cents, win_rate_on_fills.
+
+    All numeric rates are None when data is insufficient.
+    """
+    from sqlalchemy import func, select
+    from datetime import timedelta
+    from kalshi_bot.db.models import StrategyCRoom
+
+    svc = container.strategy_cleanup_service
+    status = await svc.get_status()
+    fill_rate = await svc.compute_counterfactual_fill_rate()
+
+    now = datetime.now(UTC)
+    cutoff_30d = now - timedelta(days=30)
+
+    async with container.session_factory() as session:
+        # Signal count per day (shadow, last 30d)
+        shadow_count_stmt = select(func.count()).select_from(StrategyCRoom).where(
+            StrategyCRoom.execution_outcome == "shadow",
+            StrategyCRoom.decision_time >= cutoff_30d,
+        )
+        shadow_count = (await session.execute(shadow_count_stmt)).scalar_one()
+
+        # Race rate: signals where settlement_outcome == "raced"
+        race_stmt = select(func.count()).select_from(StrategyCRoom).where(
+            StrategyCRoom.settlement_outcome == "raced",
+            StrategyCRoom.decision_time >= cutoff_30d,
+        )
+        race_count = (await session.execute(race_stmt)).scalar_one()
+
+        # Signal precision: shadow signals where settlement_outcome == "confirmed"
+        confirmed_stmt = select(func.count()).select_from(StrategyCRoom).where(
+            StrategyCRoom.settlement_outcome == "confirmed",
+            StrategyCRoom.execution_outcome == "shadow",
+            StrategyCRoom.decision_time >= cutoff_30d,
+        )
+        confirmed_count = (await session.execute(confirmed_stmt)).scalar_one()
+
+        settled_shadow_stmt = select(func.count()).select_from(StrategyCRoom).where(
+            StrategyCRoom.execution_outcome == "shadow",
+            StrategyCRoom.settlement_outcome.isnot(None),
+            StrategyCRoom.decision_time >= cutoff_30d,
+        )
+        settled_shadow_count = (await session.execute(settled_shadow_stmt)).scalar_one()
+
+        # Live metrics (contracts_filled > 0)
+        filled_stmt = select(StrategyCRoom).where(
+            StrategyCRoom.contracts_filled > 0,
+            StrategyCRoom.decision_time >= cutoff_30d,
+        )
+        filled_rooms = (await session.execute(filled_stmt)).scalars().all()
+
+        wins_stmt = select(func.count()).select_from(StrategyCRoom).where(
+            StrategyCRoom.contracts_filled > 0,
+            StrategyCRoom.outcome_pnl_dollars > 0,
+            StrategyCRoom.decision_time >= cutoff_30d,
+        )
+        wins_count = (await session.execute(wins_stmt)).scalar_one()
+
+    signal_count_per_day = round(shadow_count / 30, 2) if shadow_count else 0.0
+    race_rate = round(race_count / max(shadow_count, 1), 4) if shadow_count else None
+    signal_precision = (
+        round(confirmed_count / settled_shadow_count, 4)
+        if settled_shadow_count >= 5
+        else None
+    )
+
+    realized_edges = sorted(
+        r.realized_edge_cents for r in filled_rooms if r.realized_edge_cents is not None
+    )
+    realized_edge_median = (
+        realized_edges[len(realized_edges) // 2] if realized_edges else None
+    )
+    realized_edge_p10 = (
+        realized_edges[max(0, int(len(realized_edges) * 0.10))] if realized_edges else None
+    )
+    win_rate_on_fills = (
+        round(wins_count / len(filled_rooms), 4) if len(filled_rooms) >= 5 else None
+    )
+    live_fill_rate = (
+        round(len(filled_rooms) / shadow_count, 4) if shadow_count else None
+    )
+
+    return {
+        "enabled": status.get("strategy_c_enabled"),
+        "shadow_only": status.get("strategy_c_shadow_only"),
+        # Shadow metrics (graduation gates)
+        "shadow": {
+            "signal_count_per_day": signal_count_per_day,
+            "counterfactual_fill_rate": fill_rate,
+            "signal_precision": signal_precision,
+            "race_rate": race_rate,
+            "per_station_variance": status.get("lock_tracker_state"),
+        },
+        # Live post-graduation metrics (§4.1.6)
+        "live": {
+            "signal_count_30d": shadow_count,
+            "fill_rate": live_fill_rate,
+            "race_rate": race_rate,
+            "realized_edge_median_cents": realized_edge_median,
+            "realized_edge_p10_cents": realized_edge_p10,
+            "win_rate_on_fills": win_rate_on_fills,
+        },
+        "recent": status.get("recent"),
+    }
+
+
 async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
     now = datetime.now(UTC)
     async with container.session_factory() as session:
@@ -1264,6 +1380,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
     )
     payload["daily_pnl_display"] = _money_display(daily_pnl, signed=True)
     payload["daily_pnl_tone"] = _pnl_tone(daily_pnl)
+    payload["strategy_c"] = await _strategy_c_summary(container)
     return payload
 
 

@@ -28,6 +28,7 @@ from kalshi_bot.services.strategy_eval import StrategyEvaluationService
 from kalshi_bot.services.strategy_codex import StrategyCodexService
 from kalshi_bot.services.strategy_dashboard import StrategyDashboardService
 from kalshi_bot.services.stop_loss import StopLossService
+from kalshi_bot.services.strategy_cleanup_service import StrategyCleanupService
 from kalshi_bot.services.strategy_regression import StrategyRegressionService, WINDOW_DAYS as DEFAULT_STRATEGY_WINDOW_DAYS
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
@@ -58,6 +59,7 @@ class DaemonService:
         strategy_eval_service: StrategyEvaluationService | None = None,
         strategy_regression_service: StrategyRegressionService | None = None,
         stop_loss_service: StopLossService | None = None,
+        strategy_cleanup_service: StrategyCleanupService | None = None,
         strategy_codex_service: StrategyCodexService | None = None,
         strategy_dashboard_service: StrategyDashboardService | None = None,
     ) -> None:
@@ -79,6 +81,7 @@ class DaemonService:
         self.market_history_service = market_history_service
         self.strategy_eval_service = strategy_eval_service
         self.strategy_regression_service = strategy_regression_service
+        self.strategy_cleanup_service = strategy_cleanup_service
         self.strategy_codex_service = strategy_codex_service
         self.strategy_dashboard_service = strategy_dashboard_service
         self.stop_loss_service = stop_loss_service
@@ -216,6 +219,7 @@ class DaemonService:
             "heartbeat": asyncio.create_task(self._periodic_heartbeat_loop()),
             "market_history": asyncio.create_task(self._periodic_market_history_loop()),
             "stop_loss": asyncio.create_task(self._periodic_stop_loss_loop()),
+            "strategy_c": asyncio.create_task(self._periodic_strategy_c_loop()),
         }
         if run_seconds is not None:
             tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
@@ -290,6 +294,17 @@ class DaemonService:
                 await self.market_history_service.purge_once()
             except Exception:
                 logger.warning("market_history loop error", exc_info=True)
+
+    async def _periodic_strategy_c_loop(self) -> None:
+        interval = self.settings.strategy_c_cadence_idle_seconds
+        while True:
+            await asyncio.sleep(interval)
+            if self.strategy_cleanup_service is None:
+                continue
+            try:
+                await self.strategy_cleanup_service.sweep()
+            except Exception:
+                logger.warning("strategy_c sweep error", exc_info=True)
 
     async def _run_heartbeat_follow_up(self, payload: dict[str, Any]) -> None:
         if (
