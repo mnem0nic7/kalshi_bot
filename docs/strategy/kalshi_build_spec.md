@@ -155,12 +155,33 @@ Implement Strategy C as a **separate strategy code path**, per the roadmap's exp
 
 Strategy C is shadow-only in its initial deployment.
 
-#### 4.1.2 Files to touch
+#### 4.1.2 Partition invariant (Strategy A × C)
+
+At most one strategy may hold an open position per `(ticker, event_date)` tuple at any moment. Strategy A and Strategy C operate as **mutually exclusive strategies per market**, not as additive layers.
+
+| Strategy A position | Strategy C signal | Correct action |
+|---|---|---|
+| None | CleanupSignal emitted | Strategy C may enter |
+| Open YES | CleanupSignal YES | Block — Strategy A already holds the expected-value position |
+| Open YES | CleanupSignal NO | Block — conflicting sides; one of the signals is wrong |
+| Open NO | CleanupSignal YES | Block — conflicting sides |
+
+**Implementation.** Market selection in both strategy engines must enforce this as a two-sided gate:
+- Strategy A's supervisor routing skips any ticker where `resolution_state == LOCKED_YES` or `LOCKED_NO` **and** Strategy C is enabled — even if Strategy C holds no position yet (the lock itself marks the ticker as a Strategy C candidate).
+- Strategy C's signal engine skips any ticker where an open Strategy A position exists for that ticker.
+
+**Stage 2 re-check.** In addition to market-selection filters, the execution pre-flight re-verifies the invariant immediately before placing any order. If a concurrent Strategy A fill completed while a Strategy C signal was in-flight, the re-check blocks the Strategy C order and emits a SEV-2 alert.
+
+**Lock-reversal exit.** If Strategy A holds a YES position and the market subsequently reaches `resolution_state == LOCKED_NO` (temperature drops below threshold before settlement), Strategy A's position management must unwind at market. This is not a Strategy C trade — do not route it through `strategy_cleanup.py`. Add this scenario to Strategy A's risk path as an explicit handled case.
+
+**SEV-2 alert format.** `"PARTITION VIOLATION BLOCKED: ticker={ticker}, a_position={...}, c_signal={...}"`. Emitted to the watchdog ops-event stream. Do not suppress or rate-limit — each event requires investigation.
+
+#### 4.1.3 Files to touch
 
 **New files:**
 - `src/kalshi_bot/services/strategy_cleanup.py` — the Strategy C signal engine, parallel to `services/signal.py`
 - `src/kalshi_bot/services/cli_reconciliation.py` — per-station CLI-vs-METAR historical variance stats
-- `alembic/versions/YYYYMMDD_NNNN_strategy_cleanup.py` — new tables (see §4.1.5)
+- `alembic/versions/YYYYMMDD_NNNN_strategy_cleanup.py` — new tables (see §4.1.6)
 - `tests/unit/test_strategy_cleanup.py`
 - `tests/integration/test_strategy_cleanup_service.py`
 - `docs/strategy/strategy_c_cleanup.md` — design doc with activation criteria
@@ -169,13 +190,13 @@ Strategy C is shadow-only in its initial deployment.
 - `src/kalshi_bot/core/enums.py` — add `StrategyMode.RESOLUTION_CLEANUP`; extend `StandDownReason` with cleanup-specific reasons
 - `src/kalshi_bot/core/schemas.py` — extend `StrategySignal` or create `CleanupSignal` with cleanup-specific fields
 - `src/kalshi_bot/services/container.py` — register `StrategyCleanupService`
-- `src/kalshi_bot/orchestration/supervisor.py` — add strategy router selecting between directional (A) and cleanup (C) based on `resolution_state`
+- `src/kalshi_bot/orchestration/supervisor.py` — add strategy router selecting between directional (A) and cleanup (C) based on `resolution_state`; enforce two-sided partition gate (§4.1.2)
 - `src/kalshi_bot/services/risk.py` — add cleanup-specific risk path with tighter caps during shadow period
-- `src/kalshi_bot/config.py` — new settings: `strategy_c_enabled: bool = False`, `strategy_c_shadow_only: bool = True`, plus the full adaptive-polling and lock-confirmation config block in §4.1.4 (do not duplicate here — §4.1.4 is authoritative)
+- `src/kalshi_bot/config.py` — new settings: `strategy_c_enabled: bool = False`, `strategy_c_shadow_only: bool = True`, plus the full adaptive-polling and lock-confirmation config block in §4.1.5 (do not duplicate here — §4.1.5 is authoritative)
 - `docs/kalshi-weather-bot-engineering-plan.md` — section 5.x added for Strategy C activation criteria
-- `src/kalshi_bot/cli.py` — add `shadow-c-sweep` and `strategy-c-status` commands
+- `src/kalshi_bot/cli.py` — add `shadow-c-sweep`, `strategy-c-status`, and `strategy-c approve` commands
 
-#### 4.1.3 Strategy C logic
+#### 4.1.4 Strategy C logic
 
 For each open weather threshold market where `resolution_state == LOCKED_YES` or `LOCKED_NO`:
 
@@ -194,7 +215,7 @@ For each open weather threshold market where `resolution_state == LOCKED_YES` or
 
    Tier assignment is recomputed every polling cycle. Typically only 3–5 stations are in the near-threshold tier simultaneously, so the fast cadence is not globally expensive. NWS per-station rate limits are generous.
 
-   **Implementation decomposition.** Do not build the adaptive cadence logic inside the Strategy C signal pass. Build it as a separate `ThresholdProximityMonitor` service in Session 4.5 — with its own unit tests for tier transitions — that Session 5's signal logic consumes. This mirrors the Prerequisite 0 decomposition principle: cadence behavior must be testable independently from lock detection.
+   **Implementation decomposition.** Do not build the adaptive cadence logic inside the Strategy C signal pass. Build it as a separate `ThresholdProximityMonitor` service in Session 5 (see §7) — with its own unit tests for tier transitions — that Session 7's signal logic consumes. This mirrors the Prerequisite 0 decomposition principle: cadence behavior must be testable independently from lock detection.
 
 2. **Compute fair value.** For a locked-YES contract:
 
@@ -239,7 +260,7 @@ For each open weather threshold market where `resolution_state == LOCKED_YES` or
 
 7. **Shadow-first.** While `strategy_c_shadow_only=true`, produce `CleanupSignal` → `TradeTicket` with `mode=shadow`; do **not** hit Kalshi write endpoints. Log the simulated decision.
 
-#### 4.1.4 Adaptive polling configuration
+#### 4.1.5 Adaptive polling configuration
 
 ```python
 # config.py additions for ThresholdProximityMonitor (adaptive cadence)
@@ -260,7 +281,7 @@ strategy_c_locked_yes_discount_cents: int = 1   # flat; not per-station
 strategy_c_locked_no_discount_cents: int = 1    # flat; not per-station
 
 # config.py additions for edge and book-freshness gates
-strategy_c_min_edge_cents: int = 2              # gross, before fees; see fee model in §4.1.3 step 3
+strategy_c_min_edge_cents: int = 2              # gross, before fees; see fee model in §4.1.4 step 3
 strategy_c_max_book_age_seconds: int = 30
 strategy_c_recent_adverse_window_minutes: int = 15
 strategy_c_race_detection_enabled: bool = True  # classify zero-fill cancels as 'raced' when True;
@@ -272,7 +293,7 @@ strategy_c_race_detection_enabled: bool = True  # classify zero-fill cancels as 
 
 Cadence values are conservative defaults. Tune `strategy_c_cadence_near_threshold_seconds` down only if shadow data shows the system is consistently late (>40% of qualifying locks reprice before the poll fires). `strategy_c_required_consecutive_confirmations` is fixed at 2 — 30 days of shadow data is insufficient to calibrate transient-error frequency; do not lower based on shadow P&L.
 
-#### 4.1.5 New database tables
+#### 4.1.6 New database tables
 
 ```sql
 -- CLI vs real-time observation variance per station, for buffering the lock detection
@@ -301,6 +322,7 @@ CREATE TABLE strategy_c_rooms (
     resolution_state     TEXT NOT NULL,
     observed_max_at_decision REAL NOT NULL,
     threshold            REAL NOT NULL,
+    buffer_at_decision_f REAL NOT NULL,          -- observed_max_at_decision - threshold; signed (negative = below threshold)
     fair_value_dollars   NUMERIC(10,4) NOT NULL,
     modeled_edge_cents   REAL NOT NULL,
     target_price_cents   REAL NOT NULL,
@@ -345,15 +367,34 @@ CREATE TABLE cli_station_variance (
 );
 ```
 
+```sql
+-- ThresholdProximityMonitor: DB-persisted write-through state.
+-- Written on every tier transition; read by monitor on startup (to reconstruct working set)
+-- and by Strategy C signal engine on each evaluation cycle.
+CREATE TABLE threshold_proximity_state (
+    station                TEXT NOT NULL,
+    event_date             DATE NOT NULL,
+    tier                   TEXT NOT NULL,        -- 'idle' | 'approach' | 'near_threshold' | 'post_peak'
+    current_temp_f         REAL,                 -- most recent observed reading; NULL if not yet observed
+    nearest_threshold_f    REAL,                 -- closest open threshold for this station/date
+    entered_tier_at        TIMESTAMPTZ NOT NULL,
+    last_updated_at        TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (station, event_date)
+);
+```
+
+**Write path:** `ThresholdProximityMonitor` calls `upsert(station, event_date, tier, ...)` on every tier change; also writes on startup to clear stale rows from prior daemon runs.
+**Read path:** On startup the monitor reads all rows to reconstruct its in-memory working set without re-polling NWS. Strategy C signal engine reads the row for `(station, event_date)` on each evaluation — it does not call `ThresholdProximityMonitor` directly (decoupled via DB).
+
 Populate `cli_reconciliation` by backfilling across the existing `historical_replay` corpus (reuse `services/historical_pipeline.py` patterns). Populate `cli_station_variance` via a weekly rollup job.
 
-#### 4.1.6 Acceptance criteria
+#### 4.1.7 Acceptance criteria
 
 The three core metrics — signal precision, fill feasibility, and edge realization — are distinct and must be evaluated separately. A single "win rate" target collapses them in ways that make it impossible to diagnose failures. Each has its own hard-block threshold.
 
 1. **Unit tests pass.** Coverage ≥ 85% on `strategy_cleanup.py` and `cli_reconciliation.py`.
 
-2. **Shadow-C runs for 30 calendar days** producing ≥ 30 shadow-mode `strategy_c_rooms` rows across all 20 cities.
+2. **Shadow-C runs for 30 calendar days** producing ≥ **50 qualifying events** (shadow-mode `strategy_c_rooms` rows where `execution_outcome != 'shadow_blocked'`). If 30 days completes with fewer than 50 qualifying events, extend in 15-day increments until the event-count gate is met. A 30-day shadow window that logs only 10 events provides insufficient statistical power to evaluate signal precision or fill-rate distribution — an estimated ~70–75 qualifying Strategy C events per 30 days is expected across 20 cities, so this gate should be met within the base window barring unusual market closures.
 
 3. **Signal precision.** Of shadow `CleanupSignal`s asserting a locked-YES state, ≥ 99% of the corresponding contracts settled YES (and analogously for locked-NO). Computed by joining `strategy_c_rooms` against `historical_settlement_labels` for all settled rows in the shadow window. Hard block at < 95% — a miss rate above 5% indicates a bug in lock-detection logic, not a calibration issue.
 
@@ -369,7 +410,11 @@ The three core metrics — signal precision, fill feasibility, and edge realizat
 
 8. **Dashboard row added.** Control room `/api/control-room/summary` surfaces Strategy C shadow metrics: signal count/day, counterfactual fill rate, median realized edge, signal precision, race rate, per-station variance status.
 
-9. **Operator review.** Grant reviews all three core metrics (criteria 3–5) and explicitly approves the live transition in writing (commit a dated approval note to `docs/strategy/strategy_c_cleanup.md`). Do not flip `strategy_c_shadow_only=false` programmatically.
+9. **Operator review and DB activation.** Grant reviews all three core metrics (criteria 3–5) and explicitly approves the live transition in writing (commit a dated approval note to `docs/strategy/strategy_c_cleanup.md`). Additionally, create a DB activation record using the CLI:
+   ```bash
+   kalshi-bot-cli strategy-c approve --shadow-window-id <window_uuid>
+   ```
+   This writes a row to the `strategy_activations` table (see §5.8) referencing the shadow window being graduated. The live deployment verifies this record exists at startup and blocks live execution if it is absent — a config flag alone (`strategy_c_shadow_only=false`) is not sufficient. Do not flip `strategy_c_shadow_only=false` without the DB activation record in place.
 
 **Live monitoring (post-graduation).** Track five numbers together in the control room dashboard; no single number tells the full story:
 - **Signal count** — how often Strategy C triggers
@@ -378,9 +423,9 @@ The three core metrics — signal precision, fill feasibility, and edge realizat
 - **Realized edge per fill** — distribution (median + P10), not mean; drawn from `realized_edge_cents`
 - **Win rate on fills** — fraction of settled fills where `settlement_outcome = 'lock_held'`; target ≥ 99%; any drift below 99% is a signal-precision issue requiring immediate investigation, not a tolerable degradation
 
-#### 4.1.7 Stop condition
+#### 4.1.8 Stop condition
 
-Do not promote Strategy C out of shadow mode until all nine acceptance criteria (§4.1.6) pass and operator has signed off. Specifically:
+Do not promote Strategy C out of shadow mode until all nine acceptance criteria (§4.1.7) pass and operator has signed off. Specifically:
 - Shadow window ≥ 30 calendar days (or 60 days if no divergence events observed)
 - Signal precision ≥ 99% (hard block at 95%)
 - Counterfactual fill rate ≥ 20% (hard block; 40–70% is the calibrated target)
@@ -863,7 +908,7 @@ For the coding assistant's quick navigation:
 Path A is complete when:
 - **Prerequisite 0** merged and deployed: pagination bug fixed, ADR committed
 - All three additions merged to `main` behind feature flags
-- Strategy C has completed 30-day shadow + operator sign-off (all criteria in §4.1.6 met)
+- Strategy C has completed 30-day shadow + operator sign-off (all criteria in §4.1.7 met)
 - Monotonicity scanner has completed 30-day shadow + operator sign-off
 - Per-station σ calibration is live and improving CRPS in production metrics
 - `ThresholdProximityMonitor` deployed and confirming near-threshold tier transitions in logs
