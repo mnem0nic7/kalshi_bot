@@ -1362,6 +1362,12 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": "invalid_run_state", "message": str(exc)}, status_code=400)
         return JSONResponse(jsonable_encoder(payload))
 
+    @app.post("/api/strategies/auto-evolve/run")
+    async def run_strategy_auto_evolve(request: Request) -> JSONResponse:
+        app_container = container(request)
+        payload = await app_container.strategy_auto_evolve_service.run_once(trigger_source="manual")
+        return JSONResponse(jsonable_encoder(payload))
+
     @app.get("/api/strategies/calibration")
     async def strategies_calibration(
         request: Request,

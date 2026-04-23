@@ -272,6 +272,8 @@
     codexRunDetail: null,
     codexPollTimer: null,
     codexMessage: null,
+    autoEvolveSubmitting: false,
+    autoEvolveMessage: null,
     fetching: false,
     dirty: false,
     approvalSubmitting: false,
@@ -787,6 +789,117 @@
     ];
 
     clearNode(container, stats);
+  }
+
+  function autoEvolvePayload(payload) {
+    return payload && payload.automation ? payload.automation : {};
+  }
+
+  function setAutoEvolveMessage(tone, text) {
+    strategyState.autoEvolveMessage = text ? { tone: tone || "neutral", text } : null;
+  }
+
+  async function startAutoEvolveRun() {
+    if (strategyState.autoEvolveSubmitting) return;
+    strategyState.autoEvolveSubmitting = true;
+    setAutoEvolveMessage("neutral", "Running Auto-Evolve...");
+    if (strategyState.payload) renderStrategies(strategyState.payload);
+    try {
+      const response = await fetch("/api/strategies/auto-evolve/run", { method: "POST" });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (redirectToLoginIfRequired(response, body)) return;
+        setAutoEvolveMessage("bad", responseErrorMessage(body, "Auto-Evolve run failed."));
+        return;
+      }
+      const status = body.status || "completed";
+      const count = Array.isArray(body.assignment_changes) ? body.assignment_changes.length : 0;
+      setAutoEvolveMessage(status === "failed" ? "bad" : "good", `Auto-Evolve ${status}; applied ${count} assignment(s).`);
+      await loadStrategies({
+        windowDays: strategyState.windowDays,
+        focusMode: strategyState.focusMode,
+        explicitSelection: strategyState.explicitSelection,
+      });
+    } catch (error) {
+      setAutoEvolveMessage(
+        "bad",
+        error instanceof Error && error.message ? `Auto-Evolve failed. ${error.message}` : "Auto-Evolve failed.",
+      );
+    } finally {
+      strategyState.autoEvolveSubmitting = false;
+      if (strategyState.payload) renderStrategies(strategyState.payload);
+    }
+  }
+
+  function renderAutoEvolve(payload) {
+    const card = document.getElementById("strategies-auto-evolve-card");
+    const container = document.getElementById("strategies-auto-evolve");
+    const meta = document.getElementById("strategies-auto-evolve-meta");
+    if (!container) return;
+    const automation = autoEvolvePayload(payload);
+    const last = automation.last_run || {};
+    const enabled = Boolean(automation.enabled);
+    if (card) card.hidden = false;
+    if (meta) {
+      meta.textContent = enabled
+        ? "Production-on automation accepts suggestions, activates presets, and applies eligible assignments."
+        : "Automation is disabled; manual strategy controls remain available.";
+    }
+
+    const children = [];
+    const statusRow = el("div", "strategy-auto-evolve-status-row");
+    statusRow.append(
+      pill(enabled ? "enabled" : "disabled", enabled ? "good" : "bad"),
+      pill(last.status || automation.last_status || "no run", last.status === "failed" ? "bad" : last.status ? "neutral" : "warning"),
+    );
+    if (automation.provider) statusRow.appendChild(pill(codexProviderLabel(automation.provider, payload), "neutral"));
+    if (automation.model) statusRow.appendChild(el("span", "muted-label mono", automation.model));
+    children.push(statusRow);
+
+    const facts = el("div", "strategy-auto-evolve-facts");
+    const lastRun = automation.last_ran_at || last.ran_at;
+    facts.append(
+      metricListItem("Window", automation.window_days ? `${automation.window_days}d` : "—"),
+      metricListItem("Last run", lastRun ? formatAge(lastRun) : "Never"),
+      metricListItem("Accepted", automation.accepted_strategy || "—"),
+      metricListItem("Activated", automation.activated_strategy || "—"),
+      metricListItem("Assignments", String(automation.assignment_change_count || 0)),
+    );
+    children.push(facts);
+
+    if (Array.isArray(automation.assignment_changes) && automation.assignment_changes.length) {
+      const list = el("ul", "strategy-methodology-list");
+      automation.assignment_changes.slice(0, 4).forEach((change) => {
+        list.appendChild(el(
+          "li",
+          null,
+          `${change.series_ticker}: ${change.previous_strategy || "unassigned"} -> ${change.new_strategy}`,
+        ));
+      });
+      children.push(list);
+    }
+
+    const actionRow = el("div", "strategy-codex-action-row");
+    const runButton = setTestId(el(
+      "button",
+      "dash-button secondary-button",
+      strategyState.autoEvolveSubmitting ? "Running..." : "Run Auto-Evolve",
+    ), "strategy-auto-evolve-run");
+    runButton.type = "button";
+    runButton.disabled = !enabled || strategyState.autoEvolveSubmitting;
+    runButton.addEventListener("click", () => {
+      void startAutoEvolveRun();
+    });
+    actionRow.appendChild(runButton);
+    if (strategyState.autoEvolveMessage && strategyState.autoEvolveMessage.text) {
+      actionRow.appendChild(el(
+        "div",
+        `strategy-codex-message is-${strategyState.autoEvolveMessage.tone || "neutral"}`,
+        strategyState.autoEvolveMessage.text,
+      ));
+    }
+    children.push(actionRow);
+    clearNode(container, children);
   }
 
   function renderWindowFilter(summary) {
@@ -2205,11 +2318,15 @@
           ? "promotion"
           : event.kind === "threshold_adjustment"
           ? "tuning"
+          : event.direction === "auto_evolved"
+          ? "auto"
           : event.kind === "assignment_approval"
           ? "approval"
           : "event";
       const eventTone =
         event.kind === "promotion"
+          ? "good"
+          : event.direction === "auto_evolved"
           ? "good"
           : event.kind === "assignment_approval"
           ? "neutral"
@@ -2791,7 +2908,7 @@
     const note = el(
       "p",
       "muted-label",
-      `Recommendation tiers: at least ${methodology && methodology.recommendation_trade_threshold != null ? methodology.recommendation_trade_threshold : "?"} resolved trades, ${(methodology && methodology.recommendation_outcome_coverage_threshold != null ? methodology.recommendation_outcome_coverage_threshold * 100 : "?")}% outcome coverage, and ${(methodology && methodology.recommendation_lean_gap_threshold != null ? methodology.recommendation_lean_gap_threshold * 100 : "?")}%–${(methodology && methodology.recommendation_strong_gap_threshold != null ? methodology.recommendation_strong_gap_threshold * 100 : "?")}% win-rate separation. Auto-assignment stays paused, but the latest 180d winner can be manually approved with a required note.`,
+      `Recommendation tiers: at least ${methodology && methodology.recommendation_trade_threshold != null ? methodology.recommendation_trade_threshold : "?"} resolved trades, ${(methodology && methodology.recommendation_outcome_coverage_threshold != null ? methodology.recommendation_outcome_coverage_threshold * 100 : "?")}% outcome coverage, and ${(methodology && methodology.recommendation_lean_gap_threshold != null ? methodology.recommendation_lean_gap_threshold * 100 : "?")}%–${(methodology && methodology.recommendation_strong_gap_threshold != null ? methodology.recommendation_strong_gap_threshold * 100 : "?")}% win-rate separation. Auto-Evolve applies eligible 180d winners automatically; manual approval remains available as an override.`,
     );
     children.push(note);
     clearNode(container, children);
@@ -2816,6 +2933,7 @@
     renderFocusSwitch(payload);
     renderWindowFilter(payload.summary || {});
     renderStrategiesSummary(payload);
+    renderAutoEvolve(payload);
     renderCodexLab(payload);
     renderReviewQueue(payload);
     renderStrategyLeaderboard(payload.leaderboard || []);

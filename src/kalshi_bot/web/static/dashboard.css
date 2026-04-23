@@ -505,6 +505,23 @@
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.strategy-auto-evolve-card {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.strategy-auto-evolve-status-row,
+.strategy-auto-evolve-facts {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.strategy-auto-evolve-facts .strategy-metric-item {
+  min-width: 8rem;
+}
+
 .dash-card[hidden] {
   display: none !important;
 }

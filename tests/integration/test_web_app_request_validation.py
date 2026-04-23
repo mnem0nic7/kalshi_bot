@@ -172,7 +172,7 @@ def _strategy_assignment_payload(
             "assignments_covered": 0 if assignment_strategy is None else 1,
             "assignments_total": 1,
             "assignments_covered_display": "0 / 1" if assignment_strategy is None else "1 / 1",
-            "methodology_note": "Canonical outcomes, manual approval",
+            "methodology_note": "Canonical outcomes, Auto-Evolve",
         },
         "leaderboard": [],
         "city_matrix": [city_row],
@@ -188,6 +188,15 @@ def _strategy_assignment_payload(
         },
         "recent_promotions": [],
         "methodology": {"points": []},
+        "automation": {
+            "enabled": True,
+            "mode": "auto_evolve",
+            "window_days": 180,
+            "last_status": "completed",
+            "provider": "gemini",
+            "model": "gemini-2.5-pro",
+            "assignment_change_count": 1,
+        },
     }
 
 
@@ -1068,6 +1077,43 @@ def test_accept_strategy_codex_run_endpoint_maps_service_errors(tmp_path, monkey
     }
     assert missing_response.status_code == 404
     assert missing_response.json() == {"error": "unknown_run_id", "run_id": "missing"}
+    get_settings.cache_clear()
+
+
+def test_strategy_auto_evolve_manual_run_endpoint_returns_summary(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    captured: dict[str, object] = {}
+
+    class FakeStrategyAutoEvolveService:
+        async def run_once(self, *, trigger_source: str = "manual"):
+            captured["trigger_source"] = trigger_source
+            return {
+                "status": "completed",
+                "trigger_source": trigger_source,
+                "accepted_strategy": "balanced-plus",
+                "activated_strategy": "balanced-plus",
+                "assignment_changes": [{"series_ticker": "KXHIGHNY", "new_strategy": "balanced-plus"}],
+            }
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        client.app.state.container.strategy_auto_evolve_service = FakeStrategyAutoEvolveService()  # type: ignore[assignment]
+        response = client.post("/api/strategies/auto-evolve/run")
+
+    assert response.status_code == 200
+    assert captured["trigger_source"] == "manual"
+    assert response.json()["status"] == "completed"
+    assert response.json()["accepted_strategy"] == "balanced-plus"
+    assert response.json()["assignment_changes"][0]["series_ticker"] == "KXHIGHNY"
     get_settings.cache_clear()
 
 

@@ -13,11 +13,15 @@ class StrategyDashboardService:
     def __init__(
         self,
         *,
+        settings: Any | None = None,
         session_factory: async_sessionmaker,
+        regression_read_session_factory: async_sessionmaker | None = None,
         weather_directory: WeatherMarketDirectory,
         strategy_codex_service: Any | None = None,
     ) -> None:
+        self.settings = settings
         self.session_factory = session_factory
+        self.regression_read_session_factory = regression_read_session_factory or session_factory
         self.weather_directory = weather_directory
         self.strategy_codex_service = strategy_codex_service
 
@@ -32,7 +36,9 @@ class StrategyDashboardService:
         from kalshi_bot.web.control_room import build_strategies_dashboard_core
 
         container = SimpleNamespace(
+            settings=self.settings,
             session_factory=self.session_factory,
+            regression_read_session_factory=self.regression_read_session_factory,
             weather_directory=self.weather_directory,
             strategy_codex_service=self.strategy_codex_service,
         )

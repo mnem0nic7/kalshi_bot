@@ -206,6 +206,29 @@ class FakeStrategyCodexService:
         ]
 
 
+class FakeStrategyAutoEvolveService:
+    def __init__(self, session_factory) -> None:
+        self.session_factory = session_factory
+        self.calls: list[dict[str, object]] = []
+
+    async def run_once(self, *, trigger_source: str = "manual") -> dict[str, object]:
+        self.calls.append({"trigger_source": trigger_source})
+        payload = {
+            "status": "completed",
+            "mode": "auto_evolve",
+            "trigger_source": trigger_source,
+            "run_ids": ["nightly-evaluate", "nightly-suggest"],
+            "accepted_strategy": "balanced-plus",
+            "activated_strategy": "balanced-plus",
+            "assignment_changes": [{"series_ticker": "KXHIGHNY", "new_strategy": "balanced-plus"}],
+        }
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.set_checkpoint("daemon_strategy_auto_evolve:demo:blue", None, payload)
+            await session.commit()
+        return payload
+
+
 class BlockingShadowCampaignService:
     def __init__(self) -> None:
         self.calls = 0
@@ -607,6 +630,68 @@ async def test_daemon_heartbeat_runs_nightly_strategy_codex_once_per_pacific_dat
 
     assert len(codex_service.calls) == 1
     assert "strategy_codex_nightly" not in second_payload
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_delegates_nightly_strategy_auto_evolve_when_enabled(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-auto-evolve-nightly.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        strategy_codex_nightly_enabled=True,
+        strategy_codex_nightly_timezone="UTC",
+        strategy_codex_nightly_hour_local=1,
+        strategy_auto_evolve_enabled=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory({})
+    now_holder = {"value": datetime(2026, 4, 22, 2, 30, tzinfo=UTC)}
+    regression_service = FakeStrategyRegressionService(session_factory, now_fn=lambda: now_holder["value"])
+    dashboard_service = FakeStrategyDashboardService()
+    codex_service = FakeStrategyCodexService()
+    auto_evolve_service = FakeStrategyAutoEvolveService(session_factory)
+
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        strategy_regression_service=regression_service,  # type: ignore[arg-type]
+        strategy_codex_service=codex_service,  # type: ignore[arg-type]
+        strategy_dashboard_service=dashboard_service,  # type: ignore[arg-type]
+        strategy_auto_evolve_service=auto_evolve_service,  # type: ignore[arg-type]
+    )
+    daemon._utc_now = lambda: now_holder["value"]  # type: ignore[method-assign]
+
+    payload = await daemon.heartbeat_once()
+
+    assert auto_evolve_service.calls == [{"trigger_source": "nightly"}]
+    assert codex_service.calls == []
+    assert "strategy_codex_nightly" not in payload
+    assert payload["strategy_auto_evolve"]["status"] == "completed"
+    assert payload["strategy_auto_evolve"]["accepted_strategy"] == "balanced-plus"
+
+    async with session_factory() as session:
+        checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_strategy_auto_evolve:demo:blue"))
+        ).scalar_one()
+        await session.commit()
+
+    assert checkpoint.payload["trigger_source"] == "nightly"
+    assert checkpoint.payload["mode"] == "auto_evolve"
 
     await engine.dispose()
 

@@ -25,6 +25,7 @@ from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.strategy_eval import StrategyEvaluationService
+from kalshi_bot.services.strategy_auto_evolve import StrategyAutoEvolveService
 from kalshi_bot.services.strategy_codex import StrategyCodexService
 from kalshi_bot.services.strategy_dashboard import StrategyDashboardService
 from kalshi_bot.services.stop_loss import StopLossService
@@ -64,6 +65,7 @@ class DaemonService:
         monotonicity_arb_service: MonotonicityArbScannerService | None = None,
         strategy_codex_service: StrategyCodexService | None = None,
         strategy_dashboard_service: StrategyDashboardService | None = None,
+        strategy_auto_evolve_service: StrategyAutoEvolveService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -87,6 +89,7 @@ class DaemonService:
         self.monotonicity_arb_service = monotonicity_arb_service
         self.strategy_codex_service = strategy_codex_service
         self.strategy_dashboard_service = strategy_dashboard_service
+        self.strategy_auto_evolve_service = strategy_auto_evolve_service
         self.stop_loss_service = stop_loss_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
@@ -345,7 +348,10 @@ class DaemonService:
                 payload["strategy_regression"] = strategy_regression
             strategy_codex_nightly = await self._maybe_run_strategy_codex_nightly()
             if strategy_codex_nightly is not None:
-                payload["strategy_codex_nightly"] = strategy_codex_nightly
+                if strategy_codex_nightly.get("mode") == "auto_evolve":
+                    payload["strategy_auto_evolve"] = strategy_codex_nightly
+                else:
+                    payload["strategy_codex_nightly"] = strategy_codex_nightly
             historical_pipeline = await self._maybe_run_historical_pipeline()
             if historical_pipeline is not None:
                 payload["historical_pipeline"] = historical_pipeline
@@ -559,6 +565,9 @@ class DaemonService:
         night_state = self._strategy_codex_nightly_state()
         if not night_state["due"]:
             return None
+
+        if self.settings.strategy_auto_evolve_enabled and self.strategy_auto_evolve_service is not None:
+            return await self.strategy_auto_evolve_service.run_once(trigger_source="nightly")
 
         checkpoint_name = f"daemon_strategy_codex_nightly:{self.settings.kalshi_env}:{self.settings.app_color}"
         async with self.session_factory() as session:

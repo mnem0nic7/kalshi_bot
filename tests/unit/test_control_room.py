@@ -851,6 +851,7 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
             assert "strategy_regression" in (sources or [])
             assert "strategy_eval" in (sources or [])
             assert "strategy_review" in (sources or [])
+            assert "strategy_auto_evolve" in (sources or [])
             return [
                 SimpleNamespace(
                     source="strategy_regression",
@@ -925,14 +926,34 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
 
     monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
 
+    class FakeAutoEvolveService:
+        async def dashboard_payload(self) -> dict[str, object]:
+            return {
+                "enabled": True,
+                "mode": "auto_evolve",
+                "last_status": "completed",
+                "accepted_strategy": "balanced-plus",
+                "assignment_change_count": 1,
+            }
+
     container = SimpleNamespace(
         session_factory=_FakeSessionFactory(),
         weather_directory=_FakeStrategyWeatherDirectory(),
+        strategy_auto_evolve_service=FakeAutoEvolveService(),
     )
 
     payload = await control_room_module.build_strategies_dashboard(container)
 
-    assert set(payload) == {"summary", "leaderboard", "city_matrix", "detail_context", "recent_promotions", "methodology"}
+    assert set(payload) == {
+        "summary",
+        "leaderboard",
+        "city_matrix",
+        "detail_context",
+        "recent_promotions",
+        "methodology",
+        "automation",
+    }
+    assert payload["automation"]["last_status"] == "completed"
     assert payload["summary"]["window_days"] == 180
     assert payload["summary"]["recommendation_mode"] == "recommendation_only"
     assert payload["summary"]["review_available"] is True
@@ -965,6 +986,38 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
     assert payload["summary"]["recent_approvals_count"] == 1
     assert payload["leaderboard"][0]["name"] == "moderate"
     assert payload["leaderboard"][0]["outcome_coverage_display"] == "50/50 scored"
+
+
+def test_strategy_event_view_handles_auto_evolve_assignment_history() -> None:
+    event = SimpleNamespace(
+        source="strategy_auto_evolve",
+        summary="Strategy Auto-Evolve completed: activated balanced-plus, applied 1 assignment(s)",
+        updated_at=datetime(2026, 4, 23, 8, 0, tzinfo=UTC),
+        payload={
+            "event_kind": "auto_evolve",
+            "accepted_strategy": "balanced-plus",
+            "activated_strategy": "balanced-plus",
+            "assignment_changes": [
+                {
+                    "series_ticker": "KXHIGHNY",
+                    "previous_strategy": "aggressive",
+                    "new_strategy": "balanced-plus",
+                    "recommendation_status": "strong_recommendation",
+                    "recommendation_label": "Strong recommendation",
+                }
+            ],
+        },
+    )
+
+    view = control_room_module._strategy_event_view(event)
+
+    assert view["kind"] == "assignment_approval"
+    assert view["direction"] == "auto_evolved"
+    assert view["source"] == "strategy_auto_evolve"
+    assert view["series_ticker"] == "KXHIGHNY"
+    assert view["previous_strategy"] == "aggressive"
+    assert view["new_strategy"] == "balanced-plus"
+    assert "Auto-Evolve accepted balanced-plus" in view["note"]
 
 
 def test_city_review_state_classifies_all_review_states() -> None:

@@ -266,6 +266,11 @@ class Settings(BaseSettings):
     strategy_codex_nightly_enabled: bool = True
     strategy_codex_nightly_timezone: str = "America/Los_Angeles"
     strategy_codex_nightly_hour_local: int = 1
+    strategy_auto_evolve_enabled: bool = True
+    strategy_auto_evolve_window_days: int = 180
+    strategy_auto_evolve_assign_eligible: bool = True
+    strategy_auto_evolve_accept_suggestions: bool = True
+    strategy_auto_evolve_activate_suggestions: bool = True
     historical_execution_confidence_min_market_days: int = 60
     historical_directional_confidence_min_full_market_days: int = 30
     historical_directional_confidence_min_holdout_market_days: int = 7

@@ -7,7 +7,7 @@
 
 ## What It Is
 
-The Strategies page is the operator interface for reviewing, approving, and improving the trading strategy assigned to each weather market city. It has three focus modes selectable via the toolbar, a detail panel that updates based on what you click, and an Evaluation Lab section for AI-driven strategy suggestions.
+The Strategies page is the operator interface for monitoring automated strategy evolution across weather market cities. Auto-Evolve runs the nightly 180d evidence refresh, asks the AI for evaluation and suggestion runs, accepts valid suggested presets, activates them, and applies eligible city assignments automatically. Manual approval, activation, and lab controls remain available as operator override tools.
 
 ---
 
@@ -19,7 +19,8 @@ Browser (dashboard.js)
         └── control_room.py → build_strategies_dashboard_core()
               ├── StrategyRegressionService     (historical backtesting)
               ├── StrategyEvaluationService     (live edge-adjustment after settlements)
-              └── StrategyCodexService          (Evaluation Lab runs)
+              ├── StrategyCodexService          (Evaluation Lab runs)
+              └── StrategyAutoEvolveService     (nightly automation orchestration)
 ```
 
 **Key files:**
@@ -31,6 +32,7 @@ Browser (dashboard.js)
 | Regression engine | `src/kalshi_bot/services/strategy_regression.py` |
 | Edge adjustment | `src/kalshi_bot/services/strategy_eval.py` |
 | Evaluation Lab | `src/kalshi_bot/services/strategy_codex.py` |
+| Auto-Evolve service | `src/kalshi_bot/services/strategy_auto_evolve.py` |
 | Codex CLI provider | `src/kalshi_bot/agents/codex_cli.py` |
 | Provider router | `src/kalshi_bot/agents/providers.py` — `build_codex_provider()` |
 | Dashboard service | `src/kalshi_bot/services/strategy_dashboard.py` — bridges `control_room.py` to the three sub-services |
@@ -52,9 +54,9 @@ Assignment review queue. Shows **all** cities grouped by their current review st
 | Aligned assignments | `aligned` | Assignment matches current recommendation — no action needed |
 | Waiting for evidence | `waiting_for_evidence` | Unassigned city; evidence not yet strong enough |
 
-Only `strong_recommendation` and `lean_recommendation` cities are eligible for approval (`STRATEGY_APPROVAL_ELIGIBLE_STATUSES`). The review workflow requires the latest 180d regression snapshot to be available (`summary.review_available`); if not, the queue is hidden.
+Only `strong_recommendation` and `lean_recommendation` cities are eligible for assignment (`STRATEGY_APPROVAL_ELIGIBLE_STATUSES`). Auto-Evolve applies those eligible 180d recommendations automatically when enabled. The review workflow requires the latest 180d regression snapshot to be available (`summary.review_available`); if not, the queue is hidden.
 
-**Approval flow:**  
+**Manual override flow:**
 Click a city → detail panel shows recommendation rationale and threshold comparison → "Approve" button → `POST /api/strategies/assignments/{series_ticker}/approve` → recorded as `strategy_review` / `assignment_approval` event.
 
 ---
@@ -82,7 +84,7 @@ Two panels:
 
 ## Evaluation Lab
 
-The Evaluation Lab lets the operator ask the AI to evaluate an existing city's strategy fit or propose an entirely new strategy preset. Results are stored as "runs" and can be accepted or discarded.
+The Evaluation Lab lets the operator or Auto-Evolve ask the AI to evaluate an existing city's strategy fit or propose an entirely new strategy preset. Results are stored as "runs" and can be accepted manually or automatically.
 
 ### How It Works
 
@@ -90,9 +92,9 @@ The Evaluation Lab lets the operator ask the AI to evaluate an existing city's s
 2. Browser calls `POST /api/strategies/codex/runs` with a `mode` (`"evaluate"` or `"suggest"`), `window_days`, and optional `series_ticker` / `strategy_name`.
    - `evaluate` — scores how well existing strategies fit a city; no new strategy is created.
    - `suggest` — proposes a new strategy preset with different thresholds; accepted runs create a new strategy.
-3. `StrategyCodexService.execute_run()` calls the Codex CLI provider with a structured prompt.
+3. `StrategyCodexService.execute_run()` calls the selected AI provider with a structured prompt.
 4. Browser polls `GET /api/strategies/codex/runs/{run_id}` until status is `completed` or `failed`.
-5. Operator reviews output and clicks "Accept" → `POST /api/strategies/codex/runs/{run_id}/accept` → strategy applied (only valid for `suggest` mode runs).
+5. For manual runs, the operator reviews output and clicks "Accept" → `POST /api/strategies/codex/runs/{run_id}/accept` → strategy saved (only valid for `suggest` mode runs). For Auto-Evolve runs, valid suggestions with deterministic backtest status `ok` are accepted by the service.
 
 **Trigger sources:** `"manual"` (operator-initiated from the UI) and `"nightly"` (daemon-scheduled).
 
@@ -107,14 +109,81 @@ The Evaluation Lab supports two providers: **Gemini** (primary) and **Codex CLI*
 
 Config:
 ```
+GEMINI_KEY=...          # enables Gemini provider
 CODEX_MODEL=gpt-4o          # model passed to the CLI binary (default)
 ```
 
 If neither provider is available, the Evaluation Lab is disabled (`is_available()` returns false).
 
+## Auto-Evolve Lifecycle
+
+Auto-Evolve is the production-on automation path for the Strategies page. It has one service entrypoint:
+
+```
+StrategyAutoEvolveService.run_once(trigger_source="nightly" | "manual")
+```
+
+Daily cadence:
+
+1. The daemon reaches the local nightly target from `STRATEGY_CODEX_NIGHTLY_TIMEZONE` and `STRATEGY_CODEX_NIGHTLY_HOUR_LOCAL`.
+2. `_maybe_run_strategy_codex_nightly()` delegates to `StrategyAutoEvolveService` when `STRATEGY_AUTO_EVOLVE_ENABLED=true`.
+3. The service refreshes or requires a fresh strategy regression checkpoint for the configured window, default 180d.
+4. It builds the dashboard snapshot and runs both AI modes: `evaluate` and `suggest`.
+5. If the suggestion run completes and its deterministic backtest has `status="ok"`, the existing accept logic saves the preset into `strategies`.
+6. If activation is enabled, the saved preset is immediately activated.
+7. The service rebuilds the 180d dashboard and assigns every `approval_eligible=true` city to the current recommendation, including drifted and unassigned cities.
+8. It records a single `ops_events` row and updates the checkpoint.
+
+Checkpoint names:
+
+| Checkpoint | Purpose |
+|------------|---------|
+| `daemon_strategy_auto_evolve:{kalshi_env}:{app_color}` | Auto-Evolve run status, run IDs, accepted/activated strategy, provider/model, assignment changes, skips, and errors |
+| `strategy_regression` | Latest regression refresh used as the 180d evidence base |
+| `daemon_strategy_codex_nightly:{kalshi_env}:{app_color}` | Legacy nightly Codex checkpoint when Auto-Evolve is disabled |
+
+Default settings:
+
+```
+STRATEGY_AUTO_EVOLVE_ENABLED=true
+STRATEGY_AUTO_EVOLVE_WINDOW_DAYS=180
+STRATEGY_AUTO_EVOLVE_ASSIGN_ELIGIBLE=true
+STRATEGY_AUTO_EVOLVE_ACCEPT_SUGGESTIONS=true
+STRATEGY_AUTO_EVOLVE_ACTIVATE_SUGGESTIONS=true
+```
+
+Provider precedence is Gemini first, then Codex CLI when available. Gemini requires `GEMINI_KEY`; Codex requires the `codex` binary and CLI auth. If no provider is available, Auto-Evolve writes a skipped checkpoint and does not mutate strategies or assignments.
+
+Automatic mutations:
+
+| Storage | Mutation |
+|---------|----------|
+| `strategy_codex_runs` | Stores nightly `evaluate` and `suggest` runs |
+| `strategies` | Stores accepted AI-suggested presets and active status |
+| `city_strategy_assignments` | Writes canonical city assignments with `assigned_by="auto_evolve"` |
+| `ops_events` | Summarizes each Auto-Evolve run |
+
+The flow is idempotent by local date: rerunning after a completed same-day run refreshes the Auto-Evolve checkpoint but does not duplicate accepted strategies or rewrite already matching assignments.
+
+Rollback / stop procedure:
+
+1. Set `STRATEGY_AUTO_EVOLVE_ENABLED=false`.
+2. Redeploy.
+3. Use the Strategies page manual override controls to restore city assignments or deactivate AI-suggested strategy presets as needed.
+
+Failure modes:
+
+| Failure | Behavior |
+|---------|----------|
+| Provider unavailable | Skipped checkpoint, no strategy or assignment mutation |
+| Invalid suggestion schema | Suggestion cannot be accepted, activation and assignment are skipped |
+| Backtest failure | Suggestion is not accepted, activation and assignment are skipped |
+| Stale regression unavailable | Skipped checkpoint, no mutation |
+| Partial assignment failure | Run records `completed_with_failures` with assignment errors |
+
 ### Nightly Evaluation
 
-When `STRATEGY_CODEX_NIGHTLY_ENABLED=true`, the daemon runs Codex on all cities automatically in a nightly window defined by `STRATEGY_CODEX_NIGHTLY_TIMEZONE` and `STRATEGY_CODEX_NIGHTLY_HOUR`. Checkpoint key: `daemon_strategy_codex_nightly:{kalshi_env}:{app_color}`.
+When `STRATEGY_CODEX_NIGHTLY_ENABLED=true`, the daemon enters the nightly strategy window defined by `STRATEGY_CODEX_NIGHTLY_TIMEZONE` and `STRATEGY_CODEX_NIGHTLY_HOUR_LOCAL`. With Auto-Evolve enabled, that nightly path delegates to `StrategyAutoEvolveService` and writes `daemon_strategy_auto_evolve:{kalshi_env}:{app_color}`. With Auto-Evolve disabled, it falls back to the legacy Codex-only checkpoint `daemon_strategy_codex_nightly:{kalshi_env}:{app_color}`.
 
 ---
 
@@ -156,6 +225,7 @@ Strategy presets are seeded at startup from `STRATEGY_PRESETS` in `src/kalshi_bo
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/api/dashboard/strategies` | Full dashboard payload; params: `window_days`, `series_ticker`, `strategy_name` |
+| `POST` | `/api/strategies/auto-evolve/run` | Authenticated manual Auto-Evolve smoke run using the same service path |
 | `POST` | `/api/strategies/codex/runs` | Create an Evaluation Lab run |
 | `GET` | `/api/strategies/codex/runs/{run_id}` | Poll run status |
 | `POST` | `/api/strategies/codex/runs/{run_id}/accept` | Accept Evaluation Lab suggestion |
@@ -163,6 +233,8 @@ Strategy presets are seeded at startup from `STRATEGY_PRESETS` in `src/kalshi_bo
 | `POST` | `/api/strategies/assignments/{series_ticker}/approve` | Approve city assignment |
 | `GET` | `/api/strategy-audit/rooms/{room_id}` | Strategy audit for one room |
 | `GET` | `/api/strategy-audit/summary` | Aggregate strategy audit |
+
+`GET /api/dashboard/strategies` includes an `automation` object with enabled state, mode, checkpoint name, last status, provider/model, accepted and activated strategies, assignment change count, and recent assignment changes.
 
 ---
 
@@ -174,12 +246,13 @@ Strategy presets are seeded at startup from `STRATEGY_PRESETS` in `src/kalshi_bo
 - [x] City matrix view — recommendation grid with window filter (30d / 90d / 180d)
 - [x] Strategy leaderboard — aggregate ranking across cities
 - [x] Manual approval workflow — Review queue with status labels and approval POST
+- [x] Auto-Evolve workflow — nightly 180d evaluation, suggestion acceptance, activation, and eligible assignment application
 - [x] City detail panel — threshold comparison, evidence status, next-action copy
 - [x] Strategy detail panel — per-city breakdown for selected preset
 - [x] Evaluation Lab UI — run creation, polling, accept/discard flow
 - [x] `CodexCLIProvider` — shells out to `codex exec` via subprocess; CLI manages its own auth
-- [x] `build_codex_provider()` — provider resolution: CLI binary only (Gemini + Codex CLI are the only supported providers)
-- [x] Nightly Codex evaluation — daemon-scheduled, checkpoint-guarded
+- [x] `build_codex_provider()` — provider resolution: Gemini first, Codex CLI second
+- [x] Nightly strategy automation — daemon-scheduled, checkpoint-guarded
 - [x] Edge adjustment after settlements
 - [x] Recent promotion / approval history panel
 - [x] Strategy audit per room and aggregate summary endpoints
@@ -187,12 +260,12 @@ Strategy presets are seeded at startup from `STRATEGY_PRESETS` in `src/kalshi_bo
 ### In Progress / Pending
 
 - [ ] **Codex CLI in production** — `@openai/codex` npm package must be installed in the production container (`npm install -g @openai/codex`). Without it, only Gemini is available for the Evaluation Lab. Run `codex login` on the server after install to authenticate.
-- [ ] **Evaluation Lab end-to-end smoke test on live** — verify CLI path works once binary is deployed; check `codexLabPayload` in dashboard response shows correct provider type.
-- [ ] **Codex nightly enabled on live** — `STRATEGY_CODEX_NIGHTLY_ENABLED` is off by default; enable after CLI is confirmed working.
+- [ ] **Evaluation Lab end-to-end smoke test on live** — verify provider execution works after deploy; check `codexLabPayload` and `automation.provider` in dashboard response show the selected provider.
+- [ ] **Evaluation Lab provider smoke test on live** — verify the active provider path works after deploy; the dashboard `automation.provider` field should show `gemini` first when `GEMINI_KEY` is present.
 
 ### Known Gaps / Future Work
 
 - Strategy presets are currently defined at seed time; there is no UI for creating a new preset from scratch without going through Evaluation Lab.
 - The 180d window is the only one used for approval eligibility; shorter windows (30d / 90d) are display-only.
-- No alerting when a city drifts from `aligned` to `drifted_assignment` between regression runs.
+- No external alerting when a city drifts from `aligned` to `drifted_assignment` between regression runs; Auto-Evolve records the correction in the dashboard and ops log.
 - **Strategies read source is configurable.** By default the page reads from the deployment's primary DB (demo deployments read `postgres_demo`, production reads `postgres_production`). Set `STRATEGY_REGRESSION_READ_SOURCE=secondary` together with `POSTGRES_SECONDARY_HOST` on the demo deployment to make the strategies page and the regression pipeline pull from the production DB instead — regression snapshots and city assignments still write locally so each deployment keeps its own history. If `secondary` is requested without a secondary DB configured, the app logs an error and falls back to primary. The active source appears as `regression_read_source` in `/api/control-room/summary`.

@@ -470,7 +470,7 @@ def _build_strategies_payload(
             "assignments_covered": 2,
             "assignments_total": 2,
             "assignments_covered_display": "2 / 2",
-            "methodology_note": "Canonical outcomes, manual approval",
+            "methodology_note": "Canonical outcomes, Auto-Evolve",
         },
         "leaderboard": leaderboard,
         "city_matrix": city_matrix,
@@ -543,6 +543,29 @@ def _build_strategies_payload(
             {"kind": "threshold_adjustment", "summary": "Auto-adjusted risk_min_edge_bps 50->40", "source": "strategy_eval", "created_at": "2026-04-21T18:00:00+00:00", "change_display": "50bps -> 40bps", "win_rate_display": "63%", "trade_count": 82},
             {"kind": "assignment_approval", "summary": "Approved strategy assignment for KXHIGHNY: aggressive -> moderate", "source": "strategy_review", "created_at": "2026-04-21T18:30:00+00:00", "series_ticker": "KXHIGHNY", "win_rate_display": "75%", "trade_count": 12, "note": "Operator approved the current 180d winner."},
         ],
+        "automation": {
+            "enabled": True,
+            "mode": "auto_evolve",
+            "window_days": 180,
+            "last_status": "completed",
+            "provider": "gemini",
+            "model": "gemini-2.5-pro",
+            "accepted_strategy": "balanced-plus",
+            "activated_strategy": "balanced-plus",
+            "assignment_change_count": 1,
+            "last_run": {
+                "status": "completed",
+                "accepted_strategy": "balanced-plus",
+                "activated_strategy": "balanced-plus",
+                "assignment_changes": [
+                    {
+                        "series_ticker": "KXHIGHNY",
+                        "previous_strategy": "aggressive",
+                        "new_strategy": "balanced-plus",
+                    }
+                ],
+            },
+        },
         "methodology": {
             "title": "How to read this tab",
             "points": [
@@ -943,6 +966,10 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert "Actionable Cities" in summary_text
                 assert "Assignment Mismatches" in summary_text
                 assert "Low-Confidence Cities" in summary_text
+                automation_text = page.locator("#strategies-auto-evolve-card").text_content(timeout=15_000) or ""
+                assert "Auto-Evolve" in automation_text
+                assert "completed" in automation_text
+                assert "balanced-plus" in automation_text
                 detail_text = page.locator("#strategies-cities-detail").text_content(timeout=15_000) or ""
                 assert "City Research Brief" in detail_text
                 assert "Evidence interpretation" in detail_text

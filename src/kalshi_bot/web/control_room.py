@@ -19,6 +19,7 @@ from kalshi_bot.services.position_governance import (
     stop_loss_outcome_from_payloads,
     stop_loss_stopped_at_from_payloads,
 )
+from kalshi_bot.services.strategy_auto_evolve import AUTO_EVOLVE_EVENT_KIND, AUTO_EVOLVE_SOURCE
 from kalshi_bot.services.strategy_regression import (
     LEAN_RECOMMENDATION_MIN_GAP as STRATEGY_LEAN_RECOMMENDATION_GAP,
     MIN_TRADE_COUNT as STRATEGY_MIN_TRADE_COUNT,
@@ -2076,6 +2077,27 @@ def _strategy_event_view(event: Any) -> dict[str, Any]:
             "basis_run_at": payload.get("basis_run_at"),
             "direction": "approved",
         }
+    if source == AUTO_EVOLVE_SOURCE and payload.get("event_kind") == AUTO_EVOLVE_EVENT_KIND:
+        changes = list(payload.get("assignment_changes") or [])
+        first_change = changes[0] if changes else {}
+        return {
+            "kind": "assignment_approval",
+            "summary": getattr(event, "summary", "Strategy Auto-Evolve completed"),
+            "source": source,
+            "created_at": updated_at,
+            "series_ticker": first_change.get("series_ticker") if len(changes) == 1 else None,
+            "previous_strategy": first_change.get("previous_strategy") if len(changes) == 1 else None,
+            "new_strategy": first_change.get("new_strategy") if len(changes) == 1 else payload.get("activated_strategy"),
+            "recommendation_status": first_change.get("recommendation_status") if len(changes) == 1 else None,
+            "recommendation_label": first_change.get("recommendation_label") if len(changes) == 1 else None,
+            "trade_count": len(changes),
+            "note": (
+                f"Auto-Evolve accepted {payload.get('accepted_strategy') or 'no new preset'}; "
+                f"activated {payload.get('activated_strategy') or 'none'}; "
+                f"applied {len(changes)} assignment(s)."
+            ),
+            "direction": "auto_evolved",
+        }
     if source == "strategy_eval":
         old_bps = _float_or_none(payload.get("old_bps"))
         new_bps = _float_or_none(payload.get("new_bps"))
@@ -2892,7 +2914,7 @@ async def build_strategies_dashboard_core(
         regression_checkpoint = await repo.get_checkpoint("strategy_regression")
         strategy_events_raw = await repo.list_ops_events(
             limit=STRATEGY_EVENT_LIMIT,
-            sources=["strategy_regression", "strategy_eval", STRATEGY_APPROVAL_SOURCE],
+            sources=["strategy_regression", "strategy_eval", STRATEGY_APPROVAL_SOURCE, AUTO_EVOLVE_SOURCE],
             created_after=now - timedelta(days=STRATEGY_EVENT_LOOKBACK_DAYS),
         )
 
@@ -2994,9 +3016,9 @@ async def build_strategies_dashboard_core(
     methodology_points = [
         "Canonical replay outcomes come from persisted trade tickets and settlement labels, not raw signal payloads.",
         f"Default view uses a rolling {DEFAULT_STRATEGY_WINDOW_DAYS}d regression snapshot.",
-        "Regression stays recommendation-only; auto-assignment remains paused during calibration.",
+        "Auto-Evolve runs the latest stored 180d evidence through evaluation, suggestion, activation, and assignment steps.",
         "The assignment review queue is driven only by the latest stored 180d evidence, not by 30d or 90d research views.",
-        "Manual approval is available only for the latest 180d strong or lean recommendation, and it always requires an operator note.",
+        "Eligible strong or lean recommendations are applied automatically; manual approval remains available as an override.",
         "Recommendation tiers require resolved-trade evidence, strong outcome coverage, and a measurable gap to the runner-up.",
         "Resolved-contract, longshot, and effectively-broken-book stand-down cases are excluded from regression.",
         "Missing data means not enough evidence, not that a strategy failed.",
@@ -3012,6 +3034,7 @@ async def build_strategies_dashboard_core(
         "source_mode": snapshot_meta["source_mode"],
         "recommendation_mode": STRATEGY_RECOMMENDATION_MODE,
         "manual_approval_enabled": True,
+        "auto_evolve_enabled": bool(getattr(getattr(container, "settings", None), "strategy_auto_evolve_enabled", False)),
         "approval_window_days": STRATEGY_APPROVAL_WINDOW_DAYS,
         "review_available": review_available,
         "review_window_days": STRATEGY_APPROVAL_WINDOW_DAYS if review_available else None,
@@ -3041,7 +3064,7 @@ async def build_strategies_dashboard_core(
         "assignments_covered": len(assigned_series),
         "assignments_total": len(configured_series),
         "assignments_covered_display": f"{len(assigned_series)} / {len(configured_series) if configured_series else 0}",
-        "methodology_note": "Canonical outcomes, manual approval",
+        "methodology_note": "Canonical outcomes, Auto-Evolve",
     }
     payload = {
         "summary": summary,
@@ -3061,6 +3084,8 @@ async def build_strategies_dashboard_core(
             "promotion_gap_threshold": STRATEGY_STRONG_RECOMMENDATION_GAP,
         },
     }
+    if getattr(container, "strategy_auto_evolve_service", None) is not None:
+        payload["automation"] = await container.strategy_auto_evolve_service.dashboard_payload()
     if include_codex_lab and getattr(container, "strategy_codex_service", None) is not None:
         payload["codex_lab"] = await container.strategy_codex_service.dashboard_payload()
     return payload
