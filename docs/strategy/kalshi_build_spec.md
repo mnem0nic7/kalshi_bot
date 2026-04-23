@@ -694,8 +694,8 @@ A scanner service that runs every N seconds over current open `KXHIGH*` markets,
 
 **Modified files:**
 - `src/kalshi_bot/services/container.py` — register scanner
-- `src/kalshi_bot/services/daemon.py` — schedule scanner at 60-second cadence
-- `src/kalshi_bot/config.py` — `monotonicity_arb_enabled: bool = False`, `monotonicity_arb_shadow_only: bool = True`, `monotonicity_arb_min_net_edge_cents: int = 2`, `monotonicity_arb_max_notional_dollars: float = 25.0`, `monotonicity_arb_max_proposals_per_minute: int = 5`
+- `src/kalshi_bot/services/daemon.py` — schedule scanner at **5-second** cadence (competitive arb bots run tighter cycles; a 60-second scanner systematically misses violations and only captures slow-moving ones where atomic execution is most likely to leg-break)
+- `src/kalshi_bot/config.py` — `monotonicity_arb_enabled: bool = False`, `monotonicity_arb_shadow_only: bool = True`, `monotonicity_arb_min_net_edge_cents: int = 2`, `monotonicity_arb_max_notional_dollars: float = 25.0`, `monotonicity_arb_max_pairs_per_tick: int = 100` (circuit breaker — skip remaining pairs if 100 evaluated in one tick), `monotonicity_arb_suppression_ttl_seconds: int = 300` (per-(station, event_date) suppression after a proposal is emitted)
 - `src/kalshi_bot/core/enums.py` — `StrategyMode.MONOTONICITY_ARB`
 - `src/kalshi_bot/cli.py` — `monotonicity-scan --once` command
 
@@ -705,8 +705,8 @@ On each tick:
 
 1. Query all open `KXHIGH*` markets grouped by `(station, event_date)`
 2. For each group, sort by threshold ascending
-3. For each threshold, read `bid_yes`, `ask_yes`, and `ask_no` from the market snapshot. **Prefer the actual `ask_no` field over the derived `100 - bid_yes`** — Kalshi's NO side can have independent resting orders and the two may diverge precisely when arbs appear (thin markets). Verify `ask_no` is present in `market/kalshi_mdata.py` snapshot output before shipping; if absent, add it as a prerequisite.
-4. Walk the sequence; for each pair `T_i < T_j` (T_i = lower threshold, T_j = higher threshold), flag a violation when:
+3. For each threshold, read `bid_yes` and `ask_yes` from the market snapshot. **Kalshi's NO side is a computed inverse of the YES side, not an independent book; `ask_no(T) = 100 - bid_yes(T)` by construction** — confirmed in `services/streaming.py` where `best_no_ask = 1.0000 - best_yes_bid` is a plain computed property, not a field from the API. Do not expect an independent `ask_no` field in the snapshot — it does not exist. If `bid_yes(T_j)` is None or zero (no resting YES bid on the higher threshold), skip the pair — there is no alternative source for the NO-side ask price.
+4. Walk **all pairs** `T_i < T_j` (not just adjacent — a violation between T80 and T90 is real even if T85 is not violated). Apply a **100-pair circuit breaker per tick**: if 100 pairs have been evaluated for a given `(station, event_date)` group, skip remaining pairs and log a warning. This prevents a single bloated snapshot from starving the scanner across other city/date groups. For each pair, flag a violation when:
    ```
    bid_yes(T_j) - ask_yes(T_i) > 2·fees + min_edge_cents
    ```
@@ -714,11 +714,24 @@ On each tick:
 
    **Fee calculation.** Use actual per-leg fee from Kalshi's formula `ceil(0.07·C·P·(1-P)·100)/100` evaluated at each leg's price — do not assume the 1¢ floor that applies to Strategy C's near-par prices. At mid-range prices (e.g., 30¢ and 50¢), per-contract fees can run 1.5–2¢. Safe-side shortcut for the detection gate: assume 2¢/leg = 4¢ total. Compute actual fees separately at sizing time.
 
-5. For each violation, generate a paired proposal: **buy YES on T_i at ask_yes(T_i) + buy NO on T_j at ask_no(T_j)** (the lower threshold YES is cheap; the higher threshold NO is cheap because the higher threshold is overpriced on YES).
+5. For each violation, generate a paired proposal: **buy YES on T_i at ask_yes(T_i) + buy NO on T_j at ask_no(T_j)** (the lower threshold YES is cheap; the higher threshold NO is cheap because the higher threshold is overpriced on YES). Skip the pair if: `bid_yes(T_j) == 0`, `ask_yes(T_i) == 0` (no quote), or the `(station, event_date)` group has had a proposal emitted within the last `monotonicity_arb_suppression_ttl_seconds` (300 s) — do not re-propose while a prior proposal is still in-flight or recently settled.
 6. Pass through existing risk engine with `StrategyMode.MONOTONICITY_ARB`
-7. In shadow mode, log proposals; in live mode, emit paired orders **as a single atomic unit** (both or neither)
+7. In shadow mode, log proposals; in live mode, emit paired orders sequentially per the atomic execution protocol below
 
-**Key: atomic execution.** If only one leg fills, you have directional risk, not arb. Either use Kalshi's multi-order batch endpoint if available, or place the less-liquid leg first with a TTL and cancel if the other leg can't fill within 1 second.
+**Key: atomic execution.** If only one leg fills, you have directional risk, not arb. There is no Kalshi batch endpoint — execute sequentially with these semantics:
+
+1. Place the less-liquid leg first (heuristic: higher-threshold YES tends to be thinner).
+2. Wait up to **200 ms** for placement confirmation.
+3. Immediately place the second leg.
+4. If the second leg is not filled within **2000 ms**, cancel it. Attempt a closing order on the first leg at market. If the closing order also fails (market moved, no liquidity), emit a `leg_break` SEV-2 alert and record the open position for manual operator review.
+
+**`leg_break` execution outcome taxonomy.** Add `'leg_break'` to the monotonicity scanner position records:
+- `'filled'` — both legs filled within the 2000 ms window
+- `'partial'` — first leg filled; second failed; closing order placed and confirmed
+- `'leg_break'` — first leg filled; second failed; closing order also failed; open directional exposure requiring manual resolution
+- `'raced'` — first leg filled but price moved before second placement; total pair cost now > $1 (arb math broken); cancel first leg, record as missed opportunity
+
+A `leg_break` position must appear in the control room as an open alert. Do not classify it as a normal trading loss and do not suppress the SEV-2 event.
 
 #### 4.3.3.1 Payoff table
 
@@ -738,7 +751,10 @@ The intuition: by monotonicity, high > T_j implies high > T_i (guaranteed), and 
 #### 4.3.4 Acceptance criteria
 
 1. **Unit tests pass.** Scanner correctly identifies violations on synthetic orderbook fixtures.
-2. **Shadow run.** 30 days of shadow-mode scanning produces a distribution of proposals. Expected volume: low (maybe 0–3 per day across 20 cities); this is a rare-opportunity strategy.
+2. **Shadow run.** 30 days of shadow-mode scanning. Expected volume: very low (estimated 6–120 filled shadow arbs across 30 days — far too few for P&L to be a statistically meaningful gate). The **primary acceptance gates for monotonicity arb are**:
+   - Detection correctness: zero payoff-table-property-test failures (the property test asserts positive net PnL in all outcome scenarios for every proposed pair; a failure means the scanner proposed a losing "arb").
+   - Execution feasibility: zero `leg_break` events in shadow-mode atomic execution simulation.
+   P&L gate is **not** primary. The backtest (criterion 3) is the P&L evidence source, using 90 days of historical orderbook data where volume is sufficient for meaningful statistics.
 3. **Backtest on historical book data.** Using `market_price_history` (migration 0011), replay the scanner over the last 90 days. Simulated PnL must be net-of-fees positive with zero losses on filled pairs (arbs should not lose; if any do, find the bug).
 4. **No leg-breakage in shadow simulation.** Simulated execution tracks whether both legs would have filled atomically within the TTL window.
 5. **Operator review.** Grant reviews shadow output; approves flipping to live canary with `monotonicity_arb_shadow_only=false`. Do not auto-flip.
