@@ -342,6 +342,10 @@ class WorkflowSupervisor:
                     ticket.side.value,
                     kalshi_env=room.kalshi_env,
                 )
+                strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                    kalshi_env=room.kalshi_env,
+                )
                 risk_context = RiskContext(
                     market_observed_at=market_observed_at,
                     research_observed_at=research_observed_at,
@@ -351,6 +355,8 @@ class WorkflowSupervisor:
                     pending_order_count_fp=pending_order_count_fp,
                     portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                     open_ticker_count=open_ticker_count,
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                    strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
                 )
                 if daily_loss_hard_blocked:
                     verdict = RiskVerdictPayload(
@@ -966,6 +972,10 @@ class WorkflowSupervisor:
                             ticket.side.value,
                             kalshi_env=room.kalshi_env,
                         )
+                        strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
+                            strategy_code=StrategyCode.DIRECTIONAL.value,
+                            kalshi_env=room.kalshi_env,
+                        )
                         risk_context = RiskContext(
                             market_observed_at=market_state.observed_at,
                             research_observed_at=dossier.freshness.refreshed_at,
@@ -975,6 +985,8 @@ class WorkflowSupervisor:
                             pending_order_count_fp=pending_order_count_fp,
                             portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                             open_ticker_count=open_ticker_count,
+                            strategy_code=StrategyCode.DIRECTIONAL.value,
+                            strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
                         )
                         daily_pnl_llm = await repo.get_daily_pnl_dollars(kalshi_env=room.kalshi_env)
                         _daily_loss_ratio_llm = 0.0
