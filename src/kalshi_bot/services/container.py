@@ -31,6 +31,7 @@ from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.signal import WeatherSignalEngine
+from kalshi_bot.services.signal_calibration import SignalCalibrationService
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.stop_loss import StopLossService
@@ -63,6 +64,7 @@ class AppContainer:
     weather_directory: WeatherMarketDirectory
     agent_pack_service: AgentPackService
     signal_engine: WeatherSignalEngine
+    signal_calibration_service: SignalCalibrationService
     risk_engine: DeterministicRiskEngine
     execution_service: ExecutionService
     memory_service: MemoryService
@@ -113,6 +115,7 @@ class AppContainer:
             logger.warning("Market map validation: %s", warning)
         agent_pack_service = AgentPackService(settings)
         signal_engine = WeatherSignalEngine(settings)
+        signal_calibration_service = SignalCalibrationService(session_factory)
         risk_engine = DeterministicRiskEngine(settings)
         execution_service = ExecutionService(settings, kalshi)
         memory_service = MemoryService()
@@ -281,6 +284,7 @@ class AppContainer:
             weather_directory=weather_directory,
             agent_pack_service=agent_pack_service,
             signal_engine=signal_engine,
+            signal_calibration_service=signal_calibration_service,
             risk_engine=risk_engine,
             execution_service=execution_service,
             memory_service=memory_service,
