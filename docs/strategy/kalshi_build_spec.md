@@ -817,8 +817,66 @@ Every addition follows the existing deploy pattern:
 2. Merged to `main` behind feature flag
 3. Enabled in shadow mode in `.env` on deployed host
 4. Observed for required shadow period (30 days minimum for Strategy C; 7 days minimum for sigma calibration; 30 days for monotonicity arb)
-5. Operator-reviewed; flag flipped to live with small caps
+5. Operator-reviewed; flag flipped to live **only after DB activation record created** (§5.8) with small caps
 6. Caps raised gradually if metrics hold
+
+### 5.7 Strategy A × C partition invariant
+
+At most one strategy may hold an open position per `(ticker, event_date)` at any time. See §4.1.2 for the four-state decomposition table, two-sided gate requirement, and lock-reversal exit semantics. This invariant is enforced at three independent layers:
+
+1. **Market selection** — both strategy engines' supervisor routing is two-sided: Strategy A skips tickers where `resolution_state == LOCKED_YES | LOCKED_NO` and Strategy C is enabled; Strategy C skips tickers where Strategy A holds an open position.
+2. **Pre-execution re-check** — the execution pre-flight re-verifies the invariant immediately before order submission. This covers the TOCTOU window between signal generation and order placement (the two are async with a non-trivial gap).
+3. **SEV-2 alert** — any attempt to violate the invariant (including one that was correctly blocked) emits a non-suppressible SEV-2 alert to the watchdog ops-event stream. Each alert requires investigation — do not rate-limit.
+
+Add an integration test explicitly for the race condition: Strategy A fill completing while a Strategy C signal is in-flight. The re-check must block the Strategy C order and emit the alert.
+
+### 5.8 DB activation gate
+
+Strategy C and monotonicity arb require a DB-persisted activation record before the system will permit live execution. A config flag alone (`strategy_c_shadow_only=false`) is insufficient — the activation record proves the operator completed the full shadow review and approval process, and it is verifiable at startup independently of the config file.
+
+**`strategy_activations` table** (add to the same migration as the relevant strategy's other tables):
+
+```sql
+CREATE TABLE strategy_activations (
+    activation_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_mode        TEXT NOT NULL,       -- 'RESOLUTION_CLEANUP' | 'MONOTONICITY_ARB'
+    shadow_window_id     UUID NOT NULL,       -- references the shadow window being graduated
+    shadow_days_elapsed  INT NOT NULL,
+    qualifying_events    INT NOT NULL,        -- events meeting shadow adequacy gate
+    operator_note        TEXT,
+    activated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    activated_by         TEXT
+);
+```
+
+**CLI commands:**
+```bash
+kalshi-bot-cli strategy-c approve --shadow-window-id <uuid>
+kalshi-bot-cli monotonicity-arb approve --shadow-window-id <uuid>
+```
+
+**Startup check.** During daemon startup, for any strategy whose shadow flag is false, verify a `strategy_activations` row exists for that `strategy_mode` with `shadow_days_elapsed >= 30` and `qualifying_events >= 50`. If absent, log an error, revert to shadow mode, and emit an ops warning. This prevents a misconfigured `.env` from silently enabling live trading.
+
+### 5.9 SigmaResolver and ResolvedSigma
+
+The three-layer σ resolution chain is encapsulated in `src/kalshi_bot/services/sigma_resolver.py`. `SigmaResolver` is registered in `AppContainer` and injected into `WeatherSignalEngine` — `scoring.py` receives a pre-resolved `ResolvedSigma` dataclass, not raw DB queries.
+
+**Cache semantics.** `SigmaResolver` maintains an in-process TTL cache (1 hour) with a per-key `asyncio.Lock` to prevent concurrent cache misses from triggering multiple simultaneous DB reads for the same `(station, season)` stratum. This is critical because the service runs under multiple concurrent async supervisors, not a single discrete daemon loop — "per-daemon-cycle caching" does not apply.
+
+**`ResolvedSigma` dataclass** (in `src/kalshi_bot/core/schemas.py`):
+
+```python
+@dataclass
+class ResolvedSigma:
+    sigma_active: float
+    sigma_source: Literal["db_fit", "yaml_anchor", "global"]
+    sigma_db_fitted: float | None
+    sigma_db_sample_count: int | None
+    sigma_yaml_anchor: float | None
+    sigma_global: float
+```
+
+All six fields are written to the signal record for every room, satisfying the §4.2.6 observability requirement. Tests in `test_sigma_resolver.py` must cover: cache TTL expiry, concurrent-caller lock (one DB read per key, not N), and correct layer selection across all eight combinations of (DB-fit present/absent, YAML present/absent, CRPS gate passing/failing).
 
 ---
 
