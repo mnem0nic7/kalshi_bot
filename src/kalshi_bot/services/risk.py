@@ -12,6 +12,7 @@ from kalshi_bot.core.schemas import PortfolioBucketSnapshot, RiskVerdictPayload,
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.agent_packs import RuntimeThresholds
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
+from kalshi_bot.services.strategy_cleanup import CleanupSignal
 
 
 @dataclass(slots=True)
@@ -245,3 +246,59 @@ class DeterministicRiskEngine:
             ),
             resized_by_bucket=resized_by_bucket if status == RiskStatus.APPROVED else False,
         )
+
+
+def evaluate_cleanup_risk(
+    signal: CleanupSignal,
+    *,
+    control: DeploymentControl,
+    settings: Settings,
+    current_position_notional_dollars: Decimal = Decimal("0"),
+    current_position_side: str | None = None,
+) -> RiskVerdictPayload:
+    """Deterministic risk gate for Strategy C cleanup signals.
+
+    Skips all Strategy A gates (confidence, extremity, research staleness, etc.).
+    Applies only: kill switch, Strategy C enabled flag, per-trade notional cap,
+    per-position notional cap, and opposite-side guard.
+    """
+    blocking_reasons: list[str] = []
+    reasons: list[str] = []
+
+    def block(reason: str) -> None:
+        reasons.append(reason)
+        blocking_reasons.append(reason)
+
+    if control.kill_switch_enabled:
+        block("Global kill switch is enabled.")
+
+    if not settings.strategy_c_enabled:
+        block("Strategy C is not enabled (strategy_c_enabled=False).")
+
+    order_notional = as_decimal(signal.target_price_cents / 100)
+    max_order = Decimal(str(settings.strategy_c_max_order_notional_dollars))
+    if order_notional > max_order:
+        block(
+            f"Target price {signal.target_price_cents:.2f}¢ implies notional {float(order_notional):.2f} "
+            f"exceeds Strategy C order cap {settings.strategy_c_max_order_notional_dollars:.2f}."
+        )
+
+    max_position = Decimal(str(settings.strategy_c_max_position_notional_dollars))
+    projected_position = current_position_notional_dollars + order_notional
+    if projected_position > max_position:
+        block(
+            f"Projected position notional {float(projected_position):.2f} exceeds "
+            f"Strategy C position cap {settings.strategy_c_max_position_notional_dollars:.2f}."
+        )
+
+    if current_position_side is not None and current_position_side != signal.side.value:
+        block(
+            f"Existing {current_position_side} position conflicts with new "
+            f"{signal.side.value} cleanup signal; no opposite-side add-ons."
+        )
+
+    status = RiskStatus.APPROVED if not blocking_reasons else RiskStatus.BLOCKED
+    return RiskVerdictPayload(
+        status=status,
+        reasons=reasons or ["Strategy C risk checks passed."],
+    )

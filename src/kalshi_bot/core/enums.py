@@ -62,6 +62,7 @@ class StrategyMode(StrEnum):
     DIRECTIONAL_UNRESOLVED = "directional_unresolved"
     LATE_DAY_AVOID = "late_day_avoid"
     RESOLVED_CLEANUP_CANDIDATE = "resolved_cleanup_candidate"
+    RESOLUTION_CLEANUP = "resolution_cleanup"
 
 
 class StandDownReason(StrEnum):
@@ -78,6 +79,11 @@ class StandDownReason(StrEnum):
     MOMENTUM_AGAINST_TRADE = "momentum_against_trade"
     VOLUME_TOO_LOW = "volume_too_low"
     LONGSHOT_BET = "longshot_bet"
+    # Strategy C lock-confirmation gate failures
+    STRATEGY_C_LOCK_UNCONFIRMED = "strategy_c_lock_unconfirmed"
+    STRATEGY_C_FORECAST_RESIDUAL_EXCEEDED = "strategy_c_forecast_residual_exceeded"
+    STRATEGY_C_BOOK_STALE = "strategy_c_book_stale"
+    STRATEGY_C_CLI_VARIANCE = "strategy_c_cli_variance"
 
 
 class RiskStatus(StrEnum):

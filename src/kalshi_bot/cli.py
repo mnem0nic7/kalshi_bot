@@ -513,6 +513,35 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps({"room_id": result.room_id, "market_ticker": result.market_ticker, "stage": result.stage}, indent=2))
             return 0
 
+        if args.command == "shadow-c-sweep":
+            signals = await container.strategy_cleanup_service.sweep()
+            print(
+                json.dumps(
+                    [
+                        {
+                            "ticker": s.ticker,
+                            "station": s.station,
+                            "resolution_state": s.resolution_state.value,
+                            "observed_max_f": s.observed_max_f,
+                            "threshold_f": s.threshold_f,
+                            "edge_cents": s.edge_cents,
+                            "target_price_cents": s.target_price_cents,
+                            "side": s.side.value,
+                            "shadow": s.shadow,
+                            "suppression_reason": s.suppression_reason,
+                        }
+                        for s in signals
+                    ],
+                    indent=2,
+                )
+            )
+            return 0
+
+        if args.command == "strategy-c-status":
+            status = await container.strategy_cleanup_service.get_status()
+            print(json.dumps(status, indent=2, default=str))
+            return 0
+
         if args.command == "shadow-sweep":
             results = await container.shadow_training_service.run_shadow_sweep(
                 markets=args.markets,
@@ -979,6 +1008,9 @@ def build_parser() -> argparse.ArgumentParser:
     shadow_run.add_argument("--name", default=None)
     shadow_run.add_argument("--prompt", default=None)
     shadow_run.add_argument("--reason", default="cli_shadow_run")
+
+    subparsers.add_parser("shadow-c-sweep", help="Strategy C: evaluate lock-confirmation signals across all configured markets")
+    subparsers.add_parser("strategy-c-status", help="Strategy C: show aggregate sweep metrics and lock tracker state")
 
     shadow_sweep = subparsers.add_parser("shadow-sweep")
     shadow_sweep.add_argument("--markets", nargs="*", default=None)
