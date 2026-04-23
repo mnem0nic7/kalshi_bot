@@ -834,3 +834,37 @@ class CliStationVariance(Base):
     p95_abs_delta_degf: Mapped[float] = mapped_column(Float, nullable=False)
     last_refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class MonotonicityArbProposal(Base):
+    """Per-proposal record for the Monotonicity Arb Scanner (Addition 3, §4.3).
+
+    Each row represents a detected monotonicity violation: a pair of thresholds
+    for the same station/date where bid_yes(T_j) > ask_yes(T_i).
+
+    execution_outcome: 'shadow', 'risk_blocked', 'suppressed', or 'live'.
+    """
+    __tablename__ = "monotonicity_arb_proposals"
+
+    proposal_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(__import__("uuid").uuid4()))
+    station: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    event_date: Mapped[date] = mapped_column(Date(), nullable=False, index=True)
+    ticker_low: Mapped[str] = mapped_column(String(128), nullable=False)
+    ticker_high: Mapped[str] = mapped_column(String(128), nullable=False)
+    threshold_low_f: Mapped[float] = mapped_column(Float, nullable=False)
+    threshold_high_f: Mapped[float] = mapped_column(Float, nullable=False)
+    ask_yes_low_cents: Mapped[float] = mapped_column(Float, nullable=False)
+    ask_no_high_cents: Mapped[float] = mapped_column(Float, nullable=False)
+    total_cost_cents: Mapped[float] = mapped_column(Float, nullable=False)
+    gross_edge_cents: Mapped[float] = mapped_column(Float, nullable=False)
+    fee_estimate_cents: Mapped[float] = mapped_column(Float, nullable=False)
+    net_edge_cents: Mapped[float] = mapped_column(Float, nullable=False)
+    contracts_proposed: Mapped[int] = mapped_column(Integer, nullable=False)
+    execution_outcome: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    suppression_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )

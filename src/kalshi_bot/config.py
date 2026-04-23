@@ -162,6 +162,14 @@ class Settings(BaseSettings):
     strategy_c_enabled: bool = False
     strategy_c_shadow_only: bool = True
 
+    # Addition 3: Monotonicity Arb Scanner (§4.3)
+    monotonicity_arb_enabled: bool = False
+    monotonicity_arb_shadow_only: bool = True
+    monotonicity_arb_min_net_edge_cents: int = 2
+    monotonicity_arb_max_notional_dollars: float = 25.0
+    monotonicity_arb_max_proposals_per_minute: int = 5
+    monotonicity_arb_cadence_seconds: int = 60
+
     memory_embedding_dimensions: int = 16
     sse_poll_interval_seconds: float = 1.0
     research_stale_seconds: int = 900

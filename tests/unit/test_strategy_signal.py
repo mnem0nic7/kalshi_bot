@@ -371,7 +371,7 @@ def test_annotate_signal_quality_warns_on_near_threshold_low_confidence_and_over
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
     signal = StrategySignal(
         fair_yes_dollars=Decimal("0.6200"),
-        confidence=0.65,
+        confidence=0.55,
         edge_bps=90,
         recommended_action=TradeAction.BUY,
         recommended_side=ContractSide.YES,

@@ -542,6 +542,40 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(status, indent=2, default=str))
             return 0
 
+        if args.command == "monotonicity-scan":
+            proposals = await container.monotonicity_arb_service.sweep()
+            print(
+                json.dumps(
+                    [
+                        {
+                            "station": p.station,
+                            "event_date": str(p.event_date),
+                            "ticker_low": p.ticker_low,
+                            "ticker_high": p.ticker_high,
+                            "threshold_low_f": p.threshold_low_f,
+                            "threshold_high_f": p.threshold_high_f,
+                            "ask_yes_low_cents": p.ask_yes_low_cents,
+                            "ask_no_high_cents": p.ask_no_high_cents,
+                            "total_cost_cents": p.total_cost_cents,
+                            "gross_edge_cents": p.gross_edge_cents,
+                            "fee_estimate_cents": p.fee_estimate_cents,
+                            "net_edge_cents": p.net_edge_cents,
+                            "contracts_proposed": p.contracts_proposed,
+                            "execution_outcome": p.execution_outcome,
+                            "suppression_reason": p.suppression_reason,
+                        }
+                        for p in proposals
+                    ],
+                    indent=2,
+                )
+            )
+            return 0
+
+        if args.command == "monotonicity-status":
+            status = await container.monotonicity_arb_service.get_status()
+            print(json.dumps(status, indent=2, default=str))
+            return 0
+
         if args.command == "shadow-sweep":
             results = await container.shadow_training_service.run_shadow_sweep(
                 markets=args.markets,
@@ -1011,6 +1045,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("shadow-c-sweep", help="Strategy C: evaluate lock-confirmation signals across all configured markets")
     subparsers.add_parser("strategy-c-status", help="Strategy C: show aggregate sweep metrics and lock tracker state")
+    subparsers.add_parser("monotonicity-scan", help="Addition 3: run one monotonicity arb scan tick across all open KXHIGH* markets")
+    subparsers.add_parser("monotonicity-status", help="Addition 3: show aggregate monotonicity arb proposal metrics")
 
     shadow_sweep = subparsers.add_parser("shadow-sweep")
     shadow_sweep.add_argument("--markets", nargs="*", default=None)

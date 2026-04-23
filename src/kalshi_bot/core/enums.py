@@ -63,6 +63,7 @@ class StrategyMode(StrEnum):
     LATE_DAY_AVOID = "late_day_avoid"
     RESOLVED_CLEANUP_CANDIDATE = "resolved_cleanup_candidate"
     RESOLUTION_CLEANUP = "resolution_cleanup"
+    MONOTONICITY_ARB = "monotonicity_arb"
 
 
 class StandDownReason(StrEnum):

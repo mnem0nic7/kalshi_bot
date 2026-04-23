@@ -44,6 +44,7 @@ from kalshi_bot.services.market_history import MarketHistoryService
 from kalshi_bot.services.watchdog import WatchdogService
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.strategy_cleanup_service import StrategyCleanupService
+from kalshi_bot.services.monotonicity_scanner_service import MonotonicityArbScannerService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -81,6 +82,7 @@ class AppContainer:
     shadow_campaign_service: ShadowCampaignService
     self_improve_service: SelfImproveService
     strategy_cleanup_service: StrategyCleanupService
+    monotonicity_arb_service: MonotonicityArbScannerService
     strategy_codex_service: StrategyCodexService
     strategy_dashboard_service: StrategyDashboardService
     market_history_service: MarketHistoryService
@@ -230,6 +232,11 @@ class AppContainer:
             weather,
             weather_directory,
         )
+        monotonicity_arb_service = MonotonicityArbScannerService(
+            settings,
+            session_factory,
+            kalshi,
+        )
         strategy_dashboard_service = StrategyDashboardService(
             session_factory=session_factory,
             weather_directory=weather_directory,
@@ -255,6 +262,7 @@ class AppContainer:
             strategy_eval_service=strategy_eval_service,
             strategy_regression_service=strategy_regression_service,
             strategy_cleanup_service=strategy_cleanup_service,
+            monotonicity_arb_service=monotonicity_arb_service,
             strategy_codex_service=strategy_codex_service,
             strategy_dashboard_service=strategy_dashboard_service,
             stop_loss_service=stop_loss_service,
@@ -292,6 +300,7 @@ class AppContainer:
             shadow_campaign_service=shadow_campaign_service,
             self_improve_service=self_improve_service,
             strategy_cleanup_service=strategy_cleanup_service,
+            monotonicity_arb_service=monotonicity_arb_service,
             strategy_codex_service=strategy_codex_service,
             strategy_dashboard_service=strategy_dashboard_service,
             market_history_service=market_history_service,
