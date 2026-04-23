@@ -145,6 +145,23 @@ class Settings(BaseSettings):
     strategy_c_near_threshold_margin_f: float = 2.0
     strategy_c_approach_margin_f: float = 5.0
 
+    # Strategy C lock-confirmation gates (§4.1.4)
+    strategy_c_required_consecutive_confirmations: int = 2
+    strategy_c_max_observation_age_minutes: int = 30
+    strategy_c_max_forecast_residual_f: float = 8.0
+    strategy_c_max_cli_variance_degf: float = 1.5
+    strategy_c_min_time_to_settlement_minutes: int = 60
+    strategy_c_locked_yes_discount_cents: int = 1
+    strategy_c_locked_no_discount_cents: int = 1
+    strategy_c_min_edge_cents: int = 2
+    strategy_c_max_book_age_seconds: int = 30
+    strategy_c_recent_adverse_window_minutes: int = 15
+    strategy_c_race_detection_enabled: bool = True
+    strategy_c_max_order_notional_dollars: float = 50.0
+    strategy_c_max_position_notional_dollars: float = 50.0
+    strategy_c_enabled: bool = False
+    strategy_c_shadow_only: bool = True
+
     memory_embedding_dimensions: int = 16
     sse_poll_interval_seconds: float = 1.0
     research_stale_seconds: int = 900
