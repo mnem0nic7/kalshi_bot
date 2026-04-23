@@ -561,3 +561,146 @@ def test_risk_engine_combines_filled_and_pending_for_cap() -> None:
         ),
     )
     assert verdict.status == RiskStatus.BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# Per-strategy daily-loss envelope (P1-1)
+# ---------------------------------------------------------------------------
+
+
+def _base_settings(**overrides):
+    return Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=300,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        **overrides,
+    )
+
+
+def _base_eval(engine, context):
+    return engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=context,
+    )
+
+
+def test_per_strategy_cap_blocks_when_realized_loss_meets_cap() -> None:
+    settings = _base_settings(risk_daily_loss_dollars_by_strategy={"A": 100.0})
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="A",
+        strategy_daily_realized_pnl_dollars=Decimal("-100.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("daily cap" in reason for reason in verdict.reasons)
+
+
+def test_per_strategy_cap_blocks_when_realized_loss_exceeds_cap() -> None:
+    settings = _base_settings(risk_daily_loss_dollars_by_strategy={"A": 50.0})
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="A",
+        strategy_daily_realized_pnl_dollars=Decimal("-125.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.BLOCKED
+
+
+def test_per_strategy_cap_allows_when_realized_loss_under_cap() -> None:
+    settings = _base_settings(risk_daily_loss_dollars_by_strategy={"A": 100.0})
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="A",
+        strategy_daily_realized_pnl_dollars=Decimal("-50.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.APPROVED
+
+
+def test_per_strategy_cap_allows_positive_pnl() -> None:
+    settings = _base_settings(risk_daily_loss_dollars_by_strategy={"A": 100.0})
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="A",
+        strategy_daily_realized_pnl_dollars=Decimal("42.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.APPROVED
+
+
+def test_per_strategy_cap_for_strategy_a_does_not_block_strategy_c() -> None:
+    """A cap configured for A must not impact a Strategy-C trade, even if C is
+    currently bleeding hard. Each strategy gets its own envelope."""
+    settings = _base_settings(risk_daily_loss_dollars_by_strategy={"A": 100.0})
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="C",
+        strategy_daily_realized_pnl_dollars=Decimal("-500.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.APPROVED
+
+
+def test_per_strategy_cap_no_op_when_no_cap_configured() -> None:
+    settings = _base_settings()  # no risk_daily_loss_dollars_by_strategy
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="A",
+        strategy_daily_realized_pnl_dollars=Decimal("-1000.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.APPROVED
+
+
+def test_per_strategy_cap_no_op_when_pnl_is_none() -> None:
+    """If the caller couldn't compute P&L (e.g. fresh DB with no fills yet),
+    the cap doesn't trigger — absence of data is not a blocker."""
+    settings = _base_settings(risk_daily_loss_dollars_by_strategy={"A": 1.0})
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="A",
+        strategy_daily_realized_pnl_dollars=None,
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.APPROVED
+
+
+def test_per_strategy_cap_no_op_when_strategy_code_is_none() -> None:
+    """Replay/training callers that don't tag a strategy_code must not be
+    blocked by the per-strategy cap."""
+    settings = _base_settings(risk_daily_loss_dollars_by_strategy={"A": 1.0})
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code=None,
+        strategy_daily_realized_pnl_dollars=Decimal("-1000.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.APPROVED

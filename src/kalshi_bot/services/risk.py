@@ -26,6 +26,11 @@ class RiskContext:
     pending_order_count_fp: Decimal = Decimal("0")
     portfolio_bucket_snapshot: PortfolioBucketSnapshot | None = None
     open_ticker_count: int = 0
+    strategy_code: str | None = None
+    # Realized P&L over the last 24h for this strategy. Negative = loss.
+    # Populated by the caller; risk engine gates on it against
+    # Settings.risk_daily_loss_dollars_by_strategy[strategy_code].
+    strategy_daily_realized_pnl_dollars: Decimal | None = None
 
 
 def _quantize_money(value: Any) -> Decimal:
@@ -187,6 +192,26 @@ class DeterministicRiskEngine:
             block("Ticket notional exceeds max order notional.")
         if active_thresholds.risk_max_position_notional_dollars is not None and float(context.current_position_notional_dollars + order_notional) > active_thresholds.risk_max_position_notional_dollars:
             block("Projected position exceeds max position notional.")
+
+        # Per-strategy daily-loss envelope: hard stop distinct from the global
+        # portfolio-wide daily-loss check in the supervisor. Each strategy can
+        # have its own dollar cap so one bad strategy can't starve another of
+        # capital.
+        if (
+            context.strategy_code is not None
+            and context.strategy_daily_realized_pnl_dollars is not None
+        ):
+            cap_dollars = self.settings.risk_daily_loss_dollars_by_strategy.get(
+                context.strategy_code
+            )
+            if cap_dollars is not None and cap_dollars > 0:
+                realized_loss_dollars = -float(context.strategy_daily_realized_pnl_dollars)
+                if realized_loss_dollars >= cap_dollars:
+                    block(
+                        f"Strategy {context.strategy_code} realized loss "
+                        f"${realized_loss_dollars:.2f} has reached the "
+                        f"${cap_dollars:.2f} daily cap."
+                    )
 
         snapshot = context.portfolio_bucket_snapshot
         if snapshot is not None:

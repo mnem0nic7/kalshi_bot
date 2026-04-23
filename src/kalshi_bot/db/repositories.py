@@ -1331,6 +1331,87 @@ class PlatformRepository:
 
         return {"won_contracts": won, "total_contracts": total}
 
+    async def get_daily_realized_pnl_dollars_by_strategy(
+        self,
+        *,
+        strategy_code: str,
+        kalshi_env: str | None = None,
+        now: datetime | None = None,
+    ) -> Decimal:
+        """Conservative realized daily P&L for one strategy in the last 24 hours.
+
+        Powers the per-strategy hard-loss cap. Intentionally narrow: counts only
+        BUY fills whose settlement is already known, matched-pair BUY→SELL
+        (stop-loss exits) on the same rolling window, and standalone SELL fills
+        (treated as pure proceeds — the offsetting BUY is assumed to be older
+        than the 24-hour window and therefore already accounted for).
+
+        Open unsettled BUYs contribute zero so the cap cannot be tripped by
+        unrealized marks. A negative return means losses; compare magnitude
+        against the configured cap.
+        """
+        cutoff = (now or datetime.now(UTC)) - timedelta(hours=24)
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = select(FillRecord).where(
+            FillRecord.kalshi_env == env,
+            FillRecord.strategy_code == strategy_code,
+            FillRecord.created_at >= cutoff,
+        )
+        fills = list((await self.session.execute(stmt)).scalars())
+        pnl = Decimal("0")
+
+        # Index sells per (ticker, side) so matched-pair exits can net against
+        # a buy from the same window.
+        sells_by_key: dict[tuple[str, str], list[FillRecord]] = {}
+        matched_sell_ids: set[str] = set()
+        for fill in fills:
+            if fill.action == "sell":
+                sells_by_key.setdefault((fill.market_ticker, fill.side), []).append(fill)
+
+        for buy in fills:
+            if buy.action != "buy":
+                continue
+            cost_per_contract = (
+                buy.yes_price_dollars
+                if buy.side == "yes"
+                else Decimal("1") - buy.yes_price_dollars
+            )
+            cost_total = cost_per_contract * buy.count_fp
+
+            key = (buy.market_ticker, buy.side)
+            matched_sells = [s for s in sells_by_key.get(key, []) if s.id not in matched_sell_ids]
+            if matched_sells:
+                # Match the earliest unused sell. Partial matching is rare in practice
+                # and would only skew the figure by a fraction of a cent.
+                sell = matched_sells[0]
+                matched_sell_ids.add(sell.id)
+                sell_per_contract = (
+                    sell.yes_price_dollars
+                    if sell.side == "yes"
+                    else Decimal("1") - sell.yes_price_dollars
+                )
+                pnl += sell_per_contract * sell.count_fp - cost_total
+            elif buy.settlement_result == "win":
+                pnl += buy.count_fp - cost_total
+            elif buy.settlement_result == "loss":
+                pnl -= cost_total
+            # else: unsettled + unmatched buy → unrealized, contributes nothing
+
+        # Standalone sells whose corresponding buy fell out of the 24h window
+        # still produced proceeds today. Treat those as pure positive cashflow.
+        for sells in sells_by_key.values():
+            for sell in sells:
+                if sell.id in matched_sell_ids:
+                    continue
+                sell_per_contract = (
+                    sell.yes_price_dollars
+                    if sell.side == "yes"
+                    else Decimal("1") - sell.yes_price_dollars
+                )
+                pnl += sell_per_contract * sell.count_fp
+
+        return pnl.quantize(Decimal("0.01"))
+
     async def get_broken_book_rate_30d(self, *, kalshi_env: str | None = None) -> dict[str, Any]:
         cutoff = datetime.now(UTC) - timedelta(days=30)
         env = self._resolved_kalshi_env(kalshi_env)

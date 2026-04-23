@@ -113,6 +113,9 @@ class Settings(BaseSettings):
     risk_max_order_notional_dollars: float | None = None
     risk_max_position_notional_dollars: float | None = None
     risk_daily_loss_limit_dollars: float | None = None
+    # Per-strategy dollar-denominated hard-loss cap. Empty = no per-strategy cap.
+    # Example env var value: '{"A": 500, "C": 100}' (JSON-parsed by pydantic-settings).
+    risk_daily_loss_dollars_by_strategy: dict[str, float] = Field(default_factory=dict)
     stop_loss_threshold_pct: float = 0.10
     stop_loss_profit_protection_threshold_pct: float = 0.15
     stop_loss_reentry_cooldown_seconds: int = 14400
