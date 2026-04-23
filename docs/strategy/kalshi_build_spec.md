@@ -505,12 +505,14 @@ At query time: `σ_effective = σ_base(station, season) × lead_factor(lead_buck
 **Plumbing prerequisite.** This requires `WeatherSignalEngine` to know its lead time at σ lookup. Verify in Session 1 whether `signal.py` currently tracks `(room_decision_time, target_settlement_date)` in a structured way. If it does, lead is derivable with no new schema. If not, note it as a small upstream change required before DB-fit wiring.
 
 **Resolution logic:**
-1. If a DB-fit row exists for `(station, season)` with `sample_count ≥ sigma_min_samples_beats_yaml` (200) AND `crps_improvement_vs_global > sigma_min_crps_improvement` (0.0): use `σ_base × lead_factor`, with bias correction applied.
-2. Else if DB-fit row exists with `sample_count ≥ sigma_min_samples_beats_global` (100) AND `crps_improvement_vs_global > 0` but YAML anchor is absent: use `σ_base × lead_factor`.
+1. If a DB-fit row exists for `(station, season)` with `sample_count ≥ sigma_min_samples_beats_yaml` (200) AND `crps_improvement_vs_global ≥ sigma_min_crps_improvement` (0.05): use `σ_base × lead_factor`, with bias correction applied.
+2. Else if DB-fit row exists with `sample_count ≥ sigma_min_samples_beats_global` (100) AND `crps_improvement_vs_global ≥ 0.05` but YAML anchor is absent: use `σ_base × lead_factor`.
 3. Else if a YAML cell exists for `(station, month)`: use it (× lead_factor if `sigma_lead_correction_enabled`).
 4. Else use global `_MONTHLY_SIGMA_F[month]` (× lead_factor if `sigma_lead_correction_enabled`).
 
-The `crps_improvement_vs_global > 0` gate is the second quality check: if the DB-fit doesn't beat the global fallback on held-out residuals, using it is worse than ignoring it regardless of sample count. This catches the "150 samples but outlier-heavy season" case.
+The `crps_improvement_vs_global ≥ 0.05` gate means the DB-fit must reduce CRPS by at least 5% vs the global fallback (`fit_crps / global_crps ≤ 0.95`). A DB-fit that barely improves — or shows CRPS regression — falls back to YAML/global even when `is_active=True`. This prevents a numerically-fit row from displacing a well-understood prior when evidence is marginal. The 5% threshold is not tunable via config; it encodes the minimum practical improvement worth the added complexity of a DB-derived σ.
+
+**CRPS regression protection.** If a subsequent refit produces a row where `crps_improvement_vs_global < 0` (regression vs prior version), mark the new row `is_active=FALSE` and retain the prior active row. Log an ops warning with the CRPS delta. Do not silently regress the model.
 
 **Why two sample thresholds?** Sample SE on σ scales as `σ/√(2n)`. At n=100 and σ=4°F, SE ≈ 0.28°F. Global fallback is a rough average across stations — beating it is easier, so n=100 suffices. YAML overrides encode explicit operator knowledge (e.g., SFO marine layer) calibrated to ≈ 0.3°F precision — DB-fit needs n≥200 (SE ≈ 0.2°F) to compete.
 
@@ -531,21 +533,24 @@ Implement the three-layer lookup. The current codebase already has Layer 2 (ship
 #### 4.2.3 Files to touch
 
 **New files:**
-- `src/kalshi_bot/weather/sigma_calibration.py` — fitting logic, `resolve_sigma()` function
+- `src/kalshi_bot/weather/sigma_calibration.py` — fitting logic (two-stage σ_base + lead_factor, chronological holdout, rolling-origin CV for n≥200)
+- `src/kalshi_bot/services/sigma_resolver.py` — `SigmaResolver` service: encapsulates three-layer lookup, in-process 1h TTL cache with per-key `asyncio.Lock`, returns `ResolvedSigma`
 - `alembic/versions/YYYYMMDD_NNNN_station_sigma.py` — `station_sigma_params` and `global_lead_factor` tables
 - `tests/unit/test_sigma_calibration.py`
+- `tests/unit/test_sigma_resolver.py` — cache TTL test, concurrent-caller lock test, fallback-layer selection tests
 - `scripts/refit_station_sigma.py` — manual refit trigger
 - `docs/strategy/sigma_calibration.md` — design doc
 
 **Modified files:**
-- `src/kalshi_bot/weather/scoring.py` — `sigma_f_for_mapping()` extended to accept `lead_hours` and consult DB-fit layer; falls back to existing YAML/global chain; applies lead_factor when `sigma_lead_correction_enabled`
+- `src/kalshi_bot/weather/scoring.py` — `sigma_f_for_mapping()` refactored to accept a pre-resolved `ResolvedSigma` dataclass (injected by `SigmaResolver`); no longer calls DB directly
+- `src/kalshi_bot/core/schemas.py` — add `ResolvedSigma` dataclass (six fields per §4.2.6)
 - `src/kalshi_bot/services/signal.py` — pass station identifier and forecast lead hours into scoring; verify whether `(room_decision_time, target_settlement_date)` is already tracked before adding new fields (Session 1 audit)
 - `src/kalshi_bot/config.py`:
   - `sigma_calibration_enabled: bool = True`
   - `sigma_calibration_refit_cadence_days: int = 7`
   - `sigma_min_samples_beats_global: int = 100` — threshold for DB-fit to supersede global fallback
   - `sigma_min_samples_beats_yaml: int = 200` — threshold for DB-fit to supersede YAML anchor
-  - `sigma_min_crps_improvement: float = 0.0` — DB-fit must beat global on held-out CRPS
+  - `sigma_min_crps_improvement: float = 0.05` — DB-fit must reduce CRPS by ≥5% vs global (fit_crps/global_crps ≤ 0.95)
   - `sigma_lead_correction_enabled: bool = True` — kill switch; set False if lead_factor ≈ 1.0 at measurement
 - `src/kalshi_bot/services/daemon.py` — register weekly refit task
 - `docs/examples/weather_markets.example.yaml` — audit YAML overrides for sparsity (see §4.2.7)
@@ -559,8 +564,8 @@ Implement the three-layer lookup. The current codebase already has Layer 2 (ship
 3. Fit `sigma_base_f` = std(r_i), `mean_bias_f` = mean(r_i).
 4. Compute `sigma_se_f` = std(r_i) / √(2n) — standard error on σ estimate.
 5. Compute `residual_skewness` — flag non-Gaussianity for dashboard display.
-6. Compute `crps_improvement_vs_global` — evaluate both this fit and the global fallback on a held-out 20% of the matched pairs; record CRPS difference.
-7. Persist to `station_sigma_params` with version timestamp. Write the row regardless of sample count — the resolver gates on sample count and CRPS at lookup time.
+6. Compute `crps_improvement_vs_global` — evaluate both this fit and the global fallback on a **chronological holdout** (last 20% of pairs ordered by date, not a random split). Random splits leak future data into the training set via temporal autocorrelation; chronological holdout reflects true out-of-sample performance. For strata with `sample_count ≥ 200`, use **rolling-origin cross-validation** (expanding window, 5 folds) instead of a single split and report the mean CRPS improvement across folds.
+7. Persist to `station_sigma_params` with version timestamp. Write the row regardless of sample count — the resolver gates on sample count and CRPS improvement (≥5%) at lookup time.
 
 **Stage 2: global lead_factor.** Run once across the entire corpus (all stations, all seasons):
 
