@@ -605,6 +605,12 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "list-strategy-promotions":
+            if args.limit < 1 or args.limit > 500:
+                print(
+                    json.dumps({"error": "limit must be in [1, 500]"}),
+                    file=sys.stderr,
+                )
+                return 2
             async with container.session_factory() as session:
                 repo = PlatformRepository(session)
                 events = await repo.list_strategy_promotions(

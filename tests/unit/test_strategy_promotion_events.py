@@ -154,3 +154,107 @@ async def test_list_strategy_promotions_respects_limit(repo_factory) -> None:
 
         events = await repo.list_strategy_promotions(kalshi_env="demo", limit=2)
         assert len(events) == 2
+
+
+# ---------------------------------------------------------------------------
+# Hardening (review feedback on PR #14)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_rejects_no_op_after_strip(repo_factory) -> None:
+    """Whitespace-padded equality must not bypass the no-op guard."""
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        with pytest.raises(ValueError, match="differ"):
+            await repo.record_strategy_promotion(
+                strategy="A",
+                from_state="shadow ",
+                to_state="shadow",
+                actor="ops",
+            )
+
+
+@pytest.mark.asyncio
+async def test_record_rejects_empty_from_state(repo_factory) -> None:
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        with pytest.raises(ValueError, match="from_state"):
+            await repo.record_strategy_promotion(
+                strategy="A",
+                from_state="   ",
+                to_state="live",
+                actor="ops",
+            )
+
+
+@pytest.mark.asyncio
+async def test_record_rejects_empty_to_state(repo_factory) -> None:
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        with pytest.raises(ValueError, match="to_state"):
+            await repo.record_strategy_promotion(
+                strategy="A",
+                from_state="shadow",
+                to_state="",
+                actor="ops",
+            )
+
+
+@pytest.mark.asyncio
+async def test_record_resolves_default_kalshi_env_when_omitted(repo_factory) -> None:
+    """A row with no caller-supplied env still gets the repo's resolved env so
+    it remains visible to the env-filtered API endpoint."""
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        event = await repo.record_strategy_promotion(
+            strategy="A",
+            from_state="shadow",
+            to_state="live",
+            actor="ops",
+            # kalshi_env intentionally omitted
+        )
+        assert event.kalshi_env == "demo"
+
+
+@pytest.mark.asyncio
+async def test_list_strategy_promotions_strips_strategy_filter(repo_factory) -> None:
+    """A whitespace-padded filter must still match rows persisted with the
+    stripped form (record_* always strips)."""
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        await repo.record_strategy_promotion(
+            strategy="A", from_state="shadow", to_state="live", actor="ops",
+            kalshi_env="demo",
+        )
+        await session.commit()
+
+        events = await repo.list_strategy_promotions(strategy=" A ", kalshi_env="demo")
+        assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_strategy_promotions_clamps_non_positive_and_huge_limits(repo_factory) -> None:
+    """Defensive: backend doesn't choke on .limit(0) / .limit(-5) / .limit(10**9)."""
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        for i in range(3):
+            await repo.record_strategy_promotion(
+                strategy="A", from_state="shadow", to_state="live",
+                actor=f"ops-{i}", kalshi_env="demo",
+            )
+        await session.commit()
+
+        zero = await repo.list_strategy_promotions(kalshi_env="demo", limit=0)
+        assert len(zero) == 1  # clamped to 1
+        negative = await repo.list_strategy_promotions(kalshi_env="demo", limit=-100)
+        assert len(negative) == 1
+        huge = await repo.list_strategy_promotions(kalshi_env="demo", limit=10_000_000)
+        # All 3 rows returned (clamped to 500, but only 3 exist).
+        assert len(huge) == 3

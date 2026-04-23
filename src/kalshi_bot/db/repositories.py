@@ -3452,21 +3452,34 @@ class PlatformRepository:
         kalshi_env: str | None = None,
     ) -> StrategyPromotionEvent:
         """Append one row to the strategy promotion audit log (P2-3)."""
-        if not strategy or not strategy.strip():
+        normalized_strategy = (strategy or "").strip()
+        normalized_from = (from_state or "").strip()
+        normalized_to = (to_state or "").strip()
+        normalized_actor = (actor or "").strip()
+        if not normalized_strategy:
             raise ValueError("strategy must be non-empty")
-        if not actor or not actor.strip():
+        if not normalized_from:
+            raise ValueError("from_state must be non-empty")
+        if not normalized_to:
+            raise ValueError("to_state must be non-empty")
+        if not normalized_actor:
             raise ValueError("actor must be non-empty")
-        if from_state == to_state:
+        if normalized_from == normalized_to:
             raise ValueError("from_state and to_state must differ")
+        # Always resolve to the deployment's configured env. NULL audit rows
+        # are unfilterable by the dashboard / API and silently disappear; the
+        # CLI always passes an explicit env, but defending here keeps direct
+        # callers honest.
+        resolved_env = self._resolved_kalshi_env(kalshi_env)
         record = StrategyPromotionEvent(
             id=str(uuid4()),
-            strategy=strategy.strip(),
-            from_state=from_state.strip(),
-            to_state=to_state.strip(),
-            actor=actor.strip(),
+            strategy=normalized_strategy,
+            from_state=normalized_from,
+            to_state=normalized_to,
+            actor=normalized_actor,
             evidence_ref=evidence_ref,
             notes=notes,
-            kalshi_env=self._resolved_kalshi_env(kalshi_env) if kalshi_env is not None else None,
+            kalshi_env=resolved_env,
         )
         self.session.add(record)
         await self.session.flush()
@@ -3479,14 +3492,21 @@ class PlatformRepository:
         kalshi_env: str | None = None,
         limit: int = 50,
     ) -> list[StrategyPromotionEvent]:
+        # Clamp limit defensively. The HTTP endpoint enforces [1, 500] but
+        # CLI / direct repo callers shouldn't be able to trigger a backend
+        # error with a non-positive or absurdly large value.
+        clamped_limit = max(1, min(int(limit), 500))
         stmt = select(StrategyPromotionEvent)
         if strategy is not None:
-            stmt = stmt.where(StrategyPromotionEvent.strategy == strategy)
+            normalized = strategy.strip()
+            if normalized:
+                # Match on the same normalized form persisted by record_*.
+                stmt = stmt.where(StrategyPromotionEvent.strategy == normalized)
         if kalshi_env is not None:
             stmt = stmt.where(
                 StrategyPromotionEvent.kalshi_env == self._resolved_kalshi_env(kalshi_env)
             )
-        stmt = stmt.order_by(StrategyPromotionEvent.created_at.desc()).limit(limit)
+        stmt = stmt.order_by(StrategyPromotionEvent.created_at.desc()).limit(clamped_limit)
         return list((await self.session.execute(stmt)).scalars())
 
     async def clear_city_strategy_assignments(self, *, assigned_by: str | None = None) -> int:
