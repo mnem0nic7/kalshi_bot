@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import AgentRole, MessageKind, RiskStatus, RoomOrigin, RoomStage
+from kalshi_bot.core.enums import AgentRole, MessageKind, RiskStatus, RoomOrigin, RoomStage, StrategyCode
 from kalshi_bot.core.schemas import (
     HistoricalTrainingBuildRequest,
     RoomCreate,
@@ -3087,7 +3087,13 @@ class HistoricalTrainingService:
                 rationale_ids.append(trader_record.id)
 
                 if ticket is not None and client_order_id is not None:
-                    ticket_record = await repo.save_trade_ticket(room.id, ticket, client_order_id, message_id=trader_record.id)
+                    ticket_record = await repo.save_trade_ticket(
+                        room.id,
+                        ticket,
+                        client_order_id,
+                        message_id=trader_record.id,
+                        strategy_code=StrategyCode.DIRECTIONAL.value,
+                    )
                     historical_control = DeploymentControl(
                         id="historical",
                         active_color=self.settings.app_color,
