@@ -137,6 +137,14 @@ class Settings(BaseSettings):
     strategy_quality_edge_buffer_bps: int = 25
     sigma_lead_correction_enabled: bool = True
 
+    # Strategy C adaptive polling cadence (ThresholdProximityMonitor, §4.1.4)
+    strategy_c_cadence_idle_seconds: int = 3600
+    strategy_c_cadence_approach_seconds: int = 900
+    strategy_c_cadence_near_threshold_seconds: int = 150
+    strategy_c_cadence_post_peak_seconds: int = 900
+    strategy_c_near_threshold_margin_f: float = 2.0
+    strategy_c_approach_margin_f: float = 5.0
+
     memory_embedding_dimensions: int = 16
     sse_poll_interval_seconds: float = 1.0
     research_stale_seconds: int = 900
