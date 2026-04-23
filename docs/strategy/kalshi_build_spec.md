@@ -903,47 +903,73 @@ Hard-stop list for the coding assistant. Any of these requires operator override
 
 A reasonable breakdown into Claude Code sessions. Each session should end at a reviewable state (branch pushed, PR opened, tests passing, operator can review).
 
-Two prerequisites ship as their own PRs and must merge before the main Addition work begins. Do not bundle them.
+Prerequisite 0 ships as its own PR and must merge before Addition 2 work begins. Do not bundle it with Addition work.
 
-| Session | Scope | Est. duration |
+| Session | Scope | Blocking dependency | Est. duration |
+|---|---|---|---|
+| 1 | **Repo audit + verification memo.** No code. Produce a FOUND / NOT FOUND / AMBIGUOUS assessment for each item in the verification checklist below. Flag any deviations to operator before Session 2 begins. | None | 2–3 hours |
+| 2 | **Prerequisite 0 PR** — Fix silent pagination bug in `_list_historical_markets` (§4.2.0): pass `series_ticker` param, unit + integration tests, ADR `docs/adrs/001-historical-markets-series-filter.md`. Merge and deploy before Session 3. | Session 1 operator sign-off | 2–3 hours |
+| 3 | Addition 2 — σ calibration: schema migrations (`station_sigma_params`, `global_lead_factor`), `sigma_calibration.py` fitting logic (two-stage: σ_base + lead_factor, chronological holdout, rolling-origin CV for n≥200), `SigmaResolver` service + `ResolvedSigma` dataclass, `refit_station_sigma.py` script. | Session 2 merged | 4–5 hours |
+| 4 | Addition 2 — resolver integration: refactor `scoring.py` to accept pre-resolved `ResolvedSigma`; wire lead_factor; update `signal.py` for lead-hours pass-through; tests; backtest validation showing CRPS improvement; docs. | Session 3 | 3–4 hours |
+| 5 | **`ThresholdProximityMonitor` service** — stand-alone service with `threshold_proximity_state` DB table, write-through persistence, unit tests for tier transitions (idle/approach/near-threshold/post-peak). No Strategy C signal logic — only the adaptive polling machinery that Session 7 signal logic consumes. | Session 4 | 2–3 hours |
+| 6 | Addition 1 (Strategy C) — schema migrations (`cli_reconciliation`, `strategy_c_rooms` with `buffer_at_decision_f`, `cli_station_variance`); `strategy_activations` table; `cli_reconciliation.py` backfill from historical corpus. | Session 5 | 3–4 hours |
+| 7 | Addition 1 — `strategy_cleanup.py` signal engine: lock confirmation (Parts A/B/C), fair-value with flat discount, freshness + market-status gates, partition-invariant two-sided gate (§4.1.2), consumes `ThresholdProximityMonitor` via DB read. | Session 6 | 4–5 hours |
+| 8 | Addition 1 — risk path extensions, container wiring, CLI commands (`shadow-c-sweep`, `strategy-c-status`, `strategy-c approve`), supervisor routing, partition-invariant pre-execution re-check + SEV-2 alert. | Session 7 | 3–4 hours |
+| 9 | Addition 1 — integration tests: kill-switch coverage, stale-observation handling, divergence event simulation, partition-invariant race-condition test (A fill during C in-flight). Control room surfacing (five live metrics from §4.1.7). Counterfactual fill-rate harness. | Session 8 | 3–4 hours |
+| 10 | Addition 1 — **30-day shadow run** (elapsed, not active work; operator reviews weekly). Dual gate: 30 calendar days + ≥ 50 qualifying events. Extend in 15-day increments if event count not met. | Session 9 | 30 days |
+| 11 | Addition 3 — monotonicity scanner: `monotonicity_scanner.py` (5-second cadence, all-pairs with 100-pair circuit breaker, per-group suppression, `leg_break` execution taxonomy), unit + integration tests, property test, payoff-table unit test, backtest against `market_price_history`. | Session 10 merged | 4–5 hours |
+| 12 | Addition 3 — **30-day shadow run** (elapsed). Primary gates: detection correctness (zero property-test failures) + execution feasibility (zero `leg_break` events). P&L is not the primary gate. | Session 11 | 30 days |
+| 13 | **§5.X assumption reconciliation** — apply any spec corrections surfaced by Session 1 memo that were not incorporated at the time; update §8 open questions based on Session 1 findings; close any AMBIGUOUS items. | After Session 1 memo reviewed | 1–2 hours |
+| 14 | **Bankroll scale-up evaluation** — after ≥ 30 days of live data for at least one strategy, apply `--factor 1.5` step-up if all 7 criteria in §8 are met. Record decision in `risk_limit_changes` table with `gate_report_json`. | ≥30 live days | 2–3 hours |
+| 15 | **Consolidation** — docs, engineering plan update to v2.1, operator review of all three additions, sign-off commits. | Sessions 12 + 14 | 2–3 hours |
+
+Total active engineering: ~46–60 hours across sessions. Elapsed wall time: ~90 days minimum before all three additions are live-eligible.
+
+**Session 1 is non-optional.** The coding assistant produces a verification memo with a FOUND / NOT FOUND / AMBIGUOUS assessment for each item below. **No code is written until operator confirms the memo.** Any item assessed as NOT FOUND or AMBIGUOUS becomes a §5.X spec assumption correction (Session 13) and is flagged to operator before Session 2 begins.
+
+| # | Assertion to verify | Expected location |
 |---|---|---|
-| 1 | Read repo + reference docs; no code. Produce an assessment memo: confirm repo state matches spec, verify migration numbers and file paths, flag deviations to operator before coding begins. Audit `integrations/weather.py` for stale-observation guard (§4.1.3 step 1) and `signal.py` for lead-time tracking (§4.2.1 plumbing prerequisite). | 1 hour |
-| 2 | **Prerequisite 0 PR** — Fix silent pagination bug in `_list_historical_markets` (§4.2.0): pass `series_ticker` param, unit + integration tests, ADR `docs/adrs/001-historical-markets-series-filter.md`. Merge and deploy before Session 3. | 2–3 hours |
-| 3 | Addition 2 — σ calibration: schema migrations (`station_sigma_params`, `global_lead_factor`), `sigma_calibration.py` fitting logic (two-stage: σ_base + lead_factor), `refit_station_sigma.py` script. | 3–4 hours |
-| 4 | Addition 2 — resolver integration: extend `sigma_f_for_mapping()` to consult DB-fit with CRPS gate, wire lead_factor, update `signal.py` for lead-hours pass-through, tests, backtest validation, docs. | 3–4 hours |
-| 4.5 | **`ThresholdProximityMonitor` service** — stand-alone service with its own unit tests for tier transitions (idle/approach/near-threshold/post-peak). No Strategy C signal logic here — only the adaptive polling machinery that §4.1.3 step 1 consumes. Session 5 depends on this. | 2–3 hours |
-| 5 | Addition 1 (Strategy C) — schema migrations (`cli_reconciliation`, `strategy_c_rooms`, `cli_station_variance`); `cli_reconciliation.py` backfill from historical corpus. | 3–4 hours |
-| 6 | Addition 1 — `strategy_cleanup.py` signal engine: lock confirmation (Parts A/B/C), fair-value with flat discount, freshness + market-status gates, consumes `ThresholdProximityMonitor`. | 4–5 hours |
-| 7 | Addition 1 — risk path extensions, container wiring, CLI commands (`shadow-c-sweep`, `strategy-c-status`), supervisor routing. | 3–4 hours |
-| 8 | Addition 1 — integration tests (kill-switch coverage, stale-observation handling, divergence event simulation), control room surfacing (five live metrics from §4.1.6), counterfactual fill-rate harness. | 3–4 hours |
-| 9 | Addition 1 — 30-day shadow run (elapsed, not active work; operator reviews weekly) | 30 days |
-| 10 | Addition 3 — monotonicity scanner: `monotonicity_scanner.py`, unit + integration tests, property test asserting positive PnL across all outcome scenarios, payoff table unit test, backtest against `market_price_history`. | 4–5 hours |
-| 11 | Addition 3 — 30-day shadow run (elapsed) | 30 days |
-| 12 | Consolidation — docs, engineering plan update to v2.1, operator review of all three additions, sign-off commits. | 2–3 hours |
-
-Total active engineering: ~32–42 hours across sessions. Elapsed wall time: ~90 days minimum before all three additions are live-eligible.
-
-**Session 1 is non-optional.** The coding assistant produces a memo confirming:
-- Repo state matches this spec's assumptions
-- No breaking changes landed since this spec was written
-- Specific migration numbers and file paths are still valid
-- `integrations/weather.py` stale-observation guard status (required before Strategy C)
-- `signal.py` lead-time tracking status (required before Addition 2 resolver wiring)
-- Any deviations flagged to operator before coding begins
+| 1 | `WeatherResolutionState` enum with `LOCKED_YES` / `LOCKED_NO` variants exists | `src/kalshi_bot/core/enums.py` |
+| 2 | Stale-observation guard in weather ingestion checks observation timestamp ≤ 30 min | `src/kalshi_bot/integrations/weather.py` |
+| 3 | `signal.py` tracks `(room_decision_time, target_settlement_date)` in a structured way enabling lead_hours derivation | `src/kalshi_bot/services/signal.py` |
+| 4 | Latest Alembic migration is numbered 0016 with no gaps since spec was written | `alembic/versions/` |
+| 5 | `best_no_ask` is a computed property (`1.0000 - best_yes_bid`), not an independent API field | `src/kalshi_bot/services/streaming.py` |
+| 6 | `sigma_f_by_month` is a field on `WeatherMarketMapping` (Layer 2 YAML anchor exists) | `src/kalshi_bot/config.py` or mapping schema |
+| 7 | `_MONTHLY_SIGMA_F` global fallback table exists in `scoring.py` (Layer 3) | `src/kalshi_bot/weather/scoring.py` |
+| 8 | `APP_SHADOW_MODE` kill switch halts order submission end-to-end (verified by existing integration test) | `src/kalshi_bot/services/shadow.py` |
+| 9 | `market_price_history` table exists (migration 0011) with orderbook snapshot columns for backtest replay | `alembic/versions/` |
 
 ---
 
 ## 8. Open Questions for Operator
 
-Answer before coding begins (Session 2):
+Items 1–5 were open at spec v1.0 and are now settled. Items 6–8 remain open.
 
-1. **Strategic path (A / B / C).** Default A. Confirm.
-2. **Shadow period lengths.** Default 30 days per addition. Confirm or adjust.
-3. **Bankroll scale-up** for Strategy C and monotonicity arb once live-eligible. Suggest: start at $100 notional cap per addition, step up only after 30 days of green metrics.
-4. **Is the repo's `main` branch the right integration target,** or does the operator use a personal fork with different conventions?
-5. **Operator availability for 30-day shadow reviews.** Strategy C output needs at least weekly operator eyes. Confirm Grant (or a backup) can commit to this.
-6. **Any Libra employment disclosure still pending** on this project? (Was flagged in earlier P&L model; assumed resolved, verify.)
-7. **Is there a Bitbucket mirror** of this GitHub repo for Libra-internal CI integration, or is CI staying on GitHub Actions?
+**Settled — do not revisit:**
+
+1. **Strategic path**: Path A confirmed.
+2. **Shadow period lengths**: 30 days per addition, with 15-day extensions if the event-count gate is not met.
+3. **Bankroll scale-up parameters**: Start at existing caps. First step: `--factor 1.5` (50% increase) after ≥ 30 live days per strategy, if all 7 criteria below are met. Scale-down is permitted at operator discretion with no criteria. Each change recorded in `risk_limit_changes` with `gate_report_json`.
+
+   **7 criteria required for +50% step:**
+   1. ≥ 30 days of live data for the strategy being scaled
+   2. Win rate on fills ≥ 99% (Strategy C) or net PnL positive on ≥ 75% of filled pairs (monotonicity arb)
+   3. Race rate stable or declining (no rising trend in the trailing 14 days)
+   4. Median realized edge ≥ 80% of modeled edge
+   5. Zero `leg_break` events in the preceding 30 days (monotonicity arb only)
+   6. Zero SEV-2 partition-invariant alerts in the preceding 30 days
+   7. Kill-switch and shadow-mode reversion tested within the preceding 7 days
+
+4. **Integration target**: `main` branch confirmed.
+5. **Operator availability**: Grant confirmed for weekly shadow reviews.
+
+**Still open — answer before the indicated session:**
+
+6. **Libra employment disclosure**: Any disclosure still pending on this project? (Was flagged in earlier P&L model; assumed resolved — verify before Session 2.)
+
+7. **CI target**: Is there a Bitbucket mirror of this repo for Libra-internal CI integration, or is CI staying on GitHub Actions? (Answer before Session 15 — affects handoff criteria.)
+
+8. **Session 1 deviations**: Any assertions in the Session 1 verification memo assessed as NOT FOUND or AMBIGUOUS become open questions for the operator. The specific list is unknown until Session 1 completes. Answer before Session 2.
 
 ---
 
