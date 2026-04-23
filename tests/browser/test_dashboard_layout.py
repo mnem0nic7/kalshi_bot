@@ -1000,15 +1000,16 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert provider_options == ["Gemini", "OpenAI"]
                 assert "Codex" not in provider_options
                 assert page.locator("#strategies-codex-model").input_value(timeout=15_000) == "gemini-2.5-pro"
-                assert page.locator("#strategies-codex-model").get_attribute("list", timeout=15_000) == "strategies-codex-model-options"
-                model_options = page.locator("#strategies-codex-model-options option").evaluate_all(
+                model_options = page.locator("#strategies-codex-model option").evaluate_all(
                     "(nodes) => nodes.map((node) => node.value)"
                 )
                 assert model_options == ["gemini-2.5-pro", "gemini-2.5-flash"]
+                page.locator("#strategies-codex-model").select_option("gemini-2.5-flash")
+                assert page.locator("#strategies-codex-model").input_value(timeout=15_000) == "gemini-2.5-flash"
                 page.locator("#strategies-codex-provider").select_option("openai")
                 assert page.locator("#strategies-codex-provider").input_value(timeout=15_000) == "openai"
                 assert page.locator("#strategies-codex-model").input_value(timeout=15_000) == "gpt-5.4"
-                openai_model_options = page.locator("#strategies-codex-model-options option").evaluate_all(
+                openai_model_options = page.locator("#strategies-codex-model option").evaluate_all(
                     "(nodes) => nodes.map((node) => node.value)"
                 )
                 assert openai_model_options == ["gpt-5.4"]

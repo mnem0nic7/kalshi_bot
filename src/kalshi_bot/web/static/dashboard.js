@@ -1705,30 +1705,28 @@
         ? [strategyState.codexModel, ...suggestedModels]
         : suggestedModels
     );
-    const modelInput = setTestId(el("input", "strategy-codex-model-input"), "strategy-codex-model");
+    const modelInput = setTestId(el("select", "strategy-codex-select"), "strategy-codex-model");
     modelInput.id = "strategies-codex-model";
-    modelInput.type = "text";
-    modelInput.autocomplete = "off";
-    modelInput.spellcheck = false;
-    modelInput.disabled = !lab.available || strategyState.codexSubmitting;
-    modelInput.value = strategyState.codexModel || "";
-    modelInput.placeholder = activeProvider && activeProvider.default_model ? activeProvider.default_model : "Enter model id";
-    modelInput.addEventListener("input", () => {
-      strategyState.codexModel = modelInput.value || "";
-    });
+    modelInput.disabled = !lab.available || strategyState.codexSubmitting || !modelOptions.length;
+    if (!modelOptions.length) {
+      const optionNode = document.createElement("option");
+      optionNode.value = "";
+      optionNode.textContent = "Default model";
+      modelInput.appendChild(optionNode);
+    }
     if (modelOptions.length) {
-      modelInput.setAttribute("list", "strategies-codex-model-options");
-      const modelSuggestions = document.createElement("datalist");
-      modelSuggestions.id = "strategies-codex-model-options";
       modelOptions.forEach((modelName) => {
         const optionNode = document.createElement("option");
         optionNode.value = modelName;
-        modelSuggestions.appendChild(optionNode);
+        optionNode.textContent = modelName;
+        optionNode.selected = modelName === strategyState.codexModel;
+        modelInput.appendChild(optionNode);
       });
-      modelBlock.append(modelLabel, modelInput, modelSuggestions);
-    } else {
-      modelBlock.append(modelLabel, modelInput);
     }
+    modelInput.addEventListener("change", () => {
+      strategyState.codexModel = modelInput.value || "";
+    });
+    modelBlock.append(modelLabel, modelInput);
     providerRow.appendChild(modelBlock);
     controls.appendChild(providerRow);
 

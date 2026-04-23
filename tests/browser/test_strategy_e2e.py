@@ -726,11 +726,12 @@ def test_strategy_operator_flow_e2e(monkeypatch: pytest.MonkeyPatch, tmp_path: P
                 assert provider_options == ["Gemini", "OpenAI"]
                 assert "Codex" not in provider_options
                 assert model_input.input_value(timeout=15_000) == "gemini-2.5-pro"
-                assert model_input.get_attribute("list", timeout=15_000) == "strategies-codex-model-options"
-                model_options = codex_lab.locator("#strategies-codex-model-options option").evaluate_all(
+                model_options = codex_lab.locator("#strategies-codex-model option").evaluate_all(
                     "(nodes) => nodes.map((node) => node.value)"
                 )
                 assert model_options == ["gemini-2.5-pro", "gemini-2.5-flash"]
+                model_input.select_option("gemini-2.5-flash")
+                assert model_input.input_value(timeout=15_000) == "gemini-2.5-flash"
 
                 page.locator('#strategies-codex-lab .strategy-codex-mode-switch button:has-text("Suggest")').click(timeout=15_000)
                 run_button.click(timeout=15_000)
