@@ -659,6 +659,33 @@ async def _run_cli(args: argparse.Namespace) -> int:
             )
             return 0
 
+        if args.command == "calibrate-momentum":
+            from kalshi_bot.services.momentum_calibration import MomentumCalibrationService
+
+            svc = MomentumCalibrationService(container.session_factory, container.kalshi, container.settings)
+            sub = args.calibrate_momentum_command
+            if sub == "backfill-slopes":
+                result = await svc.backfill_slopes(args.date_from, args.date_to)
+                print(json.dumps(result, indent=2))
+                return 0
+            if sub == "first-look":
+                result = await svc.first_look_report(
+                    args.date_from,
+                    args.date_to,
+                    output_path=Path(args.output) if args.output else None,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            if sub == "deploy":
+                result = await svc.deploy_calibration(
+                    args.date_from,
+                    args.date_to,
+                    min_observations=args.min_observations,
+                    output_path=Path(args.output) if args.output else None,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+
         async with container.session_factory() as session:
             repo = PlatformRepository(session)
 
@@ -1152,6 +1179,24 @@ def build_parser() -> argparse.ArgumentParser:
     create_web_user = subparsers.add_parser("create-web-user", help="Create or reset a web UI user account")
     create_web_user.add_argument("--email", required=True, help="User email address")
     create_web_user.add_argument("--password", required=True, help="Plaintext password (hashed before storage)")
+
+    calibrate_momentum = subparsers.add_parser("calibrate-momentum", help="Step-2 momentum calibration tooling")
+    calibrate_momentum_sub = calibrate_momentum.add_subparsers(dest="calibrate_momentum_command", required=True)
+
+    cm_backfill = calibrate_momentum_sub.add_parser("backfill-slopes", help="Fetch Kalshi candlesticks and write slopes to Signal.payload")
+    cm_backfill.add_argument("--date-from", required=True, help="Start local_market_day (YYYY-MM-DD)")
+    cm_backfill.add_argument("--date-to", required=True, help="End local_market_day (YYYY-MM-DD)")
+
+    cm_first_look = calibrate_momentum_sub.add_parser("first-look", help="Bucket table and bootstrap CIs from stored slopes")
+    cm_first_look.add_argument("--date-from", required=True, help="Start local_market_day (YYYY-MM-DD)")
+    cm_first_look.add_argument("--date-to", required=True, help="End local_market_day (YYYY-MM-DD)")
+    cm_first_look.add_argument("--output", default=None, help="JSONL output path for per-room records")
+
+    cm_deploy = calibrate_momentum_sub.add_parser("deploy", help="One-parameter fit + veto candidates")
+    cm_deploy.add_argument("--date-from", required=True, help="Start local_market_day (YYYY-MM-DD)")
+    cm_deploy.add_argument("--date-to", required=True, help="End local_market_day (YYYY-MM-DD)")
+    cm_deploy.add_argument("--min-observations", type=int, default=1000, help="Minimum usable observations required (default: 1000)")
+    cm_deploy.add_argument("--output", default=None, help="JSONL output path for timestamped calibration log")
 
     return parser
 
