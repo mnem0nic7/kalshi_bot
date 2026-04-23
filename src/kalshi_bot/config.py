@@ -136,6 +136,15 @@ class Settings(BaseSettings):
     # Set to -999.0 during Step 2 calibration replay to bypass Gate 3; do not tune between
     # Step 1 and Step 3 deploys — this key is removed when the multiplicative weight mechanism lands.
     momentum_entry_slope_threshold_cents_per_min: float = 0.0
+    # Step 3 momentum weight config keys (placeholder defaults; calibrated values written to DB checkpoint).
+    # momentum_weight_scale_cents_per_min: the denominator in w = max(floor, 1 - slope_against/scale).
+    # momentum_slope_veto_cents_per_min: hard veto gate; None = disabled until first calibration ships.
+    # momentum_weight_floor: minimum weight applied to edge_effective_bps.
+    # momentum_veto_staleness_gate: staleness_factor must exceed this before veto can fire.
+    momentum_weight_scale_cents_per_min: float = 1.0
+    momentum_slope_veto_cents_per_min: float | None = None
+    momentum_weight_floor: float = 0.3
+    momentum_veto_staleness_gate: float = 0.5
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False

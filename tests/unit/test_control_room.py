@@ -278,6 +278,7 @@ async def test_build_control_room_summary_skips_live_market_discovery(monkeypatc
     monkeypatch.setattr(control_room_module, "_recent_room_outcome_views", AsyncMock(return_value=[]))
     monkeypatch.setattr(control_room_module, "_current_intel_board", AsyncMock(return_value=[]))
     monkeypatch.setattr(control_room_module, "_strategy_c_summary", AsyncMock(return_value={}))
+    monkeypatch.setattr(control_room_module, "_momentum_calibration_summary", AsyncMock(return_value={"active": None, "pending": None}))
 
     container = SimpleNamespace(
         session_factory=_FakeSessionFactory(),

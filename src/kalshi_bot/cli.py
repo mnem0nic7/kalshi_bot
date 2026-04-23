@@ -668,21 +668,35 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 result = await svc.backfill_slopes(args.date_from, args.date_to)
                 print(json.dumps(result, indent=2))
                 return 0
-            if sub == "first-look":
-                result = await svc.first_look_report(
+            if sub == "preview":
+                result = await svc.preview(
                     args.date_from,
                     args.date_to,
                     output_path=Path(args.output) if args.output else None,
                 )
                 print(json.dumps(result, indent=2))
                 return 0
-            if sub == "deploy":
-                result = await svc.deploy_calibration(
+            if sub == "stage":
+                result = await svc.stage(
                     args.date_from,
                     args.date_to,
                     min_observations=args.min_observations,
+                    staged_by=args.staged_by,
+                    force=args.force,
                     output_path=Path(args.output) if args.output else None,
                 )
+                print(json.dumps(result, indent=2))
+                return 0 if result.get("ok") else 1
+            if sub == "promote":
+                result = await svc.promote(activated_by=args.activated_by)
+                print(json.dumps(result, indent=2))
+                return 0 if result.get("ok") else 1
+            if sub == "reject":
+                result = await svc.reject()
+                print(json.dumps(result, indent=2))
+                return 0
+            if sub == "status":
+                result = await svc.status()
                 print(json.dumps(result, indent=2))
                 return 0
 
@@ -1187,16 +1201,25 @@ def build_parser() -> argparse.ArgumentParser:
     cm_backfill.add_argument("--date-from", required=True, help="Start local_market_day (YYYY-MM-DD)")
     cm_backfill.add_argument("--date-to", required=True, help="End local_market_day (YYYY-MM-DD)")
 
-    cm_first_look = calibrate_momentum_sub.add_parser("first-look", help="Bucket table and bootstrap CIs from stored slopes")
-    cm_first_look.add_argument("--date-from", required=True, help="Start local_market_day (YYYY-MM-DD)")
-    cm_first_look.add_argument("--date-to", required=True, help="End local_market_day (YYYY-MM-DD)")
-    cm_first_look.add_argument("--output", default=None, help="JSONL output path for per-room records")
+    cm_preview = calibrate_momentum_sub.add_parser("preview", help="Full analysis (fit + buckets + CIs). Read-only, never writes DB.")
+    cm_preview.add_argument("--date-from", required=True, help="Start local_market_day (YYYY-MM-DD)")
+    cm_preview.add_argument("--date-to", required=True, help="End local_market_day (YYYY-MM-DD)")
+    cm_preview.add_argument("--output", default=None, help="JSONL output path for per-room records")
 
-    cm_deploy = calibrate_momentum_sub.add_parser("deploy", help="One-parameter fit + veto candidates")
-    cm_deploy.add_argument("--date-from", required=True, help="Start local_market_day (YYYY-MM-DD)")
-    cm_deploy.add_argument("--date-to", required=True, help="End local_market_day (YYYY-MM-DD)")
-    cm_deploy.add_argument("--min-observations", type=int, default=1000, help="Minimum usable observations required (default: 1000)")
-    cm_deploy.add_argument("--output", default=None, help="JSONL output path for timestamped calibration log")
+    cm_stage = calibrate_momentum_sub.add_parser("stage", help="Full analysis + sanity bounds + write pending checkpoint")
+    cm_stage.add_argument("--date-from", required=True, help="Start local_market_day (YYYY-MM-DD)")
+    cm_stage.add_argument("--date-to", required=True, help="End local_market_day (YYYY-MM-DD)")
+    cm_stage.add_argument("--min-observations", type=int, default=1000, help="Minimum usable observations required (default: 1000)")
+    cm_stage.add_argument("--staged-by", default=None, help="Operator identity recorded in checkpoint (default: $USER)")
+    cm_stage.add_argument("--force", action="store_true", help="Overwrite stale pending (>=24h) without prompting")
+    cm_stage.add_argument("--output", default=None, help="JSONL output path for per-room records")
+
+    cm_promote = calibrate_momentum_sub.add_parser("promote", help="Rename pending checkpoint to active")
+    cm_promote.add_argument("--activated-by", default=None, help="Operator identity recorded in checkpoint (default: $USER)")
+
+    calibrate_momentum_sub.add_parser("reject", help="Clear pending calibration (idempotent)")
+
+    calibrate_momentum_sub.add_parser("status", help="Print current active + pending calibration state")
 
     return parser
 

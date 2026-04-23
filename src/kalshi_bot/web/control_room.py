@@ -1367,6 +1367,41 @@ async def _strategy_c_summary(container: AppContainer) -> dict[str, Any]:
     }
 
 
+async def _momentum_calibration_summary(container: AppContainer) -> dict[str, Any]:
+    from kalshi_bot.services.momentum_calibration import get_momentum_calibration_state
+
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session)
+        state = await get_momentum_calibration_state(repo, container.settings.kalshi_env)
+        await session.commit()
+
+    active = state.get("active") or {}
+    pending = state.get("pending")
+    result: dict[str, Any] = {
+        "active": {
+            "momentum_weight_scale_cents_per_min": active.get("momentum_weight_scale_cents_per_min"),
+            "momentum_slope_veto_cents_per_min": active.get("momentum_slope_veto_cents_per_min"),
+            "activated_at": active.get("activated_at"),
+            "activated_by": active.get("activated_by"),
+        },
+        "pending": None,
+    }
+    if pending is not None:
+        result["pending"] = {
+            "momentum_weight_scale_cents_per_min": pending.get("momentum_weight_scale_cents_per_min"),
+            "momentum_slope_veto_cents_per_min": pending.get("momentum_slope_veto_cents_per_min"),
+            "ci_width_fraction": pending.get("ci_width_fraction"),
+            "corpus_n_usable": pending.get("corpus_n_usable"),
+            "staged_at": pending.get("staged_at"),
+            "staged_by": pending.get("staged_by"),
+            "provenance": pending.get("provenance"),
+        }
+        if state.get("pending_age_hours") is not None:
+            result["pending_age_hours"] = state["pending_age_hours"]
+            result["pending_is_stale"] = state.get("pending_is_stale", False)
+    return result
+
+
 async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
     now = datetime.now(UTC)
     async with container.session_factory() as session:
@@ -1398,7 +1433,12 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
     )
     payload["daily_pnl_display"] = _money_display(daily_pnl, signed=True)
     payload["daily_pnl_tone"] = _pnl_tone(daily_pnl)
-    payload["strategy_c"] = await _strategy_c_summary(container)
+    strategy_c, momentum_calibration = await asyncio.gather(
+        _strategy_c_summary(container),
+        _momentum_calibration_summary(container),
+    )
+    payload["strategy_c"] = strategy_c
+    payload["momentum_calibration"] = momentum_calibration
     payload["regression_read_source"] = getattr(container, "regression_read_source", "primary")
     return payload
 
