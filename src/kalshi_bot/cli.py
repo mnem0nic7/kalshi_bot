@@ -576,6 +576,58 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(status, indent=2, default=str))
             return 0
 
+        if args.command == "record-strategy-promotion":
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                try:
+                    event = await repo.record_strategy_promotion(
+                        strategy=args.strategy,
+                        from_state=args.from_state,
+                        to_state=args.to_state,
+                        actor=args.actor,
+                        evidence_ref=args.evidence_ref,
+                        notes=args.notes,
+                        kalshi_env=container.settings.kalshi_env,
+                    )
+                except ValueError as exc:
+                    print(json.dumps({"error": str(exc)}), file=sys.stderr)
+                    return 2
+                await session.commit()
+            print(json.dumps({
+                "id": event.id,
+                "strategy": event.strategy,
+                "from_state": event.from_state,
+                "to_state": event.to_state,
+                "actor": event.actor,
+                "kalshi_env": event.kalshi_env,
+                "created_at": event.created_at.isoformat(),
+            }, indent=2))
+            return 0
+
+        if args.command == "list-strategy-promotions":
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session)
+                events = await repo.list_strategy_promotions(
+                    strategy=args.strategy,
+                    kalshi_env=container.settings.kalshi_env,
+                    limit=args.limit,
+                )
+            print(json.dumps([
+                {
+                    "id": e.id,
+                    "strategy": e.strategy,
+                    "from_state": e.from_state,
+                    "to_state": e.to_state,
+                    "actor": e.actor,
+                    "evidence_ref": e.evidence_ref,
+                    "notes": e.notes,
+                    "kalshi_env": e.kalshi_env,
+                    "created_at": e.created_at.isoformat(),
+                }
+                for e in events
+            ], indent=2))
+            return 0
+
         if args.command == "shadow-sweep":
             results = await container.shadow_training_service.run_shadow_sweep(
                 markets=args.markets,
@@ -1047,6 +1099,24 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("strategy-c-status", help="Strategy C: show aggregate sweep metrics and lock tracker state")
     subparsers.add_parser("monotonicity-scan", help="Addition 3: run one monotonicity arb scan tick across all open KXHIGH* markets")
     subparsers.add_parser("monotonicity-status", help="Addition 3: show aggregate monotonicity arb proposal metrics")
+
+    record_promotion = subparsers.add_parser(
+        "record-strategy-promotion",
+        help="P2-3: append one row to the strategy_promotion_events audit log.",
+    )
+    record_promotion.add_argument("--strategy", required=True, help="Short code: A, C, ARB, ...")
+    record_promotion.add_argument("--from-state", required=True, help="e.g. shadow")
+    record_promotion.add_argument("--to-state", required=True, help="e.g. live")
+    record_promotion.add_argument("--actor", required=True, help="Operator identity (git user, @handle, etc.)")
+    record_promotion.add_argument("--evidence-ref", default=None, help="URL / PR # / dashboard snapshot")
+    record_promotion.add_argument("--notes", default=None, help="Free-text rationale")
+
+    list_promotions = subparsers.add_parser(
+        "list-strategy-promotions",
+        help="P2-3: list recent strategy_promotion_events rows.",
+    )
+    list_promotions.add_argument("--strategy", default=None)
+    list_promotions.add_argument("--limit", type=int, default=25)
 
     shadow_sweep = subparsers.add_parser("shadow-sweep")
     shadow_sweep.add_argument("--markets", nargs="*", default=None)

@@ -698,6 +698,35 @@ class CityStrategyAssignment(Base):
     assigned_by: Mapped[str] = mapped_column(String(64), default="auto_regression")
 
 
+class StrategyPromotionEvent(Base):
+    """Audit log row for a strategy shadow→live (or live→shadow) transition.
+
+    P2-3 — inserted via the ``record-strategy-promotion`` CLI so the operator's
+    intent, identity, and evidence reference are captured alongside the
+    environment change. Intentionally not a per-row foreign key to
+    ``strategies.name`` — the strategy column accepts short codes (A, C, ARB)
+    and may reference strategies that were never persisted as StrategyRecord.
+    """
+
+    __tablename__ = "strategy_promotion_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    strategy: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    from_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    evidence_ref: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    kalshi_env: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+
 class StrategyCodexRunRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "strategy_codex_runs"
 
