@@ -1410,6 +1410,40 @@ def create_app() -> FastAPI:
             jsonable_encoder({"bucket_by": bucket_by, "results": [s.to_dict() for s in summaries]})
         )
 
+    @app.get("/api/strategies/cleanup/discount-sweep")
+    async def strategies_cleanup_discount_sweep(
+        request: Request,
+        discounts: str = "0,0.5,1,2",
+        lookback_days: int = 30,
+        latency_budget_seconds: int = 10,
+    ) -> JSONResponse:
+        """Strategy C discount sensitivity sweep (P1-3).
+
+        Replays persisted shadow StrategyCRoom signals against alternative
+        discount levels and reports fill_rate + avg_net_ev per candidate.
+        Used to decide whether the default 1¢ discount is sized correctly.
+        """
+        try:
+            candidates = [float(x) for x in discounts.split(",") if x.strip()]
+        except ValueError:
+            return JSONResponse({"error": "invalid_discounts"}, status_code=400)
+        if not candidates:
+            return JSONResponse({"error": "empty_discounts"}, status_code=400)
+        if any(d < 0 or d > 100 for d in candidates):
+            return JSONResponse({"error": "discount_out_of_range"}, status_code=400)
+        if lookback_days < 1 or lookback_days > 365:
+            return JSONResponse({"error": "invalid_lookback_days"}, status_code=400)
+        if latency_budget_seconds < 1 or latency_budget_seconds > 600:
+            return JSONResponse({"error": "invalid_latency_budget_seconds"}, status_code=400)
+
+        app_container = container(request)
+        payload = await app_container.strategy_cleanup_service.sweep_discount_sensitivity(
+            discount_cents_candidates=candidates,
+            lookback_days=lookback_days,
+            latency_budget_seconds=latency_budget_seconds,
+        )
+        return JSONResponse(jsonable_encoder(payload))
+
     @app.post("/api/strategies/{strategy_name}/activate")
     async def activate_strategy_preset(strategy_name: str, request: Request) -> JSONResponse:
         app_container = container(request)

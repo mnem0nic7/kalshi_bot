@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
@@ -56,3 +57,72 @@ def score_counterfactual_trade(
         pnl_dollars=pnl.quantize(Decimal("0.0001")),
         settlement_result=settlement_result,
     )
+
+
+# ---------------------------------------------------------------------------
+# Strategy C discount sensitivity helpers (P1-3)
+# ---------------------------------------------------------------------------
+
+
+def _is_locked_yes(resolution_state: str) -> bool:
+    return str(resolution_state).lower().endswith("yes")
+
+
+def strategy_c_target_cents(
+    *, resolution_state: str, discount_cents: float
+) -> float:
+    """Entry-price target (in cents, 0..100) for a Strategy C signal.
+
+    LOCKED_YES → 100 - discount (bid on YES just below settlement $1.00).
+    LOCKED_NO  → discount      (bid on NO just above settlement $0.00, priced on
+                                 the YES-axis as the complement).
+
+    ``discount_cents`` may be fractional (e.g. 0.5).
+    """
+    if _is_locked_yes(resolution_state):
+        return 100.0 - discount_cents
+    return discount_cents
+
+
+def strategy_c_gross_edge_cents(
+    *, resolution_state: str, discount_cents: float
+) -> float:
+    """Gross edge per filled contract assuming fill at target, in cents.
+
+    Settlement pays $1 to the correct side. For LOCKED_YES buying YES at
+    (100 - d) cents the gross edge is d cents. For LOCKED_NO buying NO at
+    d cents the gross edge is (100 - d) cents — larger per-contract edge but
+    historically a much tighter market near $0.00 so fill rate collapses.
+    """
+    target = strategy_c_target_cents(
+        resolution_state=resolution_state, discount_cents=discount_cents
+    )
+    # Settlement payoff is 100 cents; entry cost is the target, so gross = 100 - target.
+    return 100.0 - target
+
+
+def strategy_c_fee_cents(entry_price_dollars: float) -> float:
+    """Kalshi taker fee per contract at ``entry_price_dollars`` (0..1).
+
+    Formula (§ fee schedule): ceil(0.07 * price * (1-price) * 100) cents.
+    Matches kalshi_fee_cents in services/monotonicity_scanner.py and is copied
+    here rather than imported to keep the counterfactual module dependency-free.
+    """
+    price = max(0.0, min(1.0, entry_price_dollars))
+    raw_dollars = 0.07 * price * (1.0 - price) * 100
+    fee_dollars = math.ceil(raw_dollars) / 100.0
+    return fee_dollars * 100.0  # cents
+
+
+def strategy_c_net_ev_per_fill_cents(
+    *, resolution_state: str, discount_cents: float
+) -> float:
+    """Net expected value per filled contract: gross edge minus entry fee."""
+    gross = strategy_c_gross_edge_cents(
+        resolution_state=resolution_state, discount_cents=discount_cents
+    )
+    target = strategy_c_target_cents(
+        resolution_state=resolution_state, discount_cents=discount_cents
+    )
+    fee = strategy_c_fee_cents(target / 100.0)
+    return gross - fee
