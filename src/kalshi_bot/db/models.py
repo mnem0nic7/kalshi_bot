@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from kalshi_bot.core.enums import DeploymentColor, RiskStatus, RoomOrigin, RoomStage
@@ -750,3 +750,87 @@ class GlobalLeadFactor(Base):
     fitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     version: Mapped[str] = mapped_column(String(32), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+# ---------------------------------------------------------------------------
+# Strategy C — Addition 1 tables (§4.1.5)
+# ---------------------------------------------------------------------------
+
+class CliReconciliationRecord(Base):
+    """Daily CLI vs ASOS observed max per station. Composite PK (station, date).
+
+    Populated by backfill_cli_reconciliation.py and extended daily post-settlement.
+    Source of truth for cli_station_variance rollup.
+    """
+    __tablename__ = "cli_reconciliation"
+
+    station: Mapped[str] = mapped_column(String(32), primary_key=True)
+    observation_date: Mapped[date] = mapped_column(Date(), primary_key=True)
+    asos_observed_max: Mapped[float] = mapped_column(Float, nullable=False)
+    asos_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cli_value: Mapped[float] = mapped_column(Float, nullable=False)
+    cli_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delta_degf: Mapped[float] = mapped_column(Float, nullable=False)   # cli_value - asos_observed_max
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+
+class StrategyCRoom(Base):
+    """Per-decision record for Strategy C (lock-confirmation) trades.
+
+    execution_outcome: what happened between signal and order resolution (stage 1).
+    settlement_outcome: did CLI agree with the asserted lock (stage 2, diagnostic).
+    Do not collapse these into a single outcome column.
+    """
+    __tablename__ = "strategy_c_rooms"
+
+    room_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(__import__("uuid").uuid4()))
+    ticker: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    station: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    decision_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    resolution_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    observed_max_at_decision: Mapped[float] = mapped_column(Float, nullable=False)
+    threshold: Mapped[float] = mapped_column(Float, nullable=False)
+    fair_value_dollars: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    modeled_edge_cents: Mapped[float] = mapped_column(Float, nullable=False)
+    target_price_cents: Mapped[float] = mapped_column(Float, nullable=False)
+    contracts_requested: Mapped[int] = mapped_column(Integer, nullable=False)
+    contracts_filled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    avg_fill_price_cents: Mapped[float | None] = mapped_column(Float, nullable=True)
+    realized_edge_cents: Mapped[float | None] = mapped_column(Float, nullable=True)
+    execution_outcome: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    settlement_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    outcome_pnl_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
+class CliStationVariance(Base):
+    """Per-station CLI/ASOS variance rollup. Recomputed periodically from cli_reconciliation.
+
+    Signed columns: retained for future parametric calibration (not consumed by default pricing).
+    Abs-value columns: used for dashboards and anomaly detection only.
+    """
+    __tablename__ = "cli_station_variance"
+
+    station: Mapped[str] = mapped_column(String(32), primary_key=True)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    signed_mean_delta_degf: Mapped[float] = mapped_column(Float, nullable=False)
+    signed_stddev_delta_degf: Mapped[float] = mapped_column(Float, nullable=False)
+    mean_abs_delta_degf: Mapped[float] = mapped_column(Float, nullable=False)
+    p95_abs_delta_degf: Mapped[float] = mapped_column(Float, nullable=False)
+    last_refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
