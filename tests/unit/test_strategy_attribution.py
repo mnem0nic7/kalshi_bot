@@ -142,6 +142,52 @@ async def test_upsert_fill_inherits_strategy_code_from_kalshi_order(repo_factory
 
 
 @pytest.mark.asyncio
+async def test_upsert_fill_tolerates_duplicate_kalshi_order_ids(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        await repo.upsert_order(
+            client_order_id="coid-A1",
+            market_ticker="KXHIGHNY-26APR23-T68",
+            status="submitted",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.4000"),
+            count_fp=Decimal("10.00"),
+            raw={},
+            kalshi_order_id="kord-1",
+            kalshi_env="demo",
+            strategy_code=StrategyCode.DIRECTIONAL.value,
+        )
+        await repo.upsert_order(
+            client_order_id="coid-C1",
+            market_ticker="KXHIGHNY-26APR23-T68",
+            status="submitted",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.4000"),
+            count_fp=Decimal("10.00"),
+            raw={},
+            kalshi_order_id="kord-1",
+            kalshi_env="demo",
+            strategy_code=StrategyCode.CLEANUP.value,
+        )
+
+        fill = await repo.upsert_fill(
+            market_ticker="KXHIGHNY-26APR23-T68",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.4000"),
+            count_fp=Decimal("10.00"),
+            raw={"order_id": "kord-1"},
+            trade_id="trade-1",
+            kalshi_env="demo",
+        )
+
+        assert fill.strategy_code in {StrategyCode.DIRECTIONAL.value, StrategyCode.CLEANUP.value}
+
+
+@pytest.mark.asyncio
 async def test_daily_realized_pnl_by_strategy_settled_buys_only(repo_factory, room_id):
     """Conservative daily P&L counts BUY fills whose settlement is known plus
     matched BUY→SELL round-trips; unsettled open BUYs contribute zero."""

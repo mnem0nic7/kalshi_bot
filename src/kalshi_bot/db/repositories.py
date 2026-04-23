@@ -1107,7 +1107,7 @@ class PlatformRepository:
             stmt = select(OrderRecord.strategy_code).where(
                 OrderRecord.kalshi_env == kalshi_env,
                 OrderRecord.kalshi_order_id == kalshi_order_id,
-            )
+            ).order_by(OrderRecord.updated_at.desc(), OrderRecord.created_at.desc()).limit(1)
             found = (await self.session.execute(stmt)).scalar_one_or_none()
             if found is not None:
                 return found
