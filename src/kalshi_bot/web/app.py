@@ -1362,6 +1362,54 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": "invalid_run_state", "message": str(exc)}, status_code=400)
         return JSONResponse(jsonable_encoder(payload))
 
+    @app.get("/api/strategies/calibration")
+    async def strategies_calibration(
+        request: Request,
+        series_ticker: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        bucket_by: str = "overall",
+        n_buckets: int = 10,
+    ) -> JSONResponse:
+        """Per-strategy-A signal calibration: Brier, log-loss, reliability curve.
+
+        Query params:
+        - series_ticker: filter to one series (e.g. KXHIGHNY)
+        - date_from / date_to: ISO dates (YYYY-MM-DD)
+        - bucket_by: "overall" (default), "series", or "month"
+        - n_buckets: reliability-curve bucket count (default 10)
+        """
+        from datetime import date as _date
+
+        if bucket_by not in {"overall", "series", "month"}:
+            return JSONResponse({"error": "invalid_bucket_by"}, status_code=400)
+        if n_buckets < 2 or n_buckets > 50:
+            return JSONResponse({"error": "invalid_n_buckets"}, status_code=400)
+        try:
+            df = _date.fromisoformat(date_from) if date_from else None
+            dt = _date.fromisoformat(date_to) if date_to else None
+        except ValueError:
+            return JSONResponse({"error": "invalid_date_format"}, status_code=400)
+
+        app_container = container(request)
+        service = app_container.signal_calibration_service
+        if bucket_by == "overall":
+            summary = await service.compute_overall(
+                date_from=df, date_to=dt, series_ticker=series_ticker, n_buckets=n_buckets,
+            )
+            return JSONResponse(jsonable_encoder({"bucket_by": "overall", "result": summary.to_dict()}))
+        if bucket_by == "series":
+            summaries = await service.compute_per_series(
+                date_from=df, date_to=dt, n_buckets=n_buckets,
+            )
+        else:
+            summaries = await service.compute_per_month(
+                date_from=df, date_to=dt, series_ticker=series_ticker, n_buckets=n_buckets,
+            )
+        return JSONResponse(
+            jsonable_encoder({"bucket_by": bucket_by, "results": [s.to_dict() for s in summaries]})
+        )
+
     @app.post("/api/strategies/{strategy_name}/activate")
     async def activate_strategy_preset(strategy_name: str, request: Request) -> JSONResponse:
         app_container = container(request)
