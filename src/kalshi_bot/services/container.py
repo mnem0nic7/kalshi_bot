@@ -243,7 +243,7 @@ class AppContainer:
             shadow_training_service,
         )
         auto_trigger_service = AutoTriggerService(settings, session_factory, weather_directory, agent_pack_service, supervisor)
-        stop_loss_service = StopLossService(settings, session_factory, kalshi)
+        stop_loss_service = StopLossService(settings, session_factory, execution_service)
         strategy_eval_service = StrategyEvaluationService(settings, session_factory, agent_pack_service)
         strategy_regression_service = StrategyRegressionService(
             settings,

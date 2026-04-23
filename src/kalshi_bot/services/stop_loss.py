@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import MarketPriceHistory, MarketState, PositionRecord
 from kalshi_bot.db.repositories import PlatformRepository
-from kalshi_bot.integrations.kalshi import KalshiClient
+from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_FILLED_EXIT,
     STOP_LOSS_OUTCOME_SUBMIT_FAILED,
@@ -104,11 +104,11 @@ class StopLossService:
         self,
         settings: Settings,
         session_factory: async_sessionmaker,
-        kalshi: KalshiClient,
+        execution_service: ExecutionService,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
-        self.kalshi = kalshi
+        self.execution_service = execution_service
 
     async def check_once(self) -> list[dict[str, Any]]:
         triggered: list[dict[str, Any]] = []
@@ -184,6 +184,10 @@ class StopLossService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
 
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            kill_switch_enabled: bool = bool(control.kill_switch_enabled)
+            active_color: str = control.active_color
+
             # shared submit cooldown — read with committed isolation
             submit_key = f"stop_loss_submit:{self.settings.kalshi_env}:{position.market_ticker}"
             submit_cp = await repo.get_checkpoint(submit_key)
@@ -210,6 +214,8 @@ class StopLossService:
                     if sell_px is not None and sell_px > 0:
                         result = await self._submit(
                             repo, position, sell_px, mid, trailing_ratio, now,
+                            kill_switch_enabled=kill_switch_enabled,
+                            active_color=active_color,
                             trigger="trailing_stop", peak=peak,
                         )
                         await session.commit()
@@ -240,6 +246,8 @@ class StopLossService:
             trigger = "profit_protection" if (profit is not None and profit >= self.settings.stop_loss_profit_protection_threshold_pct) else "momentum"
             result = await self._submit(
                 repo, position, sell_px, mid, trailing_ratio, now,
+                kill_switch_enabled=kill_switch_enabled,
+                active_color=active_color,
                 trigger=trigger, slope=slope, peak=peak,
             )
             await session.commit()
@@ -254,13 +262,13 @@ class StopLossService:
         loss_ratio: float | None,
         now: datetime,
         *,
+        kill_switch_enabled: bool,
+        active_color: str,
         trigger: str = "trailing_stop",
         slope: float | None = None,
         peak: Decimal | None = None,
     ) -> dict[str, Any]:
         market_ticker = position.market_ticker
-        shadow = self.settings.app_shadow_mode
-        action = f"stop_loss_{trigger}_shadow" if shadow else f"stop_loss_{trigger}"
         peak_display = str(peak) if peak is not None else "n/a"
         mark_display = str(mid)
         sell_display = str(sell_price)
@@ -274,6 +282,71 @@ class StopLossService:
             and loss_ratio > 0.30
             and hold_minutes < 120
         )
+
+        client_order_id = str(uuid4())
+        receipt = await self.execution_service.close_position(
+            market_ticker=market_ticker,
+            side=position.side,
+            count_fp=position.count_fp,
+            yes_price_dollars=sell_price,
+            client_order_id=client_order_id,
+            kill_switch_enabled=kill_switch_enabled,
+            active_color=active_color,
+            subaccount=self.settings.kalshi_subaccount or None,
+        )
+
+        # Kill switch: clean noop — no submit/reentry checkpoints, rate-limited warning.
+        if receipt.status == "kill_switch_blocked":
+            ks_cp_key = f"stop_loss_kill_switch_suppressed:{self.settings.kalshi_env}:{market_ticker}"
+            ks_cp = await repo.get_checkpoint(ks_cp_key)
+            rate_limited = (
+                ks_cp is not None
+                and ks_cp.payload.get("suppressed_at") is not None
+                and now - datetime.fromisoformat(ks_cp.payload["suppressed_at"]) < timedelta(minutes=10)
+            )
+            if not rate_limited:
+                await repo.log_ops_event(
+                    severity="warning",
+                    summary=(
+                        f"Stop-loss suppressed by kill switch [{trigger}]: "
+                        f"{market_ticker} {position.side}"
+                        + (f" loss={loss_ratio:.0%}" if loss_ratio is not None else "")
+                    ),
+                    source="stop_loss",
+                    payload={
+                        "market_ticker": market_ticker,
+                        "side": position.side,
+                        "trigger": trigger,
+                        "mid_mark": str(mid),
+                        "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+                        "peak_price": str(peak) if peak is not None else None,
+                        "action": "stop_loss_kill_switch_suppressed",
+                    },
+                )
+                await repo.set_checkpoint(
+                    ks_cp_key,
+                    cursor=None,
+                    payload={"suppressed_at": now.isoformat(), "trigger": trigger},
+                )
+            logger.warning(
+                "Stop-loss suppressed by kill switch [%s]: %s %s loss=%s",
+                trigger,
+                market_ticker,
+                position.side,
+                f"{loss_ratio:.0%}" if loss_ratio is not None else "n/a",
+            )
+            return {
+                "market_ticker": market_ticker,
+                "side": position.side,
+                "action": "stop_loss_kill_switch_suppressed",
+                "trigger": trigger,
+                "kill_switch_blocked": True,
+                "rate_limited_event": rate_limited,
+            }
+
+        shadow = receipt.status == "shadow_skipped"
+        submit_failed = not shadow and receipt.external_order_id is None
+        action = f"stop_loss_{trigger}_shadow" if shadow else f"stop_loss_{trigger}"
 
         event_payload: dict[str, Any] = {
             "market_ticker": market_ticker,
@@ -289,11 +362,11 @@ class StopLossService:
             "action": action,
             "trigger": trigger,
             "possible_model_error": possible_model_error,
+            "exec_status": receipt.status,
         }
         if slope is not None:
             event_payload["momentum_slope_cents_per_min"] = round(slope, 4)
 
-        submit_failed = False
         submit_payload: dict[str, Any] = {
             "submitted_at": now.isoformat(),
             "stopped_at": now.isoformat(),
@@ -302,42 +375,28 @@ class StopLossService:
             "peak_price": str(peak) if peak is not None else None,
             "trigger": trigger,
         }
-        if not shadow:
-            try:
-                order_request: dict[str, Any] = {
-                    "ticker": market_ticker,
-                    "side": position.side,
-                    "action": "sell",
-                    "client_order_id": str(uuid4()),
-                    "count_fp": f"{position.count_fp:.2f}",
-                    "yes_price_dollars": f"{sell_price:.4f}",
-                    "time_in_force": "immediate_or_cancel",
-                    "self_trade_prevention_type": "taker_at_cross",
-                }
-                if self.settings.kalshi_subaccount:
-                    order_request["subaccount"] = self.settings.kalshi_subaccount
-                order_resp = await self.kalshi.create_order(order_request)
-                event_payload["order_request"] = order_request
-                event_payload["order_response"] = order_resp
-                order_data = dict(order_resp.get("order") or {})
-                submit_payload.update(
-                    {
-                        "client_order_id": order_request["client_order_id"],
-                        "order_status": order_data.get("status"),
-                        "kalshi_order_id": order_data.get("order_id"),
-                        "outcome_status": STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
-                    }
-                )
-            except Exception as exc:
-                logger.warning("stop_loss order submit failed for %s: %s", market_ticker, exc)
-                event_payload["submit_error"] = str(exc)
-                submit_failed = True
-                submit_payload["submit_error"] = str(exc)
-                submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_SUBMIT_FAILED
-                # Back off on outright submit errors to avoid spamming an illiquid book.
-                submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
-        else:
+
+        if shadow:
             submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_FILLED_EXIT
+            submit_payload["client_order_id"] = client_order_id
+        elif not submit_failed:
+            order_data = dict((receipt.details or {}).get("order") or {})
+            submit_payload.update(
+                {
+                    "client_order_id": client_order_id,
+                    "order_status": order_data.get("status") or receipt.status,
+                    "kalshi_order_id": receipt.external_order_id,
+                    "outcome_status": STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
+                }
+            )
+            event_payload["order_response"] = receipt.details
+        else:
+            logger.warning("stop_loss order submit failed for %s: %s", market_ticker, receipt.details)
+            event_payload["submit_error"] = str(receipt.details)
+            submit_payload["submit_error"] = str(receipt.details)
+            submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_SUBMIT_FAILED
+            # Back off on outright submit errors to avoid spamming an illiquid book.
+            submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
 
         await repo.log_ops_event(
             severity="warning",

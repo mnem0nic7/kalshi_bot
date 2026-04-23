@@ -187,6 +187,87 @@ class ExecutionService:
             details={"attempts": min(attempt, _MAX_REQUOTES)},
         )
 
+    async def close_position(
+        self,
+        *,
+        market_ticker: str,
+        side: str,
+        count_fp: Decimal,
+        yes_price_dollars: Decimal,
+        client_order_id: str,
+        kill_switch_enabled: bool,
+        active_color: str,
+        subaccount: int | None = None,
+    ) -> ExecReceiptPayload:
+        """Submit an IOC sell order for an existing position.
+
+        Returns a sentinel status without hitting the API in three cases:
+        - ``shadow_skipped``: app is in shadow mode
+        - ``kill_switch_blocked``: kill switch is enabled (caller must NOT write submit cooldown)
+        - ``inactive_color_skipped``: this deployment color is not active
+        """
+        if self.settings.app_shadow_mode:
+            return ExecReceiptPayload(
+                status="shadow_skipped",
+                client_order_id=client_order_id,
+                details={"reason": "shadow mode"},
+            )
+        if kill_switch_enabled:
+            return ExecReceiptPayload(
+                status="kill_switch_blocked",
+                client_order_id=client_order_id,
+                details={"reason": "kill switch enabled"},
+            )
+        if active_color != self.settings.app_color:
+            return ExecReceiptPayload(
+                status="inactive_color_skipped",
+                client_order_id=client_order_id,
+                details={"active_color": active_color, "app_color": self.settings.app_color},
+            )
+        if self.kalshi.write_credentials is None:
+            return ExecReceiptPayload(
+                status="write_credentials_missing",
+                client_order_id=client_order_id,
+                details={"reason": "write credentials were not configured"},
+            )
+        payload: dict[str, Any] = {
+            "ticker": market_ticker,
+            "side": side,
+            "action": "sell",
+            "client_order_id": client_order_id,
+            "count_fp": f"{count_fp:.2f}",
+            "yes_price_dollars": f"{yes_price_dollars:.4f}",
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+        }
+        if subaccount:
+            payload["subaccount"] = subaccount
+        try:
+            response = await self.kalshi.create_order(payload)
+        except httpx.HTTPStatusError as exc:
+            try:
+                body = exc.response.json()
+            except Exception:
+                body = exc.response.text
+            logger.error(
+                "close_position rejected for %s status=%d body=%s",
+                market_ticker,
+                exc.response.status_code,
+                body,
+            )
+            return ExecReceiptPayload(
+                status=f"rejected_{exc.response.status_code}",
+                client_order_id=client_order_id,
+                details={"http_status": exc.response.status_code, "body": body, "payload": payload},
+            )
+        order = response.get("order", {})
+        return ExecReceiptPayload(
+            status=order.get("status", "submitted"),
+            external_order_id=order.get("order_id"),
+            client_order_id=client_order_id,
+            details=response,
+        )
+
     async def _wait_for_fill(self, order_id: str) -> bool:
         elapsed = 0
         while elapsed < _FILL_TIMEOUT:
