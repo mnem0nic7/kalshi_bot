@@ -1444,6 +1444,41 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(jsonable_encoder(payload))
 
+    @app.get("/api/strategies/promotions")
+    async def strategies_promotions(
+        request: Request,
+        strategy: str | None = None,
+        limit: int = 25,
+    ) -> JSONResponse:
+        """Strategy promotion audit log (P2-3). Read-only surface; rows are
+        inserted via the ``record-strategy-promotion`` CLI."""
+        if limit < 1 or limit > 500:
+            return JSONResponse({"error": "invalid_limit"}, status_code=400)
+        app_container = container(request)
+        async with app_container.session_factory() as session:
+            repo = PlatformRepository(session)
+            events = await repo.list_strategy_promotions(
+                strategy=strategy,
+                kalshi_env=app_container.settings.kalshi_env,
+                limit=limit,
+            )
+        return JSONResponse(jsonable_encoder({
+            "events": [
+                {
+                    "id": e.id,
+                    "strategy": e.strategy,
+                    "from_state": e.from_state,
+                    "to_state": e.to_state,
+                    "actor": e.actor,
+                    "evidence_ref": e.evidence_ref,
+                    "notes": e.notes,
+                    "kalshi_env": e.kalshi_env,
+                    "created_at": e.created_at.isoformat(),
+                }
+                for e in events
+            ],
+        }))
+
     @app.post("/api/strategies/{strategy_name}/activate")
     async def activate_strategy_preset(strategy_name: str, request: Request) -> JSONResponse:
         app_container = container(request)

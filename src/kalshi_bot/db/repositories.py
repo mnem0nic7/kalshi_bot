@@ -69,6 +69,7 @@ from kalshi_bot.db.models import (
     RoomStrategyAuditRecord,
     CityStrategyAssignment,
     Signal,
+    StrategyPromotionEvent,
     StrategyRecord,
     StrategyCodexRunRecord,
     StrategyResultRecord,
@@ -3437,6 +3438,55 @@ class PlatformRepository:
 
     async def list_city_strategy_assignments(self) -> list[CityStrategyAssignment]:
         stmt = select(CityStrategyAssignment).order_by(CityStrategyAssignment.series_ticker)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def record_strategy_promotion(
+        self,
+        *,
+        strategy: str,
+        from_state: str,
+        to_state: str,
+        actor: str,
+        evidence_ref: str | None = None,
+        notes: str | None = None,
+        kalshi_env: str | None = None,
+    ) -> StrategyPromotionEvent:
+        """Append one row to the strategy promotion audit log (P2-3)."""
+        if not strategy or not strategy.strip():
+            raise ValueError("strategy must be non-empty")
+        if not actor or not actor.strip():
+            raise ValueError("actor must be non-empty")
+        if from_state == to_state:
+            raise ValueError("from_state and to_state must differ")
+        record = StrategyPromotionEvent(
+            id=str(uuid4()),
+            strategy=strategy.strip(),
+            from_state=from_state.strip(),
+            to_state=to_state.strip(),
+            actor=actor.strip(),
+            evidence_ref=evidence_ref,
+            notes=notes,
+            kalshi_env=self._resolved_kalshi_env(kalshi_env) if kalshi_env is not None else None,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def list_strategy_promotions(
+        self,
+        *,
+        strategy: str | None = None,
+        kalshi_env: str | None = None,
+        limit: int = 50,
+    ) -> list[StrategyPromotionEvent]:
+        stmt = select(StrategyPromotionEvent)
+        if strategy is not None:
+            stmt = stmt.where(StrategyPromotionEvent.strategy == strategy)
+        if kalshi_env is not None:
+            stmt = stmt.where(
+                StrategyPromotionEvent.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+            )
+        stmt = stmt.order_by(StrategyPromotionEvent.created_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
     async def clear_city_strategy_assignments(self, *, assigned_by: str | None = None) -> int:
