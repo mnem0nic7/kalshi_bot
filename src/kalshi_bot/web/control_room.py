@@ -1381,6 +1381,7 @@ async def build_control_room_summary(container: AppContainer) -> dict[str, Any]:
     payload["daily_pnl_display"] = _money_display(daily_pnl, signed=True)
     payload["daily_pnl_tone"] = _pnl_tone(daily_pnl)
     payload["strategy_c"] = await _strategy_c_summary(container)
+    payload["regression_read_source"] = getattr(container, "regression_read_source", "primary")
     return payload
 
 
@@ -2854,7 +2855,14 @@ async def build_strategies_dashboard_core(
     if window_days not in STRATEGY_WINDOW_OPTIONS:
         window_days = DEFAULT_STRATEGY_WINDOW_DAYS
 
-    async with container.session_factory() as session:
+    # Reads go through the regression read factory so operators can point the
+    # strategies dashboard at production data while regression snapshots still
+    # land locally. Falls back to the primary session factory for test stubs
+    # that predate the split.
+    read_session_factory = getattr(
+        container, "regression_read_session_factory", container.session_factory
+    )
+    async with read_session_factory() as session:
         repo = PlatformRepository(session)
         strategies = await repo.list_strategies(active_only=True)
         assignments = await repo.list_city_strategy_assignments()

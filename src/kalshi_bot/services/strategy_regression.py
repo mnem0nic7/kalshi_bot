@@ -431,9 +431,14 @@ class StrategyRegressionService:
         session_factory: async_sessionmaker,
         weather_directory: WeatherMarketDirectory,
         agent_pack_service: AgentPackService,
+        *,
+        read_session_factory: async_sessionmaker | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
+        # Read factory: historical rooms, settlements, strategies come from here.
+        # Write factory (session_factory above): regression snapshots + checkpoints.
+        self.read_session_factory = read_session_factory or session_factory
         self.weather_directory = weather_directory
         self.agent_pack_service = agent_pack_service
 
@@ -450,10 +455,9 @@ class StrategyRegressionService:
         run_at = run_at or datetime.now(UTC)
         date_from = run_at - timedelta(days=window_days)
         date_to = run_at
-        async with self.session_factory() as session:
+        async with self.read_session_factory() as session:
             repo = PlatformRepository(session)
             rooms = await repo.get_strategy_regression_rooms(date_from, date_to)
-            await session.commit()
         if not rooms:
             return {"status": "no_rooms", "window_days": window_days}
         return self.evaluate_strategy_specs_from_rooms(
@@ -527,9 +531,10 @@ class StrategyRegressionService:
         date_from = now - timedelta(days=WINDOW_DAYS)
         date_to = now
 
-        async with self.session_factory() as session:
-            repo = PlatformRepository(session)
-            strategy_rows = await repo.list_strategies(active_only=True)
+        # Read phase — strategies + rooms come from the (possibly remote) read source.
+        async with self.read_session_factory() as read_session:
+            read_repo = PlatformRepository(read_session)
+            strategy_rows = await read_repo.list_strategies(active_only=True)
             strategies = [
                 RegressionStrategySpec(
                     id=strategy.id,
@@ -542,22 +547,25 @@ class StrategyRegressionService:
             if not strategies:
                 return {"status": "no_strategies"}
 
-            rooms = await repo.get_strategy_regression_rooms(date_from, date_to)
+            rooms = await read_repo.get_strategy_regression_rooms(date_from, date_to)
             if not rooms:
                 return {"status": "no_rooms", "window_days": WINDOW_DAYS}
 
-            evaluation = self.evaluate_strategy_specs_from_rooms(
-                strategies=strategies,
-                rooms=rooms,
-                run_at=now,
-                date_from=date_from,
-                date_to=date_to,
-                window_days=WINDOW_DAYS,
-            )
-            diagnostics = evaluation["diagnostics"]
-            result_rows = evaluation["result_rows"]
-            city_results = evaluation["city_results"]
+        evaluation = self.evaluate_strategy_specs_from_rooms(
+            strategies=strategies,
+            rooms=rooms,
+            run_at=now,
+            date_from=date_from,
+            date_to=date_to,
+            window_days=WINDOW_DAYS,
+        )
+        diagnostics = evaluation["diagnostics"]
+        result_rows = evaluation["result_rows"]
+        city_results = evaluation["city_results"]
 
+        # Write phase — regression snapshots and checkpoints stay on local primary.
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
             await repo.save_strategy_results(result_rows)
 
             recommendation_counts: Counter[str] = Counter()

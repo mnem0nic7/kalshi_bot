@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     postgres_user: str = "postgres"
     postgres_password: str | None = None
     postgres_secondary_host: str | None = None
+    strategy_regression_read_source: str = "primary"
 
     kalshi_env: str = "demo"
     kalshi_read_api_key_id: str | None = Field(
