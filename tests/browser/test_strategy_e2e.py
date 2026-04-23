@@ -134,12 +134,11 @@ class FakeStrategyProvider:
 class FakeProviderRouter:
     def __init__(self) -> None:
         self.gemini = FakeStrategyProvider("gemini")
-        self.codex = FakeStrategyProvider("codex")
-        self.hosted = None
+        self.hosted = FakeStrategyProvider("openai")
 
     async def close(self) -> None:
         await self.gemini.close()
-        await self.codex.close()
+        await self.hosted.close()
 
 
 def _artifact_root() -> Path:
@@ -721,6 +720,11 @@ def test_strategy_operator_flow_e2e(monkeypatch: pytest.MonkeyPatch, tmp_path: P
                 message_box = codex_lab.locator('[data-testid="strategy-codex-message"]').first
 
                 assert provider_input.input_value(timeout=15_000) == "gemini"
+                provider_options = codex_lab.locator("#strategies-codex-provider option").evaluate_all(
+                    "(nodes) => nodes.map((node) => node.textContent)"
+                )
+                assert provider_options == ["Gemini", "OpenAI"]
+                assert "Codex" not in provider_options
                 assert model_input.input_value(timeout=15_000) == "gemini-2.5-pro"
                 assert model_input.get_attribute("list", timeout=15_000) == "strategies-codex-model-options"
                 model_options = codex_lab.locator("#strategies-codex-model-options option").evaluate_all(

@@ -33,8 +33,7 @@ Browser (dashboard.js)
 | Edge adjustment | `src/kalshi_bot/services/strategy_eval.py` |
 | Evaluation Lab | `src/kalshi_bot/services/strategy_codex.py` |
 | Auto-Evolve service | `src/kalshi_bot/services/strategy_auto_evolve.py` |
-| Codex CLI provider | `src/kalshi_bot/agents/codex_cli.py` |
-| Provider router | `src/kalshi_bot/agents/providers.py` — `build_codex_provider()` |
+| Evaluation Lab providers | `src/kalshi_bot/agents/providers.py` — Gemini and OpenAI-compatible Chat Completions clients |
 | Dashboard service | `src/kalshi_bot/services/strategy_dashboard.py` — bridges `control_room.py` to the three sub-services |
 | Frontend | `src/kalshi_bot/web/static/dashboard.js` — `renderStrategies()` and friends |
 | Template | `src/kalshi_bot/web/templates/index.html` lines 209–351 |
@@ -100,17 +99,19 @@ The Evaluation Lab lets the operator or Auto-Evolve ask the AI to evaluate an ex
 
 ### Providers
 
-The Evaluation Lab supports two providers: **Gemini** (primary) and **Codex CLI** (secondary). No other paths are wired.
+The Evaluation Lab supports two providers for new runs: **Gemini** (primary) and **OpenAI** (secondary through the OpenAI-compatible Chat Completions path). Historical `strategy_codex_runs` rows with `codex` or `codex-cli` provider labels remain readable in the dashboard, but those provider IDs are not accepted for new run requests.
 
 | Provider | How it works |
 |----------|-------------|
-| Gemini | `NativeGeminiProvider` via `GEMINI_KEY`. Used by default when available. |
-| Codex CLI | `CodexCLIProvider` shells out to the `codex` binary: `codex exec -c 'approval_policy="never"' - < prompt`. Auth is managed by the CLI from `~/.codex/auth.json`. Available when the `codex` binary is on PATH. |
+| Gemini | `NativeGeminiProvider` via `GEMINI_API_KEY` or the legacy `GEMINI_KEY` alias. Used by default when available. |
+| OpenAI | `OpenAICompatibleProvider` via `OPENAI_API_KEY` or `LLM_HOSTED_API_KEY`. Uses `LLM_HOSTED_BASE_URL` and `LLM_HOSTED_MODEL` for OpenAI-compatible overrides. |
 
 Config:
 ```
-GEMINI_KEY=...          # enables Gemini provider
-CODEX_MODEL=gpt-4o          # model passed to the CLI binary (default)
+GEMINI_API_KEY=...          # enables Gemini provider; GEMINI_KEY is also accepted
+OPENAI_API_KEY=...          # enables OpenAI provider; LLM_HOSTED_API_KEY is also accepted
+LLM_HOSTED_BASE_URL=https://api.openai.com/v1
+LLM_HOSTED_MODEL=gpt-5.4
 ```
 
 If neither provider is available, the Evaluation Lab is disabled (`is_available()` returns false).
@@ -152,7 +153,7 @@ STRATEGY_AUTO_EVOLVE_ACCEPT_SUGGESTIONS=true
 STRATEGY_AUTO_EVOLVE_ACTIVATE_SUGGESTIONS=true
 ```
 
-Provider precedence is Gemini first, then Codex CLI when available. Gemini requires `GEMINI_KEY`; Codex requires the `codex` binary and CLI auth. If no provider is available, Auto-Evolve writes a skipped checkpoint and does not mutate strategies or assignments.
+Provider precedence is Gemini first, then OpenAI when available. Gemini requires `GEMINI_API_KEY` or `GEMINI_KEY`; OpenAI requires `OPENAI_API_KEY` or `LLM_HOSTED_API_KEY`. If no provider is available, Auto-Evolve writes a skipped checkpoint and does not mutate strategies or assignments.
 
 Automatic mutations:
 
@@ -250,8 +251,7 @@ Strategy presets are seeded at startup from `STRATEGY_PRESETS` in `src/kalshi_bo
 - [x] City detail panel — threshold comparison, evidence status, next-action copy
 - [x] Strategy detail panel — per-city breakdown for selected preset
 - [x] Evaluation Lab UI — run creation, polling, accept/discard flow
-- [x] `CodexCLIProvider` — shells out to `codex exec` via subprocess; CLI manages its own auth
-- [x] `build_codex_provider()` — provider resolution: Gemini first, Codex CLI second
+- [x] Evaluation Lab providers — Gemini first, OpenAI-compatible Chat Completions second
 - [x] Nightly strategy automation — daemon-scheduled, checkpoint-guarded
 - [x] Edge adjustment after settlements
 - [x] Recent promotion / approval history panel
@@ -259,9 +259,8 @@ Strategy presets are seeded at startup from `STRATEGY_PRESETS` in `src/kalshi_bo
 
 ### In Progress / Pending
 
-- [ ] **Codex CLI in production** — `@openai/codex` npm package must be installed in the production container (`npm install -g @openai/codex`). Without it, only Gemini is available for the Evaluation Lab. Run `codex login` on the server after install to authenticate.
-- [ ] **Evaluation Lab end-to-end smoke test on live** — verify provider execution works after deploy; check `codexLabPayload` and `automation.provider` in dashboard response show the selected provider.
-- [ ] **Evaluation Lab provider smoke test on live** — verify the active provider path works after deploy; the dashboard `automation.provider` field should show `gemini` first when `GEMINI_KEY` is present.
+- [ ] **Evaluation Lab end-to-end smoke test on live** — verify Gemini/OpenAI provider execution works after deploy; check `codexLabPayload` and `automation.provider` in dashboard response show the selected provider.
+- [ ] **Optional live provider smoke tests** — run `RUN_EVAL_LAB_LIVE_PROVIDER_SMOKE=1 pytest tests/integration/test_evaluation_lab_live_providers.py` only when real Gemini/OpenAI keys are present and API spend is expected.
 
 ### Known Gaps / Future Work
 

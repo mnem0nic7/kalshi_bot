@@ -10,10 +10,6 @@ import httpx
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
-from pathlib import Path
-
-from kalshi_bot.agents.chatgpt_auth import ChatGPTAuthManager
-from kalshi_bot.agents.codex_cli import CodexCLIProvider
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import AgentRoleRuntime
@@ -101,6 +97,15 @@ class OpenAICompatibleProvider:
         temperature: float,
         schema_model: type[BaseModel] | None = None,
     ) -> dict[str, Any]:
+        response_format: dict[str, Any] = {"type": "json_object"}
+        if schema_model is not None and "api.openai.com" in self.config.base_url:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_model.__name__,
+                    "schema": schema_model.model_json_schema(),
+                },
+            }
         response = await self.client.post(
             f"{self.config.base_url.rstrip('/')}/chat/completions",
             json={
@@ -110,7 +115,7 @@ class OpenAICompatibleProvider:
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": temperature,
-                "response_format": {"type": "json_object"},
+                "response_format": response_format,
             },
         )
         response.raise_for_status()
@@ -189,108 +194,6 @@ class NativeGeminiProvider:
         return decoded
 
 
-class ChatGPTCodexProvider:
-    """OpenAI chat/completions via ChatGPT OAuth tokens (no API key required).
-
-    Fetches a fresh access_token before every request so token refreshes are
-    transparent. The chatgpt-account-id header is required by the ChatGPT backend.
-    """
-
-    _API_URL = "https://api.openai.com/v1/chat/completions"
-
-    def __init__(self, auth_manager: ChatGPTAuthManager, timeout_seconds: float) -> None:
-        self._auth = auth_manager
-        self._client = httpx.AsyncClient(timeout=timeout_seconds)
-
-    async def close(self) -> None:
-        await self._client.aclose()
-
-    @_llm_retry
-    async def complete_text(self, *, system_prompt: str, user_prompt: str, model: str, temperature: float) -> str:
-        token = await self._auth.get_access_token()
-        account_id = await self._auth.get_account_id()
-        response = await self._client.post(
-            self._API_URL,
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": temperature,
-            },
-            headers={
-                "Authorization": f"Bearer {token}",
-                "chatgpt-account-id": account_id,
-            },
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
-
-    @_llm_retry
-    async def complete_json(
-        self,
-        *,
-        system_prompt: str,
-        user_prompt: str,
-        model: str,
-        temperature: float,
-        schema_model: type[BaseModel] | None = None,
-    ) -> dict[str, Any]:
-        token = await self._auth.get_access_token()
-        account_id = await self._auth.get_account_id()
-        response = await self._client.post(
-            self._API_URL,
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": temperature,
-                "response_format": {"type": "json_object"},
-            },
-            headers={
-                "Authorization": f"Bearer {token}",
-                "chatgpt-account-id": account_id,
-            },
-        )
-        response.raise_for_status()
-        decoded = json.loads(response.json()["choices"][0]["message"]["content"])
-        if schema_model is not None:
-            decoded = schema_model.model_validate(decoded).model_dump(mode="json")
-        return decoded
-
-
-def _load_chatgpt_auth_manager(settings: Settings) -> ChatGPTAuthManager | None:
-    """Return a ChatGPTAuthManager if auth.json exists and has auth_mode='chatgpt'."""
-    path = Path(settings.codex_auth_json_path).expanduser()
-    if not path.exists():
-        return None
-    try:
-        import json as _json
-        data = _json.loads(path.read_text(encoding="utf-8"))
-        if data.get("auth_mode") != "chatgpt":
-            return None
-        return ChatGPTAuthManager(path)
-    except Exception as exc:
-        logger.warning("Failed to read %s: %s — ChatGPT OAuth provider unavailable", path, exc)
-        return None
-
-
-def build_codex_provider(
-    settings: Settings,
-    *,
-    timeout_seconds: float | None = None,
-) -> tuple[CodexCLIProvider | None, str]:
-    """Return (provider, description). Only the Codex CLI binary is supported."""
-    effective_timeout = timeout_seconds if timeout_seconds is not None else settings.llm_request_timeout_seconds
-    if CodexCLIProvider.is_available():
-        logger.info("Codex provider: CLI binary (codex exec)")
-        return CodexCLIProvider(model=settings.codex_model, timeout_seconds=effective_timeout), "codex-cli"
-    return None, "unavailable"
-
-
 class ProviderRouter:
     GEMINI_ROLE_DEFAULTS = {
         AgentRole.RESEARCHER: "gemini_model_researcher",
@@ -315,14 +218,6 @@ class ProviderRouter:
             if settings.gemini_api_key
             else None
         )
-        _chatgpt_mgr = _load_chatgpt_auth_manager(settings)
-        if _chatgpt_mgr is not None:
-            self.codex: ChatGPTCodexProvider | CodexCLIProvider | OpenAICompatibleProvider | None = ChatGPTCodexProvider(
-                _chatgpt_mgr, timeout_seconds=settings.llm_request_timeout_seconds
-            )
-            logger.info("Codex provider: ChatGPT OAuth (chatgpt-account-id auth)")
-        else:
-            self.codex, _codex_mode = build_codex_provider(settings)
         self.hosted = (
             OpenAICompatibleProvider(
                 ProviderConfig(
@@ -347,8 +242,6 @@ class ProviderRouter:
     async def close(self) -> None:
         if self.gemini is not None:
             await self.gemini.close()
-        if self.codex is not None:
-            await self.codex.close()
         if self.hosted is not None:
             await self.hosted.close()
         await self.local.close()
@@ -357,8 +250,8 @@ class ProviderRouter:
         if self.gemini is not None and role in self.GEMINI_ROLE_DEFAULTS:
             default_model = getattr(self.settings, self.GEMINI_ROLE_DEFAULTS[role])
             return AgentRoleRuntime(provider="gemini", model=default_model, temperature=0.2)
-        if self.codex is not None:
-            return AgentRoleRuntime(provider="codex", model=self.settings.codex_model, temperature=0.2)
+        if self.hosted is not None:
+            return AgentRoleRuntime(provider="hosted", model=self.settings.llm_hosted_model, temperature=0.2)
         return AgentRoleRuntime(provider="local", model=self.settings.llm_local_model, temperature=0.2)
 
     def resolve_usage(self, *, role: AgentRole, role_config: AgentRoleRuntime | None = None) -> tuple[Any | None, ProviderUsage]:
@@ -369,15 +262,8 @@ class ProviderRouter:
             if self.gemini is not None:
                 model = config.model or getattr(self.settings, self.GEMINI_ROLE_DEFAULTS.get(role, "gemini_model_researcher"))
                 return self.gemini, ProviderUsage(provider="gemini", model=model, temperature=temperature)
-            requested_provider = "codex"
-        if requested_provider == "codex":
-            if self.codex is not None:
-                return self.codex, ProviderUsage(
-                    provider="codex",
-                    model=config.model or self.settings.codex_model,
-                    temperature=temperature,
-                    fallback_used=(role_config is not None and role_config.provider.lower() not in {"codex"}),
-                )
+            requested_provider = "hosted"
+        if requested_provider == "openai":
             requested_provider = "hosted"
         if requested_provider == "hosted":
             if self.hosted is not None:
@@ -385,6 +271,7 @@ class ProviderRouter:
                     provider="hosted",
                     model=config.model or self.settings.llm_hosted_model,
                     temperature=temperature,
+                    fallback_used=(role_config is not None and role_config.provider.lower() not in {"hosted", "openai"}),
                 )
             requested_provider = "local"
         if requested_provider == "local":

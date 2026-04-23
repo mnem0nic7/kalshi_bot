@@ -11,9 +11,9 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from kalshi_bot.agents.codex_cli import CodexCLIProvider
 from kalshi_bot.agents.providers import (
     NativeGeminiProvider,
+    OpenAICompatibleProvider,
     ProviderRouter,
 )
 from kalshi_bot.config import Settings
@@ -33,10 +33,10 @@ CODEX_CREATION_WINDOW_DAYS = 180
 CODEX_TRIGGER_SOURCES = {"manual", "nightly"}
 STRATEGY_LAB_SOURCE = "strategy_lab"
 LEGACY_STRATEGY_LAB_SOURCES = {"codex_cli", STRATEGY_LAB_SOURCE}
-STRATEGY_PROVIDER_PREFERENCE = ("gemini", "codex")
+STRATEGY_PROVIDER_PREFERENCE = ("gemini", "openai")
 STRATEGY_PROVIDER_LABELS = {
     "gemini": "Gemini",
-    "codex": "Codex",
+    "openai": "OpenAI",
 }
 
 
@@ -112,22 +112,22 @@ class StrategyCodexService:
         if not provider_id:
             return None
         lowered = provider_id.strip().lower()
-        if lowered in {"codex", "codex-cli"}:
-            return "codex"
+        if lowered == "hosted":
+            return "openai"
         if lowered == "gemini":
+            return lowered
+        if lowered == "openai":
             return lowered
         return None
 
     def _provider_object(
         self,
         provider_id: str | None,
-    ) -> NativeGeminiProvider | CodexCLIProvider | None:
+    ) -> NativeGeminiProvider | OpenAICompatibleProvider | None:
         normalized = self._normalize_provider_id(provider_id)
         if normalized == "gemini":
             return self.providers.gemini
-        if normalized == "codex":
-            return self.providers.codex
-        if normalized == "hosted":
+        if normalized == "openai":
             return self.providers.hosted
         return None
 
@@ -135,9 +135,7 @@ class StrategyCodexService:
         normalized = self._normalize_provider_id(provider_id)
         if normalized == "gemini":
             return self.settings.gemini_model_president
-        if normalized == "codex":
-            return self.settings.codex_model
-        if normalized == "hosted":
+        if normalized == "openai":
             return self.settings.llm_hosted_model
         return None
 
@@ -156,10 +154,8 @@ class StrategyCodexService:
                     "gemini-2.5-flash",
                 ]
             )
-        if normalized == "codex":
-            return _ordered_unique([self.settings.codex_model])
-        if normalized == "hosted":
-            return _ordered_unique([self.settings.llm_hosted_model])
+        if normalized == "openai":
+            return _ordered_unique([self.settings.llm_hosted_model, "gpt-5.4"])
         return []
 
     def _provider_options(self) -> list[dict[str, Any]]:
@@ -188,8 +184,12 @@ class StrategyCodexService:
         *,
         requested_provider: str | None,
         requested_model: str | None,
-    ) -> tuple[str, NativeGeminiProvider | CodexCLIProvider, str]:
-        provider_id = self._normalize_provider_id(requested_provider) or self._preferred_provider_id()
+    ) -> tuple[str, NativeGeminiProvider | OpenAICompatibleProvider, str]:
+        requested_provider_id = _clean_text(requested_provider)
+        provider_id = self._normalize_provider_id(requested_provider_id)
+        if requested_provider_id is not None and provider_id is None:
+            raise ValueError(f"Strategy provider {requested_provider_id} is unavailable")
+        provider_id = provider_id or self._preferred_provider_id()
         if provider_id is None:
             raise RuntimeError("No strategy lab provider is configured")
         provider = self._provider_object(provider_id)

@@ -109,7 +109,8 @@
   const LOW_CONFIDENCE_RECOMMENDATION_STATUSES = new Set(["too_close", "low_sample"]);
   const CODEX_PROVIDER_MODEL_FALLBACKS = {
     gemini: ["gemini-2.5-pro", "gemini-2.5-flash"],
-    codex: ["gpt-4o"],
+    openai: ["gpt-5.4"],
+    hosted: ["gpt-5.4"],
   };
 
   function reviewPriority(status) {
@@ -1299,8 +1300,9 @@
     const option = codexProviderOptions(payload).find((item) => item.id === providerId);
     if (option && option.label) return option.label;
     if (providerId === "gemini") return "Gemini";
-    if (providerId === "codex") return "Codex";
-    if (providerId === "hosted") return "Hosted";
+    if (providerId === "openai") return "OpenAI";
+    if (providerId === "codex" || providerId === "codex-cli") return "Codex";
+    if (providerId === "hosted") return "OpenAI";
     return providerId || "AI";
   }
 

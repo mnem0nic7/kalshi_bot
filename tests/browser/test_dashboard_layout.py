@@ -488,10 +488,10 @@ def _build_strategies_payload(
                     "suggested_models": ["gemini-2.5-pro", "gemini-2.5-flash"],
                 },
                 {
-                    "id": "codex",
-                    "label": "Codex",
-                    "default_model": "gpt-4o",
-                    "suggested_models": ["gpt-4o"],
+                    "id": "openai",
+                    "label": "OpenAI",
+                    "default_model": "gpt-5.4",
+                    "suggested_models": ["gpt-5.4"],
                 },
             ],
             "creation_window_days": 180,
@@ -530,7 +530,7 @@ def _build_strategies_payload(
             "inactive_codex_strategies": [
                 {
                     "name": "balanced-plus",
-                    "description": "A Codex-suggested preset that splits the difference between moderate and aggressive.",
+                    "description": "An AI-suggested preset that splits the difference between moderate and aggressive.",
                     "created_at": "2026-04-21T18:42:00+00:00",
                     "labels": ["city-specific", "gap-sensitive"],
                     "rationale": "Designed to preserve moderate's coverage while adding slightly looser spread tolerance.",
@@ -994,12 +994,24 @@ def test_strategies_tab_renders_filters_and_drilldowns(
                 assert "Saved Inactive Presets" in codex_text
                 assert "balanced-plus" in codex_text
                 assert page.locator("#strategies-codex-provider").input_value(timeout=15_000) == "gemini"
+                provider_options = page.locator("#strategies-codex-provider option").evaluate_all(
+                    "(nodes) => nodes.map((node) => node.textContent)"
+                )
+                assert provider_options == ["Gemini", "OpenAI"]
+                assert "Codex" not in provider_options
                 assert page.locator("#strategies-codex-model").input_value(timeout=15_000) == "gemini-2.5-pro"
                 assert page.locator("#strategies-codex-model").get_attribute("list", timeout=15_000) == "strategies-codex-model-options"
                 model_options = page.locator("#strategies-codex-model-options option").evaluate_all(
                     "(nodes) => nodes.map((node) => node.value)"
                 )
                 assert model_options == ["gemini-2.5-pro", "gemini-2.5-flash"]
+                page.locator("#strategies-codex-provider").select_option("openai")
+                assert page.locator("#strategies-codex-provider").input_value(timeout=15_000) == "openai"
+                assert page.locator("#strategies-codex-model").input_value(timeout=15_000) == "gpt-5.4"
+                openai_model_options = page.locator("#strategies-codex-model-options option").evaluate_all(
+                    "(nodes) => nodes.map((node) => node.value)"
+                )
+                assert openai_model_options == ["gpt-5.4"]
                 provider_row_box = page.locator("#strategies-codex-lab .strategy-codex-provider-row").bounding_box()
                 provider_box = page.locator("#strategies-codex-provider").bounding_box()
                 model_box = page.locator("#strategies-codex-model").bounding_box()

@@ -910,8 +910,8 @@ def test_create_strategy_codex_run_endpoint_schedules_background_execution(tmp_p
                 "series_ticker": "KXHIGHNY",
                 "strategy_name": "moderate",
                 "operator_brief": "Focus on mismatches and weak coverage.",
-                "provider": "gemini",
-                "model": "gemini-2.5-pro",
+                "provider": "openai",
+                "model": "gpt-5.4",
             },
         )
 
@@ -928,8 +928,8 @@ def test_create_strategy_codex_run_endpoint_schedules_background_execution(tmp_p
     assert request_payload.series_ticker == "KXHIGHNY"
     assert request_payload.strategy_name == "moderate"
     assert request_payload.operator_brief == "Focus on mismatches and weak coverage."
-    assert request_payload.provider == "gemini"
-    assert request_payload.model == "gemini-2.5-pro"
+    assert request_payload.provider == "openai"
+    assert request_payload.model == "gpt-5.4"
     assert captured["dashboard_snapshot"]["summary"]["window_days"] == 180
     get_settings.cache_clear()
 
@@ -965,6 +965,29 @@ def test_create_strategy_codex_run_endpoint_handles_unavailable_and_invalid_wind
     get_settings.cache_clear()
 
 
+def test_create_strategy_codex_run_endpoint_rejects_codex_provider(tmp_path, monkeypatch) -> None:
+    map_path = tmp_path / "markets.yaml"
+    map_path.write_text("markets: []\n", encoding="utf-8")
+    db_path = tmp_path / "api.db"
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/strategies/codex/runs",
+            json={"mode": "evaluate", "window_days": 180, "provider": "codex"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["msg"] == "Value error, Provider must be gemini or openai"
+    get_settings.cache_clear()
+
+
 def test_create_strategy_codex_run_endpoint_maps_invalid_provider_config(tmp_path, monkeypatch) -> None:
     map_path = tmp_path / "markets.yaml"
     map_path.write_text("markets: []\n", encoding="utf-8")
@@ -986,7 +1009,7 @@ def test_create_strategy_codex_run_endpoint_maps_invalid_provider_config(tmp_pat
             return True
 
         async def create_run(self, *, request, dashboard_snapshot, trigger_source="manual"):
-            raise ValueError("Strategy provider hosted is unavailable")
+            raise ValueError("Strategy provider openai is unavailable")
 
     monkeypatch.setattr(web_app_module, "build_strategies_dashboard", fake_build_strategies_dashboard)
     app = create_app()
@@ -1001,7 +1024,7 @@ def test_create_strategy_codex_run_endpoint_maps_invalid_provider_config(tmp_pat
     assert response.status_code == 400
     assert response.json() == {
         "error": "invalid_provider_config",
-        "message": "Strategy provider hosted is unavailable",
+        "message": "Strategy provider openai is unavailable",
     }
     get_settings.cache_clear()
 

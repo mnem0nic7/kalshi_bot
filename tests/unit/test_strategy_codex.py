@@ -22,9 +22,9 @@ from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
 class FakeProviderRouter:
-    def __init__(self, *, gemini=None, codex=None) -> None:
+    def __init__(self, *, gemini=None, openai=None) -> None:
         self.gemini = gemini
-        self.codex = codex
+        self.hosted = openai
 
     async def close(self) -> None:
         return None
@@ -120,12 +120,12 @@ async def test_strategy_codex_unique_strategy_name_uses_deterministic_suffixes()
     assert unique_name == "balanced-plus-3"
 
 
-def test_strategy_codex_service_prefers_gemini_when_available() -> None:
+def test_strategy_codex_service_prefers_gemini_then_openai_when_available() -> None:
     service = StrategyCodexService(
         Settings(database_url="sqlite+aiosqlite:///./strategy-codex-gemini.db"),
         SimpleNamespace(),
         SimpleNamespace(),
-        FakeProviderRouter(gemini=object(), codex=object()),
+        FakeProviderRouter(gemini=object(), openai=object()),
     )
 
     assert service.is_available() is True
@@ -134,6 +134,28 @@ def test_strategy_codex_service_prefers_gemini_when_available() -> None:
     provider_options = service._provider_options()
     assert provider_options[0]["id"] == "gemini"
     assert provider_options[0]["suggested_models"] == ["gemini-2.5-pro", "gemini-2.5-flash"]
+    assert provider_options[1]["id"] == "openai"
+    assert provider_options[1]["label"] == "OpenAI"
+    assert provider_options[1]["default_model"] == "gpt-5.4"
+    assert provider_options[1]["suggested_models"] == ["gpt-5.4"]
+    assert "codex" not in {option["id"] for option in provider_options}
+
+
+def test_strategy_codex_service_uses_openai_when_gemini_unavailable() -> None:
+    service = StrategyCodexService(
+        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-openai.db"),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        FakeProviderRouter(gemini=None, openai=object()),
+    )
+
+    assert service.is_available() is True
+    assert service._preferred_provider_id() == "openai"
+    assert service._default_model_for_provider("openai") == "gpt-5.4"
+    assert service._normalize_provider_id("hosted") == "openai"
+    assert service._normalize_provider_id("codex") is None
+    with pytest.raises(ValueError, match="Strategy provider codex is unavailable"):
+        service._resolve_provider_config(requested_provider="codex", requested_model=None)
 
 
 def test_strategy_codex_service_reports_unavailable_without_strategy_providers() -> None:
@@ -141,7 +163,7 @@ def test_strategy_codex_service_reports_unavailable_without_strategy_providers()
         Settings(database_url="sqlite+aiosqlite:///./strategy-codex-none.db"),
         SimpleNamespace(),
         SimpleNamespace(),
-        FakeProviderRouter(gemini=None, codex=None),
+        FakeProviderRouter(gemini=None, openai=None),
     )
 
     assert service.is_available() is False
@@ -177,11 +199,11 @@ async def test_strategy_codex_create_run_persists_selected_provider_and_model(tm
         settings,
         session_factory,
         SimpleNamespace(),
-        FakeProviderRouter(gemini=object(), codex=object()),
+        FakeProviderRouter(gemini=object(), openai=object()),
     )
 
     run = await service.create_run(
-        request=StrategyCodexRunRequest(mode="evaluate", window_days=180, provider="codex", model="gpt-4o"),
+        request=StrategyCodexRunRequest(mode="evaluate", window_days=180, provider="openai", model="gpt-5.4"),
         dashboard_snapshot={"summary": {"window_days": 180}, "leaderboard": [], "city_matrix": []},
         trigger_source="manual",
     )
@@ -192,10 +214,48 @@ async def test_strategy_codex_create_run_persists_selected_provider_and_model(tm
         await session.commit()
 
     assert record is not None
-    assert record.provider == "codex"
-    assert record.model == "gpt-4o"
+    assert record.provider == "openai"
+    assert record.model == "gpt-5.4"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_strategy_codex_create_run_persists_hosted_alias_as_openai(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-codex-hosted.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    service = StrategyCodexService(
+        settings,
+        session_factory,
+        SimpleNamespace(),
+        FakeProviderRouter(gemini=None, openai=object()),
+    )
+
+    run = await service.create_run(
+        request=StrategyCodexRunRequest(mode="evaluate", window_days=180, provider="hosted", model=None),
+        dashboard_snapshot={"summary": {"window_days": 180}, "leaderboard": [], "city_matrix": []},
+        trigger_source="manual",
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        record = await repo.get_strategy_codex_run(run["run_id"])
+        await session.commit()
+
+    assert record is not None
+    assert record.provider == "openai"
+    assert record.model == "gpt-5.4"
+
+    await engine.dispose()
+
+
+@pytest.mark.parametrize("provider", ["codex", "codex-cli"])
+def test_strategy_codex_run_request_rejects_codex_for_new_requests(provider: str) -> None:
+    with pytest.raises(ValidationError):
+        StrategyCodexRunRequest(mode="evaluate", window_days=180, provider=provider)
 
 
 def test_candidate_backtest_uses_dashboard_metric_shape() -> None:
@@ -300,7 +360,7 @@ async def test_strategy_codex_payloads_include_trigger_source(tmp_path) -> None:
         settings,
         session_factory,
         SimpleNamespace(),
-        FakeProviderRouter(gemini=None, codex=object()),
+        FakeProviderRouter(gemini=None, openai=object()),
     )
 
     dashboard_payload = await service.dashboard_payload()

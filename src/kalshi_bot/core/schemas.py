@@ -979,8 +979,10 @@ class StrategyCodexRunRequest(BaseModel):
         if value is None:
             return None
         normalized = value.lower()
-        if normalized not in {"gemini", "codex", "hosted"}:
-            raise ValueError("Provider must be gemini, codex, or hosted")
+        if normalized == "hosted":
+            return "openai"
+        if normalized not in {"gemini", "openai"}:
+            raise ValueError("Provider must be gemini or openai")
         return normalized
 
 
