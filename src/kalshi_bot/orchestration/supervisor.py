@@ -303,12 +303,52 @@ class WorkflowSupervisor:
                 loss_sensitivity_active = False
                 daily_loss_hard_blocked = False
                 daily_loss_ratio = 0.0
+                sensitivity_cp_key = f"loss_sensitivity_state:{room.kalshi_env}"
+                prior_sensitivity_cp = await repo.get_checkpoint(sensitivity_cp_key)
+                prior_sensitivity_active = (
+                    prior_sensitivity_cp.payload.get("active") is True
+                    if prior_sensitivity_cp is not None
+                    else False
+                )
                 if daily_pnl is not None and float(total_capital) > 0:
                     daily_loss_ratio = float(-daily_pnl) / float(total_capital)
                     if self.settings.risk_daily_loss_pct > 0 and daily_loss_ratio >= self.settings.risk_daily_loss_pct:
                         daily_loss_hard_blocked = True
                     elif self.settings.risk_daily_loss_sensitivity_pct > 0:
                         loss_sensitivity_active = daily_loss_ratio >= self.settings.risk_daily_loss_sensitivity_pct
+
+                if loss_sensitivity_active != prior_sensitivity_active:
+                    await repo.log_ops_event(
+                        severity="warning" if loss_sensitivity_active else "info",
+                        summary=(
+                            f"Loss sensitivity gate {'activated' if loss_sensitivity_active else 'deactivated'}: "
+                            f"{daily_loss_ratio:.1%} vs {self.settings.risk_daily_loss_sensitivity_pct:.0%} threshold"
+                        ),
+                        source="supervisor",
+                        room_id=room.id,
+                        kalshi_env=room.kalshi_env,
+                        payload={
+                            "daily_loss_ratio": round(daily_loss_ratio, 4),
+                            "sensitivity_pct": self.settings.risk_daily_loss_sensitivity_pct,
+                            "active": loss_sensitivity_active,
+                            "market_ticker": room.market_ticker,
+                        },
+                    )
+                    await repo.set_checkpoint(
+                        sensitivity_cp_key,
+                        cursor=None,
+                        payload={
+                            "active": loss_sensitivity_active,
+                            "changed_at": datetime.now(UTC).isoformat(),
+                            "daily_loss_ratio": round(daily_loss_ratio, 4),
+                        },
+                    )
+                    logger.warning(
+                        "Loss sensitivity gate %s: %.1f%% daily loss vs %.0f%% threshold",
+                        "activated" if loss_sensitivity_active else "deactivated",
+                        daily_loss_ratio * 100,
+                        self.settings.risk_daily_loss_sensitivity_pct * 100,
+                    )
 
                 effective_edge_bps = thresholds.risk_min_edge_bps
                 effective_order_cap = dynamic_order_cap
@@ -360,6 +400,27 @@ class WorkflowSupervisor:
                     strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
                 )
                 if daily_loss_hard_blocked:
+                    await repo.log_ops_event(
+                        severity="critical",
+                        summary=(
+                            f"Daily loss circuit breaker tripped: {daily_loss_ratio:.1%} loss "
+                            f">= {self.settings.risk_daily_loss_pct:.0%} hard limit"
+                        ),
+                        source="supervisor",
+                        room_id=room.id,
+                        kalshi_env=room.kalshi_env,
+                        payload={
+                            "daily_loss_ratio": round(daily_loss_ratio, 4),
+                            "hard_limit_pct": self.settings.risk_daily_loss_pct,
+                            "market_ticker": room.market_ticker,
+                        },
+                    )
+                    logger.critical(
+                        "Daily loss circuit breaker tripped: %.1f%% loss >= %.0f%% hard limit (ticker=%s)",
+                        daily_loss_ratio * 100,
+                        self.settings.risk_daily_loss_pct * 100,
+                        room.market_ticker,
+                    )
                     verdict = RiskVerdictPayload(
                         status=RiskStatus.BLOCKED,
                         reasons=[
