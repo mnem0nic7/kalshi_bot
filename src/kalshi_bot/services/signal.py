@@ -202,13 +202,47 @@ def suggested_trade_count_fp(
     settings: Settings,
     signal: StrategySignal,
     max_order_notional_dollars: float | None = None,
+    total_capital_dollars: Decimal | None = None,
 ) -> Decimal | None:
+    """Initial contract count for a Strategy A ticket.
+
+    Default behavior: ``flat_order_notional × confidence_tier_factor / unit_price``.
+
+    When ``settings.risk_edge_scaled_sizing_enabled`` is True *and*
+    ``total_capital_dollars`` is provided, falls back to fractional-Kelly
+    sizing via :mod:`kalshi_bot.services.sizing`. The Kelly notional is
+    always capped at the flat-percentage cap so this can only ever size
+    down; edge-scaled sizing never increases an order beyond the flat
+    limit the operator already chose.
+    """
     if signal.recommended_side is None or signal.target_yes_price_dollars is None:
         return None
     notional_cap = max_order_notional_dollars if max_order_notional_dollars is not None else settings.risk_max_order_notional_dollars
     if notional_cap is None:
         return None
-    max_notional = Decimal(str(notional_cap)) * _confidence_size_factor(signal.confidence)
+    flat_max_notional = Decimal(str(notional_cap)) * _confidence_size_factor(signal.confidence)
+
+    if (
+        settings.risk_edge_scaled_sizing_enabled
+        and total_capital_dollars is not None
+        and total_capital_dollars > Decimal("0")
+    ):
+        from kalshi_bot.services.sizing import edge_scaled_notional_dollars
+        kelly_notional = edge_scaled_notional_dollars(
+            total_capital_dollars=total_capital_dollars,
+            fair_yes=signal.fair_yes_dollars,
+            target_price=signal.target_yes_price_dollars,
+            side=signal.recommended_side.value,
+            confidence=signal.confidence,
+            kelly_multiplier=settings.risk_edge_scaled_kelly_multiplier,
+        )
+        # Flat cap is still the ceiling — Kelly can only shrink the order.
+        max_notional = min(kelly_notional, flat_max_notional)
+        if max_notional <= Decimal("0"):
+            return None
+    else:
+        max_notional = flat_max_notional
+
     unit_price = (
         signal.target_yes_price_dollars
         if signal.recommended_side == ContractSide.YES

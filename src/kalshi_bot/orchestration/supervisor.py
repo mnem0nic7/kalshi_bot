@@ -256,6 +256,7 @@ class WorkflowSupervisor:
                     settings=self.settings,
                     signal=signal,
                     max_order_notional_dollars=dynamic_order_cap,
+                    total_capital_dollars=total_capital,
                 )
                 if count_fp is None or count_fp <= Decimal("0"):
                     eligible = False
