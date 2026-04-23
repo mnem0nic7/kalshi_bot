@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from unittest.mock import MagicMock
 
 import pytest
@@ -225,5 +226,57 @@ async def test_supervisor_proceeds_when_market_not_yet_closed(tmp_path) -> None:
     # Room ran past the close guard — it should have more messages than just the trigger
     market_closed_messages = [m for m in messages if m.payload.get("final_status") == "market_closed"]
     assert len(market_closed_messages) == 0
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_log_flip_alert_for_zero_count_position(tmp_path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path}/app.db"
+    settings = Settings(
+        database_url=database_url,
+        app_color="blue",
+        app_shadow_mode=True,
+        risk_min_edge_bps=10,
+        risk_max_order_notional_dollars=50,
+        risk_max_position_notional_dollars=100,
+        risk_max_order_count_fp=20,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    future_close = (datetime.now(UTC) + timedelta(hours=4)).isoformat()
+    kalshi = _make_kalshi(future_close)
+    supervisor = _make_supervisor(settings, session_factory, kalshi)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(settings.app_color)
+        await repo.upsert_position(
+            market_ticker="WX-TEST",
+            subaccount=settings.kalshi_subaccount,
+            kalshi_env=settings.kalshi_env,
+            side="no",
+            count_fp=Decimal("0.00"),
+            average_price_dollars=Decimal("0.5500"),
+            raw={"seeded": True},
+        )
+        room = await repo.create_room(
+            RoomCreate(name="Zero Count Position Test", market_ticker="WX-TEST"),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        await session.commit()
+
+    await supervisor.run_room(room.id, reason="zero_count_position_test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        ops_events = await repo.list_ops_events(limit=20, kalshi_env=settings.kalshi_env)
+
+    assert all("Latest signal flipped away from held side" not in event.summary for event in ops_events)
 
     await engine.dispose()

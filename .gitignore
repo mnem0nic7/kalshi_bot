@@ -22,3 +22,4 @@ htmlcov/
 *.log
 .tmp/
 .codex
+docs/production-trade-mechanics-audit-*.md

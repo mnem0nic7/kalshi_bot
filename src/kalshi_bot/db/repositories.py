@@ -1244,6 +1244,7 @@ class PlatformRepository:
         subaccount: int = 0,
         *,
         kalshi_env: str | None = None,
+        include_closed: bool = False,
     ) -> PositionRecord | None:
         env = self._resolved_kalshi_env(kalshi_env)
         stmt = select(PositionRecord).where(
@@ -1251,6 +1252,8 @@ class PlatformRepository:
             PositionRecord.market_ticker == market_ticker,
             PositionRecord.subaccount == subaccount,
         )
+        if not include_closed:
+            stmt = stmt.where(PositionRecord.count_fp > 0)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def get_pending_buy_count_fp(
