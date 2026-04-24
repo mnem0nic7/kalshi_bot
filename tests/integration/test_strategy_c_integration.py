@@ -23,7 +23,7 @@ from kalshi_bot.weather.models import WeatherMarketMapping
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-TICKER = "KXHIGHTBOS-26APR22-T58"
+TICKER = f"KXHIGHTBOS-{(datetime.now(UTC) + timedelta(days=7)).strftime('%y%b%d').upper()}-T58"
 STATION = "KBOS"
 
 

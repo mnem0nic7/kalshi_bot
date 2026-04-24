@@ -139,7 +139,7 @@ async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_p
                 location_name="NYC",
                 latitude=40.0,
                 longitude=-73.0,
-                threshold_f=80,
+                threshold_f=96,
             ),
             "WX-TWO": WeatherMarketMapping(
                 market_ticker="WX-TWO",
@@ -148,7 +148,7 @@ async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_p
                 location_name="Chicago",
                 latitude=41.0,
                 longitude=-87.0,
-                threshold_f=78,
+                threshold_f=86,
             ),
         }
     )
