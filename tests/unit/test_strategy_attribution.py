@@ -139,6 +139,38 @@ async def test_upsert_fill_inherits_strategy_code_from_kalshi_order(repo_factory
             kalshi_env="demo",
         )
         assert fill.strategy_code == "A"
+        assert fill.order_id is not None
+
+
+@pytest.mark.asyncio
+async def test_upsert_sell_fill_inherits_strategy_from_latest_same_side_buy(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        await repo.upsert_fill(
+            market_ticker="KXHIGHNY-26APR23-T68",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.4000"),
+            count_fp=Decimal("10.00"),
+            raw={},
+            trade_id="entry-fill",
+            kalshi_env="demo",
+            strategy_code=StrategyCode.DIRECTIONAL.value,
+        )
+
+        exit_fill = await repo.upsert_fill(
+            market_ticker="KXHIGHNY-26APR23-T68",
+            side="yes",
+            action="sell",
+            yes_price_dollars=Decimal("0.3000"),
+            count_fp=Decimal("10.00"),
+            raw={},
+            trade_id="exit-fill",
+            kalshi_env="demo",
+        )
+
+        assert exit_fill.strategy_code == StrategyCode.DIRECTIONAL.value
 
 
 @pytest.mark.asyncio

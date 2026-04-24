@@ -24,6 +24,7 @@ from kalshi_bot.db.session import init_models
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
+from kalshi_bot.services.trading_audit import format_trading_audit_text
 
 
 def _float_or_none(value: object) -> float | None:
@@ -44,7 +45,7 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
-    container = await AppContainer.build(bootstrap_db=args.command != "init-db")
+    container = await AppContainer.build(bootstrap_db=args.command not in {"init-db", "trading-audit"})
     try:
         if args.command == "init-db":
             await init_models(container.engine)
@@ -172,6 +173,27 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "training-status":
             print(json.dumps(await container.training_corpus_service.get_status(persist_readiness=True), indent=2))
+            return 0
+
+        if args.command == "trading-audit":
+            if args.trading_audit_command == "repair":
+                result = await container.trading_audit_service.repair_attribution(
+                    kalshi_env=args.kalshi_env,
+                    days=args.days,
+                    dry_run=args.dry_run,
+                    limit=args.limit,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            report = await container.trading_audit_service.build_report(
+                kalshi_env=args.kalshi_env,
+                days=args.days,
+                focus=args.focus,
+            )
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(format_trading_audit_text(report))
             return 0
 
         if args.command == "training-build":
@@ -943,6 +965,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("training-status")
+
+    trading_audit = subparsers.add_parser(
+        "trading-audit",
+        help="Read-only money/safety audit of recent trading behavior.",
+    )
+    trading_audit.add_argument("trading_audit_command", nargs="?", choices=["report", "repair"], default="report")
+    trading_audit.add_argument("--kalshi-env", default="production")
+    trading_audit.add_argument("--days", type=int, default=7)
+    trading_audit.add_argument("--focus", choices=["money-safety"], default="money-safety")
+    trading_audit.add_argument("--json", action="store_true")
+    trading_audit.add_argument("--limit", type=int, default=500)
+    trading_audit.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
 
     training_build = subparsers.add_parser("training-build")
     training_build.add_argument("training_build_scope", nargs="?", choices=["historical"])

@@ -40,6 +40,7 @@ from kalshi_bot.services.strategy_eval import StrategyEvaluationService
 from kalshi_bot.services.strategy_codex import StrategyCodexService
 from kalshi_bot.services.strategy_dashboard import StrategyDashboardService
 from kalshi_bot.services.strategy_regression import StrategyRegressionService
+from kalshi_bot.services.trading_audit import TradingAuditService
 from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.services.market_history import MarketHistoryService
@@ -92,6 +93,7 @@ class AppContainer:
     strategy_codex_service: StrategyCodexService
     strategy_dashboard_service: StrategyDashboardService
     strategy_auto_evolve_service: StrategyAutoEvolveService
+    trading_audit_service: TradingAuditService
     market_history_service: MarketHistoryService
     watchdog_service: WatchdogService
     agents: AgentSuite
@@ -280,6 +282,7 @@ class AppContainer:
             weather_directory=weather_directory,
             strategy_codex_service=strategy_codex_service,
         )
+        trading_audit_service = TradingAuditService(settings, session_factory)
         strategy_auto_evolve_service = StrategyAutoEvolveService(
             settings=settings,
             session_factory=session_factory,
@@ -287,6 +290,7 @@ class AppContainer:
             strategy_regression_service=strategy_regression_service,
             strategy_codex_service=strategy_codex_service,
             strategy_dashboard_service=strategy_dashboard_service,
+            trading_audit_service=trading_audit_service,
         )
         momentum_calibration_service = MomentumCalibrationService(
             session_factory=session_factory,
@@ -360,6 +364,7 @@ class AppContainer:
             strategy_codex_service=strategy_codex_service,
             strategy_dashboard_service=strategy_dashboard_service,
             strategy_auto_evolve_service=strategy_auto_evolve_service,
+            trading_audit_service=trading_audit_service,
             market_history_service=market_history_service,
             watchdog_service=watchdog_service,
             agents=agents,

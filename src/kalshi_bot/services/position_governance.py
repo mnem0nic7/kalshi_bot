@@ -406,6 +406,12 @@ async def refresh_stop_loss_checkpoints(
             and (
                 (latest_order is not None and fill.order_id == latest_order.id)
                 or (
+                    latest_order is not None
+                    and latest_order.kalshi_order_id
+                    and isinstance(fill.raw, dict)
+                    and fill.raw.get("order_id") == latest_order.kalshi_order_id
+                )
+                or (
                     submitted_at is not None
                     and _datetime_on_or_after(fill.created_at, submitted_at - timedelta(seconds=5))
                 )

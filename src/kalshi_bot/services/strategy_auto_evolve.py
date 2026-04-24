@@ -27,6 +27,7 @@ class StrategyAutoEvolveService:
         strategy_regression_service: Any,
         strategy_codex_service: Any,
         strategy_dashboard_service: Any,
+        trading_audit_service: Any | None = None,
         secondary_session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self.settings = settings
@@ -35,6 +36,7 @@ class StrategyAutoEvolveService:
         self.strategy_regression_service = strategy_regression_service
         self.strategy_codex_service = strategy_codex_service
         self.strategy_dashboard_service = strategy_dashboard_service
+        self.trading_audit_service = trading_audit_service
 
     @property
     def checkpoint_name(self) -> str:
@@ -107,6 +109,17 @@ class StrategyAutoEvolveService:
             )
             return payload
 
+        audit_summary = await self._trading_audit_summary()
+        payload["trading_audit"] = audit_summary
+        if audit_summary.get("blocked"):
+            payload.update({"status": "skipped", "reason": "trading_audit_blocked"})
+            await self._record_result(
+                payload,
+                severity="warning",
+                summary="Strategy Auto-Evolve skipped: trading audit blockers present",
+            )
+            return payload
+
         regression_payload = await self._ensure_fresh_regression()
         payload["regression"] = regression_payload
         if not regression_payload.get("fresh"):
@@ -122,6 +135,7 @@ class StrategyAutoEvolveService:
             window_days=self.settings.strategy_auto_evolve_window_days,
             include_codex_lab=False,
         )
+        snapshot["trading_audit"] = audit_summary
         run_views = await self.strategy_codex_service.execute_modes_for_snapshot(
             modes=["evaluate", "suggest"],
             dashboard_snapshot=snapshot,
@@ -156,6 +170,7 @@ class StrategyAutoEvolveService:
             window_days=self.settings.strategy_auto_evolve_window_days,
             include_codex_lab=False,
         )
+        assignment_snapshot["trading_audit"] = audit_summary
         if errors:
             assignment_result = {"changes": [], "skips": [], "errors": []}
         else:
@@ -278,6 +293,42 @@ class StrategyAutoEvolveService:
             "last_run_at": last_run_at.isoformat() if last_run_at is not None else None,
             "refreshed": refreshed,
             "result": regression_result,
+        }
+
+    async def _trading_audit_summary(self) -> dict[str, Any]:
+        if self.trading_audit_service is None:
+            return {"available": False, "blocked": False, "reason": "service_unavailable"}
+        report = await self.trading_audit_service.build_report(
+            kalshi_env=self.settings.kalshi_env,
+            days=7,
+            focus="money-safety",
+        )
+        issues = list(report.get("issues") or [])
+        blockers = [
+            issue for issue in issues
+            if str(issue.get("severity") or "").lower() in {"critical", "high"}
+        ]
+        return {
+            "available": True,
+            "blocked": bool(blockers),
+            "blocker_count": len(blockers),
+            "issue_count": len(issues),
+            "issues": [
+                {
+                    "severity": issue.get("severity"),
+                    "code": issue.get("code"),
+                    "summary": issue.get("summary"),
+                }
+                for issue in issues[:20]
+            ],
+            "counts": report.get("counts", {}),
+            "pnl": report.get("pnl", {}),
+            "attribution": report.get("attribution", {}),
+            "execution_funnel": report.get("execution_funnel", {}),
+            "stop_loss": {
+                "event_count": (report.get("stop_loss") or {}).get("event_count"),
+                "clusters": (report.get("stop_loss") or {}).get("clusters", [])[:5],
+            },
         }
 
     async def _checkpoint_time(self, stream_name: str) -> datetime | None:

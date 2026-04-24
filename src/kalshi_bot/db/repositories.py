@@ -1142,14 +1142,18 @@ class PlatformRepository:
         strategy_code: str | None = None,
     ) -> FillRecord:
         env = self._resolved_kalshi_env(kalshi_env)
-        resolved_strategy = await self._resolve_strategy_code_for_fill(
+        raw_order_id = raw.get("order_id") if isinstance(raw, dict) else None
+        resolved_order_id, resolved_strategy = await self._resolve_fill_links(
             strategy_code=strategy_code,
             order_id=order_id,
-            kalshi_order_id=raw.get("order_id") if isinstance(raw, dict) else None,
+            kalshi_order_id=raw_order_id,
             kalshi_env=env,
+            market_ticker=market_ticker,
+            side=side,
+            action=action,
         )
         record = FillRecord(
-            order_id=order_id,
+            order_id=resolved_order_id,
             trade_id=trade_id,
             kalshi_env=env,
             market_ticker=market_ticker,
@@ -1165,24 +1169,20 @@ class PlatformRepository:
         await self.session.flush()
         return record
 
-    async def _resolve_strategy_code_for_fill(
+    async def _resolve_order_for_fill(
         self,
         *,
-        strategy_code: str | None,
         order_id: str | None,
         kalshi_order_id: str | None,
         kalshi_env: str | None,
-    ) -> str | None:
-        """Strategy code flows from the associated order when the caller doesn't specify one."""
-        if strategy_code is not None:
-            return strategy_code
+    ) -> OrderRecord | None:
         if order_id is not None:
-            stmt = select(OrderRecord.strategy_code).where(OrderRecord.id == order_id)
+            stmt = select(OrderRecord).where(OrderRecord.id == order_id)
             found = (await self.session.execute(stmt)).scalar_one_or_none()
             if found is not None:
                 return found
         if kalshi_order_id is not None and kalshi_env is not None:
-            stmt = select(OrderRecord.strategy_code).where(
+            stmt = select(OrderRecord).where(
                 OrderRecord.kalshi_env == kalshi_env,
                 OrderRecord.kalshi_order_id == kalshi_order_id,
             ).order_by(OrderRecord.updated_at.desc(), OrderRecord.created_at.desc()).limit(1)
@@ -1190,6 +1190,92 @@ class PlatformRepository:
             if found is not None:
                 return found
         return None
+
+    async def _latest_attributed_buy_fill(
+        self,
+        *,
+        market_ticker: str,
+        side: str,
+        kalshi_env: str,
+        before: datetime | None = None,
+    ) -> FillRecord | None:
+        stmt = select(FillRecord).where(
+            FillRecord.kalshi_env == kalshi_env,
+            FillRecord.market_ticker == market_ticker,
+            FillRecord.side == side,
+            FillRecord.action == "buy",
+            FillRecord.strategy_code.is_not(None),
+        )
+        if before is not None:
+            stmt = stmt.where(FillRecord.created_at <= before)
+        stmt = stmt.order_by(FillRecord.created_at.desc()).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def get_latest_fill_strategy_for_market_side(
+        self,
+        *,
+        market_ticker: str,
+        side: str,
+        kalshi_env: str | None = None,
+        before: datetime | None = None,
+    ) -> str | None:
+        found = await self._latest_attributed_buy_fill(
+            market_ticker=market_ticker,
+            side=side,
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            before=before,
+        )
+        return found.strategy_code if found is not None else None
+
+    async def _resolve_fill_links(
+        self,
+        *,
+        strategy_code: str | None,
+        order_id: str | None,
+        kalshi_order_id: str | None,
+        kalshi_env: str,
+        market_ticker: str,
+        side: str,
+        action: str,
+        before: datetime | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Return (order_id, strategy_code) for a fill using bounded evidence."""
+        if strategy_code is not None:
+            matched = await self._resolve_order_for_fill(
+                order_id=order_id,
+                kalshi_order_id=kalshi_order_id,
+                kalshi_env=kalshi_env,
+            )
+            return (order_id or (matched.id if matched is not None else None), strategy_code)
+
+        matched_order = await self._resolve_order_for_fill(
+            order_id=order_id,
+            kalshi_order_id=kalshi_order_id,
+            kalshi_env=kalshi_env,
+        )
+        if matched_order is not None:
+            matched_strategy = matched_order.strategy_code
+            if matched_strategy is None:
+                matched_strategy = await self._resolve_strategy_code_for_order(
+                    strategy_code=None,
+                    ticket_id=matched_order.trade_ticket_id,
+                    client_order_id=matched_order.client_order_id,
+                )
+                if matched_strategy is not None:
+                    matched_order.strategy_code = matched_strategy
+            return matched_order.id, matched_strategy
+
+        if action == "sell":
+            latest_buy = await self._latest_attributed_buy_fill(
+                market_ticker=market_ticker,
+                side=side,
+                kalshi_env=kalshi_env,
+                before=before,
+            )
+            if latest_buy is not None:
+                return order_id, latest_buy.strategy_code
+
+        return order_id, None
 
     async def upsert_fill(
         self,
@@ -1207,17 +1293,21 @@ class PlatformRepository:
         strategy_code: str | None = None,
     ) -> FillRecord:
         env = self._resolved_kalshi_env(kalshi_env)
-        resolved_strategy = await self._resolve_strategy_code_for_fill(
+        raw_order_id = raw.get("order_id") if isinstance(raw, dict) else None
+        resolved_order_id, resolved_strategy = await self._resolve_fill_links(
             strategy_code=strategy_code,
             order_id=order_id,
-            kalshi_order_id=raw.get("order_id") if isinstance(raw, dict) else None,
+            kalshi_order_id=raw_order_id,
             kalshi_env=env,
+            market_ticker=market_ticker,
+            side=side,
+            action=action,
         )
         if trade_id is not None:
             observed_at = datetime.now(UTC)
             insert_values = {
                 "id": str(uuid4()),
-                "order_id": order_id,
+                "order_id": resolved_order_id,
                 "trade_id": trade_id,
                 "kalshi_env": env,
                 "market_ticker": market_ticker,
@@ -1273,7 +1363,7 @@ class PlatformRepository:
             record = (await self.session.execute(stmt)).scalar_one_or_none()
         if record is None:
             record = FillRecord(
-                order_id=order_id,
+                order_id=resolved_order_id,
                 trade_id=trade_id,
                 kalshi_env=env,
                 market_ticker=market_ticker,
@@ -1287,7 +1377,7 @@ class PlatformRepository:
             )
             self.session.add(record)
         else:
-            record.order_id = order_id or record.order_id
+            record.order_id = resolved_order_id or record.order_id
             record.market_ticker = market_ticker
             record.side = side
             record.action = action

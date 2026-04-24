@@ -44,3 +44,31 @@ def test_python_module_cli_entrypoint_reports_operator_errors_cleanly(tmp_path) 
     assert '"error"' in result.stderr
     assert "Training corpus is not ready for evaluation" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_trading_audit_cli_json_smoke(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/trading-audit-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "trading-audit",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = result.stdout
+    assert '"audit"' in payload
+    assert '"fill_summary"' in payload
+    assert '"issues"' in payload
+    assert '"read_only": true' in payload
+    assert "Traceback" not in result.stderr

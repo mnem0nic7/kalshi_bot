@@ -30,6 +30,23 @@ class FakeDashboardService:
         return self.payload
 
 
+class FakeAuditService:
+    def __init__(self, issues: list[dict] | None = None) -> None:
+        self.issues = issues or []
+        self.calls = 0
+
+    async def build_report(self, **_kwargs):
+        self.calls += 1
+        return {
+            "issues": self.issues,
+            "counts": {"fills": 1},
+            "pnl": {"net_pnl_dollars": "0.0000"},
+            "attribution": {"missing_fill_strategy_count": 0},
+            "execution_funnel": {"failed_order_count": 0},
+            "stop_loss": {"event_count": 0, "clusters": []},
+        }
+
+
 class FakeCodexService:
     def __init__(self, *, available: bool = True, backtest_status: str = "ok") -> None:
         self.available = available
@@ -37,12 +54,14 @@ class FakeCodexService:
         self.execute_calls = 0
         self.accept_calls = 0
         self.activate_calls = 0
+        self.snapshots: list[dict] = []
 
     def is_available(self) -> bool:
         return self.available
 
-    async def execute_modes_for_snapshot(self, **_kwargs):
+    async def execute_modes_for_snapshot(self, **kwargs):
         self.execute_calls += 1
+        self.snapshots.append(kwargs.get("dashboard_snapshot") or {})
         return [
             {
                 "id": "eval-run",
@@ -106,13 +125,14 @@ async def auto_evolve_harness(tmp_path):
         await repo.set_checkpoint("strategy_regression", None, {"ran_at": datetime.now(UTC).isoformat()})
         await session.commit()
 
-    async def build(*, dashboard=None, codex=None):
+    async def build(*, dashboard=None, codex=None, audit=None):
         service = StrategyAutoEvolveService(
             settings=settings,
             session_factory=session_factory,
             strategy_regression_service=FakeRegressionService(),
             strategy_codex_service=codex or FakeCodexService(),
             strategy_dashboard_service=FakeDashboardService(dashboard or _dashboard_payload()),
+            trading_audit_service=audit or FakeAuditService(),
         )
         return service
 
@@ -194,3 +214,51 @@ async def test_auto_evolve_failed_backtest_does_not_activate_or_assign(auto_evol
         assignment = await repo.get_city_strategy_assignment("KXHIGHNY")
         await session.commit()
     assert assignment is None
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_trading_audit_blocker_skips_before_codex(auto_evolve_harness) -> None:
+    codex = FakeCodexService()
+    audit = FakeAuditService([
+        {
+            "severity": "critical",
+            "code": "missing_fill_strategy_attribution",
+            "summary": "Fills without strategy attribution",
+        }
+    ])
+    service = await auto_evolve_harness.build(codex=codex, audit=audit)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "trading_audit_blocked"
+    assert result["trading_audit"]["blocked"] is True
+    assert codex.execute_calls == 0
+    async with auto_evolve_harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        checkpoint = await repo.get_checkpoint(service.checkpoint_name)
+        assignment = await repo.get_city_strategy_assignment("KXHIGHNY")
+        await session.commit()
+    assert checkpoint is not None
+    assert checkpoint.payload["reason"] == "trading_audit_blocked"
+    assert assignment is None
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_medium_audit_issue_is_context_only(auto_evolve_harness) -> None:
+    codex = FakeCodexService()
+    audit = FakeAuditService([
+        {
+            "severity": "medium",
+            "code": "ops_warning_error_noise",
+            "summary": "Noisy ops events",
+        }
+    ])
+    service = await auto_evolve_harness.build(codex=codex, audit=audit)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed"
+    assert result["trading_audit"]["blocked"] is False
+    assert codex.execute_calls == 1
+    assert codex.snapshots[0]["trading_audit"]["issue_count"] == 1

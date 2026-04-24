@@ -66,10 +66,10 @@ def test_sell_price_yes_is_bid():
     assert _sell_price(ms, "yes") == Decimal("0.22")
 
 
-def test_sell_price_no_is_complement_of_ask():
-    # no_bid = 1 - yes_ask = 1 - 0.30 = 0.70
+def test_sell_price_no_is_yes_ask():
+    # SELL NO at yes_price_dollars=yes_ask: "fill when NO bid ≥ 1-yes_ask = no_bid". ✓
     ms = _ms("0.22", "0.30")
-    assert _sell_price(ms, "no") == Decimal("0.7000")
+    assert _sell_price(ms, "no") == Decimal("0.30")
 
 
 def test_sell_price_none_when_ask_missing_for_no():

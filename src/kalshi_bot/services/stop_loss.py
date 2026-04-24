@@ -14,6 +14,7 @@ from kalshi_bot.db.models import FillRecord, MarketPriceHistory, MarketState, Po
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.position_governance import (
+    STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED,
     STOP_LOSS_OUTCOME_FILLED_EXIT,
     STOP_LOSS_OUTCOME_SUBMIT_FAILED,
     STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
@@ -47,10 +48,11 @@ def _midpoint(market_state: MarketState, side: str) -> Decimal | None:
 def _sell_price(market_state: MarketState, side: str) -> Decimal | None:
     if side == "yes":
         return market_state.yes_bid_dollars
-    yes_ask = market_state.yes_ask_dollars
-    if yes_ask is None:
-        return None
-    return (Decimal("1") - yes_ask).quantize(Decimal("0.0001"))
+    # For NO sell: yes_price_dollars = yes_ask.
+    # SELL NO at P means min acceptable NO price = 1-P; fills when NO bid ≥ 1-P.
+    # yes_ask = 1 - no_bid, so P = yes_ask → 1-P = no_bid → fills at the NO bid. ✓
+    # The old formula (1 - yes_ask) inverted this: min NO = 0.82 when market NO = 0.18 → never fills.
+    return market_state.yes_ask_dollars
 
 
 def _side_price(mid_yes: Decimal, side: str) -> Decimal:
@@ -238,6 +240,9 @@ class StopLossService:
             submit_key = f"stop_loss_submit:{self.settings.kalshi_env}:{position.market_ticker}"
             submit_cp = await repo.get_checkpoint(submit_key)
             if submit_cp is not None:
+                outcome_status = str((submit_cp.payload or {}).get("outcome_status") or "")
+                if outcome_status == STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL:
+                    return None
                 next_retry = submit_cp.payload.get("next_retry_at")
                 if next_retry is not None:
                     if now < datetime.fromisoformat(next_retry):
@@ -328,6 +333,12 @@ class StopLossService:
         )
 
         client_order_id = str(uuid4())
+        strategy_code = await repo.get_latest_fill_strategy_for_market_side(
+            market_ticker=market_ticker,
+            side=position.side,
+            kalshi_env=self.settings.kalshi_env,
+            before=now,
+        )
         receipt = await self.execution_service.close_position(
             market_ticker=market_ticker,
             side=position.side,
@@ -389,7 +400,12 @@ class StopLossService:
             }
 
         shadow = receipt.status == "shadow_skipped"
-        submit_failed = not shadow and receipt.external_order_id is None
+        order_data = dict((receipt.details or {}).get("order") or {})
+        order_status = str(order_data.get("status") or receipt.status)
+        normalized_order_status = order_status.strip().lower()
+        terminal_filled = normalized_order_status in {"filled", "executed"}
+        terminal_unfilled = normalized_order_status in {"cancelled", "canceled", "expired"}
+        submit_failed = not shadow and receipt.external_order_id is None and not terminal_filled and not terminal_unfilled
         action = f"stop_loss_{trigger}_shadow" if shadow else f"stop_loss_{trigger}"
 
         event_payload: dict[str, Any] = {
@@ -407,6 +423,7 @@ class StopLossService:
             "trigger": trigger,
             "possible_model_error": possible_model_error,
             "exec_status": receipt.status,
+            "strategy_code": strategy_code,
             "position_opened_at": hold_start.isoformat(),
         }
         if slope is not None:
@@ -426,15 +443,24 @@ class StopLossService:
             submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_FILLED_EXIT
             submit_payload["client_order_id"] = client_order_id
         elif not submit_failed:
-            order_data = dict((receipt.details or {}).get("order") or {})
             submit_payload.update(
                 {
                     "client_order_id": client_order_id,
-                    "order_status": order_data.get("status") or receipt.status,
+                    "order_status": order_status,
                     "kalshi_order_id": receipt.external_order_id,
-                    "outcome_status": STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
+                    "outcome_status": (
+                        STOP_LOSS_OUTCOME_FILLED_EXIT
+                        if terminal_filled
+                        else (
+                            STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED
+                            if terminal_unfilled
+                            else STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL
+                        )
+                    ),
                 }
             )
+            if terminal_unfilled:
+                submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
             event_payload["order_response"] = receipt.details
         else:
             logger.warning("stop_loss order submit failed for %s: %s", market_ticker, receipt.details)
@@ -443,6 +469,22 @@ class StopLossService:
             submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_SUBMIT_FAILED
             # Back off on outright submit errors to avoid spamming an illiquid book.
             submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
+
+        if not shadow and receipt.status != "inactive_color_skipped":
+            await repo.save_order(
+                ticket_id=None,
+                client_order_id=client_order_id,
+                market_ticker=market_ticker,
+                status=order_status,
+                side=position.side,
+                action="sell",
+                yes_price_dollars=sell_price,
+                count_fp=position.count_fp,
+                raw=receipt.details or {},
+                kalshi_order_id=receipt.external_order_id,
+                kalshi_env=self.settings.kalshi_env,
+                strategy_code=strategy_code,
+            )
 
         await repo.log_ops_event(
             severity="warning",
