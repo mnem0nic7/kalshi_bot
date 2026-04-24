@@ -72,3 +72,31 @@ def test_trading_audit_cli_json_smoke(tmp_path) -> None:
     assert '"issues"' in payload
     assert '"read_only": true' in payload
     assert "Traceback" not in result.stderr
+
+
+def test_trade_analysis_cli_report_json_smoke(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/trade-analysis-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "trade-analysis",
+            "report",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = result.stdout
+    assert '"schema_version": "trade-analysis-v1"' in payload
+    assert '"row_count"' in payload
+    assert '"read_only": true' in payload
+    assert "Traceback" not in result.stderr

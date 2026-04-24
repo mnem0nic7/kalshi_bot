@@ -28,6 +28,7 @@ class StrategyAutoEvolveService:
         strategy_codex_service: Any,
         strategy_dashboard_service: Any,
         trading_audit_service: Any | None = None,
+        trade_analysis_service: Any | None = None,
         secondary_session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self.settings = settings
@@ -37,6 +38,7 @@ class StrategyAutoEvolveService:
         self.strategy_codex_service = strategy_codex_service
         self.strategy_dashboard_service = strategy_dashboard_service
         self.trading_audit_service = trading_audit_service
+        self.trade_analysis_service = trade_analysis_service
 
     @property
     def checkpoint_name(self) -> str:
@@ -110,7 +112,9 @@ class StrategyAutoEvolveService:
             return payload
 
         audit_summary = await self._trading_audit_summary()
+        analysis_summary = await self._trade_analysis_summary()
         payload["trading_audit"] = audit_summary
+        payload["trade_analysis"] = analysis_summary
         if audit_summary.get("blocked"):
             payload.update({"status": "skipped", "reason": "trading_audit_blocked"})
             await self._record_result(
@@ -136,6 +140,7 @@ class StrategyAutoEvolveService:
             include_codex_lab=False,
         )
         snapshot["trading_audit"] = audit_summary
+        snapshot["trade_analysis"] = analysis_summary
         run_views = await self.strategy_codex_service.execute_modes_for_snapshot(
             modes=["evaluate", "suggest"],
             dashboard_snapshot=snapshot,
@@ -171,6 +176,7 @@ class StrategyAutoEvolveService:
             include_codex_lab=False,
         )
         assignment_snapshot["trading_audit"] = audit_summary
+        assignment_snapshot["trade_analysis"] = analysis_summary
         if errors:
             assignment_result = {"changes": [], "skips": [], "errors": []}
         else:
@@ -330,6 +336,17 @@ class StrategyAutoEvolveService:
                 "clusters": (report.get("stop_loss") or {}).get("clusters", [])[:5],
             },
         }
+
+    async def _trade_analysis_summary(self) -> dict[str, Any]:
+        if self.trade_analysis_service is None:
+            return {"available": False, "reason": "service_unavailable"}
+        try:
+            return await self.trade_analysis_service.summary_for_auto_evolve(
+                kalshi_env=self.settings.kalshi_env,
+                days=self.settings.strategy_auto_evolve_window_days,
+            )
+        except Exception as exc:
+            return {"available": False, "reason": "summary_failed", "error": str(exc)}
 
     async def _checkpoint_time(self, stream_name: str) -> datetime | None:
         async with self.session_factory() as session:

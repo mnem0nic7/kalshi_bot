@@ -24,6 +24,7 @@ from kalshi_bot.db.session import init_models
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
+from kalshi_bot.services.trade_analysis import format_trade_analysis_report
 from kalshi_bot.services.trading_audit import format_trading_audit_text
 
 
@@ -45,7 +46,7 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
-    container = await AppContainer.build(bootstrap_db=args.command not in {"init-db", "trading-audit"})
+    container = await AppContainer.build(bootstrap_db=args.command not in {"init-db", "trading-audit", "trade-analysis"})
     try:
         if args.command == "init-db":
             await init_models(container.engine)
@@ -194,6 +195,33 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 print(json.dumps(report, indent=2))
             else:
                 print(format_trading_audit_text(report))
+            return 0
+
+        if args.command == "trade-analysis":
+            if args.trade_analysis_command == "dataset":
+                result = await container.trade_analysis_service.write_dataset(
+                    kalshi_env=args.kalshi_env,
+                    days=args.days,
+                    output=Path(args.output),
+                    limit=args.limit,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            if args.trade_analysis_command == "model-eval":
+                result = await container.trade_analysis_service.model_eval(
+                    dataset_path=Path(args.dataset),
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            report = await container.trade_analysis_service.build_report(
+                kalshi_env=args.kalshi_env,
+                days=args.days,
+                limit=args.limit,
+            )
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(format_trade_analysis_report(report))
             return 0
 
         if args.command == "training-build":
@@ -977,6 +1005,18 @@ def build_parser() -> argparse.ArgumentParser:
     trading_audit.add_argument("--json", action="store_true")
     trading_audit.add_argument("--limit", type=int, default=500)
     trading_audit.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
+
+    trade_analysis = subparsers.add_parser(
+        "trade-analysis",
+        help="Build read-only no-leakage trade analysis datasets and baseline model cards",
+    )
+    trade_analysis.add_argument("trade_analysis_command", choices=["dataset", "report", "model-eval"])
+    trade_analysis.add_argument("--kalshi-env", default="production")
+    trade_analysis.add_argument("--days", type=int, default=180)
+    trade_analysis.add_argument("--limit", type=int, default=None)
+    trade_analysis.add_argument("--json", action="store_true")
+    trade_analysis.add_argument("--output", default="data/trade_analysis.jsonl")
+    trade_analysis.add_argument("--dataset", default="data/trade_analysis.jsonl")
 
     training_build = subparsers.add_parser("training-build")
     training_build.add_argument("training_build_scope", nargs="?", choices=["historical"])
