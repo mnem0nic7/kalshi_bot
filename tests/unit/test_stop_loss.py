@@ -11,7 +11,7 @@ import numpy as np
 
 from kalshi_bot.services.stop_loss import (
     _midpoint, _momentum_slope, _peak_price_from_history,
-    _sell_price, _side_price, _trailing_loss_ratio,
+    _position_opened_at_from_fills, _sell_price, _side_price, _trailing_loss_ratio,
 )
 
 
@@ -101,9 +101,10 @@ def test_trailing_loss_ratio_zero_peak():
 
 # ── peak price from history ──────────────────────────────────────────────────
 
-def _ph(mid: str) -> MagicMock:
+def _ph(mid: str, observed_at: datetime | None = None) -> MagicMock:
     row = MagicMock()
     row.mid_dollars = Decimal(mid)
+    row.observed_at = observed_at or datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
     return row
 
 
@@ -126,6 +127,48 @@ def test_peak_price_none_on_empty():
 def test_peak_price_skips_none_mid():
     rows = [_ph("0.70"), MagicMock(mid_dollars=None), _ph("0.85")]
     assert _peak_price_from_history(rows, "yes") == Decimal("0.85")
+
+
+def test_peak_price_ignores_highs_before_position_opened():
+    opened_at = datetime(2025, 1, 1, 12, 5, tzinfo=UTC)
+    rows = [
+        _ph("0.92", datetime(2025, 1, 1, 12, 0, tzinfo=UTC)),
+        _ph("0.70", datetime(2025, 1, 1, 12, 5, tzinfo=UTC)),
+        _ph("0.74", datetime(2025, 1, 1, 12, 6, tzinfo=UTC)),
+    ]
+
+    assert _peak_price_from_history(rows, "yes", opened_at=opened_at) == Decimal("0.74")
+
+
+def _fill(action: str, count: str, created_at: datetime, *, side: str = "yes") -> MagicMock:
+    fill = MagicMock()
+    fill.market_ticker = "WX-TEST"
+    fill.side = side
+    fill.action = action
+    fill.count_fp = Decimal(count)
+    fill.created_at = created_at
+    return fill
+
+
+def test_position_opened_at_from_fills_uses_current_open_lot():
+    position = MagicMock()
+    position.market_ticker = "WX-TEST"
+    position.side = "yes"
+    first_open = datetime(2025, 1, 1, 10, 0, tzinfo=UTC)
+    closed = datetime(2025, 1, 1, 10, 30, tzinfo=UTC)
+    reopened = datetime(2025, 1, 1, 11, 15, tzinfo=UTC)
+
+    opened_at = _position_opened_at_from_fills(
+        position,
+        [
+            _fill("buy", "5.00", first_open),
+            _fill("sell", "5.00", closed),
+            _fill("buy", "3.00", reopened),
+            _fill("buy", "2.00", reopened + timedelta(minutes=5)),
+        ],
+    )
+
+    assert opened_at == reopened
 
 
 # ── momentum slope ───────────────────────────────────────────────────────────

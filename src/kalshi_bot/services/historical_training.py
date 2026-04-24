@@ -28,6 +28,7 @@ from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext, approved_ticket_for_verdict
+from kalshi_bot.orchestration.supervisor import _research_ref_time
 from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
 from kalshi_bot.services.signal import (
     apply_heuristic_application_to_signal,
@@ -3120,7 +3121,7 @@ class HistoricalTrainingService:
                         signal=signal,
                         context=RiskContext(
                             market_observed_at=market_snapshot.asof_ts,
-                            research_observed_at=dossier.freshness.refreshed_at,
+                            research_observed_at=_research_ref_time(signal, dossier.freshness.refreshed_at),
                             decision_time=checkpoint_ts,
                             current_position_notional_dollars=Decimal("0"),
                             portfolio_bucket_snapshot=portfolio_bucket_snapshot,

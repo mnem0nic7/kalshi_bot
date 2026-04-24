@@ -10,7 +10,7 @@ import numpy as np
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import MarketPriceHistory, MarketState, PositionRecord
+from kalshi_bot.db.models import FillRecord, MarketPriceHistory, MarketState, PositionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.position_governance import (
@@ -57,14 +57,55 @@ def _side_price(mid_yes: Decimal, side: str) -> Decimal:
     return mid_yes if side == "yes" else Decimal("1") - mid_yes
 
 
-def _peak_price_from_history(prices: list[MarketPriceHistory], side: str) -> Decimal | None:
-    """Return the day's highest side-appropriate mid price from price history."""
+def _price_history_since(
+    prices: list[MarketPriceHistory],
+    opened_at: datetime | None,
+) -> list[MarketPriceHistory]:
+    opened_at = _as_utc(opened_at)
+    if opened_at is None:
+        return prices
+    return [
+        row
+        for row in prices
+        if (_as_utc(row.observed_at) or datetime.min.replace(tzinfo=UTC)) >= opened_at
+    ]
+
+
+def _peak_price_from_history(
+    prices: list[MarketPriceHistory],
+    side: str,
+    *,
+    opened_at: datetime | None = None,
+) -> Decimal | None:
+    """Return the highest side-appropriate mid price while this position was held."""
     candidates = [
         _side_price(row.mid_dollars, side)
-        for row in prices
+        for row in _price_history_since(prices, opened_at)
         if row.mid_dollars is not None
     ]
     return max(candidates) if candidates else None
+
+
+def _position_opened_at_from_fills(position: PositionRecord, fills: list[FillRecord]) -> datetime | None:
+    """Infer when the current open lot began by replaying same-side fills."""
+    running = Decimal("0")
+    opened_at: datetime | None = None
+    for fill in sorted(fills, key=lambda item: _as_utc(item.created_at) or datetime.min.replace(tzinfo=UTC)):
+        if fill.market_ticker != position.market_ticker or str(fill.side) != str(position.side):
+            continue
+        delta = Decimal(str(fill.count_fp or "0"))
+        if str(fill.action).lower() == "sell":
+            delta = -delta
+        if running <= 0 and delta > 0:
+            opened_at = _as_utc(fill.created_at)
+        running += delta
+        if running <= 0:
+            opened_at = None
+    return opened_at
+
+
+def _position_opened_at(position: PositionRecord, fills: list[FillRecord]) -> datetime | None:
+    return _position_opened_at_from_fills(position, fills) or _as_utc(position.created_at)
 
 
 def _trailing_loss_ratio(peak: Decimal, current: Decimal) -> float:
@@ -134,7 +175,7 @@ class StopLossService:
             }
 
         now = datetime.now(UTC)
-        # Fetch a full trading day of price history for each held ticker.
+        # Fetch the retained price and fill history for each held ticker.
         today_window = timedelta(hours=24)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -145,6 +186,9 @@ class StopLossService:
                     kalshi_env=self.settings.kalshi_env,
                     window=today_window,
                 )
+            fills_by_ticker: dict[str, list[FillRecord]] = {ticker: [] for ticker in tickers}
+            for fill in await repo.list_fills_for_markets(tickers, kalshi_env=self.settings.kalshi_env):
+                fills_by_ticker.setdefault(fill.market_ticker, []).append(fill)
 
         stale_cutoff = timedelta(seconds=self.settings.risk_stale_market_seconds)
         for position in positions:
@@ -166,7 +210,8 @@ class StopLossService:
                 continue
 
             prices = price_histories.get(position.market_ticker, [])
-            result = await self._evaluate_and_submit(position, ms, mid, prices, now)
+            opened_at = _position_opened_at(position, fills_by_ticker.get(position.market_ticker, []))
+            result = await self._evaluate_and_submit(position, ms, mid, prices, now, opened_at)
             if result is not None:
                 triggered.append(result)
 
@@ -179,6 +224,7 @@ class StopLossService:
         mid: Decimal,
         prices: list[MarketPriceHistory],
         now: datetime,
+        opened_at: datetime | None,
     ) -> dict[str, Any] | None:
         """Evaluate one position in its own committed transaction to make the cooldown checkpoint immediately visible."""
         async with self.session_factory() as session:
@@ -203,9 +249,10 @@ class StopLossService:
                         if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
                             return None
 
-            # Trigger 1: trailing stop — 10% drop from today's peak price.
-            # Uses day's price history so the stop trails upward as price rises.
-            peak = _peak_price_from_history(prices, position.side)
+            held_prices = _price_history_since(prices, opened_at)
+
+            # Trigger 1: trailing stop — 10% drop from the peak seen while held.
+            peak = _peak_price_from_history(held_prices, position.side)
             trailing_ratio: float | None = None
             if peak is not None:
                 trailing_ratio = _trailing_loss_ratio(peak, mid)
@@ -216,21 +263,19 @@ class StopLossService:
                             repo, position, sell_px, mid, trailing_ratio, now,
                             kill_switch_enabled=kill_switch_enabled,
                             active_color=active_color,
-                            trigger="trailing_stop", peak=peak,
+                            trigger="trailing_stop", peak=peak, opened_at=opened_at,
                         )
                         await session.commit()
                         return result
 
             # Trigger 2: adverse momentum (no P&L requirement — catches slow bleeds
             # that haven't yet hit the trailing stop threshold).
-            created_at = position.created_at
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=UTC)
-            hold_minutes = (now - created_at).total_seconds() / 60
+            hold_start = opened_at or _as_utc(position.created_at) or now
+            hold_minutes = (now - hold_start).total_seconds() / 60
             if hold_minutes < self.settings.stop_loss_momentum_min_hold_minutes:
                 return None
 
-            slope = _momentum_slope(prices)
+            slope = _momentum_slope(held_prices)
             if slope is None:
                 return None
 
@@ -248,7 +293,7 @@ class StopLossService:
                 repo, position, sell_px, mid, trailing_ratio, now,
                 kill_switch_enabled=kill_switch_enabled,
                 active_color=active_color,
-                trigger=trigger, slope=slope, peak=peak,
+                trigger=trigger, slope=slope, peak=peak, opened_at=opened_at,
             )
             await session.commit()
             return result
@@ -267,16 +312,15 @@ class StopLossService:
         trigger: str = "trailing_stop",
         slope: float | None = None,
         peak: Decimal | None = None,
+        opened_at: datetime | None = None,
     ) -> dict[str, Any]:
         market_ticker = position.market_ticker
         peak_display = str(peak) if peak is not None else "n/a"
         mark_display = str(mid)
         sell_display = str(sell_price)
 
-        created_at = position.created_at
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=UTC)
-        hold_minutes = (now - created_at).total_seconds() / 60
+        hold_start = opened_at or _as_utc(position.created_at) or now
+        hold_minutes = (now - hold_start).total_seconds() / 60
         possible_model_error = (
             loss_ratio is not None
             and loss_ratio > 0.30
@@ -363,6 +407,7 @@ class StopLossService:
             "trigger": trigger,
             "possible_model_error": possible_model_error,
             "exec_status": receipt.status,
+            "position_opened_at": hold_start.isoformat(),
         }
         if slope is not None:
             event_payload["momentum_slope_cents_per_min"] = round(slope, 4)
@@ -374,6 +419,7 @@ class StopLossService:
             "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
             "peak_price": str(peak) if peak is not None else None,
             "trigger": trigger,
+            "position_opened_at": hold_start.isoformat(),
         }
 
         if shadow:
@@ -429,6 +475,7 @@ class StopLossService:
                     "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
                     "peak_price": str(peak) if peak is not None else None,
                     "trigger": trigger,
+                    "position_opened_at": hold_start.isoformat(),
                     "outcome_status": submit_payload.get("outcome_status"),
                     "reverse_evaluated": False,
                 },

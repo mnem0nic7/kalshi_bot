@@ -1658,9 +1658,19 @@ async def _momentum_calibration_summary(container: AppContainer) -> dict[str, An
             container.settings.kalshi_env,
             app_color=container.settings.app_color,
         )
+        active_state = state.get("active") or {}
+        veto_threshold = (
+            active_state.get("momentum_slope_veto_cents_per_min")
+            or container.settings.momentum_slope_veto_cents_per_min
+        )
+        shadow_metrics = await repo.get_momentum_shadow_metrics(
+            kalshi_env=container.settings.kalshi_env,
+            window_hours=24,
+            veto_threshold_cents_per_min=float(veto_threshold),
+        )
         await session.commit()
 
-    active = state.get("active") or {}
+    active = active_state
     pending = state.get("pending")
     result: dict[str, Any] = {
         "active": {
@@ -1696,6 +1706,7 @@ async def _momentum_calibration_summary(container: AppContainer) -> dict[str, An
             "recent_coverage": nightly.get("recent_coverage"),
             "fit_ci_width_fraction": nightly.get("fit_ci_width_fraction"),
         }
+    result["shadow_metrics"] = shadow_metrics
     return result
 
 

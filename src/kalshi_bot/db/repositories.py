@@ -759,6 +759,84 @@ class PlatformRepository:
         )
         return list((await self.session.execute(stmt)).scalars())
 
+    async def get_momentum_shadow_metrics(
+        self,
+        *,
+        kalshi_env: str,
+        window_hours: int = 24,
+        veto_threshold_cents_per_min: float | None = None,
+    ) -> dict[str, Any]:
+        """Return shadow-mode outcome counts and slope/weight averages for the rolling window.
+
+        Aggregates momentum_post_processor_outcome from signal payloads.
+        avg_slope_cents_per_min includes all rows that have a slope stamped (any outcome).
+        avg_weight is restricted to 'success' rows.
+        veto_fraction is the share of 'success' rows where |slope| exceeds the threshold.
+        """
+        cutoff = datetime.now(UTC) - timedelta(hours=window_hours)
+        stmt = (
+            select(Signal.payload)
+            .join(Room, Signal.room_id == Room.id)
+            .where(
+                Room.kalshi_env == kalshi_env,
+                Signal.created_at >= cutoff,
+            )
+        )
+        payloads = list((await self.session.execute(stmt)).scalars())
+
+        by_outcome: dict[str, int] = {
+            "success": 0,
+            "calibration_missing": 0,
+            "insufficient_points": 0,
+            "price_history_error": 0,
+            "unknown": 0,
+        }
+        slopes: list[float] = []
+        weights: list[float] = []
+        success_with_slope = 0
+        veto_count = 0
+
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                by_outcome["unknown"] += 1
+                continue
+            outcome = str(payload.get("momentum_post_processor_outcome") or "unknown")
+            if outcome not in by_outcome:
+                outcome = "unknown"
+            by_outcome[outcome] += 1
+
+            raw_slope = payload.get("momentum_slope_cents_per_min")
+            raw_weight = payload.get("momentum_weight")
+
+            if raw_slope is not None:
+                try:
+                    slopes.append(float(raw_slope))
+                except (TypeError, ValueError):
+                    pass
+
+            if outcome == "success" and raw_weight is not None:
+                try:
+                    weights.append(float(raw_weight))
+                except (TypeError, ValueError):
+                    pass
+
+            if outcome == "success" and raw_slope is not None and veto_threshold_cents_per_min is not None:
+                try:
+                    success_with_slope += 1
+                    if abs(float(raw_slope)) > veto_threshold_cents_per_min:
+                        veto_count += 1
+                except (TypeError, ValueError):
+                    pass
+
+        return {
+            "window_hours": window_hours,
+            "total": len(payloads),
+            "by_outcome": by_outcome,
+            "avg_slope_cents_per_min": (sum(slopes) / len(slopes)) if slopes else None,
+            "avg_weight": (sum(weights) / len(weights)) if weights else None,
+            "veto_fraction": (veto_count / success_with_slope) if success_with_slope > 0 else None,
+        }
+
     async def purge_market_price_history(
         self,
         *,

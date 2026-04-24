@@ -91,6 +91,20 @@ async def _pending_post_kill_switch_reconcile(
     return None
 
 
+def _research_ref_time(
+    signal: "StrategySignal",
+    fallback: "datetime | None",
+) -> "datetime | None":
+    """Return the best available research reference timestamp.
+
+    Uses signal.weather.observation_time when present (the actual moment the
+    weather was observed, more precise than dossier refresh time). Falls back
+    to the caller-supplied dossier freshness timestamp.
+    """
+    obs = signal.weather.observation_time if signal.weather is not None else None
+    return obs or fallback
+
+
 class WorkflowSupervisor:
     def __init__(
         self,
@@ -133,24 +147,16 @@ class WorkflowSupervisor:
         repo: "PlatformRepository",
         market_ticker: str,
         bundle_age_reference: datetime | None,
-    ) -> StrategySignal:
+    ) -> tuple[StrategySignal, str]:
         from datetime import timedelta
 
         from sqlalchemy.exc import DBAPIError
         try:
-            params = await get_active_momentum_calibration_async(repo, self.settings)
+            params, checkpoint_exists = await get_active_momentum_calibration_async(repo, self.settings)
             price_history = await repo.fetch_recent_prices(
                 market_ticker,
                 kalshi_env=self.settings.kalshi_env,
                 window=timedelta(minutes=60),
-            )
-            return apply_momentum_weight_to_signal(
-                signal,
-                params=params,
-                price_history=price_history,
-                research_stale_seconds=self.settings.research_stale_seconds,
-                bundle_age_reference=bundle_age_reference,
-                shadow_mode=self.settings.momentum_weight_shadow_mode,
             )
         except (DBAPIError, asyncio.TimeoutError) as exc:
             key = (self.settings.kalshi_env, type(exc).__name__)
@@ -164,7 +170,26 @@ class WorkflowSupervisor:
                     source="momentum_post_processor",
                     payload={"market_ticker": market_ticker, "error": str(exc)},
                 )
-            return signal
+            return signal, "price_history_error"
+
+        result = apply_momentum_weight_to_signal(
+            signal,
+            params=params,
+            price_history=price_history,
+            research_stale_seconds=self.settings.research_stale_seconds,
+            bundle_age_reference=bundle_age_reference,
+            shadow_mode=self.settings.momentum_weight_shadow_mode,
+        )
+
+        # priority: error → missing → insufficient → success
+        if not checkpoint_exists:
+            outcome = "calibration_missing"
+        elif result.momentum_slope_cents_per_min is None:
+            outcome = "insufficient_points"
+        else:
+            outcome = "success"
+
+        return result, outcome
 
     async def _run_market_gates(
         self,
@@ -298,8 +323,9 @@ class WorkflowSupervisor:
         signal: StrategySignal,
         thresholds: Any,
         market_observed_at: datetime | None = None,
-        research_observed_at: datetime | None = None,
+        research_fallback_time: datetime | None = None,
     ) -> None:
+        research_observed_at = _research_ref_time(signal, research_fallback_time)
         receipt = ExecReceiptPayload(status="no_trade", details={})
         final_status = "no_trade"
         candidate_trace = dict(signal.candidate_trace or {})
@@ -809,7 +835,7 @@ class WorkflowSupervisor:
                         quality_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
                         minimum_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
                     )
-                signal = await self._try_apply_momentum_post_processor(
+                signal, momentum_outcome = await self._try_apply_momentum_post_processor(
                     signal,
                     repo=repo,
                     market_ticker=room.market_ticker,
@@ -896,6 +922,7 @@ class WorkflowSupervisor:
                         "momentum_slope_cents_per_min": signal.momentum_slope_cents_per_min,
                         "momentum_weight": signal.momentum_weight,
                         "edge_effective_bps": signal.edge_effective_bps,
+                        "momentum_post_processor_outcome": momentum_outcome,
                     },
                 )
                 await session.commit()
@@ -938,7 +965,7 @@ class WorkflowSupervisor:
                         signal=signal,
                         thresholds=thresholds,
                         market_observed_at=market_state.observed_at,
-                        research_observed_at=dossier.freshness.refreshed_at,
+                        research_fallback_time=dossier.freshness.refreshed_at,
                     )
                     return
 
@@ -1143,7 +1170,7 @@ class WorkflowSupervisor:
                         )
                         risk_context = RiskContext(
                             market_observed_at=market_state.observed_at,
-                            research_observed_at=dossier.freshness.refreshed_at,
+                            research_observed_at=_research_ref_time(signal, dossier.freshness.refreshed_at),
                             current_position_notional_dollars=current_position_notional,
                             current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
                             current_position_side=open_position.side if open_position is not None else None,

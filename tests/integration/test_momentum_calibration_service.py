@@ -381,8 +381,9 @@ async def test_active_calibration_no_checkpoint_uses_settings_defaults(sf) -> No
     session_factory, settings = sf
     async with session_factory() as session:
         repo = PlatformRepository(session)
-        params = await get_active_momentum_calibration_async(repo, settings)
+        params, checkpoint_exists = await get_active_momentum_calibration_async(repo, settings)
 
+    assert not checkpoint_exists
     assert params.momentum_weight_scale_cents_per_min == settings.momentum_weight_scale_cents_per_min
     assert params.momentum_slope_veto_cents_per_min == settings.momentum_slope_veto_cents_per_min
     assert params.momentum_weight_floor == settings.momentum_weight_floor
@@ -404,8 +405,9 @@ async def test_active_calibration_partial_checkpoint_falls_back_per_field(sf) ->
 
     async with session_factory() as session:
         repo = PlatformRepository(session)
-        params = await get_active_momentum_calibration_async(repo, settings)
+        params, checkpoint_exists = await get_active_momentum_calibration_async(repo, settings)
 
+    assert checkpoint_exists
     # scale comes from checkpoint
     assert params.momentum_weight_scale_cents_per_min == 2.5
     # others fall back to Settings
@@ -433,8 +435,9 @@ async def test_active_calibration_full_checkpoint_uses_all_checkpoint_values(sf)
 
     async with session_factory() as session:
         repo = PlatformRepository(session)
-        params = await get_active_momentum_calibration_async(repo, settings)
+        params, checkpoint_exists = await get_active_momentum_calibration_async(repo, settings)
 
+    assert checkpoint_exists
     assert params.momentum_weight_scale_cents_per_min == 1.8
     assert params.momentum_slope_veto_cents_per_min == 0.75
     assert params.momentum_weight_floor == 0.25

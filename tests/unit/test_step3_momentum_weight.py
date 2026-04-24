@@ -6,6 +6,8 @@ Cluster B: edge_for_eligibility() null-fallback, float promotion
 Cluster C: post-processor exception narrowing (DBAPIError/TimeoutError caught; TypeError propagates)
 Cluster D: evaluate_trade_eligibility uses edge_for_eligibility() not raw edge_bps
 Cluster F: slope extraction (¢/min conversion, < 5 points, signed)
+Cluster G: get_momentum_shadow_metrics repo aggregation
+Cluster H: _momentum_calibration_summary shadow_metrics sub-key shape
 """
 from __future__ import annotations
 
@@ -285,12 +287,13 @@ class TestCC_PostProcessorExceptionNarrowing:
             side_effect=DBAPIError("stmt", {}, Exception("orig"))
         )
         signal = _signal(ContractSide.YES)
-        result = await supervisor._try_apply_momentum_post_processor(
+        result, outcome = await supervisor._try_apply_momentum_post_processor(
             signal, repo=repo, market_ticker="WX-TEST", bundle_age_reference=None
         )
         assert result.momentum_slope_cents_per_min is None
         assert result.momentum_weight is None
         assert result.edge_effective_bps is None
+        assert outcome == "price_history_error"
 
     async def test_C2_dbapi_error_emits_warning_ops_event(self, supervisor, repo):
         from sqlalchemy.exc import DBAPIError
@@ -326,10 +329,11 @@ class TestCC_PostProcessorExceptionNarrowing:
     async def test_C4_timeout_error_leaves_fields_none(self, supervisor, repo):
         repo.fetch_recent_prices = AsyncMock(side_effect=asyncio.TimeoutError())
         signal = _signal(ContractSide.YES)
-        result = await supervisor._try_apply_momentum_post_processor(
+        result, outcome = await supervisor._try_apply_momentum_post_processor(
             signal, repo=repo, market_ticker="WX-TEST", bundle_age_reference=None
         )
         assert result.momentum_slope_cents_per_min is None
+        assert outcome == "price_history_error"
 
     async def test_C5_type_error_propagates(self, supervisor, repo):
         signal = _signal(ContractSide.YES)
@@ -341,6 +345,46 @@ class TestCC_PostProcessorExceptionNarrowing:
                 await supervisor._try_apply_momentum_post_processor(
                     signal, repo=repo, market_ticker="WX-TEST", bundle_age_reference=None
                 )
+
+    async def test_C6_no_checkpoint_yields_calibration_missing_outcome(self, supervisor, repo):
+        # get_checkpoint returns None → checkpoint_exists=False → "calibration_missing"
+        # fetch_recent_prices returns enough points for a slope
+        repo.get_checkpoint = AsyncMock(return_value=None)
+        repo.fetch_recent_prices = AsyncMock(return_value=_history(slope_cpmin=0.5, n=10))
+        signal = _signal(ContractSide.YES)
+        result, outcome = await supervisor._try_apply_momentum_post_processor(
+            signal, repo=repo, market_ticker="WX-TEST", bundle_age_reference=None
+        )
+        assert outcome == "calibration_missing"
+        # slope is still stamped even when calibration is missing
+        assert result.momentum_slope_cents_per_min is not None
+
+    async def test_C7_few_price_points_yields_insufficient_points_outcome(self, supervisor, repo):
+        # checkpoint exists but < 5 price points → slope is None → "insufficient_points"
+        from unittest.mock import MagicMock
+        cp = MagicMock()
+        cp.payload = {}
+        repo.get_checkpoint = AsyncMock(return_value=cp)
+        repo.fetch_recent_prices = AsyncMock(return_value=_history(slope_cpmin=0.5, n=3))
+        signal = _signal(ContractSide.YES)
+        result, outcome = await supervisor._try_apply_momentum_post_processor(
+            signal, repo=repo, market_ticker="WX-TEST", bundle_age_reference=None
+        )
+        assert outcome == "insufficient_points"
+        assert result.momentum_slope_cents_per_min is None
+
+    async def test_C8_success_outcome_when_checkpoint_and_enough_points(self, supervisor, repo):
+        from unittest.mock import MagicMock
+        cp = MagicMock()
+        cp.payload = {}
+        repo.get_checkpoint = AsyncMock(return_value=cp)
+        repo.fetch_recent_prices = AsyncMock(return_value=_history(slope_cpmin=0.5, n=10))
+        signal = _signal(ContractSide.YES)
+        result, outcome = await supervisor._try_apply_momentum_post_processor(
+            signal, repo=repo, market_ticker="WX-TEST", bundle_age_reference=None
+        )
+        assert outcome == "success"
+        assert result.momentum_slope_cents_per_min is not None
 
 
 # ── Cluster D: eligibility uses effective edge ────────────────────────────────
@@ -466,3 +510,195 @@ class TestCF_SlopeExtraction:
             research_stale_seconds=900,
         )
         assert signal.momentum_slope_cents_per_min is None
+
+
+# ── Cluster G: get_momentum_shadow_metrics ────────────────────────────────────
+
+
+def _make_payloads(rows: list[dict]) -> list[dict | None]:
+    """Build a list of signal payload dicts for mock repo responses."""
+    return rows
+
+
+class TestCG_ShadowMetricsRepo:
+    """Unit tests for get_momentum_shadow_metrics using a mock session."""
+
+    def _make_repo_with_payloads(self, payloads: list) -> MagicMock:
+        from unittest.mock import MagicMock, AsyncMock
+
+        mock_result = MagicMock()
+        mock_result.scalars.return_value = payloads
+        session = MagicMock()
+        session.execute = AsyncMock(return_value=mock_result)
+
+        from kalshi_bot.db.repositories import PlatformRepository
+        repo = PlatformRepository.__new__(PlatformRepository)
+        repo.session = session
+        repo._kalshi_env = "demo"
+        return repo
+
+    async def test_G1_empty_window_returns_zero_counts(self):
+        from kalshi_bot.db.repositories import PlatformRepository
+        repo = self._make_repo_with_payloads([])
+        result = await repo.get_momentum_shadow_metrics(kalshi_env="demo")
+        assert result["total"] == 0
+        assert result["by_outcome"]["success"] == 0
+        assert result["avg_slope_cents_per_min"] is None
+        assert result["avg_weight"] is None
+        assert result["veto_fraction"] is None
+
+    async def test_G2_success_rows_counted_and_avg_weight_computed(self):
+        from kalshi_bot.db.repositories import PlatformRepository
+        payloads = [
+            {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": 1.0, "momentum_weight": 0.8},
+            {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": 2.0, "momentum_weight": 0.6},
+        ]
+        repo = self._make_repo_with_payloads(payloads)
+        result = await repo.get_momentum_shadow_metrics(kalshi_env="demo")
+        assert result["by_outcome"]["success"] == 2
+        assert result["avg_slope_cents_per_min"] == pytest.approx(1.5)
+        assert result["avg_weight"] == pytest.approx(0.7)
+
+    async def test_G3_calibration_missing_rows_counted_slope_included_in_avg(self):
+        from kalshi_bot.db.repositories import PlatformRepository
+        payloads = [
+            {"momentum_post_processor_outcome": "calibration_missing", "momentum_slope_cents_per_min": 3.0, "momentum_weight": 0.5},
+            {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": 1.0, "momentum_weight": 0.9},
+        ]
+        repo = self._make_repo_with_payloads(payloads)
+        result = await repo.get_momentum_shadow_metrics(kalshi_env="demo")
+        assert result["by_outcome"]["calibration_missing"] == 1
+        assert result["by_outcome"]["success"] == 1
+        # slope avg includes both rows (calibration_missing still has slope stamped)
+        assert result["avg_slope_cents_per_min"] == pytest.approx(2.0)
+        # weight avg is success-only
+        assert result["avg_weight"] == pytest.approx(0.9)
+
+    async def test_G4_price_history_error_rows_have_no_slope_contribution(self):
+        from kalshi_bot.db.repositories import PlatformRepository
+        payloads = [
+            {"momentum_post_processor_outcome": "price_history_error"},
+            {"momentum_post_processor_outcome": "price_history_error"},
+        ]
+        repo = self._make_repo_with_payloads(payloads)
+        result = await repo.get_momentum_shadow_metrics(kalshi_env="demo")
+        assert result["by_outcome"]["price_history_error"] == 2
+        assert result["avg_slope_cents_per_min"] is None
+        assert result["avg_weight"] is None
+
+    async def test_G5_none_payload_counted_as_unknown(self):
+        from kalshi_bot.db.repositories import PlatformRepository
+        repo = self._make_repo_with_payloads([None, None])
+        result = await repo.get_momentum_shadow_metrics(kalshi_env="demo")
+        assert result["by_outcome"]["unknown"] == 2
+        assert result["total"] == 2
+
+    async def test_G6_veto_fraction_computed_for_success_rows_exceeding_threshold(self):
+        from kalshi_bot.db.repositories import PlatformRepository
+        payloads = [
+            # slope_against = |slope| for a YES signal with negative slope = adverse
+            {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": -2.0, "momentum_weight": 0.5},
+            {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": -0.2, "momentum_weight": 0.9},
+            {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": 0.5, "momentum_weight": 0.8},
+        ]
+        repo = self._make_repo_with_payloads(payloads)
+        # threshold=1.0 → only |−2.0| > 1.0 qualifies
+        result = await repo.get_momentum_shadow_metrics(kalshi_env="demo", veto_threshold_cents_per_min=1.0)
+        assert result["veto_fraction"] == pytest.approx(1 / 3)
+
+    async def test_G7_unknown_outcome_string_bucketed_as_unknown(self):
+        from kalshi_bot.db.repositories import PlatformRepository
+        payloads = [
+            {"momentum_post_processor_outcome": "unexpected_future_value"},
+        ]
+        repo = self._make_repo_with_payloads(payloads)
+        result = await repo.get_momentum_shadow_metrics(kalshi_env="demo")
+        assert result["by_outcome"]["unknown"] == 1
+
+
+# ── Cluster H: control room shadow_metrics card shape ─────────────────────────
+
+
+class TestCH_ControlRoomShadowMetrics:
+    """Unit tests for _momentum_calibration_summary shadow_metrics sub-key."""
+
+    async def test_H1_summary_includes_shadow_metrics_key(self):
+        """_momentum_calibration_summary must include a 'shadow_metrics' key."""
+        from kalshi_bot.web.control_room import _momentum_calibration_summary
+
+        shadow_stub = {
+            "window_hours": 24,
+            "total": 5,
+            "by_outcome": {"success": 3, "calibration_missing": 1, "insufficient_points": 1,
+                           "price_history_error": 0, "unknown": 0},
+            "avg_slope_cents_per_min": 1.2,
+            "avg_weight": 0.75,
+            "veto_fraction": 0.0,
+        }
+
+        mock_repo = AsyncMock()
+        mock_repo.get_checkpoint = AsyncMock(return_value=None)
+        mock_repo.get_momentum_shadow_metrics = AsyncMock(return_value=shadow_stub)
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.commit = AsyncMock()
+
+        with patch("kalshi_bot.web.control_room.PlatformRepository", return_value=mock_repo):
+            with patch("kalshi_bot.services.momentum_calibration.get_momentum_calibration_state",
+                       new_callable=AsyncMock, return_value={"active": None, "pending": None}):
+                container = MagicMock()
+                container.session_factory.return_value = mock_session
+                container.settings.kalshi_env = "demo"
+                container.settings.app_color = "blue"
+                container.settings.momentum_slope_veto_cents_per_min = 0.5
+
+                result = await _momentum_calibration_summary(container)
+
+        assert "shadow_metrics" in result
+        sm = result["shadow_metrics"]
+        assert sm["window_hours"] == 24
+        assert sm["total"] == 5
+        assert "by_outcome" in sm
+        assert "avg_slope_cents_per_min" in sm
+        assert "avg_weight" in sm
+        assert "veto_fraction" in sm
+
+    async def test_H2_shadow_metrics_by_outcome_has_all_four_outcome_keys(self):
+        """by_outcome must contain success/calibration_missing/insufficient_points/price_history_error."""
+        from kalshi_bot.web.control_room import _momentum_calibration_summary
+
+        shadow_stub = {
+            "window_hours": 24,
+            "total": 0,
+            "by_outcome": {"success": 0, "calibration_missing": 0, "insufficient_points": 0,
+                           "price_history_error": 0, "unknown": 0},
+            "avg_slope_cents_per_min": None,
+            "avg_weight": None,
+            "veto_fraction": None,
+        }
+
+        mock_repo = AsyncMock()
+        mock_repo.get_checkpoint = AsyncMock(return_value=None)
+        mock_repo.get_momentum_shadow_metrics = AsyncMock(return_value=shadow_stub)
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.commit = AsyncMock()
+
+        with patch("kalshi_bot.web.control_room.PlatformRepository", return_value=mock_repo):
+            with patch("kalshi_bot.services.momentum_calibration.get_momentum_calibration_state",
+                       new_callable=AsyncMock, return_value={"active": None, "pending": None}):
+                container = MagicMock()
+                container.session_factory.return_value = mock_session
+                container.settings.kalshi_env = "demo"
+                container.settings.app_color = "blue"
+                container.settings.momentum_slope_veto_cents_per_min = 0.5
+
+                result = await _momentum_calibration_summary(container)
+
+        by_outcome = result["shadow_metrics"]["by_outcome"]
+        for key in ("success", "calibration_missing", "insufficient_points", "price_history_error"):
+            assert key in by_outcome

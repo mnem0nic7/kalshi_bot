@@ -84,20 +84,22 @@ def get_active_momentum_calibration(
 async def get_active_momentum_calibration_async(
     repo: PlatformRepository,
     settings: Settings,
-) -> MomentumCalibrationParams:
+) -> tuple[MomentumCalibrationParams, bool]:
     """
-    Read the active momentum_calibration:{env} checkpoint and return typed params.
+    Read the active momentum_calibration:{env} checkpoint and return typed params plus a bool
+    indicating whether a checkpoint record exists (False = settings-defaults only).
     Falls back per-field to Settings defaults when the checkpoint is absent or a field is missing.
     Partial checkpoints (missing individual fields) are supported for forward-compat.
     """
     cp = await repo.get_checkpoint(f"momentum_calibration:{settings.kalshi_env}")
+    checkpoint_exists = cp is not None
     payload: dict[str, Any] = (cp.payload if cp is not None else {}) or {}
 
     def _get(key: str, default: Any) -> Any:
         v = payload.get(key)
         return v if v is not None else default
 
-    return MomentumCalibrationParams(
+    params = MomentumCalibrationParams(
         momentum_weight_scale_cents_per_min=float(
             _get("momentum_weight_scale_cents_per_min", settings.momentum_weight_scale_cents_per_min)
         ),
@@ -113,6 +115,7 @@ async def get_active_momentum_calibration_async(
             _get("momentum_veto_staleness_gate", settings.momentum_veto_staleness_gate)
         ),
     )
+    return params, checkpoint_exists
 
 
 async def get_momentum_calibration_state(
