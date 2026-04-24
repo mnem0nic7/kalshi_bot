@@ -450,14 +450,15 @@ def test_risk_engine_allows_when_under_per_ticker_count_cap() -> None:
     assert verdict.status == RiskStatus.APPROVED
 
 
-def test_risk_engine_blocks_near_50_pct_probability() -> None:
+def test_risk_engine_blocks_midband_probability_with_weak_edge() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         risk_min_edge_bps=50,
         risk_min_probability_extremity_pct=25.0,
+        risk_probability_midband_max_extra_edge_bps=500,
     )
     engine = DeterministicRiskEngine(settings)
-    # fair_yes=0.64 is between 0.25 and 0.75 → blocked
+    # fair_yes=0.64 needs about 270bps under the edge-scaled midband policy.
     verdict = engine.evaluate(
         room=make_room(),
         control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
@@ -472,7 +473,87 @@ def test_risk_engine_blocks_near_50_pct_probability() -> None:
         context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
     )
     assert verdict.status == RiskStatus.BLOCKED
-    assert any("50%" in r for r in verdict.reasons)
+    assert any("requires 270bps edge" in r and "actual edge is 200bps" in r for r in verdict.reasons)
+
+
+def test_risk_engine_approves_midband_probability_with_strong_edge() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=25.0,
+        risk_probability_midband_max_extra_edge_bps=500,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(edge_bps=300),
+        context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+
+
+def test_risk_engine_probability_boundaries_pass() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=25.0,
+        risk_probability_midband_max_extra_edge_bps=500,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    for fair_yes in (Decimal("0.2500"), Decimal("0.7500")):
+        signal = replace(make_signal(edge_bps=200), fair_yes_dollars=fair_yes)
+        verdict = engine.evaluate(
+            room=make_room(),
+            control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+            ticket=TradeTicket(
+                market_ticker="WX-TEST",
+                action=TradeAction.BUY,
+                side=ContractSide.YES,
+                yes_price_dollars=Decimal("0.5800"),
+                count_fp=Decimal("10.00"),
+            ),
+            signal=signal,
+            context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
+        )
+        assert verdict.status == RiskStatus.APPROVED
+
+
+def test_risk_engine_midpoint_requires_full_extra_edge() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=25.0,
+        risk_probability_midband_max_extra_edge_bps=500,
+    )
+    engine = DeterministicRiskEngine(settings)
+    signal = replace(make_signal(edge_bps=549), fair_yes_dollars=Decimal("0.5000"))
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=signal,
+        context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("requires 550bps edge" in r and "actual edge is 549bps" in r for r in verdict.reasons)
 
 
 def test_risk_engine_approves_extreme_probability() -> None:

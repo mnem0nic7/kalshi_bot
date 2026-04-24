@@ -10,6 +10,8 @@ if TYPE_CHECKING:
     from kalshi_bot.db.models import FillRecord, OrderRecord
     from kalshi_bot.db.repositories import PlatformRepository
 
+from kalshi_bot.services.risk_policy import probability_midband_block_reason
+
 STOP_LOSS_OUTCOME_SUBMIT_FAILED = "submit_failed"
 STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL = "submitted_pending_fill"
 STOP_LOSS_OUTCOME_FILLED_EXIT = "filled_exit"
@@ -197,11 +199,15 @@ def classify_position_health(
     if fair_yes is None:
         fresh_entry_reasons.append("Latest model fair value unavailable.")
     else:
-        extremity = Decimal(str(settings.risk_min_probability_extremity_pct)) / Decimal("100")
-        if extremity > 0 and extremity <= fair_yes <= (Decimal("1.0000") - extremity):
-            fresh_entry_reasons.append(
-                f"Fair probability {fair_yes:.2f} is inside the {extremity:.0%}-{(Decimal('1.0000') - extremity):.0%} no-trade band."
-            )
+        probability_reason = probability_midband_block_reason(
+            fair_yes=fair_yes,
+            edge_bps=implied_edge_bps,
+            base_min_edge_bps=settings.risk_min_edge_bps,
+            extremity_pct=settings.risk_min_probability_extremity_pct,
+            max_extra_edge_bps=getattr(settings, "risk_probability_midband_max_extra_edge_bps", 500),
+        )
+        if probability_reason is not None:
+            fresh_entry_reasons.append(probability_reason)
     if trade_regime != "standard":
         fresh_entry_reasons.append(f"Trade regime '{trade_regime}' is no longer permitted for fresh entries.")
     if implied_edge_bps is None:

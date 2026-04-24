@@ -11,6 +11,7 @@ from kalshi_bot.core.fixed_point import as_decimal, quantize_count
 from kalshi_bot.core.schemas import PortfolioBucketSnapshot, RiskVerdictPayload, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.agent_packs import RuntimeThresholds
+from kalshi_bot.services.risk_policy import probability_midband_block_reason
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
 from kalshi_bot.services.strategy_cleanup import CleanupSignal
 
@@ -145,16 +146,15 @@ class DeterministicRiskEngine:
                 f"Contract price {contract_price} is below minimum {min_price}; "
                 f"market has priced this as nearly impossible."
             )
-        extremity_pct = self.settings.risk_min_probability_extremity_pct
-        if extremity_pct > 0:
-            extremity = extremity_pct / 100.0
-            fair_yes = float(signal.fair_yes_dollars)
-            if extremity <= fair_yes <= (1.0 - extremity):
-                block(
-                    f"Fair probability {fair_yes:.2f} is too close to 50% (must be "
-                    f"<{extremity:.0%} or >{1.0 - extremity:.0%}); forecast error noise "
-                    f"exceeds reliable edge at this probability."
-                )
+        probability_reason = probability_midband_block_reason(
+            fair_yes=signal.fair_yes_dollars,
+            edge_bps=signal.edge_bps,
+            base_min_edge_bps=active_thresholds.risk_min_edge_bps,
+            extremity_pct=self.settings.risk_min_probability_extremity_pct,
+            max_extra_edge_bps=getattr(self.settings, "risk_probability_midband_max_extra_edge_bps", 500),
+        )
+        if probability_reason is not None:
+            block(probability_reason)
 
         if market_observed_at is None or (now - market_observed_at).total_seconds() > self.settings.risk_stale_market_seconds:
             block("Kalshi market data is stale.")

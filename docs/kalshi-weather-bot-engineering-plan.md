@@ -386,7 +386,7 @@ Resolution-state detection: if `current_temp_f >= threshold`, the market is `LOC
 | 5 | Max edge (credibility) | `edge_bps > risk_max_credible_edge_bps` (5000 bps) — model error signal |
 | 6 | Confidence floor | `signal.confidence < risk_min_confidence` (0.70) |
 | 7 | Contract price floor | contract price < `risk_min_contract_price_dollars` (0.25) — market pricing it as nearly impossible |
-| 7b | Probability extremity | `fair_yes` between 25% and 75% — too close to coin-flip; forecast noise exceeds edge signal (`risk_min_probability_extremity_pct=25.0`, disabled by default, enable in production) |
+| 7b | Probability extremity | `fair_yes` strictly inside the configured midband requires extra edge that ramps linearly toward 50%; with `risk_min_probability_extremity_pct=25.0`, exact 25%/75% pass and 50% requires `risk_probability_midband_max_extra_edge_bps` additional edge |
 | 8 | Market staleness | `market_observed_at` older than 60s |
 | 9 | Research staleness | `research_observed_at` older than 900s |
 | 10 | Order count cap | `count_fp > risk_max_order_count_fp` |
@@ -766,7 +766,8 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `RISK_MAX_CREDIBLE_EDGE_BPS` | 5000 | Maximum credible edge; larger values indicate model error |
 | `RISK_MIN_CONFIDENCE` | 0.70 | Hard block below this confidence score; 0.70–0.80 gets 50% size, 0.80–0.90 gets 75%, ≥0.90 gets 100% |
 | `RISK_MIN_CONTRACT_PRICE_DOLLARS` | 0.25 | Hard block if the traded side costs less than 25¢ |
-| `RISK_MIN_PROBABILITY_EXTREMITY_PCT` | 0.0 (prod: 25.0) | Block trades where fair_yes is within this many pct-points of 50%; set 25.0 in production |
+| `RISK_MIN_PROBABILITY_EXTREMITY_PCT` | 25.0 | Defines the fair-probability midband around 50%; inside the band, trades need extra edge instead of an absolute block |
+| `RISK_PROBABILITY_MIDBAND_MAX_EXTRA_EDGE_BPS` | 500 | Maximum extra edge required at fair_yes=50%; linearly tapers to 0 at the midband edges |
 | `RISK_MAX_CONCURRENT_TICKERS` | 10 | Max open-position tickers |
 | `RISK_MAX_ORDER_COUNT_FP` | 500 | Hard contract count cap per order (guard #10) |
 | `RISK_MAX_POSITION_COUNT_FP_PER_TICKER` | 200 | Max contracts held per ticker (guard #11) |
@@ -931,7 +932,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 - [ ] Kill switch and shadow mode tested end-to-end in demo
 - [ ] Production RSA key loaded and verified (`chmod 600 <key_path>` recommended; startup raises `PermissionError` if the key has any write bits set — group/other-writable — but allows 0o644 read-only mounts as used by Docker secrets)
 - [ ] `WEATHER_USER_AGENT` set to a real app identifier and contact email (e.g., `kalshi-bot/1.0 (your@email.com)`) — NWS API requires a valid User-Agent or will rate-limit; default placeholder `ops@example.com` should not reach production
-- [ ] `RISK_MIN_PROBABILITY_EXTREMITY_PCT=25.0` set in production env (guard #7b — blocks near-50% coin-flip trades; intentionally 0.0 in demo)
+- [ ] `RISK_MIN_PROBABILITY_EXTREMITY_PCT=25.0` and `RISK_PROBABILITY_MIDBAND_MAX_EXTRA_EDGE_BPS=500` set in production env (guard #7b — requires stronger edge near 50% fair probability)
 - [ ] `APP_SHADOW_MODE=false` and `APP_ENABLE_KILL_SWITCH=false` confirmed in production env
 - [ ] `KALSHI_ENV=production` set
 - [ ] Auth cookie domain verified: `WEB_AUTH_COOKIE_DOMAIN` set to the correct shared domain (e.g., `.ai-al.site`) so sessions are valid across `web_demo`, `web_production`, and `web_strategies` — confirm in browser devtools that the `Set-Cookie` domain matches before exposing `web_production` externally
