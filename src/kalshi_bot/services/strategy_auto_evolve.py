@@ -17,6 +17,21 @@ AUTO_EVOLVE_SOURCE = "strategy_auto_evolve"
 AUTO_EVOLVE_EVENT_KIND = "auto_evolve"
 AUTO_EVOLVE_ASSIGNED_BY = "auto_evolve"
 
+# Schema-defined upper bounds used as the delta-cap reference when current value is zero.
+# Ratios are bounded by the schema [0, 1]. Bps/seconds fields have no declared max, so we
+# use practical ceilings that represent the outer edge of any sane configuration.
+_THRESHOLD_FIELD_CEILING: dict[str, float] = {
+    "risk_min_edge_bps": 10000.0,
+    "risk_max_order_notional_dollars": 0.0,       # validates > 0; can never be zero
+    "risk_max_position_notional_dollars": 0.0,    # validates > 0; can never be zero
+    "trigger_max_spread_bps": 10000.0,
+    "trigger_cooldown_seconds": 86400.0,
+    "strategy_quality_edge_buffer_bps": 10000.0,
+    "strategy_min_remaining_payout_bps": 0.0,     # validates > 0; can never be zero
+    "risk_safe_capital_reserve_ratio": 1.0,
+    "risk_risky_capital_max_ratio": 1.0,
+}
+
 
 class StrategyAutoEvolveService:
     def __init__(
@@ -217,6 +232,17 @@ class StrategyAutoEvolveService:
         backtest = dict((suggestion.get("result") or {}).get("backtest") or {})
         if backtest.get("status") != "ok":
             return None, {"stage": "accept", "reason": "backtest_not_ok", "backtest_status": backtest.get("status")}
+
+        proposed_thresholds = dict(((suggestion.get("result") or {}).get("candidate") or {}).get("thresholds") or {})
+        if proposed_thresholds:
+            cap_error = await self._validate_delta_cap(proposed_thresholds)
+            if cap_error is not None:
+                logger.warning(
+                    "auto-evolve suggestion rejected: delta cap exceeded — %s",
+                    cap_error.get("violations"),
+                )
+                return None, cap_error
+
         saved_name = suggestion.get("saved_strategy_name")
         if saved_name:
             return str(saved_name), None
@@ -228,45 +254,127 @@ class StrategyAutoEvolveService:
             return None, {"stage": "accept", "run_id": suggestion.get("id"), "error": str(exc)}
         return accepted.get("strategy_name"), None
 
+    async def _validate_delta_cap(self, proposed: dict[str, Any]) -> dict[str, Any] | None:
+        """Return an error dict if any numeric threshold field moves beyond the configured cap."""
+        cap = self.settings.strategy_auto_evolve_max_threshold_delta_pct
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            active_strategies = await repo.list_strategies(active_only=True)
+        if not active_strategies:
+            return None
+        # Use the most recently created active strategy as the baseline
+        current_record = max(active_strategies, key=lambda s: s.created_at)
+        current = current_record.thresholds or {}
+        violations: list[dict[str, Any]] = []
+        for field, ceiling in _THRESHOLD_FIELD_CEILING.items():
+            raw_current = current.get(field)
+            raw_proposed = proposed.get(field)
+            if raw_current is None or raw_proposed is None:
+                continue
+            current_f = float(raw_current)
+            proposed_f = float(raw_proposed)
+            if current_f == 0.0:
+                if ceiling == 0.0:
+                    # Field can never be zero by schema; skip
+                    continue
+                # Zero-value: use schema ceiling as reference
+                allowed_min = 0.0
+                allowed_max = ceiling * cap
+            else:
+                ref = abs(current_f)
+                allowed_min = current_f - ref * cap
+                allowed_max = current_f + ref * cap
+            if not (allowed_min <= proposed_f <= allowed_max):
+                violations.append({
+                    "field": field,
+                    "current": current_f,
+                    "proposed": proposed_f,
+                    "allowed_min": round(allowed_min, 6),
+                    "allowed_max": round(allowed_max, 6),
+                })
+        if violations:
+            return {
+                "stage": "accept",
+                "reason": "delta_cap_exceeded",
+                "cap_pct": cap,
+                "violations": violations,
+            }
+        return None
+
     async def _apply_eligible_assignments(self, snapshot: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         changes: list[dict[str, Any]] = []
         skips: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        cycle_cap = self.settings.strategy_auto_evolve_max_cities_per_cycle
         rows = list(snapshot.get("city_matrix") or [])
+
+        # Separate ineligible rows from eligible candidates
+        eligible: list[dict[str, Any]] = []
+        for row in rows:
+            series_ticker = row.get("series_ticker")
+            recommendation = dict(row.get("recommendation") or {})
+            recommended_name = recommendation.get("strategy_name")
+            previous_name = (row.get("assignment") or {}).get("strategy_name")
+            if not row.get("approval_eligible") or not series_ticker or not recommended_name:
+                skips.append({
+                    "series_ticker": series_ticker,
+                    "reason": "not_eligible",
+                    "recommendation_status": recommendation.get("status"),
+                })
+                continue
+            if previous_name == recommended_name:
+                skips.append({
+                    "series_ticker": series_ticker,
+                    "reason": "already_matching",
+                    "strategy_name": recommended_name,
+                })
+                continue
+            eligible.append(row)
+
+        # Sort by improvement vs current assignment (desc), then runner-up gap (desc), then ticker (asc)
+        eligible.sort(
+            key=lambda r: (
+                -(r.get("gap_to_assignment") or 0.0),
+                -(r.get("gap_to_runner_up") or 0.0),
+                r.get("series_ticker") or "",
+            )
+        )
+
+        # Apply per-cycle cap: defer remainder to next nightly run
+        to_assign = eligible[:cycle_cap]
+        for row in eligible[cycle_cap:]:
+            recommendation = dict(row.get("recommendation") or {})
+            skips.append({
+                "series_ticker": row.get("series_ticker"),
+                "reason": "cycle_cap_exceeded",
+                "strategy_name": recommendation.get("strategy_name"),
+                "recommendation_status": recommendation.get("status"),
+            })
+
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            for row in rows:
+            for row in to_assign:
                 series_ticker = row.get("series_ticker")
                 recommendation = dict(row.get("recommendation") or {})
                 recommended_name = recommendation.get("strategy_name")
                 previous_name = (row.get("assignment") or {}).get("strategy_name")
-                if not row.get("approval_eligible") or not series_ticker or not recommended_name:
-                    skips.append({
+                try:
+                    await repo.set_city_strategy_assignment(
+                        str(series_ticker),
+                        str(recommended_name),
+                        assigned_by=AUTO_EVOLVE_ASSIGNED_BY,
+                    )
+                    changes.append({
                         "series_ticker": series_ticker,
-                        "reason": "not_eligible",
+                        "previous_strategy": previous_name,
+                        "new_strategy": recommended_name,
                         "recommendation_status": recommendation.get("status"),
+                        "recommendation_label": recommendation.get("label"),
+                        "gap_to_runner_up": row.get("gap_to_runner_up"),
+                        "gap_to_assignment": row.get("gap_to_assignment"),
                     })
-                    continue
-                if previous_name == recommended_name:
-                    skips.append({
-                        "series_ticker": series_ticker,
-                        "reason": "already_matching",
-                        "strategy_name": recommended_name,
-                    })
-                    continue
-                await repo.set_city_strategy_assignment(
-                    str(series_ticker),
-                    str(recommended_name),
-                    assigned_by=AUTO_EVOLVE_ASSIGNED_BY,
-                )
-                changes.append({
-                    "series_ticker": series_ticker,
-                    "previous_strategy": previous_name,
-                    "new_strategy": recommended_name,
-                    "recommendation_status": recommendation.get("status"),
-                    "recommendation_label": recommendation.get("label"),
-                    "gap_to_runner_up": row.get("gap_to_runner_up"),
-                })
+                except Exception as exc:
+                    errors.append({"stage": "assign", "series_ticker": series_ticker, "error": str(exc)})
             await session.commit()
 
         if changes and self.secondary_session_factory is not None:

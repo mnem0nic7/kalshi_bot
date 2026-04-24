@@ -308,12 +308,22 @@ class Settings(BaseSettings):
     strategy_codex_nightly_hour_local: int = 1
     strategy_auto_evolve_enabled: bool = True
     strategy_auto_evolve_window_days: int = 180
-    strategy_auto_evolve_assign_eligible: bool = True
+    strategy_auto_evolve_assign_eligible: bool = False
     strategy_auto_evolve_accept_suggestions: bool = True
-    strategy_auto_evolve_activate_suggestions: bool = True
+    strategy_auto_evolve_activate_suggestions: bool = False
+    strategy_auto_evolve_max_threshold_delta_pct: float = 0.30
+    strategy_auto_evolve_max_cities_per_cycle: int = 3
     historical_execution_confidence_min_market_days: int = 60
     historical_directional_confidence_min_full_market_days: int = 30
     historical_directional_confidence_min_holdout_market_days: int = 7
+
+    @model_validator(mode="after")
+    def _validate_auto_evolve_flags(self) -> "Settings":
+        if self.strategy_auto_evolve_assign_eligible and not self.strategy_auto_evolve_activate_suggestions:
+            raise ValueError(
+                "strategy_auto_evolve_assign_eligible requires strategy_auto_evolve_activate_suggestions=True"
+            )
+        return self
 
     def model_post_init(self, __context: object) -> None:
         if self.database_url:
