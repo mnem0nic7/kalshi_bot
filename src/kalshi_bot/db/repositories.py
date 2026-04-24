@@ -68,6 +68,8 @@ from kalshi_bot.db.models import (
     RoomResearchHealthRecord,
     RoomStrategyAuditRecord,
     CityStrategyAssignment,
+    DecisionCorpusBuildRecord,
+    DecisionCorpusRowRecord,
     Signal,
     StrategyPromotionEvent,
     StrategyRecord,
@@ -3090,6 +3092,195 @@ class PlatformRepository:
         await self.session.delete(record)
         await self.session.flush()
         return True
+
+    async def create_decision_corpus_build(
+        self,
+        *,
+        version: str,
+        date_from: date,
+        date_to: date,
+        source: dict[str, Any],
+        filters: dict[str, Any],
+        git_sha: str | None = None,
+        parent_build_id: str | None = None,
+        notes: str | None = None,
+    ) -> DecisionCorpusBuildRecord:
+        record = DecisionCorpusBuildRecord(
+            version=version,
+            status="in_progress",
+            git_sha=git_sha,
+            source=source,
+            filters=filters,
+            date_from=date_from,
+            date_to=date_to,
+            parent_build_id=parent_build_id,
+            notes=notes,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def get_decision_corpus_build(self, build_id: str) -> DecisionCorpusBuildRecord | None:
+        return await self.session.get(DecisionCorpusBuildRecord, build_id)
+
+    async def list_decision_corpus_builds(
+        self,
+        *,
+        status: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        limit: int = 20,
+    ) -> list[DecisionCorpusBuildRecord]:
+        stmt = select(DecisionCorpusBuildRecord)
+        if status is not None:
+            stmt = stmt.where(DecisionCorpusBuildRecord.status == status)
+        if date_from is not None:
+            stmt = stmt.where(DecisionCorpusBuildRecord.date_to >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(DecisionCorpusBuildRecord.date_from <= date_to)
+        result = await self.session.execute(
+            stmt.order_by(DecisionCorpusBuildRecord.created_at.desc(), DecisionCorpusBuildRecord.id.desc()).limit(limit)
+        )
+        return list(result.scalars())
+
+    async def mark_decision_corpus_build_successful(
+        self,
+        build_id: str,
+        *,
+        row_count: int,
+    ) -> DecisionCorpusBuildRecord:
+        record = await self.get_decision_corpus_build(build_id)
+        if record is None:
+            raise KeyError(f"Decision corpus build {build_id} not found")
+        record.status = "successful"
+        record.row_count = row_count
+        record.finished_at = datetime.now(UTC)
+        record.failure_reason = None
+        await self.session.flush()
+        return record
+
+    async def mark_decision_corpus_build_failed(
+        self,
+        build_id: str,
+        *,
+        failure_reason: str,
+        row_count: int | None = None,
+    ) -> DecisionCorpusBuildRecord:
+        record = await self.get_decision_corpus_build(build_id)
+        if record is None:
+            raise KeyError(f"Decision corpus build {build_id} not found")
+        record.status = "failed"
+        record.row_count = row_count
+        record.finished_at = datetime.now(UTC)
+        record.failure_reason = failure_reason
+        await self.session.flush()
+        return record
+
+    async def add_decision_corpus_row(self, **values: Any) -> DecisionCorpusRowRecord:
+        build_id = str(values.get("corpus_build_id") or "")
+        build = await self.get_decision_corpus_build(build_id)
+        if build is None:
+            raise KeyError(f"Decision corpus build {build_id} not found")
+        if build.status != "in_progress":
+            raise ValueError("Decision corpus rows can only be inserted into in-progress builds")
+        record = DecisionCorpusRowRecord(**values)
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def list_decision_corpus_rows(
+        self,
+        *,
+        build_id: str,
+        limit: int | None = None,
+    ) -> list[DecisionCorpusRowRecord]:
+        stmt = (
+            select(DecisionCorpusRowRecord)
+            .where(DecisionCorpusRowRecord.corpus_build_id == build_id)
+            .order_by(
+                DecisionCorpusRowRecord.local_market_day.asc(),
+                DecisionCorpusRowRecord.checkpoint_ts.asc(),
+                DecisionCorpusRowRecord.market_ticker.asc(),
+                DecisionCorpusRowRecord.id.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def count_decision_corpus_rows(self, *, build_id: str) -> int:
+        stmt = select(func.count()).select_from(DecisionCorpusRowRecord).where(DecisionCorpusRowRecord.corpus_build_id == build_id)
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    def decision_corpus_current_checkpoint_name(self, *, kalshi_env: str | None = None) -> str:
+        return self._env_stream_name("current_decision_corpus_build", kalshi_env=kalshi_env)
+
+    async def get_current_decision_corpus_build(
+        self,
+        *,
+        kalshi_env: str | None = None,
+    ) -> DecisionCorpusBuildRecord | None:
+        checkpoint = await self.get_checkpoint(self.decision_corpus_current_checkpoint_name(kalshi_env=kalshi_env))
+        build_id = ((checkpoint.payload or {}).get("build_id") if checkpoint is not None else None)
+        if not build_id:
+            return None
+        build = await self.get_decision_corpus_build(str(build_id))
+        if build is None or build.status != "successful":
+            return None
+        return build
+
+    async def promote_decision_corpus_build(
+        self,
+        build_id: str,
+        *,
+        kalshi_env: str | None = None,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        build = await self.get_decision_corpus_build(build_id)
+        if build is None:
+            raise KeyError(f"Decision corpus build {build_id} not found")
+        if build.status != "successful":
+            raise ValueError("Only successful decision corpus builds can be promoted")
+        env = self._resolved_kalshi_env(kalshi_env)
+        previous = await self.get_current_decision_corpus_build(kalshi_env=env)
+        if previous is not None and previous.id == build_id:
+            raise ValueError("Decision corpus build is already current for this environment")
+        await self.set_checkpoint(
+            self.decision_corpus_current_checkpoint_name(kalshi_env=env),
+            build_id,
+            {
+                "build_id": build_id,
+                "kalshi_env": env,
+                "promoted_at": datetime.now(UTC).isoformat(),
+                "previous_build_id": previous.id if previous is not None else None,
+                "actor": actor,
+            },
+        )
+        await self.log_ops_event(
+            severity="info",
+            summary=f"Decision corpus build promoted for {env}",
+            source="decision_corpus",
+            kalshi_env=env,
+            payload={
+                "event_kind": "decision_corpus_build_promoted",
+                "build_id": build_id,
+                "previous_build_id": previous.id if previous is not None else None,
+                "kalshi_env": env,
+                "actor": actor,
+            },
+        )
+        return {"build_id": build_id, "previous_build_id": previous.id if previous is not None else None, "kalshi_env": env}
+
+    async def list_current_decision_corpus_rows(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        limit: int | None = None,
+    ) -> list[DecisionCorpusRowRecord]:
+        build = await self.get_current_decision_corpus_build(kalshi_env=kalshi_env)
+        if build is None:
+            return []
+        return await self.list_decision_corpus_rows(build_id=build.id, limit=limit)
 
     async def save_memory_note(self, *, room_id: str | None, payload: MemoryNotePayload, embedding: list[float] | None, provider: str) -> MemoryNoteRecord:
         note = MemoryNoteRecord(

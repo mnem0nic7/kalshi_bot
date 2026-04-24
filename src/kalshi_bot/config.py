@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     demo_kalshi_read_private_key_path: str | None = None
     demo_kalshi_write_private_key_path: str | None = None
     kalshi_subaccount: int = 0
+    kalshi_taker_fee_rate: float = 0.07
 
     weather_user_agent: str = "kalshi-bot/0.1 (ops@example.com)"
     weather_market_map_path: str = "docs/examples/weather_markets.example.yaml"

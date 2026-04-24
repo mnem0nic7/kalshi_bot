@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from kalshi_bot.core.enums import DeploymentColor, RiskStatus, RoomOrigin, RoomStage
@@ -627,6 +627,136 @@ class HistoricalReplayRunRecord(Base, IdMixin, TimestampMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class DecisionCorpusBuildRecord(Base, IdMixin, TimestampMixin):
+    """Build-level metadata for immutable decision corpus row sets.
+
+    Rows are inserted while a build is in progress. Once a build leaves
+    ``in_progress``, application code creates a new build rather than mutating
+    rows in the completed one.
+    """
+
+    __tablename__ = "decision_corpus_builds"
+
+    version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="in_progress", index=True)
+    git_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[dict] = mapped_column(JSON, default=dict)
+    filters: Mapped[dict] = mapped_column(JSON, default=dict)
+    date_from: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    date_to: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    parent_build_id: Mapped[str | None] = mapped_column(
+        ForeignKey("decision_corpus_builds.id"),
+        nullable=True,
+        index=True,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DecisionCorpusRowRecord(Base, IdMixin):
+    """Per-decision historical corpus row.
+
+    The repository intentionally exposes insert/list/get paths only. If a row is
+    wrong, the normal-operation fix is to create a new build with corrected
+    derivation logic.
+    """
+
+    __tablename__ = "decision_corpus_rows"
+    __table_args__ = (
+        CheckConstraint(
+            "support_status IN ('supported', 'exploratory', 'insufficient')",
+            name="ck_decision_corpus_support_status",
+        ),
+        CheckConstraint(
+            "support_level IN ("
+            "'L1_station_season_lead_regime', "
+            "'L2_station_season_lead', "
+            "'L3_station_season', "
+            "'L4_season_lead', "
+            "'L5_global')",
+            name="ck_decision_corpus_support_level",
+        ),
+        CheckConstraint(
+            "source_provenance IN ("
+            "'historical_replay_full_checkpoint', "
+            "'historical_replay_partial_checkpoint', "
+            "'historical_replay_late_only', "
+            "'historical_replay_external_forecast_repair', "
+            "'historical_replay_unknown')",
+            name="ck_decision_corpus_source_provenance",
+        ),
+        UniqueConstraint(
+            "corpus_build_id",
+            "room_id",
+            "market_ticker",
+            "checkpoint_ts",
+            "policy_version",
+            "model_version",
+            name="uq_decision_corpus_row_identity",
+        ),
+    )
+
+    corpus_build_id: Mapped[str] = mapped_column(
+        ForeignKey("decision_corpus_builds.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    room_id: Mapped[str] = mapped_column(ForeignKey("rooms.id", ondelete="CASCADE"), nullable=False, index=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    series_ticker: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    station_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    local_market_day: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    checkpoint_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    deployment_color: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    model_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    source_asof_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    quote_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    quote_captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    time_to_settlement_at_checkpoint_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fair_yes_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    edge_bps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recommended_side: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    target_yes_price_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    eligibility_status: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    stand_down_reason: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    trade_regime: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    liquidity_regime: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    support_status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    support_level: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    support_n: Mapped[int] = mapped_column(Integer, nullable=False)
+    support_market_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    support_recency_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    backoff_path: Mapped[list] = mapped_column(JSON, default=list)
+    settlement_result: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    settlement_value_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    pnl_counterfactual_target_frictionless: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    pnl_counterfactual_target_with_fees: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    pnl_model_fair_frictionless: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    pnl_executed_realized: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    fee_counterfactual_dollars: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    counterfactual_count: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    executed_count: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    fee_model_version: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_provenance: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_details: Mapped[dict] = mapped_column(JSON, default=dict)
+    signal_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    quote_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    settlement_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+
 class Checkpoint(Base, IdMixin, TimestampMixin):
     __tablename__ = "checkpoints"
     __table_args__ = (UniqueConstraint("stream_name", name="uq_checkpoint_stream_name"),)
@@ -654,6 +784,17 @@ class DeploymentControl(Base):
 
 Index("ix_room_messages_room_created", RoomMessage.room_id, RoomMessage.created_at)
 Index("ix_raw_exchange_events_stream_created", RawExchangeEvent.stream_name, RawExchangeEvent.created_at)
+Index(
+    "ix_decision_corpus_rows_day_env_policy",
+    DecisionCorpusRowRecord.local_market_day,
+    DecisionCorpusRowRecord.kalshi_env,
+    DecisionCorpusRowRecord.policy_version,
+)
+Index(
+    "ix_decision_corpus_rows_series_day",
+    DecisionCorpusRowRecord.series_ticker,
+    DecisionCorpusRowRecord.local_market_day,
+)
 
 
 class StrategyRecord(Base):

@@ -1,0 +1,404 @@
+from __future__ import annotations
+
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from types import SimpleNamespace
+
+import pytest
+
+from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import ContractSide, DeploymentColor, RoomOrigin, TradeAction
+from kalshi_bot.core.schemas import RoomCreate, TradeTicket
+from kalshi_bot.db.models import DecisionCorpusRowRecord
+from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+from kalshi_bot.services.decision_corpus import DecisionCorpusService
+from kalshi_bot.services.fee_model import KALSHI_TAKER_FEE_V1
+
+
+async def _setup(tmp_path) -> SimpleNamespace:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'decision_corpus.db'}",
+        kalshi_taker_fee_rate=0.07,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    return SimpleNamespace(
+        settings=settings,
+        session_factory=session_factory,
+        service=DecisionCorpusService(settings, session_factory),
+    )
+
+
+async def _seed_historical_decision(
+    session_factory,
+    *,
+    market_ticker: str,
+    series_ticker: str = "KXHIGHNY",
+    station_id: str = "KNYC",
+    local_market_day: str = "2026-04-20",
+    checkpoint_ts: datetime = datetime(2026, 4, 20, 17, 0, tzinfo=UTC),
+    recommended_side: str | None = "yes",
+    target_yes_price: Decimal | None = Decimal("0.6000"),
+    fair_yes: Decimal = Decimal("0.5500"),
+    settlement_result: str | None = "yes",
+    coverage_class: str = "full_checkpoint_coverage",
+    source_kind: str = "checkpoint_archive",
+) -> str:
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        room = await repo.create_room(
+            RoomCreate(name=f"Replay {market_ticker}", market_ticker=market_ticker),
+            active_color=DeploymentColor.BLUE.value,
+            shadow_mode=True,
+            kill_switch_enabled=False,
+            kalshi_env="demo",
+            room_origin=RoomOrigin.HISTORICAL_REPLAY.value,
+            agent_pack_version="model-v1",
+        )
+        signal_payload = {
+            "trade_regime": "standard",
+            "eligibility": {
+                "eligible": bool(recommended_side and target_yes_price is not None),
+                "stand_down_reason": None if recommended_side else "below_min_edge",
+            },
+            "agent_pack_version": "model-v1",
+            "heuristic_pack_version": "policy-v1",
+        }
+        if recommended_side is not None:
+            signal_payload["recommended_side"] = recommended_side
+        if target_yes_price is not None:
+            signal_payload["target_yes_price_dollars"] = str(target_yes_price)
+        await repo.save_signal(
+            room_id=room.id,
+            market_ticker=market_ticker,
+            fair_yes_dollars=fair_yes,
+            edge_bps=700,
+            confidence=0.82,
+            summary="synthetic corpus fixture",
+            payload=signal_payload,
+        )
+        if recommended_side is not None and target_yes_price is not None:
+            await repo.save_trade_ticket(
+                room_id=room.id,
+                ticket=TradeTicket(
+                    market_ticker=market_ticker,
+                    action=TradeAction.BUY,
+                    side=ContractSide.YES if recommended_side == "yes" else ContractSide.NO,
+                    yes_price_dollars=target_yes_price,
+                    count_fp=Decimal("1.00"),
+                ),
+                client_order_id=f"ticket-{market_ticker}",
+            )
+        await repo.save_artifact(
+            room_id=room.id,
+            artifact_type="market_snapshot",
+            source="fixture",
+            title="fixture market snapshot",
+            payload={
+                "mapping": {"station_id": station_id, "timezone_name": "America/New_York"},
+                "market": {
+                    "yes_bid_dollars": "0.5000",
+                    "yes_ask_dollars": "0.6000",
+                    "observed_at": checkpoint_ts.isoformat(),
+                },
+            },
+        )
+        await repo.save_artifact(
+            room_id=room.id,
+            artifact_type="weather_bundle",
+            source="fixture",
+            title="fixture weather bundle",
+            payload={
+                "mapping": {"station_id": station_id, "timezone_name": "America/New_York"},
+            },
+        )
+        if settlement_result is not None:
+            await repo.upsert_historical_settlement_label(
+                market_ticker=market_ticker,
+                series_ticker=series_ticker,
+                local_market_day=local_market_day,
+                source_kind="cli_daily",
+                kalshi_result=settlement_result,
+                settlement_value_dollars=Decimal("1.0000") if settlement_result == "yes" else Decimal("0.0000"),
+                settlement_ts=datetime.fromisoformat(f"{local_market_day}T23:59:00+00:00"),
+                crosscheck_status="matched",
+                crosscheck_high_f=None,
+                crosscheck_result=settlement_result,
+                payload={"fixture": True},
+            )
+        await repo.create_historical_replay_run(
+            room_id=room.id,
+            market_ticker=market_ticker,
+            series_ticker=series_ticker,
+            local_market_day=local_market_day,
+            checkpoint_label="1300",
+            checkpoint_ts=checkpoint_ts,
+            status="completed",
+            agent_pack_version="model-v1",
+            payload={
+                "historical_provenance": {
+                    "coverage_class": coverage_class,
+                    "market_source_kind": source_kind,
+                    "weather_source_kind": source_kind,
+                    "checkpoint_label": "1300",
+                    "checkpoint_ts": checkpoint_ts.isoformat(),
+                    "asof_ts": checkpoint_ts.isoformat(),
+                    "station_id": station_id,
+                    "timezone_name": "America/New_York",
+                }
+            },
+        )
+        await session.commit()
+        return room.id
+
+
+@pytest.mark.asyncio
+async def test_build_creates_rows_with_pnl_nulls_support_and_provenance(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-T80",
+        recommended_side="yes",
+        target_yes_price=Decimal("0.6000"),
+        settlement_result="yes",
+    )
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-T85",
+        recommended_side="no",
+        target_yes_price=Decimal("0.4000"),
+        settlement_result="no",
+        checkpoint_ts=datetime(2026, 4, 20, 17, 1, tzinfo=UTC),
+    )
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-T90",
+        recommended_side=None,
+        target_yes_price=None,
+        settlement_result="no",
+        checkpoint_ts=datetime(2026, 4, 20, 17, 2, tzinfo=UTC),
+    )
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-T95",
+        recommended_side="yes",
+        target_yes_price=Decimal("0.7000"),
+        settlement_result=None,
+        checkpoint_ts=datetime(2026, 4, 20, 17, 3, tzinfo=UTC),
+    )
+
+    result = await harness.service.build(
+        date_from=date(2026, 4, 20),
+        date_to=date(2026, 4, 20),
+        source="historical-replay",
+        notes="fixture build",
+    )
+
+    assert result["status"] == "successful"
+    assert result["row_count"] == 3
+    assert result["support_distribution"] == {"supported": 0, "exploratory": 0, "insufficient": 3}
+
+    async with harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        rows = await repo.list_decision_corpus_rows(build_id=result["build_id"])
+
+    by_ticker = {row.market_ticker: row for row in rows}
+    yes_row = by_ticker["KXHIGHNY-26APR20-T80"]
+    assert yes_row.pnl_counterfactual_target_frictionless == Decimal("0.400000")
+    assert yes_row.fee_counterfactual_dollars == Decimal("0.016800")
+    assert yes_row.pnl_counterfactual_target_with_fees == Decimal("0.383200")
+    assert yes_row.pnl_model_fair_frictionless == Decimal("0.450000")
+    assert yes_row.fee_model_version == KALSHI_TAKER_FEE_V1
+    assert yes_row.source_provenance == "historical_replay_full_checkpoint"
+    assert yes_row.station_id == "KNYC"
+    assert yes_row.time_to_settlement_at_checkpoint_minutes is not None
+    assert yes_row.support_level == "L5_global"
+    assert yes_row.support_status == "insufficient"
+    assert yes_row.backoff_path[-1]["failed_on"] == ["n", "market_days"]
+
+    no_row = by_ticker["KXHIGHNY-26APR20-T85"]
+    assert no_row.recommended_side == "no"
+    assert no_row.pnl_counterfactual_target_frictionless == Decimal("0.400000")
+    assert no_row.pnl_counterfactual_target_with_fees == Decimal("0.383200")
+    assert no_row.pnl_model_fair_frictionless == Decimal("0.550000")
+
+    stand_down = by_ticker["KXHIGHNY-26APR20-T90"]
+    assert stand_down.recommended_side is None
+    assert stand_down.pnl_counterfactual_target_frictionless is None
+    assert stand_down.pnl_counterfactual_target_with_fees is None
+    assert stand_down.pnl_model_fair_frictionless is None
+    assert stand_down.fee_counterfactual_dollars is None
+    assert stand_down.fee_model_version is None
+
+
+@pytest.mark.asyncio
+async def test_dry_run_is_deterministic_and_does_not_write_build_rows(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-T80",
+    )
+
+    first = await harness.service.build(
+        date_from=date(2026, 4, 20),
+        date_to=date(2026, 4, 20),
+        source="historical-replay",
+        dry_run=True,
+    )
+    second = await harness.service.build(
+        date_from=date(2026, 4, 20),
+        date_to=date(2026, 4, 20),
+        source="historical-replay",
+        dry_run=True,
+    )
+
+    assert first["status"] == "dry_run"
+    assert first["row_count"] == second["row_count"] == 1
+    assert first["support_distribution"] == second["support_distribution"]
+    assert await harness.service.list_builds() == []
+
+
+@pytest.mark.asyncio
+async def test_build_rejects_empty_date_range(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+
+    with pytest.raises(ValueError, match="no eligible historical replay"):
+        await harness.service.build(
+            date_from=date(2026, 4, 20),
+            date_to=date(2026, 4, 20),
+            source="historical-replay",
+            dry_run=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_build_rows_are_append_only_after_completion(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-T80",
+    )
+    result = await harness.service.build(
+        date_from=date(2026, 4, 20),
+        date_to=date(2026, 4, 20),
+    )
+
+    async with harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        with pytest.raises(ValueError, match="in-progress"):
+            await repo.add_decision_corpus_row(corpus_build_id=result["build_id"])
+
+
+@pytest.mark.asyncio
+async def test_promote_pointer_is_env_scoped_and_current_rows_follow_pointer(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-T80",
+    )
+    first = await harness.service.build(date_from=date(2026, 4, 20), date_to=date(2026, 4, 20))
+    second = await harness.service.build(date_from=date(2026, 4, 20), date_to=date(2026, 4, 20))
+
+    assert (await harness.service.current(kalshi_env="demo"))["status"] == "missing"
+    await harness.service.promote(first["build_id"], kalshi_env="demo", actor="test")
+    await harness.service.promote(second["build_id"], kalshi_env="live", actor="test")
+
+    async with harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        demo = await repo.get_current_decision_corpus_build(kalshi_env="demo")
+        live = await repo.get_current_decision_corpus_build(kalshi_env="live")
+        demo_rows = await repo.list_current_decision_corpus_rows(kalshi_env="demo")
+        live_rows = await repo.list_current_decision_corpus_rows(kalshi_env="live")
+
+    assert demo is not None and demo.id == first["build_id"]
+    assert live is not None and live.id == second["build_id"]
+    assert {row.corpus_build_id for row in demo_rows} == {first["build_id"]}
+    assert {row.corpus_build_id for row in live_rows} == {second["build_id"]}
+
+    rollback = await harness.service.promote(first["build_id"], kalshi_env="live", actor="test")
+    assert rollback["previous_build_id"] == second["build_id"]
+    with pytest.raises(ValueError, match="already current"):
+        await harness.service.promote(first["build_id"], kalshi_env="live", actor="test")
+
+
+@pytest.mark.asyncio
+async def test_failed_or_in_progress_builds_cannot_promote(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    async with harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        failed = await repo.create_decision_corpus_build(
+            version="failed-fixture",
+            date_from=date(2026, 4, 20),
+            date_to=date(2026, 4, 20),
+            source={"type": "fixture"},
+            filters={},
+        )
+        await repo.mark_decision_corpus_build_failed(failed.id, failure_reason="fixture")
+        in_progress = await repo.create_decision_corpus_build(
+            version="in-progress-fixture",
+            date_from=date(2026, 4, 20),
+            date_to=date(2026, 4, 20),
+            source={"type": "fixture"},
+            filters={},
+        )
+        await repo.set_checkpoint(
+            repo.decision_corpus_current_checkpoint_name(kalshi_env="demo"),
+            failed.id,
+            {"build_id": failed.id},
+        )
+        await session.commit()
+
+    assert (await harness.service.current(kalshi_env="demo"))["status"] == "missing"
+    with pytest.raises(ValueError, match="successful"):
+        await harness.service.promote(failed.id, kalshi_env="demo")
+    with pytest.raises(ValueError, match="successful"):
+        await harness.service.promote(in_progress.id, kalshi_env="demo")
+
+
+@pytest.mark.asyncio
+async def test_validate_detects_target_pnl_mismatch(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-T80",
+    )
+    result = await harness.service.build(date_from=date(2026, 4, 20), date_to=date(2026, 4, 20))
+
+    async with harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        rows = await repo.list_decision_corpus_rows(build_id=result["build_id"])
+        rows[0].pnl_counterfactual_target_frictionless = Decimal("-99.000000")
+        await session.commit()
+
+    validation = await harness.service.validate_build(result["build_id"])
+    assert validation["ok"] is False
+    assert validation["errors"][0]["code"] == "target_pnl_mismatch"
+
+
+def test_corpus_schema_has_no_win_rate_columns() -> None:
+    column_names = {column.name for column in DecisionCorpusRowRecord.__table__.columns}
+
+    assert not {"win_rate", "win_count", "loss_count"} & column_names
+
+
+def test_corpus_schema_has_required_integrity_constraints() -> None:
+    table = DecisionCorpusRowRecord.__table__
+    constraint_names = {constraint.name for constraint in table.constraints}
+
+    assert table.c.source_provenance.nullable is False
+    assert "ck_decision_corpus_source_provenance" in constraint_names
+    assert "uq_decision_corpus_row_identity" in constraint_names
+
+
+def test_platform_repository_exposes_no_decision_corpus_row_mutators() -> None:
+    dangerous_names = {
+        "update_decision_corpus_row",
+        "delete_decision_corpus_row",
+        "upsert_decision_corpus_row",
+        "modify_decision_corpus_pnl",
+        "rewrite_decision_corpus_row",
+    }
+
+    assert all(not hasattr(PlatformRepository, name) for name in dangerous_names)
