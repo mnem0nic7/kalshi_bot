@@ -536,3 +536,52 @@ def test_annotate_signal_quality_marks_broken_book_as_warn_only_block() -> None:
     assert annotated.warn_only_blocked is True
     assert annotated.model_quality_status == "warn"
     assert verdict.stand_down_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN
+
+
+def _eligible_signal(*, forecast_delta_f: float | None) -> StrategySignal:
+    """Signal with actionable edge that reaches the delta_f gate."""
+    return StrategySignal(
+        fair_yes_dollars=Decimal("0.6500"),
+        confidence=0.95,
+        edge_bps=3000,
+        recommended_action=TradeAction.BUY,
+        recommended_side=ContractSide.YES,
+        target_yes_price_dollars=Decimal("0.5800"),
+        summary="Test signal.",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+        forecast_delta_f=forecast_delta_f,
+    )
+
+
+def test_null_forecast_delta_blocked_with_forecast_delta_missing() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_edge_bps=50)
+    signal = _eligible_signal(forecast_delta_f=None)
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.5600", "yes_ask_dollars": "0.5800", "no_ask_dollars": "0.4200"}},
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.stand_down_reason == StandDownReason.FORECAST_DELTA_MISSING
+
+
+def test_present_forecast_delta_above_threshold_passes() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_edge_bps=50)
+    signal = _eligible_signal(forecast_delta_f=10.0)
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.5600", "yes_ask_dollars": "0.5800", "no_ask_dollars": "0.4200"}},
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.stand_down_reason is None
+    assert verdict.eligible is True

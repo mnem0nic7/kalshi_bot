@@ -846,10 +846,10 @@ def evaluate_trade_eligibility(
                 f"required {thresholds.risk_min_edge_bps}bps."
             )
             stand_down_reason = StandDownReason.NO_ACTIONABLE_EDGE
-        elif (
-            signal.forecast_delta_f is not None
-            and abs(signal.forecast_delta_f) < settings.strategy_min_abs_delta_f
-        ):
+        elif signal.forecast_delta_f is None:
+            reasons.append("Forecast delta unavailable; cannot verify weather separation.")
+            stand_down_reason = StandDownReason.FORECAST_DELTA_MISSING
+        elif abs(signal.forecast_delta_f) < settings.strategy_min_abs_delta_f:
             reasons.append(
                 f"Forecast separation {signal.forecast_delta_f:.1f}°F is below minimum "
                 f"{settings.strategy_min_abs_delta_f:.1f}°F."

@@ -42,6 +42,7 @@ def _signal(
         recommended_side=side,
         target_yes_price_dollars=Decimal("0.60"),
         summary="test",
+        forecast_delta_f=10.0,
     )
 
 
