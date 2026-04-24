@@ -124,6 +124,7 @@ class TradingAuditService:
             risk_verdicts=risk_verdicts,
             orders=orders,
             fills=fills,
+            now=now,
         )
         stop_loss = self._stop_loss_clusters(ops_events, now=now)
         risk = self._risk_summary(risk_verdicts)
@@ -315,6 +316,7 @@ class TradingAuditService:
             select(TradeTicketRecord)
             .join(Room, TradeTicketRecord.room_id == Room.id)
             .where(Room.kalshi_env == kalshi_env)
+            .where(Room.room_origin != "historical_replay")
             .where(TradeTicketRecord.created_at >= cutoff)
             .order_by(TradeTicketRecord.created_at.asc())
         )
@@ -521,7 +523,9 @@ class TradingAuditService:
         risk_verdicts: list[RiskVerdictRecord],
         orders: list[OrderRecord],
         fills: list[FillRecord],
+        now: datetime,
     ) -> dict[str, Any]:
+        recent_cutoff = now - timedelta(hours=24)
         verdict_by_ticket = {verdict.ticket_id: verdict for verdict in risk_verdicts}
         orders_by_ticket: dict[str, list[OrderRecord]] = defaultdict(list)
         for order in orders:
@@ -533,6 +537,7 @@ class TradingAuditService:
             for order in orders
             if order.status in bad_statuses or order.status.startswith("rejected_")
         ]
+        recent_failed_orders = [o for o in failed_orders if _as_utc(o.created_at) and _as_utc(o.created_at) >= recent_cutoff]
         approved_tickets = [ticket for ticket in tickets if verdict_by_ticket.get(ticket.id) and verdict_by_ticket[ticket.id].status == "approved"]
         approved_without_order = [ticket for ticket in approved_tickets if not orders_by_ticket.get(ticket.id)]
         return {
@@ -543,6 +548,7 @@ class TradingAuditService:
             "fills": len(fills),
             "approved_without_order_count": len(approved_without_order),
             "failed_order_count": len(failed_orders),
+            "recent_failed_order_count": len(recent_failed_orders),
             "failed_orders": [
                 {
                     "client_order_id": order.client_order_id,
@@ -700,7 +706,7 @@ class TradingAuditService:
             })
         repeated_clusters = [
             cluster for cluster in stop_loss["clusters"]
-            if cluster["events"] >= 10 or (cluster["events"] >= 3 and cluster["exceeds_cooldown_expectation"])
+            if cluster["exceeds_cooldown_expectation"]
         ]
         if repeated_clusters:
             issues.append({
@@ -709,7 +715,7 @@ class TradingAuditService:
                 "summary": "Stop-loss events repeatedly targeted the same market, suggesting exits may not be resolving cleanly.",
                 "evidence": {"clusters": repeated_clusters[:10]},
             })
-        if funnel["approved_without_order_count"] or funnel["failed_order_count"]:
+        if funnel["approved_without_order_count"] or funnel["recent_failed_order_count"]:
             issues.append({
                 "severity": "high",
                 "code": "approved_trade_execution_gaps",
