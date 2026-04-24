@@ -78,6 +78,16 @@
     return proposal.risk_reasons.map((reason) => String(reason || "").trim()).filter(Boolean).join(" ");
   }
 
+  function proposalCandidateText(proposal) {
+    if (!proposal || !proposal.selected_side) return "";
+    const selected = String(proposal.selected_side || "").toUpperCase();
+    const skipped = proposal.skipped_side ? String(proposal.skipped_side || "").toUpperCase() : "";
+    const reason = proposal.skipped_side_reason ? String(proposal.skipped_side_reason || "").replaceAll("_", " ") : "";
+    if (skipped && reason) return `Selected ${selected}; ${skipped} ${reason}`;
+    if (skipped) return `Selected ${selected}; checked ${skipped}`;
+    return `Selected ${selected}`;
+  }
+
   function parseBootstrap() {
     const node = document.getElementById("strategies-bootstrap");
     if (!node) return null;
@@ -575,6 +585,10 @@
       const sideTd = el("td");
       const sideTone = proposal.side_tone || (proposal.side === "yes" ? "good" : proposal.side === "no" ? "warning" : "neutral");
       sideTd.appendChild(el("span", `status-pill ${statusPillClass(sideTone)}`, proposal.side || "—"));
+      const candidateText = proposalCandidateText(proposal);
+      if (candidateText) {
+        sideTd.appendChild(el("div", "proposal-risk-reasons", candidateText));
+      }
       const statusTd = el("td");
       const statusTone = proposal.status_tone || tradeProposalTone(proposal.status);
       statusTd.appendChild(el("span", `status-pill ${statusPillClass(statusTone)}`, proposal.status || "—"));

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import func, select
 
 from kalshi_bot.core.enums import RoomOrigin
-from kalshi_bot.db.models import FillRecord, OrderRecord, RiskVerdictRecord, Room, RoomResearchHealthRecord, RoomStrategyAuditRecord, TradeTicketRecord
+from kalshi_bot.db.models import FillRecord, OrderRecord, RiskVerdictRecord, Room, RoomResearchHealthRecord, RoomStrategyAuditRecord, Signal, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.position_governance import (
     classify_position_health,
@@ -690,6 +690,14 @@ def _trade_proposal_tone(status: Any) -> str:
 
 
 async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: int = RECENT_TRADE_PROPOSAL_LIMIT) -> list[dict[str, Any]]:
+    latest_signal = (
+        select(
+            Signal.room_id.label("room_id"),
+            Signal.payload.label("signal_payload"),
+            func.row_number().over(partition_by=Signal.room_id, order_by=Signal.updated_at.desc()).label("rn"),
+        )
+        .subquery()
+    )
     latest_risk = (
         select(
             RiskVerdictRecord.ticket_id.label("ticket_id"),
@@ -713,9 +721,14 @@ async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: 
             latest_risk.c.risk_status,
             latest_risk.c.risk_reasons,
             latest_risk.c.approved_notional_dollars,
+            latest_signal.c.signal_payload,
         )
         .select_from(TradeTicketRecord)
         .join(Room, TradeTicketRecord.room_id == Room.id)
+        .outerjoin(
+            latest_signal,
+            (latest_signal.c.room_id == Room.id) & (latest_signal.c.rn == 1),
+        )
         .outerjoin(
             latest_risk,
             (latest_risk.c.ticket_id == TradeTicketRecord.id) & (latest_risk.c.rn == 1),
@@ -736,10 +749,20 @@ async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: 
         status = str(row.status or "")
         risk_status = str(row.risk_status or "") if row.risk_status is not None else None
         risk_reasons = [str(reason) for reason in (row.risk_reasons or []) if str(reason or "").strip()]
+        raw_signal_payload = getattr(row, "signal_payload", None)
+        signal_payload = raw_signal_payload if isinstance(raw_signal_payload, dict) else {}
+        candidate_trace = signal_payload.get("candidate_trace") if isinstance(signal_payload.get("candidate_trace"), dict) else {}
+        selected_side = str(candidate_trace.get("selected_side") or side or "").lower() or None
+        skipped_side = "no" if candidate_trace and selected_side == "yes" else "yes" if candidate_trace and selected_side == "no" else None
+        skipped_candidate = _candidate_from_trace(candidate_trace, skipped_side)
         rows.append(
             {
                 "market_ticker": str(row.market_ticker or ""),
                 "side": side,
+                "selected_side": selected_side,
+                "skipped_side": skipped_side,
+                "skipped_side_reason": skipped_candidate.get("reason"),
+                "candidate_trace": candidate_trace,
                 "side_tone": "good" if side == "yes" else "warning" if side == "no" else "neutral",
                 "yes_price_dollars": str(yes_price),
                 "count_fp": str(count),
@@ -753,6 +776,264 @@ async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: 
             }
         )
     return rows
+
+
+def _series_from_market_ticker(market_ticker: str | None) -> str:
+    ticker = str(market_ticker or "").strip()
+    return ticker.split("-", 1)[0] if ticker else "unknown"
+
+
+def _bucket_contract_price(value: Decimal | None) -> str:
+    if value is None:
+        return "unknown"
+    if value < Decimal("0.2500"):
+        return "<0.25"
+    if value < Decimal("0.5000"):
+        return "0.25-0.50"
+    if value < Decimal("0.7500"):
+        return "0.50-0.75"
+    return ">=0.75"
+
+
+def _bucket_remaining_payout(value: Decimal | None) -> str:
+    if value is None:
+        return "unknown"
+    if value <= Decimal("0.0300"):
+        return "<=0.03"
+    if value < Decimal("0.2500"):
+        return "0.03-0.25"
+    if value < Decimal("0.5000"):
+        return "0.25-0.50"
+    return ">=0.50"
+
+
+def _bucket_time_to_settlement(market_ticker: str | None, reference_time: datetime | None) -> str:
+    ticker = str(market_ticker or "")
+    reference = _parse_iso(_iso_or_none(reference_time)) if reference_time is not None else None
+    if reference is None:
+        return "unknown"
+    parts = ticker.split("-")
+    if len(parts) < 2 or len(parts[1]) != 7:
+        return "unknown"
+    date_part = parts[1].upper()
+    month_lookup = {
+        "JAN": 1,
+        "FEB": 2,
+        "MAR": 3,
+        "APR": 4,
+        "MAY": 5,
+        "JUN": 6,
+        "JUL": 7,
+        "AUG": 8,
+        "SEP": 9,
+        "OCT": 10,
+        "NOV": 11,
+        "DEC": 12,
+    }
+    try:
+        settlement_date = datetime(
+            2000 + int(date_part[:2]),
+            month_lookup[date_part[2:5]],
+            int(date_part[5:]),
+            tzinfo=UTC,
+        ).date()
+    except (KeyError, ValueError):
+        return "unknown"
+    days = (settlement_date - reference.date()).days
+    if days < 0:
+        return "expired"
+    if days == 0:
+        return "same_day"
+    if days == 1:
+        return "1d"
+    if days <= 3:
+        return "2-3d"
+    if days <= 7:
+        return "4-7d"
+    return ">7d"
+
+
+def _top_counter(counter: Counter[str], *, limit: int = 8) -> list[dict[str, Any]]:
+    return [{"key": key, "count": count} for key, count in counter.most_common(limit)]
+
+
+def _candidate_from_trace(trace: dict[str, Any], side: str | None) -> dict[str, Any]:
+    if side in {"yes", "no"} and isinstance(trace.get(side), dict):
+        return dict(trace[side])
+    for candidate in trace.get("candidates") or []:
+        if isinstance(candidate, dict) and candidate.get("side") == side:
+            return dict(candidate)
+    return {}
+
+
+def _empty_strategy_block_analytics(since: datetime) -> dict[str, Any]:
+    return {
+        "window_started_at": _iso_or_none(since),
+        "evaluations_scanned": 0,
+        "blocked_count": 0,
+        "outcome_counts": {},
+        "risk_blocked_count": 0,
+        "pre_risk_filtered_count": 0,
+        "no_candidate_count": 0,
+        "approved_count": 0,
+        "missed_alternate_side_count": 0,
+        "by_reason": [],
+        "by_city": [],
+        "by_strategy": [],
+        "by_side": [],
+        "by_price_bucket": [],
+        "by_remaining_payout_bucket": [],
+        "by_time_to_settlement_bucket": [],
+    }
+
+
+async def _strategy_block_analytics(
+    session: Any,
+    *,
+    kalshi_env: str,
+    since: datetime,
+    limit: int = 1000,
+) -> dict[str, Any]:
+    if not hasattr(session, "execute"):
+        return _empty_strategy_block_analytics(since)
+    latest_signal = (
+        select(
+            Signal.room_id.label("room_id"),
+            Signal.payload.label("signal_payload"),
+            func.row_number().over(partition_by=Signal.room_id, order_by=Signal.updated_at.desc()).label("rn"),
+        )
+        .subquery()
+    )
+    latest_risk = (
+        select(
+            RiskVerdictRecord.room_id.label("room_id"),
+            RiskVerdictRecord.status.label("risk_status"),
+            RiskVerdictRecord.reasons.label("risk_reasons"),
+            RiskVerdictRecord.payload.label("risk_payload"),
+            TradeTicketRecord.side.label("ticket_side"),
+            TradeTicketRecord.yes_price_dollars.label("ticket_yes_price_dollars"),
+            func.row_number()
+            .over(partition_by=RiskVerdictRecord.room_id, order_by=RiskVerdictRecord.updated_at.desc())
+            .label("rn"),
+        )
+        .select_from(RiskVerdictRecord)
+        .join(TradeTicketRecord, RiskVerdictRecord.ticket_id == TradeTicketRecord.id)
+        .subquery()
+    )
+    result = await session.execute(
+        select(
+            Room.market_ticker,
+            Room.created_at,
+            latest_signal.c.signal_payload,
+            latest_risk.c.risk_status,
+            latest_risk.c.risk_reasons,
+            latest_risk.c.risk_payload,
+            latest_risk.c.ticket_side,
+            latest_risk.c.ticket_yes_price_dollars,
+        )
+        .select_from(Room)
+        .outerjoin(latest_signal, (latest_signal.c.room_id == Room.id) & (latest_signal.c.rn == 1))
+        .outerjoin(latest_risk, (latest_risk.c.room_id == Room.id) & (latest_risk.c.rn == 1))
+        .where(Room.kalshi_env == kalshi_env, Room.updated_at >= since)
+        .order_by(Room.updated_at.desc())
+        .limit(limit)
+    )
+    reason_counts: Counter[str] = Counter()
+    city_counts: Counter[str] = Counter()
+    strategy_counts: Counter[str] = Counter()
+    side_counts: Counter[str] = Counter()
+    price_bucket_counts: Counter[str] = Counter()
+    payout_bucket_counts: Counter[str] = Counter()
+    settlement_bucket_counts: Counter[str] = Counter()
+    outcome_counts: Counter[str] = Counter()
+    total = 0
+    blocked = 0
+    missed_alternate_side_count = 0
+
+    for row in result.all():
+        total += 1
+        payload = row.signal_payload if isinstance(row.signal_payload, dict) else {}
+        eligibility = payload.get("eligibility") if isinstance(payload.get("eligibility"), dict) else {}
+        trace = payload.get("candidate_trace") if isinstance(payload.get("candidate_trace"), dict) else {}
+        selected_side = str(
+            trace.get("selected_side")
+            or payload.get("recommended_side")
+            or row.ticket_side
+            or "unknown"
+        ).lower()
+        outcome = str(
+            payload.get("evaluation_outcome")
+            or eligibility.get("evaluation_outcome")
+            or trace.get("final_outcome")
+            or trace.get("eligibility_outcome")
+            or trace.get("outcome")
+            or "unknown"
+        )
+        if row.risk_status == "approved":
+            outcome = "approved"
+        elif row.risk_status == "blocked":
+            outcome = "risk_blocked"
+        outcome_counts[outcome] += 1
+
+        is_blocked = outcome in {"risk_blocked", "pre_risk_filtered", "no_candidate"} or row.risk_status == "blocked"
+        if not is_blocked:
+            continue
+        blocked += 1
+
+        reasons = [str(reason) for reason in (row.risk_reasons or []) if str(reason or "").strip()]
+        if not reasons:
+            if eligibility.get("stand_down_reason"):
+                reasons = [str(eligibility["stand_down_reason"])]
+            elif trace.get("eligibility_stand_down_reason"):
+                reasons = [str(trace["eligibility_stand_down_reason"])]
+            elif trace.get("outcome"):
+                reasons = [str(trace["outcome"])]
+        for reason in reasons or ["unknown"]:
+            reason_counts[reason] += 1
+
+        city_counts[_series_from_market_ticker(row.market_ticker)] += 1
+        strategy_counts[str(payload.get("strategy_mode") or "unknown")] += 1
+        side_counts[selected_side] += 1
+
+        ticket_price = _decimal_or_none(row.ticket_yes_price_dollars)
+        if selected_side == "no" and ticket_price is not None:
+            contract_price = Decimal("1.0000") - ticket_price
+        elif selected_side == "yes":
+            contract_price = ticket_price
+        else:
+            selected_candidate = _candidate_from_trace(trace, selected_side)
+            contract_price = _decimal_or_none(selected_candidate.get("traded_price_dollars"))
+        selected_candidate = _candidate_from_trace(trace, selected_side)
+        remaining_payout = _decimal_or_none(
+            eligibility.get("remaining_payout_dollars") or selected_candidate.get("remaining_payout_dollars")
+        )
+        price_bucket_counts[_bucket_contract_price(contract_price)] += 1
+        payout_bucket_counts[_bucket_remaining_payout(remaining_payout)] += 1
+        settlement_bucket_counts[_bucket_time_to_settlement(row.market_ticker, row.created_at)] += 1
+
+        opposite_side = "no" if selected_side == "yes" else "yes" if selected_side == "no" else None
+        opposite_candidate = _candidate_from_trace(trace, opposite_side)
+        if opposite_candidate.get("status") in {"eligible", "selected"} and outcome in {"risk_blocked", "pre_risk_filtered"}:
+            missed_alternate_side_count += 1
+
+    return {
+        "window_started_at": _iso_or_none(since),
+        "evaluations_scanned": total,
+        "blocked_count": blocked,
+        "outcome_counts": dict(outcome_counts),
+        "risk_blocked_count": int(outcome_counts.get("risk_blocked") or 0),
+        "pre_risk_filtered_count": int(outcome_counts.get("pre_risk_filtered") or 0),
+        "no_candidate_count": int(outcome_counts.get("no_candidate") or 0),
+        "approved_count": int(outcome_counts.get("approved") or 0),
+        "missed_alternate_side_count": missed_alternate_side_count,
+        "by_reason": _top_counter(reason_counts),
+        "by_city": _top_counter(city_counts),
+        "by_strategy": _top_counter(strategy_counts),
+        "by_side": _top_counter(side_counts),
+        "by_price_bucket": _top_counter(price_bucket_counts),
+        "by_remaining_payout_bucket": _top_counter(payout_bucket_counts),
+        "by_time_to_settlement_bucket": _top_counter(settlement_bucket_counts),
+    }
 
 
 def _capital_bucket_summary(snapshot: Any) -> dict[str, Any]:
@@ -1372,7 +1653,11 @@ async def _momentum_calibration_summary(container: AppContainer) -> dict[str, An
 
     async with container.session_factory() as session:
         repo = PlatformRepository(session)
-        state = await get_momentum_calibration_state(repo, container.settings.kalshi_env)
+        state = await get_momentum_calibration_state(
+            repo,
+            container.settings.kalshi_env,
+            app_color=container.settings.app_color,
+        )
         await session.commit()
 
     active = state.get("active") or {}
@@ -1385,6 +1670,7 @@ async def _momentum_calibration_summary(container: AppContainer) -> dict[str, An
             "activated_by": active.get("activated_by"),
         },
         "pending": None,
+        "nightly": None,
     }
     if pending is not None:
         result["pending"] = {
@@ -1399,6 +1685,17 @@ async def _momentum_calibration_summary(container: AppContainer) -> dict[str, An
         if state.get("pending_age_hours") is not None:
             result["pending_age_hours"] = state["pending_age_hours"]
             result["pending_is_stale"] = state.get("pending_is_stale", False)
+    nightly = state.get("nightly")
+    if nightly is not None:
+        result["nightly"] = {
+            "ran_at": nightly.get("ran_at"),
+            "outcome": nightly.get("outcome"),
+            "tier": nightly.get("tier"),
+            "consecutive_skips": nightly.get("consecutive_skips"),
+            "overall_coverage": nightly.get("overall_coverage"),
+            "recent_coverage": nightly.get("recent_coverage"),
+            "fit_ci_width_fraction": nightly.get("fit_ci_width_fraction"),
+        }
     return result
 
 
@@ -2957,6 +3254,12 @@ async def build_strategies_dashboard_core(
             sources=["strategy_regression", "strategy_eval", STRATEGY_APPROVAL_SOURCE, AUTO_EVOLVE_SOURCE],
             created_after=now - timedelta(days=STRATEGY_EVENT_LOOKBACK_DAYS),
         )
+        settings = getattr(container, "settings", SimpleNamespace(kalshi_env="demo"))
+        block_analytics = await _strategy_block_analytics(
+            session,
+            kalshi_env=getattr(settings, "kalshi_env", "demo"),
+            since=now - timedelta(days=window_days),
+        )
 
         snapshot_meta = {
             "rooms_scanned": 0,
@@ -3057,6 +3360,7 @@ async def build_strategies_dashboard_core(
         "Canonical replay outcomes come from persisted trade tickets and settlement labels, not raw signal payloads.",
         f"Default view uses a rolling {DEFAULT_STRATEGY_WINDOW_DAYS}d regression snapshot.",
         "Auto-Evolve runs the latest stored 180d evidence through evaluation, suggestion, activation, and assignment steps.",
+        "Evaluation Lab context includes recent risk and pre-risk block distributions so suggestions can reduce avoidable ticket failures.",
         "The assignment review queue is driven only by the latest stored 180d evidence, not by 30d or 90d research views.",
         "Eligible strong or lean recommendations are applied automatically; manual approval remains available as an override.",
         "Recommendation tiers require resolved-trade evidence, strong outcome coverage, and a measurable gap to the runner-up.",
@@ -3101,6 +3405,10 @@ async def build_strategies_dashboard_core(
         "aligned_assignments_count": int(review_counts.get("aligned") or 0) if review_available else None,
         "recent_promotions_count": sum(1 for event in strategy_events if event["kind"] == "promotion"),
         "recent_approvals_count": sum(1 for event in strategy_events if event["kind"] == "assignment_approval"),
+        "recent_blocked_evaluations_count": block_analytics["blocked_count"],
+        "recent_risk_blocked_count": block_analytics["risk_blocked_count"],
+        "recent_pre_risk_filtered_count": block_analytics["pre_risk_filtered_count"],
+        "recent_missed_alternate_side_count": block_analytics["missed_alternate_side_count"],
         "assignments_covered": len(assigned_series),
         "assignments_total": len(configured_series),
         "assignments_covered_display": f"{len(assigned_series)} / {len(configured_series) if configured_series else 0}",
@@ -3111,6 +3419,7 @@ async def build_strategies_dashboard_core(
         "leaderboard": leaderboard,
         "city_matrix": city_matrix,
         "detail_context": detail_context,
+        "block_analytics": block_analytics,
         "recent_promotions": recent_promotions,
         "methodology": {
             "title": "How to read this tab",

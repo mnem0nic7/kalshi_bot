@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+
+if TYPE_CHECKING:
+    from kalshi_bot.services.momentum_calibration import MomentumCalibrationParams
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, StandDownReason, StrategyMode, TradeAction, WeatherResolutionState
@@ -31,6 +36,8 @@ class StrategySignal:
     strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED
     eligibility: TradeEligibilityVerdict | None = None
     stand_down_reason: StandDownReason | None = None
+    evaluation_outcome: str | None = None
+    candidate_trace: dict[str, Any] = field(default_factory=dict)
     heuristic_application: dict[str, Any] | None = None
     trade_regime: str = "standard"
     capital_bucket: str = "safe"
@@ -41,6 +48,12 @@ class StrategySignal:
     recommended_size_cap_fp: Decimal | None = None
     warn_only_blocked: bool = False
     size_factor: Decimal = field(default_factory=lambda: Decimal("1.00"))
+    momentum_slope_cents_per_min: float | None = None
+    momentum_weight: float | None = None
+    edge_effective_bps: float | None = None
+
+    def edge_for_eligibility(self) -> float:
+        return self.edge_effective_bps if self.edge_effective_bps is not None else float(self.edge_bps)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -186,6 +199,16 @@ def remaining_payout_dollars(side: ContractSide, yes_price_dollars: Decimal) -> 
     if side == ContractSide.YES:
         return quantize_price(Decimal("1.0000") - yes_price_dollars)
     return quantize_price(yes_price_dollars)
+
+
+def _price_text(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return f"{quantize_price(value):.4f}"
+
+
+def _edge_bps(edge_dollars: Decimal) -> int:
+    return int((edge_dollars * Decimal("10000")).to_integral_value())
 
 
 def _confidence_size_factor(confidence: float) -> Decimal:
@@ -393,43 +416,220 @@ def annotate_signal_quality(
     return signal
 
 
+def _candidate_trace_entry(
+    *,
+    side: ContractSide,
+    ask_price: Decimal | None,
+    fair_side_dollars: Decimal,
+    target_yes_price_dollars: Decimal | None,
+    min_edge_bps: int,
+    quality_buffer_bps: int,
+    minimum_remaining_payout_bps: int,
+    min_contract_price_dollars: Decimal,
+    spread_bps: int | None,
+    spread_limit_bps: int,
+) -> dict[str, Any]:
+    min_edge = Decimal(min_edge_bps) / Decimal("10000")
+    min_remaining_payout = Decimal(minimum_remaining_payout_bps) / Decimal("10000")
+    spread_status = (
+        "too_wide"
+        if spread_bps is not None and spread_bps > spread_limit_bps
+        else "ok"
+        if spread_bps is not None
+        else "unknown"
+    )
+    entry: dict[str, Any] = {
+        "side": side.value,
+        "checked": ask_price is not None,
+        "status": "skipped",
+        "reason": "missing_quote",
+        "target_yes_price_dollars": _price_text(target_yes_price_dollars),
+        "traded_price_dollars": _price_text(ask_price),
+        "remaining_payout_dollars": None,
+        "fair_side_dollars": _price_text(fair_side_dollars),
+        "edge_bps": None,
+        "quality_adjusted_edge_bps": None,
+        "spread_bps": spread_bps,
+        "spread_status": spread_status,
+    }
+    if ask_price is None or target_yes_price_dollars is None:
+        return entry
+
+    edge_bps = _edge_bps(fair_side_dollars - ask_price)
+    quality_adjusted_edge_bps = edge_bps - quality_buffer_bps
+    remaining_payout = remaining_payout_dollars(side, target_yes_price_dollars)
+    fair_longshot = fair_side_dollars <= Decimal("0.0800")
+    entry.update(
+        {
+            "remaining_payout_dollars": _price_text(remaining_payout),
+            "edge_bps": edge_bps,
+            "quality_adjusted_edge_bps": quality_adjusted_edge_bps,
+        }
+    )
+    if edge_bps < min_edge_bps:
+        entry["reason"] = "below_min_edge"
+    elif ask_price < min_contract_price_dollars:
+        entry["reason"] = "below_min_contract_price"
+    elif remaining_payout <= min_remaining_payout:
+        entry["reason"] = "insufficient_remaining_payout"
+    elif spread_status == "too_wide":
+        entry["reason"] = "spread_too_wide"
+    elif fair_longshot:
+        entry["reason"] = "longshot_regime"
+    elif quality_adjusted_edge_bps < min_edge_bps:
+        entry["reason"] = "below_quality_adjusted_edge"
+    else:
+        entry["status"] = "eligible"
+        entry["reason"] = "eligible"
+    # Keep the raw dollar threshold visible when this was an edge miss.
+    entry["min_edge_dollars"] = _price_text(min_edge)
+    return entry
+
+
+def _trade_recommendation_with_trace(
+    *,
+    fair_yes_dollars: Decimal,
+    market_snapshot: dict[str, Any],
+    min_edge_bps: int,
+    settings: Settings | None = None,
+    quality_buffer_bps: int | None = None,
+    minimum_remaining_payout_bps: int | None = None,
+    min_contract_price_dollars: Decimal | None = None,
+    spread_limit_bps: int | None = None,
+) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
+    quotes = market_quotes(market_snapshot)
+    ask_yes = quotes["yes_ask"]
+    bid_yes = quotes["yes_bid"]
+    ask_no = quotes["no_ask"]
+    effective_quality_buffer_bps = (
+        quality_buffer_bps
+        if quality_buffer_bps is not None
+        else (settings.strategy_quality_edge_buffer_bps if settings is not None else 0)
+    )
+    effective_min_remaining_payout_bps = (
+        minimum_remaining_payout_bps
+        if minimum_remaining_payout_bps is not None
+        else (settings.strategy_min_remaining_payout_bps if settings is not None else 0)
+    )
+    effective_min_contract_price = (
+        min_contract_price_dollars
+        if min_contract_price_dollars is not None
+        else Decimal(str(settings.risk_min_contract_price_dollars))
+        if settings is not None
+        else Decimal("0.2500")
+    )
+    effective_spread_limit_bps = (
+        spread_limit_bps
+        if spread_limit_bps is not None
+        else (settings.trigger_max_spread_bps if settings is not None else 999999)
+    )
+    spread_bps = market_spread_bps(market_snapshot)
+    fair_no = quantize_price(Decimal("1.0000") - fair_yes_dollars)
+
+    yes_candidate = _candidate_trace_entry(
+        side=ContractSide.YES,
+        ask_price=ask_yes,
+        fair_side_dollars=fair_yes_dollars,
+        target_yes_price_dollars=ask_yes,
+        min_edge_bps=min_edge_bps,
+        quality_buffer_bps=effective_quality_buffer_bps,
+        minimum_remaining_payout_bps=effective_min_remaining_payout_bps,
+        min_contract_price_dollars=effective_min_contract_price,
+        spread_bps=spread_bps,
+        spread_limit_bps=effective_spread_limit_bps,
+    )
+    no_target_yes = quantize_price(Decimal("1.0000") - ask_no) if ask_no is not None else None
+    no_candidate = _candidate_trace_entry(
+        side=ContractSide.NO,
+        ask_price=ask_no,
+        fair_side_dollars=fair_no,
+        target_yes_price_dollars=no_target_yes,
+        min_edge_bps=min_edge_bps,
+        quality_buffer_bps=effective_quality_buffer_bps,
+        minimum_remaining_payout_bps=effective_min_remaining_payout_bps,
+        min_contract_price_dollars=effective_min_contract_price,
+        spread_bps=spread_bps,
+        spread_limit_bps=effective_spread_limit_bps,
+    )
+    candidates = [yes_candidate, no_candidate]
+    eligible_candidates = [candidate for candidate in candidates if candidate["status"] == "eligible"]
+
+    recommendation_action: TradeAction | None = None
+    recommendation_side: ContractSide | None = None
+    target_yes: Decimal | None = None
+    edge_bps = max(
+        [
+            int(candidate["edge_bps"])
+            for candidate in candidates
+            if candidate.get("edge_bps") is not None
+        ]
+        or [0]
+    )
+    selected: dict[str, Any] | None = None
+    if eligible_candidates:
+        selected = max(
+            eligible_candidates,
+            key=lambda candidate: (
+                int(candidate.get("quality_adjusted_edge_bps") or 0),
+                int(candidate.get("edge_bps") or 0),
+                Decimal(str(candidate.get("traded_price_dollars") or "0")),
+            ),
+        )
+        selected["status"] = "selected"
+        selected["reason"] = "selected_best_quality_adjusted_edge"
+        recommendation_action = TradeAction.BUY
+        recommendation_side = ContractSide(selected["side"])
+        target_raw = selected.get("target_yes_price_dollars")
+        target_yes = quantize_price(target_raw) if target_raw is not None else None
+        edge_bps = int(selected.get("edge_bps") or 0)
+    elif bid_yes is not None:
+        min_edge = Decimal(min_edge_bps) / Decimal("10000")
+        if fair_yes_dollars >= bid_yes + min_edge:
+            edge_bps = max(edge_bps, _edge_bps(fair_yes_dollars - bid_yes))
+
+    had_edge_candidate = any(
+        candidate.get("edge_bps") is not None and int(candidate["edge_bps"]) >= min_edge_bps
+        for candidate in candidates
+    )
+    outcome = "candidate_selected" if selected is not None else "pre_risk_filtered" if had_edge_candidate else "no_candidate"
+    trace = {
+        "outcome": outcome,
+        "selected_side": recommendation_side.value if recommendation_side is not None else None,
+        "selected_edge_bps": edge_bps if selected is not None else None,
+        "min_edge_bps": min_edge_bps,
+        "quality_buffer_bps": effective_quality_buffer_bps,
+        "minimum_remaining_payout_bps": effective_min_remaining_payout_bps,
+        "min_contract_price_dollars": _price_text(effective_min_contract_price),
+        "spread_limit_bps": effective_spread_limit_bps,
+        "spread_bps": spread_bps,
+        "yes": yes_candidate,
+        "no": no_candidate,
+        "candidates": candidates,
+    }
+    return recommendation_action, recommendation_side, target_yes, edge_bps, trace
+
+
 def _trade_recommendation(
     *,
     fair_yes_dollars: Decimal,
     market_snapshot: dict[str, Any],
     min_edge_bps: int,
+    settings: Settings | None = None,
+    quality_buffer_bps: int | None = None,
+    minimum_remaining_payout_bps: int | None = None,
+    min_contract_price_dollars: Decimal | None = None,
+    spread_limit_bps: int | None = None,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int]:
-    quotes = market_quotes(market_snapshot)
-    ask_yes = quotes["yes_ask"]
-    bid_yes = quotes["yes_bid"]
-    ask_no = quotes["no_ask"]
-    min_edge = Decimal(min_edge_bps) / Decimal("10000")
-
-    recommendation_action: TradeAction | None = None
-    recommendation_side: ContractSide | None = None
-    target_yes: Decimal | None = None
-    edge_bps = 0
-
-    if ask_yes is not None:
-        edge_yes = fair_yes_dollars - ask_yes
-        if edge_yes >= min_edge:
-            recommendation_action = TradeAction.BUY
-            recommendation_side = ContractSide.YES
-            target_yes = ask_yes
-            edge_bps = int((edge_yes * Decimal("10000")).to_integral_value())
-
-    if recommendation_action is None and ask_no is not None:
-        fair_no = Decimal("1.0000") - fair_yes_dollars
-        edge_no = fair_no - ask_no
-        if edge_no >= min_edge:
-            recommendation_action = TradeAction.BUY
-            recommendation_side = ContractSide.NO
-            target_yes = quantize_price(Decimal("1.0000") - ask_no)
-            edge_bps = int((edge_no * Decimal("10000")).to_integral_value())
-
-    if recommendation_action is None and bid_yes is not None and fair_yes_dollars >= bid_yes + min_edge:
-        edge_bps = int(((fair_yes_dollars - bid_yes) * Decimal("10000")).to_integral_value())
-
+    recommendation_action, recommendation_side, target_yes, edge_bps, _trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=fair_yes_dollars,
+        market_snapshot=market_snapshot,
+        min_edge_bps=min_edge_bps,
+        settings=settings,
+        quality_buffer_bps=quality_buffer_bps,
+        minimum_remaining_payout_bps=minimum_remaining_payout_bps,
+        min_contract_price_dollars=min_contract_price_dollars,
+        spread_limit_bps=spread_limit_bps,
+    )
     return recommendation_action, recommendation_side, target_yes, edge_bps
 
 
@@ -440,14 +640,20 @@ def apply_heuristic_application_to_signal(
     market_snapshot: dict[str, Any],
     min_edge_bps: int,
     spread_limit_bps: int,
+    quality_buffer_bps: int | None = None,
+    minimum_remaining_payout_bps: int | None = None,
 ) -> StrategySignal:
     application = dict(signal.heuristic_application or {})
     adjusted_fair_raw = application.get("adjusted_fair_yes_dollars")
     adjusted_fair = quantize_price(adjusted_fair_raw) if adjusted_fair_raw not in (None, "") else signal.fair_yes_dollars
-    recommendation_action, recommendation_side, target_yes, edge_bps = _trade_recommendation(
+    recommendation_action, recommendation_side, target_yes, edge_bps, candidate_trace = _trade_recommendation_with_trace(
         fair_yes_dollars=adjusted_fair,
         market_snapshot=market_snapshot,
         min_edge_bps=min_edge_bps,
+        settings=settings,
+        quality_buffer_bps=quality_buffer_bps,
+        minimum_remaining_payout_bps=minimum_remaining_payout_bps,
+        spread_limit_bps=spread_limit_bps,
     )
     summary = base_strategy_summary(signal.summary)
     if adjusted_fair != signal.fair_yes_dollars:
@@ -473,6 +679,8 @@ def apply_heuristic_application_to_signal(
         weather=signal.weather,
         resolution_state=signal.resolution_state,
         strategy_mode=signal.strategy_mode,
+        evaluation_outcome=candidate_trace.get("outcome"),
+        candidate_trace=candidate_trace,
         heuristic_application=application,
         trade_regime=signal.trade_regime,
         capital_bucket=signal.capital_bucket,
@@ -484,6 +692,60 @@ def apply_heuristic_application_to_signal(
         signal=annotated,
         market_snapshot=market_snapshot,
     )
+
+
+def apply_momentum_weight_to_signal(
+    signal: StrategySignal,
+    *,
+    params: "MomentumCalibrationParams",
+    price_history: list[Any],
+    research_stale_seconds: int,
+    bundle_age_reference: datetime | None = None,
+    shadow_mode: bool = True,
+    reference_time: datetime | None = None,
+) -> StrategySignal:
+    valid_points = [
+        (row.observed_at.timestamp(), float(row.mid_dollars))
+        for row in price_history
+        if row.mid_dollars is not None
+    ]
+    if len(valid_points) < 5:
+        return signal
+
+    xs = np.array([p[0] for p in valid_points])
+    ys = np.array([p[1] for p in valid_points])
+    xs = xs - xs[0]
+    slope_cpmin = float(np.polyfit(xs, ys, 1)[0]) * 100.0 * 60.0
+
+    signal.momentum_slope_cents_per_min = slope_cpmin
+
+    if signal.recommended_side is None:
+        return signal
+
+    # slope_against: positive = adverse (price moving against the trade)
+    slope_against = (
+        -slope_cpmin if signal.recommended_side == ContractSide.YES else slope_cpmin
+    )
+
+    # staleness_factor: 0 = fresh model (no discount), 1 = maximally stale (full discount)
+    now = _as_utc(reference_time) or datetime.now(UTC)
+    obs_time = signal.weather.observation_time if signal.weather is not None else None
+    time_ref = _as_utc(obs_time) or _as_utc(bundle_age_reference)
+    if time_ref is not None:
+        staleness_factor = min(1.0, (now - time_ref).total_seconds() / max(research_stale_seconds, 1))
+    else:
+        staleness_factor = 0.0
+
+    scale = params.momentum_weight_scale_cents_per_min
+    base_w = max(params.momentum_weight_floor, 1.0 - max(0.0, slope_against) / max(scale, 1e-9))
+    # Linear interpolation: fresh model → no discount; stale model → full base_w discount.
+    effective_w = 1.0 - staleness_factor * (1.0 - base_w)
+
+    signal.momentum_weight = effective_w
+    if not shadow_mode:
+        signal.edge_effective_bps = float(signal.edge_bps) * effective_w
+
+    return signal
 
 
 def evaluate_trade_eligibility(
@@ -513,7 +775,7 @@ def evaluate_trade_eligibility(
         "strategy_min_remaining_payout_bps",
         settings.strategy_min_remaining_payout_bps,
     )
-    edge_after_quality_buffer_bps = signal.edge_bps - quality_buffer_bps
+    edge_after_quality_buffer_bps = signal.edge_for_eligibility() - quality_buffer_bps
     no_trade_reason, no_trade_text = non_trade_market_reason(
         market_snapshot,
         spread_limit_bps=thresholds.trigger_max_spread_bps,
@@ -521,6 +783,8 @@ def evaluate_trade_eligibility(
     heuristic_application = dict(signal.heuristic_application or {})
     forced_strategy_mode = heuristic_application.get("recommended_strategy_mode")
     forced_stand_down_value = heuristic_application.get("force_stand_down_reason")
+    candidate_trace = dict(signal.candidate_trace or {})
+    trace_outcome = candidate_trace.get("outcome") if isinstance(candidate_trace.get("outcome"), str) else None
 
     strategy_mode = signal.strategy_mode
     if isinstance(forced_strategy_mode, str) and forced_strategy_mode:
@@ -582,12 +846,24 @@ def evaluate_trade_eligibility(
 
     if stand_down_reason is not None and strategy_mode == StrategyMode.DIRECTIONAL_UNRESOLVED:
         strategy_mode = StrategyMode.LATE_DAY_AVOID
+    if stand_down_reason is None:
+        evaluation_outcome = "candidate_selected"
+    elif trace_outcome in {"no_candidate", "pre_risk_filtered"}:
+        evaluation_outcome = trace_outcome
+    elif signal.recommended_action is None or signal.recommended_side is None or signal.target_yes_price_dollars is None:
+        evaluation_outcome = "no_candidate"
+    else:
+        evaluation_outcome = "pre_risk_filtered"
+    candidate_trace["eligibility_outcome"] = evaluation_outcome
+    candidate_trace["eligibility_stand_down_reason"] = stand_down_reason.value if stand_down_reason is not None else None
 
     return TradeEligibilityVerdict(
         eligible=stand_down_reason is None,
         strategy_mode=strategy_mode,
         resolution_state=signal.resolution_state,
         stand_down_reason=stand_down_reason,
+        evaluation_outcome=evaluation_outcome,
+        candidate_trace=candidate_trace,
         capital_bucket=signal.capital_bucket,
         reasons=reasons or ["Trade passed marketability checks."],
         market_stale=market_stale,
@@ -642,10 +918,12 @@ class WeatherSignalEngine:
             sigma_ctx=sigma_ctx,
         )
         effective_min_edge_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
-        recommendation_action, recommendation_side, target_yes, edge_bps = _trade_recommendation(
+        recommendation_action, recommendation_side, target_yes, edge_bps, candidate_trace = _trade_recommendation_with_trace(
             fair_yes_dollars=weather.fair_yes_dollars,
             market_snapshot=market_snapshot,
             min_edge_bps=effective_min_edge_bps,
+            settings=self.settings,
+            spread_limit_bps=self.settings.trigger_max_spread_bps,
         )
 
         summary = summarize_signal_action(
@@ -673,6 +951,8 @@ class WeatherSignalEngine:
                 if weather.resolution_state != WeatherResolutionState.UNRESOLVED
                 else StrategyMode.DIRECTIONAL_UNRESOLVED
             ),
+            evaluation_outcome=candidate_trace.get("outcome"),
+            candidate_trace=candidate_trace,
             trade_regime=weather.trade_regime,
             capital_bucket=capital_bucket_for_trade_regime(weather.trade_regime),
             forecast_delta_f=weather.forecast_delta_f,

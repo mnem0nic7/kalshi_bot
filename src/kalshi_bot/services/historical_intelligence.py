@@ -861,6 +861,8 @@ class HistoricalIntelligenceService:
             market_snapshot=market_snapshot,
             min_edge_bps=threshold_overrides.risk_min_edge_bps,
             spread_limit_bps=threshold_overrides.trigger_max_spread_bps,
+            quality_buffer_bps=threshold_overrides.strategy_quality_edge_buffer_bps,
+            minimum_remaining_payout_bps=threshold_overrides.strategy_min_remaining_payout_bps,
         )
         signal.heuristic_application = application
         signal.eligibility = evaluate_trade_eligibility(

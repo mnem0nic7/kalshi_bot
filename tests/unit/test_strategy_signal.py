@@ -9,6 +9,7 @@ from kalshi_bot.core.enums import ContractSide, StandDownReason, StrategyMode, T
 from kalshi_bot.core.schemas import ResearchFreshness
 from kalshi_bot.services.signal import (
     StrategySignal,
+    _trade_recommendation_with_trace,
     apply_heuristic_application_to_signal,
     annotate_signal_quality,
     base_strategy_summary,
@@ -63,6 +64,79 @@ def _thresholds() -> SimpleNamespace:
         risk_min_edge_bps=50,
         trigger_max_spread_bps=1200,
     )
+
+
+def test_trade_recommendation_selects_no_when_yes_is_below_price_floor() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_contract_price_dollars=0.25)
+
+    action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=Decimal("0.3500"),
+        market_snapshot={"market": {"yes_bid_dollars": "0.0050", "yes_ask_dollars": "0.0100", "no_ask_dollars": "0.4500"}},
+        min_edge_bps=50,
+        settings=settings,
+    )
+
+    assert action == TradeAction.BUY
+    assert side == ContractSide.NO
+    assert target_yes == Decimal("0.5500")
+    assert edge_bps == 2000
+    assert trace["yes"]["reason"] == "below_min_contract_price"
+    assert trace["no"]["status"] == "selected"
+    assert trace["outcome"] == "candidate_selected"
+
+
+def test_trade_recommendation_ranks_best_eligible_side() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_contract_price_dollars=0.25)
+
+    _action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=Decimal("0.5500"),
+        market_snapshot={"market": {"yes_bid_dollars": "0.4400", "yes_ask_dollars": "0.4600", "no_ask_dollars": "0.3000"}},
+        min_edge_bps=50,
+        settings=settings,
+    )
+
+    assert side == ContractSide.NO
+    assert target_yes == Decimal("0.7000")
+    assert edge_bps == 1500
+    assert trace["yes"]["status"] == "eligible"
+    assert trace["no"]["reason"] == "selected_best_quality_adjusted_edge"
+
+
+def test_trade_recommendation_filters_both_sides_below_price_floor() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_contract_price_dollars=0.25)
+
+    action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=Decimal("0.5000"),
+        market_snapshot={"market": {"yes_bid_dollars": "0.0050", "yes_ask_dollars": "0.0100", "no_ask_dollars": "0.0100"}},
+        min_edge_bps=50,
+        settings=settings,
+    )
+
+    assert action is None
+    assert side is None
+    assert target_yes is None
+    assert edge_bps == 4950
+    assert trace["outcome"] == "pre_risk_filtered"
+    assert trace["yes"]["reason"] == "below_min_contract_price"
+    assert trace["no"]["reason"] == "below_min_contract_price"
+
+
+def test_trade_recommendation_checks_no_when_yes_fails_remaining_payout() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_contract_price_dollars=0.25)
+
+    _action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=Decimal("0.5000"),
+        market_snapshot={"market": {"yes_bid_dollars": "0.3300", "yes_ask_dollars": "0.3500", "no_ask_dollars": "0.2500"}},
+        min_edge_bps=50,
+        settings=settings,
+        minimum_remaining_payout_bps=7000,
+    )
+
+    assert side == ContractSide.NO
+    assert target_yes == Decimal("0.7500")
+    assert edge_bps == 2500
+    assert trace["yes"]["reason"] == "insufficient_remaining_payout"
+    assert trace["no"]["status"] == "selected"
 
 
 def test_trade_eligibility_prioritizes_stale_research_then_market() -> None:
@@ -238,6 +312,7 @@ def test_trade_eligibility_labels_no_actionable_edge_when_book_is_normal_but_edg
 
     assert verdict.eligible is False
     assert verdict.stand_down_reason == StandDownReason.NO_ACTIONABLE_EDGE
+    assert verdict.evaluation_outcome == "no_candidate"
 
 
 def test_base_strategy_summary_strips_old_trade_suffixes() -> None:
@@ -292,6 +367,8 @@ def test_apply_heuristic_application_adjusts_signal_and_summary() -> None:
     assert adjusted.recommended_side == ContractSide.YES
     assert adjusted.recommended_action == TradeAction.BUY
     assert adjusted.target_yes_price_dollars == Decimal("0.5300")
+    assert adjusted.evaluation_outcome == "candidate_selected"
+    assert adjusted.candidate_trace["yes"]["status"] == "selected"
     assert "Historical heuristics adjusted fair yes by +300bps" in adjusted.summary
 
 

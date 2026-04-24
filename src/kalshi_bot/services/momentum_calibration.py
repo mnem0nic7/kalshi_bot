@@ -25,7 +25,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +50,6 @@ _CALIBRATION_SCRIPT_VERSION = "1.0"
 # Sanity bounds enforced by `stage` before writing a pending checkpoint.
 _SCALE_MIN = 0.1
 _SCALE_MAX = 10.0
-_CI_WIDTH_FRACTION_MAX = 0.5
 
 
 # ── Consumer interface (Phase 1 contract; wired into supervisor in Step 3) ───
@@ -119,9 +118,11 @@ async def get_active_momentum_calibration_async(
 async def get_momentum_calibration_state(
     repo: PlatformRepository,
     kalshi_env: str,
+    app_color: str | None = None,
 ) -> dict[str, Any]:
     """
     Return the full calibration state (active + pending) for status display and control-room.
+    When app_color is provided, also reads the nightly checkpoint for Phase 2 control-room tile.
     Different projection from get_active_momentum_calibration_async — includes audit metadata.
     """
     active_cp = await repo.get_checkpoint(f"momentum_calibration:{kalshi_env}")
@@ -132,7 +133,7 @@ async def get_momentum_calibration_state(
             return None
         return dict(cp.payload or {})
 
-    state = {
+    state: dict[str, Any] = {
         "active": _cp_to_dict(active_cp),
         "pending": _cp_to_dict(pending_cp),
     }
@@ -146,6 +147,11 @@ async def get_momentum_calibration_state(
                 state["pending_is_stale"] = age_hours >= _PENDING_STALE_HOURS
             except (ValueError, TypeError):
                 pass
+    if app_color is not None:
+        nightly_cp = await repo.get_checkpoint(
+            f"nightly_momentum_calibration_run:{kalshi_env}:{app_color}"
+        )
+        state["nightly"] = _cp_to_dict(nightly_cp)
     return state
 
 
@@ -227,15 +233,23 @@ class MomentumCalibrationService:
         self,
         date_from: str,
         date_to: str,
-        min_observations: int = 1000,
+        min_observations: int | None = None,
         staged_by: str | None = None,
         force: bool = False,
         output_path: Path | None = None,
+        auto: bool = False,
+        tier: int | None = None,
+        color: str | None = None,
+        quiet: bool = False,
     ) -> dict[str, Any]:
         """
         Run full analysis, enforce sanity bounds, write pending_momentum_calibration:{env}.
         Exits (returns error dict) without writing if bounds or corpus size fail.
+        auto/tier/color are Phase 2 additive fields written into the checkpoint and ops_event.
         """
+        min_obs = min_observations if min_observations is not None else self.settings.momentum_calibration_min_observations
+        ci_width_max = self.settings.momentum_calibration_sanity_max_ci_width_fraction
+
         rows = await self._load_corpus(date_from, date_to)
         records = _build_analysis_records(rows)
         n_usable = sum(
@@ -243,10 +257,10 @@ class MomentumCalibrationService:
             for r in records
             if r["slope_against"] is not None and r["ratio"] is not None
         )
-        if n_usable < min_observations:
+        if n_usable < min_obs:
             return {
                 "ok": False,
-                "error": f"insufficient observations: {n_usable} < {min_observations}",
+                "error": f"insufficient observations: {n_usable} < {min_obs}",
                 "n_usable": n_usable,
             }
 
@@ -272,10 +286,10 @@ class MomentumCalibrationService:
                 "error": f"veto candidate {proposed_veto:.4f} < 0 (must be non-negative)",
                 "proposed_veto": proposed_veto,
             }
-        if ci_frac is not None and ci_frac > _CI_WIDTH_FRACTION_MAX:
+        if ci_frac is not None and ci_frac > ci_width_max:
             return {
                 "ok": False,
-                "error": f"CI width fraction {ci_frac:.4f} > {_CI_WIDTH_FRACTION_MAX} (fit too uncertain)",
+                "error": f"CI width fraction {ci_frac:.4f} > {ci_width_max} (fit too uncertain)",
                 "ci_width_fraction": ci_frac,
             }
 
@@ -314,7 +328,7 @@ class MomentumCalibrationService:
             previous_veto = active_payload.get("momentum_slope_veto_cents_per_min")
 
             now_iso = datetime.now(UTC).isoformat()
-            who = staged_by or os.getenv("USER") or "cli"
+            who = staged_by or (f"daemon:{color}" if auto else None) or os.getenv("USER") or "cli"
             checkpoint_payload: dict[str, Any] = {
                 "momentum_weight_scale_cents_per_min": scale,
                 "momentum_slope_veto_cents_per_min": proposed_veto,
@@ -330,7 +344,10 @@ class MomentumCalibrationService:
                 "previous_veto": previous_veto,
                 "staged_at": now_iso,
                 "staged_by": who,
-                "provenance": "manual",
+                "provenance": "auto" if auto else "manual",
+                "auto": auto,
+                "tier": tier,
+                "color": color,
                 "calibration_script_version": _CALIBRATION_SCRIPT_VERSION,
             }
 
@@ -339,17 +356,25 @@ class MomentumCalibrationService:
                 severity="info",
                 summary=f"Momentum calibration staged: scale={scale:.4f}, veto={proposed_veto}",
                 source="momentum_calibration",
-                payload=checkpoint_payload,
+                payload={"event": "momentum_calibration_staged", **checkpoint_payload},
             )
             await session.commit()
 
         if output_path is not None:
             _write_jsonl(output_path, records)
-        _print_deploy(result)
-        _print_stage_summary(checkpoint_payload)
+        if not quiet:
+            _print_deploy(result)
+            _print_stage_summary(checkpoint_payload)
         return {"ok": True, "checkpoint": checkpoint_payload, **result}
 
-    async def promote(self, activated_by: str | None = None) -> dict[str, Any]:
+    async def promote(
+        self,
+        activated_by: str | None = None,
+        auto: bool = False,
+        tier: int | None = None,
+        color: str | None = None,
+        quiet: bool = False,
+    ) -> dict[str, Any]:
         """Atomically rename pending → active. Emits ops_event. Non-zero return if no pending."""
         pending_key = f"pending_momentum_calibration:{self.settings.kalshi_env}"
         active_key = f"momentum_calibration:{self.settings.kalshi_env}"
@@ -360,12 +385,15 @@ class MomentumCalibrationService:
             if pending_cp is None:
                 return {"ok": False, "error": "no pending calibration to promote"}
 
-            who = activated_by or os.getenv("USER") or "cli"
+            who = activated_by or (f"daemon:{color}" if auto else None) or os.getenv("USER") or "cli"
             now_iso = datetime.now(UTC).isoformat()
             active_payload = {
                 **(pending_cp.payload or {}),
                 "activated_at": now_iso,
                 "activated_by": who,
+                "auto": auto,
+                "tier": tier,
+                "color": color,
             }
             await repo.set_checkpoint(active_key, cursor=None, payload=active_payload)
 
@@ -384,12 +412,13 @@ class MomentumCalibrationService:
                     f"scale={active_payload.get('momentum_weight_scale_cents_per_min')}"
                 ),
                 source="momentum_calibration",
-                payload=active_payload,
+                payload={"event": "momentum_calibration_activated", **active_payload},
             )
             await session.commit()
 
-        print(f"Promoted. Active scale={active_payload.get('momentum_weight_scale_cents_per_min'):.4f}  "
-              f"veto={active_payload.get('momentum_slope_veto_cents_per_min')}")
+        if not quiet:
+            print(f"Promoted. Active scale={active_payload.get('momentum_weight_scale_cents_per_min'):.4f}  "
+                  f"veto={active_payload.get('momentum_slope_veto_cents_per_min')}")
         return {"ok": True, "active": active_payload}
 
     async def reject(self) -> dict[str, Any]:
@@ -429,6 +458,278 @@ class MomentumCalibrationService:
             await session.commit()
         _print_status(state)
         return state
+
+    async def nightly_auto_run(self, *, app_color: str) -> dict[str, Any]:
+        """
+        Phase 2 nightly daemon entry point. Called by DaemonService._maybe_run_momentum_calibration_nightly().
+        Gate ordering: pending-exists → corpus load → coverage → min-obs → fit → sanity → tier.
+        Always writes the nightly checkpoint under try/finally regardless of outcome.
+        Returns a result dict with 'outcome' and supporting fields.
+        """
+        s = self.settings
+        nightly_key = f"nightly_momentum_calibration_run:{s.kalshi_env}:{app_color}"
+        result: dict[str, Any] = {
+            "ran_at": datetime.now(UTC).isoformat(),
+            "outcome": "error",
+            "tier": None,
+            "consecutive_skips": 0,
+            "overall_coverage": None,
+            "recent_coverage": None,
+            "fit_ci_width_fraction": None,
+        }
+
+        try:
+            # ── Gate 1: pending-exists (cheap DB read, before corpus load) ──────
+            pending_key = f"pending_momentum_calibration:{s.kalshi_env}"
+            active_key = f"momentum_calibration:{s.kalshi_env}"
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                pending_cp = await repo.get_checkpoint(pending_key)
+                active_cp = await repo.get_checkpoint(active_key)
+                # Read previous nightly checkpoint to carry consecutive_skips forward.
+                prev_nightly_cp = await repo.get_checkpoint(nightly_key)
+                await session.commit()
+
+            prev_skips: int = 0
+            if prev_nightly_cp is not None and isinstance(prev_nightly_cp.payload, dict):
+                prev_skips = int(prev_nightly_cp.payload.get("consecutive_skips") or 0)
+
+            if pending_cp is not None:
+                new_skips = prev_skips + 1
+                result["outcome"] = "skipped_pending"
+                result["consecutive_skips"] = new_skips
+                pending_meta = dict(pending_cp.payload or {})
+                severity = (
+                    "critical"
+                    if new_skips >= s.momentum_calibration_skip_critical_threshold
+                    else "warning"
+                )
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    await repo.log_ops_event(
+                        severity=severity,
+                        summary=f"Momentum calibration nightly skipped: pending exists (skip #{new_skips})",
+                        source="momentum_calibration",
+                        payload={
+                            "event": "momentum_calibration_skipped",
+                            "reason": "pending_exists",
+                            "consecutive_skips": new_skips,
+                            "auto": True,
+                            "tier": None,
+                            "color": app_color,
+                            "pending_staged_at": pending_meta.get("staged_at"),
+                            "pending_staged_by": pending_meta.get("staged_by"),
+                        },
+                    )
+                    await session.commit()
+                return result
+
+            # ── Gate 2: load corpus and compute coverage ──────────────────────
+            today = datetime.now(UTC).date()
+            lookback_start = today - timedelta(days=s.momentum_calibration_nightly_lookback_days)
+            date_from = lookback_start.isoformat()
+            date_to = today.isoformat()
+
+            rows = await self._load_corpus(date_from, date_to)
+            n_total = len(rows)
+
+            if n_total == 0:
+                result["outcome"] = "skipped_coverage"
+                result["overall_coverage"] = 0.0
+                result["recent_coverage"] = 0.0
+                result["consecutive_skips"] = prev_skips + 1
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    await repo.log_ops_event(
+                        severity="critical",
+                        summary="Momentum calibration nightly skipped: empty corpus (ingestion failure?)",
+                        source="momentum_calibration",
+                        payload={
+                            "event": "momentum_calibration_skipped",
+                            "reason": "coverage_low",
+                            "consecutive_skips": result["consecutive_skips"],
+                            "auto": True,
+                            "tier": None,
+                            "color": app_color,
+                            "overall_coverage": 0.0,
+                            "recent_coverage": 0.0,
+                        },
+                    )
+                    await session.commit()
+                return result
+
+            overall_coverage, recent_coverage = _compute_coverage_fractions(
+                rows, s.momentum_calibration_recent_coverage_days, today
+            )
+            result["overall_coverage"] = round(overall_coverage, 4)
+            result["recent_coverage"] = round(recent_coverage, 4)
+
+            if overall_coverage < s.momentum_calibration_min_slope_coverage:
+                new_skips = prev_skips + 1
+                result["outcome"] = "skipped_coverage"
+                result["consecutive_skips"] = new_skips
+                severity = (
+                    "critical"
+                    if new_skips >= s.momentum_calibration_skip_critical_threshold
+                    else "warning"
+                )
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    await repo.log_ops_event(
+                        severity=severity,
+                        summary=f"Momentum calibration nightly skipped: coverage {overall_coverage:.2%} < {s.momentum_calibration_min_slope_coverage:.2%}",
+                        source="momentum_calibration",
+                        payload={
+                            "event": "momentum_calibration_skipped",
+                            "reason": "coverage_low",
+                            "consecutive_skips": new_skips,
+                            "auto": True,
+                            "tier": None,
+                            "color": app_color,
+                            "overall_coverage": overall_coverage,
+                            "recent_coverage": recent_coverage,
+                        },
+                    )
+                    await session.commit()
+                return result
+
+            # ── Gate 3: min-obs + fit + sanity (delegated to stage()) ─────────
+            records = _build_analysis_records(rows)
+            n_usable = sum(
+                1 for r in records
+                if r["slope_against"] is not None and r["ratio"] is not None
+            )
+            min_obs = s.momentum_calibration_min_observations
+            if n_usable < min_obs:
+                result["outcome"] = "skipped_coverage"
+                result["consecutive_skips"] = prev_skips + 1
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    await repo.log_ops_event(
+                        severity="warning",
+                        summary=f"Momentum calibration nightly skipped: usable obs {n_usable} < {min_obs}",
+                        source="momentum_calibration",
+                        payload={
+                            "event": "momentum_calibration_skipped",
+                            "reason": "coverage_low",
+                            "consecutive_skips": result["consecutive_skips"],
+                            "auto": True,
+                            "tier": None,
+                            "color": app_color,
+                            "overall_coverage": overall_coverage,
+                            "recent_coverage": recent_coverage,
+                            "n_usable": n_usable,
+                        },
+                    )
+                    await session.commit()
+                return result
+
+            analysis = _deploy_analysis(records)
+            fit = analysis.get("scale_fit") or {}
+            scale_new = fit.get("scale_fit")
+            ci_frac = fit.get("ci_width_fraction")
+
+            result["fit_ci_width_fraction"] = ci_frac
+
+            # Sanity bounds check
+            ci_width_max = s.momentum_calibration_sanity_max_ci_width_fraction
+            veto_candidates = analysis.get("veto_candidates") or []
+            proposed_veto = veto_candidates[0].get("slope_against_cents_per_min") if veto_candidates else None
+            sanity_fail: str | None = None
+            if scale_new is None:
+                sanity_fail = "fit did not converge"
+            elif not (_SCALE_MIN <= scale_new <= _SCALE_MAX):
+                sanity_fail = f"scale {scale_new:.4f} outside bounds"
+            elif proposed_veto is not None and proposed_veto < 0:
+                sanity_fail = f"veto candidate {proposed_veto:.4f} < 0"
+            elif ci_frac is not None and ci_frac > ci_width_max:
+                sanity_fail = f"CI width {ci_frac:.4f} > {ci_width_max}"
+
+            active_payload = dict((active_cp.payload or {}) if active_cp else {})
+            tier = _compute_tier(
+                scale_new=scale_new,
+                veto_new=proposed_veto,
+                active_payload=active_payload,
+                ci_width_fraction=ci_frac,
+                tier1_max_delta_fraction=s.momentum_calibration_tier1_max_delta_fraction,
+                tier2_max_delta_fraction=s.momentum_calibration_tier2_max_delta_fraction,
+                tier1_max_ci_width_fraction=s.momentum_calibration_tier1_max_ci_width_fraction,
+                sanity_fail=sanity_fail,
+            )
+            result["tier"] = tier
+            result["consecutive_skips"] = 0
+
+            # ── Tier 3: no stage, critical ops_event ─────────────────────────
+            if tier == 3:
+                result["outcome"] = "tier3"
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    await repo.log_ops_event(
+                        severity="critical",
+                        summary=f"Momentum calibration nightly Tier 3: {sanity_fail or 'delta too large'}",
+                        source="momentum_calibration",
+                        payload={
+                            "event": "momentum_calibration_skipped",
+                            "reason": sanity_fail or "delta_too_large",
+                            "auto": True,
+                            "tier": 3,
+                            "color": app_color,
+                            "scale_new": scale_new,
+                            "proposed_veto": proposed_veto,
+                            "ci_frac": ci_frac,
+                            "overall_coverage": overall_coverage,
+                            "recent_coverage": recent_coverage,
+                        },
+                    )
+                    await session.commit()
+                return result
+
+            # ── Tier 1/2: stage ───────────────────────────────────────────────
+            stage_result = await self.stage(
+                date_from=date_from,
+                date_to=date_to,
+                staged_by=f"daemon:{app_color}",
+                force=False,
+                auto=True,
+                tier=tier,
+                color=app_color,
+                quiet=True,
+            )
+            if not stage_result.get("ok"):
+                result["outcome"] = "error"
+                logger.warning("nightly_auto_run stage() failed: %s", stage_result.get("error"))
+                return result
+
+            if tier == 1 and s.momentum_calibration_tier1_auto_promote_enabled:
+                promote_result = await self.promote(
+                    activated_by=f"daemon:{app_color}",
+                    auto=True,
+                    tier=tier,
+                    color=app_color,
+                    quiet=True,
+                )
+                if promote_result.get("ok"):
+                    result["outcome"] = "promoted"
+                else:
+                    result["outcome"] = "staged"
+            else:
+                result["outcome"] = "staged"
+
+            return result
+
+        except Exception:
+            logger.exception("nightly_auto_run error")
+            return result
+
+        finally:
+            # Always write the nightly checkpoint regardless of outcome.
+            try:
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    await repo.set_checkpoint(nightly_key, cursor=None, payload=result)
+                    await session.commit()
+            except Exception:
+                logger.exception("nightly_auto_run: failed to write nightly checkpoint")
 
     # ── internals ────────────────────────────────────────────────────────────
 
@@ -764,6 +1065,93 @@ def _bootstrap_ci_mean(values: list[float], n_boot: int = 1000) -> tuple[float, 
         count=n_boot,
     )
     return float(np.percentile(boot_means, 2.5)), float(np.percentile(boot_means, 97.5))
+
+
+def _compute_tier(
+    *,
+    scale_new: float | None,
+    veto_new: float | None,
+    active_payload: dict[str, Any],
+    ci_width_fraction: float | None,
+    tier1_max_delta_fraction: float,
+    tier2_max_delta_fraction: float,
+    tier1_max_ci_width_fraction: float,
+    sanity_fail: str | None,
+) -> int:
+    """
+    Classify a proposed calibration update into Tier 1/2/3.
+    Tier 3 if sanity_fail is set or scale_new is None.
+    Tier 2 if no active checkpoint, None-transitions, or delta/CI outside Tier 1 but within Tier 2.
+    Tier 1 if delta small and CI tight.
+    """
+    if sanity_fail is not None or scale_new is None:
+        return 3
+
+    active_scale = active_payload.get("momentum_weight_scale_cents_per_min")
+    active_veto = active_payload.get("momentum_slope_veto_cents_per_min")
+
+    # No active checkpoint → Tier 2 (first deploy, operator reviews)
+    if active_scale is None:
+        return 2
+
+    # None-transitions → Tier 2 regardless of magnitude
+    if (active_veto is None) != (veto_new is None):
+        return 2
+
+    # Delta = max relative change across scale and veto
+    scale_delta = abs(scale_new - active_scale) / abs(active_scale)
+    veto_delta = 0.0
+    if active_veto is not None and veto_new is not None:
+        veto_delta = abs(veto_new - active_veto) / abs(active_scale)  # relative to scale per design
+    max_delta = max(scale_delta, veto_delta)
+
+    if max_delta >= tier2_max_delta_fraction:
+        return 3
+
+    ci_wide = ci_width_fraction is not None and ci_width_fraction > tier1_max_ci_width_fraction
+    if max_delta >= tier1_max_delta_fraction or ci_wide:
+        return 2
+
+    return 1
+
+
+def _compute_coverage_fractions(
+    rows: list[dict[str, Any]],
+    recent_days: int,
+    today: date,
+) -> tuple[float, float]:
+    """
+    Return (overall_coverage, recent_coverage) — fraction of rows that have a slope stamp.
+    overall_coverage: all rows; recent_coverage: rows from the last recent_days days only.
+    """
+    n_total = len(rows)
+    if n_total == 0:
+        return 0.0, 0.0
+
+    cutoff = today - timedelta(days=recent_days)
+    n_with_slope = 0
+    n_recent_total = 0
+    n_recent_with_slope = 0
+
+    for row in rows:
+        payload: dict = row.get("signal_payload") or {}
+        has_slope = "momentum_slope_cents_per_min" in payload
+        if has_slope:
+            n_with_slope += 1
+        day_raw = row.get("local_market_day")
+        if day_raw is not None:
+            try:
+                day = day_raw if isinstance(day_raw, date) else date.fromisoformat(str(day_raw))
+                if day >= cutoff:
+                    n_recent_total += 1
+                    if has_slope:
+                        n_recent_with_slope += 1
+            except (ValueError, TypeError):
+                pass
+
+    overall = n_with_slope / n_total
+    recent = (n_recent_with_slope / n_recent_total) if n_recent_total > 0 else 0.0
+    return overall, recent
 
 
 # ── print helpers ─────────────────────────────────────────────────────────────

@@ -30,6 +30,7 @@ from kalshi_bot.services.strategy_codex import StrategyCodexService
 from kalshi_bot.services.strategy_dashboard import StrategyDashboardService
 from kalshi_bot.services.stop_loss import StopLossService
 from kalshi_bot.services.strategy_cleanup_service import StrategyCleanupService
+from kalshi_bot.services.momentum_calibration import MomentumCalibrationService
 from kalshi_bot.services.monotonicity_scanner_service import MonotonicityArbScannerService
 from kalshi_bot.services.strategy_regression import StrategyRegressionService, WINDOW_DAYS as DEFAULT_STRATEGY_WINDOW_DAYS
 from kalshi_bot.services.streaming import MarketStreamService
@@ -66,6 +67,7 @@ class DaemonService:
         strategy_codex_service: StrategyCodexService | None = None,
         strategy_dashboard_service: StrategyDashboardService | None = None,
         strategy_auto_evolve_service: StrategyAutoEvolveService | None = None,
+        momentum_calibration_service: MomentumCalibrationService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -90,6 +92,7 @@ class DaemonService:
         self.strategy_codex_service = strategy_codex_service
         self.strategy_dashboard_service = strategy_dashboard_service
         self.strategy_auto_evolve_service = strategy_auto_evolve_service
+        self.momentum_calibration_service = momentum_calibration_service
         self.stop_loss_service = stop_loss_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
@@ -352,6 +355,9 @@ class DaemonService:
                     payload["strategy_auto_evolve"] = strategy_codex_nightly
                 else:
                     payload["strategy_codex_nightly"] = strategy_codex_nightly
+            momentum_calibration_nightly = await self._maybe_run_momentum_calibration_nightly()
+            if momentum_calibration_nightly is not None:
+                payload["momentum_calibration_nightly"] = momentum_calibration_nightly
             historical_pipeline = await self._maybe_run_historical_pipeline()
             if historical_pipeline is not None:
                 payload["historical_pipeline"] = historical_pipeline
@@ -721,6 +727,56 @@ class DaemonService:
         local_now = now.astimezone(timezone)
         target_local = local_now.replace(
             hour=self.settings.strategy_codex_nightly_hour_local,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        return {
+            "due": local_now >= target_local,
+            "local_date": local_now.date().isoformat(),
+            "local_now": local_now,
+            "target_local": target_local,
+        }
+
+    async def _maybe_run_momentum_calibration_nightly(self) -> dict[str, Any] | None:
+        if not self.settings.momentum_calibration_auto_enabled:
+            return None
+        if self.momentum_calibration_service is None:
+            return None
+
+        night_state = self._momentum_calibration_nightly_state()
+        if not night_state["due"]:
+            return None
+
+        checkpoint_name = f"nightly_momentum_calibration_run:{self.settings.kalshi_env}:{self.settings.app_color}"
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            checkpoint = await repo.get_checkpoint(checkpoint_name)
+            await session.commit()
+        if checkpoint is not None and isinstance(checkpoint.payload, dict):
+            if checkpoint.payload.get("ran_at"):
+                try:
+                    ran_at = datetime.fromisoformat(checkpoint.payload["ran_at"])
+                    local_ran = ran_at.astimezone(ZoneInfo(self.settings.momentum_calibration_nightly_timezone))
+                    if local_ran.date().isoformat() == night_state["local_date"]:
+                        return None
+                except (ValueError, TypeError):
+                    pass
+
+        try:
+            return await self.momentum_calibration_service.nightly_auto_run(
+                app_color=self.settings.app_color
+            )
+        except Exception:
+            logger.warning("momentum_calibration nightly run error", exc_info=True)
+            return None
+
+    def _momentum_calibration_nightly_state(self) -> dict[str, Any]:
+        now = self._utc_now()
+        timezone = ZoneInfo(self.settings.momentum_calibration_nightly_timezone)
+        local_now = now.astimezone(timezone)
+        target_local = local_now.replace(
+            hour=self.settings.momentum_calibration_nightly_hour_local,
             minute=0,
             second=0,
             microsecond=0,

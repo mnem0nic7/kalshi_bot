@@ -252,7 +252,14 @@
                   {% endif %}
                 </div>
               </td>
-              <td><span class="status-pill {% if item.side_tone == 'good' %}status-good{% elif item.side_tone == 'warning' %}status-warning{% elif item.side_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.side }}</span></td>
+              <td>
+                <span class="status-pill {% if item.side_tone == 'good' %}status-good{% elif item.side_tone == 'warning' %}status-warning{% elif item.side_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.side }}</span>
+                {% if item.selected_side %}
+                <div class="proposal-risk-reasons">
+                  Selected {{ item.selected_side | upper }}{% if item.skipped_side %}; {{ item.skipped_side | upper }} {{ (item.skipped_side_reason or "checked") | replace("_", " ") }}{% endif %}
+                </div>
+                {% endif %}
+              </td>
               <td class="mono">{{ item.yes_price_dollars }}</td>
               <td class="mono">{{ item.count_fp }}</td>
               <td><span class="status-pill {% if item.status_tone == 'good' %}status-good{% elif item.status_tone == 'warning' %}status-warning{% elif item.status_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.status }}</span></td>

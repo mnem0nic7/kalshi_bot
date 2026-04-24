@@ -132,20 +132,35 @@ class Settings(BaseSettings):
     stop_loss_momentum_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_reentry_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_min_hold_minutes: int = 30
-    # Adverse-direction slope threshold for entry Gate 3 (¢/min, stored negative).
-    # Condition: slope_against < threshold → block. Default 0.0 = current behaviour (any adverse slope blocks).
-    # Set to -999.0 during Step 2 calibration replay to bypass Gate 3; do not tune between
-    # Step 1 and Step 3 deploys — this key is removed when the multiplicative weight mechanism lands.
-    momentum_entry_slope_threshold_cents_per_min: float = 0.0
     # Step 3 momentum weight config keys (placeholder defaults; calibrated values written to DB checkpoint).
     # momentum_weight_scale_cents_per_min: the denominator in w = max(floor, 1 - slope_against/scale).
     # momentum_slope_veto_cents_per_min: hard veto gate; None = disabled until first calibration ships.
     # momentum_weight_floor: minimum weight applied to edge_effective_bps.
     # momentum_veto_staleness_gate: staleness_factor must exceed this before veto can fire.
+    # momentum_weight_shadow_mode: when True, post-processor stamps analytics fields but does not
+    #   enforce edge_effective_bps in eligibility decisions — enforcement falls back to raw edge.
     momentum_weight_scale_cents_per_min: float = 1.0
     momentum_slope_veto_cents_per_min: float | None = None
     momentum_weight_floor: float = 0.3
     momentum_veto_staleness_gate: float = 0.5
+    momentum_weight_shadow_mode: bool = True
+    # Phase 2 — nightly automation
+    momentum_calibration_auto_enabled: bool = False
+    momentum_calibration_nightly_hour_local: int = 2
+    momentum_calibration_nightly_timezone: str = "America/Los_Angeles"
+    momentum_calibration_nightly_lookback_days: int = 90
+    # Phase 2 — tier thresholds
+    momentum_calibration_tier1_max_delta_fraction: float = 0.10
+    momentum_calibration_tier2_max_delta_fraction: float = 0.20
+    momentum_calibration_tier1_max_ci_width_fraction: float = 0.30
+    momentum_calibration_sanity_max_ci_width_fraction: float = 0.50
+    momentum_calibration_tier1_auto_promote_enabled: bool = False
+    # Phase 2 — coverage gate
+    momentum_calibration_min_slope_coverage: float = 0.80
+    momentum_calibration_recent_coverage_days: int = 7
+    momentum_calibration_min_observations: int = 1000
+    # Phase 2 — skip escalation
+    momentum_calibration_skip_critical_threshold: int = 4
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False

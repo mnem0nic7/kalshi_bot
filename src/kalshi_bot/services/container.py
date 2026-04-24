@@ -46,6 +46,7 @@ from kalshi_bot.services.market_history import MarketHistoryService
 from kalshi_bot.services.watchdog import WatchdogService
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.strategy_cleanup_service import StrategyCleanupService
+from kalshi_bot.services.momentum_calibration import MomentumCalibrationService
 from kalshi_bot.services.monotonicity_scanner_service import MonotonicityArbScannerService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
@@ -287,6 +288,11 @@ class AppContainer:
             strategy_codex_service=strategy_codex_service,
             strategy_dashboard_service=strategy_dashboard_service,
         )
+        momentum_calibration_service = MomentumCalibrationService(
+            session_factory=session_factory,
+            kalshi_client=kalshi,
+            settings=settings,
+        )
         daemon_service = DaemonService(
             settings,
             session_factory,
@@ -312,6 +318,7 @@ class AppContainer:
             strategy_dashboard_service=strategy_dashboard_service,
             strategy_auto_evolve_service=strategy_auto_evolve_service,
             stop_loss_service=stop_loss_service,
+            momentum_calibration_service=momentum_calibration_service,
         )
         container = cls(
             settings=settings,

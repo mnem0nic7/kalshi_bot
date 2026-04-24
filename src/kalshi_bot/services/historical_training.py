@@ -2850,6 +2850,8 @@ class HistoricalTrainingService:
                     market_snapshot=market_response,
                     min_edge_bps=thresholds.risk_min_edge_bps,
                     spread_limit_bps=thresholds.trigger_max_spread_bps,
+                    quality_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
+                    minimum_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
                 )
             signal.eligibility = evaluate_trade_eligibility(
                 settings=self.settings,
@@ -2863,6 +2865,8 @@ class HistoricalTrainingService:
             )
             signal.strategy_mode = signal.eligibility.strategy_mode
             signal.stand_down_reason = signal.eligibility.stand_down_reason
+            signal.evaluation_outcome = signal.eligibility.evaluation_outcome
+            signal.candidate_trace = signal.eligibility.candidate_trace or signal.candidate_trace
             if signal.eligibility.reasons and not signal.eligibility.eligible:
                 signal.summary = f"{signal.summary} Stand down: {' '.join(signal.eligibility.reasons)}"
 
@@ -2883,6 +2887,8 @@ class HistoricalTrainingService:
                     "effective_research_freshness": dossier.freshness.model_dump(mode="json"),
                     "resolution_state": signal.resolution_state.value,
                     "strategy_mode": signal.strategy_mode.value,
+                    "evaluation_outcome": signal.evaluation_outcome,
+                    "candidate_trace": signal.candidate_trace,
                     "trade_regime": signal.trade_regime,
                     "capital_bucket": signal.capital_bucket,
                     "forecast_delta_f": signal.forecast_delta_f,

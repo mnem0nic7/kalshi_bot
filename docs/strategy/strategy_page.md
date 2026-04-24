@@ -34,6 +34,7 @@ Browser (dashboard.js)
 | Evaluation Lab | `src/kalshi_bot/services/strategy_codex.py` |
 | Auto-Evolve service | `src/kalshi_bot/services/strategy_auto_evolve.py` |
 | Evaluation Lab providers | `src/kalshi_bot/agents/providers.py` — Gemini and OpenAI-compatible Chat Completions clients |
+| Live signal/risk evaluation | `src/kalshi_bot/services/signal.py`, `src/kalshi_bot/services/risk.py` |
 | Dashboard service | `src/kalshi_bot/services/strategy_dashboard.py` — bridges `control_room.py` to the three sub-services |
 | Frontend | `src/kalshi_bot/web/static/dashboard.js` — `renderStrategies()` and friends |
 | Template | `src/kalshi_bot/web/templates/index.html` lines 209–351 |
@@ -84,6 +85,21 @@ Two panels:
 ## Evaluation Lab
 
 The Evaluation Lab lets the operator or Auto-Evolve ask the AI to evaluate an existing city's strategy fit or propose an entirely new strategy preset. Results are stored as "runs" and can be accepted manually or automatically.
+
+### Live Evaluation Context
+
+The live signal path ranks both YES and NO candidates before ticket creation. Each side records a candidate trace with quote availability, traded-side price, remaining payout, raw edge, quality-buffer-adjusted edge, spread status, and skip/selection reason. Hard pre-risk floors include `RISK_MIN_CONTRACT_PRICE_DOLLARS` (default `0.25`), minimum remaining payout, longshot regime, spread, and quality-buffer-adjusted edge. The deterministic risk engine keeps the same `0.25` minimum contract price as a final backstop, but normal low-price cases should now stand down before a ticket is created.
+
+Evaluation outcomes are bucketed as:
+
+| Outcome | Meaning |
+|---------|---------|
+| `no_candidate` | Neither side had an actionable edge at the current quotes |
+| `pre_risk_filtered` | A side had edge but failed an obvious pre-ticket constraint |
+| `risk_blocked` | A ticket was created and the risk engine blocked it |
+| `approved` | The selected candidate passed risk |
+
+The dashboard snapshot sent to Evaluation Lab includes recent block analytics grouped by reason, city, strategy mode, side, price bucket, remaining-payout bucket, and time-to-settlement bucket. It also includes a missed-alternate-side count for cases where the selected side failed while the opposite side looked eligible from the trace.
 
 ### How It Works
 

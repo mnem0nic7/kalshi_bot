@@ -524,11 +524,15 @@ class StrategyCodexService:
             system_prompt=(
                 "You are a strategy evaluator for a Kalshi trading dashboard. "
                 "Review only the supplied strategy snapshot. "
+                "Use block analytics to identify avoidable pre-risk and risk blocks when present. "
                 "Do not invent data, do not propose code changes, and stay grounded in the given metrics."
             ),
             user_prompt=json.dumps(
                 {
-                    "task": "Evaluate the current strategy landscape and explain the most important strengths, risks, and next actions.",
+                    "task": (
+                        "Evaluate the current strategy landscape and explain the most important strengths, risks, "
+                        "avoidable block patterns, and next actions."
+                    ),
                     "window_days": run.window_days,
                     "selected_series_ticker": run.series_ticker,
                     "selected_strategy_name": run.strategy_name,
@@ -551,11 +555,15 @@ class StrategyCodexService:
             system_prompt=(
                 "You design one new threshold-based strategy preset for a Kalshi strategy regression dashboard. "
                 "Use only the current threshold schema. "
+                "Prefer candidates that improve replay quality while reducing avoidable pre-risk and risk blocks. "
                 "Return one candidate only, do not propose code changes, and do not modify approval or assignment rules."
             ),
             user_prompt=json.dumps(
                 {
-                    "task": "Suggest one new strategy preset and explain why it could complement the current presets.",
+                    "task": (
+                        "Suggest one new strategy preset and explain why it could complement the current presets "
+                        "while reducing avoidable block patterns."
+                    ),
                     "window_days": run.window_days,
                     "selected_series_ticker": run.series_ticker,
                     "selected_strategy_name": run.strategy_name,
@@ -732,6 +740,7 @@ class StrategyCodexService:
         leaderboard = list(snapshot.get("leaderboard") or [])
         city_matrix = list(snapshot.get("city_matrix") or [])
         detail_context = dict(snapshot.get("detail_context") or {})
+        block_analytics = dict(snapshot.get("block_analytics") or {})
         recent_promotions = list(snapshot.get("recent_promotions") or [])
         methodology = dict(snapshot.get("methodology") or {})
 
@@ -809,10 +818,29 @@ class StrategyCodexService:
                 "best_strategy_win_rate": summary.get("best_strategy_win_rate"),
                 "last_regression_run": summary.get("last_regression_run"),
                 "assignments_covered_display": summary.get("assignments_covered_display"),
+                "recent_blocked_evaluations_count": summary.get("recent_blocked_evaluations_count"),
+                "recent_risk_blocked_count": summary.get("recent_risk_blocked_count"),
+                "recent_pre_risk_filtered_count": summary.get("recent_pre_risk_filtered_count"),
+                "recent_missed_alternate_side_count": summary.get("recent_missed_alternate_side_count"),
             },
             "leaderboard": compact_leaderboard,
             "city_matrix": compact_rows,
             "detail_context": compact_detail,
+            "block_analytics": {
+                "blocked_count": block_analytics.get("blocked_count"),
+                "risk_blocked_count": block_analytics.get("risk_blocked_count"),
+                "pre_risk_filtered_count": block_analytics.get("pre_risk_filtered_count"),
+                "no_candidate_count": block_analytics.get("no_candidate_count"),
+                "approved_count": block_analytics.get("approved_count"),
+                "missed_alternate_side_count": block_analytics.get("missed_alternate_side_count"),
+                "by_reason": list(block_analytics.get("by_reason") or [])[:8],
+                "by_city": list(block_analytics.get("by_city") or [])[:8],
+                "by_strategy": list(block_analytics.get("by_strategy") or [])[:8],
+                "by_side": list(block_analytics.get("by_side") or [])[:8],
+                "by_price_bucket": list(block_analytics.get("by_price_bucket") or [])[:8],
+                "by_remaining_payout_bucket": list(block_analytics.get("by_remaining_payout_bucket") or [])[:8],
+                "by_time_to_settlement_bucket": list(block_analytics.get("by_time_to_settlement_bucket") or [])[:8],
+            },
             "recent_promotions": recent_promotions[:6],
             "methodology": {
                 "points": list(methodology.get("points") or [])[:6],

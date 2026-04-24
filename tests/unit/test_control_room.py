@@ -245,6 +245,66 @@ async def test_recent_room_outcome_views_builds_lightweight_statuses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_strategy_block_analytics_groups_blocked_candidates() -> None:
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=UTC)
+
+    class AnalyticsSession(_FakeSession):
+        async def execute(self, _stmt) -> _FakeResult:
+            return _FakeResult(
+                [
+                    SimpleNamespace(
+                        market_ticker="KXHIGHNY-26APR24-T70",
+                        created_at=now,
+                        signal_payload={
+                            "strategy_mode": "directional_unresolved",
+                            "recommended_side": "yes",
+                            "evaluation_outcome": "candidate_selected",
+                            "eligibility": {
+                                "evaluation_outcome": "candidate_selected",
+                                "remaining_payout_dollars": "0.9900",
+                            },
+                            "candidate_trace": {
+                                "selected_side": "yes",
+                                "yes": {
+                                    "side": "yes",
+                                    "status": "selected",
+                                    "traded_price_dollars": "0.0100",
+                                    "remaining_payout_dollars": "0.9900",
+                                },
+                                "no": {
+                                    "side": "no",
+                                    "status": "eligible",
+                                    "reason": "eligible",
+                                    "traded_price_dollars": "0.4500",
+                                    "remaining_payout_dollars": "0.5500",
+                                },
+                            },
+                        },
+                        risk_status="blocked",
+                        risk_reasons=["Contract price 0.0100 is below minimum 0.25"],
+                        risk_payload={},
+                        ticket_side="yes",
+                        ticket_yes_price_dollars=Decimal("0.0100"),
+                    )
+                ]
+            )
+
+    analytics = await control_room_module._strategy_block_analytics(
+        AnalyticsSession(),
+        kalshi_env="demo",
+        since=now - timedelta(days=1),
+    )
+
+    assert analytics["blocked_count"] == 1
+    assert analytics["risk_blocked_count"] == 1
+    assert analytics["missed_alternate_side_count"] == 1
+    assert analytics["by_city"] == [{"key": "KXHIGHNY", "count": 1}]
+    assert analytics["by_price_bucket"] == [{"key": "<0.25", "count": 1}]
+    assert analytics["by_side"] == [{"key": "yes", "count": 1}]
+    assert analytics["by_time_to_settlement_bucket"] == [{"key": "same_day", "count": 1}]
+
+
+@pytest.mark.asyncio
 async def test_build_control_room_summary_skips_live_market_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeRepo:
         def __init__(self, _session) -> None:
@@ -385,6 +445,10 @@ async def test_recent_trade_proposal_views_formats_rows() -> None:
         {
             "market_ticker": "KXHIGHNY-26APR23-T75",
             "side": "yes",
+            "selected_side": "yes",
+            "skipped_side": None,
+            "skipped_side_reason": None,
+            "candidate_trace": {},
             "side_tone": "good",
             "yes_price_dollars": "0.4000",
             "count_fp": "12.50",
@@ -399,6 +463,10 @@ async def test_recent_trade_proposal_views_formats_rows() -> None:
         {
             "market_ticker": "KXHIGHCHI-26APR23-T68",
             "side": "no",
+            "selected_side": "no",
+            "skipped_side": None,
+            "skipped_side_reason": None,
+            "candidate_trace": {},
             "side_tone": "warning",
             "yes_price_dollars": "0.2100",
             "count_fp": "8.00",
@@ -950,6 +1018,7 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
         "leaderboard",
         "city_matrix",
         "detail_context",
+        "block_analytics",
         "recent_promotions",
         "methodology",
         "automation",
@@ -985,6 +1054,8 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
     assert payload["recent_promotions"][0]["resolved_trade_count"] == 24
     assert any(event["kind"] == "assignment_approval" for event in payload["recent_promotions"])
     assert payload["summary"]["recent_approvals_count"] == 1
+    assert payload["summary"]["recent_blocked_evaluations_count"] == 0
+    assert payload["block_analytics"]["blocked_count"] == 0
     assert payload["leaderboard"][0]["name"] == "moderate"
     assert payload["leaderboard"][0]["outcome_coverage_display"] == "50/50 scored"
 

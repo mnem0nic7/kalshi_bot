@@ -254,6 +254,8 @@ class TradeEligibilityVerdict(BaseModel):
     strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED
     resolution_state: WeatherResolutionState = WeatherResolutionState.UNRESOLVED
     stand_down_reason: StandDownReason | None = None
+    evaluation_outcome: str | None = None
+    candidate_trace: dict[str, Any] = Field(default_factory=dict)
     capital_bucket: str = "safe"
     reasons: list[str] = Field(default_factory=list)
     market_stale: bool = False

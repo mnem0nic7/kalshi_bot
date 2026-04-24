@@ -29,10 +29,12 @@ from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
 import numpy as np
 
+from kalshi_bot.services.momentum_calibration import get_active_momentum_calibration_async
 from kalshi_bot.services.signal import (
     StrategySignal,
     WeatherSignalEngine,
     apply_heuristic_application_to_signal,
+    apply_momentum_weight_to_signal,
     estimate_notional_dollars,
     evaluate_trade_eligibility,
     is_market_stale,
@@ -122,6 +124,47 @@ class WorkflowSupervisor:
         self.research_coordinator = research_coordinator
         self.training_corpus_service = training_corpus_service
         self.agents = agents
+        self._momentum_post_processor_rate_limit: dict[tuple[str, str], datetime] = {}
+
+    async def _try_apply_momentum_post_processor(
+        self,
+        signal: StrategySignal,
+        *,
+        repo: "PlatformRepository",
+        market_ticker: str,
+        bundle_age_reference: datetime | None,
+    ) -> StrategySignal:
+        from datetime import timedelta
+
+        from sqlalchemy.exc import DBAPIError
+        try:
+            params = await get_active_momentum_calibration_async(repo, self.settings)
+            price_history = await repo.fetch_recent_prices(
+                market_ticker,
+                kalshi_env=self.settings.kalshi_env,
+                window=timedelta(minutes=60),
+            )
+            return apply_momentum_weight_to_signal(
+                signal,
+                params=params,
+                price_history=price_history,
+                research_stale_seconds=self.settings.research_stale_seconds,
+                bundle_age_reference=bundle_age_reference,
+                shadow_mode=self.settings.momentum_weight_shadow_mode,
+            )
+        except (DBAPIError, asyncio.TimeoutError) as exc:
+            key = (self.settings.kalshi_env, type(exc).__name__)
+            now = datetime.now(UTC)
+            last = self._momentum_post_processor_rate_limit.get(key)
+            if last is None or (now - last).total_seconds() >= 300:
+                self._momentum_post_processor_rate_limit[key] = now
+                await repo.log_ops_event(
+                    severity="warning",
+                    summary=f"Momentum post-processor unavailable: {type(exc).__name__}",
+                    source="momentum_post_processor",
+                    payload={"market_ticker": market_ticker, "error": str(exc)},
+                )
+            return signal
 
     async def _run_market_gates(
         self,
@@ -146,12 +189,34 @@ class WorkflowSupervisor:
                 return None
 
         def _reject(reason: "StandDownReason", msg: str) -> bool:
+            candidate_trace = dict(signal.candidate_trace or {})
+            candidate_trace["eligibility_outcome"] = "pre_risk_filtered"
+            candidate_trace["eligibility_stand_down_reason"] = reason.value
             if signal.eligibility is None:
-                signal.eligibility = TradeEligibilityVerdict(eligible=False, reasons=[msg])
+                signal.eligibility = TradeEligibilityVerdict(
+                    eligible=False,
+                    reasons=[msg],
+                    stand_down_reason=reason,
+                    evaluation_outcome="pre_risk_filtered",
+                    candidate_trace=candidate_trace,
+                )
             else:
-                signal.eligibility = signal.eligibility.model_copy(update={"eligible": False, "reasons": list(signal.eligibility.reasons) + [msg]})
+                signal.eligibility = signal.eligibility.model_copy(
+                    update={
+                        "eligible": False,
+                        "reasons": list(signal.eligibility.reasons) + [msg],
+                        "stand_down_reason": reason,
+                        "evaluation_outcome": "pre_risk_filtered",
+                        "candidate_trace": candidate_trace,
+                    }
+                )
             signal.stand_down_reason = reason
+            signal.evaluation_outcome = "pre_risk_filtered"
+            signal.candidate_trace = candidate_trace
             signal.summary = f"Stand down: {msg}"
+            return False
+
+        if signal.eligibility is not None and not signal.eligibility.eligible:
             return False
 
         bid = _d("yes_bid_dollars")
@@ -184,28 +249,31 @@ class WorkflowSupervisor:
                         f"Edge vs market mid is {market_edge_bps} bps (non-positive)",
                     )
 
-        # Gate 3: momentum (linear regression on 60 min of mid prices)
-        if signal.recommended_side is not None:
+        # Gate 3: momentum veto (reads slope pre-stamped by post-processor; None → pass per Q5)
+        veto_threshold = self.settings.momentum_slope_veto_cents_per_min
+        slope_cpmin = signal.momentum_slope_cents_per_min
+        if (
+            veto_threshold is not None
+            and slope_cpmin is not None
+            and signal.recommended_side is not None
+        ):
             from kalshi_bot.core.enums import ContractSide
-            from datetime import timedelta as _td
-            history = await repo.fetch_recent_prices(
-                market_ticker,
-                kalshi_env=self.settings.kalshi_env,
-                window=timedelta(minutes=60),
+            slope_against = (
+                -slope_cpmin if signal.recommended_side == ContractSide.YES else slope_cpmin
             )
-            valid_points = [(row.observed_at.timestamp(), float(row.mid_dollars)) for row in history if row.mid_dollars is not None]
-            if len(valid_points) >= 5:
-                xs = np.array([p[0] for p in valid_points])
-                ys = np.array([p[1] for p in valid_points])
-                xs = xs - xs[0]
-                slope_per_s = np.polyfit(xs, ys, 1)[0]
-                slope_cpmin = slope_per_s * 100 * 60  # $/s → ¢/min
-                slope_against = slope_cpmin if signal.recommended_side == ContractSide.YES else -slope_cpmin
-                if slope_against < self.settings.momentum_entry_slope_threshold_cents_per_min:
-                    return _reject(
-                        StandDownReason.MOMENTUM_AGAINST_TRADE,
-                        f"Price momentum ({slope_cpmin:.3f} ¢/min) is against {signal.recommended_side.value.upper()} trade",
-                    )
+            # Recompute staleness at veto time from signal — never cache on signal to stay current.
+            obs_time = signal.weather.observation_time if signal.weather is not None else None
+            _time_ref = obs_time.astimezone(UTC) if obs_time is not None else None
+            if _time_ref is not None:
+                _bundle_age_s = (datetime.now(UTC) - _time_ref).total_seconds()
+                staleness_factor = min(1.0, _bundle_age_s / max(self.settings.research_stale_seconds, 1))
+            else:
+                staleness_factor = 0.0
+            if staleness_factor >= self.settings.momentum_veto_staleness_gate and slope_against > veto_threshold:
+                return _reject(
+                    StandDownReason.MOMENTUM_AGAINST_TRADE,
+                    f"Price momentum ({slope_cpmin:.3f} ¢/min) is against {signal.recommended_side.value.upper()} trade",
+                )
 
         # Gate 4: volume check and size_factor — only gate if volume is explicitly reported
         raw_volume = market.get("volume")
@@ -234,6 +302,14 @@ class WorkflowSupervisor:
     ) -> None:
         receipt = ExecReceiptPayload(status="no_trade", details={})
         final_status = "no_trade"
+        candidate_trace = dict(signal.candidate_trace or {})
+        if signal.eligibility is not None and signal.eligibility.candidate_trace:
+            candidate_trace = dict(signal.eligibility.candidate_trace)
+        evaluation_outcome = (
+            signal.evaluation_outcome
+            or (signal.eligibility.evaluation_outcome if signal.eligibility is not None else None)
+            or "no_candidate"
+        )
 
         eligible = (
             signal.eligibility is not None
@@ -444,6 +520,7 @@ class WorkflowSupervisor:
                     payload=verdict.model_dump(mode="json"),
                 )
                 if verdict.status == RiskStatus.APPROVED:
+                    evaluation_outcome = "approved"
                     approved_ticket = approved_ticket_for_verdict(ticket, verdict)
                     await repo.update_room_stage(room.id, RoomStage.EXECUTING)
                     pending_reconcile = await _pending_post_kill_switch_reconcile(
@@ -491,17 +568,26 @@ class WorkflowSupervisor:
                             kalshi_env=room.kalshi_env,
                         )
                 else:
+                    evaluation_outcome = "risk_blocked"
                     receipt = ExecReceiptPayload(
                         status="blocked",
                         client_order_id=client_order_id,
-                        details={"reasons": verdict.reasons},
+                        details={
+                            "reasons": verdict.reasons,
+                            "evaluation_outcome": evaluation_outcome,
+                            "candidate_trace": candidate_trace,
+                        },
                     )
                     ORDERS_TOTAL.labels(status="blocked").inc()
                 final_status = receipt.status
             else:
                 final_status = "stand_down"
+                evaluation_outcome = evaluation_outcome if evaluation_outcome in {"no_candidate", "pre_risk_filtered"} else "pre_risk_filtered"
         else:
             final_status = "stand_down"
+            evaluation_outcome = evaluation_outcome if evaluation_outcome in {"no_candidate", "pre_risk_filtered"} else "pre_risk_filtered"
+        candidate_trace["final_outcome"] = evaluation_outcome
+        candidate_trace["final_status"] = final_status
 
         await repo.append_message(
             room.id,
@@ -511,7 +597,12 @@ class WorkflowSupervisor:
                 stage=RoomStage.COMPLETE,
                 content=f"Deterministic path: {final_status}. {signal.summary}"
                 + (" [loss sensitivity active: edge x2, size x0.5]" if loss_sensitivity_active else ""),
-                payload={"final_status": final_status, "loss_sensitivity_active": loss_sensitivity_active},
+                payload={
+                    "final_status": final_status,
+                    "evaluation_outcome": evaluation_outcome,
+                    "candidate_trace": candidate_trace,
+                    "loss_sensitivity_active": loss_sensitivity_active,
+                },
             ),
         )
         await repo.update_room_campaign(
@@ -715,7 +806,15 @@ class WorkflowSupervisor:
                         market_snapshot=market_response,
                         min_edge_bps=thresholds.risk_min_edge_bps,
                         spread_limit_bps=thresholds.trigger_max_spread_bps,
+                        quality_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
+                        minimum_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
                     )
+                signal = await self._try_apply_momentum_post_processor(
+                    signal,
+                    repo=repo,
+                    market_ticker=room.market_ticker,
+                    bundle_age_reference=dossier.freshness.refreshed_at,
+                )
                 signal.eligibility = evaluate_trade_eligibility(
                     settings=self.settings,
                     signal=signal,
@@ -726,6 +825,8 @@ class WorkflowSupervisor:
                 )
                 signal.strategy_mode = signal.eligibility.strategy_mode
                 signal.stand_down_reason = signal.eligibility.stand_down_reason
+                signal.evaluation_outcome = signal.eligibility.evaluation_outcome
+                signal.candidate_trace = signal.eligibility.candidate_trace or signal.candidate_trace
                 if signal.eligibility.reasons and not signal.eligibility.eligible:
                     signal.summary = f"{signal.summary} Stand down: {' '.join(signal.eligibility.reasons)}"
                 await repo.save_signal(
@@ -745,6 +846,8 @@ class WorkflowSupervisor:
                         "effective_research_freshness": dossier.freshness.model_dump(mode="json"),
                         "resolution_state": signal.resolution_state.value,
                         "strategy_mode": signal.strategy_mode.value,
+                        "evaluation_outcome": signal.evaluation_outcome,
+                        "candidate_trace": signal.candidate_trace,
                         "trade_regime": signal.trade_regime,
                         "capital_bucket": signal.capital_bucket,
                         "recommended_side": signal.recommended_side.value if signal.recommended_side is not None else None,
@@ -790,6 +893,9 @@ class WorkflowSupervisor:
                             if signal.heuristic_application is not None
                             else {}
                         ),
+                        "momentum_slope_cents_per_min": signal.momentum_slope_cents_per_min,
+                        "momentum_weight": signal.momentum_weight,
+                        "edge_effective_bps": signal.edge_effective_bps,
                     },
                 )
                 await session.commit()
@@ -1079,6 +1185,13 @@ class WorkflowSupervisor:
                             approved_count_fp=verdict.approved_count_fp,
                             payload=verdict.model_dump(mode="json"),
                         )
+                        candidate_trace = dict(signal.candidate_trace or {})
+                        if signal.eligibility is not None and signal.eligibility.candidate_trace:
+                            candidate_trace = dict(signal.eligibility.candidate_trace)
+                        risk_evaluation_outcome = (
+                            "approved" if verdict.status == RiskStatus.APPROVED else "risk_blocked"
+                        )
+                        candidate_trace["final_outcome"] = risk_evaluation_outcome
                         risk_message, risk_usage = await self.agents.risk_message(
                             verdict=verdict,
                             role_config=self.agent_pack_service.role_config(pack, AgentRole.RISK_OFFICER),
@@ -1139,7 +1252,11 @@ class WorkflowSupervisor:
                             receipt = ExecReceiptPayload(
                                 status="blocked",
                                 client_order_id=client_order_id,
-                                details={"reasons": verdict.reasons},
+                                details={
+                                    "reasons": verdict.reasons,
+                                    "evaluation_outcome": risk_evaluation_outcome,
+                                    "candidate_trace": candidate_trace,
+                                },
                             )
                             ORDERS_TOTAL.labels(status="blocked").inc()
 
@@ -1161,6 +1278,20 @@ class WorkflowSupervisor:
                                 payload={
                                     "market_ticker": room.market_ticker,
                                     "status": "stand_down",
+                                    "evaluation_outcome": (
+                                        signal.evaluation_outcome
+                                        or (
+                                            signal.eligibility.evaluation_outcome
+                                            if signal.eligibility is not None
+                                            else None
+                                        )
+                                        or "pre_risk_filtered"
+                                    ),
+                                    "candidate_trace": (
+                                        signal.eligibility.candidate_trace
+                                        if signal.eligibility is not None and signal.eligibility.candidate_trace
+                                        else signal.candidate_trace
+                                    ),
                                     "eligibility": (
                                         signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None
                                     ),
