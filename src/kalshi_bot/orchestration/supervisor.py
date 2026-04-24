@@ -383,11 +383,25 @@ class WorkflowSupervisor:
                     client_order_id,
                     strategy_code=StrategyCode.DIRECTIONAL.value,
                 )
-                open_position = await repo.get_position(
+                ticker_positions = await repo.list_positions_for_ticker(
                     room.market_ticker,
                     self.settings.kalshi_subaccount,
                     kalshi_env=room.kalshi_env,
                 )
+                if len(ticker_positions) > 1:
+                    await repo.log_ops_event(
+                        severity="warning",
+                        summary=f"data_inconsistency: multiple_positions_for_ticker {room.market_ticker}",
+                        source="supervisor",
+                        room_id=room.id,
+                        kalshi_env=room.kalshi_env,
+                        payload={
+                            "market_ticker": room.market_ticker,
+                            "position_count": len(ticker_positions),
+                            "sides": [p.side for p in ticker_positions],
+                        },
+                    )
+                open_position = max(ticker_positions, key=lambda p: p.count_fp) if ticker_positions else None
                 current_position_notional = (
                     estimate_notional_dollars(
                         ContractSide(open_position.side),
@@ -926,11 +940,12 @@ class WorkflowSupervisor:
                     },
                 )
                 await session.commit()
-                held_position = await repo.get_position(
+                _governance_positions = await repo.list_positions_for_ticker(
                     room.market_ticker,
                     self.settings.kalshi_subaccount,
                     kalshi_env=room.kalshi_env,
                 )
+                held_position = max(_governance_positions, key=lambda p: p.count_fp) if _governance_positions else None
                 if (
                     held_position is not None
                     and signal.recommended_side is not None
@@ -1116,11 +1131,25 @@ class WorkflowSupervisor:
                             message_id=trader_record.id,
                             strategy_code=StrategyCode.DIRECTIONAL.value,
                         )
-                        open_position = await repo.get_position(
+                        _ticker_positions = await repo.list_positions_for_ticker(
                             room.market_ticker,
                             self.settings.kalshi_subaccount,
                             kalshi_env=room.kalshi_env,
                         )
+                        if len(_ticker_positions) > 1:
+                            await repo.log_ops_event(
+                                severity="warning",
+                                summary=f"data_inconsistency: multiple_positions_for_ticker {room.market_ticker}",
+                                source="supervisor",
+                                room_id=room.id,
+                                kalshi_env=room.kalshi_env,
+                                payload={
+                                    "market_ticker": room.market_ticker,
+                                    "position_count": len(_ticker_positions),
+                                    "sides": [p.side for p in _ticker_positions],
+                                },
+                            )
+                        open_position = max(_ticker_positions, key=lambda p: p.count_fp) if _ticker_positions else None
                         current_position_notional = (
                             estimate_notional_dollars(
                                 ContractSide(open_position.side),

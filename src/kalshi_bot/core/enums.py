@@ -85,6 +85,10 @@ class StandDownReason(StrEnum):
     STRATEGY_C_FORECAST_RESIDUAL_EXCEEDED = "strategy_c_forecast_residual_exceeded"
     STRATEGY_C_BOOK_STALE = "strategy_c_book_stale"
     STRATEGY_C_CLI_VARIANCE = "strategy_c_cli_variance"
+    # Signal-level stand-downs (before risk engine)
+    FORECAST_UNAVAILABLE = "forecast_unavailable"
+    INSUFFICIENT_FORECAST_SEPARATION = "insufficient_forecast_separation"
+    CONFIDENCE_TOO_LOW = "confidence_too_low"
 
 
 class RiskStatus(StrEnum):

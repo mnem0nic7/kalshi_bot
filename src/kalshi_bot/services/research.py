@@ -452,7 +452,18 @@ class ResearchCoordinator:
     ) -> StrategySignal:
         dossier = self._hydrate_runtime_fields(dossier)
         market = _coerce_market(market_response)
-        fair_yes = dossier.trader_context.fair_yes_dollars or Decimal("0.5000")
+        fair_yes = dossier.trader_context.fair_yes_dollars
+        if fair_yes is None:
+            return StrategySignal(
+                fair_yes_dollars=Decimal("0.5000"),
+                confidence=0.0,
+                edge_bps=0,
+                recommended_action=None,
+                recommended_side=None,
+                target_yes_price_dollars=None,
+                summary="Stand down: dossier fair value is unavailable.",
+                stand_down_reason=StandDownReason.FORECAST_UNAVAILABLE,
+            )
         ask_yes = quantize_price(market.get("yes_ask_dollars")) if market.get("yes_ask_dollars") is not None else None
         bid_yes = quantize_price(market.get("yes_bid_dollars")) if market.get("yes_bid_dollars") is not None else None
         ask_no = quantize_price(market.get("no_ask_dollars")) if market.get("no_ask_dollars") is not None else None

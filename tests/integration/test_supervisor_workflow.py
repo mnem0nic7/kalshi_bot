@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -529,5 +530,180 @@ async def test_supervisor_executes_bucket_resized_trade_size(tmp_path) -> None:
     assert risk_verdict.payload["capital_bucket"] == "safe"
     assert orders[0].count_fp == Decimal("5.00")
     assert signal.payload["capital_bucket"] == "safe"
+
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Opposite-side guard integration tests
+# ---------------------------------------------------------------------------
+
+async def _make_supervisor_for_opposite_side_test(tmp_path):
+    """Return (settings, engine, session_factory, supervisor) wired with FakeWeather/FakeKalshi."""
+    database_url = f"sqlite+aiosqlite:///{tmp_path}/opp_side.db"
+    settings = Settings(
+        database_url=database_url,
+        app_color="blue",
+        app_shadow_mode=False,
+        llm_trading_enabled=True,
+        risk_min_edge_bps=10,
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=500,
+        risk_max_order_count_fp=50,
+        risk_allow_position_add_ons=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    directory = WeatherMarketDirectory(
+        {
+            "WX-TEST": WeatherMarketMapping(
+                market_ticker="WX-TEST",
+                market_type="weather",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+                settlement_source="NWS station observation",
+            )
+        }
+    )
+    providers = FakeProviders()
+    agent_pack_service = AgentPackService(settings)
+    agents = AgentSuite(settings, providers)  # type: ignore[arg-type]
+    signal_engine = WeatherSignalEngine(settings)
+    risk_engine = DeterministicRiskEngine(settings)
+    execution_service = ExecutionService(settings, FakeKalshi())  # type: ignore[arg-type]
+    memory_service = MemoryService()  # type: ignore[arg-type]
+    research_coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        FakeKalshi(),  # type: ignore[arg-type]
+        FakeWeather(),  # type: ignore[arg-type]
+        directory,
+        providers,  # type: ignore[arg-type]
+        signal_engine,
+        agent_pack_service,
+    )
+    training_corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        DiscoveryService(FakeKalshi(), directory),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
+    supervisor = WorkflowSupervisor(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=FakeKalshi(),  # type: ignore[arg-type]
+        weather=FakeWeather(),  # type: ignore[arg-type]
+        weather_directory=directory,
+        agent_pack_service=agent_pack_service,
+        signal_engine=signal_engine,
+        risk_engine=risk_engine,
+        execution_service=execution_service,
+        memory_service=memory_service,
+        research_coordinator=research_coordinator,
+        training_corpus_service=training_corpus_service,
+        agents=agents,
+    )
+    return settings, engine, session_factory, supervisor
+
+
+@pytest.mark.asyncio
+async def test_supervisor_blocks_opposite_side_entry_end_to_end(tmp_path) -> None:
+    """Seeding a NO position and running the supervisor with a BUY-YES signal produces
+    a BLOCKED risk verdict due to the opposite-side guard."""
+    settings, engine, session_factory, supervisor = await _make_supervisor_for_opposite_side_test(tmp_path)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(settings.app_color)
+        await _seed_reconcile_balance(repo, kalshi_env=settings.kalshi_env)
+        await repo.upsert_position(
+            market_ticker="WX-TEST",
+            subaccount=settings.kalshi_subaccount,
+            kalshi_env=settings.kalshi_env,
+            side="no",
+            count_fp=Decimal("5.00"),
+            average_price_dollars=Decimal("0.4200"),
+            raw={"seeded": True},
+        )
+        room = await repo.create_room(
+            RoomCreate(name="Opp Side Test", market_ticker="WX-TEST"),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        await session.commit()
+
+    await supervisor.run_room(room.id, reason="opp_side_test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        risk_verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        orders = await repo.list_orders_for_room(room.id)
+        await session.commit()
+
+    assert risk_verdict is not None
+    assert risk_verdict.status == "blocked"
+    assert any("opposite-side" in r for r in risk_verdict.reasons)
+    assert len(orders) == 0, "No orders should be placed when the opposite-side guard fires"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_guard_fires_when_both_sides_already_held(tmp_path) -> None:
+    """When list_positions_for_ticker returns two rows (multi-row anomaly), the supervisor
+    selects the canonical row by max count_fp, logs a data_inconsistency ops_event,
+    and the opposite-side guard blocks the new entry."""
+    settings, engine, session_factory, supervisor = await _make_supervisor_for_opposite_side_test(tmp_path)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(settings.app_color)
+        await _seed_reconcile_balance(repo, kalshi_env=settings.kalshi_env)
+        room = await repo.create_room(
+            RoomCreate(name="Multi-Row Test", market_ticker="WX-TEST"),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        await session.commit()
+
+    # Simulate the impossible multi-row DB state: NO(8) canonical, YES(3) stale
+    no_pos = MagicMock()
+    no_pos.count_fp = Decimal("8.00")
+    no_pos.side = "no"
+    yes_pos = MagicMock()
+    yes_pos.count_fp = Decimal("3.00")
+    yes_pos.side = "yes"
+
+    with patch(
+        "kalshi_bot.db.repositories.PlatformRepository.list_positions_for_ticker",
+        new_callable=AsyncMock,
+        return_value=[no_pos, yes_pos],
+    ):
+        await supervisor.run_room(room.id, reason="multi_row_test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        risk_verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        ops_events = await repo.list_ops_events(sources=["supervisor"])
+        orders = await repo.list_orders_for_room(room.id)
+        await session.commit()
+
+    assert risk_verdict is not None
+    assert risk_verdict.status == "blocked"
+    assert any("opposite-side" in r for r in risk_verdict.reasons)
+    assert any("data_inconsistency" in e.summary for e in ops_events), (
+        "Expected a data_inconsistency ops_event for the multi-row position anomaly"
+    )
+    assert len(orders) == 0
 
     await engine.dispose()

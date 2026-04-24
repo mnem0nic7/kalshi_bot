@@ -815,6 +815,9 @@ def evaluate_trade_eligibility(
             reasons.append(
                 "Historical heuristic policy forced an early stand-down for this regime before order generation."
             )
+    elif signal.weather is not None and signal.weather.stand_down_reason is not None:
+        stand_down_reason = signal.weather.stand_down_reason
+        reasons.append(f"Weather signal stand-down: {signal.weather.stand_down_reason.value}.")
     elif signal.trade_regime in {"longshot_yes", "longshot_no"}:
         reasons.append(f"Longshot bet blocked: trade regime is {signal.trade_regime}.")
         stand_down_reason = StandDownReason.LONGSHOT_BET
@@ -843,6 +846,21 @@ def evaluate_trade_eligibility(
                 f"required {thresholds.risk_min_edge_bps}bps."
             )
             stand_down_reason = StandDownReason.NO_ACTIONABLE_EDGE
+        elif (
+            signal.forecast_delta_f is not None
+            and abs(signal.forecast_delta_f) < settings.strategy_min_abs_delta_f
+        ):
+            reasons.append(
+                f"Forecast separation {signal.forecast_delta_f:.1f}°F is below minimum "
+                f"{settings.strategy_min_abs_delta_f:.1f}°F."
+            )
+            stand_down_reason = StandDownReason.INSUFFICIENT_FORECAST_SEPARATION
+        elif signal.confidence < settings.risk_min_confidence:
+            reasons.append(
+                f"Signal confidence {signal.confidence:.2f} is below minimum "
+                f"{settings.risk_min_confidence:.2f}."
+            )
+            stand_down_reason = StandDownReason.CONFIDENCE_TOO_LOW
 
     if stand_down_reason is not None and strategy_mode == StrategyMode.DIRECTIONAL_UNRESOLVED:
         strategy_mode = StrategyMode.LATE_DAY_AVOID

@@ -170,6 +170,15 @@ class DeterministicRiskEngine:
                 f"Existing live position in {room.market_ticker} blocks same-ticker add-ons; "
                 "no pyramiding is enabled."
             )
+        if (
+            context.current_position_count_fp > 0
+            and context.current_position_side is not None
+            and context.current_position_side != ticket.side.value
+        ):
+            block(
+                f"Existing {context.current_position_side} position in {room.market_ticker} "
+                f"blocks opposite-side {ticket.side.value} entry."
+            )
         if float(effective_position_count_fp) >= self.settings.risk_max_position_count_fp_per_ticker:
             block(
                 f"Position + in-flight orders in {room.market_ticker} at {effective_position_count_fp} contracts "

@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     demo_kalshi_read_private_key_path: str | None = None
     demo_kalshi_write_private_key_path: str | None = None
     kalshi_subaccount: int = 0
+    kalshi_taker_fee_rate: float = 0.07
 
     weather_user_agent: str = "kalshi-bot/0.1 (ops@example.com)"
     weather_market_map_path: str = "docs/examples/weather_markets.example.yaml"
@@ -170,13 +171,21 @@ class Settings(BaseSettings):
     risk_stale_weather_seconds: int = 900
     risk_min_edge_bps: int = 500
     risk_max_credible_edge_bps: int = 5000
-    risk_min_confidence: float = 0.60
+    # PENDING_CALIBRATION: raised from 0.60 to 0.80 based on N=3 winning trades
+    # (AUS-T86/CHI-T78/SFO-T70) all having confidence ≥ 0.80 at entry. Unblocking
+    # experiment: collect ≥ 30 settled trades across confidence deciles and verify
+    # the win-rate cliff is at 0.80 and not lower.
+    risk_min_confidence: float = 0.80
     risk_min_contract_price_dollars: float = 0.25
     # Probability distance from 50%: inside this band, require extra edge that ramps
     # linearly to risk_probability_midband_max_extra_edge_bps at fair_yes=0.50.
     # Set risk_min_probability_extremity_pct to 0.0 to disable.
     risk_min_probability_extremity_pct: float = 25.0
     risk_probability_midband_max_extra_edge_bps: int = 500
+    # PENDING_CALIBRATION: 8.0°F boundary derived from N=3 winners (delta_f=10–13°F).
+    # Unblocking experiment: collect ≥ 30 settled trades with |delta_f| 4–12°F and
+    # verify loss rate drops materially above 8°F versus below.
+    strategy_min_abs_delta_f: float = 8.0
     strategy_min_remaining_payout_bps: int = 300
     strategy_quality_edge_buffer_bps: int = 25
     sigma_lead_correction_enabled: bool = True

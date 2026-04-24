@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
-from kalshi_bot.core.enums import WeatherResolutionState
+from kalshi_bot.core.enums import StandDownReason, WeatherResolutionState
 from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.weather.models import WeatherMarketMapping
 
@@ -106,6 +106,7 @@ class WeatherSignalSnapshot:
     observation_time: datetime | None
     forecast_updated_time: datetime | None
     summary: str
+    stand_down_reason: StandDownReason | None = None
 
 
 def gaussian_probability(delta_f: float, sigma_f: float = 3.5) -> float:
@@ -316,6 +317,7 @@ def score_weather_market(
         elif mapping.operator in ("<", "<=") and current_temp_f > mapping.threshold_f:
             resolution_state = WeatherResolutionState.LOCKED_NO
 
+    snapshot_stand_down_reason: StandDownReason | None = None
     if resolution_state == WeatherResolutionState.LOCKED_YES:
         fair = Decimal("1.0000")
         confidence = 1.0
@@ -332,8 +334,9 @@ def score_weather_market(
         )
     elif forecast_high_f is None:
         fair = Decimal("0.5000")
-        confidence = 0.2
-        summary = "Forecast high was unavailable, so the model defaulted to neutral pricing."
+        confidence = 0.0
+        summary = "Forecast high was unavailable; standing down."
+        snapshot_stand_down_reason = StandDownReason.FORECAST_UNAVAILABLE
     else:
         delta_f = forecast_high_f - mapping.threshold_f
         if mapping.operator in ("<", "<="):
@@ -418,4 +421,5 @@ def score_weather_market(
         observation_time=obs_ts,
         forecast_updated_time=parse_iso_datetime(forecast_payload.get("properties", {}).get("updated")),
         summary=summary,
+        stand_down_reason=snapshot_stand_down_reason,
     )

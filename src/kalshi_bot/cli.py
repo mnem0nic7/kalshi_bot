@@ -457,6 +457,57 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps([build.model_dump(mode="json") for build in builds], indent=2))
             return 0
 
+        if args.command == "decision-corpus":
+            subcommand = args.decision_corpus_command
+            if subcommand == "build":
+                result = await container.decision_corpus_service.build(
+                    date_from=date.fromisoformat(args.date_from),
+                    date_to=date.fromisoformat(args.date_to),
+                    source=args.source,
+                    dry_run=args.dry_run,
+                    notes=args.notes,
+                    parent_build_id=args.parent_build_id,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            if subcommand == "list-builds":
+                builds = await container.decision_corpus_service.list_builds(
+                    status=args.status,
+                    date_from=date.fromisoformat(args.date_from) if args.date_from else None,
+                    date_to=date.fromisoformat(args.date_to) if args.date_to else None,
+                    limit=args.limit,
+                )
+                if args.json:
+                    print(json.dumps(builds, indent=2))
+                else:
+                    for build in builds:
+                        print(
+                            f"{build['id']} status={build['status']} rows={build['row_count']} "
+                            f"range={build['date_from']}..{build['date_to']} version={build['version']} "
+                            f"created={build['created_at']} finished={build['finished_at']} git={build['git_sha']}"
+                        )
+                return 0
+            if subcommand == "inspect-build":
+                result = await container.decision_corpus_service.inspect_build(args.build_id)
+                print(json.dumps(result, indent=2))
+                return 0
+            if subcommand == "validate":
+                result = await container.decision_corpus_service.validate_build(args.build_id)
+                print(json.dumps(result, indent=2))
+                return 0 if result.get("ok") else 1
+            if subcommand == "promote":
+                result = await container.decision_corpus_service.promote(
+                    args.build_id,
+                    kalshi_env=args.env,
+                    actor=args.actor,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            if subcommand == "current":
+                result = await container.decision_corpus_service.current(kalshi_env=args.env)
+                print(json.dumps(result, indent=2))
+                return 0 if result.get("status") == "ok" else 1
+
         if args.command == "self-improve":
             action = args.self_improve_command
             if action == "status":
@@ -1051,6 +1102,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     training_build_list = subparsers.add_parser("training-build-list")
     training_build_list.add_argument("--limit", type=int, default=20)
+
+    decision_corpus = subparsers.add_parser("decision-corpus")
+    decision_corpus_subparsers = decision_corpus.add_subparsers(dest="decision_corpus_command", required=True)
+    decision_corpus_build = decision_corpus_subparsers.add_parser("build")
+    decision_corpus_build.add_argument("--date-from", required=True)
+    decision_corpus_build.add_argument("--date-to", required=True)
+    decision_corpus_build.add_argument("--source", default="historical-replay", choices=["historical-replay"])
+    decision_corpus_build.add_argument("--dry-run", action="store_true")
+    decision_corpus_build.add_argument("--notes", default=None)
+    decision_corpus_build.add_argument("--parent-build-id", default=None)
+    decision_corpus_list = decision_corpus_subparsers.add_parser("list-builds")
+    decision_corpus_list.add_argument("--status", default=None)
+    decision_corpus_list.add_argument("--date-from", default=None)
+    decision_corpus_list.add_argument("--date-to", default=None)
+    decision_corpus_list.add_argument("--limit", type=int, default=20)
+    decision_corpus_list.add_argument("--json", action="store_true")
+    decision_corpus_inspect = decision_corpus_subparsers.add_parser("inspect-build")
+    decision_corpus_inspect.add_argument("build_id")
+    decision_corpus_validate = decision_corpus_subparsers.add_parser("validate")
+    decision_corpus_validate.add_argument("build_id")
+    decision_corpus_promote = decision_corpus_subparsers.add_parser("promote")
+    decision_corpus_promote.add_argument("build_id")
+    decision_corpus_promote.add_argument("--env", default="demo")
+    decision_corpus_promote.add_argument("--actor", default=None)
+    decision_corpus_current = decision_corpus_subparsers.add_parser("current")
+    decision_corpus_current.add_argument("--env", default="demo")
 
     historical_status = subparsers.add_parser("historical-status")
     historical_status.add_argument("--verbose", action="store_true")

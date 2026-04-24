@@ -785,3 +785,174 @@ def test_per_strategy_cap_no_op_when_strategy_code_is_none() -> None:
     )
     verdict = _base_eval(engine, context)
     assert verdict.status == RiskStatus.APPROVED
+
+
+# ---------------------------------------------------------------------------
+# Opposite-side guard tests
+# ---------------------------------------------------------------------------
+
+def _opp_side_settings(**overrides) -> Settings:
+    return Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=True,
+        **overrides,
+    )
+
+
+def test_blocks_no_entry_when_yes_position_open() -> None:
+    """Buying NO while a YES position is open must be BLOCKED by the opposite-side guard."""
+    settings = _opp_side_settings()
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        current_position_count_fp=Decimal("5.00"),
+        current_position_side="yes",
+    )
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.NO,
+            yes_price_dollars=Decimal("0.4200"),
+            count_fp=Decimal("5.00"),
+        ),
+        signal=make_signal(),
+        context=context,
+    )
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("opposite-side" in r for r in verdict.reasons)
+
+
+def test_blocks_yes_entry_when_no_position_open() -> None:
+    """Buying YES while a NO position is open must be BLOCKED."""
+    settings = _opp_side_settings()
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        current_position_count_fp=Decimal("8.00"),
+        current_position_side="no",
+    )
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("5.00"),
+        ),
+        signal=make_signal(),
+        context=context,
+    )
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("opposite-side" in r for r in verdict.reasons)
+
+
+def test_same_side_pyramid_still_allowed() -> None:
+    """Adding to an existing YES position (pyramid) must be APPROVED when add-ons are enabled."""
+    settings = _opp_side_settings()
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        current_position_count_fp=Decimal("5.00"),
+        current_position_side="yes",
+    )
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("5.00"),
+        ),
+        signal=make_signal(),
+        context=context,
+    )
+    assert verdict.status == RiskStatus.APPROVED
+
+
+def test_no_position_no_guard_fires() -> None:
+    """With no open position the opposite-side guard must not fire."""
+    settings = _opp_side_settings()
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        current_position_count_fp=Decimal("0"),
+        current_position_side=None,
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.APPROVED
+    assert not any("opposite-side" in r for r in verdict.reasons)
+
+
+def test_guard_and_addons_disabled_produce_distinct_reasons() -> None:
+    """When add-ons are disabled AND opposite side is held, both reasons appear separately."""
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=False,
+    )
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        current_position_count_fp=Decimal("5.00"),
+        current_position_side="no",
+    )
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("5.00"),
+        ),
+        signal=make_signal(),
+        context=context,
+    )
+    assert verdict.status == RiskStatus.BLOCKED
+    reason_text = " ".join(verdict.reasons)
+    assert "add-on" in reason_text or "add_on" in reason_text or "existing" in reason_text.lower()
+    assert "opposite-side" in reason_text
+
+
+def test_guard_reads_position_side_for_queried_row() -> None:
+    """The guard uses current_position_side from RiskContext, not the ticket side."""
+    settings = _opp_side_settings()
+    engine = DeterministicRiskEngine(settings)
+    # side in context is "yes", ticket is buying NO — guard must fire
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        current_position_count_fp=Decimal("3.00"),
+        current_position_side="yes",
+    )
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.NO,
+            yes_price_dollars=Decimal("0.4200"),
+            count_fp=Decimal("3.00"),
+        ),
+        signal=make_signal(),
+        context=context,
+    )
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("opposite-side" in r for r in verdict.reasons)
