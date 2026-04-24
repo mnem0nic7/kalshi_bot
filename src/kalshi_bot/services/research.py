@@ -451,6 +451,18 @@ class ResearchCoordinator:
         min_edge_bps: int | None = None,
     ) -> StrategySignal:
         dossier = self._hydrate_runtime_fields(dossier)
+        age_seconds = (datetime.now(UTC) - dossier.created_at).total_seconds()
+        if age_seconds > self.settings.research_stale_seconds:
+            return StrategySignal(
+                fair_yes_dollars=Decimal("0.5000"),
+                confidence=0.0,
+                edge_bps=0,
+                recommended_action=None,
+                recommended_side=None,
+                target_yes_price_dollars=None,
+                summary=f"Stand down: dossier is {age_seconds:.0f}s old (max {self.settings.research_stale_seconds}s).",
+                stand_down_reason=StandDownReason.DOSSIER_STALE,
+            )
         market = _coerce_market(market_response)
         fair_yes = dossier.trader_context.fair_yes_dollars
         if fair_yes is None:

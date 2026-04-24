@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import StandDownReason
 from kalshi_bot.core.schemas import (
     ResearchDossier,
     ResearchFreshness,
@@ -158,3 +159,72 @@ def test_runtime_hydration_stale_within_grace_passes_with_tolerance() -> None:
     assert hydrated.gate.passed is True
     assert hydrated.gate.stale_tolerance_active is True
     assert any("stale tolerance" in reason.lower() for reason in hydrated.gate.reasons)
+
+
+# ---------------------------------------------------------------------------
+# Dossier freshness gate in build_signal_from_dossier
+# ---------------------------------------------------------------------------
+
+_MARKET_SNAPSHOT = {
+    "yes_ask_dollars": "0.55",
+    "yes_bid_dollars": "0.50",
+    "no_ask_dollars": "0.45",
+    "volume": 1000,
+}
+
+
+def _make_dossier_aged(now: datetime, age_seconds: float) -> ResearchDossier:
+    created = now - timedelta(seconds=age_seconds)
+    return ResearchDossier(
+        market_ticker="API-FRESH-TEST",
+        status="ready",
+        mode="structured",
+        summary=ResearchSummary(
+            narrative="Test",
+            bullish_case="Bull",
+            bearish_case="Bear",
+            unresolved_uncertainties=[],
+            settlement_mechanics="Official",
+            current_numeric_facts={},
+            source_coverage="1 source",
+            research_confidence=0.9,
+        ),
+        freshness=ResearchFreshness(
+            refreshed_at=created,
+            expires_at=created + timedelta(seconds=900),
+            stale=False,
+            max_source_age_seconds=0,
+        ),
+        trader_context=ResearchTraderContext(
+            fair_yes_dollars="0.6500",
+            confidence=0.9,
+            thesis="Thesis",
+            structured_source_used=True,
+            autonomous_ready=True,
+        ),
+        gate=ResearchGateVerdict(passed=True, reasons=["OK"], cited_source_keys=[]),
+        created_at=created,
+    )
+
+
+def test_build_signal_from_dossier_fresh_dossier_passes() -> None:
+    coordinator = make_coordinator()
+    now = datetime.now(UTC)
+    dossier = _make_dossier_aged(now, age_seconds=60)  # 1 minute old — well within 900s
+
+    signal = coordinator.build_signal_from_dossier(dossier, _MARKET_SNAPSHOT)
+
+    assert signal.stand_down_reason != StandDownReason.DOSSIER_STALE
+    assert signal.edge_bps > 0
+
+
+def test_build_signal_from_dossier_stale_dossier_blocked() -> None:
+    coordinator = make_coordinator()
+    now = datetime.now(UTC)
+    dossier = _make_dossier_aged(now, age_seconds=901)  # just over the 900s limit
+
+    signal = coordinator.build_signal_from_dossier(dossier, _MARKET_SNAPSHOT)
+
+    assert signal.stand_down_reason == StandDownReason.DOSSIER_STALE
+    assert signal.recommended_action is None
+    assert signal.edge_bps == 0

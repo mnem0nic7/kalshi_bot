@@ -89,6 +89,7 @@ class StandDownReason(StrEnum):
     FORECAST_UNAVAILABLE = "forecast_unavailable"
     INSUFFICIENT_FORECAST_SEPARATION = "insufficient_forecast_separation"
     CONFIDENCE_TOO_LOW = "confidence_too_low"
+    DOSSIER_STALE = "dossier_stale"
 
 
 class RiskStatus(StrEnum):
