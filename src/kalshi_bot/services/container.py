@@ -42,6 +42,7 @@ from kalshi_bot.services.strategy_eval import StrategyEvaluationService
 from kalshi_bot.services.strategy_codex import StrategyCodexService
 from kalshi_bot.services.strategy_dashboard import StrategyDashboardService
 from kalshi_bot.services.strategy_regression import StrategyRegressionService
+from kalshi_bot.services.strategy_regression_ranking import StrategyRegressionRankingReportService
 from kalshi_bot.services.trade_analysis import TradeAnalysisService
 from kalshi_bot.services.trading_audit import TradingAuditService
 from kalshi_bot.services.training import TrainingExportService
@@ -97,6 +98,7 @@ class AppContainer:
     monotonicity_arb_service: MonotonicityArbScannerService
     strategy_codex_service: StrategyCodexService
     strategy_dashboard_service: StrategyDashboardService
+    strategy_regression_ranking_service: StrategyRegressionRankingReportService
     strategy_auto_evolve_service: StrategyAutoEvolveService
     trade_analysis_service: TradeAnalysisService
     trading_audit_service: TradingAuditService
@@ -290,6 +292,10 @@ class AppContainer:
             weather_directory=weather_directory,
             strategy_codex_service=strategy_codex_service,
         )
+        strategy_regression_ranking_service = StrategyRegressionRankingReportService(
+            settings,
+            session_factory,
+        )
         trading_audit_service = TradingAuditService(settings, session_factory)
         trade_analysis_service = TradeAnalysisService(
             settings,
@@ -380,6 +386,7 @@ class AppContainer:
             monotonicity_arb_service=monotonicity_arb_service,
             strategy_codex_service=strategy_codex_service,
             strategy_dashboard_service=strategy_dashboard_service,
+            strategy_regression_ranking_service=strategy_regression_ranking_service,
             strategy_auto_evolve_service=strategy_auto_evolve_service,
             trade_analysis_service=trade_analysis_service,
             trading_audit_service=trading_audit_service,
