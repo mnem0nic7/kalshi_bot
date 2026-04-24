@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import FillRecord, MarketPriceHistory, MarketState, PositionRecord
 from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.core.enums import StrategyCode
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED,
@@ -339,6 +340,16 @@ class StopLossService:
             kalshi_env=self.settings.kalshi_env,
             before=now,
         )
+        if strategy_code is None:
+            # Buy fill has no attribution (pre-fix data or missing chain).
+            # All live positions are Strategy A; default prevents null propagation.
+            strategy_code = StrategyCode.DIRECTIONAL
+            logger.debug(
+                "stop_loss: no attributed buy fill found for %s %s; defaulting strategy_code=%s",
+                market_ticker,
+                position.side,
+                strategy_code,
+            )
         receipt = await self.execution_service.close_position(
             market_ticker=market_ticker,
             side=position.side,
