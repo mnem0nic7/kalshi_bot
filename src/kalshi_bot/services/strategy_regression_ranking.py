@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Decision-corpus-backed strategy regression ranking report.
 
 This module is PR 2's read-only ranking consumer of the decision corpus. It does
@@ -28,6 +26,8 @@ JSON schema v1:
 Fields documented in schema v1 are stable. Future fields may be added; existing
 fields are not renamed or removed without bumping ``report_schema_version``.
 """
+
+from __future__ import annotations
 
 import json
 import math

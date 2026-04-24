@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import sys
 
-from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import RoomOrigin
 from kalshi_bot.core.schemas import (
     HeuristicPackPromoteRequest,

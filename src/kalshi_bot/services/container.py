@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from kalshi_bot.agents.providers import ProviderRouter
@@ -54,6 +53,9 @@ from kalshi_bot.services.strategy_cleanup_service import StrategyCleanupService
 from kalshi_bot.services.momentum_calibration import MomentumCalibrationService
 from kalshi_bot.services.monotonicity_scanner_service import MonotonicityArbScannerService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
