@@ -26,6 +26,7 @@ from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.services.daemon import DaemonService
 from kalshi_bot.services.decision_corpus import DecisionCorpusService
+from kalshi_bot.services.decision_corpus_calibration import DecisionCorpusCalibrationReportService
 from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
@@ -79,6 +80,7 @@ class AppContainer:
     auto_trigger_service: AutoTriggerService
     daemon_service: DaemonService
     decision_corpus_service: DecisionCorpusService
+    decision_corpus_calibration_service: DecisionCorpusCalibrationReportService
     discovery_service: DiscoveryService
     reconciliation_service: ReconciliationService
     stream_service: MarketStreamService
@@ -154,6 +156,7 @@ class AppContainer:
         memory_service = MemoryService()
         watchdog_service = WatchdogService(settings)
         decision_corpus_service = DecisionCorpusService(settings, session_factory)
+        decision_corpus_calibration_service = DecisionCorpusCalibrationReportService(settings, session_factory)
         discovery_service = DiscoveryService(kalshi, weather_directory)
         market_history_service = MarketHistoryService(
             session_factory,
@@ -360,6 +363,7 @@ class AppContainer:
             auto_trigger_service=auto_trigger_service,
             daemon_service=daemon_service,
             decision_corpus_service=decision_corpus_service,
+            decision_corpus_calibration_service=decision_corpus_calibration_service,
             discovery_service=discovery_service,
             reconciliation_service=reconciliation_service,
             stream_service=stream_service,
