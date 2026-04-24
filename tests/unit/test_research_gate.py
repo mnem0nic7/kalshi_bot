@@ -228,3 +228,20 @@ def test_build_signal_from_dossier_stale_dossier_blocked() -> None:
     assert signal.stand_down_reason == StandDownReason.DOSSIER_STALE
     assert signal.recommended_action is None
     assert signal.edge_bps == 0
+
+
+def test_build_signal_from_dossier_sentinel_fair_yes_blocked() -> None:
+    """LLM returning fair_yes=0.5000 (the 'I don't know' sentinel) must be blocked."""
+    coordinator = make_coordinator()
+    now = datetime.now(UTC)
+    dossier = _make_dossier_aged(now, age_seconds=60)
+    # Overwrite fair_yes_dollars with the sentinel value
+    from decimal import Decimal
+
+    dossier.trader_context.fair_yes_dollars = Decimal("0.5000")
+
+    signal = coordinator.build_signal_from_dossier(dossier, _MARKET_SNAPSHOT)
+
+    assert signal.stand_down_reason == StandDownReason.FORECAST_UNAVAILABLE
+    assert signal.recommended_action is None
+    assert signal.edge_bps == 0
