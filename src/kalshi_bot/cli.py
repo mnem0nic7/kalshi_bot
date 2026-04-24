@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import sys
 
-from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import RoomOrigin
 from kalshi_bot.core.schemas import (
     HeuristicPackPromoteRequest,
@@ -513,6 +512,21 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     kalshi_env=args.env,
                     output=Path(args.output),
                 )
+                return int(result.get("exit_code", 0))
+
+        if args.command == "strategy-regression":
+            subcommand = args.strategy_regression_command
+            if subcommand == "rank":
+                try:
+                    result = await container.strategy_regression_ranking_service.rank_report(
+                        build_id=args.build_id,
+                        kalshi_env=args.env,
+                        output=Path(args.output),
+                    )
+                except (ValueError, KeyError) as exc:
+                    message = exc.args[0] if exc.args else str(exc)
+                    print(json.dumps({"error": message}, indent=2), file=sys.stderr)
+                    return 2
                 return int(result.get("exit_code", 0))
 
         if args.command == "self-improve":
@@ -1140,6 +1154,17 @@ def build_parser() -> argparse.ArgumentParser:
     calibration_selector.add_argument("--env", default=None)
     calibration_selector.add_argument("--build-id", default=None)
     decision_corpus_calibration.add_argument("--output", required=True)
+
+    strategy_regression = subparsers.add_parser("strategy-regression")
+    strategy_regression_subparsers = strategy_regression.add_subparsers(
+        dest="strategy_regression_command",
+        required=True,
+    )
+    strategy_regression_rank = strategy_regression_subparsers.add_parser("rank")
+    strategy_regression_selector = strategy_regression_rank.add_mutually_exclusive_group(required=True)
+    strategy_regression_selector.add_argument("--env", default=None)
+    strategy_regression_selector.add_argument("--build-id", default=None)
+    strategy_regression_rank.add_argument("--output", required=True)
 
     historical_status = subparsers.add_parser("historical-status")
     historical_status.add_argument("--verbose", action="store_true")

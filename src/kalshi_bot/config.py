@@ -299,6 +299,10 @@ class Settings(BaseSettings):
     historical_pipeline_daily_run_seconds: int = 86400
     historical_pipeline_incremental_days: int = 7
     strategy_regression_daily_run_seconds: int = 86400
+    strategy_regression_promote_floor_clusters: int = 30
+    strategy_regression_min_clusters_for_ranking: int = 3
+    strategy_regression_min_sortino_for_promotion: float = 0.5
+    strategy_regression_sortino_downside_epsilon_dollars: float = 1.0
     strategy_codex_nightly_enabled: bool = True
     strategy_codex_nightly_timezone: str = "America/Los_Angeles"
     strategy_codex_nightly_hour_local: int = 1
