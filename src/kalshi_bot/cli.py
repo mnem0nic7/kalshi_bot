@@ -507,6 +507,13 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 result = await container.decision_corpus_service.current(kalshi_env=args.env)
                 print(json.dumps(result, indent=2))
                 return 0 if result.get("status") == "ok" else 1
+            if subcommand == "calibration-report":
+                result = await container.decision_corpus_calibration_service.calibration_report(
+                    build_id=args.build_id,
+                    kalshi_env=args.env,
+                    output=Path(args.output),
+                )
+                return int(result.get("exit_code", 0))
 
         if args.command == "self-improve":
             action = args.self_improve_command
@@ -1128,6 +1135,11 @@ def build_parser() -> argparse.ArgumentParser:
     decision_corpus_promote.add_argument("--actor", default=None)
     decision_corpus_current = decision_corpus_subparsers.add_parser("current")
     decision_corpus_current.add_argument("--env", default="demo")
+    decision_corpus_calibration = decision_corpus_subparsers.add_parser("calibration-report")
+    calibration_selector = decision_corpus_calibration.add_mutually_exclusive_group(required=True)
+    calibration_selector.add_argument("--env", default=None)
+    calibration_selector.add_argument("--build-id", default=None)
+    decision_corpus_calibration.add_argument("--output", required=True)
 
     historical_status = subparsers.add_parser("historical-status")
     historical_status.add_argument("--verbose", action="store_true")
