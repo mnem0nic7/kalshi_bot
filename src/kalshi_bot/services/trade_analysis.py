@@ -40,6 +40,14 @@ TRAINING_EXCLUDED_REASONS = {
     "missing_side",
     "missing_ticket_price",
 }
+MODEL_REQUIRED_FEATURES = {
+    "edge_bps",
+    "confidence",
+    "ticket_yes_price_dollars",
+    "spread_dollars",
+    "market_stale_seconds",
+    "weather_stale_seconds",
+}
 
 
 def _utc_now() -> datetime:
@@ -870,7 +878,7 @@ class TradeAnalysisService:
             return False
         if row.get("label_win") in (None, ""):
             return False
-        return all(self._feature(row, key) is not None for key in self._feature_names())
+        return all(self._feature(row, key) is not None for key in MODEL_REQUIRED_FEATURES)
 
     def _feature_names(self) -> list[str]:
         return [

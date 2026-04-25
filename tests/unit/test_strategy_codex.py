@@ -188,6 +188,48 @@ def test_strategy_codex_json_safe_normalizes_decimal_payloads() -> None:
     assert decoded["backtest"]["strongest_cities"][0]["total_pnl_dollars"] == 0.75
 
 
+def test_strategy_codex_threshold_baseline_prefers_selected_strategy() -> None:
+    active_rows = [
+        SimpleNamespace(
+            id=1,
+            name="moderate",
+            thresholds={"risk_min_edge_bps": 40},
+            created_at=datetime(2026, 4, 20, tzinfo=UTC),
+        ),
+        SimpleNamespace(
+            id=2,
+            name="aggressive",
+            thresholds={"risk_min_edge_bps": 20},
+            created_at=datetime(2026, 4, 21, tzinfo=UTC),
+        ),
+    ]
+
+    baseline = StrategyCodexService._threshold_baseline(active_rows, strategy_name="moderate")
+
+    assert baseline == {"risk_min_edge_bps": 40}
+
+
+def test_strategy_codex_threshold_baseline_falls_back_to_latest_strategy_deterministically() -> None:
+    active_rows = [
+        SimpleNamespace(
+            id=10,
+            name="older-high-id",
+            thresholds={"risk_min_edge_bps": 10},
+            created_at=datetime(2026, 4, 20, tzinfo=UTC),
+        ),
+        SimpleNamespace(
+            id=2,
+            name="newer-low-id",
+            thresholds={"risk_min_edge_bps": 30},
+            created_at=datetime(2026, 4, 21, tzinfo=UTC),
+        ),
+    ]
+
+    baseline = StrategyCodexService._threshold_baseline(list(reversed(active_rows)), strategy_name=None)
+
+    assert baseline == {"risk_min_edge_bps": 30}
+
+
 def test_decision_corpus_backtest_summary_stamps_corpus_and_assignment_baseline() -> None:
     service = object.__new__(StrategyCodexService)
 

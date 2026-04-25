@@ -1571,6 +1571,8 @@ async def test_build_strategies_dashboard_uses_decision_corpus_ranking_service(m
     assert payload["summary"]["source_mode"] == "decision_corpus_ranking"
     assert payload["summary"]["recommendation_snapshot_available"] is True
     assert payload["summary"]["ranking_version"] == control_room_module.STRATEGY_RANKING_VERSION
+    assert payload["summary"]["rooms_scanned"] == 40
+    assert payload["summary"]["cities_evaluated"] == 1
     assert payload["city_matrix"][0]["recommendation"]["strategy_name"] == "low_win_high_sortino"
 
 

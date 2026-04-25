@@ -3556,7 +3556,11 @@ async def build_strategies_dashboard_core(
                     snapshot_meta["unavailable_reason"] = "missing_corpus_strategy_results"
             snapshot_meta["strategy_results_available"] = bool(latest_results)
             normalized_rows = _normalize_strategy_result_rows(latest_results, strategies_by_id)
-            if regression_checkpoint is not None and isinstance(regression_checkpoint.payload, dict):
+            if (
+                snapshot_meta["source_mode"] != "decision_corpus_ranking"
+                and regression_checkpoint is not None
+                and isinstance(regression_checkpoint.payload, dict)
+            ):
                 snapshot_meta["rooms_scanned"] = int(regression_checkpoint.payload.get("rooms_scanned") or 0)
                 snapshot_meta["series_evaluated"] = int(regression_checkpoint.payload.get("series_evaluated") or 0)
         else:

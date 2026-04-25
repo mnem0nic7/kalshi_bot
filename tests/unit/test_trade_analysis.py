@@ -313,7 +313,7 @@ async def test_trade_analysis_dataset_write_and_model_eval(tmp_path, analysis_ha
             "spread_dollars": "0.0400",
             "market_stale_seconds": 30,
             "weather_stale_seconds": 300,
-            "forecast_residual_f": idx - 10,
+            "forecast_residual_f": None,
             "label_win": label,
             "training_eligible": True,
             "gross_pnl_dollars": "1.0000" if label else "-1.0000",
@@ -325,6 +325,7 @@ async def test_trade_analysis_dataset_write_and_model_eval(tmp_path, analysis_ha
 
     assert result["read_only"] is True
     assert result["dataset"]["rows"] == 24
+    assert result["dataset"]["eligible_rows"] == 24
     assert result["metrics"]["status"] == "ok"
     assert result["metrics"]["train_window"]["end"] < result["metrics"]["test_window"]["start"]
 

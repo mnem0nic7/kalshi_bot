@@ -557,8 +557,38 @@ class StrategyCodexService:
             "evaluation": payload,
         }
 
+    @staticmethod
+    def _threshold_baseline(active_rows: list[Any], *, strategy_name: str | None = None) -> dict[str, Any]:
+        if not active_rows:
+            return {}
+        if strategy_name:
+            selected = next((row for row in active_rows if getattr(row, "name", None) == strategy_name), None)
+            if selected is not None:
+                return dict(getattr(selected, "thresholds", None) or {})
+
+        def _created_at_value(row: Any) -> float:
+            created_at = getattr(row, "created_at", None)
+            if not isinstance(created_at, datetime):
+                return float("-inf")
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            return created_at.timestamp()
+
+        def _id_value(row: Any) -> int:
+            value = getattr(row, "id", 0) or 0
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
+        selected = max(
+            active_rows,
+            key=lambda row: (_created_at_value(row), _id_value(row), str(getattr(row, "name", "") or "")),
+        )
+        return dict(getattr(selected, "thresholds", None) or {})
+
     async def _suggest_strategy(self, *, run, snapshot: dict[str, Any], active_rows: list[Any], provider, model: str) -> dict[str, Any]:
-        threshold_baseline = dict(active_rows[-1].thresholds or {}) if active_rows else {}
+        threshold_baseline = self._threshold_baseline(active_rows, strategy_name=run.strategy_name)
         suggestion = await provider.complete_json(
             system_prompt=(
                 "You design one new threshold-based strategy preset for a Kalshi strategy regression dashboard. "
