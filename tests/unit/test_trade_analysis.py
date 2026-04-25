@@ -239,6 +239,10 @@ async def test_trade_analysis_builds_asof_decision_rows_without_leakage(analysis
     assert row["forecast_high_f"] == "70.00"
     assert row["gross_pnl_dollars"] == "4.9000"
     assert row["market_snapshot_source"] == "market_price_history"
+    assert row["market_stale_seconds"] == 120.0
+    assert row["market_stale_threshold_seconds"] == 120.0
+    assert row["market_stale_overage_seconds"] is None
+    assert row["market_snapshot_age_bucket"] == "61-300s"
 
 
 @pytest.mark.asyncio
@@ -269,6 +273,18 @@ async def test_trade_analysis_keeps_excluded_rows_with_reasons(analysis_harness)
     assert "missing_weather_snapshot" in row["exclusion_reasons"]
     assert "missing_settlement_label" in row["exclusion_reasons"]
     assert "missing_strategy_attribution" in row["exclusion_reasons"]
+
+    report = await TradeAnalysisService(settings, session_factory, directory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    assert report["top_exclusion_reasons_by_series"][0] == {
+        "series_ticker": "KXHIGHNY",
+        "reason": "missing_market_snapshot",
+        "rows": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -326,8 +342,14 @@ async def test_trade_analysis_dataset_write_and_model_eval(tmp_path, analysis_ha
     assert result["read_only"] is True
     assert result["dataset"]["rows"] == 24
     assert result["dataset"]["eligible_rows"] == 24
+    assert result["feature_diagnostics"]["model_eligible_rows"]["forecast_residual_f"]["missing_count"] == 24
+    assert result["feature_diagnostics"]["train_rows"]["forecast_residual_f"]["missing_count"] == 16
+    assert result["feature_diagnostics"]["test_rows"]["forecast_residual_f"]["missing_count"] == 8
+    assert result["feature_diagnostics"]["test_rows"]["forecast_residual_f"]["imputation_value"] == 0.0
     assert result["metrics"]["status"] == "ok"
     assert result["metrics"]["train_window"]["end"] < result["metrics"]["test_window"]["start"]
+    assert "picked_trade_diagnostics" in result["metrics"]
+    assert "worst_picked_rows" in result["metrics"]["picked_trade_diagnostics"]
 
     output = tmp_path / "written.jsonl"
     write_result = await service.write_dataset(output=output, kalshi_env="production", days=7, now=NOW)

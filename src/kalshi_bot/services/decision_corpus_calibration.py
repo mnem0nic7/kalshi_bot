@@ -430,20 +430,59 @@ class DecisionCorpusCalibrationReportService:
     ) -> dict[str, Any]:
         valid_row_ids = {item.row.id for item in valid_rows}
         clean_valid = [item for item in valid_rows if item.provenance_scope == "primary_clean"]
+        primary_clean = [item for item in clean_valid if item.row.support_status in {"supported", "exploratory"}]
+        clean_insufficient = [item for item in clean_valid if item.row.support_status not in {"supported", "exploratory"}]
         degraded_valid = [item for item in valid_rows if item.provenance_scope == "degraded"]
         return {
             "row_counts": {
                 "total_rows": len(rows),
                 "valid_prediction_and_binary_outcome": len(valid_rows),
+                "clean_valid_rows": len(clean_valid),
+                "clean_primary_rows": len(primary_clean),
+                "clean_insufficient_rows": len(clean_insufficient),
                 "primary_clean_valid_rows": len(clean_valid),
                 "degraded_valid_rows": len(degraded_valid),
                 "stand_down_valid_rows": sum(1 for item in valid_rows if item.row.recommended_side is None),
                 "skipped_rows": len(rows) - len(valid_row_ids),
                 "contaminated_clean_rows": contaminated_clean_rows,
+                "clean_valid_market_days": len({item.row.local_market_day for item in clean_valid}),
+                "primary_clean_market_days": len({item.row.local_market_day for item in primary_clean}),
+            },
+            "coverage_gap": {
+                "to_exploratory": {
+                    "additional_clean_primary_rows": max(0, EXPLORATORY_N - len(primary_clean)),
+                    "additional_clean_primary_market_days": max(
+                        0,
+                        EXPLORATORY_MARKET_DAYS - len({item.row.local_market_day for item in primary_clean}),
+                    ),
+                },
+                "to_supported": {
+                    "additional_clean_primary_rows": max(0, SUPPORTED_N - len(primary_clean)),
+                    "additional_clean_primary_market_days": max(
+                        0,
+                        SUPPORTED_MARKET_DAYS - len({item.row.local_market_day for item in primary_clean}),
+                    ),
+                },
             },
             "skips": [{"reason": reason, "rows": count} for reason, count in sorted(skip_counts.items())],
             "source_provenance": _counter_table(row.source_provenance for row in rows),
             "source_provenance_valid": _counter_table(item.row.source_provenance for item in valid_rows),
+            "primary_clean_by_market_day": _counter_table(item.row.local_market_day for item in primary_clean),
+            "clean_insufficient_by_market_day": _counter_table(item.row.local_market_day for item in clean_insufficient),
+            "primary_clean_by_series": _counter_table(item.row.series_ticker for item in primary_clean),
+            "support_status_by_provenance": [
+                {
+                    "source_provenance": provenance,
+                    "support_status": support_status,
+                    "rows": count,
+                }
+                for (provenance, support_status), count in sorted(
+                    Counter((row.source_provenance, row.support_status) for row in rows).items()
+                )
+            ],
+            "source_coverage_class": _counter_table((row.source_details or {}).get("source_coverage") for row in rows),
+            "market_source_kind": _counter_table((row.source_details or {}).get("market_source_kind") for row in rows),
+            "weather_source_kind": _counter_table((row.source_details or {}).get("weather_source_kind") for row in rows),
             "support_status": _counter_table(row.support_status for row in rows),
             "support_level": _counter_table(row.support_level for row in rows),
             "local_market_days": len({row.local_market_day for row in rows}),
@@ -694,7 +733,58 @@ class DecisionCorpusCalibrationReportService:
             "",
             _md_table(["Support status", "Rows"], [[item["value"], str(item["rows"])] for item in coverage["support_status"]]),
             "",
+            "### Clean Primary Coverage",
+            "",
+            f"Clean valid rows: **{counts.get('clean_valid_rows', 0)}** across "
+            f"**{counts.get('clean_valid_market_days', 0)} market-days**. "
+            f"Clean primary rows after support-status filtering: **{counts.get('clean_primary_rows', 0)}** across "
+            f"**{counts.get('primary_clean_market_days', 0)} market-days**. "
+            f"Clean rows excluded by insufficient support: **{counts.get('clean_insufficient_rows', 0)}**.",
+            "",
+            _md_table(
+                ["Gap", "Rows needed", "Market-days needed"],
+                [
+                    [
+                        "Exploratory",
+                        str(coverage.get("coverage_gap", {}).get("to_exploratory", {}).get("additional_clean_primary_rows", 0)),
+                        str(coverage.get("coverage_gap", {}).get("to_exploratory", {}).get("additional_clean_primary_market_days", 0)),
+                    ],
+                    [
+                        "Supported",
+                        str(coverage.get("coverage_gap", {}).get("to_supported", {}).get("additional_clean_primary_rows", 0)),
+                        str(coverage.get("coverage_gap", {}).get("to_supported", {}).get("additional_clean_primary_market_days", 0)),
+                    ],
+                ],
+            ),
+            "",
         ]
+        if coverage.get("primary_clean_by_market_day"):
+            lines.extend(
+                [
+                    "### Primary Clean Rows By Market Day",
+                    "",
+                    _md_table(
+                        ["Market day", "Rows"],
+                        [[item["value"], str(item["rows"])] for item in coverage["primary_clean_by_market_day"][:REPORT_TOP_N]],
+                    ),
+                    "",
+                ]
+            )
+        if coverage.get("support_status_by_provenance"):
+            lines.extend(
+                [
+                    "### Support Status By Provenance",
+                    "",
+                    _md_table(
+                        ["Source provenance", "Support status", "Rows"],
+                        [
+                            [item["source_provenance"], item["support_status"], str(item["rows"])]
+                            for item in coverage["support_status_by_provenance"][:REPORT_TOP_N]
+                        ],
+                    ),
+                    "",
+                ]
+            )
         if coverage["skips"]:
             lines.extend(
                 [
@@ -842,7 +932,7 @@ class DecisionCorpusCalibrationReportService:
         return [
             "## Recommended Actions",
             "",
-            f"Current clean-provenance coverage is {counts['primary_clean_valid_rows']} rows against "
+            f"Current clean primary coverage is {counts.get('clean_primary_rows', 0)} rows against "
             f"{counts['degraded_valid_rows']} degraded-provenance rows.",
             "",
             "1. Continue live-shadow operation once live-shadow corpus capture is added.",

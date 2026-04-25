@@ -148,6 +148,7 @@ async def test_calibration_report_warns_on_sparse_clean_primary_and_counts_degra
     specs = _clean_specs(16, days=3)
     specs[0]["recommended_side"] = None
     specs[0]["stand_down_reason"] = "below_min_edge"
+    specs += _clean_specs(1, days=1, support_status="insufficient", support_n=5, support_market_days=1)
     specs += _clean_specs(
         3,
         days=1,
@@ -170,7 +171,24 @@ async def test_calibration_report_warns_on_sparse_clean_primary_and_counts_degra
     assert report["report_metadata"]["warnings"][0]["type"] == "insufficient_primary_clean_coverage"
     assert report["aggregates"]["primary"]["n"] == 16
     assert report["aggregates"]["degraded_provenance"]["n"] == 3
-    assert report["aggregates"]["descriptive"]["n"] == 19
+    assert report["aggregates"]["descriptive"]["n"] == 20
+    assert report["coverage"]["row_counts"]["clean_valid_rows"] == 17
+    assert report["coverage"]["row_counts"]["clean_primary_rows"] == 16
+    assert report["coverage"]["row_counts"]["clean_insufficient_rows"] == 1
+    assert report["coverage"]["coverage_gap"]["to_exploratory"] == {
+        "additional_clean_primary_rows": 14,
+        "additional_clean_primary_market_days": 7,
+    }
+    assert report["coverage"]["primary_clean_by_market_day"] == [
+        {"value": "2026-04-20", "rows": 6},
+        {"value": "2026-04-21", "rows": 5},
+        {"value": "2026-04-22", "rows": 5},
+    ]
+    assert {
+        "source_provenance": "historical_replay_full_checkpoint",
+        "support_status": "insufficient",
+        "rows": 1,
+    } in report["coverage"]["support_status_by_provenance"]
     assert report["coverage"]["row_counts"]["stand_down_valid_rows"] == 1
     assert {"reason": "null_fair_yes_dollars", "rows": 1} in report["coverage"]["skips"]
     assert {"reason": "non_binary_settlement:void", "rows": 1} in report["coverage"]["skips"]

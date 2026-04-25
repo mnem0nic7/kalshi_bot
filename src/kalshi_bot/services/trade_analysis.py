@@ -48,6 +48,7 @@ MODEL_REQUIRED_FEATURES = {
     "market_stale_seconds",
     "weather_stale_seconds",
 }
+MODEL_OPTIONAL_IMPUTED_FEATURES = {"forecast_residual_f"}
 
 
 def _utc_now() -> datetime:
@@ -87,6 +88,35 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _group_pnl_by_series(picked: list[tuple[float, int, dict[str, Any]]]) -> dict[str, list[float]]:
+    grouped: dict[str, list[float]] = {}
+    for _prediction, _label, row in picked:
+        series = str(row.get("series_ticker") or "<unknown>")
+        grouped.setdefault(series, []).append(float(row.get("gross_pnl_dollars") or 0.0))
+    return grouped
+
+
+def _stale_age_bucket(seconds: float | None) -> str:
+    if seconds is None:
+        return "missing"
+    if seconds <= 60:
+        return "<=60s"
+    if seconds <= 300:
+        return "61-300s"
+    if seconds <= 900:
+        return "301-900s"
+    if seconds <= 3600:
+        return "901-3600s"
+    return ">3600s"
+
+
+def _counter_rows(rows: list[dict[str, Any]], key: str, *, limit: int = 20) -> list[dict[str, Any]]:
+    return [
+        {"value": value, "rows": count}
+        for value, count in Counter(str(row.get(key) or "<unknown>") for row in rows).most_common(limit)
+    ]
 
 
 def _market_day_from_ticker(ticker: str) -> str | None:
@@ -261,6 +291,15 @@ class TradeAnalysisService:
                 for row in dataset.rows
                 for reason in row.get("exclusion_reasons", [])
             ).most_common(20),
+            "top_exclusion_reasons_by_series": [
+                {"series_ticker": series, "reason": reason, "rows": count}
+                for (series, reason), count in Counter(
+                    (row.get("series_ticker") or "<unknown>", reason)
+                    for row in dataset.rows
+                    for reason in row.get("exclusion_reasons", [])
+                ).most_common(20)
+            ],
+            "stale_market_snapshot_diagnostics": self._stale_market_snapshot_diagnostics(dataset.rows),
             "by_decision_status": dict(Counter(row.get("decision_status") for row in dataset.rows)),
             "by_series": dict(Counter(row.get("series_ticker") or "<unknown>" for row in dataset.rows)),
             "pnl": self._pnl_summary(dataset.rows),
@@ -303,6 +342,8 @@ class TradeAnalysisService:
                 warnings.extend(await self._promotion_blockers(kalshi_env=next(iter(envs))))
 
         split = self._chronological_split(eligible)
+        train: list[dict[str, Any]] = []
+        test: list[dict[str, Any]] = []
         metrics: dict[str, Any]
         if split is None:
             metrics = {"status": "insufficient_data", "reason": "need_at_least_20_eligible_rows_and_both_labels"}
@@ -321,6 +362,7 @@ class TradeAnalysisService:
                 "excluded_rows": len(rows) - len(eligible),
                 "schema_version": rows[0].get("schema_version") if rows else SCHEMA_VERSION,
             },
+            "feature_diagnostics": self._feature_diagnostics(rows, eligible, train=train, test=test),
             "warnings": warnings,
             "promotion_blocked": any(w.get("severity") in {"critical", "high"} for w in warnings),
             "metrics": metrics,
@@ -622,6 +664,13 @@ class TradeAnalysisService:
             if weather_observed_at is not None
             else None
         )
+        market_stale_threshold_seconds = float(self.settings.risk_stale_market_seconds)
+        replay_stale_threshold_seconds = float(getattr(self.settings, "historical_replay_market_stale_seconds", market_stale_threshold_seconds))
+        market_stale_overage_seconds = (
+            stale_market_seconds - market_stale_threshold_seconds
+            if stale_market_seconds is not None and stale_market_seconds > market_stale_threshold_seconds
+            else None
+        )
         yes_bid = market_snapshot.get("yes_bid_dollars") if market_snapshot else None
         yes_ask = market_snapshot.get("yes_ask_dollars") if market_snapshot else None
         spread = (Decimal(yes_ask) - Decimal(yes_bid)) if yes_bid is not None and yes_ask is not None else None
@@ -685,6 +734,10 @@ class TradeAnalysisService:
             "market_snapshot_id": (market_snapshot or {}).get("snapshot_id"),
             "market_observed_at": _iso(market_observed_at),
             "market_stale_seconds": stale_market_seconds,
+            "market_stale_threshold_seconds": market_stale_threshold_seconds,
+            "historical_replay_market_stale_threshold_seconds": replay_stale_threshold_seconds,
+            "market_stale_overage_seconds": market_stale_overage_seconds,
+            "market_snapshot_age_bucket": _stale_age_bucket(stale_market_seconds),
             "yes_bid_dollars": _decimal_str(yes_bid),
             "yes_ask_dollars": _decimal_str(yes_ask),
             "mid_dollars": _decimal_str((market_snapshot or {}).get("mid_dollars")),
@@ -812,6 +865,28 @@ class TradeAnalysisService:
             "avg_pnl_dollars": str((total / Decimal(len(values))).quantize(Decimal("0.0001"))) if values else None,
         }
 
+    def _stale_market_snapshot_diagnostics(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        stale_rows = [row for row in rows if "stale_market_snapshot" in row.get("exclusion_reasons", [])]
+        ages = sorted(
+            value
+            for row in stale_rows
+            if (value := _float_or_none(row.get("market_stale_seconds"))) is not None
+        )
+        p95 = ages[min(len(ages) - 1, math.ceil(len(ages) * 0.95) - 1)] if ages else None
+        return {
+            "row_count": len(stale_rows),
+            "max_market_stale_seconds": round(max(ages), 3) if ages else None,
+            "p95_market_stale_seconds": round(p95, 3) if p95 is not None else None,
+            "by_source": _counter_rows(stale_rows, "market_snapshot_source"),
+            "by_series": _counter_rows(stale_rows, "series_ticker"),
+            "by_station_id": _counter_rows(stale_rows, "station_id"),
+            "by_market_day": _counter_rows(stale_rows, "market_day"),
+            "by_age_bucket": [
+                {"value": bucket, "rows": count}
+                for bucket, count in Counter(row.get("market_snapshot_age_bucket") or "missing" for row in stale_rows).most_common()
+            ],
+        }
+
     async def _promotion_blockers(self, *, kalshi_env: str) -> list[dict[str, Any]]:
         if self.trading_audit_service is None:
             return []
@@ -879,6 +954,39 @@ class TradeAnalysisService:
         if row.get("label_win") in (None, ""):
             return False
         return all(self._feature(row, key) is not None for key in MODEL_REQUIRED_FEATURES)
+
+    def _feature_diagnostics(
+        self,
+        rows: list[dict[str, Any]],
+        eligible: list[dict[str, Any]],
+        *,
+        train: list[dict[str, Any]] | None = None,
+        test: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        feature_names = self._feature_names()
+        train = train or []
+        test = test or []
+
+        def counts_for(sample: list[dict[str, Any]]) -> dict[str, dict[str, float | int | None]]:
+            result: dict[str, dict[str, float | int | None]] = {}
+            for feature in feature_names:
+                missing_count = sum(1 for row in sample if self._feature(row, feature) is None)
+                result[feature] = {
+                    "present_count": len(sample) - missing_count,
+                    "missing_count": missing_count,
+                    "missing_rate": round(missing_count / len(sample), 6) if sample else None,
+                    "imputation_value": 0.0 if feature in MODEL_OPTIONAL_IMPUTED_FEATURES else None,
+                }
+            return result
+
+        return {
+            "required_features": sorted(MODEL_REQUIRED_FEATURES),
+            "optional_imputed_features": sorted(MODEL_OPTIONAL_IMPUTED_FEATURES),
+            "all_rows": counts_for(rows),
+            "model_eligible_rows": counts_for(eligible),
+            "train_rows": counts_for(train),
+            "test_rows": counts_for(test),
+        }
 
     def _feature_names(self) -> list[str]:
         return [
@@ -969,6 +1077,13 @@ class TradeAnalysisService:
         log_loss = -sum(y * math.log(max(eps, p)) + (1 - y) * math.log(max(eps, 1 - p)) for p, y, _ in predictions) / len(predictions)
         picked = [(p, y, row) for p, y, row in predictions if p >= 0.5]
         pnl_values = [float(row.get("gross_pnl_dollars") or 0.0) for _, _, row in picked]
+        picked_losers = [(p, y, row) for p, y, row in picked if float(row.get("gross_pnl_dollars") or 0.0) < 0]
+        picked_losses = [float(row.get("gross_pnl_dollars") or 0.0) for _, _, row in picked_losers]
+        picked_wins = [value for value in pnl_values if value > 0]
+        worst_picked_rows = sorted(
+            picked,
+            key=lambda item: (float(item[2].get("gross_pnl_dollars") or 0.0), str(item[2].get("decision_ts") or "")),
+        )[:10]
         return {
             "status": "ok",
             "model_type": "builtin_logistic",
@@ -984,7 +1099,53 @@ class TradeAnalysisService:
             "expected_value_mean": round(sum((p - 0.5) for p, _, _ in predictions) / len(predictions), 6),
             "fill_adjusted_pnl_dollars": round(sum(pnl_values), 4),
             "max_drawdown_dollars": round(self._max_drawdown(pnl_values), 4),
+            "picked_trade_diagnostics": {
+                "picked_count": len(picked),
+                "picked_winning_rows": len(picked_wins),
+                "picked_losing_rows": len(picked_losses),
+                "avg_picked_pnl_dollars": round(sum(pnl_values) / len(pnl_values), 4) if pnl_values else None,
+                "worst_picked_pnl_dollars": round(min(pnl_values), 4) if pnl_values else None,
+                "best_picked_pnl_dollars": round(max(pnl_values), 4) if pnl_values else None,
+                "picked_feature_missingness": self._prediction_row_missingness(picked),
+                "picked_loser_feature_missingness": self._prediction_row_missingness(picked_losers),
+                "worst_picked_rows": [
+                    self._picked_row_diagnostic(prediction=prediction, label=label, row=row)
+                    for prediction, label, row in worst_picked_rows
+                ],
+                "by_series": [
+                    {
+                        "series_ticker": series,
+                        "picked_count": len(values),
+                        "pnl_dollars": round(sum(values), 4),
+                    }
+                    for series, values in sorted(
+                        _group_pnl_by_series(picked).items(),
+                        key=lambda item: (sum(item[1]), item[0]),
+                    )
+                ],
+            },
             "calibration": self._calibration(predictions),
+        }
+
+    def _prediction_row_missingness(self, rows: list[tuple[float, int, dict[str, Any]]]) -> dict[str, int]:
+        return {
+            feature: sum(1 for _prediction, _label, row in rows if self._feature(row, feature) is None)
+            for feature in self._feature_names()
+        }
+
+    def _picked_row_diagnostic(self, *, prediction: float, label: int, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "room_id": row.get("room_id"),
+            "market_ticker": row.get("market_ticker"),
+            "series_ticker": row.get("series_ticker") or "<unknown>",
+            "decision_ts": row.get("decision_ts"),
+            "prediction": round(prediction, 6),
+            "label_win": bool(label),
+            "gross_pnl_dollars": _float_or_none(row.get("gross_pnl_dollars")),
+            "side": row.get("side"),
+            "ticket_yes_price_dollars": _float_or_none(row.get("ticket_yes_price_dollars")),
+            "forecast_residual_f": _float_or_none(row.get("forecast_residual_f")),
+            "forecast_residual_f_imputed": self._feature(row, "forecast_residual_f") is None,
         }
 
     def _max_drawdown(self, values: list[float]) -> float:
