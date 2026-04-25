@@ -1530,9 +1530,12 @@ def create_app() -> FastAPI:
         recommendation = dict(city_row.get("recommendation") or {})
         approved_strategy_name = recommendation.get("strategy_name")
         approved_status = recommendation.get("status")
+        snapshot_summary = dict(snapshot.get("summary") or {})
+        current_corpus_build_id = snapshot_summary.get("corpus_build_id")
         if (
             approved_strategy_name != payload.expected_strategy_name
             or approved_status != payload.expected_recommendation_status
+            or payload.expected_corpus_build_id != current_corpus_build_id
         ):
             return JSONResponse(
                 {
@@ -1565,23 +1568,46 @@ def create_app() -> FastAPI:
 
         async with app_container.session_factory() as session:
             repo = PlatformRepository(session)
-            previous_assignment = await repo.get_city_strategy_assignment(series_ticker)
+            previous_assignment = await repo.get_city_strategy_assignment(
+                series_ticker,
+                kalshi_env=app_container.settings.kalshi_env,
+            )
+            previous_strategy_name = previous_assignment.strategy_name if previous_assignment is not None else None
             await repo.set_city_strategy_assignment(
                 series_ticker,
                 str(approved_strategy_name),
                 assigned_by=STRATEGY_APPROVAL_ASSIGNED_BY,
+                kalshi_env=app_container.settings.kalshi_env,
+                evidence_corpus_build_id=current_corpus_build_id,
+                evidence_run_at=snapshot_summary.get("last_regression_run"),
+            )
+            await repo.record_city_assignment_event(
+                series_ticker=series_ticker,
+                previous_strategy=previous_strategy_name,
+                new_strategy=str(approved_strategy_name),
+                event_type="manual_assign",
+                actor=STRATEGY_APPROVAL_ASSIGNED_BY,
+                kalshi_env=app_container.settings.kalshi_env,
+                note=payload.note,
+                metadata={
+                    "recommendation_status": approved_status,
+                    "recommendation_label": recommendation.get("label"),
+                    "basis_run_at": snapshot_summary.get("last_regression_run"),
+                    "corpus_build_id": current_corpus_build_id,
+                    "source": STRATEGY_APPROVAL_SOURCE,
+                },
             )
             await repo.log_ops_event(
                 severity="info",
                 summary=(
                     f"Approved strategy assignment for {series_ticker}: "
-                    f"{previous_assignment.strategy_name if previous_assignment is not None else 'unassigned'} -> {approved_strategy_name}"
+                    f"{previous_strategy_name or 'unassigned'} -> {approved_strategy_name}"
                 ),
                 source=STRATEGY_APPROVAL_SOURCE,
                 payload={
                     "event_kind": STRATEGY_APPROVAL_EVENT_KIND,
                     "series_ticker": series_ticker,
-                    "previous_strategy": previous_assignment.strategy_name if previous_assignment is not None else None,
+                    "previous_strategy": previous_strategy_name,
                     "new_strategy": approved_strategy_name,
                     "recommendation_status": approved_status,
                     "recommendation_label": recommendation.get("label"),
@@ -1598,21 +1624,28 @@ def create_app() -> FastAPI:
                     "gap_to_runner_up": city_row.get("gap_to_runner_up"),
                     "new_win_rate": winning_metric.get("win_rate") if winning_metric is not None else None,
                     "note": payload.note,
-                    "basis_run_at": (snapshot.get("summary") or {}).get("last_regression_run"),
+                    "basis_run_at": snapshot_summary.get("last_regression_run"),
+                    "corpus_build_id": current_corpus_build_id,
                     "assigned_by": STRATEGY_APPROVAL_ASSIGNED_BY,
                 },
             )
-            assignment = await repo.get_city_strategy_assignment(series_ticker)
+            assignment = await repo.get_city_strategy_assignment(
+                series_ticker,
+                kalshi_env=app_container.settings.kalshi_env,
+            )
             await session.commit()
 
         if app_container.secondary_session_factory is not None:
             try:
                 async with app_container.secondary_session_factory() as sec_session:
-                    sec_repo = PlatformRepository(sec_session)
+                    sec_repo = PlatformRepository(sec_session, kalshi_env=app_container.settings.kalshi_env)
                     await sec_repo.set_city_strategy_assignment(
                         series_ticker,
                         str(approved_strategy_name),
                         assigned_by=STRATEGY_APPROVAL_ASSIGNED_BY,
+                        kalshi_env=app_container.settings.kalshi_env,
+                        evidence_corpus_build_id=current_corpus_build_id,
+                        evidence_run_at=snapshot_summary.get("last_regression_run"),
                     )
                     await sec_session.commit()
             except Exception:

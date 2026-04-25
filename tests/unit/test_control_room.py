@@ -1039,9 +1039,19 @@ async def test_build_strategies_dashboard_builds_research_sections(monkeypatch: 
     assert payload["detail_context"]["type"] == "strategy"
     city_row = next(row for row in payload["city_matrix"] if row["series_ticker"] == "KXHIGHNY")
     assert city_row["best_strategy"] == "moderate"
+    assert city_row["city_corpus_days"] == 40
+    assert city_row["eligible_corpus_days"] == 40
+    assert city_row["candidate_win_rate"] == pytest.approx(0.75)
+    assert city_row["candidate_resolved_trade_count"] == 24
+    assert city_row["candidate_total_pnl_dollars"] == pytest.approx(8.4)
     assert city_row["assignment"]["strategy_name"] == "aggressive"
+    assert city_row["current_assignment_win_rate"] == pytest.approx(0.60)
+    assert city_row["current_assignment_resolved_trade_count"] == 20
     assert city_row["recommendation"]["strategy_name"] == "moderate"
     assert city_row["recommendation"]["status"] == "strong_recommendation"
+    assert city_row["recommendation"]["win_rate"] == pytest.approx(0.75)
+    assert city_row["recommendation"]["total_pnl_dollars"] == pytest.approx(8.4)
+    assert city_row["recommendation"]["city_corpus_days"] == 40
     assert city_row["review"]["status"] == "drifted_assignment"
     assert city_row["review"]["needs_review"] is True
     assert city_row["assignment_context_status"] == "differs_from_recommendation"
@@ -1128,6 +1138,68 @@ def test_city_review_state_classifies_all_review_states() -> None:
     )
     assert waiting["status"] == "waiting_for_evidence"
     assert waiting["needs_review"] is False
+
+
+def test_strategy_sections_use_sortino_for_ranking_recommendations() -> None:
+    strategies = [
+        SimpleNamespace(id=1, name="high_win_low_sortino", description="Volatile", thresholds={}),
+        SimpleNamespace(id=2, name="low_win_high_sortino", description="Steady", thresholds={}),
+    ]
+    raw_rows = [
+        control_room_module.normalize_ranking_row_for_dashboard({
+            "ranking_version": control_room_module.STRATEGY_RANKING_VERSION,
+            "strategy_id": 1,
+            "strategy_name": "high_win_low_sortino",
+            "series_ticker": "KXHIGHNY",
+            "total_rows_evaluated": 40,
+            "candidate_decision_count": 40,
+            "total_rows_contributing": 40,
+            "cluster_count": 40,
+            "supported_clusters": 40,
+            "total_net_pnl_dollars": 8.0,
+            "sortino": 0.2,
+            "win_rate": 0.95,
+            "promotion_candidate": False,
+            "below_support_floor": False,
+            "insufficient_for_ranking": False,
+        }),
+        control_room_module.normalize_ranking_row_for_dashboard({
+            "ranking_version": control_room_module.STRATEGY_RANKING_VERSION,
+            "strategy_id": 2,
+            "strategy_name": "low_win_high_sortino",
+            "series_ticker": "KXHIGHNY",
+            "total_rows_evaluated": 40,
+            "candidate_decision_count": 40,
+            "total_rows_contributing": 40,
+            "cluster_count": 40,
+            "supported_clusters": 40,
+            "total_net_pnl_dollars": 4.0,
+            "sortino": 1.5,
+            "win_rate": 0.35,
+            "promotion_candidate": True,
+            "below_support_floor": False,
+            "insufficient_for_ranking": False,
+        }),
+    ]
+    strategies_by_id = {strategy.id: strategy for strategy in strategies}
+    normalized = control_room_module._normalize_strategy_result_rows(raw_rows, strategies_by_id)
+    ranking_leaderboard_rows = control_room_module._normalize_strategy_result_rows(raw_rows, strategies_by_id)
+
+    leaderboard, city_matrix, _context = control_room_module._build_strategy_research_sections(
+        strategies=strategies,
+        normalized_rows=normalized,
+        ranking_leaderboard_rows=ranking_leaderboard_rows,
+        assignments=[],
+        series_metadata={},
+        selected_series_ticker=None,
+        selected_strategy_name=None,
+        window_days=180,
+    )
+
+    assert city_matrix[0]["recommendation"]["strategy_name"] == "low_win_high_sortino"
+    assert city_matrix[0]["recommendation"]["status"] == "strong_recommendation"
+    assert city_matrix[0]["best_strategy_sortino"] == pytest.approx(1.5)
+    assert leaderboard[0]["name"] == "low_win_high_sortino"
 
 
 @pytest.mark.asyncio
@@ -1292,6 +1364,214 @@ async def test_build_strategies_dashboard_uses_neutral_summary_when_no_evidence(
     assert payload["city_matrix"][0]["evidence_status"] == "no_outcomes"
     assert payload["city_matrix"][0]["recommendation"]["status"] == "no_outcomes"
     assert payload["detail_context"]["type"] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_build_strategies_dashboard_marks_missing_corpus_strategy_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 4, 21, 18, 0, tzinfo=UTC)
+    requested_corpus_ids: list[str | None] = []
+
+    class FakeRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def list_strategies(self, *, active_only: bool = True) -> list[SimpleNamespace]:
+            assert active_only is True
+            return [
+                SimpleNamespace(id=1, name="aggressive", description="Loose filters", thresholds=_strategy_thresholds(min_edge_bps=20)),
+                SimpleNamespace(id=2, name="moderate", description="Balanced filters", thresholds=_strategy_thresholds(min_edge_bps=40)),
+            ]
+
+        async def list_city_strategy_assignments(self, *, kalshi_env: str) -> list[SimpleNamespace]:
+            assert kalshi_env == "demo"
+            return [
+                SimpleNamespace(series_ticker="KXHIGHNY", strategy_name="moderate", assigned_at=now, assigned_by="auto_regression"),
+            ]
+
+        async def get_checkpoint(self, stream_name: str) -> SimpleNamespace:
+            assert stream_name == "strategy_regression"
+            return SimpleNamespace(
+                payload={"ran_at": now.isoformat(), "rooms_scanned": 84, "series_evaluated": 2, "promotions": []},
+                updated_at=now,
+            )
+
+        async def list_ops_events(self, *, limit: int, sources: list[str] | None = None, created_after=None) -> list[SimpleNamespace]:
+            return []
+
+        async def get_current_decision_corpus_build(self, *, kalshi_env: str) -> SimpleNamespace:
+            assert kalshi_env == "demo"
+            return SimpleNamespace(id="corpus-current")
+
+        async def get_latest_strategy_results(self, *, corpus_build_id: str | None = None) -> list[SimpleNamespace]:
+            requested_corpus_ids.append(corpus_build_id)
+            if corpus_build_id == "corpus-current":
+                return []
+            return [
+                _strategy_result_row(
+                    strategy_id=2,
+                    run_at=now,
+                    series_ticker="KXHIGHNY",
+                    rooms_evaluated=40,
+                    trade_count=24,
+                    resolved_trade_count=24,
+                    win_count=18,
+                    total_pnl_dollars=Decimal("8.40"),
+                    trade_rate=Decimal("0.6000"),
+                    win_rate=Decimal("0.7500"),
+                    avg_edge_bps=Decimal("68.0"),
+                ),
+            ]
+
+        async def list_strategy_results_history(
+            self,
+            *,
+            strategy_ids: list[int] | None = None,
+            series_ticker: str | None = None,
+            corpus_build_id: str | None = None,
+            run_after=None,
+            limit: int = 500,
+        ) -> list[SimpleNamespace]:
+            return []
+
+    monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
+
+    container = SimpleNamespace(
+        session_factory=_FakeSessionFactory(),
+        weather_directory=_FakeStrategyWeatherDirectory(),
+        settings=SimpleNamespace(kalshi_env="demo"),
+    )
+
+    payload = await control_room_module.build_strategies_dashboard(container)
+
+    assert requested_corpus_ids == ["corpus-current"]
+    assert payload["summary"]["source_mode"] == "missing_corpus_strategy_results"
+    assert payload["summary"]["corpus_build_id"] == "corpus-current"
+    assert payload["summary"]["decision_corpus_available"] is True
+    assert payload["summary"]["strategy_results_available"] is False
+    assert payload["summary"]["recommendation_snapshot_available"] is False
+    assert payload["summary"]["unavailable_reason"] == "missing_corpus_strategy_results"
+    assert payload["summary"]["review_available"] is False
+    assert payload["summary"]["review_window_days"] is None
+    assert payload["summary"]["ready_for_approval_count"] is None
+    assert payload["summary"]["best_strategy_name"] == "—"
+    assert payload["city_matrix"][0]["recommendation"]["status"] == "no_outcomes"
+    assert payload["city_matrix"][0]["approval_eligible"] is False
+
+
+@pytest.mark.asyncio
+async def test_build_strategies_dashboard_uses_decision_corpus_ranking_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 4, 21, 18, 0, tzinfo=UTC)
+    ranking_calls: list[list[str]] = []
+
+    class FakeRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def list_strategies(self, *, active_only: bool = True) -> list[SimpleNamespace]:
+            assert active_only is True
+            return [
+                SimpleNamespace(id=1, name="high_win_low_sortino", description="Volatile", thresholds=_strategy_thresholds(min_edge_bps=20)),
+                SimpleNamespace(id=2, name="low_win_high_sortino", description="Steady", thresholds=_strategy_thresholds(min_edge_bps=40)),
+            ]
+
+        async def list_city_strategy_assignments(self, *, kalshi_env: str) -> list[SimpleNamespace]:
+            assert kalshi_env == "demo"
+            return []
+
+        async def get_checkpoint(self, stream_name: str) -> SimpleNamespace:
+            assert stream_name == "strategy_regression"
+            return SimpleNamespace(
+                payload={"ran_at": now.isoformat(), "rooms_scanned": 84, "series_evaluated": 1, "promotions": []},
+                updated_at=now,
+            )
+
+        async def list_ops_events(self, *, limit: int, sources: list[str] | None = None, created_after=None) -> list[SimpleNamespace]:
+            return []
+
+        async def get_current_decision_corpus_build(self, *, kalshi_env: str) -> SimpleNamespace:
+            assert kalshi_env == "demo"
+            return SimpleNamespace(id="corpus-current")
+
+        async def get_latest_strategy_results(self, *, corpus_build_id: str | None = None) -> list[SimpleNamespace]:
+            raise AssertionError("stored strategy_results should not be read when ranking service is available")
+
+        async def list_strategy_results_history(
+            self,
+            *,
+            strategy_ids: list[int] | None = None,
+            series_ticker: str | None = None,
+            corpus_build_id: str | None = None,
+            run_after=None,
+            limit: int = 500,
+        ) -> list[SimpleNamespace]:
+            return []
+
+    class FakeRankingService:
+        async def evaluate_strategy_specs(self, *, strategies: list[SimpleNamespace], kalshi_env: str) -> dict:
+            assert kalshi_env == "demo"
+            ranking_calls.append([strategy.name for strategy in strategies])
+            rows = [
+                {
+                    "ranking_version": control_room_module.STRATEGY_RANKING_VERSION,
+                    "strategy_id": 1,
+                    "strategy_name": "high_win_low_sortino",
+                    "series_ticker": "KXHIGHNY",
+                    "total_rows_evaluated": 40,
+                    "candidate_decision_count": 40,
+                    "total_rows_contributing": 40,
+                    "cluster_count": 40,
+                    "supported_clusters": 40,
+                    "total_net_pnl_dollars": 8.0,
+                    "sortino": 0.2,
+                    "win_rate": 0.95,
+                    "promotion_candidate": False,
+                    "below_support_floor": False,
+                    "insufficient_for_ranking": False,
+                },
+                {
+                    "ranking_version": control_room_module.STRATEGY_RANKING_VERSION,
+                    "strategy_id": 2,
+                    "strategy_name": "low_win_high_sortino",
+                    "series_ticker": "KXHIGHNY",
+                    "total_rows_evaluated": 40,
+                    "candidate_decision_count": 40,
+                    "total_rows_contributing": 40,
+                    "cluster_count": 40,
+                    "supported_clusters": 40,
+                    "total_net_pnl_dollars": 4.0,
+                    "sortino": 1.5,
+                    "win_rate": 0.35,
+                    "promotion_candidate": True,
+                    "below_support_floor": False,
+                    "insufficient_for_ranking": False,
+                },
+            ]
+            return {
+                "status": "ok",
+                "corpus_build_id": "corpus-current",
+                "diagnostics": {"total_corpus_rows": 40},
+                "report_metadata": {"ranking_version": control_room_module.STRATEGY_RANKING_VERSION},
+                "result_rows": rows,
+                "leaderboard": rows,
+                "city_results": {"KXHIGHNY": rows},
+            }
+
+    monkeypatch.setattr(control_room_module, "PlatformRepository", FakeRepo)
+
+    container = SimpleNamespace(
+        session_factory=_FakeSessionFactory(),
+        weather_directory=_FakeStrategyWeatherDirectory(),
+        settings=SimpleNamespace(kalshi_env="demo"),
+        strategy_regression_ranking_service=FakeRankingService(),
+    )
+
+    payload = await control_room_module.build_strategies_dashboard(container)
+
+    assert ranking_calls == [["high_win_low_sortino", "low_win_high_sortino"]]
+    assert payload["summary"]["source_mode"] == "decision_corpus_ranking"
+    assert payload["summary"]["recommendation_snapshot_available"] is True
+    assert payload["summary"]["ranking_version"] == control_room_module.STRATEGY_RANKING_VERSION
+    assert payload["city_matrix"][0]["recommendation"]["strategy_name"] == "low_win_high_sortino"
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -14,6 +14,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.fee_model import current_fee_model_version, estimate_kalshi_taker_fee_dollars
+from kalshi_bot.services.trading_audit import TradingAuditService
 
 
 SOURCE_HISTORICAL_REPLAY = "historical-replay"
@@ -29,6 +30,17 @@ SUPPORTED_MARKET_DAYS = 20
 SUPPORTED_RECENCY_DAYS = 365
 EXPLORATORY_N = 30
 EXPLORATORY_MARKET_DAYS = 10
+AUTO_PROMOTION_TRIGGER_NEW_RESOLVED_ROOMS = 50
+AUTO_PROMOTION_MIN_INTERVAL = timedelta(days=7)
+AUTO_PROMOTION_MIN_RESOLVED_ROOMS = 30
+AUTO_PROMOTION_MIN_SETTLEMENT_COVERAGE = 0.95
+AUTO_PROMOTION_MIN_STRATEGY_CODE_ATTRIBUTION = 0.99
+AUTO_PROMOTION_SETTLEMENT_LAG_DAYS = 2
+ATTRIBUTION_AUDIT_CODES = {
+    "missing_fill_strategy_attribution",
+    "unlinked_fills_with_recoverable_order_attribution",
+}
+AUTO_PROMOTION_ALLOWED_SOURCE_PROVENANCE = {"historical_replay_full_checkpoint"}
 
 
 @dataclass(slots=True)
@@ -90,9 +102,15 @@ def lead_bucket_for_minutes(minutes: int | None) -> str:
 
 
 class DecisionCorpusService:
-    def __init__(self, settings: Settings, session_factory: async_sessionmaker) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        session_factory: async_sessionmaker,
+        trading_audit_service: Any | None = None,
+    ) -> None:
         self.settings = settings
         self.session_factory = session_factory
+        self.trading_audit_service = trading_audit_service or TradingAuditService(settings, session_factory)
 
     async def build(
         self,
@@ -103,6 +121,7 @@ class DecisionCorpusService:
         dry_run: bool = False,
         notes: str | None = None,
         parent_build_id: str | None = None,
+        kalshi_env: str | None = None,
     ) -> dict[str, Any]:
         if source != SOURCE_HISTORICAL_REPLAY:
             raise ValueError("PR1 decision corpus only supports --source historical-replay")
@@ -116,9 +135,11 @@ class DecisionCorpusService:
             "source": source,
             "requires_settlement_label": True,
         }
-        source_payload = {"type": "historical_replay_rooms"}
+        if kalshi_env is not None:
+            filters["kalshi_env"] = kalshi_env
+        source_payload = {"type": "historical_replay_rooms", "kalshi_env": kalshi_env}
 
-        rows = await self._build_candidate_rows(date_from=date_from, date_to=date_to)
+        rows = await self._build_candidate_rows(date_from=date_from, date_to=date_to, kalshi_env=kalshi_env)
         rows = self._apply_support_labels(rows, reference_date=date_to)
         if not rows:
             raise ValueError("no eligible historical replay decisions found for decision corpus build")
@@ -130,6 +151,7 @@ class DecisionCorpusService:
                 "row_count": len(rows),
                 "date_from": date_from.isoformat(),
                 "date_to": date_to.isoformat(),
+                "kalshi_env": kalshi_env,
                 "support_distribution": self._support_distribution(rows),
             }
 
@@ -270,6 +292,78 @@ class DecisionCorpusService:
         return {"ok": not errors, "build_id": build_id, "row_count": len(rows), "errors": errors}
 
     async def promote(self, build_id: str, *, kalshi_env: str, actor: str | None = None) -> dict[str, Any]:
+        validation = await self.validate_build(build_id)
+        if not validation["ok"]:
+            raise ValueError(
+                {
+                    "status": "rejected",
+                    "reason": "validation_failed",
+                    "build_id": build_id,
+                    "validation": validation,
+                }
+            )
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            env = repo._resolved_kalshi_env(kalshi_env)
+            build = await repo.get_decision_corpus_build(build_id)
+            if build is None:
+                raise KeyError(f"Decision corpus build {build_id} not found")
+            if build.status != "successful":
+                raise ValueError("Only successful decision corpus builds can be promoted")
+            rows = await repo.list_decision_corpus_rows(build_id=build_id)
+            build_envs = self._build_kalshi_envs(build.source or {}, build.filters or {})
+            row_envs = sorted({row.kalshi_env for row in rows if row.kalshi_env not in (None, "")})
+            mismatched_metadata_envs = sorted(env_value for env_value in build_envs if env_value != env)
+            mismatched_row_envs = sorted(row_env for row_env in row_envs if row_env != env)
+            if mismatched_metadata_envs or mismatched_row_envs:
+                raise ValueError(
+                    {
+                        "status": "rejected",
+                        "reason": "kalshi_env_mismatch",
+                        "build_id": build_id,
+                        "target_kalshi_env": env,
+                        "build_kalshi_envs": sorted(build_envs),
+                        "row_kalshi_envs": row_envs,
+                    }
+                )
+            metrics = await repo.decision_corpus_promotion_source_metrics(
+                date_from=build.date_from.isoformat(),
+                date_to=build.date_to.isoformat(),
+                kalshi_env=env,
+            )
+            excluded_windows = await self._excluded_date_windows(
+                repo,
+                kalshi_env=env,
+                date_from=build.date_from,
+                date_to=build.date_to,
+            )
+            await session.commit()
+
+        provenance_metrics = await self._source_provenance_metrics(
+            date_from=date.fromisoformat(metrics["date_from"]),
+            date_to=date.fromisoformat(metrics["date_to"]),
+            kalshi_env=metrics["kalshi_env"],
+        )
+        gates = await self._promotion_gates(
+            kalshi_env=metrics["kalshi_env"],
+            now=datetime.now(UTC),
+            metrics=metrics,
+            excluded_windows=excluded_windows,
+            provenance_metrics=provenance_metrics,
+        )
+        if not gates["ok"]:
+            raise ValueError(
+                {
+                    "status": "rejected",
+                    "reason": "promotion_gates_failed",
+                    "build_id": build_id,
+                    "kalshi_env": metrics["kalshi_env"],
+                    "metrics": metrics,
+                    "gates": gates,
+                }
+            )
+
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             result = await repo.promote_decision_corpus_build(
@@ -280,6 +374,143 @@ class DecisionCorpusService:
             await session.commit()
             return result
 
+    async def nightly_auto_promote(
+        self,
+        *,
+        kalshi_env: str,
+        now: datetime | None = None,
+        actor: str = "daemon",
+    ) -> dict[str, Any]:
+        now = _as_datetime(now) or datetime.now(UTC)
+        date_to = now.date() - timedelta(days=AUTO_PROMOTION_SETTLEMENT_LAG_DAYS)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            env = repo._resolved_kalshi_env(kalshi_env)
+            bounds = await repo.decision_corpus_replay_date_bounds(
+                kalshi_env=env,
+                date_to=date_to.isoformat(),
+            )
+            if bounds is None:
+                return {"status": "skipped", "reason": "no_replay_source", "kalshi_env": env}
+            current_checkpoint = await repo.get_checkpoint(repo.decision_corpus_current_checkpoint_name(kalshi_env=env))
+            current = await repo.get_current_decision_corpus_build(kalshi_env=env)
+            last_promoted_at = self._last_promoted_at(current_checkpoint, current)
+            new_after_date = current.date_to.isoformat() if current is not None else None
+            metrics = await repo.decision_corpus_promotion_source_metrics(
+                date_from=bounds["date_from"],
+                date_to=bounds["date_to"],
+                kalshi_env=env,
+                new_after_date=new_after_date,
+            )
+            excluded_windows = await self._excluded_date_windows(
+                repo,
+                kalshi_env=env,
+                date_from=date.fromisoformat(bounds["date_from"]),
+                date_to=date.fromisoformat(bounds["date_to"]),
+            )
+            await session.commit()
+
+        provenance_metrics = await self._source_provenance_metrics(
+            date_from=date.fromisoformat(bounds["date_from"]),
+            date_to=date.fromisoformat(bounds["date_to"]),
+            kalshi_env=env,
+        )
+
+        trigger = {
+            **metrics,
+            "source_provenance": provenance_metrics,
+            "current_build_id": current.id if current is not None else None,
+            "current_date_to": current.date_to.isoformat() if current is not None else None,
+            "last_promoted_at": last_promoted_at.isoformat() if last_promoted_at is not None else None,
+            "min_new_resolved_rooms": AUTO_PROMOTION_TRIGGER_NEW_RESOLVED_ROOMS,
+            "min_interval_days": AUTO_PROMOTION_MIN_INTERVAL.days,
+        }
+        if last_promoted_at is not None and now - last_promoted_at < AUTO_PROMOTION_MIN_INTERVAL:
+            return {"status": "skipped", "reason": "promotion_interval", "trigger": trigger}
+        if metrics["new_resolved_rooms"] < AUTO_PROMOTION_TRIGGER_NEW_RESOLVED_ROOMS:
+            return {"status": "skipped", "reason": "new_resolved_rooms", "trigger": trigger}
+
+        gates = await self._promotion_gates(
+            kalshi_env=env,
+            now=now,
+            metrics=metrics,
+            excluded_windows=excluded_windows,
+            provenance_metrics=provenance_metrics,
+        )
+        if not gates["ok"]:
+            payload = {
+                "event_kind": "decision_corpus_auto_promotion_failed",
+                "status": "failed",
+                "reason": "promotion_gates_failed",
+                "kalshi_env": env,
+                "trigger": trigger,
+                "gates": gates,
+                "retained_build_id": current.id if current is not None else None,
+            }
+            await self._log_auto_promotion_event(
+                severity="warning",
+                summary=f"Decision corpus auto-promotion failed gates for {env}",
+                payload=payload,
+            )
+            return payload
+
+        try:
+            build_result = await self.build(
+                date_from=date.fromisoformat(bounds["date_from"]),
+                date_to=date.fromisoformat(bounds["date_to"]),
+                source=SOURCE_HISTORICAL_REPLAY,
+                notes=f"nightly_auto_promotion:{env}",
+                parent_build_id=current.id if current is not None else None,
+                kalshi_env=env,
+            )
+            validation = await self.validate_build(build_result["build_id"])
+            if not validation["ok"]:
+                payload = {
+                    "event_kind": "decision_corpus_auto_promotion_failed",
+                    "status": "failed",
+                    "reason": "validation_failed",
+                    "kalshi_env": env,
+                    "trigger": trigger,
+                    "gates": gates,
+                    "build": build_result,
+                    "validation": validation,
+                    "retained_build_id": current.id if current is not None else None,
+                }
+                await self._log_auto_promotion_event(
+                    severity="warning",
+                    summary=f"Decision corpus auto-promotion validation failed for {env}",
+                    payload=payload,
+                )
+                return payload
+            promotion = await self.promote(build_result["build_id"], kalshi_env=env, actor=actor)
+            return {
+                "event_kind": "decision_corpus_auto_promotion_completed",
+                "status": "promoted",
+                "kalshi_env": env,
+                "trigger": trigger,
+                "gates": gates,
+                "build": build_result,
+                "validation": validation,
+                "promotion": promotion,
+            }
+        except Exception as exc:
+            payload = {
+                "event_kind": "decision_corpus_auto_promotion_failed",
+                "status": "failed",
+                "reason": "promotion_error",
+                "error": str(exc),
+                "kalshi_env": env,
+                "trigger": trigger,
+                "gates": gates,
+                "retained_build_id": current.id if current is not None else None,
+            }
+            await self._log_auto_promotion_event(
+                severity="error",
+                summary=f"Decision corpus auto-promotion failed for {env}",
+                payload=payload,
+            )
+            return payload
+
     async def current(self, *, kalshi_env: str) -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -288,7 +519,223 @@ class DecisionCorpusService:
                 return {"status": "missing", "kalshi_env": kalshi_env, "build": None}
             return {"status": "ok", "kalshi_env": kalshi_env, "build": self._build_to_dict(build)}
 
-    async def _build_candidate_rows(self, *, date_from: date, date_to: date) -> list[dict[str, Any]]:
+    async def _promotion_gates(
+        self,
+        *,
+        kalshi_env: str,
+        now: datetime,
+        metrics: dict[str, Any],
+        excluded_windows: list[dict[str, Any]],
+        provenance_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        audit_unavailable: str | None = None
+        try:
+            audit_report = await self.trading_audit_service.build_report(
+                kalshi_env=kalshi_env,
+                days=7,
+                focus="money-safety",
+                now=now,
+            )
+        except Exception as exc:
+            audit_report = {}
+            audit_unavailable = str(exc)
+        total_fills = int(audit_report.get("fill_summary", {}).get("total_fills") or 0)
+        missing_fills = int(audit_report.get("attribution", {}).get("missing_fill_strategy_count") or 0)
+        strategy_code_attribution = 1.0 if total_fills == 0 else (total_fills - missing_fills) / total_fills
+        audit_blockers = [
+            {
+                "severity": issue.get("severity"),
+                "code": issue.get("code"),
+                "summary": issue.get("summary"),
+            }
+            for issue in audit_report.get("issues", [])
+            if str(issue.get("severity") or "").lower() in {"critical", "high"}
+            and issue.get("code") not in ATTRIBUTION_AUDIT_CODES
+        ]
+        if audit_unavailable is not None:
+            audit_blockers.append(
+                {
+                    "severity": "high",
+                    "code": "trading_audit_unavailable",
+                    "summary": audit_unavailable,
+                }
+            )
+        if provenance_metrics is None:
+            provenance_metrics = {
+                "total_rows": int(metrics.get("resolved_rooms") or 0),
+                "allowed_rows": int(metrics.get("resolved_rooms") or 0),
+                "disallowed_rows": 0,
+                "by_source_provenance": {},
+                "disallowed_by_source_provenance": {},
+                "not_evaluated": True,
+            }
+        checks = {
+            "resolved_rooms": {
+                "ok": metrics["resolved_rooms"] >= AUTO_PROMOTION_MIN_RESOLVED_ROOMS,
+                "actual": metrics["resolved_rooms"],
+                "minimum": AUTO_PROMOTION_MIN_RESOLVED_ROOMS,
+            },
+            "settlement_coverage": {
+                "ok": metrics["settlement_coverage"] >= AUTO_PROMOTION_MIN_SETTLEMENT_COVERAGE,
+                "actual": metrics["settlement_coverage"],
+                "minimum": AUTO_PROMOTION_MIN_SETTLEMENT_COVERAGE,
+            },
+            "strategy_code_attribution": {
+                "ok": strategy_code_attribution >= AUTO_PROMOTION_MIN_STRATEGY_CODE_ATTRIBUTION,
+                "actual": strategy_code_attribution,
+                "minimum": AUTO_PROMOTION_MIN_STRATEGY_CODE_ATTRIBUTION,
+                "total_fills": total_fills,
+                "missing_fill_strategy_count": missing_fills,
+            },
+            "excluded_date_windows": {
+                "ok": not excluded_windows,
+                "windows": excluded_windows,
+            },
+            "source_provenance": {
+                "ok": provenance_metrics["total_rows"] > 0 and provenance_metrics["disallowed_rows"] == 0,
+                **provenance_metrics,
+                "allowed": sorted(AUTO_PROMOTION_ALLOWED_SOURCE_PROVENANCE),
+            },
+            "audit_blockers": {
+                "ok": not audit_blockers,
+                "blockers": audit_blockers,
+            },
+        }
+        failed = [name for name, check in checks.items() if not check["ok"]]
+        return {"ok": not failed, "failed": failed, "checks": checks}
+
+    async def _excluded_date_windows(
+        self,
+        repo: PlatformRepository,
+        *,
+        kalshi_env: str,
+        date_from: date,
+        date_to: date,
+    ) -> list[dict[str, Any]]:
+        checkpoint = await repo.get_checkpoint(f"decision_corpus_excluded_date_windows:{kalshi_env}")
+        payload = checkpoint.payload if checkpoint is not None and isinstance(checkpoint.payload, dict) else {}
+        candidates = payload.get("windows") if isinstance(payload.get("windows"), list) else []
+        overlaps: list[dict[str, Any]] = []
+        for start, end in self._configured_excluded_date_ranges():
+            if start <= date_to and end >= date_from:
+                overlaps.append(
+                    {
+                        "date_from": start.isoformat(),
+                        "date_to": end.isoformat(),
+                        "reason": "strategy_corpus_excluded_date_ranges",
+                    }
+                )
+        for item in candidates:
+            if not isinstance(item, dict) or item.get("active") is False:
+                continue
+            start = self._date_from_window_value(item.get("date_from") or item.get("start"))
+            end = self._date_from_window_value(item.get("date_to") or item.get("end")) or start
+            if start is None or end is None:
+                continue
+            if start <= date_to and end >= date_from:
+                overlaps.append(
+                    {
+                        "date_from": start.isoformat(),
+                        "date_to": end.isoformat(),
+                        "reason": item.get("reason"),
+                    }
+                )
+        return overlaps
+
+    def _configured_excluded_date_ranges(self) -> list[tuple[date, date]]:
+        ranges: list[tuple[date, date]] = []
+        raw = self.settings.strategy_corpus_excluded_date_ranges.strip()
+        if not raw:
+            return ranges
+        for raw_range in raw.split(","):
+            start_raw, end_raw = [part.strip() for part in raw_range.strip().split("/", 1)]
+            ranges.append((date.fromisoformat(start_raw), date.fromisoformat(end_raw)))
+        return ranges
+
+    async def _source_provenance_metrics(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        kalshi_env: str,
+    ) -> dict[str, Any]:
+        rows = await self._build_candidate_rows(date_from=date_from, date_to=date_to, kalshi_env=kalshi_env)
+        by_source: dict[str, int] = defaultdict(int)
+        for row in rows:
+            by_source[str(row.get("source_provenance") or "unknown")] += 1
+        disallowed = {
+            source: count
+            for source, count in sorted(by_source.items())
+            if source not in AUTO_PROMOTION_ALLOWED_SOURCE_PROVENANCE
+        }
+        allowed_rows = sum(
+            count for source, count in by_source.items() if source in AUTO_PROMOTION_ALLOWED_SOURCE_PROVENANCE
+        )
+        return {
+            "total_rows": len(rows),
+            "allowed_rows": allowed_rows,
+            "disallowed_rows": sum(disallowed.values()),
+            "by_source_provenance": dict(sorted(by_source.items())),
+            "disallowed_by_source_provenance": disallowed,
+        }
+
+    async def _log_auto_promotion_event(self, *, severity: str, summary: str, payload: dict[str, Any]) -> None:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            await repo.log_ops_event(
+                severity=severity,
+                summary=summary,
+                source="decision_corpus",
+                kalshi_env=payload.get("kalshi_env"),
+                payload=payload,
+            )
+            await session.commit()
+
+    @staticmethod
+    def _build_kalshi_envs(source: dict[str, Any], filters: dict[str, Any]) -> set[str]:
+        envs: set[str] = set()
+        for payload in (source, filters):
+            value = payload.get("kalshi_env") if isinstance(payload, dict) else None
+            if value not in (None, ""):
+                envs.add(str(value))
+        return envs
+
+    @staticmethod
+    def _date_from_window_value(value: Any) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if value in (None, ""):
+            return None
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _last_promoted_at(checkpoint: Any | None, current: Any | None) -> datetime | None:
+        payload = checkpoint.payload if checkpoint is not None and isinstance(checkpoint.payload, dict) else {}
+        promoted_at = _as_datetime(payload.get("promoted_at"))
+        if promoted_at is not None:
+            return promoted_at
+        for value in (
+            getattr(current, "finished_at", None),
+            getattr(current, "updated_at", None),
+            getattr(current, "created_at", None),
+        ):
+            parsed = _as_datetime(value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    async def _build_candidate_rows(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        kalshi_env: str | None = None,
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -296,6 +743,7 @@ class DecisionCorpusService:
                 date_from=date_from.isoformat(),
                 date_to=date_to.isoformat(),
                 status="completed",
+                kalshi_env=kalshi_env,
                 limit=1_000_000,
             )
             for run in runs:

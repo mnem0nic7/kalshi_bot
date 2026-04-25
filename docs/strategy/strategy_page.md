@@ -148,14 +148,14 @@ Daily cadence:
 4. It builds the dashboard snapshot and runs both AI modes: `evaluate` and `suggest`.
 5. If the suggestion run completes and its deterministic backtest has `status="ok"`, the existing accept logic saves the preset into `strategies`.
 6. If activation is enabled, the saved preset is immediately activated.
-7. The service rebuilds the 180d dashboard and assigns every `approval_eligible=true` city to the current recommendation, including drifted and unassigned cities.
-8. It records a single `ops_events` row and updates the checkpoint.
+7. If assignment is enabled, the service rebuilds the 180d dashboard, applies the hard safety filters, ranks eligible cities, and writes at most `STRATEGY_AUTO_EVOLVE_MAX_CITIES_PER_CYCLE` assignments.
+8. It records the run outcome, assignment changes/skips, and any promotion watchdog metadata.
 
 Checkpoint names:
 
 | Checkpoint | Purpose |
 |------------|---------|
-| `daemon_strategy_auto_evolve:{kalshi_env}:{app_color}` | Auto-Evolve run status, run IDs, accepted/activated strategy, provider/model, assignment changes, skips, and errors |
+| `daemon_strategy_auto_evolve:{kalshi_env}` | Auto-Evolve run status, run IDs, accepted/activated strategy, provider/model, assignment changes, skips, and errors |
 | `strategy_regression` | Latest regression refresh used as the 180d evidence base |
 | `daemon_strategy_codex_nightly:{kalshi_env}:{app_color}` | Legacy nightly Codex checkpoint when Auto-Evolve is disabled |
 
@@ -164,10 +164,12 @@ Default settings:
 ```
 STRATEGY_AUTO_EVOLVE_ENABLED=true
 STRATEGY_AUTO_EVOLVE_WINDOW_DAYS=180
-STRATEGY_AUTO_EVOLVE_ASSIGN_ELIGIBLE=true
 STRATEGY_AUTO_EVOLVE_ACCEPT_SUGGESTIONS=true
-STRATEGY_AUTO_EVOLVE_ACTIVATE_SUGGESTIONS=true
+STRATEGY_AUTO_EVOLVE_ACTIVATE_SUGGESTIONS=false
+STRATEGY_AUTO_EVOLVE_ASSIGN_ELIGIBLE=false
 ```
+
+That default is staged-only: suggestions may be evaluated and accepted as inactive presets, but activation and city assignment stay off until the remaining safety gates are explicitly verified.
 
 Provider precedence is Gemini first, then OpenAI when available. Gemini requires `GEMINI_API_KEY` or `GEMINI_KEY`; OpenAI requires `OPENAI_API_KEY` or `LLM_HOSTED_API_KEY`. If no provider is available, Auto-Evolve writes a skipped checkpoint and does not mutate strategies or assignments.
 
@@ -177,7 +179,9 @@ Automatic mutations:
 |---------|----------|
 | `strategy_codex_runs` | Stores nightly `evaluate` and `suggest` runs |
 | `strategies` | Stores accepted AI-suggested presets and active status |
-| `city_strategy_assignments` | Writes canonical city assignments with `assigned_by="auto_evolve"` |
+| `city_strategy_assignments` | Writes canonical city assignments with `assigned_by="auto_evolve"` only when assignment is enabled and all gates pass |
+| `strategy_promotions` | Records assignment batches, watchdog state, rollback snapshots, and secondary sync state |
+| `city_assignment_events` | Audits auto-evolve assignments, manual overrides, and watchdog rollbacks |
 | `ops_events` | Summarizes each Auto-Evolve run |
 
 The flow is idempotent by local date: rerunning after a completed same-day run refreshes the Auto-Evolve checkpoint but does not duplicate accepted strategies or rewrite already matching assignments.
@@ -200,7 +204,7 @@ Failure modes:
 
 ### Nightly Evaluation
 
-When `STRATEGY_CODEX_NIGHTLY_ENABLED=true`, the daemon enters the nightly strategy window defined by `STRATEGY_CODEX_NIGHTLY_TIMEZONE` and `STRATEGY_CODEX_NIGHTLY_HOUR_LOCAL`. With Auto-Evolve enabled, that nightly path delegates to `StrategyAutoEvolveService` and writes `daemon_strategy_auto_evolve:{kalshi_env}:{app_color}`. With Auto-Evolve disabled, it falls back to the legacy Codex-only checkpoint `daemon_strategy_codex_nightly:{kalshi_env}:{app_color}`.
+When `STRATEGY_CODEX_NIGHTLY_ENABLED=true`, the daemon enters the nightly strategy window defined by `STRATEGY_CODEX_NIGHTLY_TIMEZONE` and `STRATEGY_CODEX_NIGHTLY_HOUR_LOCAL`. With Auto-Evolve enabled, that nightly path delegates to `StrategyAutoEvolveService` and writes `daemon_strategy_auto_evolve:{kalshi_env}`. With Auto-Evolve disabled, it falls back to the legacy Codex-only checkpoint `daemon_strategy_codex_nightly:{kalshi_env}:{app_color}`.
 
 ---
 

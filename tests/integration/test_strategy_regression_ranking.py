@@ -18,6 +18,7 @@ from kalshi_bot.db.session import create_engine, create_session_factory, init_mo
 from kalshi_bot.services.strategy_regression_ranking import (
     RANKING_VERSION,
     StrategyRegressionRankingReportService,
+    promotion_quality_recommendation_decision,
     _rank_rows,
 )
 
@@ -286,6 +287,46 @@ def test_rank_rows_orders_by_sortino_not_display_win_rate() -> None:
     )
 
     assert ranked[0]["strategy_name"] == "low_win_high_sortino"
+
+
+def test_promotion_quality_recommendation_uses_sortino_candidate_not_win_rate() -> None:
+    decision = promotion_quality_recommendation_decision(
+        results_by_strategy={
+            "high_win_low_sortino": {
+                "ranking_version": RANKING_VERSION,
+                "strategy_name": "high_win_low_sortino",
+                "series_ticker": "KX",
+                "sortino": 0.2,
+                "cluster_count": 40,
+                "total_net_pnl_dollars": 8.0,
+                "win_rate": 0.95,
+                "resolved_trade_count": 40,
+                "trade_count": 40,
+                "promotion_candidate": False,
+                "below_support_floor": False,
+                "insufficient_for_ranking": False,
+            },
+            "low_win_high_sortino": {
+                "ranking_version": RANKING_VERSION,
+                "strategy_name": "low_win_high_sortino",
+                "series_ticker": "KX",
+                "sortino": 1.5,
+                "cluster_count": 40,
+                "total_net_pnl_dollars": 4.0,
+                "win_rate": 0.35,
+                "resolved_trade_count": 40,
+                "trade_count": 40,
+                "promotion_candidate": True,
+                "below_support_floor": False,
+                "insufficient_for_ranking": False,
+            },
+        },
+        current_name=None,
+    )
+
+    assert decision["recommendation"]["strategy_name"] == "low_win_high_sortino"
+    assert decision["recommendation"]["status"] == "strong_recommendation"
+    assert decision["quality_gap_to_runner_up"] == pytest.approx(1.3)
 
 
 def test_win_rate_is_display_only_not_rank_key_logic() -> None:

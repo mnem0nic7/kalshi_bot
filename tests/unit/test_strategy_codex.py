@@ -188,6 +188,55 @@ def test_strategy_codex_json_safe_normalizes_decimal_payloads() -> None:
     assert decoded["backtest"]["strongest_cities"][0]["total_pnl_dollars"] == 0.75
 
 
+def test_decision_corpus_backtest_summary_stamps_corpus_and_assignment_baseline() -> None:
+    service = object.__new__(StrategyCodexService)
+
+    summary = service._summarize_decision_corpus_backtest(
+        evaluation={
+            "status": "ok",
+            "corpus_build_id": "corpus-1",
+            "row_count": 30,
+            "leaderboard": [
+                {
+                    "strategy_name": "candidate",
+                    "win_rate": 0.60,
+                    "total_rows_contributing": 12,
+                    "total_net_pnl_dollars": 3.5,
+                },
+                {"strategy_name": "incumbent", "win_rate": 0.50, "total_rows_contributing": 10},
+            ],
+            "city_results": {
+                "KXHIGHNY": [
+                    {"strategy_name": "candidate", "win_rate": 0.60, "total_rows_contributing": 12},
+                    {"strategy_name": "incumbent", "win_rate": 0.50, "total_rows_contributing": 10},
+                ]
+            },
+            "result_rows": [
+                {"strategy_name": "candidate", "series_ticker": "KXHIGHNY"},
+                {"strategy_name": "incumbent", "series_ticker": "KXHIGHNY"},
+            ],
+            "diagnostics": {"total_corpus_rows": 30},
+        },
+        candidate_name="candidate",
+        snapshot={
+            "city_matrix": [
+                {
+                    "series_ticker": "KXHIGHNY",
+                    "assignment": {"strategy_name": "incumbent"},
+                }
+            ]
+        },
+        compare_strategy_name=None,
+    )
+
+    assert summary["corpus_build_id"] == "corpus-1"
+    assert summary["resolved_regression_rooms"] == 30
+    assert summary["candidate_hypothetical_trades"] == 12
+    assert summary["candidate_metrics"]["assignment_weighted_win_rate"] == pytest.approx(0.60)
+    assert summary["assignment_weighted_baseline"]["assignment_weighted_win_rate"] == pytest.approx(0.50)
+    assert summary["assignment_weighted_baseline"]["corpus_build_id"] == "corpus-1"
+
+
 @pytest.mark.asyncio
 async def test_strategy_codex_create_run_persists_selected_provider_and_model(tmp_path) -> None:
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-codex-provider.db")

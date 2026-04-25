@@ -18,6 +18,7 @@ from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.historical_training import HistoricalTrainingService
 from kalshi_bot.services.historical_intelligence import HistoricalIntelligenceService
 from kalshi_bot.services.historical_pipeline import HistoricalPipelineService
+from kalshi_bot.services.decision_corpus import DecisionCorpusService
 from kalshi_bot.services.market_history import MarketHistoryService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
@@ -68,6 +69,7 @@ class DaemonService:
         strategy_dashboard_service: StrategyDashboardService | None = None,
         strategy_auto_evolve_service: StrategyAutoEvolveService | None = None,
         momentum_calibration_service: MomentumCalibrationService | None = None,
+        decision_corpus_service: DecisionCorpusService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -93,6 +95,7 @@ class DaemonService:
         self.strategy_dashboard_service = strategy_dashboard_service
         self.strategy_auto_evolve_service = strategy_auto_evolve_service
         self.momentum_calibration_service = momentum_calibration_service
+        self.decision_corpus_service = decision_corpus_service
         self.stop_loss_service = stop_loss_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
@@ -349,6 +352,12 @@ class DaemonService:
             strategy_regression = await self._maybe_run_strategy_regression()
             if strategy_regression is not None:
                 payload["strategy_regression"] = strategy_regression
+            strategy_promotion_watchdog = await self._maybe_run_strategy_promotion_watchdog()
+            if strategy_promotion_watchdog is not None:
+                payload["strategy_promotion_watchdog"] = strategy_promotion_watchdog
+            decision_corpus_promotion = await self._maybe_run_decision_corpus_promotion()
+            if decision_corpus_promotion is not None:
+                payload["decision_corpus_promotion"] = decision_corpus_promotion
             strategy_codex_nightly = await self._maybe_run_strategy_codex_nightly()
             if strategy_codex_nightly is not None:
                 if strategy_codex_nightly.get("mode") == "auto_evolve":
@@ -548,6 +557,18 @@ class DaemonService:
             await session.commit()
         return result
 
+    async def _maybe_run_decision_corpus_promotion(self) -> dict[str, Any] | None:
+        if self.decision_corpus_service is None:
+            return None
+        try:
+            return await self.decision_corpus_service.nightly_auto_promote(
+                kalshi_env=self.settings.kalshi_env,
+                actor=f"daemon:{self.settings.app_color}",
+            )
+        except Exception:
+            logger.warning("decision corpus auto-promotion failed", exc_info=True)
+            return None
+
     async def _maybe_run_strategy_regression(self) -> dict[str, Any] | None:
         if self.strategy_regression_service is None:
             return None
@@ -560,6 +581,15 @@ class DaemonService:
             return await self.strategy_regression_service.run_regression()
         except Exception:
             logger.warning("strategy_regression failed", exc_info=True)
+            return None
+
+    async def _maybe_run_strategy_promotion_watchdog(self) -> dict[str, Any] | None:
+        if self.strategy_auto_evolve_service is None:
+            return None
+        try:
+            return await self.strategy_auto_evolve_service.run_promotion_watchdog_once(trigger_source="nightly")
+        except Exception:
+            logger.warning("strategy promotion watchdog failed", exc_info=True)
             return None
 
     async def _maybe_run_strategy_codex_nightly(self) -> dict[str, Any] | None:

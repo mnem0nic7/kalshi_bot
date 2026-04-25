@@ -445,17 +445,36 @@ async def _seed_strategy_fixture(container: container_module.AppContainer) -> St
 
     async with container.session_factory() as session:
         repo = PlatformRepository(session)
+        corpus = await repo.create_decision_corpus_build(
+            version="strategy-e2e-corpus",
+            date_from=(FIXTURE_NOW - timedelta(days=180)).date(),
+            date_to=FIXTURE_NOW.date(),
+            source={"kind": "browser-fixture"},
+            filters={},
+        )
+        await repo.mark_decision_corpus_build_successful(corpus.id, row_count=len(latest_rows))
+        await repo.promote_decision_corpus_build(
+            corpus.id,
+            kalshi_env=container.settings.kalshi_env,
+            actor="browser-fixture",
+        )
+        latest_rows = [{**row, "corpus_build_id": corpus.id} for row in latest_rows]
+        history_rows = [{**row, "corpus_build_id": corpus.id} for row in history_rows]
         await repo.save_strategy_results(history_rows)
         await repo.save_strategy_results(latest_rows)
         await repo.set_city_strategy_assignment(
             fixture.approved_series_ticker,
             fixture.previous_strategy_name,
             assigned_by="auto_regression",
+            evidence_corpus_build_id=corpus.id,
+            evidence_run_at=FIXTURE_NOW,
         )
         await repo.set_city_strategy_assignment(
             fixture.aligned_series_ticker,
             fixture.approved_strategy_name,
             assigned_by="auto_regression",
+            evidence_corpus_build_id=corpus.id,
+            evidence_run_at=FIXTURE_NOW,
         )
         await repo.set_checkpoint(
             "strategy_regression",

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from kalshi_bot.config import Settings
 
 
@@ -66,3 +68,79 @@ def test_gemini_key_alias_is_accepted(monkeypatch) -> None:
     settings = Settings()
 
     assert settings.gemini_api_key == "alias-key"
+
+
+def test_auto_evolve_gate_settings_have_safe_defaults() -> None:
+    settings = Settings()
+
+    assert settings.strategy_auto_evolve_min_improvement_bps == 100
+    assert settings.strategy_auto_evolve_min_city_improvement_bps == 100
+    assert settings.strategy_auto_evolve_max_regression_bps == 50
+    assert settings.strategy_auto_evolve_max_run_age_seconds == 172800
+    assert settings.strategy_auto_evolve_min_corpus_rows == 500
+    assert settings.strategy_auto_evolve_min_corpus_cities == 3
+    assert settings.strategy_auto_evolve_min_city_rows == 25
+    assert settings.strategy_auto_evolve_cooldown_seconds == 86400
+    assert settings.strategy_auto_evolve_greenfield_enabled is False
+    assert settings.strategy_auto_evolve_reference_strategy_name is None
+    assert settings.strategy_auto_evolve_reference_run_id is None
+
+
+def test_auto_evolve_activate_requires_accept_suggestions() -> None:
+    with pytest.raises(ValueError, match="accept_suggestions"):
+        Settings(
+            strategy_auto_evolve_accept_suggestions=False,
+            strategy_auto_evolve_activate_suggestions=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("strategy_auto_evolve_min_improvement_bps", -1),
+        ("strategy_auto_evolve_max_regression_bps", -1),
+        ("strategy_auto_evolve_max_run_age_seconds", 0),
+        ("strategy_auto_evolve_min_corpus_rows", -1),
+        ("strategy_auto_evolve_min_corpus_cities", -1),
+        ("strategy_auto_evolve_min_city_rows", -1),
+        ("strategy_auto_evolve_cooldown_seconds", -1),
+        ("strategy_auto_evolve_max_cities_per_cycle", -1),
+    ],
+)
+def test_auto_evolve_gate_settings_validate_ranges(field_name: str, value: int) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        Settings(**{field_name: value})
+
+
+def test_auto_evolve_threshold_delta_pct_is_bounded() -> None:
+    with pytest.raises(ValueError, match="strategy_auto_evolve_max_threshold_delta_pct"):
+        Settings(strategy_auto_evolve_max_threshold_delta_pct=1.01)
+
+
+def test_auto_evolve_reference_settings_are_stripped() -> None:
+    settings = Settings(
+        strategy_auto_evolve_reference_strategy_name="  baseline  ",
+        strategy_auto_evolve_reference_run_id="  run-123  ",
+    )
+
+    assert settings.strategy_auto_evolve_reference_strategy_name == "baseline"
+    assert settings.strategy_auto_evolve_reference_run_id == "run-123"
+
+
+def test_strategy_corpus_excluded_date_ranges_are_validated() -> None:
+    settings = Settings(strategy_corpus_excluded_date_ranges=" 2026-04-19/2026-04-23 ")
+
+    assert settings.strategy_corpus_excluded_date_ranges == "2026-04-19/2026-04-23"
+
+
+@pytest.mark.parametrize(
+    "raw_ranges",
+    [
+        "2026-04-19",
+        "2026-04-23/2026-04-19",
+        "not-a-date/2026-04-19",
+    ],
+)
+def test_strategy_corpus_excluded_date_ranges_reject_invalid_values(raw_ranges: str) -> None:
+    with pytest.raises(ValueError, match="strategy_corpus_excluded_date_ranges"):
+        Settings(strategy_corpus_excluded_date_ranges=raw_ranges)

@@ -154,6 +154,8 @@ def _strategy_assignment_payload(
             "window_display": "180d",
             "window_options": [30, 90, 180],
             "source_mode": "stored_snapshot",
+            "corpus_build_id": "corpus-1",
+            "decision_corpus_available": True,
             "recommendation_mode": "recommendation_only",
             "manual_approval_enabled": True,
             "approval_window_days": 180,
@@ -688,6 +690,7 @@ def test_approve_strategy_assignment_creates_assignment_and_audit_event(tmp_path
             json={
                 "expected_strategy_name": "moderate",
                 "expected_recommendation_status": "strong_recommendation",
+                "expected_corpus_build_id": "corpus-1",
                 "note": "Approving the current winner after reviewing the latest 180d evidence.",
             },
         )
@@ -734,6 +737,7 @@ def test_approve_strategy_assignment_replaces_existing_assignment(tmp_path, monk
             json={
                 "expected_strategy_name": "moderate",
                 "expected_recommendation_status": "strong_recommendation",
+                "expected_corpus_build_id": "corpus-1",
                 "note": "Replacing the older assignment with the current approved winner.",
             },
         )
@@ -770,6 +774,7 @@ def test_approve_strategy_assignment_rejects_stale_recommendation(tmp_path, monk
             json={
                 "expected_strategy_name": "aggressive",
                 "expected_recommendation_status": "strong_recommendation",
+                "expected_corpus_build_id": "corpus-1",
                 "note": "This should fail because the strategy changed.",
             },
         )
@@ -808,6 +813,7 @@ def test_approve_strategy_assignment_rejects_ineligible_status(tmp_path, monkeyp
             json={
                 "expected_strategy_name": "moderate",
                 "expected_recommendation_status": "low_sample",
+                "expected_corpus_build_id": "corpus-1",
                 "note": "This should not be approvable.",
             },
         )
@@ -841,6 +847,7 @@ def test_approve_strategy_assignment_requires_note(tmp_path, monkeypatch) -> Non
             json={
                 "expected_strategy_name": "moderate",
                 "expected_recommendation_status": "strong_recommendation",
+                "expected_corpus_build_id": "corpus-1",
                 "note": "   ",
             },
         )

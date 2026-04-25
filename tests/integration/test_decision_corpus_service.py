@@ -5,11 +5,13 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, DeploymentColor, RoomOrigin, TradeAction
 from kalshi_bot.core.schemas import RoomCreate, TradeTicket
 from kalshi_bot.db.models import DecisionCorpusRowRecord
+from kalshi_bot.db.models import OpsEvent
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.decision_corpus import DecisionCorpusService
@@ -45,15 +47,16 @@ async def _seed_historical_decision(
     settlement_result: str | None = "yes",
     coverage_class: str = "full_checkpoint_coverage",
     source_kind: str = "checkpoint_archive",
+    kalshi_env: str = "demo",
 ) -> str:
     async with session_factory() as session:
-        repo = PlatformRepository(session, kalshi_env="demo")
+        repo = PlatformRepository(session, kalshi_env=kalshi_env)
         room = await repo.create_room(
             RoomCreate(name=f"Replay {market_ticker}", market_ticker=market_ticker),
             active_color=DeploymentColor.BLUE.value,
             shadow_mode=True,
             kill_switch_enabled=False,
-            kalshi_env="demo",
+            kalshi_env=kalshi_env,
             room_origin=RoomOrigin.HISTORICAL_REPLAY.value,
             agent_pack_version="model-v1",
         )
@@ -154,6 +157,27 @@ async def _seed_historical_decision(
         return room.id
 
 
+async def _seed_historical_decisions(
+    session_factory,
+    *,
+    count: int,
+    start_day: date,
+    ticker_prefix: str = "KXHIGHNY",
+    kalshi_env: str = "demo",
+    coverage_class: str = "full_checkpoint_coverage",
+) -> None:
+    for idx in range(count):
+        day = start_day.fromordinal(start_day.toordinal() + idx)
+        await _seed_historical_decision(
+            session_factory,
+            market_ticker=f"{ticker_prefix}-26{day.month:02d}{day.day:02d}-T{idx:03d}",
+            local_market_day=day.isoformat(),
+            checkpoint_ts=datetime(day.year, day.month, day.day, 17, 0, tzinfo=UTC),
+            kalshi_env=kalshi_env,
+            coverage_class=coverage_class,
+        )
+
+
 @pytest.mark.asyncio
 async def test_build_creates_rows_with_pnl_nulls_support_and_provenance(tmp_path) -> None:
     harness = await _setup(tmp_path)
@@ -234,6 +258,36 @@ async def test_build_creates_rows_with_pnl_nulls_support_and_provenance(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_build_filters_historical_replay_rows_by_kalshi_env(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-DEMO",
+        kalshi_env="demo",
+    )
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26APR20-LIVE",
+        kalshi_env="live",
+        checkpoint_ts=datetime(2026, 4, 20, 17, 1, tzinfo=UTC),
+    )
+
+    result = await harness.service.build(
+        date_from=date(2026, 4, 20),
+        date_to=date(2026, 4, 20),
+        kalshi_env="demo",
+    )
+
+    assert result["row_count"] == 1
+    async with harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        rows = await repo.list_decision_corpus_rows(build_id=result["build_id"])
+
+    assert [row.market_ticker for row in rows] == ["KXHIGHNY-26APR20-DEMO"]
+    assert {row.kalshi_env for row in rows} == {"demo"}
+
+
+@pytest.mark.asyncio
 async def test_dry_run_is_deterministic_and_does_not_write_build_rows(tmp_path) -> None:
     harness = await _setup(tmp_path)
     await _seed_historical_decision(
@@ -294,12 +348,21 @@ async def test_build_rows_are_append_only_after_completion(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_promote_pointer_is_env_scoped_and_current_rows_follow_pointer(tmp_path) -> None:
     harness = await _setup(tmp_path)
-    await _seed_historical_decision(
+    await _seed_historical_decisions(
         harness.session_factory,
-        market_ticker="KXHIGHNY-26APR20-T80",
+        count=30,
+        start_day=date(2026, 3, 1),
+        ticker_prefix="KXHIGHDEMO",
     )
-    first = await harness.service.build(date_from=date(2026, 4, 20), date_to=date(2026, 4, 20))
-    second = await harness.service.build(date_from=date(2026, 4, 20), date_to=date(2026, 4, 20))
+    await _seed_historical_decisions(
+        harness.session_factory,
+        count=30,
+        start_day=date(2026, 3, 1),
+        ticker_prefix="KXHIGHLIVE",
+        kalshi_env="live",
+    )
+    first = await harness.service.build(date_from=date(2026, 3, 1), date_to=date(2026, 3, 30), kalshi_env="demo")
+    second = await harness.service.build(date_from=date(2026, 3, 1), date_to=date(2026, 3, 30), kalshi_env="live")
 
     assert (await harness.service.current(kalshi_env="demo"))["status"] == "missing"
     await harness.service.promote(first["build_id"], kalshi_env="demo", actor="test")
@@ -317,10 +380,215 @@ async def test_promote_pointer_is_env_scoped_and_current_rows_follow_pointer(tmp
     assert {row.corpus_build_id for row in demo_rows} == {first["build_id"]}
     assert {row.corpus_build_id for row in live_rows} == {second["build_id"]}
 
-    rollback = await harness.service.promote(first["build_id"], kalshi_env="live", actor="test")
-    assert rollback["previous_build_id"] == second["build_id"]
-    with pytest.raises(ValueError, match="already current"):
+    with pytest.raises(ValueError, match="kalshi_env_mismatch"):
         await harness.service.promote(first["build_id"], kalshi_env="live", actor="test")
+    with pytest.raises(ValueError, match="already current"):
+        await harness.service.promote(first["build_id"], kalshi_env="demo", actor="test")
+
+
+@pytest.mark.asyncio
+async def test_nightly_auto_promote_builds_and_promotes_when_triggers_and_gates_pass(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decisions(
+        harness.session_factory,
+        count=50,
+        start_day=date(2026, 3, 1),
+    )
+    await _seed_historical_decisions(
+        harness.session_factory,
+        count=3,
+        start_day=date(2026, 3, 1),
+        ticker_prefix="KXHIGHLIVE",
+        kalshi_env="live",
+    )
+
+    result = await harness.service.nightly_auto_promote(
+        kalshi_env="demo",
+        now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC),
+    )
+
+    assert result["status"] == "promoted"
+    assert result["trigger"]["new_resolved_rooms"] == 50
+    assert result["gates"]["ok"] is True
+    assert result["build"]["row_count"] == 50
+
+    current = await harness.service.current(kalshi_env="demo")
+    assert current["status"] == "ok"
+    assert current["build"]["id"] == result["build"]["build_id"]
+    async with harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        rows = await repo.list_current_decision_corpus_rows(kalshi_env="demo")
+    assert len(rows) == 50
+    assert {row.kalshi_env for row in rows} == {"demo"}
+
+
+@pytest.mark.asyncio
+async def test_nightly_auto_promotion_rejects_non_full_replay_provenance(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decisions(
+        harness.session_factory,
+        count=50,
+        start_day=date(2026, 3, 1),
+        ticker_prefix="KXHIGHPARTIAL",
+        coverage_class="partial_checkpoint_coverage",
+    )
+
+    result = await harness.service.nightly_auto_promote(
+        kalshi_env="demo",
+        now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC),
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "promotion_gates_failed"
+    assert result["gates"]["failed"] == ["source_provenance"]
+    assert result["gates"]["checks"]["source_provenance"]["disallowed_rows"] == 50
+    assert result["gates"]["checks"]["source_provenance"]["disallowed_by_source_provenance"] == {
+        "historical_replay_partial_checkpoint": 50
+    }
+    assert (await harness.service.current(kalshi_env="demo"))["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_nightly_auto_promotion_gate_failure_retains_current_corpus_and_logs_event(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    async with harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        current = await repo.create_decision_corpus_build(
+            version="current-fixture",
+            date_from=date(2026, 2, 1),
+            date_to=date(2026, 2, 28),
+            source={"type": "fixture"},
+            filters={},
+        )
+        await repo.mark_decision_corpus_build_successful(current.id, row_count=0)
+        await repo.set_checkpoint(
+            repo.decision_corpus_current_checkpoint_name(kalshi_env="demo"),
+            current.id,
+            {
+                "build_id": current.id,
+                "kalshi_env": "demo",
+                "promoted_at": "2026-03-01T00:00:00+00:00",
+            },
+        )
+        await repo.set_checkpoint(
+            "decision_corpus_excluded_date_windows:demo",
+            None,
+            {
+                "windows": [
+                    {
+                        "date_from": "2026-03-15",
+                        "date_to": "2026-03-16",
+                        "reason": "bad source archive",
+                    }
+                ]
+            },
+        )
+        await session.commit()
+
+    await _seed_historical_decisions(
+        harness.session_factory,
+        count=50,
+        start_day=date(2026, 3, 1),
+        ticker_prefix="KXHIGHCHI",
+    )
+
+    result = await harness.service.nightly_auto_promote(
+        kalshi_env="demo",
+        now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC),
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "promotion_gates_failed"
+    assert result["retained_build_id"] == current.id
+    assert result["gates"]["failed"] == ["excluded_date_windows"]
+
+    after = await harness.service.current(kalshi_env="demo")
+    assert after["build"]["id"] == current.id
+    async with harness.session_factory() as session:
+        events = list(
+            (
+                await session.execute(
+                    select(OpsEvent)
+                    .where(OpsEvent.source == "decision_corpus")
+                    .order_by(OpsEvent.created_at.desc())
+                )
+            ).scalars()
+        )
+    assert events[0].severity == "warning"
+    assert events[0].payload["event_kind"] == "decision_corpus_auto_promotion_failed"
+
+
+@pytest.mark.asyncio
+async def test_manual_promotion_rejects_excluded_window_overlap(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decisions(
+        harness.session_factory,
+        count=30,
+        start_day=date(2026, 3, 1),
+        ticker_prefix="KXHIGHMANUAL",
+        kalshi_env="demo",
+    )
+    build = await harness.service.build(
+        date_from=date(2026, 3, 1),
+        date_to=date(2026, 3, 30),
+        kalshi_env="demo",
+    )
+    async with harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.set_checkpoint(
+            "decision_corpus_excluded_date_windows:demo",
+            None,
+            {
+                "windows": [
+                    {
+                        "date_from": "2026-03-15",
+                        "date_to": "2026-03-16",
+                        "reason": "bad source archive",
+                    }
+                ]
+            },
+        )
+        await session.commit()
+
+    with pytest.raises(ValueError, match="excluded_date_windows"):
+        await harness.service.promote(build["build_id"], kalshi_env="demo", actor="test")
+
+    assert (await harness.service.current(kalshi_env="demo"))["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_promotion_gates_require_strategy_code_attribution_threshold(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+
+    class FakeAuditService:
+        async def build_report(self, **kwargs):
+            return {
+                "fill_summary": {"total_fills": 100},
+                "attribution": {"missing_fill_strategy_count": 2},
+                "issues": [
+                    {
+                        "severity": "high",
+                        "code": "missing_fill_strategy_attribution",
+                        "summary": "covered by explicit attribution gate",
+                    }
+                ],
+            }
+
+    service = DecisionCorpusService(harness.settings, harness.session_factory, trading_audit_service=FakeAuditService())
+
+    gates = await service._promotion_gates(
+        kalshi_env="demo",
+        now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC),
+        metrics={
+            "resolved_rooms": 50,
+            "settlement_coverage": 1.0,
+        },
+        excluded_windows=[],
+    )
+
+    assert gates["ok"] is False
+    assert gates["failed"] == ["strategy_code_attribution"]
+    assert gates["checks"]["strategy_code_attribution"]["actual"] == 0.98
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ from kalshi_bot.services.strategy_regression import (
     MIN_WIN_RATE_GAP as STRATEGY_LEGACY_PROMOTION_GAP,
     RECOMMENDATION_MIN_OUTCOME_COVERAGE_RATE as STRATEGY_MIN_OUTCOME_COVERAGE_RATE,
     RECOMMENDATION_MODE as STRATEGY_RECOMMENDATION_MODE,
+    RegressionStrategySpec,
     STRONG_RECOMMENDATION_MIN_GAP as STRATEGY_STRONG_RECOMMENDATION_GAP,
     WINDOW_DAYS as DEFAULT_STRATEGY_WINDOW_DAYS,
     _group_strategy_rooms_by_series,
@@ -37,6 +38,12 @@ from kalshi_bot.services.strategy_regression import (
     _thresholds_from_dict,
     _wilson_confidence_interval,
     _would_have_traded,
+)
+from kalshi_bot.services.strategy_regression_ranking import (
+    RANKING_VERSION as STRATEGY_RANKING_VERSION,
+    normalize_ranking_row_for_dashboard,
+    promotion_quality_recommendation_decision,
+    rank_promotion_quality_rows,
 )
 
 if TYPE_CHECKING:
@@ -2170,6 +2177,12 @@ def _coverage_display(resolved_trade_count: int, trade_count: int) -> str:
     return f"{resolved_trade_count}/{trade_count} scored"
 
 
+def _sortino_display(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+.2f}"
+
+
 def _promotion_event_has_scored_evidence(payload: dict[str, Any]) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -2189,9 +2202,12 @@ def _normalize_strategy_result_rows(rows: list[Any], strategies_by_id: dict[int,
         strategy = strategies_by_id.get(int(strategy_id)) if strategy_id is not None else None
         strategy_name = strategy.name if strategy is not None else str(_strategy_result_value(row, "strategy_name") or "unknown")
         total_pnl = _decimal_or_none(_strategy_result_value(row, "total_pnl_dollars"))
+        total_net_pnl = _decimal_or_none(_strategy_result_value(row, "total_net_pnl_dollars"))
         trade_rate = _float_or_none(_strategy_result_value(row, "trade_rate"))
         win_rate = _float_or_none(_strategy_result_value(row, "win_rate"))
         avg_edge_bps = _float_or_none(_strategy_result_value(row, "avg_edge_bps"))
+        sortino = _float_or_none(_strategy_result_value(row, "sortino"))
+        sharpe = _float_or_none(_strategy_result_value(row, "sharpe"))
         run_at = _strategy_result_value(row, "run_at")
         trade_count = int(_strategy_result_value(row, "trade_count") or 0)
         resolved_trade_count = int(_strategy_result_value(row, "resolved_trade_count") or 0)
@@ -2229,9 +2245,36 @@ def _normalize_strategy_result_rows(rows: list[Any], strategies_by_id: dict[int,
             "total_pnl_dollars": total_pnl,
             "total_pnl_value": float(total_pnl) if total_pnl is not None else None,
             "total_pnl_display": _money_display(total_pnl, signed=True),
+            "ranking_version": _strategy_result_value(row, "ranking_version"),
+            "total_rows_evaluated": int(_strategy_result_value(row, "total_rows_evaluated") or 0),
+            "candidate_decision_count": int(_strategy_result_value(row, "candidate_decision_count") or trade_count),
+            "total_rows_contributing": int(_strategy_result_value(row, "total_rows_contributing") or resolved_trade_count),
+            "null_pnl_rows_excluded": int(_strategy_result_value(row, "null_pnl_rows_excluded") or 0),
+            "insufficient_support_rows_excluded": int(_strategy_result_value(row, "insufficient_support_rows_excluded") or 0),
+            "cluster_count": int(_strategy_result_value(row, "cluster_count") or 0),
+            "cluster_count_display": _compact_number(int(_strategy_result_value(row, "cluster_count") or 0)),
+            "supported_clusters": int(_strategy_result_value(row, "supported_clusters") or 0),
+            "total_net_pnl_dollars": total_net_pnl,
+            "total_net_pnl_value": float(total_net_pnl) if total_net_pnl is not None else None,
+            "total_net_pnl_display": _money_display(total_net_pnl, signed=True),
+            "mean_cluster_pnl": _float_or_none(_strategy_result_value(row, "mean_cluster_pnl")),
+            "median_cluster_pnl": _float_or_none(_strategy_result_value(row, "median_cluster_pnl")),
+            "sortino": sortino,
+            "sortino_display": _sortino_display(sortino),
+            "sharpe": sharpe,
+            "sharpe_display": _sortino_display(sharpe),
+            "downside_stdev": _float_or_none(_strategy_result_value(row, "downside_stdev")),
+            "effective_downside_stdev": _float_or_none(_strategy_result_value(row, "effective_downside_stdev")),
+            "percent_clusters_positive": _float_or_none(_strategy_result_value(row, "percent_clusters_positive")),
+            "percent_clusters_positive_display": _ratio_display(_float_or_none(_strategy_result_value(row, "percent_clusters_positive"))),
+            "win_rate_display_only": bool(_strategy_result_value(row, "win_rate_display_only")),
+            "below_support_floor": bool(_strategy_result_value(row, "below_support_floor")),
+            "insufficient_for_ranking": bool(_strategy_result_value(row, "insufficient_for_ranking")),
+            "promotion_candidate": bool(_strategy_result_value(row, "promotion_candidate")),
             "avg_edge_bps": avg_edge_bps,
             "avg_edge_bps_display": _bps_display(avg_edge_bps),
             "run_at": _iso_or_none(run_at),
+            "corpus_build_id": _strategy_result_value(row, "corpus_build_id"),
             "has_outcomes": resolved_trade_count > 0,
         })
     return normalized
@@ -2667,6 +2710,7 @@ def _build_strategy_research_sections(
     *,
     strategies: list[Any],
     normalized_rows: list[dict[str, Any]],
+    ranking_leaderboard_rows: list[dict[str, Any]] | None = None,
     assignments: list[Any],
     series_metadata: dict[str, dict[str, str]],
     selected_series_ticker: str | None,
@@ -2675,6 +2719,7 @@ def _build_strategy_research_sections(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     strategy_lookup = {strategy.name: strategy for strategy in strategies}
     assignment_index = {assignment.series_ticker: assignment for assignment in assignments}
+    ranking_mode = any(row.get("ranking_version") == STRATEGY_RANKING_VERSION for row in normalized_rows)
     results_index: dict[str, dict[str, dict[str, Any]]] = {}
     for row in normalized_rows:
         results_index.setdefault(row["series_ticker"], {})[row["strategy_name"]] = row
@@ -2686,7 +2731,11 @@ def _build_strategy_research_sections(
 
     for series_ticker in all_series:
         city_results = results_index.get(series_ticker, {})
-        ranked_rows = _rank_scored_strategy_rows(list(city_results.values()))
+        ranked_rows = (
+            rank_promotion_quality_rows(list(city_results.values()))
+            if ranking_mode
+            else _rank_scored_strategy_rows(list(city_results.values()))
+        )
         best_row = ranked_rows[0] if ranked_rows else None
         runner_up_row = ranked_rows[1] if len(ranked_rows) > 1 else None
         if best_row is not None:
@@ -2694,9 +2743,31 @@ def _build_strategy_research_sections(
 
         assignment = assignment_index.get(series_ticker)
         assigned_name = assignment.strategy_name if assignment is not None else None
-        decision = _recommendation_decision(results_by_strategy=city_results, current_name=assigned_name)
+        decision = (
+            promotion_quality_recommendation_decision(results_by_strategy=city_results, current_name=assigned_name)
+            if ranking_mode
+            else _recommendation_decision(results_by_strategy=city_results, current_name=assigned_name)
+        )
+        current_row = decision["current_row"]
         recommendation = {
             **decision["recommendation"],
+            "win_rate": best_row["win_rate"] if best_row is not None else None,
+            "trade_count": best_row["trade_count"] if best_row is not None else 0,
+            "total_pnl_dollars": best_row["total_pnl_value"] if best_row is not None else None,
+            "rooms_evaluated": best_row["rooms_evaluated"] if best_row is not None else 0,
+            "city_corpus_days": best_row["rooms_evaluated"] if best_row is not None else 0,
+            "ranking_version": best_row.get("ranking_version") if best_row is not None else None,
+            "sortino": best_row.get("sortino") if best_row is not None else None,
+            "sortino_display": best_row.get("sortino_display") if best_row is not None else "—",
+            "cluster_count": best_row.get("cluster_count") if best_row is not None else 0,
+            "cluster_count_display": best_row.get("cluster_count_display") if best_row is not None else "0",
+            "total_net_pnl_dollars": best_row.get("total_net_pnl_value") if best_row is not None else None,
+            "total_net_pnl_display": best_row.get("total_net_pnl_display") if best_row is not None else "—",
+            "promotion_candidate": bool(best_row.get("promotion_candidate")) if best_row is not None else False,
+            "below_support_floor": bool(best_row.get("below_support_floor")) if best_row is not None else False,
+            "insufficient_for_ranking": bool(best_row.get("insufficient_for_ranking")) if best_row is not None else False,
+            "quality_gap_to_runner_up": decision.get("quality_gap_to_runner_up"),
+            "quality_gap_to_current_assignment": decision.get("quality_gap_to_current_assignment"),
             "resolved_trade_count_display": _compact_number(
                 decision["recommendation"]["resolved_trade_count"]
             ),
@@ -2707,6 +2778,8 @@ def _build_strategy_research_sections(
         }
         gap_to_runner_up = decision["gap_to_runner_up"]
         gap_to_assignment = decision["gap_to_current_assignment"]
+        quality_gap_to_runner_up = decision.get("quality_gap_to_runner_up")
+        quality_gap_to_assignment = decision.get("quality_gap_to_current_assignment")
 
         evidence_status, evidence_label = _city_evidence_status(
             recommendation_status=recommendation["status"],
@@ -2770,9 +2843,30 @@ def _build_strategy_research_sections(
                 ),
                 "total_pnl_dollars": metric_row["total_pnl_value"] if metric_row is not None else None,
                 "total_pnl_display": metric_row["total_pnl_display"] if metric_row is not None else "—",
+                "ranking_version": metric_row.get("ranking_version") if metric_row is not None else None,
+                "sortino": metric_row.get("sortino") if metric_row is not None else None,
+                "sortino_display": metric_row.get("sortino_display") if metric_row is not None else "—",
+                "cluster_count": metric_row.get("cluster_count") if metric_row is not None else 0,
+                "cluster_count_display": metric_row.get("cluster_count_display") if metric_row is not None else "0",
+                "supported_clusters": metric_row.get("supported_clusters") if metric_row is not None else 0,
+                "total_net_pnl_dollars": metric_row.get("total_net_pnl_value") if metric_row is not None else None,
+                "total_net_pnl_display": metric_row.get("total_net_pnl_display") if metric_row is not None else "—",
+                "mean_cluster_pnl": metric_row.get("mean_cluster_pnl") if metric_row is not None else None,
+                "median_cluster_pnl": metric_row.get("median_cluster_pnl") if metric_row is not None else None,
+                "percent_clusters_positive": metric_row.get("percent_clusters_positive") if metric_row is not None else None,
+                "percent_clusters_positive_display": (
+                    metric_row.get("percent_clusters_positive_display") if metric_row is not None else "—"
+                ),
+                "promotion_candidate": bool(metric_row.get("promotion_candidate")) if metric_row is not None else False,
+                "below_support_floor": bool(metric_row.get("below_support_floor")) if metric_row is not None else False,
+                "insufficient_for_ranking": bool(metric_row.get("insufficient_for_ranking")) if metric_row is not None else False,
                 "avg_edge_bps": metric_row["avg_edge_bps"] if metric_row is not None else None,
                 "avg_edge_bps_display": metric_row["avg_edge_bps_display"] if metric_row is not None else "—",
-                "has_data": metric_row is not None and (metric_row["rooms_evaluated"] > 0 or metric_row["trade_count"] > 0),
+                "has_data": metric_row is not None and (
+                    metric_row["rooms_evaluated"] > 0
+                    or metric_row["trade_count"] > 0
+                    or int(metric_row.get("cluster_count") or 0) > 0
+                ),
             })
 
         meta = series_metadata.get(series_ticker, {})
@@ -2785,22 +2879,53 @@ def _build_strategy_research_sections(
                 "strategy_name": assigned_name,
                 "assigned_at": _iso_or_none(assignment.assigned_at) if assignment is not None else None,
                 "assigned_by": assignment.assigned_by if assignment is not None else None,
+                "evidence_corpus_build_id": (
+                    getattr(assignment, "evidence_corpus_build_id", None) if assignment is not None else None
+                ),
+                "evidence_run_at": (
+                    _iso_or_none(getattr(assignment, "evidence_run_at", None)) if assignment is not None else None
+                ),
             },
             "assignment_context_status": assignment_context_status,
             "best_strategy": best_row["strategy_name"] if best_row is not None else None,
             "best_strategy_win_rate": best_row["win_rate"] if best_row is not None else None,
             "best_strategy_win_rate_display": best_row["win_rate_display"] if best_row is not None else "—",
+            "best_strategy_sortino": best_row.get("sortino") if best_row is not None else None,
+            "best_strategy_sortino_display": best_row.get("sortino_display") if best_row is not None else "—",
             "best_resolved_trade_count": best_row["resolved_trade_count"] if best_row is not None else 0,
             "best_resolved_trade_count_display": (
                 best_row["resolved_trade_count_display"] if best_row is not None else "0"
             ),
+            "candidate_win_rate": best_row["win_rate"] if best_row is not None else None,
+            "candidate_resolved_trade_count": best_row["resolved_trade_count"] if best_row is not None else 0,
+            "candidate_total_pnl_dollars": best_row["total_pnl_value"] if best_row is not None else None,
+            "candidate_sortino": best_row.get("sortino") if best_row is not None else None,
+            "candidate_cluster_count": best_row.get("cluster_count") if best_row is not None else 0,
+            "candidate_total_net_pnl_dollars": best_row.get("total_net_pnl_value") if best_row is not None else None,
+            "promotion_candidate": bool(best_row.get("promotion_candidate")) if best_row is not None else False,
+            "ranking_version": best_row.get("ranking_version") if best_row is not None else None,
+            "eligible_corpus_days": best_row["rooms_evaluated"] if best_row is not None else 0,
+            "city_corpus_days": best_row["rooms_evaluated"] if best_row is not None else 0,
+            "current_assignment_win_rate": current_row["win_rate"] if current_row is not None else None,
+            "current_assignment_resolved_trade_count": (
+                current_row["resolved_trade_count"] if current_row is not None else 0
+            ),
+            "current_assignment_total_pnl_dollars": (
+                current_row["total_pnl_value"] if current_row is not None else None
+            ),
             "best_outcome_coverage_display": best_row["outcome_coverage_display"] if best_row is not None else "—",
             "runner_up_strategy": runner_up_row["strategy_name"] if runner_up_row is not None else None,
             "runner_up_win_rate_display": runner_up_row["win_rate_display"] if runner_up_row is not None else "—",
+            "runner_up_sortino": runner_up_row.get("sortino") if runner_up_row is not None else None,
+            "runner_up_sortino_display": runner_up_row.get("sortino_display") if runner_up_row is not None else "—",
             "gap_to_runner_up": gap_to_runner_up,
             "gap_to_runner_up_display": _ratio_display(gap_to_runner_up),
             "gap_to_assignment": gap_to_assignment,
             "gap_to_assignment_display": _ratio_display(gap_to_assignment),
+            "quality_gap_to_runner_up": quality_gap_to_runner_up,
+            "quality_gap_to_runner_up_display": _sortino_display(quality_gap_to_runner_up),
+            "quality_gap_to_assignment": quality_gap_to_assignment,
+            "quality_gap_to_assignment_display": _sortino_display(quality_gap_to_assignment),
             "evidence_status": evidence_status,
             "evidence_label": evidence_label,
             "trade_count_sufficient": decision["clears_trade_threshold"],
@@ -2824,11 +2949,21 @@ def _build_strategy_research_sections(
         })
 
     city_rows.sort(
-        key=lambda row: (
-            row["sort_priority"],
-            -(row["gap_to_assignment"] if row["gap_to_assignment"] is not None else -1.0),
-            -(row["gap_to_runner_up"] if row["gap_to_runner_up"] is not None else -1.0),
-            row["series_ticker"],
+        key=(
+            lambda row: (
+                row["sort_priority"],
+                -(row["candidate_sortino"] if row["candidate_sortino"] is not None else -1.0),
+                -int(row.get("candidate_cluster_count") or 0),
+                -(row["candidate_total_net_pnl_dollars"] if row["candidate_total_net_pnl_dollars"] is not None else -1.0),
+                row["series_ticker"],
+            )
+            if ranking_mode
+            else (
+                row["sort_priority"],
+                -(row["gap_to_assignment"] if row["gap_to_assignment"] is not None else -1.0),
+                -(row["gap_to_runner_up"] if row["gap_to_runner_up"] is not None else -1.0),
+                row["series_ticker"],
+            )
         )
     )
 
@@ -2836,6 +2971,11 @@ def _build_strategy_research_sections(
     rows_by_strategy: dict[str, list[dict[str, Any]]] = {strategy.name: [] for strategy in strategies}
     for row in normalized_rows:
         rows_by_strategy.setdefault(row["strategy_name"], []).append(row)
+    ranking_leaderboard_index = {
+        row["strategy_name"]: row
+        for row in (ranking_leaderboard_rows or [])
+        if row.get("strategy_name")
+    }
 
     for strategy in strategies:
         strategy_rows = rows_by_strategy.get(strategy.name, [])
@@ -2851,12 +2991,24 @@ def _build_strategy_research_sections(
         outcome_coverage_rate = (total_resolved_trades / total_trades) if total_trades > 0 else None
         overall_avg_edge = (edge_numerator / total_trades) if total_trades > 0 else None
         total_pnl_value = float(total_pnl) if total_resolved_trades > 0 else None
+        ranking_overall = ranking_leaderboard_index.get(strategy.name, {})
+        ranking_sortino = ranking_overall.get("sortino")
+        ranking_cluster_count = int(ranking_overall.get("cluster_count") or 0)
+        ranking_total_net_pnl = ranking_overall.get("total_net_pnl_value")
         leaderboard.append({
             "name": strategy.name,
             "description": strategy.description,
             "selected": selected_strategy_name == strategy.name,
             "thresholds": strategy.thresholds,
             "threshold_groups": _group_thresholds(strategy.thresholds),
+            "ranking_version": ranking_overall.get("ranking_version") if ranking_overall else None,
+            "overall_sortino": ranking_sortino,
+            "overall_sortino_display": _sortino_display(ranking_sortino),
+            "cluster_count": ranking_cluster_count,
+            "cluster_count_display": _compact_number(ranking_cluster_count),
+            "total_net_pnl_dollars": ranking_total_net_pnl,
+            "total_net_pnl_display": ranking_overall.get("total_net_pnl_display") if ranking_overall else "—",
+            "promotion_candidate": bool(ranking_overall.get("promotion_candidate")) if ranking_overall else False,
             "overall_win_rate": overall_win_rate,
             "overall_win_rate_display": _ratio_display(overall_win_rate),
             "overall_trade_rate": overall_trade_rate,
@@ -2881,15 +3033,26 @@ def _build_strategy_research_sections(
         })
 
     leaderboard.sort(
-        key=lambda row: (
-            row["overall_win_rate"] if row["overall_win_rate"] is not None else -1.0,
-            row["total_resolved_trade_count"],
-            row["total_pnl_dollars"] if row["total_pnl_dollars"] is not None else float("-inf"),
+        key=(
+            lambda row: (
+                row["overall_sortino"] if row["overall_sortino"] is not None else -1.0,
+                row["cluster_count"],
+                row["total_net_pnl_dollars"] if row["total_net_pnl_dollars"] is not None else float("-inf"),
+            )
+            if ranking_mode
+            else (
+                row["overall_win_rate"] if row["overall_win_rate"] is not None else -1.0,
+                row["total_resolved_trade_count"],
+                row["total_pnl_dollars"] if row["total_pnl_dollars"] is not None else float("-inf"),
+            )
         ),
         reverse=True,
     )
 
-    best_strategy = next((row for row in leaderboard if row["overall_win_rate"] is not None), None)
+    if ranking_mode:
+        best_strategy = next((row for row in leaderboard if row["overall_sortino"] is not None), None)
+    else:
+        best_strategy = next((row for row in leaderboard if row["overall_win_rate"] is not None), None)
     recommendation_counts = Counter(
         (row.get("recommendation") or {}).get("status") or "no_outcomes"
         for row in city_rows
@@ -2999,7 +3162,12 @@ def _city_detail_context(
     window_days: int,
 ) -> dict[str, Any]:
     selected_series_ticker = selected_city["series_ticker"]
-    ranking = sorted(list(selected_city["metrics"]), key=_strategy_result_rank_key, reverse=True)
+    ranking_mode = selected_city.get("ranking_version") == STRATEGY_RANKING_VERSION
+    ranking = (
+        rank_promotion_quality_rows(list(selected_city["metrics"]))
+        if ranking_mode
+        else sorted(list(selected_city["metrics"]), key=_strategy_result_rank_key, reverse=True)
+    )
     best_strategy_name = selected_city.get("best_strategy")
     runner_up_name = selected_city.get("runner_up_strategy")
     assigned_name = (selected_city.get("assignment") or {}).get("strategy_name")
@@ -3044,6 +3212,16 @@ def _city_detail_context(
         "gap_to_runner_up_display": selected_city.get("gap_to_runner_up_display"),
         "gap_to_current_assignment": gap_to_assignment,
         "gap_to_current_assignment_display": selected_city.get("gap_to_assignment_display"),
+        "quality_gap_to_runner_up": selected_city.get("quality_gap_to_runner_up"),
+        "quality_gap_to_runner_up_display": selected_city.get("quality_gap_to_runner_up_display"),
+        "quality_gap_to_current_assignment": selected_city.get("quality_gap_to_assignment"),
+        "quality_gap_to_current_assignment_display": selected_city.get("quality_gap_to_assignment_display"),
+        "winner_sortino": best_metric.get("sortino") if best_metric is not None else None,
+        "winner_sortino_display": best_metric.get("sortino_display") if best_metric is not None else "—",
+        "runner_up_sortino": runner_up_metric.get("sortino") if runner_up_metric is not None else None,
+        "runner_up_sortino_display": runner_up_metric.get("sortino_display") if runner_up_metric is not None else "—",
+        "winner_cluster_count": best_metric.get("cluster_count") if best_metric is not None else 0,
+        "winner_cluster_count_display": best_metric.get("cluster_count_display") if best_metric is not None else "0",
         "winner_wilson_lower": best_metric.get("win_rate_interval_lower") if best_metric is not None else None,
         "winner_wilson_upper": best_metric.get("win_rate_interval_upper") if best_metric is not None else None,
         "winner_wilson_display": best_metric.get("win_rate_interval_display") if best_metric is not None else "—",
@@ -3121,6 +3299,10 @@ def _city_detail_context(
             "label": recommendation.get("label"),
             "gap_to_runner_up": selected_city.get("gap_to_runner_up"),
             "gap_to_runner_up_display": selected_city.get("gap_to_runner_up_display"),
+            "quality_gap_to_runner_up": selected_city.get("quality_gap_to_runner_up"),
+            "quality_gap_to_runner_up_display": selected_city.get("quality_gap_to_runner_up_display"),
+            "sortino": recommendation.get("sortino"),
+            "sortino_display": recommendation.get("sortino_display"),
             "resolved_trade_count": recommendation.get("resolved_trade_count"),
             "resolved_trade_count_display": recommendation.get("resolved_trade_count_display"),
             "outcome_coverage_rate": recommendation.get("outcome_coverage_rate"),
@@ -3193,14 +3375,29 @@ def _strategy_detail_context(
             "outcome_coverage_display": metric["outcome_coverage_display"],
             "total_pnl_dollars": metric["total_pnl_dollars"],
             "total_pnl_display": metric["total_pnl_display"],
+            "sortino": metric.get("sortino"),
+            "sortino_display": metric.get("sortino_display"),
+            "cluster_count": metric.get("cluster_count") or 0,
+            "cluster_count_display": metric.get("cluster_count_display") or "0",
+            "total_net_pnl_dollars": metric.get("total_net_pnl_dollars"),
+            "total_net_pnl_display": metric.get("total_net_pnl_display"),
             "is_assigned": metric["is_assigned"],
             "is_best": metric["is_best"],
         })
+    ranking_mode = bool(selected_strategy.get("ranking_version") == STRATEGY_RANKING_VERSION)
     city_distribution.sort(
-        key=lambda row: (
-            row["win_rate"] if row["win_rate"] is not None else -1.0,
-            row["resolved_trade_count"],
-            row["total_pnl_dollars"] if row["total_pnl_dollars"] is not None else -10**9,
+        key=(
+            lambda row: (
+                row["sortino"] if row["sortino"] is not None else -1.0,
+                int(row.get("cluster_count") or 0),
+                row["total_net_pnl_dollars"] if row["total_net_pnl_dollars"] is not None else -10**9,
+            )
+            if ranking_mode
+            else (
+                row["win_rate"] if row["win_rate"] is not None else -1.0,
+                row["resolved_trade_count"],
+                row["total_pnl_dollars"] if row["total_pnl_dollars"] is not None else -10**9,
+            )
         ),
         reverse=True,
     )
@@ -3257,15 +3454,18 @@ async def build_strategies_dashboard_core(
     )
     async with read_session_factory() as session:
         repo = PlatformRepository(session)
+        settings = getattr(container, "settings", SimpleNamespace(kalshi_env="demo"))
         strategies = await repo.list_strategies(active_only=True)
-        assignments = await repo.list_city_strategy_assignments()
+        try:
+            assignments = await repo.list_city_strategy_assignments(kalshi_env=getattr(settings, "kalshi_env", "demo"))
+        except TypeError:
+            assignments = await repo.list_city_strategy_assignments()
         regression_checkpoint = await repo.get_checkpoint("strategy_regression")
         strategy_events_raw = await repo.list_ops_events(
             limit=STRATEGY_EVENT_LIMIT,
             sources=["strategy_regression", "strategy_eval", STRATEGY_APPROVAL_SOURCE, AUTO_EVOLVE_SOURCE],
             created_after=now - timedelta(days=STRATEGY_EVENT_LOOKBACK_DAYS),
         )
-        settings = getattr(container, "settings", SimpleNamespace(kalshi_env="demo"))
         block_analytics = await _strategy_block_analytics(
             session,
             kalshi_env=getattr(settings, "kalshi_env", "demo"),
@@ -3276,10 +3476,85 @@ async def build_strategies_dashboard_core(
             "rooms_scanned": 0,
             "series_evaluated": 0,
             "source_mode": "stored_snapshot",
+            "corpus_build_id": None,
+            "decision_corpus_required": False,
+            "strategy_results_available": False,
+            "unavailable_reason": None,
         }
         strategies_by_id = {strategy.id: strategy for strategy in strategies}
+        ranking_leaderboard_rows: list[dict[str, Any]] = []
         if window_days == DEFAULT_STRATEGY_WINDOW_DAYS:
-            latest_results = await repo.get_latest_strategy_results()
+            current_corpus_build_id = None
+            get_current_corpus = getattr(repo, "get_current_decision_corpus_build", None)
+            if callable(get_current_corpus):
+                snapshot_meta["decision_corpus_required"] = True
+                current_corpus = await get_current_corpus(kalshi_env=getattr(settings, "kalshi_env", "demo"))
+                current_corpus_build_id = getattr(current_corpus, "id", None) if current_corpus is not None else None
+                snapshot_meta["corpus_build_id"] = current_corpus_build_id
+
+            if snapshot_meta["decision_corpus_required"] and current_corpus_build_id is None:
+                latest_results = []
+                snapshot_meta["source_mode"] = "missing_decision_corpus"
+                snapshot_meta["unavailable_reason"] = "missing_decision_corpus"
+            elif (
+                snapshot_meta["decision_corpus_required"]
+                and current_corpus_build_id is not None
+                and getattr(container, "strategy_regression_ranking_service", None) is not None
+            ):
+                strategy_specs = [
+                    RegressionStrategySpec(
+                        id=strategy.id,
+                        name=strategy.name,
+                        description=strategy.description,
+                        thresholds=dict(strategy.thresholds or {}),
+                    )
+                    for strategy in strategies
+                ]
+                try:
+                    ranking_report = await container.strategy_regression_ranking_service.evaluate_strategy_specs(
+                        strategies=strategy_specs,
+                        kalshi_env=getattr(settings, "kalshi_env", "demo"),
+                    )
+                except Exception as exc:
+                    logger.warning("strategy ranking dashboard evaluation failed", exc_info=True)
+                    latest_results = []
+                    snapshot_meta["source_mode"] = "missing_corpus_strategy_results"
+                    snapshot_meta["unavailable_reason"] = "strategy_ranking_unavailable"
+                    snapshot_meta["strategy_ranking_error"] = str(exc)
+                else:
+                    latest_results = [
+                        normalize_ranking_row_for_dashboard(row)
+                        for row in list(ranking_report.get("result_rows") or [])
+                    ]
+                    ranking_leaderboard_rows = _normalize_strategy_result_rows(
+                        [
+                            normalize_ranking_row_for_dashboard(row)
+                            for row in list(ranking_report.get("leaderboard") or [])
+                        ],
+                        strategies_by_id,
+                    )
+                    diagnostics = dict(ranking_report.get("diagnostics") or {})
+                    metadata = dict(ranking_report.get("report_metadata") or {})
+                    snapshot_meta["source_mode"] = "decision_corpus_ranking"
+                    snapshot_meta["ranking_version"] = metadata.get("ranking_version")
+                    snapshot_meta["rooms_scanned"] = int(diagnostics.get("total_corpus_rows") or 0)
+                    snapshot_meta["series_evaluated"] = len(ranking_report.get("city_results") or {})
+                    if not latest_results:
+                        snapshot_meta["source_mode"] = "missing_corpus_strategy_results"
+                        snapshot_meta["unavailable_reason"] = "missing_corpus_strategy_results"
+            else:
+                try:
+                    latest_results = await repo.get_latest_strategy_results(corpus_build_id=current_corpus_build_id)
+                except TypeError:
+                    latest_results = await repo.get_latest_strategy_results()
+                if (
+                    snapshot_meta["decision_corpus_required"]
+                    and current_corpus_build_id is not None
+                    and not latest_results
+                ):
+                    snapshot_meta["source_mode"] = "missing_corpus_strategy_results"
+                    snapshot_meta["unavailable_reason"] = "missing_corpus_strategy_results"
+            snapshot_meta["strategy_results_available"] = bool(latest_results)
             normalized_rows = _normalize_strategy_result_rows(latest_results, strategies_by_id)
             if regression_checkpoint is not None and isinstance(regression_checkpoint.payload, dict):
                 snapshot_meta["rooms_scanned"] = int(regression_checkpoint.payload.get("rooms_scanned") or 0)
@@ -3302,6 +3577,7 @@ async def build_strategies_dashboard_core(
         leaderboard, city_matrix, leaderboard_context = _build_strategy_research_sections(
             strategies=strategies,
             normalized_rows=normalized_rows,
+            ranking_leaderboard_rows=ranking_leaderboard_rows,
             assignments=assignments,
             series_metadata=series_metadata,
             selected_series_ticker=series_ticker,
@@ -3316,10 +3592,17 @@ async def build_strategies_dashboard_core(
 
         history_rows: list[dict[str, Any]] = []
         if selected_city is not None:
-            history = await repo.list_strategy_results_history(
-                series_ticker=selected_city["series_ticker"],
-                limit=STRATEGY_RESULT_HISTORY_LIMIT,
-            )
+            try:
+                history = await repo.list_strategy_results_history(
+                    series_ticker=selected_city["series_ticker"],
+                    corpus_build_id=snapshot_meta.get("corpus_build_id"),
+                    limit=STRATEGY_RESULT_HISTORY_LIMIT,
+                )
+            except TypeError:
+                history = await repo.list_strategy_results_history(
+                    series_ticker=selected_city["series_ticker"],
+                    limit=STRATEGY_RESULT_HISTORY_LIMIT,
+                )
             history_rows = _normalize_strategy_result_rows(history, strategies_by_id)
             detail_context = _city_detail_context(
                 selected_city=selected_city,
@@ -3333,10 +3616,17 @@ async def build_strategies_dashboard_core(
             if selected_strategy is None:
                 selected_strategy = best_strategy
             if selected_strategy is not None:
-                history = await repo.list_strategy_results_history(
-                    strategy_ids=[strategy_lookup.id for strategy_lookup in strategies if strategy_lookup.name == selected_strategy["name"]],
-                    limit=STRATEGY_RESULT_HISTORY_LIMIT,
-                )
+                try:
+                    history = await repo.list_strategy_results_history(
+                        strategy_ids=[strategy_lookup.id for strategy_lookup in strategies if strategy_lookup.name == selected_strategy["name"]],
+                        corpus_build_id=snapshot_meta.get("corpus_build_id"),
+                        limit=STRATEGY_RESULT_HISTORY_LIMIT,
+                    )
+                except TypeError:
+                    history = await repo.list_strategy_results_history(
+                        strategy_ids=[strategy_lookup.id for strategy_lookup in strategies if strategy_lookup.name == selected_strategy["name"]],
+                        limit=STRATEGY_RESULT_HISTORY_LIMIT,
+                    )
                 history_rows = _normalize_strategy_result_rows(history, strategies_by_id)
                 detail_context = _strategy_detail_context(
                     selected_strategy=selected_strategy,
@@ -3380,13 +3670,30 @@ async def build_strategies_dashboard_core(
     ]
     recommendation_counts = leaderboard_context.get("recommendation_counts") or {}
     review_counts = leaderboard_context.get("review_counts") or {}
-    review_available = window_days == STRATEGY_APPROVAL_WINDOW_DAYS
+    decision_corpus_available = bool(snapshot_meta.get("corpus_build_id")) or not bool(
+        snapshot_meta.get("decision_corpus_required")
+    )
+    recommendation_snapshot_available = bool(
+        snapshot_meta["source_mode"] in {"stored_snapshot", "decision_corpus_ranking"}
+        and snapshot_meta.get("strategy_results_available")
+    )
+    review_available = (
+        window_days == STRATEGY_APPROVAL_WINDOW_DAYS
+        and decision_corpus_available
+        and recommendation_snapshot_available
+    )
 
     summary = {
         "window_days": window_days,
         "window_display": _strategy_window_display(window_days),
         "window_options": list(STRATEGY_WINDOW_OPTIONS),
         "source_mode": snapshot_meta["source_mode"],
+        "corpus_build_id": snapshot_meta.get("corpus_build_id"),
+        "decision_corpus_available": decision_corpus_available,
+        "strategy_results_available": bool(snapshot_meta.get("strategy_results_available")),
+        "recommendation_snapshot_available": recommendation_snapshot_available,
+        "unavailable_reason": snapshot_meta.get("unavailable_reason"),
+        "ranking_version": snapshot_meta.get("ranking_version"),
         "recommendation_mode": STRATEGY_RECOMMENDATION_MODE,
         "manual_approval_enabled": True,
         "auto_evolve_enabled": bool(getattr(getattr(container, "settings", None), "strategy_auto_evolve_enabled", False)),

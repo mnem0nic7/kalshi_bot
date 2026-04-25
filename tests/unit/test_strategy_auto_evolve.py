@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
 from kalshi_bot.config import Settings
+from kalshi_bot.db.models import FillRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.strategy_auto_evolve import StrategyAutoEvolveService
@@ -48,9 +50,42 @@ class FakeAuditService:
 
 
 class FakeCodexService:
-    def __init__(self, *, available: bool = True, backtest_status: str = "ok") -> None:
+    def __init__(
+        self,
+        *,
+        available: bool = True,
+        backtest_status: str = "ok",
+        corpus_build_id: str | None = None,
+        baseline_corpus_build_id: str | None = None,
+        bind_current_corpus: bool = True,
+        finished_at: str | datetime | None = None,
+        resolved_regression_rooms: int | None = 30,
+        candidate_hypothetical_trades: int | None = 12,
+        candidate_win_rate: float | None = 0.62,
+        baseline_win_rate: float | None = 0.50,
+        promotion_candidate: bool = True,
+        cluster_count: int | None = 30,
+        sortino: float | None = 0.75,
+        total_pnl_dollars: float | None = 2.5,
+        below_support_floor: bool = False,
+        insufficient_for_ranking: bool = False,
+    ) -> None:
         self.available = available
         self.backtest_status = backtest_status
+        self.corpus_build_id = corpus_build_id
+        self.baseline_corpus_build_id = baseline_corpus_build_id
+        self.bind_current_corpus = bind_current_corpus
+        self.finished_at = finished_at
+        self.resolved_regression_rooms = resolved_regression_rooms
+        self.candidate_hypothetical_trades = candidate_hypothetical_trades
+        self.candidate_win_rate = candidate_win_rate
+        self.baseline_win_rate = baseline_win_rate
+        self.promotion_candidate = promotion_candidate
+        self.cluster_count = cluster_count
+        self.sortino = sortino
+        self.total_pnl_dollars = total_pnl_dollars
+        self.below_support_floor = below_support_floor
+        self.insufficient_for_ranking = insufficient_for_ranking
         self.execute_calls = 0
         self.accept_calls = 0
         self.activate_calls = 0
@@ -62,6 +97,7 @@ class FakeCodexService:
     async def execute_modes_for_snapshot(self, **kwargs):
         self.execute_calls += 1
         self.snapshots.append(kwargs.get("dashboard_snapshot") or {})
+        finished_at = self.finished_at or datetime.now(UTC)
         return [
             {
                 "id": "eval-run",
@@ -75,12 +111,51 @@ class FakeCodexService:
                 "id": "suggest-run",
                 "mode": "suggest",
                 "status": "completed",
+                "finished_at": finished_at.isoformat() if isinstance(finished_at, datetime) else finished_at,
                 "provider": "gemini",
                 "model": "gemini-2.5-pro",
-                "result": {"kind": "suggest", "backtest": {"status": self.backtest_status}},
+                "result": {
+                    "kind": "suggest",
+                    "backtest": self._backtest_payload(),
+                },
                 "can_accept": self.backtest_status == "ok",
             },
         ]
+
+    def _backtest_payload(self) -> dict:
+        backtest = {
+            "status": self.backtest_status,
+            "corpus_build_id": self.corpus_build_id,
+            "resolved_regression_rooms": self.resolved_regression_rooms,
+            "candidate_hypothetical_trades": self.candidate_hypothetical_trades,
+            "candidate_metrics": {
+                "overall_win_rate": self.candidate_win_rate,
+                "total_resolved_trade_count": self.candidate_hypothetical_trades,
+                "total_pnl_dollars": self.total_pnl_dollars,
+                "cluster_count": self.cluster_count,
+                "sortino": self.sortino,
+                "promotion_candidate": self.promotion_candidate,
+                "below_support_floor": self.below_support_floor,
+                "insufficient_for_ranking": self.insufficient_for_ranking,
+            },
+            "candidate_result_rows": [
+                {
+                    "strategy_name": "auto-lab",
+                    "total_rows_contributing": self.candidate_hypothetical_trades,
+                    "total_net_pnl_dollars": self.total_pnl_dollars,
+                    "cluster_count": self.cluster_count,
+                    "sortino": self.sortino,
+                    "promotion_candidate": self.promotion_candidate,
+                    "below_support_floor": self.below_support_floor,
+                    "insufficient_for_ranking": self.insufficient_for_ranking,
+                }
+            ],
+            "assignment_weighted_baseline": {
+                "corpus_build_id": self.baseline_corpus_build_id or self.corpus_build_id,
+                "overall_win_rate": self.baseline_win_rate,
+            },
+        }
+        return backtest
 
     async def accept_run(self, _run_id: str):
         self.accept_calls += 1
@@ -104,7 +179,11 @@ def _dashboard_payload(*, assigned: str | None = None) -> dict:
                     "strategy_name": "auto-lab",
                     "status": "strong_recommendation",
                     "label": "Strong recommendation",
+                    "win_rate": 0.62,
+                    "resolved_trade_count": 12,
+                    "total_pnl_dollars": 2.5,
                 },
+                "city_corpus_days": 21,
                 "gap_to_runner_up": 0.2,
             }
         ],
@@ -118,6 +197,7 @@ async def auto_evolve_harness(tmp_path):
         strategy_codex_nightly_timezone="UTC",
         strategy_auto_evolve_activate_suggestions=True,
         strategy_auto_evolve_assign_eligible=True,
+        strategy_auto_evolve_greenfield_enabled=True,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -125,20 +205,39 @@ async def auto_evolve_harness(tmp_path):
     async with session_factory() as session:
         repo = PlatformRepository(session)
         await repo.set_checkpoint("strategy_regression", None, {"ran_at": datetime.now(UTC).isoformat()})
+        corpus = await repo.create_decision_corpus_build(
+            version="test-corpus",
+            date_from=date(2026, 4, 1),
+            date_to=date(2026, 4, 24),
+            source={"kind": "test"},
+            filters={},
+        )
+        await repo.mark_decision_corpus_build_successful(corpus.id, row_count=30)
+        await repo.promote_decision_corpus_build(corpus.id, kalshi_env=settings.kalshi_env, actor="test")
         await session.commit()
 
     async def build(*, dashboard=None, codex=None, audit=None):
+        codex_service = codex or FakeCodexService()
+        if (
+            isinstance(codex_service, FakeCodexService)
+            and codex_service.bind_current_corpus
+            and codex_service.corpus_build_id is None
+        ):
+            codex_service.corpus_build_id = corpus.id
+        dashboard_payload = dashboard or _dashboard_payload()
+        dashboard_payload.setdefault("summary", {}).setdefault("corpus_build_id", corpus.id)
+        dashboard_payload["summary"].setdefault("last_regression_run", datetime.now(UTC).isoformat())
         service = StrategyAutoEvolveService(
             settings=settings,
             session_factory=session_factory,
             strategy_regression_service=FakeRegressionService(),
-            strategy_codex_service=codex or FakeCodexService(),
-            strategy_dashboard_service=FakeDashboardService(dashboard or _dashboard_payload()),
+            strategy_codex_service=codex_service,
+            strategy_dashboard_service=FakeDashboardService(dashboard_payload),
             trading_audit_service=audit or FakeAuditService(),
         )
         return service
 
-    yield SimpleNamespace(settings=settings, session_factory=session_factory, build=build)
+    yield SimpleNamespace(settings=settings, session_factory=session_factory, build=build, corpus_build_id=corpus.id)
     await engine.dispose()
 
 
@@ -160,13 +259,61 @@ async def test_auto_evolve_accepts_activates_and_assigns(auto_evolve_harness) ->
         repo = PlatformRepository(session)
         assignment = await repo.get_city_strategy_assignment("KXHIGHNY")
         checkpoint = await repo.get_checkpoint(service.checkpoint_name)
+        promotion = await repo.get_strategy_promotion(result["promotion_id"])
+        events = await repo.list_city_assignment_events(
+            series_ticker="KXHIGHNY",
+            promotion_id=result["promotion_id"],
+        )
         await session.commit()
 
     assert assignment is not None
     assert assignment.strategy_name == "auto-lab"
     assert assignment.assigned_by == "auto_evolve"
+    assert assignment.evidence_corpus_build_id == auto_evolve_harness.corpus_build_id
+    assert assignment.evidence_run_at is not None
+    assert promotion is not None
+    assert promotion.watchdog_status == "pending"
+    assert promotion.watchdog_due_at is not None
+    assert promotion.watchdog_extended_due_at is not None
+    assert promotion.new_city_assignments["KXHIGHNY"]["new_strategy"] == "auto-lab"
+    assert events[0].actor == "strategy_auto_evolve"
+    assert events[0].event_type == "auto_evolve_assign"
+    assert events[0].new_strategy == "auto-lab"
+    assert events[0].event_metadata["corpus_build_id"] == auto_evolve_harness.corpus_build_id
+    assert events[0].event_metadata["basis_run_at"] is not None
     assert checkpoint is not None
     assert checkpoint.payload["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_does_not_assign_when_regression_refresh_leaves_checkpoint_stale(
+    auto_evolve_harness,
+) -> None:
+    codex = FakeCodexService()
+    async with auto_evolve_harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.set_checkpoint(
+            "strategy_regression",
+            None,
+            {"ran_at": (datetime.now(UTC) - timedelta(days=3)).isoformat()},
+        )
+        await session.commit()
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "fresh_regression_unavailable"
+    assert result["regression"]["refreshed"] is True
+    assert codex.execute_calls == 0
+    async with auto_evolve_harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        assignment = await repo.get_city_strategy_assignment("KXHIGHNY")
+        promotions = await repo.list_strategy_promotion_records(kalshi_env=auto_evolve_harness.settings.kalshi_env)
+        await session.commit()
+
+    assert assignment is None
+    assert promotions == []
 
 
 @pytest.mark.asyncio
@@ -182,6 +329,32 @@ async def test_auto_evolve_same_day_is_idempotent(auto_evolve_harness) -> None:
     assert codex.execute_calls == 1
     assert codex.accept_calls == 1
     assert codex.activate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_inactive_color_skip_does_not_overwrite_shared_checkpoint(auto_evolve_harness) -> None:
+    codex = FakeCodexService()
+    service = await auto_evolve_harness.build(codex=codex)
+
+    first = await service.run_once(trigger_source="manual")
+    async with auto_evolve_harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.set_active_color("green")
+        await session.commit()
+
+    skipped = await service.run_once(trigger_source="manual")
+
+    assert first["status"] == "completed"
+    assert skipped["status"] == "skipped"
+    assert skipped["reason"] == "inactive_color"
+    async with auto_evolve_harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        checkpoint = await repo.get_checkpoint(service.checkpoint_name)
+        await session.commit()
+
+    assert checkpoint is not None
+    assert checkpoint.payload["status"] == "completed"
+    assert checkpoint.payload["assignment_changes"][0]["series_ticker"] == "KXHIGHNY"
 
 
 @pytest.mark.asyncio
@@ -216,6 +389,165 @@ async def test_auto_evolve_failed_backtest_does_not_activate_or_assign(auto_evol
         assignment = await repo.get_city_strategy_assignment("KXHIGHNY")
         await session.commit()
     assert assignment is None
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_rejects_when_no_promoted_corpus(auto_evolve_harness) -> None:
+    codex = FakeCodexService(corpus_build_id=auto_evolve_harness.corpus_build_id)
+    async with auto_evolve_harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.set_checkpoint(
+            repo.decision_corpus_current_checkpoint_name(kalshi_env=auto_evolve_harness.settings.kalshi_env),
+            None,
+            {},
+        )
+        await session.commit()
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed_with_failures"
+    assert codex.accept_calls == 0
+    assert result["errors"][0]["reason"] == "insufficient_corpus"
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_rejects_backtest_on_stale_corpus(auto_evolve_harness) -> None:
+    codex = FakeCodexService(corpus_build_id="stale-corpus", baseline_corpus_build_id="stale-corpus")
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed_with_failures"
+    assert codex.accept_calls == 0
+    error = next(e for e in result["errors"] if e.get("reason") == "stale_backtest_corpus")
+    assert error["backtest_corpus_build_id"] == "stale-corpus"
+    assert error["current_corpus_build_id"] == auto_evolve_harness.corpus_build_id
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_rejects_backtest_without_corpus_link(auto_evolve_harness) -> None:
+    codex = FakeCodexService(bind_current_corpus=False)
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed_with_failures"
+    assert codex.accept_calls == 0
+    error = next(e for e in result["errors"] if e.get("reason") == "backtest_corpus_missing")
+    assert error["current_corpus_build_id"] == auto_evolve_harness.corpus_build_id
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_rejects_backtest_below_resolved_room_floor(auto_evolve_harness) -> None:
+    codex = FakeCodexService(
+        corpus_build_id=auto_evolve_harness.corpus_build_id,
+        resolved_regression_rooms=29,
+    )
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed_with_failures"
+    assert codex.accept_calls == 0
+    error = next(e for e in result["errors"] if e.get("reason") == "insufficient_corpus")
+    assert error["resolved_regression_rooms"] == 29
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_rejects_backtest_below_candidate_trade_floor(auto_evolve_harness) -> None:
+    codex = FakeCodexService(
+        corpus_build_id=auto_evolve_harness.corpus_build_id,
+        candidate_hypothetical_trades=9,
+    )
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed_with_failures"
+    assert codex.accept_calls == 0
+    error = next(e for e in result["errors"] if e.get("reason") == "insufficient_backtest_trades")
+    assert error["candidate_hypothetical_trades"] == 9
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_rejects_backtest_without_promotion_quality_evidence(auto_evolve_harness) -> None:
+    codex = FakeCodexService(
+        corpus_build_id=auto_evolve_harness.corpus_build_id,
+        promotion_candidate=False,
+        cluster_count=29,
+        sortino=0.25,
+        total_pnl_dollars=-0.01,
+        below_support_floor=True,
+    )
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed_with_failures"
+    assert codex.accept_calls == 0
+    error = next(e for e in result["errors"] if e.get("reason") == "failed_quality_floor")
+    assert set(error["floor_failures"]) >= {
+        "promotion_candidate",
+        "cluster_count",
+        "sortino",
+        "total_net_pnl",
+        "below_support_floor",
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_rejects_candidate_that_does_not_beat_assignment_weighted_baseline(auto_evolve_harness) -> None:
+    codex = FakeCodexService(
+        corpus_build_id=auto_evolve_harness.corpus_build_id,
+        candidate_win_rate=0.50,
+        baseline_win_rate=0.50,
+    )
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed_with_failures"
+    assert codex.accept_calls == 0
+    error = next(e for e in result["errors"] if e.get("reason") == "failed_quality_floor")
+    assert error["candidate_win_rate"] == 0.50
+    assert error["baseline_win_rate"] == 0.50
+    assert error["min_improvement_bps"] == auto_evolve_harness.settings.strategy_auto_evolve_min_improvement_bps
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_rejects_candidate_below_min_assignment_weighted_improvement(auto_evolve_harness) -> None:
+    codex = FakeCodexService(
+        corpus_build_id=auto_evolve_harness.corpus_build_id,
+        candidate_win_rate=0.505,
+        baseline_win_rate=0.50,
+    )
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed_with_failures"
+    assert codex.accept_calls == 0
+    error = next(e for e in result["errors"] if e.get("reason") == "failed_quality_floor")
+    assert error["improvement_bps"] == 50
+    assert error["min_improvement_bps"] == auto_evolve_harness.settings.strategy_auto_evolve_min_improvement_bps
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_rejects_stale_suggestion_run(auto_evolve_harness) -> None:
+    codex = FakeCodexService(
+        corpus_build_id=auto_evolve_harness.corpus_build_id,
+        finished_at=datetime.now(UTC)
+        - timedelta(seconds=auto_evolve_harness.settings.strategy_auto_evolve_accept_max_run_age_seconds + 5),
+    )
+    service = await auto_evolve_harness.build(codex=codex)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "completed_with_failures"
+    assert codex.accept_calls == 0
+    error = next(e for e in result["errors"] if e.get("reason") == "stale_backtest_run")
+    assert error["max_age_seconds"] == auto_evolve_harness.settings.strategy_auto_evolve_accept_max_run_age_seconds
 
 
 @pytest.mark.asyncio
@@ -300,6 +632,7 @@ class FakeCodexServiceWithThresholds(FakeCodexService):
         candidate: dict = {}
         if self._thresholds is not None:
             candidate = {"thresholds": self._thresholds}
+        finished_at = self.finished_at or datetime.now(UTC)
         return [
             {
                 "id": "eval-run",
@@ -313,11 +646,12 @@ class FakeCodexServiceWithThresholds(FakeCodexService):
                 "id": "suggest-run",
                 "mode": "suggest",
                 "status": "completed",
+                "finished_at": finished_at.isoformat() if isinstance(finished_at, datetime) else finished_at,
                 "provider": "gemini",
                 "model": "gemini-2.5-pro",
                 "result": {
                     "kind": "suggest",
-                    "backtest": {"status": self.backtest_status},
+                    "backtest": self._backtest_payload(),
                     "candidate": candidate,
                 },
                 "can_accept": self.backtest_status == "ok",
@@ -411,7 +745,11 @@ def _multi_city_dashboard(cities: list[tuple[str, float, float]]) -> dict:
                     "strategy_name": "auto-lab",
                     "status": "strong_recommendation",
                     "label": "Strong recommendation",
+                    "win_rate": 0.50 + gap_assign,
+                    "resolved_trade_count": 12,
+                    "total_pnl_dollars": 2.5,
                 },
+                "city_corpus_days": 21,
                 "gap_to_assignment": gap_assign,
                 "gap_to_runner_up": gap_runner,
             }
@@ -456,3 +794,235 @@ async def test_city_cap_assigns_all_when_below_limit(auto_evolve_harness) -> Non
 
     assert len(result["assignment_changes"]) == 2
     assert not any(s.get("reason") == "cycle_cap_exceeded" for s in result["assignment_skips"])
+
+
+@pytest.mark.asyncio
+async def test_city_cap_orders_ranking_rows_by_sortino(auto_evolve_harness) -> None:
+    dashboard = _multi_city_dashboard([
+        ("CITY-A", 0.30, 0.15),
+        ("CITY-B", 0.05, 0.02),
+        ("CITY-C", 0.20, 0.08),
+        ("CITY-D", 0.10, 0.04),
+    ])
+    sortinos = {
+        "CITY-A": 0.55,
+        "CITY-B": 1.90,
+        "CITY-C": 1.20,
+        "CITY-D": 1.60,
+    }
+    for row in dashboard["city_matrix"]:
+        row["ranking_version"] = "clustered_sortino_v1"
+        row["candidate_sortino"] = sortinos[row["series_ticker"]]
+        row["candidate_cluster_count"] = 36
+        row["candidate_total_net_pnl_dollars"] = 4.0
+        row["promotion_candidate"] = True
+        row["recommendation"].update({
+            "ranking_version": "clustered_sortino_v1",
+            "sortino": sortinos[row["series_ticker"]],
+            "cluster_count": 36,
+            "total_net_pnl_dollars": 4.0,
+            "promotion_candidate": True,
+            "below_support_floor": False,
+            "insufficient_for_ranking": False,
+        })
+    service = await auto_evolve_harness.build(dashboard=dashboard)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assigned = [change["series_ticker"] for change in result["assignment_changes"]]
+    assert assigned == ["CITY-B", "CITY-D", "CITY-C"]
+    capped = next(skip for skip in result["assignment_skips"] if skip.get("reason") == "cycle_cap_exceeded")
+    assert capped["series_ticker"] == "CITY-A"
+
+
+@pytest.mark.asyncio
+async def test_ranking_candidate_below_quality_floor_is_skipped(auto_evolve_harness) -> None:
+    dashboard = _dashboard_payload()
+    row = dashboard["city_matrix"][0]
+    row["ranking_version"] = "clustered_sortino_v1"
+    row["candidate_sortino"] = 0.1
+    row["candidate_cluster_count"] = 36
+    row["candidate_total_net_pnl_dollars"] = 4.0
+    row["promotion_candidate"] = False
+    row["recommendation"].update({
+        "ranking_version": "clustered_sortino_v1",
+        "sortino": 0.1,
+        "cluster_count": 36,
+        "total_net_pnl_dollars": 4.0,
+        "promotion_candidate": False,
+        "below_support_floor": False,
+        "insufficient_for_ranking": False,
+        "win_rate": 0.90,
+        "resolved_trade_count": 40,
+        "total_pnl_dollars": 10.0,
+    })
+    service = await auto_evolve_harness.build(dashboard=dashboard)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["assignment_changes"] == []
+    skip = next(s for s in result["assignment_skips"] if s["series_ticker"] == "KXHIGHNY")
+    assert skip["reason"] == "below_improvement_floor"
+    assert set(skip["floor_failures"]) == {"promotion_candidate", "sortino"}
+
+
+@pytest.mark.asyncio
+async def test_greenfield_candidate_missing_evidence_is_skipped(auto_evolve_harness) -> None:
+    dashboard = _dashboard_payload()
+    city = dashboard["city_matrix"][0]
+    city["recommendation"].pop("win_rate")
+    city["recommendation"].pop("resolved_trade_count")
+    city["recommendation"].pop("total_pnl_dollars")
+    service = await auto_evolve_harness.build(dashboard=dashboard)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["assignment_changes"] == []
+    skip = next(s for s in result["assignment_skips"] if s["series_ticker"] == "KXHIGHNY")
+    assert skip["reason"] == "below_improvement_floor"
+    assert set(skip["floor_failures"]) == {
+        "greenfield_win_rate",
+        "greenfield_resolved_trades",
+        "greenfield_pnl",
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_only_assigns_activated_candidate_strategy(auto_evolve_harness) -> None:
+    dashboard = _multi_city_dashboard([
+        ("CITY-A", 0.30, 0.15),
+        ("CITY-B", 0.25, 0.10),
+    ])
+    dashboard["city_matrix"][1]["recommendation"]["strategy_name"] = "other-active"
+    service = await auto_evolve_harness.build(dashboard=dashboard)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert {change["series_ticker"] for change in result["assignment_changes"]} == {"CITY-A"}
+    skip = next(s for s in result["assignment_skips"] if s["series_ticker"] == "CITY-B")
+    assert skip["reason"] == "not_recommended"
+    assert skip["candidate_strategy"] == "auto-lab"
+
+
+@pytest.mark.asyncio
+async def test_reassignment_promotion_snapshots_incumbent_baseline_metrics(auto_evolve_harness) -> None:
+    dashboard = _dashboard_payload(assigned="incumbent")
+    row = dashboard["city_matrix"][0]
+    row["expected_improvement"] = 0.08
+    row["incumbent_strategy_live_fill_count_30d"] = 7
+    row["incumbent_health"] = {
+        "status": "degraded",
+        "win_rate_30d": 0.52,
+        "realized_pnl_30d": 18.4,
+        "fill_count_30d": 7,
+    }
+    service = await auto_evolve_harness.build(dashboard=dashboard)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["assignment_changes"][0]["assignment_type"] == "reassignment"
+    async with auto_evolve_harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        promotion = await repo.get_strategy_promotion(result["promotion_id"])
+        await session.commit()
+
+    assert promotion is not None
+    previous = promotion.previous_city_assignments["KXHIGHNY"]
+    assert previous["strategy_name"] == "incumbent"
+    assert previous["incumbent_win_rate_30d"] == 0.52
+    assert previous["incumbent_realized_pnl_30d"] == 18.4
+    assert previous["incumbent_live_fill_count_30d"] == 7
+
+
+@pytest.mark.asyncio
+async def test_reassignment_skips_incumbent_healthy_from_metric_fallback(auto_evolve_harness) -> None:
+    dashboard = _dashboard_payload(assigned="incumbent")
+    row = dashboard["city_matrix"][0]
+    row["expected_improvement"] = 0.08
+    row["incumbent_strategy_live_fill_count_30d"] = 7
+    row["incumbent_health"] = {
+        "win_rate_30d": 0.46,
+        "realized_pnl_30d": 0.01,
+        "fill_count_30d": 7,
+    }
+    service = await auto_evolve_harness.build(dashboard=dashboard)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["assignment_changes"] == []
+    skip = next(s for s in result["assignment_skips"] if s["series_ticker"] == "KXHIGHNY")
+    assert skip["reason"] == "incumbent_healthy"
+    assert skip["incumbent_health"]["status"] == "healthy"
+    assert skip["incumbent_health"]["health_source"] == "metrics_fallback"
+
+
+@pytest.mark.asyncio
+async def test_assignment_rejects_stale_dashboard_corpus(auto_evolve_harness) -> None:
+    dashboard = _dashboard_payload()
+    dashboard["summary"]["corpus_build_id"] = "stale-corpus"
+    service = await auto_evolve_harness.build(dashboard=dashboard)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["assignment_changes"] == []
+    assert any(
+        error.get("stage") == "assign" and error.get("reason") == "stale_assignment_snapshot"
+        for error in result["errors"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_reassignment_uses_recent_live_fills_when_dashboard_omits_count(auto_evolve_harness) -> None:
+    dashboard = _dashboard_payload(assigned="incumbent")
+    row = dashboard["city_matrix"][0]
+    row["expected_improvement"] = 0.08
+    row["incumbent_health"] = {"status": "degraded", "win_rate_30d": 0.48}
+    row.pop("incumbent_strategy_live_fill_count_30d", None)
+    now = datetime.now(UTC)
+    async with auto_evolve_harness.session_factory() as session:
+        repo = PlatformRepository(session)
+        assignment = await repo.set_city_strategy_assignment("KXHIGHNY", "incumbent", assigned_by="operator")
+        assignment.assigned_at = now - timedelta(days=3)
+        session.add_all(
+            [
+                FillRecord(
+                    trade_id=f"fallback-incumbent-live-{idx}",
+                    kalshi_env=auto_evolve_harness.settings.kalshi_env,
+                    market_ticker=f"KXHIGHNY-26APR{20 + idx}-T70",
+                    side="yes",
+                    action="buy",
+                    yes_price_dollars=Decimal("0.4000"),
+                    count_fp=Decimal("1.00"),
+                    strategy_code="incumbent",
+                    settlement_result="win",
+                    raw={},
+                    created_at=now - timedelta(hours=idx),
+                    updated_at=now - timedelta(hours=idx),
+                )
+                for idx in range(1, 6)
+            ]
+            + [
+                FillRecord(
+                    trade_id=f"fallback-legacy-a-live-{idx}",
+                    kalshi_env=auto_evolve_harness.settings.kalshi_env,
+                    market_ticker=f"KXHIGHNY-26APR{30 + idx}-T70",
+                    side="yes",
+                    action="buy",
+                    yes_price_dollars=Decimal("0.4000"),
+                    count_fp=Decimal("1.00"),
+                    strategy_code="A",
+                    settlement_result="win",
+                    raw={},
+                    created_at=now - timedelta(hours=idx),
+                    updated_at=now - timedelta(hours=idx),
+                )
+                for idx in range(1, 5)
+            ]
+        )
+        await session.commit()
+    service = await auto_evolve_harness.build(dashboard=dashboard)
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["assignment_changes"][0]["series_ticker"] == "KXHIGHNY"
+    assert not any(skip.get("reason") == "insufficient_live_fills" for skip in result["assignment_skips"])

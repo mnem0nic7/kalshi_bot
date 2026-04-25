@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import asdict
-from datetime import date
+from datetime import UTC, date, datetime
 import json
 from pathlib import Path
 import sys
+
+from sqlalchemy import or_, select
 
 from kalshi_bot.core.enums import RoomOrigin
 from kalshi_bot.core.schemas import (
@@ -18,6 +20,7 @@ from kalshi_bot.core.schemas import (
     ShadowCampaignRequest,
     TrainingBuildRequest,
 )
+from kalshi_bot.db.models import StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
 from kalshi_bot.logging import configure_logging
@@ -42,6 +45,40 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
         for record in records:
             handle.write(json.dumps(record))
             handle.write("\n")
+
+
+def _secondary_ignore_resolution(
+    *,
+    resolved_by: str,
+    note: str,
+    resolved_at: datetime | None = None,
+) -> dict[str, str]:
+    resolved_by = resolved_by.strip()
+    note = note.strip()
+    if not resolved_by:
+        raise ValueError("--resolved-by must be non-empty")
+    if len(note) < 20:
+        raise ValueError("--note must be at least 20 characters")
+    return {
+        "action": "ignored_by_operator",
+        "resolved_by": resolved_by,
+        "resolved_at": (resolved_at or datetime.now(UTC)).isoformat(),
+        "note": note,
+    }
+
+
+def _secondary_ignore_update_values(
+    fields: list[str],
+    resolution: dict[str, str],
+) -> dict[str, object]:
+    values: dict[str, object] = {}
+    if "secondary_sync_status" in fields:
+        values["secondary_sync_status"] = "ignored_by_operator"
+        values["secondary_sync_resolution"] = dict(resolution)
+    if "secondary_rollback_status" in fields:
+        values["secondary_rollback_status"] = "ignored_by_operator"
+        values["secondary_rollback_resolution"] = dict(resolution)
+    return values
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
@@ -466,6 +503,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     dry_run=args.dry_run,
                     notes=args.notes,
                     parent_build_id=args.parent_build_id,
+                    kalshi_env=container.settings.kalshi_env,
                 )
                 print(json.dumps(result, indent=2))
                 return 0
@@ -749,6 +787,107 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 for e in events
             ], indent=2))
             return 0
+
+        if args.command == "ignore-strategy-promotion-secondary-status":
+            fields = list(dict.fromkeys(args.field))
+            promotion_ids = list(dict.fromkeys(args.promotion_id or []))
+            if args.all and promotion_ids:
+                raise ValueError("Use either --all or --promotion-id, not both")
+            if not args.all and not promotion_ids:
+                raise ValueError("Provide --promotion-id or --all")
+            if (args.all or len(promotion_ids) > 1) and not args.kalshi_env:
+                raise ValueError("Bulk secondary status ignore requires explicit --kalshi-env")
+
+            resolution = _secondary_ignore_resolution(resolved_by=args.resolved_by, note=args.note)
+            updated: list[dict[str, object]] = []
+            async with container.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=args.kalshi_env or container.settings.kalshi_env)
+                if args.all:
+                    status_filters = []
+                    if "secondary_sync_status" in fields:
+                        status_filters.append(
+                            StrategyPromotionRecord.secondary_sync_status.in_(["pending", "failed"])
+                        )
+                    if "secondary_rollback_status" in fields:
+                        status_filters.append(
+                            StrategyPromotionRecord.secondary_rollback_status.in_(["pending", "failed"])
+                        )
+                    stmt = (
+                        select(StrategyPromotionRecord)
+                        .where(
+                            StrategyPromotionRecord.kalshi_env == args.kalshi_env,
+                            or_(*status_filters),
+                        )
+                        .order_by(StrategyPromotionRecord.id.asc())
+                    )
+                    records = list((await session.execute(stmt)).scalars())
+                    for record in records:
+                        record_fields = [
+                            field
+                            for field in fields
+                            if getattr(record, field) in {"pending", "failed"}
+                        ]
+                        if not record_fields:
+                            continue
+                        values = _secondary_ignore_update_values(record_fields, resolution)
+                        updated_record = await repo.update_strategy_promotion(record.id, **values)
+                        updated.append(
+                            {
+                                "id": updated_record.id,
+                                "kalshi_env": updated_record.kalshi_env,
+                                "fields": record_fields,
+                            }
+                        )
+                else:
+                    values = _secondary_ignore_update_values(fields, resolution)
+                    for promotion_id in promotion_ids:
+                        updated_record = await repo.update_strategy_promotion(promotion_id, **values)
+                        updated.append(
+                            {
+                                "id": updated_record.id,
+                                "kalshi_env": updated_record.kalshi_env,
+                                "fields": fields,
+                            }
+                        )
+                await session.commit()
+            print(
+                json.dumps(
+                    {
+                        "updated_count": len(updated),
+                        "updated": updated,
+                        "resolution": resolution,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+
+        if args.command == "strategy-promotion-watchdog":
+            if args.strategy_promotion_watchdog_command == "evaluate":
+                payload = await container.strategy_auto_evolve_service.evaluate_strategy_promotion(
+                    args.promotion_id,
+                    trigger_source=args.source,
+                )
+                print(json.dumps(payload, indent=2))
+                return 0
+            if args.strategy_promotion_watchdog_command == "resolve":
+                payload = await container.strategy_auto_evolve_service.resolve_strategy_promotion_insufficient_data(
+                    args.promotion_id,
+                    action=args.action,
+                    resolved_by=args.resolved_by,
+                    note=args.note,
+                )
+                print(json.dumps(payload, indent=2))
+                return 0
+
+        if args.command == "strategy-promotion-secondary-sync":
+            if args.strategy_promotion_secondary_sync_command == "sweep":
+                payload = await container.strategy_auto_evolve_service.sweep_secondary_strategy_promotion_syncs(
+                    trigger_source=args.source,
+                    limit=args.limit,
+                )
+                print(json.dumps(payload, indent=2))
+                return 0
 
         if args.command == "shadow-sweep":
             results = await container.shadow_training_service.run_shadow_sweep(
@@ -1346,6 +1485,73 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_promotions.add_argument("--strategy", default=None)
     list_promotions.add_argument("--limit", type=int, default=25)
+
+    ignore_secondary = subparsers.add_parser(
+        "ignore-strategy-promotion-secondary-status",
+        help="Mark secondary promotion sync or rollback status ignored by an operator.",
+    )
+    ignore_secondary.add_argument("--promotion-id", type=int, action="append", default=None)
+    ignore_secondary.add_argument(
+        "--all",
+        action="store_true",
+        help="Ignore all pending/failed matching rows in --kalshi-env",
+    )
+    ignore_secondary.add_argument(
+        "--kalshi-env",
+        default=None,
+        help="Required for --all or multiple --promotion-id values",
+    )
+    ignore_secondary.add_argument(
+        "--field",
+        choices=["secondary_sync_status", "secondary_rollback_status"],
+        action="append",
+        required=True,
+    )
+    ignore_secondary.add_argument(
+        "--resolved-by",
+        required=True,
+        help="Operator identity for the resolution audit",
+    )
+    ignore_secondary.add_argument("--note", required=True, help="Resolution note, minimum 20 characters")
+
+    promotion_watchdog = subparsers.add_parser(
+        "strategy-promotion-watchdog",
+        help="Evaluate or resolve auto-evolve strategy promotion watchdog records.",
+    )
+    promotion_watchdog_subparsers = promotion_watchdog.add_subparsers(
+        dest="strategy_promotion_watchdog_command",
+        required=True,
+    )
+    promotion_watchdog_evaluate = promotion_watchdog_subparsers.add_parser(
+        "evaluate",
+        help="Evaluate a single strategy promotion watchdog row regardless of due date.",
+    )
+    promotion_watchdog_evaluate.add_argument("--promotion-id", type=int, required=True)
+    promotion_watchdog_evaluate.add_argument("--source", default="manual_strategy_promotion_watchdog")
+
+    promotion_watchdog_resolve = promotion_watchdog_subparsers.add_parser(
+        "resolve",
+        help="Resolve an insufficient_data strategy promotion with an operator note.",
+    )
+    promotion_watchdog_resolve.add_argument("--promotion-id", type=int, required=True)
+    promotion_watchdog_resolve.add_argument("--action", choices=["approve", "rollback"], required=True)
+    promotion_watchdog_resolve.add_argument("--resolved-by", required=True)
+    promotion_watchdog_resolve.add_argument("--note", required=True, help="Resolution note, minimum 20 characters")
+
+    promotion_secondary_sync = subparsers.add_parser(
+        "strategy-promotion-secondary-sync",
+        help="Retry secondary assignment or rollback sync for strategy promotion rows.",
+    )
+    promotion_secondary_sync_subparsers = promotion_secondary_sync.add_subparsers(
+        dest="strategy_promotion_secondary_sync_command",
+        required=True,
+    )
+    promotion_secondary_sync_sweep = promotion_secondary_sync_subparsers.add_parser(
+        "sweep",
+        help="Retry pending or failed secondary sync rows in the active environment.",
+    )
+    promotion_secondary_sync_sweep.add_argument("--source", default="manual_strategy_promotion_secondary_sync")
+    promotion_secondary_sync_sweep.add_argument("--limit", type=int, default=50)
 
     shadow_sweep = subparsers.add_parser("shadow-sweep")
     shadow_sweep.add_argument("--markets", nargs="*", default=None)

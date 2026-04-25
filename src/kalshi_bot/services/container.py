@@ -346,6 +346,7 @@ class AppContainer:
             strategy_auto_evolve_service=strategy_auto_evolve_service,
             stop_loss_service=stop_loss_service,
             momentum_calibration_service=momentum_calibration_service,
+            decision_corpus_service=decision_corpus_service,
         )
         container = cls(
             settings=settings,

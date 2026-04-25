@@ -122,6 +122,15 @@ class FakeHistoricalPipelineService:
         return {"status": "completed", "pipeline_kind": "daily"}
 
 
+class FakeDecisionCorpusService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def nightly_auto_promote(self, *, kalshi_env: str, actor: str = "daemon"):
+        self.calls.append({"kalshi_env": kalshi_env, "actor": actor})
+        return {"status": "skipped", "reason": "new_resolved_rooms"}
+
+
 class FakeStrategyRegressionService:
     def __init__(self, session_factory, *, now_fn) -> None:
         self.session_factory = session_factory
@@ -224,7 +233,7 @@ class FakeStrategyAutoEvolveService:
         }
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            await repo.set_checkpoint("daemon_strategy_auto_evolve:demo:blue", None, payload)
+            await repo.set_checkpoint("daemon_strategy_auto_evolve:demo", None, payload)
             await session.commit()
         return payload
 
@@ -446,6 +455,42 @@ async def test_daemon_heartbeat_runs_historical_pipeline_when_available(tmp_path
 
     assert pipeline.daily_calls == 1
     assert payload["historical_pipeline"]["pipeline_kind"] == "daily"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_runs_decision_corpus_promotion_path(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-decision-corpus.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    decision_corpus = FakeDecisionCorpusService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        decision_corpus_service=decision_corpus,  # type: ignore[arg-type]
+    )
+
+    payload = await daemon.heartbeat_once()
+
+    assert decision_corpus.calls == [{"kalshi_env": "demo", "actor": "daemon:blue"}]
+    assert payload["decision_corpus_promotion"]["reason"] == "new_resolved_rooms"
 
     await engine.dispose()
 
@@ -686,7 +731,7 @@ async def test_daemon_heartbeat_delegates_nightly_strategy_auto_evolve_when_enab
 
     async with session_factory() as session:
         checkpoint = (
-            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_strategy_auto_evolve:demo:blue"))
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_strategy_auto_evolve:demo"))
         ).scalar_one()
         await session.commit()
 

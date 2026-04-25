@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
@@ -312,17 +313,111 @@ class Settings(BaseSettings):
     strategy_auto_evolve_accept_suggestions: bool = True
     strategy_auto_evolve_activate_suggestions: bool = False
     strategy_auto_evolve_max_threshold_delta_pct: float = 0.30
+    strategy_auto_evolve_min_improvement_bps: int = 100
+    strategy_auto_evolve_min_city_improvement_bps: int = 100
+    strategy_auto_evolve_max_regression_bps: int = 50
+    strategy_auto_evolve_max_run_age_seconds: int = 172800
+    strategy_auto_evolve_min_corpus_rows: int = 500
+    strategy_auto_evolve_min_corpus_cities: int = 3
+    strategy_auto_evolve_min_city_rows: int = 25
+    strategy_auto_evolve_cooldown_seconds: int = 86400
+    strategy_auto_evolve_greenfield_enabled: bool = False
+    strategy_auto_evolve_reference_strategy_name: str | None = None
+    strategy_auto_evolve_reference_run_id: str | None = None
     strategy_auto_evolve_max_cities_per_cycle: int = 3
+    strategy_auto_evolve_accept_max_run_age_seconds: int = 3600
+    strategy_auto_evolve_city_assignment_cooldown_days: int = 14
+    strategy_auto_evolve_min_city_corpus_days: int = 14
+    strategy_auto_evolve_min_recent_live_resolved_fills: int = 5
+    strategy_auto_evolve_backtest_min_resolved_regression_rooms: int = 30
+    strategy_auto_evolve_backtest_min_candidate_trades: int = 10
+    strategy_auto_evolve_assignment_min_improvement_bps: int = 200
+    strategy_auto_evolve_per_city_max_negative_delta_bps: int = 100
+    strategy_auto_evolve_greenfield_min_win_rate_bps: int = 5500
+    strategy_auto_evolve_greenfield_min_resolved_trades: int = 10
+    strategy_auto_evolve_greenfield_reference_win_rate: float = 0.50
+    strategy_auto_evolve_incumbent_health_win_rate_floor_bps: int = 4500
+    strategy_auto_evolve_watchdog_win_rate_degradation_bps: int = 1000
+    strategy_auto_evolve_watchdog_min_resolved_live_fills: int = 5
+    strategy_corpus_excluded_date_ranges: str = ""
     historical_execution_confidence_min_market_days: int = 60
     historical_directional_confidence_min_full_market_days: int = 30
     historical_directional_confidence_min_holdout_market_days: int = 7
 
     @model_validator(mode="after")
     def _validate_auto_evolve_flags(self) -> "Settings":
+        if self.strategy_auto_evolve_activate_suggestions and not self.strategy_auto_evolve_accept_suggestions:
+            raise ValueError(
+                "strategy_auto_evolve_activate_suggestions requires "
+                "strategy_auto_evolve_accept_suggestions=True"
+            )
         if self.strategy_auto_evolve_assign_eligible and not self.strategy_auto_evolve_activate_suggestions:
             raise ValueError(
                 "strategy_auto_evolve_assign_eligible requires strategy_auto_evolve_activate_suggestions=True"
             )
+        if self.strategy_auto_evolve_assign_eligible and not self.strategy_auto_evolve_accept_suggestions:
+            raise ValueError(
+                "strategy_auto_evolve_assign_eligible requires "
+                "strategy_auto_evolve_accept_suggestions=True"
+            )
+        if not 0.0 <= self.strategy_auto_evolve_max_threshold_delta_pct <= 1.0:
+            raise ValueError("strategy_auto_evolve_max_threshold_delta_pct must be between 0.0 and 1.0")
+
+        non_negative_fields = {
+            "strategy_auto_evolve_min_improvement_bps": self.strategy_auto_evolve_min_improvement_bps,
+            "strategy_auto_evolve_min_city_improvement_bps": self.strategy_auto_evolve_min_city_improvement_bps,
+            "strategy_auto_evolve_max_regression_bps": self.strategy_auto_evolve_max_regression_bps,
+            "strategy_auto_evolve_min_corpus_rows": self.strategy_auto_evolve_min_corpus_rows,
+            "strategy_auto_evolve_min_corpus_cities": self.strategy_auto_evolve_min_corpus_cities,
+            "strategy_auto_evolve_min_city_rows": self.strategy_auto_evolve_min_city_rows,
+            "strategy_auto_evolve_cooldown_seconds": self.strategy_auto_evolve_cooldown_seconds,
+            "strategy_auto_evolve_max_cities_per_cycle": self.strategy_auto_evolve_max_cities_per_cycle,
+            "strategy_auto_evolve_city_assignment_cooldown_days": self.strategy_auto_evolve_city_assignment_cooldown_days,
+            "strategy_auto_evolve_min_city_corpus_days": self.strategy_auto_evolve_min_city_corpus_days,
+            "strategy_auto_evolve_min_recent_live_resolved_fills": self.strategy_auto_evolve_min_recent_live_resolved_fills,
+            "strategy_auto_evolve_backtest_min_resolved_regression_rooms": self.strategy_auto_evolve_backtest_min_resolved_regression_rooms,
+            "strategy_auto_evolve_backtest_min_candidate_trades": self.strategy_auto_evolve_backtest_min_candidate_trades,
+            "strategy_auto_evolve_assignment_min_improvement_bps": self.strategy_auto_evolve_assignment_min_improvement_bps,
+            "strategy_auto_evolve_per_city_max_negative_delta_bps": self.strategy_auto_evolve_per_city_max_negative_delta_bps,
+            "strategy_auto_evolve_greenfield_min_win_rate_bps": self.strategy_auto_evolve_greenfield_min_win_rate_bps,
+            "strategy_auto_evolve_greenfield_min_resolved_trades": self.strategy_auto_evolve_greenfield_min_resolved_trades,
+            "strategy_auto_evolve_incumbent_health_win_rate_floor_bps": self.strategy_auto_evolve_incumbent_health_win_rate_floor_bps,
+            "strategy_auto_evolve_watchdog_win_rate_degradation_bps": self.strategy_auto_evolve_watchdog_win_rate_degradation_bps,
+            "strategy_auto_evolve_watchdog_min_resolved_live_fills": self.strategy_auto_evolve_watchdog_min_resolved_live_fills,
+        }
+        for field_name, value in non_negative_fields.items():
+            if value < 0:
+                raise ValueError(f"{field_name} must be non-negative")
+
+        positive_fields = {
+            "strategy_auto_evolve_max_run_age_seconds": self.strategy_auto_evolve_max_run_age_seconds,
+            "strategy_auto_evolve_accept_max_run_age_seconds": self.strategy_auto_evolve_accept_max_run_age_seconds,
+        }
+        for field_name, value in positive_fields.items():
+            if value <= 0:
+                raise ValueError(f"{field_name} must be positive")
+
+        if self.strategy_auto_evolve_reference_strategy_name is not None:
+            reference_strategy_name = self.strategy_auto_evolve_reference_strategy_name.strip()
+            self.strategy_auto_evolve_reference_strategy_name = reference_strategy_name or None
+        if self.strategy_auto_evolve_reference_run_id is not None:
+            reference_run_id = self.strategy_auto_evolve_reference_run_id.strip()
+            self.strategy_auto_evolve_reference_run_id = reference_run_id or None
+        self.strategy_corpus_excluded_date_ranges = self.strategy_corpus_excluded_date_ranges.strip()
+        if self.strategy_corpus_excluded_date_ranges:
+            for raw_range in self.strategy_corpus_excluded_date_ranges.split(","):
+                bounds = raw_range.strip().split("/")
+                if len(bounds) != 2:
+                    raise ValueError("strategy_corpus_excluded_date_ranges must use YYYY-MM-DD/YYYY-MM-DD ranges")
+                try:
+                    start = date.fromisoformat(bounds[0].strip())
+                    end = date.fromisoformat(bounds[1].strip())
+                except ValueError as exc:
+                    raise ValueError(
+                        "strategy_corpus_excluded_date_ranges must use YYYY-MM-DD/YYYY-MM-DD ranges"
+                    ) from exc
+                if start > end:
+                    raise ValueError("strategy_corpus_excluded_date_ranges start must be <= end")
         return self
 
     def model_post_init(self, __context: object) -> None:

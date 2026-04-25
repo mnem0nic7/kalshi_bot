@@ -45,7 +45,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import DecisionCorpusBuildRecord, DecisionCorpusRowRecord, StrategyRecord
 from kalshi_bot.db.repositories import PlatformRepository
-from kalshi_bot.services.strategy_regression import RegressionStrategySpec, _thresholds_from_dict, _would_have_traded
+from kalshi_bot.services.strategy_regression import (
+    RegressionStrategySpec,
+    _recommendation_status_label,
+    _thresholds_from_dict,
+    _would_have_traded,
+)
 
 
 REPORT_SCHEMA_VERSION = "v1"
@@ -63,6 +68,41 @@ class StrategyRegressionRankingReportService:
     def __init__(self, settings: Settings, session_factory: async_sessionmaker) -> None:
         self.settings = settings
         self.session_factory = session_factory
+
+    async def evaluate_strategy_specs(
+        self,
+        *,
+        strategies: list[RegressionStrategySpec],
+        build_id: str | None = None,
+        kalshi_env: str | None = None,
+        generated_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate strategy specs against a promoted decision corpus without writing report files."""
+        if bool(build_id) == bool(kalshi_env):
+            raise ValueError("Specify exactly one of build_id or kalshi_env")
+        generated_at = _utc(generated_at or datetime.now(UTC))
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=kalshi_env)
+            build, selection = await self._resolve_build(repo, build_id=build_id, kalshi_env=kalshi_env)
+            rows = await repo.list_decision_corpus_rows(build_id=build.id)
+        report = self._compute_report(
+            build=build,
+            rows=rows,
+            strategies=strategies,
+            selection=selection,
+            generated_at=generated_at,
+            json_filename="",
+            markdown_filename="",
+        )
+        return {
+            "status": "ok",
+            "corpus_build_id": build.id,
+            "date_from": build.date_from.isoformat(),
+            "date_to": build.date_to.isoformat(),
+            "window_days": None,
+            "row_count": len(rows),
+            **report,
+        }
 
     async def rank_report(
         self,
@@ -540,6 +580,116 @@ def _rank_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=_rank_key)
 
 
+def rank_promotion_quality_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _rank_rows(list(rows))
+
+
+def normalize_ranking_row_for_dashboard(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    total_rows_evaluated = int(normalized.get("total_rows_evaluated") or 0)
+    candidate_decision_count = int(normalized.get("candidate_decision_count") or 0)
+    contributing_rows = int(normalized.get("total_rows_contributing") or 0)
+    win_rate = normalized.get("win_rate")
+    win_count = (
+        round(float(win_rate) * contributing_rows)
+        if win_rate is not None and contributing_rows > 0
+        else 0
+    )
+    normalized.update({
+        "rooms_evaluated": total_rows_evaluated,
+        "trade_count": candidate_decision_count,
+        "resolved_trade_count": contributing_rows,
+        "unscored_trade_count": max(candidate_decision_count - contributing_rows, 0),
+        "win_count": win_count,
+        "trade_rate": (candidate_decision_count / total_rows_evaluated) if total_rows_evaluated > 0 else None,
+        "total_pnl_dollars": normalized.get("total_net_pnl_dollars"),
+        "avg_edge_bps": normalized.get("avg_edge_bps"),
+    })
+    return normalized
+
+
+def promotion_quality_recommendation_decision(
+    *,
+    results_by_strategy: dict[str, dict[str, Any]],
+    current_name: str | None,
+) -> dict[str, Any]:
+    ranked_rows = rank_promotion_quality_rows(list(results_by_strategy.values()))
+    best_row = ranked_rows[0] if ranked_rows else None
+    runner_up_row = ranked_rows[1] if len(ranked_rows) > 1 else None
+    current_row = results_by_strategy.get(current_name) if current_name is not None else None
+    gap_to_runner_up = _rate_gap(best_row, runner_up_row)
+    gap_to_current = (
+        _rate_gap(best_row, current_row)
+        if best_row is not None
+        and current_row is not None
+        and best_row.get("strategy_name") != current_name
+        else None
+    )
+    quality_gap_to_runner_up = _metric_gap(best_row, runner_up_row, "sortino")
+    quality_gap_to_current = (
+        _metric_gap(best_row, current_row, "sortino")
+        if best_row is not None
+        and current_row is not None
+        and best_row.get("strategy_name") != current_name
+        else None
+    )
+    best_resolved_trade_count = int(best_row.get("resolved_trade_count") or best_row.get("total_rows_contributing") or 0) if best_row is not None else 0
+    best_trade_count = int(best_row.get("trade_count") or best_row.get("candidate_decision_count") or 0) if best_row is not None else 0
+    best_outcome_coverage_rate = (
+        best_resolved_trade_count / best_trade_count if best_trade_count > 0 else None
+    )
+    best_total_pnl = _float_or_none(best_row.get("total_net_pnl_dollars") if best_row is not None else None)
+    if best_total_pnl is None and best_row is not None:
+        best_total_pnl = _float_or_none(best_row.get("total_pnl_dollars"))
+    clears_trade_threshold = bool(best_row is not None and not best_row.get("insufficient_for_ranking"))
+    clears_coverage_threshold = bool(best_row is not None and not best_row.get("below_support_floor"))
+    clears_strong_gap = bool(best_row is not None and best_row.get("promotion_candidate") is True)
+    clears_lean_gap = False
+    has_positive_pnl = bool(best_total_pnl is not None and best_total_pnl > 0.0)
+
+    if best_row is None or best_resolved_trade_count == 0:
+        recommendation_status = "no_outcomes"
+    elif not clears_trade_threshold or not clears_coverage_threshold:
+        recommendation_status = "low_sample"
+    elif clears_strong_gap and has_positive_pnl:
+        recommendation_status = "strong_recommendation"
+    else:
+        recommendation_status = "too_close"
+
+    return {
+        "ranked_rows": ranked_rows,
+        "best_row": best_row,
+        "runner_up_row": runner_up_row,
+        "current_row": current_row,
+        "gap_to_runner_up": gap_to_runner_up,
+        "gap_to_current_assignment": gap_to_current,
+        "quality_gap_to_runner_up": quality_gap_to_runner_up,
+        "quality_gap_to_current_assignment": quality_gap_to_current,
+        "clears_trade_threshold": clears_trade_threshold,
+        "clears_coverage_threshold": clears_coverage_threshold,
+        "clears_strong_gap": clears_strong_gap,
+        "clears_lean_gap": clears_lean_gap,
+        "best_outcome_coverage_rate": best_outcome_coverage_rate,
+        "best_total_pnl_dollars": best_total_pnl,
+        "has_non_negative_pnl": has_positive_pnl,
+        "winner_wilson_lower": None,
+        "winner_wilson_upper": None,
+        "runner_up_wilson_lower": None,
+        "runner_up_wilson_upper": None,
+        "recommendation": {
+            "strategy_name": best_row["strategy_name"] if best_row is not None else None,
+            "status": recommendation_status,
+            "label": _recommendation_status_label(recommendation_status),
+            "resolved_trade_count": best_resolved_trade_count,
+            "outcome_coverage_rate": best_outcome_coverage_rate,
+            "gap_to_runner_up": gap_to_runner_up,
+            "quality_gap_to_runner_up": quality_gap_to_runner_up,
+            "quality_gap_to_current_assignment": quality_gap_to_current,
+            "writes_assignment": False,
+        },
+    }
+
+
 def _rank_key(row: dict[str, Any]) -> tuple[int, float, int, float, str, str]:
     metric = row.get("sortino")
     total_pnl = row.get("total_net_pnl_dollars")
@@ -551,6 +701,24 @@ def _rank_key(row: dict[str, Any]) -> tuple[int, float, int, float, str, str]:
         str(row.get("series_ticker") or ""),
         str(row.get("strategy_name") or ""),
     )
+
+
+def _metric_gap(
+    left: dict[str, Any] | None,
+    right: dict[str, Any] | None,
+    metric_name: str,
+) -> float | None:
+    if left is None or right is None:
+        return None
+    left_value = _float_or_none(left.get(metric_name))
+    right_value = _float_or_none(right.get(metric_name))
+    if left_value is None or right_value is None:
+        return None
+    return round(left_value - right_value, 6)
+
+
+def _rate_gap(left: dict[str, Any] | None, right: dict[str, Any] | None) -> float | None:
+    return _metric_gap(left, right, "win_rate")
 
 
 def _cluster_key(row: DecisionCorpusRowRecord) -> tuple[str, str, str]:
@@ -582,6 +750,12 @@ def _round(value: float | Decimal | None, places: int = 6) -> float | None:
     if value is None:
         return None
     return round(float(value), places)
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
 
 
 def _utc(value: datetime) -> datetime:

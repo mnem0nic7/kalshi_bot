@@ -2399,6 +2399,9 @@
         body: JSON.stringify({
           expected_strategy_name: recommendation.strategy_name,
           expected_recommendation_status: recommendation.status,
+          expected_corpus_build_id: strategyState.payload && strategyState.payload.summary
+            ? strategyState.payload.summary.corpus_build_id || null
+            : null,
           note,
         }),
       });

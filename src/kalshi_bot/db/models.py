@@ -3,12 +3,17 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from kalshi_bot.core.enums import DeploymentColor, RiskStatus, RoomOrigin, RoomStage
 from kalshi_bot.db.base import Base, IdMixin, TimestampMixin
 from kalshi_bot.db.types import EmbeddingType
+
+
+def _jsonb() -> JSON:
+    return JSON().with_variant(JSONB(), "postgresql")
 
 
 class Room(Base, IdMixin, TimestampMixin):
@@ -132,7 +137,7 @@ class TradeTicketRecord(Base, IdMixin, TimestampMixin):
     time_in_force: Mapped[str] = mapped_column(String(64))
     client_order_id: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="proposed")
-    strategy_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    strategy_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -162,7 +167,7 @@ class OrderRecord(Base, IdMixin, TimestampMixin):
     action: Mapped[str] = mapped_column(String(16))
     yes_price_dollars: Mapped[Decimal] = mapped_column(Numeric(10, 4))
     count_fp: Mapped[Decimal] = mapped_column(Numeric(10, 2))
-    strategy_code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    strategy_code: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -180,7 +185,7 @@ class FillRecord(Base, IdMixin, TimestampMixin):
     count_fp: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     is_taker: Mapped[bool] = mapped_column(Boolean, default=True)
     settlement_result: Mapped[str | None] = mapped_column(String(8), nullable=True)
-    strategy_code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    strategy_code: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -815,6 +820,11 @@ class StrategyResultRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     strategy_id: Mapped[int] = mapped_column(ForeignKey("strategies.id"), index=True)
+    corpus_build_id: Mapped[str | None] = mapped_column(
+        ForeignKey("decision_corpus_builds.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     date_from: Mapped[date] = mapped_column(Date)
     date_to: Mapped[date] = mapped_column(Date)
@@ -833,10 +843,129 @@ class StrategyResultRecord(Base):
 class CityStrategyAssignment(Base):
     __tablename__ = "city_strategy_assignments"
 
+    kalshi_env: Mapped[str] = mapped_column(String(16), primary_key=True, default="demo")
     series_ticker: Mapped[str] = mapped_column(String(64), primary_key=True)
     strategy_name: Mapped[str] = mapped_column(String(64))
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     assigned_by: Mapped[str] = mapped_column(String(64), default="auto_regression")
+    evidence_corpus_build_id: Mapped[str | None] = mapped_column(
+        ForeignKey("decision_corpus_builds.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    evidence_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class StrategyPromotionRecord(Base):
+    __tablename__ = "strategy_promotions"
+    __table_args__ = (
+        CheckConstraint(
+            "watchdog_status IN ('pending', 'extended', 'passed', 'rolled_back', 'insufficient_data')",
+            name="ck_strategy_promotions_watchdog_status",
+        ),
+        CheckConstraint(
+            "secondary_sync_status IN ('pending', 'failed', 'synced', 'ignored_by_operator', 'not_applicable')",
+            name="ck_strategy_promotions_secondary_sync_status",
+        ),
+        CheckConstraint(
+            "secondary_rollback_status IN ('pending', 'failed', 'synced', 'ignored_by_operator', 'not_applicable')",
+            name="ck_strategy_promotions_secondary_rollback_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False)
+    promoted_strategy_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    promoted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        nullable=False,
+    )
+    previous_city_assignments: Mapped[dict] = mapped_column(_jsonb(), default=dict, server_default=text("'{}'"))
+    new_city_assignments: Mapped[dict] = mapped_column(_jsonb(), default=dict, server_default=text("'{}'"))
+    baseline_metrics: Mapped[dict] = mapped_column(_jsonb(), default=dict, server_default=text("'{}'"))
+    rollback_metrics: Mapped[dict] = mapped_column(_jsonb(), default=dict, server_default=text("'{}'"))
+    promotion_details: Mapped[dict] = mapped_column(_jsonb(), default=dict, server_default=text("'{}'"))
+    rollback_details: Mapped[dict] = mapped_column(_jsonb(), default=dict, server_default=text("'{}'"))
+    rollback_skipped_cities: Mapped[list] = mapped_column(_jsonb(), default=list, server_default=text("'[]'"))
+    watchdog_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    watchdog_extended_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    watchdog_status: Mapped[str] = mapped_column(String(32), default="pending", server_default="pending")
+    watchdog_extended_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    watchdog_extended_detail: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    watchdog_last_eval_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    watchdog_last_eval_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    rollback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rollback_trigger: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    trigger_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resolution_data: Mapped[dict | None] = mapped_column(_jsonb(), nullable=True)
+    secondary_sync_status: Mapped[str] = mapped_column(String(32), default="not_applicable", server_default="not_applicable")
+    secondary_sync_error: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    secondary_sync_resolution: Mapped[dict | None] = mapped_column(_jsonb(), nullable=True)
+    secondary_rollback_status: Mapped[str] = mapped_column(String(32), default="not_applicable", server_default="not_applicable")
+    secondary_rollback_error: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    secondary_rollback_resolution: Mapped[dict | None] = mapped_column(_jsonb(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    assignment_events: Mapped[list["CityAssignmentEventRecord"]] = relationship(back_populates="promotion")
+
+
+class CityAssignmentEventRecord(Base):
+    __tablename__ = "city_assignment_events"
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('auto_evolve_assign', 'manual_assign', 'manual_override', 'rollback_restore', 'rollback_delete')",
+            name="ck_city_assignment_events_event_type",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False)
+    series_ticker: Mapped[str] = mapped_column(String(64), nullable=False)
+    previous_strategy: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    new_strategy: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    promotion_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategy_promotions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    event_metadata: Mapped[dict] = mapped_column("metadata", _jsonb(), default=dict, server_default=text("'{}'"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    promotion: Mapped[StrategyPromotionRecord | None] = relationship(back_populates="assignment_events")
+
+
+Index(
+    "ix_strategy_promotions_env_status_due",
+    StrategyPromotionRecord.kalshi_env,
+    StrategyPromotionRecord.watchdog_status,
+    StrategyPromotionRecord.watchdog_due_at,
+)
+Index("ix_strategy_promotions_strategy", StrategyPromotionRecord.promoted_strategy_name)
+Index(
+    "ix_city_assignment_events_env_city_created",
+    CityAssignmentEventRecord.kalshi_env,
+    CityAssignmentEventRecord.series_ticker,
+    CityAssignmentEventRecord.created_at,
+)
+Index("ix_city_assignment_events_promotion", CityAssignmentEventRecord.promotion_id)
 
 
 class StrategyPromotionEvent(Base):

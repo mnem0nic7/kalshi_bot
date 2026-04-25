@@ -672,7 +672,7 @@ class WorkflowSupervisor:
 
     async def _run_room_inner(self, *, room_id: str, reason: str) -> None:
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             control = await repo.ensure_deployment_control(self.settings.app_color)
             room = await repo.get_room(room_id)
             if room is None:

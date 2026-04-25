@@ -846,9 +846,10 @@ class SelfImproveRollbackRequest(BaseModel):
 class StrategyAssignmentApprovalRequest(BaseModel):
     expected_strategy_name: str
     expected_recommendation_status: str
+    expected_corpus_build_id: str | None = None
     note: str
 
-    @field_validator("expected_strategy_name", "expected_recommendation_status", "note", mode="before")
+    @field_validator("expected_strategy_name", "expected_recommendation_status", "expected_corpus_build_id", "note", mode="before")
     @classmethod
     def strip_text_fields(cls, value: Any) -> Any:
         if isinstance(value, str):
