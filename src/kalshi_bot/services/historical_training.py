@@ -1719,6 +1719,8 @@ class HistoricalTrainingService:
                 "deleted_room_count": 0,
                 "deleted_run_count": 0,
                 "stale_build_count": 0,
+                "stale_decision_corpus_build_count": 0,
+                "stale_decision_corpus_build_ids": [],
                 "replay": {
                     "created_room_count": 0,
                     "replayed_market_day_count": 0,
@@ -1731,6 +1733,12 @@ class HistoricalTrainingService:
         stale_room_ids = sorted({str(room_id) for room_id in (audit_before.get("affected_room_ids") or []) if room_id})
         affected_run_ids = sorted({str(run_id) for run_id in (audit_before.get("affected_run_ids") or []) if run_id})
         stale_build_ids = await self._mark_historical_builds_stale(
+            date_from=date_from,
+            date_to=date_to,
+            affected_room_ids=stale_room_ids,
+            audit=audit_before,
+        )
+        stale_decision_corpus_build_ids = await self._mark_decision_corpus_builds_stale(
             date_from=date_from,
             date_to=date_to,
             affected_room_ids=stale_room_ids,
@@ -1767,6 +1775,8 @@ class HistoricalTrainingService:
             "deleted_run_count": deleted_run_count,
             "stale_build_count": len(stale_build_ids),
             "stale_build_ids": stale_build_ids,
+            "stale_decision_corpus_build_count": len(stale_decision_corpus_build_ids),
+            "stale_decision_corpus_build_ids": stale_decision_corpus_build_ids,
             "audit_before": audit_before,
             "replay": replay_result,
             "audit_after": audit_after,
@@ -1889,7 +1899,7 @@ class HistoricalTrainingService:
         latest_pipeline_payload = pipeline_runs[0].payload if pipeline_runs else None
         bootstrap_progress = self._bootstrap_progress_from_pipeline_runs(pipeline_runs)
         external_archive_last_backfill = dict(external_archive_backfill_checkpoint.payload or {}) if external_archive_backfill_checkpoint else {}
-        return {
+        status_payload = {
             "imported_market_days": len({label.local_market_day for label in settlement_labels}),
             "imported_market_count": len(settlement_labels),
             "replayed_checkpoint_count": len(replay_runs),
@@ -1970,6 +1980,107 @@ class HistoricalTrainingService:
             "latest_intelligence_run": latest_intelligence_payload,
             "latest_pipeline_run": latest_pipeline_payload,
         }
+        if verbose:
+            status_payload["operator_next_action"] = self._operator_next_action(status_payload)
+        return status_payload
+
+    def _operator_next_action(self, status: dict[str, Any]) -> dict[str, Any]:
+        replay_audit = dict(status.get("replay_audit") or {})
+        replay_issue_counts = dict(replay_audit.get("issue_counts") or {})
+        affected_market_days = list(replay_audit.get("affected_market_days") or [])
+        affected_dates = sorted(
+            {str(item.get("local_market_day")) for item in affected_market_days if item.get("local_market_day")}
+        )
+        affected_series = sorted(
+            {
+                str(issue.get("series_ticker"))
+                for issue in (replay_audit.get("issues") or [])
+                if issue.get("series_ticker")
+            }
+        )
+        coverage_repair = dict(status.get("coverage_repair_summary") or {})
+        external_archive_failure_samples = list(status.get("external_archive_backfill_failure_samples") or [])
+        external_archive_reason_counts = dict(status.get("external_archive_backfill_reason_counts") or {})
+        coverage_backlog = dict(status.get("coverage_backlog") or {})
+        coverage_backlog_reason_counts = dict(coverage_backlog.get("market_day_reason_counts") or {})
+        coverage_samples = list(coverage_backlog.get("samples") or [])
+        coverage_dates = sorted(
+            {str(item.get("local_market_day")) for item in coverage_samples if item.get("local_market_day")}
+        )
+        coverage_series = sorted({str(item.get("series_ticker")) for item in coverage_samples if item.get("series_ticker")})
+        coverage_repair_gaps = int(coverage_repair.get("recoverable_market_day_count") or 0)
+        settlement_missing_count = int(coverage_backlog_reason_counts.get("settlement_crosscheck_missing") or 0)
+        possible_ingestion_gap_count = int(status.get("possible_ingestion_gap_count") or 0)
+        stale_build_count = int(status.get("stale_build_count") or 0)
+
+        def _range_command(command: str, *, dates: list[str] | None = None, series: list[str] | None = None) -> str:
+            dates = dates if dates is not None else affected_dates
+            series = series if series is not None else affected_series
+            if not dates:
+                return command
+            series_args = f" --series {' '.join(series)}" if series else ""
+            return f"{command} --date-from {dates[0]} --date-to {dates[-1]}{series_args}"
+
+        if replay_audit.get("refresh_needed"):
+            return {
+                "action": "refresh_historical_replay",
+                "summary": "Replay corpus has stale, missing, or orphaned checkpoints.",
+                "suggested_command": _range_command("kalshi-bot-cli historical-repair refresh"),
+                "reason_counts": replay_issue_counts,
+                "affected_market_day_count": len(affected_dates),
+                "affected_date_from": affected_dates[0] if affected_dates else None,
+                "affected_date_to": affected_dates[-1] if affected_dates else None,
+            }
+        if possible_ingestion_gap_count or settlement_missing_count:
+            return {
+                "action": "backfill_settlements",
+                "summary": "Some settled markets are still missing settlement crosschecks.",
+                "suggested_command": _range_command(
+                    "kalshi-bot-cli historical-backfill settlements",
+                    dates=coverage_dates,
+                    series=coverage_series,
+                ),
+                "reason_counts": {
+                    "possible_ingestion_gap": possible_ingestion_gap_count,
+                    "settlement_crosscheck_missing": settlement_missing_count,
+                },
+                "affected_market_day_count": len(coverage_dates),
+                "affected_date_from": coverage_dates[0] if coverage_dates else None,
+                "affected_date_to": coverage_dates[-1] if coverage_dates else None,
+            }
+        if external_archive_failure_samples:
+            return {
+                "action": "inspect_external_archive_backfill_failures",
+                "summary": "External forecast archive backfill has recorded failures.",
+                "suggested_command": "kalshi-bot-cli historical-status --verbose",
+                "reason_counts": external_archive_reason_counts,
+                "failure_sample_count": len(external_archive_failure_samples),
+            }
+        if coverage_repair_gaps:
+            return {
+                "action": "repair_source_coverage",
+                "summary": "Recoverable source coverage gaps remain before full replay coverage.",
+                "suggested_command": _range_command(
+                    "kalshi-bot-cli historical-backfill forecast-archive",
+                    dates=coverage_dates,
+                    series=coverage_series,
+                ),
+                "reason_counts": dict(coverage_backlog.get("market_day_reason_counts") or {}),
+                "recoverable_market_day_count": coverage_repair_gaps,
+            }
+        if stale_build_count:
+            return {
+                "action": "rebuild_historical_dataset",
+                "summary": "Historical dataset builds are stale after replay or settlement repairs.",
+                "suggested_command": "kalshi-bot-cli training-build historical --mode gemini-finetune",
+                "reason_counts": {"stale_build": stale_build_count},
+            }
+        return {
+            "action": "none",
+            "summary": "Historical diagnostics do not point to an operator repair step.",
+            "suggested_command": None,
+            "reason_counts": {},
+        }
 
     async def _mark_historical_builds_stale(
         self,
@@ -2015,6 +2126,54 @@ class HistoricalTrainingService:
                     affected_build_ids.append(build.id)
             await session.commit()
         return affected_build_ids
+
+    async def _mark_decision_corpus_builds_stale(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        affected_room_ids: list[str],
+        audit: dict[str, Any],
+    ) -> list[str]:
+        affected_room_id_set = set(affected_room_ids)
+        stale_build_ids: list[str] = []
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            builds = await repo.list_decision_corpus_builds(
+                status="successful",
+                date_from=date_from,
+                date_to=date_to,
+                limit=1000,
+            )
+            for build in builds:
+                source_payload = dict(build.source or {})
+                if source_payload.get("type") != "historical_replay_rooms":
+                    continue
+                rows = await repo.list_decision_corpus_rows(build_id=build.id)
+                build_room_ids = {str(row.room_id) for row in rows if row.room_id}
+                if affected_room_id_set and not affected_room_id_set.intersection(build_room_ids):
+                    continue
+                await repo.mark_decision_corpus_build_stale(
+                    build.id,
+                    reason="historical_replay_refresh",
+                )
+                stale_build_ids.append(build.id)
+            if stale_build_ids:
+                await repo.log_ops_event(
+                    severity="warning",
+                    summary="Decision corpus builds marked stale after historical replay refresh",
+                    source="decision_corpus",
+                    payload={
+                        "event_kind": "decision_corpus_builds_marked_stale",
+                        "reason": "historical_replay_refresh",
+                        "build_ids": stale_build_ids,
+                        "affected_room_ids": sorted(affected_room_id_set),
+                        "affected_market_days": audit.get("affected_market_days") or [],
+                        "replay_issue_counts": audit.get("issue_counts") or {},
+                    },
+                )
+            await session.commit()
+        return stale_build_ids
 
     @staticmethod
     def _historical_build_overlaps(build: Any, *, date_from: date, date_to: date) -> bool:
@@ -4054,6 +4213,13 @@ class HistoricalTrainingService:
             return None
 
         candlestick, asof_ts = selected
+        if is_market_stale(
+            observed_at=asof_ts,
+            stale_after_seconds=self.settings.historical_replay_market_stale_seconds,
+            reference_time=checkpoint_ts,
+        ):
+            return None
+
         market_payload = dict(((settlement_label.payload or {}).get("market") or {}))
         yes_bid = _parse_decimal(((candlestick.get("yes_bid") or {}).get("close_dollars")))
         yes_ask = _parse_decimal(((candlestick.get("yes_ask") or {}).get("close_dollars")))

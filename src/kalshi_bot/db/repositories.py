@@ -3356,6 +3356,20 @@ class PlatformRepository:
         await self.session.flush()
         return record
 
+    async def mark_decision_corpus_build_stale(
+        self,
+        build_id: str,
+        *,
+        reason: str,
+    ) -> DecisionCorpusBuildRecord:
+        record = await self.get_decision_corpus_build(build_id)
+        if record is None:
+            raise KeyError(f"Decision corpus build {build_id} not found")
+        record.status = "stale"
+        record.failure_reason = reason
+        await self.session.flush()
+        return record
+
     async def add_decision_corpus_row(self, **values: Any) -> DecisionCorpusRowRecord:
         build_id = str(values.get("corpus_build_id") or "")
         build = await self.get_decision_corpus_build(build_id)

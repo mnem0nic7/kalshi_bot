@@ -7,10 +7,12 @@ from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from kalshi_bot.config import Settings, get_settings
 from kalshi_bot.core.enums import AgentRole, MessageKind, RoomOrigin, RoomStage
 from kalshi_bot.core.schemas import RoomCreate, RoomMessageCreate
+from kalshi_bot.db.models import OpsEvent
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.integrations.forecast_archive import ForecastArchiveLookupResult
@@ -882,7 +884,7 @@ series_templates:
     with TestClient(app) as client:
         container = client.app.state.container
 
-        async def seed() -> str:
+        async def seed() -> tuple[str, str]:
             async with container.session_factory() as session:
                 repo = PlatformRepository(session)
                 control = await repo.get_deployment_control()
@@ -1009,10 +1011,79 @@ series_templates:
                     dataset_build_id=build.id,
                     items=[{"room_id": stale_room.id, "sequence": 1}],
                 )
+                decision_build = await repo.create_decision_corpus_build(
+                    version="decision-corpus-refresh-fixture",
+                    date_from=datetime(2026, 4, 11, tzinfo=UTC).date(),
+                    date_to=datetime(2026, 4, 11, tzinfo=UTC).date(),
+                    source={
+                        "type": "historical_replay_rooms",
+                        "kalshi_env": container.settings.kalshi_env,
+                    },
+                    filters={
+                        "date_from": "2026-04-11",
+                        "date_to": "2026-04-11",
+                        "source": "historical-replay",
+                    },
+                )
+                await repo.add_decision_corpus_row(
+                    corpus_build_id=decision_build.id,
+                    room_id=stale_room.id,
+                    market_ticker="KXHIGHNY-26APR11-T61",
+                    series_ticker="KXHIGHNY",
+                    station_id="KNYC",
+                    local_market_day="2026-04-11",
+                    checkpoint_ts=datetime(2026, 4, 11, 21, 0, tzinfo=UTC),
+                    kalshi_env=container.settings.kalshi_env,
+                    deployment_color=control.active_color,
+                    model_version="builtin-gemini-v1",
+                    policy_version="builtin-gemini-v1",
+                    source_asof_ts=datetime(2026, 4, 11, 20, 55, tzinfo=UTC),
+                    quote_observed_at=datetime(2026, 4, 11, 20, 55, tzinfo=UTC),
+                    quote_captured_at=datetime(2026, 4, 11, 20, 55, tzinfo=UTC),
+                    time_to_settlement_at_checkpoint_minutes=180,
+                    fair_yes_dollars=Decimal("0.5500"),
+                    confidence=0.82,
+                    edge_bps=700,
+                    recommended_side="yes",
+                    target_yes_price_dollars=Decimal("0.6000"),
+                    eligibility_status="eligible",
+                    trade_regime="standard",
+                    liquidity_regime="tight",
+                    support_status="exploratory",
+                    support_level="L5_global",
+                    support_n=30,
+                    support_market_days=10,
+                    support_recency_days=1,
+                    backoff_path=[],
+                    settlement_result="yes",
+                    settlement_value_dollars=Decimal("1.0000"),
+                    pnl_counterfactual_target_frictionless=Decimal("0.400000"),
+                    pnl_counterfactual_target_with_fees=Decimal("0.383200"),
+                    pnl_model_fair_frictionless=Decimal("0.450000"),
+                    fee_counterfactual_dollars=Decimal("0.016800"),
+                    counterfactual_count=Decimal("1.00"),
+                    fee_model_version="fixture",
+                    source_provenance="historical_replay_late_only",
+                    source_details={
+                        "coverage_class": "late_only_coverage",
+                        "market_source_kind": "captured_market_snapshot",
+                        "weather_source_kind": "archived_weather_bundle",
+                    },
+                    signal_payload={},
+                    quote_snapshot={},
+                    settlement_payload={},
+                    diagnostics={},
+                )
+                await repo.mark_decision_corpus_build_successful(decision_build.id, row_count=1)
+                await repo.promote_decision_corpus_build(
+                    decision_build.id,
+                    kalshi_env=container.settings.kalshi_env,
+                    actor="test",
+                )
                 await session.commit()
-                return stale_room.id
+                return stale_room.id, decision_build.id
 
-        stale_room_id = asyncio.run(seed())
+        stale_room_id, decision_build_id = asyncio.run(seed())
 
         status_before = client.get("/api/historical/status?verbose=true")
         assert status_before.status_code == 200
@@ -1117,6 +1188,8 @@ series_templates:
         )
         assert refresh["deleted_room_count"] == 1
         assert refresh["stale_build_count"] >= 1
+        assert refresh["stale_decision_corpus_build_count"] == 1
+        assert refresh["stale_decision_corpus_build_ids"] == [decision_build_id]
         assert refresh["replay"]["created_room_count"] == 3
         assert stale_output_path.exists() is True
 
@@ -1133,8 +1206,27 @@ series_templates:
             async with container.session_factory() as session:
                 repo = PlatformRepository(session)
                 assert await repo.get_room(stale_room_id) is None
+                assert await repo.get_current_decision_corpus_build(kalshi_env=container.settings.kalshi_env) is None
+                decision_build = await repo.get_decision_corpus_build(decision_build_id)
+                assert decision_build is not None
+                assert decision_build.status == "stale"
+                assert decision_build.failure_reason == "historical_replay_refresh"
                 builds = await repo.list_training_dataset_builds(limit=10, mode_prefix="historical-")
                 assert any(build.status == "stale" for build in builds)
+                events = list(
+                    (
+                        await session.execute(
+                            select(OpsEvent).where(OpsEvent.source == "decision_corpus")
+                        )
+                    ).scalars()
+                )
+                events = [
+                    event
+                    for event in events
+                    if (event.payload or {}).get("event_kind") == "decision_corpus_builds_marked_stale"
+                ]
+                assert events
+                assert events[0].payload["build_ids"] == [decision_build_id]
                 await session.commit()
 
         asyncio.run(verify_room_deleted())

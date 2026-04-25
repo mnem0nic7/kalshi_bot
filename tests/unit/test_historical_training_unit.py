@@ -613,6 +613,82 @@ def test_coverage_repair_summary_counts_promoted_and_recoverable_gaps() -> None:
     assert summary["permanent_weather_gap_market_day_count"] == 1
 
 
+def test_operator_next_action_prioritizes_replay_refresh() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    status = {
+        "replay_audit": {
+            "refresh_needed": True,
+            "issue_counts": {"stale_replay": 2},
+            "affected_market_days": [
+                {"market_ticker": "KXHIGHNY-26APR10-T80", "local_market_day": "2026-04-10"},
+                {"market_ticker": "KXHIGHNY-26APR11-T80", "local_market_day": "2026-04-11"},
+            ],
+            "issues": [{"series_ticker": "KXHIGHNY"}],
+        },
+        "coverage_backlog": {"market_day_reason_counts": {"settlement_crosscheck_missing": 3}},
+        "coverage_repair_summary": {"recoverable_market_day_count": 4},
+        "possible_ingestion_gap_count": 1,
+    }
+
+    action = HistoricalTrainingService._operator_next_action(service, status)
+
+    assert action["action"] == "refresh_historical_replay"
+    assert action["suggested_command"] == (
+        "kalshi-bot-cli historical-repair refresh --date-from 2026-04-10 --date-to 2026-04-11 --series KXHIGHNY"
+    )
+    assert action["reason_counts"] == {"stale_replay": 2}
+
+
+def test_operator_next_action_uses_coverage_samples_for_settlement_backfill() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    status = {
+        "replay_audit": {"refresh_needed": False, "issue_counts": {}, "affected_market_days": [], "issues": []},
+        "possible_ingestion_gap_count": 0,
+        "coverage_backlog": {
+            "market_day_reason_counts": {"settlement_crosscheck_missing": 2},
+            "samples": [
+                {
+                    "series_ticker": "KXHIGHNY",
+                    "local_market_day": "2026-04-10",
+                },
+                {
+                    "series_ticker": "KXHIGHNY",
+                    "local_market_day": "2026-04-12",
+                },
+            ],
+        },
+        "coverage_repair_summary": {"recoverable_market_day_count": 5},
+    }
+
+    action = HistoricalTrainingService._operator_next_action(service, status)
+
+    assert action["action"] == "backfill_settlements"
+    assert action["suggested_command"] == (
+        "kalshi-bot-cli historical-backfill settlements --date-from 2026-04-10 --date-to 2026-04-12 --series KXHIGHNY"
+    )
+    assert action["reason_counts"]["settlement_crosscheck_missing"] == 2
+
+
+def test_operator_next_action_reports_noop_when_verbose_diagnostics_are_clean() -> None:
+    service = object.__new__(HistoricalTrainingService)
+    status = {
+        "replay_audit": {"refresh_needed": False},
+        "coverage_backlog": {"market_day_reason_counts": {}, "samples": []},
+        "coverage_repair_summary": {"recoverable_market_day_count": 0},
+        "possible_ingestion_gap_count": 0,
+        "stale_build_count": 0,
+    }
+
+    action = HistoricalTrainingService._operator_next_action(service, status)
+
+    assert action == {
+        "action": "none",
+        "summary": "Historical diagnostics do not point to an operator repair step.",
+        "suggested_command": None,
+        "reason_counts": {},
+    }
+
+
 def test_confidence_progress_exposes_support_blockers() -> None:
     service = object.__new__(HistoricalTrainingService)
     service.settings = SimpleNamespace(
@@ -873,6 +949,82 @@ def test_reconstruct_market_checkpoint_falls_back_to_hourly_when_one_minute_unav
     assert result is not None
     assert [call["period_interval"] for call in service.kalshi.calls] == [1, 60]
     assert calls[0]["asof_ts"] == datetime(2026, 4, 10, 20, 55, tzinfo=UTC)
+
+
+def test_reconstruct_market_checkpoint_does_not_write_stale_candidate_when_no_fresh_fallback(monkeypatch) -> None:
+    service = object.__new__(HistoricalTrainingService)
+    service.settings = SimpleNamespace(
+        historical_replay_market_snapshot_lookback_hours=36,
+        historical_replay_market_stale_seconds=900,
+    )
+    calls: list[dict[str, object]] = []
+
+    class _FakeRepo:
+        def __init__(self, session):
+            self.session = session
+
+        async def upsert_historical_market_snapshot(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(source_id=kwargs["source_id"], source_kind=kwargs["source_kind"])
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr("kalshi_bot.services.historical_training.PlatformRepository", _FakeRepo)
+    service.session_factory = lambda: _FakeSession()
+    service.kalshi = _DummyKalshi(
+        candlestick_responses=[
+            {
+                "candlesticks": [
+                    {
+                        "end_period_ts": int(datetime(2026, 4, 10, 19, 0, tzinfo=UTC).timestamp()),
+                        "yes_bid": {"close_dollars": "0.4900"},
+                        "yes_ask": {"close_dollars": "0.5300"},
+                        "price": {"close_dollars": "0.5100"},
+                    }
+                ]
+            },
+            {"candlesticks": []},
+        ]
+    )
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHNY-26APR10-T68",
+        market_type="weather",
+        station_id="KNYC",
+        location_name="New York City",
+        latitude=40.7146,
+        longitude=-74.0071,
+        threshold_f=68,
+        operator=">",
+        settlement_source="NWS daily summary",
+        series_ticker="KXHIGHNY",
+    )
+    settlement_label = SimpleNamespace(
+        market_ticker="KXHIGHNY-26APR10-T68",
+        local_market_day="2026-04-10",
+        payload={"market": {"ticker": "KXHIGHNY-26APR10-T68", "close_time": "2026-04-10T23:59:59+00:00"}},
+    )
+
+    result = asyncio.run(
+        HistoricalTrainingService._reconstruct_market_checkpoint(
+            service,
+            mapping=mapping,
+            settlement_label=settlement_label,
+            checkpoint_label="late_1700",
+            checkpoint_ts=datetime(2026, 4, 10, 21, 0, tzinfo=UTC),
+        )
+    )
+
+    assert result is None
+    assert [call["period_interval"] for call in service.kalshi.calls] == [1, 60]
+    assert calls == []
 
 
 def test_gemini_build_readiness_requires_multiple_market_days_and_splits() -> None:
