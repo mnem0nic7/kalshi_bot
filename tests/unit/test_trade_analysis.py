@@ -11,6 +11,7 @@ from sqlalchemy import select
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import (
     FillRecord,
+    HistoricalMarketSnapshotRecord,
     HistoricalSettlementLabelRecord,
     HistoricalWeatherSnapshotRecord,
     MarketPriceHistory,
@@ -285,6 +286,126 @@ async def test_trade_analysis_keeps_excluded_rows_with_reasons(analysis_harness)
         "reason": "missing_market_snapshot",
         "rows": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_trade_analysis_historical_market_fallback_requires_fresh_point_in_time_snapshot(analysis_harness) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-historical-fresh")
+        ticket = _ticket(room.id)
+        session.add_all(
+            [
+                room,
+                _signal(room.id),
+                ticket,
+                _risk(ticket.id, room.id),
+                HistoricalMarketSnapshotRecord(
+                    market_ticker=TICKER,
+                    series_ticker="KXHIGHNY",
+                    station_id="KNYC",
+                    local_market_day="26APR24",
+                    asof_ts=NOW - timedelta(minutes=200),
+                    source_kind="captured_market_snapshot",
+                    source_id="stale-captured",
+                    yes_bid_dollars=Decimal("0.1000"),
+                    yes_ask_dollars=Decimal("0.2000"),
+                    payload={},
+                ),
+                HistoricalMarketSnapshotRecord(
+                    market_ticker=TICKER,
+                    series_ticker="KXHIGHNY",
+                    station_id="KNYC",
+                    local_market_day="26APR24",
+                    asof_ts=NOW - timedelta(minutes=19),
+                    source_kind="kalshi_final_market",
+                    source_id="final-market",
+                    yes_bid_dollars=Decimal("0.9000"),
+                    yes_ask_dollars=Decimal("0.9500"),
+                    payload={},
+                ),
+                HistoricalMarketSnapshotRecord(
+                    market_ticker=TICKER,
+                    series_ticker="KXHIGHNY",
+                    station_id="KNYC",
+                    local_market_day="26APR24",
+                    asof_ts=NOW - timedelta(minutes=21),
+                    source_kind="captured_market_snapshot",
+                    source_id="fresh-captured",
+                    yes_bid_dollars=Decimal("0.4400"),
+                    yes_ask_dollars=Decimal("0.4600"),
+                    payload={},
+                ),
+                *[item for item in _snapshots() if not isinstance(item, MarketPriceHistory)],
+            ]
+        )
+        await session.commit()
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    row = dataset.rows[0]
+    assert row["training_eligible"] is True
+    assert row["market_snapshot_source"] == "historical_market_snapshots"
+    assert row["market_snapshot_source_kind"] == "captured_market_snapshot"
+    assert row["market_snapshot_source_id"] == "fresh-captured"
+    assert row["yes_bid_dollars"] == "0.4400"
+
+
+@pytest.mark.asyncio
+async def test_trade_analysis_historical_market_fallback_ignores_stale_and_final_snapshots(analysis_harness) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-historical-stale")
+        ticket = _ticket(room.id)
+        session.add_all(
+            [
+                room,
+                _signal(room.id),
+                ticket,
+                _risk(ticket.id, room.id),
+                HistoricalMarketSnapshotRecord(
+                    market_ticker=TICKER,
+                    series_ticker="KXHIGHNY",
+                    station_id="KNYC",
+                    local_market_day="26APR24",
+                    asof_ts=NOW - timedelta(minutes=200),
+                    source_kind="captured_market_snapshot",
+                    source_id="stale-captured",
+                    yes_bid_dollars=Decimal("0.1000"),
+                    yes_ask_dollars=Decimal("0.2000"),
+                    payload={},
+                ),
+                HistoricalMarketSnapshotRecord(
+                    market_ticker=TICKER,
+                    series_ticker="KXHIGHNY",
+                    station_id="KNYC",
+                    local_market_day="26APR24",
+                    asof_ts=NOW - timedelta(minutes=19),
+                    source_kind="kalshi_final_market",
+                    source_id="final-market",
+                    yes_bid_dollars=Decimal("0.9000"),
+                    yes_ask_dollars=Decimal("0.9500"),
+                    payload={},
+                ),
+                *[item for item in _snapshots() if not isinstance(item, MarketPriceHistory)],
+            ]
+        )
+        await session.commit()
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    row = dataset.rows[0]
+    assert row["training_eligible"] is False
+    assert row["market_snapshot_source"] is None
+    assert "missing_market_snapshot" in row["exclusion_reasons"]
 
 
 @pytest.mark.asyncio

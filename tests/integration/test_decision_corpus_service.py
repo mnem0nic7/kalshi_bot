@@ -165,6 +165,7 @@ async def _seed_historical_decisions(
     ticker_prefix: str = "KXHIGHNY",
     kalshi_env: str = "demo",
     coverage_class: str = "full_checkpoint_coverage",
+    source_kind: str = "checkpoint_archive",
 ) -> None:
     for idx in range(count):
         day = start_day.fromordinal(start_day.toordinal() + idx)
@@ -175,6 +176,7 @@ async def _seed_historical_decisions(
             checkpoint_ts=datetime(day.year, day.month, day.day, 17, 0, tzinfo=UTC),
             kalshi_env=kalshi_env,
             coverage_class=coverage_class,
+            source_kind=source_kind,
         )
 
 
@@ -255,6 +257,54 @@ async def test_build_creates_rows_with_pnl_nulls_support_and_provenance(tmp_path
     assert stand_down.pnl_model_fair_frictionless is None
     assert stand_down.fee_counterfactual_dollars is None
     assert stand_down.fee_model_version is None
+
+
+@pytest.mark.asyncio
+async def test_inspect_build_reports_source_diagnostics(tmp_path) -> None:
+    harness = await _setup(tmp_path)
+    await _seed_historical_decisions(
+        harness.session_factory,
+        count=30,
+        start_day=date(2026, 3, 1),
+        ticker_prefix="KXHIGHPRIMARY",
+        source_kind="checkpoint_archive",
+    )
+    await _seed_historical_decision(
+        harness.session_factory,
+        market_ticker="KXHIGHNY-26MAR31-REPAIR",
+        local_market_day="2026-03-31",
+        checkpoint_ts=datetime(2026, 3, 31, 17, 0, tzinfo=UTC),
+        coverage_class="full_checkpoint_coverage",
+        source_kind="external_forecast_archive_weather_bundle",
+    )
+
+    result = await harness.service.build(
+        date_from=date(2026, 3, 1),
+        date_to=date(2026, 3, 31),
+    )
+
+    inspect = await harness.service.inspect_build(result["build_id"])
+    diagnostics = inspect["source_diagnostics"]
+
+    assert diagnostics["by_source_provenance"] == {
+        "historical_replay_external_forecast_repair": 1,
+        "historical_replay_full_checkpoint": 30,
+    }
+    assert diagnostics["by_coverage_class"] == {"full_checkpoint_coverage": 31}
+    assert diagnostics["by_market_source_kind"] == {
+        "checkpoint_archive": 30,
+        "external_forecast_archive_weather_bundle": 1,
+    }
+    assert diagnostics["by_weather_source_kind"] == {
+        "checkpoint_archive": 30,
+        "external_forecast_archive_weather_bundle": 1,
+    }
+    assert diagnostics["clean_primary_rows"] == 30
+    assert diagnostics["clean_primary_market_days"] == 30
+    assert diagnostics["degraded_rows"] == 1
+    assert diagnostics["gap_to_exploratory"] == {"clean_primary_rows": 0, "clean_primary_market_days": 0}
+    assert diagnostics["gap_to_supported"] == {"clean_primary_rows": 70, "clean_primary_market_days": 0}
+    assert "historical-status --verbose" in diagnostics["next_check"]
 
 
 @pytest.mark.asyncio

@@ -246,11 +246,38 @@ class DecisionCorpusService:
         by_day: dict[str, int] = defaultdict(int)
         by_regime: dict[str, int] = defaultdict(int)
         by_support: dict[str, int] = defaultdict(int)
+        by_source_provenance: dict[str, int] = defaultdict(int)
+        by_coverage_class: dict[str, int] = defaultdict(int)
+        by_market_source_kind: dict[str, int] = defaultdict(int)
+        by_weather_source_kind: dict[str, int] = defaultdict(int)
+        support_by_provenance: dict[str, int] = defaultdict(int)
+        clean_primary_rows = 0
+        clean_primary_days: set[str] = set()
+        degraded_rows = 0
         for row in rows:
             by_station[row.station_id or row.series_ticker or "unknown"] += 1
             by_day[row.local_market_day] += 1
             by_regime[row.trade_regime or "unknown"] += 1
             by_support[row.support_status] += 1
+            source_provenance = row.source_provenance or "unknown"
+            source_details = row.source_details or {}
+            by_source_provenance[source_provenance] += 1
+            by_coverage_class[str(source_details.get("coverage_class") or "unknown")] += 1
+            by_market_source_kind[str(source_details.get("market_source_kind") or "unknown")] += 1
+            by_weather_source_kind[str(source_details.get("weather_source_kind") or "unknown")] += 1
+            support_by_provenance[f"{source_provenance}:{row.support_status or 'unknown'}"] += 1
+            if source_provenance in {
+                "historical_replay_full_checkpoint",
+                "historical_replay_partial_checkpoint",
+                "historical_replay_late_only",
+            } and row.support_status in {"supported", "exploratory"}:
+                clean_primary_rows += 1
+                clean_primary_days.add(row.local_market_day)
+            if source_provenance in {
+                "historical_replay_external_forecast_repair",
+                "historical_replay_unknown",
+            }:
+                degraded_rows += 1
         return {
             "build": self._build_to_dict(build),
             "row_count": len(rows),
@@ -258,6 +285,28 @@ class DecisionCorpusService:
             "by_local_market_day": dict(sorted(by_day.items())),
             "by_trade_regime": dict(sorted(by_regime.items())),
             "by_support_status": dict(sorted(by_support.items())),
+            "source_diagnostics": {
+                "by_source_provenance": dict(sorted(by_source_provenance.items())),
+                "by_coverage_class": dict(sorted(by_coverage_class.items())),
+                "by_market_source_kind": dict(sorted(by_market_source_kind.items())),
+                "by_weather_source_kind": dict(sorted(by_weather_source_kind.items())),
+                "support_status_by_provenance": dict(sorted(support_by_provenance.items())),
+                "clean_primary_rows": clean_primary_rows,
+                "clean_primary_market_days": len(clean_primary_days),
+                "degraded_rows": degraded_rows,
+                "gap_to_exploratory": {
+                    "clean_primary_rows": max(0, EXPLORATORY_N - clean_primary_rows),
+                    "clean_primary_market_days": max(0, EXPLORATORY_MARKET_DAYS - len(clean_primary_days)),
+                },
+                "gap_to_supported": {
+                    "clean_primary_rows": max(0, SUPPORTED_N - clean_primary_rows),
+                    "clean_primary_market_days": max(0, SUPPORTED_MARKET_DAYS - len(clean_primary_days)),
+                },
+                "next_check": (
+                    "Run `kalshi-bot-cli historical-status --verbose` before promoting or rebuilding "
+                    "to confirm source archive freshness and replay coverage gaps."
+                ),
+            },
             "samples": [self._row_sample(row) for row in rows[:sample_limit]],
         }
 

@@ -49,6 +49,11 @@ MODEL_REQUIRED_FEATURES = {
     "weather_stale_seconds",
 }
 MODEL_OPTIONAL_IMPUTED_FEATURES = {"forecast_residual_f"}
+POINT_IN_TIME_HISTORICAL_MARKET_SOURCES = {
+    "checkpoint_captured_market_snapshot",
+    "captured_market_snapshot",
+    "reconstructed_market_checkpoint",
+}
 
 
 def _utc_now() -> datetime:
@@ -501,6 +506,7 @@ class TradeAnalysisService:
         if history is not None:
             return {
                 "source": "market_price_history",
+                "source_kind": "market_price_history",
                 "snapshot_id": history.id,
                 "observed_at": history.observed_at,
                 "yes_bid_dollars": history.yes_bid_dollars,
@@ -519,12 +525,17 @@ class TradeAnalysisService:
             )
         ).scalar_one_or_none()
         if state is None:
+            historical_cutoff = decision_ts - timedelta(
+                seconds=float(getattr(self.settings, "historical_replay_market_stale_seconds", self.settings.risk_stale_market_seconds))
+            )
             historical = (
                 await session.execute(
                     select(HistoricalMarketSnapshotRecord)
                     .where(
                         HistoricalMarketSnapshotRecord.market_ticker == market_ticker,
                         HistoricalMarketSnapshotRecord.asof_ts <= decision_ts,
+                        HistoricalMarketSnapshotRecord.asof_ts >= historical_cutoff,
+                        HistoricalMarketSnapshotRecord.source_kind.in_(POINT_IN_TIME_HISTORICAL_MARKET_SOURCES),
                     )
                     .order_by(HistoricalMarketSnapshotRecord.asof_ts.desc(), HistoricalMarketSnapshotRecord.id.desc())
                     .limit(1)
@@ -537,6 +548,8 @@ class TradeAnalysisService:
                 mid = (historical.yes_bid_dollars + historical.yes_ask_dollars) / Decimal("2")
             return {
                 "source": "historical_market_snapshots",
+                "source_kind": historical.source_kind,
+                "source_id": historical.source_id,
                 "snapshot_id": historical.id,
                 "observed_at": historical.asof_ts,
                 "yes_bid_dollars": historical.yes_bid_dollars,
@@ -550,6 +563,7 @@ class TradeAnalysisService:
             mid = (state.yes_bid_dollars + state.yes_ask_dollars) / Decimal("2")
         return {
             "source": "market_state",
+            "source_kind": "market_state",
             "snapshot_id": f"{state.kalshi_env}:{state.market_ticker}",
             "observed_at": state.observed_at,
             "yes_bid_dollars": state.yes_bid_dollars,
@@ -731,6 +745,8 @@ class TradeAnalysisService:
             "fee_dollars": _decimal_str(self._fee_dollars(fills)),
             "slippage_dollars": _decimal_str((avg_fill_yes - ticket_price) if avg_fill_yes is not None and ticket_price is not None else None),
             "market_snapshot_source": (market_snapshot or {}).get("source"),
+            "market_snapshot_source_kind": (market_snapshot or {}).get("source_kind") or (market_snapshot or {}).get("source"),
+            "market_snapshot_source_id": (market_snapshot or {}).get("source_id"),
             "market_snapshot_id": (market_snapshot or {}).get("snapshot_id"),
             "market_observed_at": _iso(market_observed_at),
             "market_stale_seconds": stale_market_seconds,
@@ -878,6 +894,7 @@ class TradeAnalysisService:
             "max_market_stale_seconds": round(max(ages), 3) if ages else None,
             "p95_market_stale_seconds": round(p95, 3) if p95 is not None else None,
             "by_source": _counter_rows(stale_rows, "market_snapshot_source"),
+            "by_source_kind": _counter_rows(stale_rows, "market_snapshot_source_kind"),
             "by_series": _counter_rows(stale_rows, "series_ticker"),
             "by_station_id": _counter_rows(stale_rows, "station_id"),
             "by_market_day": _counter_rows(stale_rows, "market_day"),
