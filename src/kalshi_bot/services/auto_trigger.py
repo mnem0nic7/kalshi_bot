@@ -72,11 +72,17 @@ class AutoTriggerService:
                 updated_within_seconds=self.settings.trigger_active_room_stale_seconds,
             )
             if active_count >= self.settings.trigger_max_concurrent_rooms:
-                await repo.log_ops_event(
+                await self._log_block_once_per_cooldown(
+                    repo,
+                    checkpoint_key=(
+                        f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
+                        "max_concurrent_rooms"
+                    ),
+                    cooldown_seconds=thresholds.trigger_cooldown_seconds,
                     severity="warning",
                     summary=f"Auto-trigger skipped for {market_ticker}: max concurrent rooms reached",
-                    source="auto_trigger",
                     payload={"market_ticker": market_ticker},
+                    kalshi_env=self.settings.kalshi_env,
                 )
                 await session.commit()
                 return
@@ -95,10 +101,15 @@ class AutoTriggerService:
                 kalshi_env=self.settings.kalshi_env,
             )
             if open_position is not None and Decimal(str(open_position.count_fp)) > Decimal("0"):
-                await repo.log_ops_event(
+                await self._log_block_once_per_cooldown(
+                    repo,
+                    checkpoint_key=(
+                        f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
+                        "open_position_governance"
+                    ),
+                    cooldown_seconds=thresholds.trigger_cooldown_seconds,
                     severity="warning",
                     summary=f"Auto-trigger blocked for {market_ticker}: live position already open",
-                    source="auto_trigger",
                     payload={"market_ticker": market_ticker, "reason": "open_position_governance"},
                     kalshi_env=self.settings.kalshi_env,
                 )
@@ -125,10 +136,15 @@ class AutoTriggerService:
                     STOP_LOSS_OUTCOME_SUBMIT_FAILED,
                     STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
                 }:
-                    await repo.log_ops_event(
+                    await self._log_block_once_per_cooldown(
+                        repo,
+                        checkpoint_key=(
+                            f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
+                            "stop_loss_unresolved"
+                        ),
+                        cooldown_seconds=thresholds.trigger_cooldown_seconds,
                         severity="warning",
                         summary=f"Auto-trigger blocked for {market_ticker}: stop-loss still unresolved",
-                        source="auto_trigger",
                         payload={"market_ticker": market_ticker, "stop_loss_outcome_status": reentry_status},
                         kalshi_env=self.settings.kalshi_env,
                     )
@@ -275,6 +291,46 @@ class AutoTriggerService:
     async def wait_for_tasks(self) -> None:
         if self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
+
+    async def _log_block_once_per_cooldown(
+        self,
+        repo: PlatformRepository,
+        *,
+        checkpoint_key: str,
+        cooldown_seconds: int,
+        severity: str,
+        summary: str,
+        payload: dict,
+        kalshi_env: str,
+    ) -> bool:
+        now = datetime.now(UTC)
+        checkpoint = await repo.get_checkpoint(checkpoint_key)
+        if checkpoint is not None:
+            last_logged_at = checkpoint.payload.get("last_logged_at")
+            try:
+                last_logged = datetime.fromisoformat(last_logged_at) if last_logged_at else None
+            except (TypeError, ValueError):
+                last_logged = None
+            if last_logged is not None and now - last_logged < timedelta(seconds=cooldown_seconds):
+                return False
+
+        await repo.log_ops_event(
+            severity=severity,
+            summary=summary,
+            source="auto_trigger",
+            payload=payload,
+            kalshi_env=kalshi_env,
+        )
+        await repo.set_checkpoint(
+            checkpoint_key,
+            cursor=None,
+            payload={
+                "last_logged_at": now.isoformat(),
+                "summary": summary,
+                **payload,
+            },
+        )
+        return True
 
     def _book_is_broken(self, market_state: MarketState) -> bool:
         yes_ask = market_state.yes_ask_dollars

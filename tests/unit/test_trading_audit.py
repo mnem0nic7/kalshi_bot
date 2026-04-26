@@ -349,3 +349,67 @@ async def test_trading_audit_repair_apply_updates_evidence_backed_rows(audit_har
     assert result["updated_count"] == 1
     assert result["candidates"][0]["reason"] == "same_ticker_side_buy_lot"
     assert fill.strategy_code == "A"
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_repair_recovers_orphaned_bot_room_order(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        room = _room()
+        order = OrderRecord(
+            id="order-orphaned-room",
+            kalshi_env="production",
+            kalshi_order_id="kord-orphaned-room",
+            client_order_id="room:abcdef123456",
+            market_ticker=room.market_ticker,
+            status="executed",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.2000"),
+            count_fp=Decimal("2.44"),
+            strategy_code=None,
+            raw={},
+            created_at=NOW - timedelta(hours=1),
+            updated_at=NOW - timedelta(hours=1),
+        )
+        session.add_all([
+            room,
+            order,
+            _fill(
+                "repair-orphaned-room",
+                ticker=room.market_ticker,
+                side="no",
+                action="buy",
+                yes_price="0.2000",
+                count="2.44",
+                strategy_code=None,
+                raw={"order_id": "kord-orphaned-room"},
+            ),
+        ])
+        await session.commit()
+
+    result = await TradingAuditService(settings, session_factory).repair_attribution(
+        kalshi_env="production",
+        days=7,
+        dry_run=False,
+        now=NOW,
+    )
+
+    async with session_factory() as session:
+        fill = (
+            await session.execute(
+                select(FillRecord).where(FillRecord.trade_id == "repair-orphaned-room")
+            )
+        ).scalar_one()
+        order = (
+            await session.execute(
+                select(OrderRecord).where(OrderRecord.id == "order-orphaned-room")
+            )
+        ).scalar_one()
+
+    assert result["candidate_count"] == 1
+    assert result["updated_count"] == 1
+    assert result["candidates"][0]["reason"] == "raw_order_id_match"
+    assert fill.strategy_code == "A"
+    assert fill.order_id == order.id
+    assert order.strategy_code == "A"

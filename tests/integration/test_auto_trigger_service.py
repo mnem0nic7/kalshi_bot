@@ -205,6 +205,71 @@ async def test_auto_trigger_blocks_when_live_position_exists(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_trigger_throttles_repeated_live_position_block_logs(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_position_block_throttle.db",
+        trigger_enable_auto_rooms=True,
+        trigger_cooldown_seconds=600,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
+    directory = WeatherMarketDirectory(
+        {
+            "WX-TEST": WeatherMarketMapping(
+                market_ticker="WX-TEST",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+            )
+        }
+    )
+    service = AutoTriggerService(settings, session_factory, directory, agent_pack_service, supervisor)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot=_GOOD_SNAPSHOT,
+            yes_bid_dollars="0.4400",  # type: ignore[arg-type]
+            yes_ask_dollars="0.4800",  # type: ignore[arg-type]
+            last_trade_dollars=None,
+        )
+        await repo.upsert_position(
+            market_ticker="WX-TEST",
+            subaccount=settings.kalshi_subaccount,
+            kalshi_env=settings.kalshi_env,
+            side="yes",
+            count_fp=Decimal("12.00"),
+            average_price_dollars=Decimal("0.4100"),
+            raw={},
+        )
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        ops_events = await repo.list_ops_events(limit=10, kalshi_env=settings.kalshi_env)
+        checkpoint = await repo.get_checkpoint("auto_trigger_block:demo:WX-TEST:open_position_governance")
+        await session.commit()
+
+    matching = [event for event in ops_events if "live position already open" in event.summary]
+    assert len(matching) == 1
+    assert checkpoint is not None
+    assert supervisor.calls == []
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_auto_trigger_blocks_when_stop_loss_is_unresolved(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_stop_loss_block.db",

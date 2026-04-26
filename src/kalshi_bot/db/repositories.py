@@ -800,28 +800,20 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         kalshi_env: str | None = None,
         strategy_code: str | None = None,
     ) -> OrderRecord:
-        resolved_strategy = await self._resolve_strategy_code_for_order(
-            strategy_code=strategy_code,
+        return await self.upsert_order(
             ticket_id=ticket_id,
             client_order_id=client_order_id,
-        )
-        record = OrderRecord(
-            trade_ticket_id=ticket_id,
-            client_order_id=client_order_id,
-            kalshi_env=self._resolved_kalshi_env(kalshi_env),
             market_ticker=market_ticker,
             status=status,
             side=side,
             action=action,
             yes_price_dollars=yes_price_dollars,
             count_fp=count_fp,
-            strategy_code=resolved_strategy,
             raw=raw,
             kalshi_order_id=kalshi_order_id,
+            kalshi_env=kalshi_env,
+            strategy_code=strategy_code,
         )
-        self.session.add(record)
-        await self.session.flush()
-        return record
 
     async def _resolve_strategy_code_for_order(
         self,
@@ -929,7 +921,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             await self.session.flush()
             return existing
 
-        # COALESCE keeps an already-set kalshi_order_id / strategy_code rather than overwriting with NULL
+        # COALESCE lets later, richer execution records repair placeholder rows
+        # inserted first by websocket/reconcile without overwriting with NULL.
+        coalesce_ticket_id = func.coalesce(stmt.excluded.trade_ticket_id, _OR.trade_ticket_id)
         coalesce_kalshi_id = func.coalesce(stmt.excluded.kalshi_order_id, _OR.kalshi_order_id)
         coalesce_strategy = func.coalesce(stmt.excluded.strategy_code, _OR.strategy_code)
         await self.session.execute(
@@ -937,6 +931,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 index_elements=["kalshi_env", "client_order_id"],
                 set_={
                     **update_values,
+                    "trade_ticket_id": coalesce_ticket_id,
                     "kalshi_order_id": coalesce_kalshi_id,
                     "strategy_code": coalesce_strategy,
                 },

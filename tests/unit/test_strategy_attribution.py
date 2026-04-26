@@ -11,10 +11,11 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, StrategyCode, TradeAction
-from kalshi_bot.db.models import Room
+from kalshi_bot.db.models import OrderRecord, Room
 from kalshi_bot.core.schemas import TradeTicket
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -102,6 +103,68 @@ async def test_upsert_order_inherits_strategy_code_from_ticket(repo_factory, roo
             kalshi_env="demo",
         )
         assert order.strategy_code == "A"
+
+
+@pytest.mark.asyncio
+async def test_save_order_repairs_stream_placeholder_with_ticket_attribution(repo_factory, room_id):
+    """Execution persistence can race websocket/reconcile order ingestion.
+
+    The stream may insert a same-client-order placeholder before the supervisor
+    records its execution receipt. Saving the execution receipt must enrich that
+    row, not raise a duplicate-key error and roll back the room's ticket/risk
+    context.
+    """
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        client_order_id = "coid-race"
+        await repo.upsert_order(
+            client_order_id=client_order_id,
+            market_ticker="KXHIGHNY-26APR23-T68",
+            status="executed",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.4000"),
+            count_fp=Decimal("10.00"),
+            raw={"source": "stream"},
+            kalshi_order_id="kord-race",
+            kalshi_env="demo",
+        )
+        ticket = await repo.save_trade_ticket(
+            room_id,
+            _ticket("KXHIGHNY-26APR23-T68"),
+            client_order_id=client_order_id,
+            strategy_code=StrategyCode.DIRECTIONAL.value,
+        )
+
+        order = await repo.save_order(
+            ticket_id=ticket.id,
+            client_order_id=client_order_id,
+            market_ticker="KXHIGHNY-26APR23-T68",
+            status="executed",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.4000"),
+            count_fp=Decimal("10.00"),
+            raw={"source": "supervisor"},
+            kalshi_order_id="kord-race",
+            kalshi_env="demo",
+        )
+        rows = list(
+            (
+                await session.execute(
+                    select(OrderRecord).where(
+                        OrderRecord.kalshi_env == "demo",
+                        OrderRecord.client_order_id == client_order_id,
+                    )
+                )
+            ).scalars()
+        )
+
+        assert len(rows) == 1
+        assert order.id == rows[0].id
+        assert order.trade_ticket_id == ticket.id
+        assert order.strategy_code == StrategyCode.DIRECTIONAL.value
 
 
 @pytest.mark.asyncio

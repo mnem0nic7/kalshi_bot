@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import StrategyCode
 from kalshi_bot.db.models import (
     FillRecord,
     MarketPriceHistory,
@@ -62,6 +63,12 @@ def _side_price(fill: FillRecord) -> Decimal:
     if fill.side == "yes":
         return Decimal(fill.yes_price_dollars)
     return Decimal("1") - Decimal(fill.yes_price_dollars)
+
+
+def _inferred_strategy_for_orphaned_order(order: OrderRecord) -> str | None:
+    if str(order.client_order_id or "").startswith("room:"):
+        return StrategyCode.DIRECTIONAL.value
+    return None
 
 
 def _current_side_price(position: PositionRecord, market_state: MarketState | None) -> Decimal | None:
@@ -183,13 +190,21 @@ class TradingAuditService:
             tickets = await self._tickets(session, kalshi_env=kalshi_env, cutoff=cutoff - timedelta(days=1))
             tickets_by_id = {ticket.id: ticket for ticket in tickets}
             tickets_by_client_order_id = {ticket.client_order_id: ticket for ticket in tickets}
+            order_strategy_overrides: dict[str, str] = {}
             for order in orders:
                 if order.strategy_code is not None:
                     continue
                 ticket = tickets_by_id.get(str(order.trade_ticket_id)) if order.trade_ticket_id else None
                 ticket = ticket or tickets_by_client_order_id.get(order.client_order_id)
-                if ticket is not None and ticket.strategy_code is not None and not dry_run:
-                    order.strategy_code = ticket.strategy_code
+                inferred_strategy = (
+                    ticket.strategy_code
+                    if ticket is not None and ticket.strategy_code is not None
+                    else _inferred_strategy_for_orphaned_order(order)
+                )
+                if inferred_strategy is not None:
+                    order_strategy_overrides[order.id] = inferred_strategy
+                    if not dry_run:
+                        order.strategy_code = inferred_strategy
             orders_by_kalshi_id = {order.kalshi_order_id: order for order in orders if order.kalshi_order_id}
             result = await session.execute(
                 select(FillRecord)
@@ -207,7 +222,8 @@ class TradingAuditService:
                 raw_order_id = (fill.raw or {}).get("order_id") if isinstance(fill.raw, dict) else None
                 matched_order = orders_by_kalshi_id.get(raw_order_id)
                 if matched_order is not None:
-                    matched_order_strategy = matched_order.strategy_code
+                    matched_order_strategy = matched_order.strategy_code or order_strategy_overrides.get(matched_order.id)
+                    strategy_source = "order_strategy_code" if matched_order.strategy_code else None
                     if matched_order_strategy is None:
                         ticket = (
                             tickets_by_id.get(str(matched_order.trade_ticket_id))
@@ -216,6 +232,9 @@ class TradingAuditService:
                         )
                         ticket = ticket or tickets_by_client_order_id.get(matched_order.client_order_id)
                         matched_order_strategy = ticket.strategy_code if ticket is not None else None
+                        strategy_source = "ticket_strategy_code" if matched_order_strategy else None
+                    elif matched_order.id in order_strategy_overrides and matched_order.strategy_code is None:
+                        strategy_source = "bot_room_client_order_id"
                     new_order_id = new_order_id or matched_order.id
                     new_strategy = new_strategy or matched_order_strategy
                     reason = "raw_order_id_match"
@@ -223,6 +242,7 @@ class TradingAuditService:
                         "raw_order_id": raw_order_id,
                         "local_order_id": matched_order.id,
                         "order_strategy_code": matched_order_strategy,
+                        "strategy_source": strategy_source,
                     }
 
                 if new_strategy is None and fill.action == "sell":
