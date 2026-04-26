@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import RiskStatus, RoomOrigin, RoomStage
 from kalshi_bot.core.fixed_point import as_decimal
+from kalshi_bot.core.signal_payload import capital_bucket_from_signal_payload as _capital_bucket_from_signal_payload
 from kalshi_bot.core.schemas import (
     MemoryNotePayload,
     PortfolioBucketSnapshot,
@@ -53,19 +54,6 @@ from kalshi_bot.db.models import (
     Signal,
     TradeTicketRecord,
 )
-
-def _capital_bucket_from_signal_payload(payload: dict[str, Any] | None) -> str:
-    if not isinstance(payload, dict):
-        return "risky"
-    explicit = str(payload.get("capital_bucket") or "").strip().lower()
-    if explicit in {"safe", "risky"}:
-        return explicit
-    trade_regime = str(payload.get("trade_regime") or "").strip().lower()
-    if trade_regime in {"near_threshold", "longshot_yes", "longshot_no"}:
-        return "risky"
-    if trade_regime == "standard":
-        return "safe"
-    return "risky"
 
 
 def _quantize_money(value: Any) -> Decimal:
