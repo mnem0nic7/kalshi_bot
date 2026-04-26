@@ -46,22 +46,29 @@ def install_aiosqlite_wakeup_patch() -> None:
         except Exception:
             logger.debug("failed to wake asyncio loop after aiosqlite work", exc_info=True)
 
+    def deliver_to_future(future: asyncio.Future | None, callback, value) -> None:
+        if future is None or future.done():
+            return
+        loop = future.get_loop()
+        if loop.is_closed():
+            logger.debug("dropped late aiosqlite worker result because event loop is closed")
+            return
+        try:
+            loop.call_soon_threadsafe(callback, future, value)
+            wake_loop(loop)
+        except RuntimeError:
+            logger.debug("dropped late aiosqlite worker result during event-loop shutdown", exc_info=True)
+
     def patched_connection_worker_thread(tx):
         while True:
             future, function = tx.get()
             try:
                 result = function()
-                if future:
-                    loop = future.get_loop()
-                    loop.call_soon_threadsafe(aiosqlite_core.set_result, future, result)
-                    wake_loop(loop)
+                deliver_to_future(future, aiosqlite_core.set_result, result)
                 if result is aiosqlite_core._STOP_RUNNING_SENTINEL:
                     break
             except BaseException as exc:
-                if future:
-                    loop = future.get_loop()
-                    loop.call_soon_threadsafe(aiosqlite_core.set_exception, future, exc)
-                    wake_loop(loop)
+                deliver_to_future(future, aiosqlite_core.set_exception, exc)
 
     async def patched_connect(self):
         if self._connection is None:

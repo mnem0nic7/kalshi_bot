@@ -23,9 +23,7 @@ import asyncio
 import math
 import sys
 from collections import defaultdict
-from decimal import Decimal
-
-from sqlalchemy import and_, select, text
+from sqlalchemy import and_, select
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.db.models import HistoricalSettlementLabelRecord, HistoricalWeatherSnapshotRecord

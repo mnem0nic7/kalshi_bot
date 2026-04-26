@@ -26,7 +26,6 @@ from kalshi_bot.config import get_settings
 from kalshi_bot.db.models import HistoricalSettlementLabelRecord, HistoricalWeatherSnapshotRecord
 from kalshi_bot.db.session import create_engine, create_session_factory
 from kalshi_bot.weather.sigma_calibration import (
-    LEAD_BUCKETS,
     fit_lead_factors,
     fit_sigma_base,
     lead_bucket_for_hours,

@@ -21,7 +21,7 @@ import sys
 from collections import defaultdict
 from datetime import UTC, date, datetime
 
-from sqlalchemy import and_, select, text
+from sqlalchemy import select
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.db.models import (
