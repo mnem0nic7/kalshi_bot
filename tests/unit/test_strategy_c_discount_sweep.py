@@ -14,11 +14,8 @@ from decimal import Decimal
 import pytest
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import WeatherResolutionState
 from kalshi_bot.db.models import MarketPriceHistory, StrategyCRoom
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
-from kalshi_bot.integrations.kalshi import KalshiClient
-from kalshi_bot.integrations.weather import NWSWeatherClient
 from kalshi_bot.services.counterfactuals import (
     strategy_c_fee_cents,
     strategy_c_gross_edge_cents,

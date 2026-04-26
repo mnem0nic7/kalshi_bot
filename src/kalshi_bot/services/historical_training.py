@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -43,6 +44,8 @@ from kalshi_bot.weather.scoring import extract_current_temp_f, extract_forecast_
 from kalshi_bot.integrations.forecast_archive import OpenMeteoForecastArchiveClient
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.historical_archive import append_weather_bundle_archive, weather_bundle_archive_metadata
+
+logger = logging.getLogger(__name__)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -4451,20 +4454,16 @@ class HistoricalTrainingService:
         if day_count == 1:
             train_days = 1
             validation_days = 0
-            holdout_days = 0
         elif day_count == 2:
             train_days = 1
             validation_days = 0
-            holdout_days = 1
         elif day_count == 3:
             train_days = 1
             validation_days = 1
-            holdout_days = 1
         else:
             validation_days = max(1, int(day_count * 0.15))
             train_days = max(1, int(day_count * 0.70))
             train_days = min(train_days, day_count - validation_days - 1)
-            holdout_days = max(1, day_count - train_days - validation_days)
         train = ordered_days[:train_days]
         validation = ordered_days[train_days : train_days + validation_days]
         holdout = ordered_days[train_days + validation_days :]

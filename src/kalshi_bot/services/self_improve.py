@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -10,7 +10,6 @@ from typing import Any
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import DeploymentColor
 from kalshi_bot.core.schemas import (
     AgentPack,
     AgentPackThresholds,
@@ -21,7 +20,7 @@ from kalshi_bot.core.schemas import (
 )
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService
-from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
+from kalshi_bot.services.risk import DeterministicRiskEngine
 from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 

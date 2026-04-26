@@ -7,7 +7,6 @@ Coverage:
 """
 from __future__ import annotations
 
-import pytest
 
 from kalshi_bot.services.proximity_monitor import (
     ThresholdProximityMonitor,

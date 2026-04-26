@@ -7,7 +7,6 @@ import pytest
 
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import RiskStatus
 from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models

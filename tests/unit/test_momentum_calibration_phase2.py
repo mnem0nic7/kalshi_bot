@@ -14,8 +14,7 @@ CC2 – gate ordering: pending + coverage both fail → pending wins, checkpoint
 """
 from __future__ import annotations
 
-import asyncio
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -71,7 +70,6 @@ def _row(*, has_slope: bool = True, day: str = "2026-04-20") -> dict[str, Any]:
 
 class TestCU:
     def test_due_after_hour(self) -> None:
-        from zoneinfo import ZoneInfo
         from kalshi_bot.services.daemon import DaemonService
 
         svc = MagicMock(spec=DaemonService)
@@ -386,7 +384,9 @@ class TestCB2:
 
     def test_checkpoint_written_via_try_finally(self) -> None:
         from kalshi_bot.services import momentum_calibration as mc
-        import inspect, ast, textwrap
+        import inspect
+        import ast
+        import textwrap
         src = textwrap.dedent(inspect.getsource(mc.MomentumCalibrationService.nightly_auto_run))
         tree = ast.parse(src)
         has_finally = any(

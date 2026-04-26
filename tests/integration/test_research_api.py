@@ -4,8 +4,6 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 import json
 
-from fastapi.testclient import TestClient
-
 from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import AgentRole, MessageKind, RoomStage
 from kalshi_bot.core.schemas import (
@@ -19,6 +17,8 @@ from kalshi_bot.core.schemas import (
     RoomMessageCreate,
 )
 from kalshi_bot.db.repositories import PlatformRepository
+import kalshi_bot.web.app as web_app_module
+from tests.integration.asgi_sync_client import SameThreadASGITestClient as TestClient
 from kalshi_bot.web.app import create_app
 
 
@@ -29,8 +29,40 @@ def test_research_api_serves_dossier_and_history(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEB_AUTH_ENABLED", "false")
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
     get_settings.cache_clear()
+
+    async def fake_build_env_dashboard(_container, kalshi_env: str):
+        return {
+            "portfolio": {"env_label": kalshi_env.title()},
+            "daily_pnl_display": "—",
+            "daily_pnl_line_display": "—",
+            "daily_pnl_tone": "neutral",
+            "active_rooms": [],
+            "alerts": [],
+            "positions": [],
+            "positions_summary": {},
+        }
+
+    async def fake_build_strategies_dashboard(_container):
+        return {
+            "summary": {"window_days": 180, "window_options": [30, 90, 180]},
+            "leaderboard": [],
+            "city_matrix": [],
+            "detail_context": {"type": "empty", "message": "No strategy data"},
+            "recent_promotions": [],
+            "methodology": {"points": []},
+        }
+
+    async def fake_build_control_room_tab(_container, tab: str):
+        if tab == "rooms":
+            return {"rooms": [{"market_ticker": "WX-UI"}]}
+        return {}
+
+    monkeypatch.setattr(web_app_module, "build_env_dashboard", fake_build_env_dashboard)
+    monkeypatch.setattr(web_app_module, "build_strategies_dashboard", fake_build_strategies_dashboard)
+    monkeypatch.setattr(web_app_module, "build_control_room_tab", fake_build_control_room_tab)
 
     app = create_app()
     with TestClient(app) as client:
@@ -144,8 +176,40 @@ def test_web_pages_render_index_and_room_detail(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEB_AUTH_ENABLED", "false")
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
     get_settings.cache_clear()
+
+    async def fake_build_env_dashboard(_container, kalshi_env: str):
+        return {
+            "portfolio": {"env_label": kalshi_env.title()},
+            "daily_pnl_display": "—",
+            "daily_pnl_line_display": "—",
+            "daily_pnl_tone": "neutral",
+            "active_rooms": [],
+            "alerts": [],
+            "positions": [],
+            "positions_summary": {},
+        }
+
+    async def fake_build_strategies_dashboard(_container):
+        return {
+            "summary": {"window_days": 180, "window_options": [30, 90, 180]},
+            "leaderboard": [],
+            "city_matrix": [],
+            "detail_context": {"type": "empty", "message": "No strategy data"},
+            "recent_promotions": [],
+            "methodology": {"points": []},
+        }
+
+    async def fake_build_control_room_tab(_container, tab: str):
+        if tab == "rooms":
+            return {"rooms": [{"market_ticker": "WX-UI"}]}
+        return {}
+
+    monkeypatch.setattr(web_app_module, "build_env_dashboard", fake_build_env_dashboard)
+    monkeypatch.setattr(web_app_module, "build_strategies_dashboard", fake_build_strategies_dashboard)
+    monkeypatch.setattr(web_app_module, "build_control_room_tab", fake_build_control_room_tab)
 
     app = create_app()
     with TestClient(app) as client:
@@ -204,6 +268,7 @@ def test_status_api_includes_runtime_health(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEB_AUTH_ENABLED", "false")
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
     get_settings.cache_clear()
 
@@ -252,6 +317,7 @@ def test_strategy_audit_endpoints_render(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEB_AUTH_ENABLED", "false")
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
     get_settings.cache_clear()
 
@@ -298,6 +364,7 @@ def test_room_events_stream_includes_stage_and_payload(tmp_path, monkeypatch) ->
 
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     monkeypatch.setenv("APP_AUTO_INIT_DB", "true")
+    monkeypatch.setenv("WEB_AUTH_ENABLED", "false")
     monkeypatch.setenv("WEATHER_MARKET_MAP_PATH", str(map_path))
     monkeypatch.setenv("SSE_POLL_INTERVAL_SECONDS", "0.01")
     get_settings.cache_clear()

@@ -6,13 +6,13 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-_PACIFIC = zoneinfo.ZoneInfo("America/Los_Angeles")
-
-from kalshi_bot.core.fixed_point import as_decimal, quantize_count, quantize_price
 from kalshi_bot.config import get_settings
+from kalshi_bot.core.fixed_point import as_decimal, quantize_count, quantize_price
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
+
+_PACIFIC = zoneinfo.ZoneInfo("America/Los_Angeles")
 
 
 def _first_present(payload: dict[str, Any], *keys: str) -> list[dict[str, Any]]:

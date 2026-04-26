@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Decision-corpus calibration report generator.
 
 This module is a read-only PR 1.5 consumer of the PR 1 decision corpus.
@@ -63,6 +61,8 @@ JSON schema v1:
 Fields documented in schema v1 are stable. Future fields may be added; existing
 fields are not renamed or removed without bumping ``report_schema_version``.
 """
+
+from __future__ import annotations
 
 import json
 import math

@@ -6,8 +6,11 @@ from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from kalshi_bot.config import Settings
+from kalshi_bot.db.aiosqlite_wakeup import install_aiosqlite_wakeup_patch
 from kalshi_bot.db.base import Base
 from kalshi_bot.db import models as _models  # noqa: F401
+
+install_aiosqlite_wakeup_patch()
 
 
 def create_engine(settings: Settings) -> AsyncEngine:

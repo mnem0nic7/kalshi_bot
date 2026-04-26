@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
-from fastapi.testclient import TestClient
+import httpx
+import pytest
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.services.container import AppContainer
 from kalshi_bot.web.auth import hash_session_token
 from kalshi_bot.web.app import create_app
 
@@ -35,44 +37,59 @@ def _create_auth_enabled_app(tmp_path, monkeypatch, *, kalshi_env: str = "demo")
     return create_app()
 
 
-def test_root_redirects_to_login_when_auth_enabled(tmp_path, monkeypatch) -> None:
+@asynccontextmanager
+async def _auth_client(app, *, base_url: str = "http://testserver"):
+    app.state.container = await AppContainer.build()
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url=base_url, follow_redirects=False) as client:
+            yield client
+    finally:
+        await app.state.container.close()
+
+
+@pytest.mark.asyncio
+async def test_root_redirects_to_login_when_auth_enabled(tmp_path, monkeypatch) -> None:
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
 
-    with TestClient(app) as client:
-        response = client.get("/", follow_redirects=False)
+    async with _auth_client(app) as client:
+        response = await client.get("/", follow_redirects=False)
 
     assert response.status_code == 303
     assert response.headers["location"] == "/login"
     get_settings.cache_clear()
 
 
-def test_api_requires_auth_when_auth_enabled(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_api_requires_auth_when_auth_enabled(tmp_path, monkeypatch) -> None:
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
 
-    with TestClient(app) as client:
-        response = client.get("/api/dashboard/strategies")
+    async with _auth_client(app) as client:
+        response = await client.get("/api/dashboard/strategies")
 
     assert response.status_code == 401
     assert response.json()["error"] == "auth_required"
     get_settings.cache_clear()
 
 
-def test_healthz_stays_public_when_auth_enabled(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_healthz_stays_public_when_auth_enabled(tmp_path, monkeypatch) -> None:
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
 
-    with TestClient(app) as client:
-        response = client.get("/healthz")
+    async with _auth_client(app) as client:
+        response = await client.get("/healthz")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     get_settings.cache_clear()
 
 
-def test_register_rejects_non_allowlisted_email(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_register_rejects_non_allowlisted_email(tmp_path, monkeypatch) -> None:
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
 
-    with TestClient(app) as client:
-        response = client.post(
+    async with _auth_client(app) as client:
+        response = await client.post(
             "/register",
             data={"email": "someone@example.com", "password": PASSWORD},
         )
@@ -83,11 +100,12 @@ def test_register_rejects_non_allowlisted_email(tmp_path, monkeypatch) -> None:
     get_settings.cache_clear()
 
 
-def test_register_page_does_not_display_allowed_email(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_register_page_does_not_display_allowed_email(tmp_path, monkeypatch) -> None:
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
 
-    with TestClient(app) as client:
-        response = client.get("/register")
+    async with _auth_client(app) as client:
+        response = await client.get("/register")
 
     assert response.status_code == 200
     assert ALLOWED_EMAIL not in response.text
@@ -95,18 +113,19 @@ def test_register_page_does_not_display_allowed_email(tmp_path, monkeypatch) -> 
     get_settings.cache_clear()
 
 
-def test_register_allowlisted_email_creates_session_and_unlocks_site(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_register_allowlisted_email_creates_session_and_unlocks_site(tmp_path, monkeypatch) -> None:
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
     settings = get_settings()
 
-    with TestClient(app) as client:
-        response = client.post(
+    async with _auth_client(app) as client:
+        response = await client.post(
             "/register",
             data={"email": ALLOWED_EMAIL, "password": PASSWORD},
             follow_redirects=False,
         )
 
-        faq_response = client.get("/faq")
+        faq_response = await client.get("/faq")
 
     assert response.status_code == 303
     assert response.headers["location"] == "/"
@@ -115,21 +134,22 @@ def test_register_allowlisted_email_creates_session_and_unlocks_site(tmp_path, m
     get_settings.cache_clear()
 
 
-def test_login_rejects_wrong_password(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_login_rejects_wrong_password(tmp_path, monkeypatch) -> None:
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
 
-    with TestClient(app) as client:
-        register_response = client.post(
+    async with _auth_client(app) as client:
+        register_response = await client.post(
             "/register",
             data={"email": ALLOWED_EMAIL, "password": PASSWORD},
             follow_redirects=False,
         )
         assert register_response.status_code == 303
 
-        logout_response = client.post("/logout", follow_redirects=False)
+        logout_response = await client.post("/logout", follow_redirects=False)
         assert logout_response.status_code == 303
 
-        response = client.post(
+        response = await client.post(
             "/login",
             data={"email": ALLOWED_EMAIL, "password": "wrong-password"},
         )
@@ -139,19 +159,20 @@ def test_login_rejects_wrong_password(tmp_path, monkeypatch) -> None:
     get_settings.cache_clear()
 
 
-def test_logout_clears_session_cookie(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_logout_clears_session_cookie(tmp_path, monkeypatch) -> None:
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
     settings = get_settings()
 
-    with TestClient(app) as client:
-        client.post(
+    async with _auth_client(app) as client:
+        await client.post(
             "/register",
             data={"email": ALLOWED_EMAIL, "password": PASSWORD},
             follow_redirects=False,
         )
         assert client.cookies.get(settings.web_auth_cookie_name)
 
-        response = client.post("/logout", follow_redirects=False)
+        response = await client.post("/logout", follow_redirects=False)
 
     assert response.status_code == 303
     assert response.headers["location"] == "/login"
@@ -159,12 +180,13 @@ def test_logout_clears_session_cookie(tmp_path, monkeypatch) -> None:
     get_settings.cache_clear()
 
 
-def test_register_uses_shared_cookie_domain_when_configured(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_register_uses_shared_cookie_domain_when_configured(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("WEB_AUTH_COOKIE_DOMAIN", ".ai-al.site")
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
 
-    with TestClient(app, base_url="https://demo.ai-al.site") as client:
-        response = client.post(
+    async with _auth_client(app, base_url="https://demo.ai-al.site") as client:
+        response = await client.post(
             "/register",
             data={"email": ALLOWED_EMAIL, "password": PASSWORD},
             follow_redirects=False,
@@ -175,7 +197,8 @@ def test_register_uses_shared_cookie_domain_when_configured(tmp_path, monkeypatc
     get_settings.cache_clear()
 
 
-def test_default_cookie_name_is_scoped_by_kalshi_env(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_default_cookie_name_is_scoped_by_kalshi_env(tmp_path, monkeypatch) -> None:
     demo_app = _create_auth_enabled_app(tmp_path / "demo", monkeypatch, kalshi_env="demo")
     demo_settings = get_settings()
     assert demo_settings.web_auth_cookie_name == "kalshi_bot_session_demo"
@@ -190,13 +213,14 @@ def test_default_cookie_name_is_scoped_by_kalshi_env(tmp_path, monkeypatch) -> N
     assert production_app is not None
 
 
-def test_authenticated_api_request_refreshes_session_expiry_and_cookie(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_authenticated_api_request_refreshes_session_expiry_and_cookie(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("WEB_AUTH_SESSION_TTL_SECONDS", "60")
     app = _create_auth_enabled_app(tmp_path, monkeypatch)
     settings = get_settings()
 
-    with TestClient(app) as client:
-        register_response = client.post(
+    async with _auth_client(app) as client:
+        register_response = await client.post(
             "/register",
             data={"email": ALLOWED_EMAIL, "password": PASSWORD},
             follow_redirects=False,
@@ -214,9 +238,9 @@ def test_authenticated_api_request_refreshes_session_expiry_and_cookie(tmp_path,
                 await session.commit()
                 return session_record.expires_at
 
-        shortened_expiry = asyncio.run(shorten_session_expiry())
+        shortened_expiry = await shorten_session_expiry()
 
-        response = client.get("/api/dashboard/strategies")
+        response = await client.get("/api/dashboard/strategies")
 
         async def read_session_expiry() -> datetime:
             async with app.state.container.session_factory() as session:
@@ -226,7 +250,7 @@ def test_authenticated_api_request_refreshes_session_expiry_and_cookie(tmp_path,
                 await session.commit()
                 return session_record.expires_at
 
-        refreshed_expiry = asyncio.run(read_session_expiry())
+        refreshed_expiry = await read_session_expiry()
 
     assert response.status_code == 200
     assert f"{settings.web_auth_cookie_name}=" in response.headers.get("set-cookie", "")

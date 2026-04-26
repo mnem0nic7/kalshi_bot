@@ -7,7 +7,7 @@ import pytest
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, TradeAction
-from kalshi_bot.core.schemas import ExecReceiptPayload, TradeTicket
+from kalshi_bot.core.schemas import TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.execution import ExecutionService
 

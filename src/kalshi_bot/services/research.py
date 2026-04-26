@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole, ContractSide, StandDownReason, StrategyMode, TradeAction, WeatherResolutionState
-from kalshi_bot.core.fixed_point import as_decimal, quantize_price
+from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.core.schemas import (
     ResearchClaim,
     ResearchDelta,

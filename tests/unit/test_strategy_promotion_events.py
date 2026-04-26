@@ -1,7 +1,7 @@
 """Unit tests for the strategy_promotion_events audit log (P2-3)."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 
 import pytest
 

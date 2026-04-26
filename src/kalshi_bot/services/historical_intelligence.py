@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -943,10 +943,6 @@ class HistoricalIntelligenceService:
         forecast_high = self._extract_float(
             (((weather_bundle.get("forecast") or {}).get("summary") or {}).get("forecast_high_f"))
             or (((bundle.research_dossier or {}).get("summary") or {}).get("current_numeric_facts") or {}).get("forecast_high_f")
-        )
-        current_temp = self._extract_float(
-            (((weather_bundle.get("observation") or {}).get("summary") or {}).get("current_temp_f"))
-            or (((bundle.research_dossier or {}).get("summary") or {}).get("current_numeric_facts") or {}).get("current_temp_f")
         )
         threshold_f = self._extract_float(
             ((weather_bundle.get("mapping") or {}).get("threshold_f"))

@@ -718,7 +718,7 @@ async def test_delta_cap_passes_within_cap_suggestion(auto_evolve_harness) -> No
     codex = FakeCodexServiceWithThresholds(thresholds=within_cap_thresholds)
     service = await auto_evolve_harness.build(codex=codex)
 
-    result = await service.run_once(trigger_source="manual")
+    await service.run_once(trigger_source="manual")
 
     assert codex.accept_calls == 1
 

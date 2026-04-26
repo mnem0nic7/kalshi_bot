@@ -46,7 +46,6 @@ from decimal import Decimal
 from typing import Any
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import StrategyMode
 from kalshi_bot.db.models import DeploymentControl
 
 logger = logging.getLogger(__name__)

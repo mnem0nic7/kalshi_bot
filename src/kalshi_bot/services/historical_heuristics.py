@@ -10,8 +10,6 @@ from kalshi_bot.core.enums import StandDownReason, StrategyMode
 from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.core.schemas import (
     HeuristicCalibrationEntry,
-    HeuristicPolicyAction,
-    HeuristicPolicyCondition,
     HeuristicPolicyNode,
     HeuristicThresholds,
     HistoricalHeuristicPack,

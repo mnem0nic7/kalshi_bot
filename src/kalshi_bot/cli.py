@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 
 from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from kalshi_bot.core.enums import RoomOrigin
 from kalshi_bot.core.schemas import (
@@ -79,6 +80,293 @@ def _secondary_ignore_update_values(
         values["secondary_rollback_status"] = "ignored_by_operator"
         values["secondary_rollback_resolution"] = dict(resolution)
     return values
+
+
+async def _run_health_check_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.health_command == "app":
+        payload = await container.watchdog_service.app_health(
+            color=args.color,
+            kalshi_env=container.settings.kalshi_env,
+        )
+        print(json.dumps(payload, indent=2))
+        return 0 if payload["healthy"] else 1
+    if args.health_command == "daemon":
+        async with container.session_factory() as session:
+            repo = PlatformRepository(session)
+            payload = await container.watchdog_service.daemon_health(
+                repo,
+                color=args.color,
+                kalshi_env=container.settings.kalshi_env,
+            )
+            await session.commit()
+        print(json.dumps(payload, indent=2))
+        return 0 if payload["healthy"] else 1
+    raise ValueError(f"Unknown command: {args.command}")
+
+
+async def _run_watchdog_command(args: argparse.Namespace, container: AppContainer) -> int:
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session)
+        if args.watchdog_command == "status":
+            payload = await container.watchdog_service.get_status(
+                repo,
+                kalshi_env=container.settings.kalshi_env,
+            )
+            await session.commit()
+            print(json.dumps(payload, indent=2))
+            return 0
+        if args.watchdog_command == "run-once":
+            payload = await container.watchdog_service.run_once(
+                repo,
+                app_statuses={
+                    "blue": args.app_blue_status,
+                    "green": args.app_green_status,
+                },
+                source=args.source,
+            )
+            await session.commit()
+            print(json.dumps(payload, indent=2))
+            return 0
+        if args.watchdog_command == "record-action":
+            payload = await container.watchdog_service.record_action(
+                repo,
+                action=args.action,
+                outcome=args.outcome,
+                reason=args.reason,
+                target_color=args.target_color,
+                failed_color=args.failed_color,
+                source=args.source,
+            )
+            await session.commit()
+            print(json.dumps(payload, indent=2))
+            return 0
+        if args.watchdog_command == "mark-boot":
+            payload = await container.watchdog_service.record_boot(
+                repo,
+                status=args.status,
+                reason=args.reason,
+                payload={"working_directory": str(Path.cwd())},
+            )
+            await session.commit()
+            print(json.dumps(payload, indent=2))
+            return 0
+    raise ValueError(f"Unknown command: {args.command}")
+
+
+async def _run_create_room_command(
+    args: argparse.Namespace,
+    container: AppContainer,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    control = await repo.get_deployment_control()
+    pack = await container.agent_pack_service.get_pack_for_color(repo, container.settings.app_color)
+    room = await repo.create_room(
+        RoomCreate(name=args.name, market_ticker=args.market_ticker, prompt=args.prompt),
+        active_color=container.settings.app_color,
+        shadow_mode=container.settings.app_shadow_mode,
+        kill_switch_enabled=control.kill_switch_enabled,
+        kalshi_env=container.settings.kalshi_env,
+        agent_pack_version=pack.version,
+    )
+    await session.commit()
+    print(room.id)
+    return 0
+
+
+async def _run_run_room_command(
+    args: argparse.Namespace,
+    container: AppContainer,
+    session: AsyncSession,
+) -> int:
+    await session.commit()
+    await container.supervisor.run_room(args.room_id, reason=args.reason)
+    print(f"room {args.room_id} completed")
+    return 0
+
+
+async def _run_reconcile_command(
+    container: AppContainer,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    summary = await container.reconciliation_service.reconcile(
+        repo,
+        subaccount=container.settings.kalshi_subaccount,
+        kalshi_env=container.settings.kalshi_env,
+    )
+    await session.commit()
+    print(json.dumps(asdict(summary), indent=2))
+    return 0
+
+
+async def _run_promote_command(
+    args: argparse.Namespace,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    control = await repo.set_active_color(args.color)
+    await session.commit()
+    print(f"active_color={control.active_color}")
+    return 0
+
+
+async def _run_kill_switch_command(
+    args: argparse.Namespace,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    enabled = args.state == "on"
+    control = await repo.set_kill_switch(enabled)
+    await session.commit()
+    print(f"kill_switch_enabled={control.kill_switch_enabled}")
+    return 0
+
+
+async def _run_status_command(
+    container: AppContainer,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    control = await repo.get_deployment_control()
+    positions = await repo.list_positions(limit=10, kalshi_env=container.settings.kalshi_env)
+    ops_events = await repo.list_ops_events(limit=10, kalshi_env=container.settings.kalshi_env)
+    await session.commit()
+    payload = {
+        "kalshi_env": container.settings.kalshi_env,
+        "active_color": control.active_color,
+        "kill_switch_enabled": control.kill_switch_enabled,
+        "execution_lock_holder": control.execution_lock_holder,
+        "positions": [
+            {
+                "market_ticker": position.market_ticker,
+                "subaccount": position.subaccount,
+                "side": position.side,
+                "count_fp": str(position.count_fp),
+                "average_price_dollars": str(position.average_price_dollars),
+            }
+            for position in positions
+        ],
+        "ops_events": [
+            {
+                "severity": event.severity,
+                "summary": event.summary,
+                "source": event.source,
+            }
+            for event in ops_events
+        ],
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+async def _run_intel_command(
+    args: argparse.Namespace,
+    container: AppContainer,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    ticker: str | None = getattr(args, "market", None)
+    if ticker:
+        dossier = await container.research_coordinator.get_latest_dossier(ticker)
+        if dossier is None:
+            print(json.dumps({"market_ticker": ticker, "status": "missing"}))
+            return 2
+        gate = dossier.gate
+        payload = {
+            "market_ticker": ticker,
+            "gate_passed": gate.passed,
+            "gate_reasons": list(gate.reasons or []),
+            "fair_yes_dollars": str(dossier.trader_context.fair_yes_dollars or ""),
+            "confidence": dossier.trader_context.confidence,
+            "stale": dossier.freshness.stale,
+            "refreshed_at": dossier.freshness.refreshed_at.isoformat() if dossier.freshness.refreshed_at else None,
+        }
+        print(json.dumps(payload, indent=2))
+        return 0 if gate.passed else 2
+
+    configured_tickers = [
+        str(m.market_ticker)
+        for m in container.weather_directory.all()
+        if getattr(m, "market_ticker", None)
+    ]
+    records = await repo.list_research_dossiers(limit=max(len(configured_tickers) * 4, 200))
+    await session.commit()
+    by_ticker = {r.market_ticker: r.payload or {} for r in records}
+    rows = []
+    for t in configured_tickers:
+        d = by_ticker.get(t, {})
+        gate_d = d.get("gate") or {}
+        tc = d.get("trader_context") or {}
+        summary_d = d.get("summary") or {}
+        rows.append({
+            "ticker": t,
+            "gate_passed": bool(gate_d.get("passed")),
+            "gate_reasons": list(gate_d.get("reasons") or []),
+            "fair_yes_dollars": str(tc.get("fair_yes_dollars") or ""),
+            "confidence": _float_or_none(summary_d.get("research_confidence")),
+        })
+    rows.sort(key=lambda r: (0 if r["gate_passed"] else 1, -(r["confidence"] or 0.0)))
+    print(json.dumps(rows, indent=2))
+    return 0
+
+
+async def _run_repair_stop_loss_checkpoints_command(
+    args: argparse.Namespace,
+    container: AppContainer,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    refreshed = await refresh_stop_loss_checkpoints(
+        repo,
+        settings=container.settings,
+        kalshi_env=container.settings.kalshi_env,
+        subaccount=container.settings.kalshi_subaccount,
+        market_tickers=args.market_tickers or None,
+        log_repairs=True,
+    )
+    await session.commit()
+    print(
+        json.dumps(
+            [
+                {
+                    "market_ticker": item.market_ticker,
+                    "outcome_status": item.outcome_status,
+                    "repaired": item.repaired,
+                }
+                for item in refreshed
+            ],
+            indent=2,
+        )
+    )
+    return 0
+
+
+async def _run_create_web_user_command(
+    args: argparse.Namespace,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    from kalshi_bot.web.auth import hash_password, normalize_auth_email
+
+    email = normalize_auth_email(args.email)
+    password_hash, password_salt = hash_password(args.password)
+    existing = await repo.get_web_user_by_email(email)
+    if existing is not None:
+        existing.password_hash = password_hash
+        existing.password_salt = password_salt
+        existing.is_active = True
+        await session.commit()
+        print(json.dumps({"action": "updated", "email": email}))
+    else:
+        await repo.create_web_user(
+            email=email,
+            password_hash=password_hash,
+            password_salt=password_salt,
+        )
+        await session.commit()
+        print(json.dumps({"action": "created", "email": email}))
+    return 0
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
@@ -597,71 +885,10 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 return 0
 
         if args.command == "health-check":
-            if args.health_command == "app":
-                payload = await container.watchdog_service.app_health(
-                    color=args.color,
-                    kalshi_env=container.settings.kalshi_env,
-                )
-                print(json.dumps(payload, indent=2))
-                return 0 if payload["healthy"] else 1
-            if args.health_command == "daemon":
-                async with container.session_factory() as session:
-                    repo = PlatformRepository(session)
-                    payload = await container.watchdog_service.daemon_health(
-                        repo,
-                        color=args.color,
-                        kalshi_env=container.settings.kalshi_env,
-                    )
-                    await session.commit()
-                print(json.dumps(payload, indent=2))
-                return 0 if payload["healthy"] else 1
+            return await _run_health_check_command(args, container)
 
         if args.command == "watchdog":
-            async with container.session_factory() as session:
-                repo = PlatformRepository(session)
-                if args.watchdog_command == "status":
-                    payload = await container.watchdog_service.get_status(
-                        repo,
-                        kalshi_env=container.settings.kalshi_env,
-                    )
-                    await session.commit()
-                    print(json.dumps(payload, indent=2))
-                    return 0
-                if args.watchdog_command == "run-once":
-                    payload = await container.watchdog_service.run_once(
-                        repo,
-                        app_statuses={
-                            "blue": args.app_blue_status,
-                            "green": args.app_green_status,
-                        },
-                        source=args.source,
-                    )
-                    await session.commit()
-                    print(json.dumps(payload, indent=2))
-                    return 0
-                if args.watchdog_command == "record-action":
-                    payload = await container.watchdog_service.record_action(
-                        repo,
-                        action=args.action,
-                        outcome=args.outcome,
-                        reason=args.reason,
-                        target_color=args.target_color,
-                        failed_color=args.failed_color,
-                        source=args.source,
-                    )
-                    await session.commit()
-                    print(json.dumps(payload, indent=2))
-                    return 0
-                if args.watchdog_command == "mark-boot":
-                    payload = await container.watchdog_service.record_boot(
-                        repo,
-                        status=args.status,
-                        reason=args.reason,
-                        payload={"working_directory": str(Path.cwd())},
-                    )
-                    await session.commit()
-                    print(json.dumps(payload, indent=2))
-                    return 0
+            return await _run_watchdog_command(args, container)
 
         if args.command == "shadow-run":
             result = await container.shadow_training_service.run_shadow_room(
@@ -965,172 +1192,31 @@ async def _run_cli(args: argparse.Namespace) -> int:
             repo = PlatformRepository(session)
 
             if args.command == "create-room":
-                control = await repo.get_deployment_control()
-                pack = await container.agent_pack_service.get_pack_for_color(repo, container.settings.app_color)
-                room = await repo.create_room(
-                    RoomCreate(name=args.name, market_ticker=args.market_ticker, prompt=args.prompt),
-                    active_color=container.settings.app_color,
-                    shadow_mode=container.settings.app_shadow_mode,
-                    kill_switch_enabled=control.kill_switch_enabled,
-                    kalshi_env=container.settings.kalshi_env,
-                    agent_pack_version=pack.version,
-                )
-                await session.commit()
-                print(room.id)
-                return 0
+                return await _run_create_room_command(args, container, repo, session)
 
             if args.command == "run-room":
-                await session.commit()
-                await container.supervisor.run_room(args.room_id, reason=args.reason)
-                print(f"room {args.room_id} completed")
-                return 0
+                return await _run_run_room_command(args, container, session)
 
             if args.command == "reconcile":
-                summary = await container.reconciliation_service.reconcile(
-                    repo,
-                    subaccount=container.settings.kalshi_subaccount,
-                    kalshi_env=container.settings.kalshi_env,
-                )
-                await session.commit()
-                print(json.dumps(asdict(summary), indent=2))
-                return 0
+                return await _run_reconcile_command(container, repo, session)
 
             if args.command == "promote":
-                control = await repo.set_active_color(args.color)
-                await session.commit()
-                print(f"active_color={control.active_color}")
-                return 0
+                return await _run_promote_command(args, repo, session)
 
             if args.command == "kill-switch":
-                enabled = args.state == "on"
-                control = await repo.set_kill_switch(enabled)
-                await session.commit()
-                print(f"kill_switch_enabled={control.kill_switch_enabled}")
-                return 0
+                return await _run_kill_switch_command(args, repo, session)
 
             if args.command == "status":
-                control = await repo.get_deployment_control()
-                positions = await repo.list_positions(limit=10, kalshi_env=container.settings.kalshi_env)
-                ops_events = await repo.list_ops_events(limit=10, kalshi_env=container.settings.kalshi_env)
-                await session.commit()
-                payload = {
-                    "kalshi_env": container.settings.kalshi_env,
-                    "active_color": control.active_color,
-                    "kill_switch_enabled": control.kill_switch_enabled,
-                    "execution_lock_holder": control.execution_lock_holder,
-                    "positions": [
-                        {
-                            "market_ticker": position.market_ticker,
-                            "subaccount": position.subaccount,
-                            "side": position.side,
-                            "count_fp": str(position.count_fp),
-                            "average_price_dollars": str(position.average_price_dollars),
-                        }
-                        for position in positions
-                    ],
-                    "ops_events": [
-                        {
-                            "severity": event.severity,
-                            "summary": event.summary,
-                            "source": event.source,
-                        }
-                        for event in ops_events
-                    ],
-                }
-                print(json.dumps(payload, indent=2))
-                return 0
+                return await _run_status_command(container, repo, session)
 
             if args.command == "intel":
-                ticker: str | None = getattr(args, "market", None)
-                if ticker:
-                    dossier = await container.research_coordinator.get_latest_dossier(ticker)
-                    if dossier is None:
-                        print(json.dumps({"market_ticker": ticker, "status": "missing"}))
-                        return 2
-                    gate = dossier.gate
-                    payload = {
-                        "market_ticker": ticker,
-                        "gate_passed": gate.passed,
-                        "gate_reasons": list(gate.reasons or []),
-                        "fair_yes_dollars": str(dossier.trader_context.fair_yes_dollars or ""),
-                        "confidence": dossier.trader_context.confidence,
-                        "stale": dossier.freshness.stale,
-                        "refreshed_at": dossier.freshness.refreshed_at.isoformat() if dossier.freshness.refreshed_at else None,
-                    }
-                    print(json.dumps(payload, indent=2))
-                    return 0 if gate.passed else 2
-                else:
-                    configured_tickers = [
-                        str(m.market_ticker)
-                        for m in container.weather_directory.all()
-                        if getattr(m, "market_ticker", None)
-                    ]
-                    records = await repo.list_research_dossiers(limit=max(len(configured_tickers) * 4, 200))
-                    await session.commit()
-                    by_ticker = {r.market_ticker: r.payload or {} for r in records}
-                    rows = []
-                    for t in configured_tickers:
-                        d = by_ticker.get(t, {})
-                        gate_d = d.get("gate") or {}
-                        tc = d.get("trader_context") or {}
-                        summary_d = d.get("summary") or {}
-                        rows.append({
-                            "ticker": t,
-                            "gate_passed": bool(gate_d.get("passed")),
-                            "gate_reasons": list(gate_d.get("reasons") or []),
-                            "fair_yes_dollars": str(tc.get("fair_yes_dollars") or ""),
-                            "confidence": _float_or_none(summary_d.get("research_confidence")),
-                        })
-                    rows.sort(key=lambda r: (0 if r["gate_passed"] else 1, -(r["confidence"] or 0.0)))
-                    print(json.dumps(rows, indent=2))
-                    return 0
+                return await _run_intel_command(args, container, repo, session)
 
             if args.command == "repair-stop-loss-checkpoints":
-                refreshed = await refresh_stop_loss_checkpoints(
-                    repo,
-                    settings=container.settings,
-                    kalshi_env=container.settings.kalshi_env,
-                    subaccount=container.settings.kalshi_subaccount,
-                    market_tickers=args.market_tickers or None,
-                    log_repairs=True,
-                )
-                await session.commit()
-                print(
-                    json.dumps(
-                        [
-                            {
-                                "market_ticker": item.market_ticker,
-                                "outcome_status": item.outcome_status,
-                                "repaired": item.repaired,
-                            }
-                            for item in refreshed
-                        ],
-                        indent=2,
-                    )
-                )
-                return 0
+                return await _run_repair_stop_loss_checkpoints_command(args, container, repo, session)
 
-        if args.command == "create-web-user":
-            from kalshi_bot.web.auth import hash_password, normalize_auth_email
-
-            email = normalize_auth_email(args.email)
-            password_hash, password_salt = hash_password(args.password)
-            existing = await repo.get_web_user_by_email(email)
-            if existing is not None:
-                existing.password_hash = password_hash
-                existing.password_salt = password_salt
-                existing.is_active = True
-                await session.commit()
-                print(json.dumps({"action": "updated", "email": email}))
-            else:
-                await repo.create_web_user(
-                    email=email,
-                    password_hash=password_hash,
-                    password_salt=password_salt,
-                )
-                await session.commit()
-                print(json.dumps({"action": "created", "email": email}))
-            return 0
+            if args.command == "create-web-user":
+                return await _run_create_web_user_command(args, repo, session)
 
         raise ValueError(f"Unknown command: {args.command}")
     finally:

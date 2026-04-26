@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from decimal import Decimal
 
 from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.config import Settings

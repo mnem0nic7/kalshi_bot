@@ -6,7 +6,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings, get_settings
@@ -16,6 +15,7 @@ from kalshi_bot.db.models import OpsEvent
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.integrations.forecast_archive import ForecastArchiveLookupResult
+from tests.integration.asgi_sync_client import SameThreadASGITestClient as TestClient
 from kalshi_bot.web.app import create_app
 
 
@@ -104,7 +104,6 @@ def test_historical_status_api_and_build_route(tmp_path, monkeypatch) -> None:
 
 def test_historical_settlement_backfill_updates_api_status(tmp_path, monkeypatch) -> None:
     map_path = tmp_path / "markets.yaml"
-    output_path = tmp_path / "historical_build.jsonl"
     map_path.write_text(
         """
 series_templates:
@@ -380,7 +379,6 @@ series_templates:
         assert body["coverage_repair_summary"]["checkpoint_archive_promotion_count"] >= 2
 
     get_settings.cache_clear()
-    output_path = tmp_path / "historical_bundles.jsonl"
 
 
 def test_external_forecast_archive_backfill_recovers_full_checkpoint_coverage(tmp_path, monkeypatch) -> None:

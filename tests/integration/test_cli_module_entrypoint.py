@@ -191,6 +191,212 @@ async def test_decision_corpus_build_cli_passes_active_kalshi_env(monkeypatch, c
     assert '"kalshi_env": "live"' in capsys.readouterr().out
 
 
+@pytest.mark.asyncio
+async def test_create_web_user_cli_runs_inside_active_session_and_updates_existing_user(monkeypatch, capsys) -> None:
+    users: dict[str, SimpleNamespace] = {}
+
+    class FakeSession:
+        active = False
+
+        async def __aenter__(self):
+            self.active = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.active = False
+            return None
+
+        async def commit(self) -> None:
+            assert self.active
+
+    class FakeSessionFactory:
+        def __call__(self) -> FakeSession:
+            return FakeSession()
+
+    class FakeContainer:
+        session_factory = FakeSessionFactory()
+
+        async def close(self) -> None:
+            return None
+
+    class FakePlatformRepository:
+        def __init__(self, session: FakeSession) -> None:
+            self.session = session
+
+        def _assert_active(self) -> None:
+            assert self.session.active
+
+        async def get_web_user_by_email(self, email: str) -> SimpleNamespace | None:
+            self._assert_active()
+            return users.get(email)
+
+        async def create_web_user(
+            self,
+            *,
+            email: str,
+            password_hash: str,
+            password_salt: str,
+            is_active: bool = True,
+        ) -> SimpleNamespace:
+            self._assert_active()
+            user = SimpleNamespace(
+                email=email,
+                password_hash=password_hash,
+                password_salt=password_salt,
+                is_active=is_active,
+            )
+            users[email] = user
+            return user
+
+    async def fake_build(*, bootstrap_db: bool):
+        assert bootstrap_db is True
+        return FakeContainer()
+
+    monkeypatch.setattr(cli_module.AppContainer, "build", fake_build)
+    monkeypatch.setattr(cli_module, "PlatformRepository", FakePlatformRepository)
+    parser = cli_module.build_parser()
+
+    create_exit = await cli_module._run_cli(
+        parser.parse_args(
+            [
+                "create-web-user",
+                "--email",
+                "Operator@Example.COM",
+                "--password",
+                "first-password",
+            ]
+        )
+    )
+    user = users["operator@example.com"]
+    first_hash = user.password_hash
+    user.is_active = False
+
+    update_exit = await cli_module._run_cli(
+        parser.parse_args(
+            [
+                "create-web-user",
+                "--email",
+                "operator@example.com",
+                "--password",
+                "second-password",
+            ]
+        )
+    )
+
+    assert create_exit == 0
+    assert update_exit == 0
+    assert user.is_active is True
+    assert user.password_hash != first_hash
+    output = capsys.readouterr().out
+    assert '"action": "created"' in output
+    assert '"action": "updated"' in output
+    assert '"email": "operator@example.com"' in output
+
+
+@pytest.mark.asyncio
+async def test_health_check_app_cli_delegates_to_watchdog_service(monkeypatch, capsys) -> None:
+    calls: list[dict[str, str]] = []
+
+    class FakeWatchdogService:
+        async def app_health(self, *, color: str, kalshi_env: str) -> dict[str, object]:
+            calls.append({"color": color, "kalshi_env": kalshi_env})
+            return {"healthy": False, "color": color, "kalshi_env": kalshi_env}
+
+    class FakeContainer:
+        settings = SimpleNamespace(kalshi_env="demo")
+        watchdog_service = FakeWatchdogService()
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_build(*, bootstrap_db: bool):
+        assert bootstrap_db is True
+        return FakeContainer()
+
+    monkeypatch.setattr(cli_module.AppContainer, "build", fake_build)
+
+    exit_code = await cli_module._run_cli(
+        cli_module.build_parser().parse_args(["health-check", "app", "--color", "green"])
+    )
+
+    assert exit_code == 1
+    assert calls == [{"color": "green", "kalshi_env": "demo"}]
+    output = capsys.readouterr().out
+    assert '"healthy": false' in output
+    assert '"kalshi_env": "demo"' in output
+
+
+@pytest.mark.asyncio
+async def test_watchdog_status_cli_runs_inside_active_session_and_commits(monkeypatch, capsys) -> None:
+    calls: list[str] = []
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.active = False
+            self.commits = 0
+
+        async def __aenter__(self):
+            self.active = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.active = False
+            return None
+
+        async def commit(self) -> None:
+            assert self.active
+            self.commits += 1
+
+    class FakeSessionFactory:
+        def __init__(self) -> None:
+            self.sessions: list[FakeSession] = []
+
+        def __call__(self) -> FakeSession:
+            session = FakeSession()
+            self.sessions.append(session)
+            return session
+
+    class FakePlatformRepository:
+        def __init__(self, session: FakeSession) -> None:
+            assert session.active
+            self.session = session
+
+    class FakeWatchdogService:
+        async def get_status(self, repo: FakePlatformRepository, *, kalshi_env: str) -> dict[str, object]:
+            assert repo.session.active
+            calls.append(kalshi_env)
+            return {"status": "ok", "kalshi_env": kalshi_env}
+
+    class FakeContainer:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(kalshi_env="production")
+            self.session_factory = FakeSessionFactory()
+            self.watchdog_service = FakeWatchdogService()
+
+        async def close(self) -> None:
+            return None
+
+    container = FakeContainer()
+
+    async def fake_build(*, bootstrap_db: bool):
+        assert bootstrap_db is True
+        return container
+
+    monkeypatch.setattr(cli_module.AppContainer, "build", fake_build)
+    monkeypatch.setattr(cli_module, "PlatformRepository", FakePlatformRepository)
+
+    exit_code = await cli_module._run_cli(
+        cli_module.build_parser().parse_args(["watchdog", "status"])
+    )
+
+    assert exit_code == 0
+    assert calls == ["production"]
+    assert container.session_factory.sessions[0].commits == 1
+    output = capsys.readouterr().out
+    assert '"status": "ok"' in output
+    assert '"kalshi_env": "production"' in output
+
+
 def test_trade_analysis_cli_report_json_smoke(tmp_path) -> None:
     env = os.environ.copy()
     env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/trade-analysis-cli.db"

@@ -7,11 +7,10 @@ import pytest
 
 from datetime import UTC, datetime, timedelta
 
-import numpy as np
 
 from kalshi_bot.services.stop_loss import (
     _midpoint, _momentum_slope, _peak_price_from_history,
-    _position_opened_at_from_fills, _sell_price, _side_price, _trailing_loss_ratio,
+    _position_opened_at_from_fills, _sell_price, _trailing_loss_ratio,
 )
 
 

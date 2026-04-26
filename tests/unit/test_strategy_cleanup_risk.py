@@ -4,7 +4,6 @@ from __future__ import annotations
 from decimal import Decimal
 from unittest.mock import MagicMock
 
-import pytest
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import (

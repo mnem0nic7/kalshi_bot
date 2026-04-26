@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import ContractSide, RoomOrigin, WeatherResolutionState
+from kalshi_bot.core.enums import RoomOrigin, WeatherResolutionState
 from kalshi_bot.core.schemas import (
     ResearchAuditIssue,
     StrategyAuditResult,

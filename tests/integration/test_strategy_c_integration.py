@@ -180,7 +180,7 @@ async def test_sweep_shadow_when_kill_switch_off() -> None:
     session_factory = await _setup_db(settings)
 
     svc = _make_service(settings, session_factory)
-    signals = await svc.sweep()
+    await svc.sweep()
 
     async with session_factory() as session:
         rows = (await session.execute(select(StrategyCRoom))).scalars().all()
@@ -372,7 +372,6 @@ async def test_fill_rate_no_side_fills_when_no_ask_within_target() -> None:
 
     now = datetime.now(UTC)
     target_price_cents = 5.0
-    target_dollars = Decimal("0.0500")
 
     async with session_factory() as session:
         for i in range(10):

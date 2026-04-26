@@ -9,7 +9,7 @@ Includes:
 """
 from __future__ import annotations
 
-from datetime import date, datetime, UTC
+from datetime import date
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock
@@ -21,7 +21,6 @@ from hypothesis import strategies as st
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import DeploymentControl
 from kalshi_bot.services.monotonicity_scanner import (
-    ArbProposal,
     MonotonicityViolation,
     _parse_station_date_threshold,
     detect_violations,
@@ -29,7 +28,6 @@ from kalshi_bot.services.monotonicity_scanner import (
     group_markets_by_station_date,
     kalshi_fee_cents,
     scan_for_violations,
-    size_proposal,
 )
 
 

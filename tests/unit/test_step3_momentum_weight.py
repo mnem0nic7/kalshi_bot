@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kalshi_bot.core.enums import ContractSide, StandDownReason, TradeAction
-from kalshi_bot.core.schemas import ResearchFreshness
+from kalshi_bot.core.schemas import ResearchFreshness, TradeEligibilityVerdict
 from kalshi_bot.services.momentum_calibration import MomentumCalibrationParams
 from kalshi_bot.services.signal import StrategySignal, apply_momentum_weight_to_signal, evaluate_trade_eligibility
 
@@ -539,7 +539,6 @@ class TestCG_ShadowMetricsRepo:
         return repo
 
     async def test_G1_empty_window_returns_zero_counts(self):
-        from kalshi_bot.db.repositories import PlatformRepository
         repo = self._make_repo_with_payloads([])
         result = await repo.get_momentum_shadow_metrics(kalshi_env="demo")
         assert result["total"] == 0
@@ -549,7 +548,6 @@ class TestCG_ShadowMetricsRepo:
         assert result["veto_fraction"] is None
 
     async def test_G2_success_rows_counted_and_avg_weight_computed(self):
-        from kalshi_bot.db.repositories import PlatformRepository
         payloads = [
             {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": 1.0, "momentum_weight": 0.8},
             {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": 2.0, "momentum_weight": 0.6},
@@ -561,7 +559,6 @@ class TestCG_ShadowMetricsRepo:
         assert result["avg_weight"] == pytest.approx(0.7)
 
     async def test_G3_calibration_missing_rows_counted_slope_included_in_avg(self):
-        from kalshi_bot.db.repositories import PlatformRepository
         payloads = [
             {"momentum_post_processor_outcome": "calibration_missing", "momentum_slope_cents_per_min": 3.0, "momentum_weight": 0.5},
             {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": 1.0, "momentum_weight": 0.9},
@@ -576,7 +573,6 @@ class TestCG_ShadowMetricsRepo:
         assert result["avg_weight"] == pytest.approx(0.9)
 
     async def test_G4_price_history_error_rows_have_no_slope_contribution(self):
-        from kalshi_bot.db.repositories import PlatformRepository
         payloads = [
             {"momentum_post_processor_outcome": "price_history_error"},
             {"momentum_post_processor_outcome": "price_history_error"},
@@ -588,14 +584,12 @@ class TestCG_ShadowMetricsRepo:
         assert result["avg_weight"] is None
 
     async def test_G5_none_payload_counted_as_unknown(self):
-        from kalshi_bot.db.repositories import PlatformRepository
         repo = self._make_repo_with_payloads([None, None])
         result = await repo.get_momentum_shadow_metrics(kalshi_env="demo")
         assert result["by_outcome"]["unknown"] == 2
         assert result["total"] == 2
 
     async def test_G6_veto_fraction_computed_for_success_rows_exceeding_threshold(self):
-        from kalshi_bot.db.repositories import PlatformRepository
         payloads = [
             # slope_against = |slope| for a YES signal with negative slope = adverse
             {"momentum_post_processor_outcome": "success", "momentum_slope_cents_per_min": -2.0, "momentum_weight": 0.5},
@@ -608,7 +602,6 @@ class TestCG_ShadowMetricsRepo:
         assert result["veto_fraction"] == pytest.approx(1 / 3)
 
     async def test_G7_unknown_outcome_string_bucketed_as_unknown(self):
-        from kalshi_bot.db.repositories import PlatformRepository
         payloads = [
             {"momentum_post_processor_outcome": "unexpected_future_value"},
         ]

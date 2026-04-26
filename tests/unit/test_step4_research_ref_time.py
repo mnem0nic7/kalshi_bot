@@ -8,10 +8,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 
 from kalshi_bot.orchestration.supervisor import _research_ref_time
 from kalshi_bot.core.enums import ContractSide, TradeAction
@@ -108,7 +106,6 @@ def _make_supervisor(tmp_path):
 class TestCJ_FastPathWiring:
     async def test_J1_research_ref_time_called_with_signal_and_fallback(self, tmp_path):
         """_run_deterministic_fast_path must call _research_ref_time(signal, research_fallback_time)."""
-        from kalshi_bot.orchestration.supervisor import WorkflowSupervisor
 
         sup = _make_supervisor(tmp_path)
 

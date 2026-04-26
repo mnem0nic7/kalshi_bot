@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-import pytest
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, TradeAction, WeatherResolutionState

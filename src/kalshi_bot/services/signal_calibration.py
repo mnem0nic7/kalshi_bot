@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from typing import Iterable, Sequence
 
 from sqlalchemy import select

@@ -2,7 +2,7 @@
 
 ## Blue/green model
 
-- `app_blue` and `app_green` run simultaneously.
+- `app_<env>_blue` and `app_<env>_green` run simultaneously for each environment.
 - Both can observe rooms and render the UI.
 - Only the DB’s `active_color` may take the execution lock and place orders.
 
@@ -11,7 +11,7 @@
 1. Deploy the inactive color.
 2. Confirm it starts, reconnects to Postgres, and can run room workflows in shadow mode.
 3. Enable the kill switch if you want a quiet handoff.
-4. Run `infra/scripts/promote.sh green` or `blue`.
+4. Run `infra/scripts/promote.sh <demo|production> <blue|green>`.
 5. Verify the new color acquires the execution lock on its next trade attempt.
 6. Disable the kill switch when satisfied.
 

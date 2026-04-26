@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.core.auto_evolve_safety import delta_cap_error, delta_to_bps, rate_to_bps
-from kalshi_bot.services.strategy_regression import WINDOW_DAYS as DEFAULT_STRATEGY_WINDOW_DAYS
 from kalshi_bot.services.strategy_regression_ranking import RANKING_VERSION as STRATEGY_RANKING_VERSION
 
 logger = logging.getLogger(__name__)

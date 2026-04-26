@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import pytest
+
 from kalshi_bot.core.enums import WeatherResolutionState
 from kalshi_bot.weather.models import WeatherMarketMapping
 from kalshi_bot.weather.scoring import extract_forecast_high_f, score_weather_market
@@ -77,6 +79,37 @@ def test_score_weather_market_locks_no_when_below_threshold_is_already_breached(
     assert signal.fair_yes_dollars == 0
     assert signal.confidence == 1.0
     assert signal.resolution_state == WeatherResolutionState.LOCKED_NO
+
+
+@pytest.mark.parametrize(
+    ("operator", "expected_state"),
+    [
+        (">", WeatherResolutionState.UNRESOLVED),
+        (">=", WeatherResolutionState.LOCKED_YES),
+        ("<", WeatherResolutionState.LOCKED_NO),
+        ("<=", WeatherResolutionState.UNRESOLVED),
+    ],
+)
+def test_score_weather_market_live_resolution_respects_strict_threshold_equality(
+    operator: str,
+    expected_state: WeatherResolutionState,
+) -> None:
+    mapping = WeatherMarketMapping(
+        market_ticker=f"WX-EQUALITY-{operator}",
+        station_id="KNYC",
+        location_name="NYC",
+        latitude=40.0,
+        longitude=-73.0,
+        threshold_f=68,
+        operator=operator,
+    )
+    forecast = {"properties": {"updated": "2026-04-10T00:00:00+00:00", "periods": []}}
+    observation = {"properties": {"temperature": {"value": 20.0}, "timestamp": "2026-04-10T18:00:00+00:00"}}
+
+    signal = score_weather_market(mapping, forecast, observation)
+
+    assert signal.current_temp_f == Decimal("68.0")
+    assert signal.resolution_state == expected_state
 
 
 def test_score_weather_market_marks_near_threshold_regime_and_shrinks_edge() -> None:

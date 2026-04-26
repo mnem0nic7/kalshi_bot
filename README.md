@@ -24,21 +24,23 @@ For strict as-of historical replay and Gemini-first fine-tune exports, use [docs
 7. Start Postgres:
 
 ```bash
-docker compose -f infra/docker-compose.yml up --build -d postgres
+docker compose -f infra/docker-compose.yml up --build -d postgres_demo postgres_production
 ```
 
 8. Run migrations:
 
 ```bash
-docker compose -f infra/docker-compose.yml build migrate
-docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
+docker compose -f infra/docker-compose.yml build migrate_demo migrate_production
+docker compose -f infra/docker-compose.yml run --rm --no-deps migrate_demo
+docker compose -f infra/docker-compose.yml run --rm --no-deps migrate_production
 ```
 
 9. Start the app stack:
 
 ```bash
 docker compose -f infra/docker-compose.yml up --build -d \
-  app_blue app_green daemon_blue daemon_green \
+  app_demo_blue app_demo_green app_production_blue app_production_green \
+  daemon_demo_blue daemon_demo_green daemon_production_blue daemon_production_green \
   web_demo web_production web_strategies caddy
 ```
 
@@ -121,7 +123,7 @@ kalshi-bot-cli run-room <room-id>
 kalshi-bot-cli reconcile
 kalshi-bot-cli status
 kalshi-bot-cli kill-switch on
-kalshi-bot-cli promote green
+infra/scripts/promote.sh demo green
 ```
 
 `discover --json` now expands any configured `series_templates` into the currently active greater/less daily temperature markets, and the control room uses the same live discovery path.
@@ -223,6 +225,7 @@ sudo systemctl enable --now kalshi-bot-watchdog.timer
 If you are upgrading an already-running stack, run migrations before using the new watchdog CLI or timer:
 
 ```bash
-docker compose -f infra/docker-compose.yml build migrate
-docker compose -f infra/docker-compose.yml run --rm --no-deps migrate
+docker compose -f infra/docker-compose.yml build migrate_demo migrate_production
+docker compose -f infra/docker-compose.yml run --rm --no-deps migrate_demo
+docker compose -f infra/docker-compose.yml run --rm --no-deps migrate_production
 ```

@@ -1,9 +1,8 @@
 """Integration tests for MonotonicityArbScannerService (Addition 3, §4.3)."""
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import date
 from typing import Any
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select

@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import math
 import random
-import statistics
-from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,7 +20,6 @@ import pytest
 from kalshi_bot.weather.scoring import SigmaContext, sigma_f_for_mapping, nws_forecast_sigma_f
 from kalshi_bot.weather.sigma_calibration import (
     LEAD_BUCKETS,
-    SEASON_BUCKETS,
     fit_lead_factors,
     fit_sigma_base,
     lead_bucket_for_hours,

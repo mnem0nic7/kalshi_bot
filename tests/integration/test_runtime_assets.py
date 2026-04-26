@@ -53,3 +53,16 @@ def test_runtime_scripts_refresh_caddy_after_app_recreate() -> None:
     assert 'app_${env_name}_${color}' in restart_color
     assert 'daemon_${env_name}_${color}' in restart_color
     assert 'docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps --force-recreate caddy' in restart_color
+
+
+def test_promote_script_targets_env_scoped_postgres_and_control_row() -> None:
+    promote = Path("infra/scripts/promote.sh").read_text(encoding="utf-8")
+
+    assert "usage: promote.sh <demo|production> <blue|green>" in promote
+    assert 'postgres_service="postgres_${env_name}"' in promote
+    assert "INSERT INTO deployment_control" in promote
+    assert "TRUE, NULL, '{}', NOW()" in promote
+    assert "ON CONFLICT (id) DO UPDATE" in promote
+    assert "active_color=EXCLUDED.active_color" in promote
+    assert "exec -T postgres \\" not in promote
+    assert "id='default'" not in promote

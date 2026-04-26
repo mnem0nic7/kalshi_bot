@@ -312,9 +312,13 @@ def score_weather_market(
     current_temp_f = extract_current_temp_f(observation_payload)
     resolution_state = WeatherResolutionState.UNRESOLVED
     if current_temp_f is not None:
-        if mapping.operator in (">", ">=") and current_temp_f >= mapping.threshold_f:
+        if mapping.operator == ">" and current_temp_f > mapping.threshold_f:
             resolution_state = WeatherResolutionState.LOCKED_YES
-        elif mapping.operator in ("<", "<=") and current_temp_f > mapping.threshold_f:
+        elif mapping.operator == ">=" and current_temp_f >= mapping.threshold_f:
+            resolution_state = WeatherResolutionState.LOCKED_YES
+        elif mapping.operator == "<" and current_temp_f >= mapping.threshold_f:
+            resolution_state = WeatherResolutionState.LOCKED_NO
+        elif mapping.operator == "<=" and current_temp_f > mapping.threshold_f:
             resolution_state = WeatherResolutionState.LOCKED_NO
 
     snapshot_stand_down_reason: StandDownReason | None = None
@@ -328,8 +332,9 @@ def score_weather_market(
     elif resolution_state == WeatherResolutionState.LOCKED_NO:
         fair = Decimal("0.0000")
         confidence = 1.0
+        locked_no_verb = "met or exceeded" if mapping.operator == "<" else "exceeded"
         summary = (
-            f"Current observed temperature {current_temp_f:.1f}F has already exceeded "
+            f"Current observed temperature {current_temp_f:.1f}F has already {locked_no_verb} "
             f"the {mapping.threshold_f:.1f}F ceiling, so the contract is locked no."
         )
     elif forecast_high_f is None:

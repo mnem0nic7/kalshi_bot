@@ -23,7 +23,7 @@ import kalshi_bot.services.container as container_module
 import kalshi_bot.web.app as web_app_module
 from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import ContractSide, RoomOrigin, RoomStage, TradeAction
-from kalshi_bot.core.schemas import RoomCreate, StrategyCodexEvaluationPayload, StrategyCodexSuggestionPayload, StrategyThresholdPreset, TradeTicket
+from kalshi_bot.core.schemas import RoomCreate, StrategyCodexEvaluationPayload, StrategyThresholdPreset, TradeTicket
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.strategy_codex import STRATEGY_LAB_SOURCE, StrategyCodexService
 from kalshi_bot.services.strategy_regression import (

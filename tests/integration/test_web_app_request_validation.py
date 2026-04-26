@@ -3,12 +3,11 @@ from __future__ import annotations
 import asyncio
 from threading import Event
 
-from fastapi.testclient import TestClient
-
 from kalshi_bot.config import get_settings
 from kalshi_bot.core.schemas import ResearchAuditIssue
 from kalshi_bot.db.repositories import PlatformRepository
 import kalshi_bot.web.app as web_app_module
+from tests.integration.asgi_sync_client import SameThreadASGITestClient as TestClient
 from kalshi_bot.web.app import create_app
 
 
@@ -897,14 +896,12 @@ def test_create_strategy_codex_run_endpoint_schedules_background_execution(tmp_p
         async def execute_run(self, run_id: str) -> None:
             captured["executed_run_id"] = run_id
 
-    real_create_task = asyncio.create_task
-
-    def fake_create_task(coro):
+    def fake_schedule_logged_task(coro, *, name: str, logger):
         captured["scheduled_coro_name"] = coro.cr_code.co_name
-        return real_create_task(coro)
+        return asyncio.create_task(coro, name=name)
 
     monkeypatch.setattr(web_app_module, "build_strategies_dashboard", fake_build_strategies_dashboard)
-    monkeypatch.setattr(web_app_module.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(web_app_module, "schedule_logged_task", fake_schedule_logged_task)
     app = create_app()
 
     with TestClient(app) as client:

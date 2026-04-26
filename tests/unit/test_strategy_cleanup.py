@@ -21,7 +21,6 @@ import pytest
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, WeatherResolutionState
 from kalshi_bot.services.strategy_cleanup import (
-    CleanupSignal,
     LockState,
     LockStateTracker,
     _edge_and_side,
@@ -237,7 +236,7 @@ class TestCheckPartC:
         assert "45" in reason or "44" in reason
 
     def test_passes_with_naive_datetime(self) -> None:
-        naive_ts = datetime.utcnow() - timedelta(minutes=10)
+        naive_ts = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=10)
         state = _lock(observation_ts=naive_ts)
         passed, _ = check_part_c(state, max_age_minutes=30, reference_time=_now())
         assert passed is True

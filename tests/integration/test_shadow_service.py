@@ -7,7 +7,6 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.shadow import ShadowTrainingService
-from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
 class FakeDiscoveryService:

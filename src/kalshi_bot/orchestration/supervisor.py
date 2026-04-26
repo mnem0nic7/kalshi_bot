@@ -15,7 +15,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage, StrategyCode
 from kalshi_bot.core.fixed_point import as_decimal, make_client_order_id, quantize_count
 from kalshi_bot.core.metrics import ACTIVE_ROOMS, ORDERS_TOTAL, ROOM_RUNS_TOTAL
-from kalshi_bot.core.schemas import ExecReceiptPayload, MemoryNotePayload, RiskVerdictPayload, RoomMessageCreate, RoomMessageRead, TradeTicket
+from kalshi_bot.core.schemas import ExecReceiptPayload, RiskVerdictPayload, RoomMessageCreate, RoomMessageRead, TradeTicket
 from kalshi_bot.db.models import Room
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
@@ -27,7 +27,6 @@ from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
-import numpy as np
 
 from kalshi_bot.services.momentum_calibration import get_active_momentum_calibration_async
 from kalshi_bot.services.signal import (
@@ -198,7 +197,6 @@ class WorkflowSupervisor:
         market: dict[str, Any],
         market_ticker: str,
     ) -> bool:
-        from datetime import timedelta
         from kalshi_bot.core.enums import StandDownReason
         from kalshi_bot.core.fixed_point import quantize_price
         from kalshi_bot.core.schemas import TradeEligibilityVerdict
@@ -869,6 +867,9 @@ class WorkflowSupervisor:
                 signal.candidate_trace = signal.eligibility.candidate_trace or signal.candidate_trace
                 if signal.eligibility.reasons and not signal.eligibility.eligible:
                     signal.summary = f"{signal.summary} Stand down: {' '.join(signal.eligibility.reasons)}"
+                # Market structure gates mutate the signal in-place. Run them before
+                # persistence so audit, dashboards, and corpus exports match execution.
+                await self._run_market_gates(repo, signal, market, room.market_ticker)
                 await repo.save_signal(
                     room_id=room.id,
                     market_ticker=room.market_ticker,
@@ -965,11 +966,6 @@ class WorkflowSupervisor:
                         room_id=room.id,
                     )
                     await session.commit()
-
-                # Market structure gates run after signal save; mutate signal in-place on failure.
-                # The existing no-ticket → stand_down path at the end of the agent sequence
-                # handles gate rejections naturally — no separate early-exit needed.
-                await self._run_market_gates(repo, signal, market, room.market_ticker)
 
                 if not self.settings.llm_trading_enabled:
                     await self._run_deterministic_fast_path(

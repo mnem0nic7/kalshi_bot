@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
@@ -30,7 +29,6 @@ from kalshi_bot.services.counterfactuals import (
 from kalshi_bot.services.risk import evaluate_cleanup_risk
 from kalshi_bot.services.strategy_cleanup import (
     CleanupSignal,
-    LockState,
     LockStateTracker,
     evaluate_cleanup_signal,
 )

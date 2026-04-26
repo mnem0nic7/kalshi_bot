@@ -9,25 +9,16 @@ Verifies:
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal
-from typing import Any
 
 import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import RoomStage
 from kalshi_bot.db.models import (
     Checkpoint,
-    HistoricalReplayRunRecord,
-    HistoricalSettlementLabelRecord,
-    Room,
-    Signal,
     StrategyRecord,
     StrategyResultRecord,
 )
-from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.strategy_regression import StrategyRegressionService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory

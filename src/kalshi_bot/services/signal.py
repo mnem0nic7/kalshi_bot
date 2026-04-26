@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, StandDownReason, StrategyMode, TradeAction, WeatherResolutionState
-from kalshi_bot.core.fixed_point import as_decimal, quantize_price
+from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.core.schemas import ResearchFreshness, TradeEligibilityVerdict
 from kalshi_bot.weather.models import WeatherMarketMapping
 from kalshi_bot.weather.scoring import SigmaContext, WeatherSignalSnapshot, confidence_band_for, score_weather_market
