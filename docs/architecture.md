@@ -52,6 +52,8 @@ The canonical supervisor path is deterministic when `LLM_TRADING_ENABLED=false` 
 
 The LLM agent-room path still exists behind `LLM_TRADING_ENABLED=true`. It is treated as legacy/experimental scaffolding for analysis and prompt-pack work, not the production decision authority.
 
+Optional learned-head and NWS-discussion-parser modules exist only as shadow-first interfaces. They define deterministic feature contracts, stable hashes, zero-weight fallback behavior, and strict JSON validation; they do not affect live probability, sizing, or execution.
+
 ## Safety boundaries
 
 - LLM output never signs requests.
