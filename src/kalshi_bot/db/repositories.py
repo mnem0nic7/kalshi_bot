@@ -55,6 +55,7 @@ from kalshi_bot.db.models import (
     RoomResearchHealthRecord,
     RoomStrategyAuditRecord,
     Signal,
+    SourceHealthLogRecord,
     TradeTicketRecord,
 )
 
@@ -854,6 +855,60 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(ClimatologyPriorRecord.bucket_high_f == bucket_high_f)
         stmt = stmt.order_by(ClimatologyPriorRecord.updated_at.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def save_source_health_log(
+        self,
+        *,
+        source: str,
+        label: str,
+        score: float,
+        success_score: float,
+        freshness_score: float,
+        completeness_score: float,
+        consistency_score: float,
+        kalshi_env: str | None = None,
+        market_ticker: str | None = None,
+        station_id: str | None = None,
+        observed_at: datetime | None = None,
+        is_aggregate: bool = False,
+        payload: dict[str, Any] | None = None,
+    ) -> SourceHealthLogRecord:
+        record = SourceHealthLogRecord(
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            source=source,
+            is_aggregate=is_aggregate,
+            market_ticker=market_ticker,
+            station_id=station_id,
+            observed_at=observed_at or datetime.now(UTC),
+            label=label,
+            score=score,
+            success_score=success_score,
+            freshness_score=freshness_score,
+            completeness_score=completeness_score,
+            consistency_score=consistency_score,
+            payload=payload or {},
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def list_recent_source_health_logs(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        aggregate_only: bool | None = None,
+        source: str | None = None,
+        limit: int = 50,
+    ) -> list[SourceHealthLogRecord]:
+        stmt = select(SourceHealthLogRecord).where(
+            SourceHealthLogRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+        )
+        if aggregate_only is not None:
+            stmt = stmt.where(SourceHealthLogRecord.is_aggregate.is_(aggregate_only))
+        if source is not None:
+            stmt = stmt.where(SourceHealthLogRecord.source == source)
+        stmt = stmt.order_by(SourceHealthLogRecord.observed_at.desc(), SourceHealthLogRecord.created_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars().all())
 
     async def get_latest_risk_verdict_for_room(self, room_id: str) -> RiskVerdictRecord | None:
         stmt = (

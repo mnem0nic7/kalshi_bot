@@ -77,6 +77,44 @@ def test_risk_engine_approves_fresh_small_trade() -> None:
     assert verdict.status == RiskStatus.APPROVED
 
 
+def test_risk_engine_blocks_new_entries_when_source_health_pause_is_active() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=300,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(
+            id="default",
+            active_color="blue",
+            kill_switch_enabled=False,
+            notes={
+                "source_health": {
+                    "pause_new_entries": True,
+                    "aggregate_label": "BROKEN",
+                    "pause_reason": "aggregate source health BROKEN for 2 consecutive cycles",
+                }
+            },
+        ),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("Source health pause is active" in reason for reason in verdict.reasons)
+
+
 def test_risk_engine_blocks_when_position_limit_would_be_breached() -> None:
     """current_position_notional_dollars must be passed from the DB, not hardcoded to 0."""
     settings = Settings(

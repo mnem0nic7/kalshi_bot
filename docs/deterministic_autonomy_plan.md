@@ -57,6 +57,14 @@ Phase 2 foundation now exists as shadow-first primitives:
 
 Score source success, freshness, completeness, and consistency each cycle. Broken sources are excluded from fusion; degraded aggregate health reduces size; broken aggregate health pauses entries or engages kill-switch behavior according to the operator-approved hard caps.
 
+Phase 3 foundation now exists as a guarded degradation layer:
+
+- `kalshi_bot.forecast.source_health` scores each source with the planned 0.45/0.25/0.20/0.10 success, freshness, completeness, and consistency weights.
+- `source_health_logs` stores per-source and aggregate labels/components for replay and incident review.
+- Deterministic sizing primitives can consume `health_size_mult` values of 1.0, 0.5, or 0.0 for HEALTHY, DEGRADED, and BROKEN aggregate health.
+- The watchdog records a `deployment_control.notes.source_health.pause_new_entries` state after consecutive BROKEN aggregate cycles.
+- The live risk engine honors that explicit pause note for new entries, while existing position management and kill-switch semantics remain separate.
+
 ### Phase 4: Parameter-Pack Autonomy
 
 Repurpose self-improve from agent-pack promotion into parameter-pack promotion. Candidate packs are tuned offline on strict-as-of replay data and promoted only after coverage, Brier, ECE, Sharpe, drawdown, city consistency, idempotency, and canary gates pass.

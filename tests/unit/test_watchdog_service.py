@@ -199,3 +199,50 @@ async def test_watchdog_status_is_isolated_per_environment(tmp_path) -> None:
     assert status["colors"]["green"]["daemon"]["healthy"] is True
     assert status["colors"]["blue"]["daemon"]["heartbeat_at"] is None
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_pauses_new_entries_after_consecutive_broken_source_health(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/watchdog.db",
+        daemon_heartbeat_interval_seconds=60,
+        source_health_broken_pause_consecutive_cycles=2,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = WatchdogService(settings)
+    now = datetime.now(UTC)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_active_color="blue")
+        await _seed_daemon_checkpoint(repo, color="blue", age_seconds=0)
+        await _seed_daemon_checkpoint(repo, color="green", age_seconds=0)
+        for offset in (60, 0):
+            await repo.save_source_health_log(
+                source="aggregate",
+                is_aggregate=True,
+                kalshi_env="demo",
+                observed_at=now - timedelta(seconds=offset),
+                label="BROKEN",
+                score=0.0,
+                success_score=0.0,
+                freshness_score=0.0,
+                completeness_score=0.0,
+                consistency_score=0.0,
+                payload={"test": True},
+            )
+        payload = await service.run_once(
+            repo,
+            app_statuses={"blue": "healthy", "green": "healthy"},
+            source="test_watchdog",
+        )
+        control = await repo.get_deployment_control()
+        await session.commit()
+
+    assert payload["action"] == "none"
+    assert payload["source_health"]["pause_new_entries"] is True
+    assert control.notes["source_health"]["pause_new_entries"] is True
+    assert control.notes["source_health"]["aggregate_label"] == "BROKEN"
+    await engine.dispose()

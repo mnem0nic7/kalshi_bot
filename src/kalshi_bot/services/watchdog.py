@@ -9,6 +9,7 @@ import httpx
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import DeploymentColor
 from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.forecast.source_health import SourceHealthLabel, should_pause_new_entries
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,9 @@ class WatchdogService:
                 },
             )
 
+        source_health_pause = await self._evaluate_source_health_pause(repo, env=env, now=now, notes=notes)
+        notes = source_health_pause.pop("notes")
+
         action_payload = {
             "kalshi_env": env,
             "action": action,
@@ -243,6 +247,7 @@ class WatchdogService:
             "wait_seconds": wait_seconds,
             "source": source,
             "colors": colors,
+            "source_health": source_health_pause,
             "observed_at": now.isoformat(),
         }
         watchdog["updated_at"] = now.isoformat()
@@ -267,6 +272,96 @@ class WatchdogService:
                 payload=action_payload,
             )
         return action_payload
+
+    async def _evaluate_source_health_pause(
+        self,
+        repo: PlatformRepository,
+        *,
+        env: str,
+        now: datetime,
+        notes: dict[str, Any],
+    ) -> dict[str, Any]:
+        current = dict(notes.get("source_health") or {})
+        if not self.settings.source_health_pause_new_entries_enabled:
+            current["pause_new_entries_enabled"] = False
+            notes["source_health"] = current
+            return {"enabled": False, "pause_new_entries": bool(current.get("pause_new_entries")), "notes": notes}
+
+        required = max(1, int(self.settings.source_health_broken_pause_consecutive_cycles))
+        recent = await repo.list_recent_source_health_logs(
+            kalshi_env=env,
+            aggregate_only=True,
+            limit=required,
+        )
+        labels = [record.label for record in recent]
+        latest = recent[0] if recent else None
+        should_pause = should_pause_new_entries(labels, consecutive_broken_cycles=required)
+        was_paused = bool(current.get("pause_new_entries"))
+        changed = False
+
+        current.update(
+            {
+                "pause_new_entries_enabled": True,
+                "required_broken_cycles": required,
+                "recent_aggregate_labels": labels,
+                "latest_observed_at": latest.observed_at.isoformat() if latest is not None else None,
+                "latest_log_id": latest.id if latest is not None else None,
+                "updated_at": now.isoformat(),
+            }
+        )
+        if latest is not None:
+            current["aggregate_label"] = latest.label
+            current["aggregate_score"] = latest.score
+
+        if should_pause:
+            current["pause_new_entries"] = True
+            current["pause_reason"] = f"aggregate source health BROKEN for {required} consecutive cycles"
+            current["paused_at"] = current.get("paused_at") or now.isoformat()
+            changed = not was_paused
+            if changed:
+                await repo.log_ops_event(
+                    severity="warning",
+                    summary="Source health paused new entries",
+                    source="watchdog",
+                    payload={
+                        "kalshi_env": env,
+                        "required_broken_cycles": required,
+                        "recent_aggregate_labels": labels,
+                        "latest_log_id": latest.id if latest is not None else None,
+                    },
+                    kalshi_env=env,
+                )
+        elif was_paused and latest is not None and latest.label == SourceHealthLabel.HEALTHY.value:
+            current["pause_new_entries"] = False
+            current["pause_reason"] = None
+            current["resumed_at"] = now.isoformat()
+            changed = True
+            await repo.log_ops_event(
+                severity="info",
+                summary="Source health resumed new entries",
+                source="watchdog",
+                payload={
+                    "kalshi_env": env,
+                    "latest_log_id": latest.id,
+                    "aggregate_label": latest.label,
+                    "aggregate_score": latest.score,
+                },
+                kalshi_env=env,
+            )
+        else:
+            current["pause_new_entries"] = was_paused
+
+        notes["source_health"] = current
+        return {
+            "enabled": True,
+            "pause_new_entries": bool(current.get("pause_new_entries")),
+            "changed": changed,
+            "aggregate_label": current.get("aggregate_label"),
+            "aggregate_score": current.get("aggregate_score"),
+            "recent_aggregate_labels": labels,
+            "latest_log_id": current.get("latest_log_id"),
+            "notes": notes,
+        }
 
     async def record_action(
         self,

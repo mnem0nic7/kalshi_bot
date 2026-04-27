@@ -86,6 +86,18 @@ def approved_ticket_for_verdict(ticket: TradeTicket, verdict: RiskVerdictPayload
     return ticket.model_copy(update={"count_fp": approved_count})
 
 
+def _source_health_pause_reason(control: DeploymentControl) -> str | None:
+    notes = dict(control.notes or {})
+    source_health = dict(notes.get("source_health") or {})
+    if not source_health.get("pause_new_entries"):
+        return None
+    reason = source_health.get("pause_reason") or source_health.get("reason") or "source health degraded"
+    label = source_health.get("aggregate_label")
+    if label:
+        return f"Source health pause is active ({label}): {reason}."
+    return f"Source health pause is active: {reason}."
+
+
 class DeterministicRiskEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -150,6 +162,9 @@ class DeterministicRiskEngine:
 
         if control.kill_switch_enabled:
             block("Global kill switch is enabled.")
+        pause_reason = _source_health_pause_reason(control)
+        if pause_reason is not None:
+            block(pause_reason)
         if signal.recommended_action is None or signal.recommended_side is None:
             block("Signal engine did not recommend a live trade.")
         if signal.resolution_state != WeatherResolutionState.UNRESOLVED:

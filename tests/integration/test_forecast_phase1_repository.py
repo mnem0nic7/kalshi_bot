@@ -51,11 +51,33 @@ async def test_forecast_snapshot_and_climatology_prior_repository_round_trip(tmp
             bucket_low_f=69.0,
             bucket_high_f=None,
         )
+        health_log = await repo.save_source_health_log(
+            source="aggregate",
+            is_aggregate=True,
+            kalshi_env="demo",
+            market_ticker="KXHIGHNY-26APR27-T69",
+            station_id="KNYC",
+            observed_at=datetime(2026, 4, 27, 18, 5, tzinfo=UTC),
+            label="HEALTHY",
+            score=0.96,
+            success_score=1.0,
+            freshness_score=1.0,
+            completeness_score=0.9,
+            consistency_score=1.0,
+            payload={"sources": ["GFS", "ECMWF"]},
+        )
+        recent_health = await repo.list_recent_source_health_logs(
+            kalshi_env="demo",
+            aggregate_only=True,
+            limit=1,
+        )
         await session.commit()
 
     assert snapshot.market_ticker == "KXHIGHNY-26APR27-T69"
     assert snapshot.probability_output["p_bucket_yes"] == 0.62
     assert prior is not None
     assert prior.p_yes == 0.41
+    assert health_log.label == "HEALTHY"
+    assert recent_health[0].id == health_log.id
 
     await engine.dispose()

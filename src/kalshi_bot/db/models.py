@@ -188,6 +188,24 @@ class ClimatologyPriorRecord(Base, IdMixin, TimestampMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class SourceHealthLogRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "source_health_logs"
+
+    kalshi_env: Mapped[str] = mapped_column(String(16), default="demo", index=True)
+    source: Mapped[str] = mapped_column(String(64), index=True)
+    is_aggregate: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    market_ticker: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    station_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    label: Mapped[str] = mapped_column(String(16), index=True)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    success_score: Mapped[float] = mapped_column(Float, nullable=False)
+    freshness_score: Mapped[float] = mapped_column(Float, nullable=False)
+    completeness_score: Mapped[float] = mapped_column(Float, nullable=False)
+    consistency_score: Mapped[float] = mapped_column(Float, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class RiskVerdictRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "risk_verdicts"
 
@@ -841,6 +859,8 @@ Index("ix_decision_traces_market_env_created", DecisionTraceRecord.market_ticker
 Index("ix_forecast_snapshots_market_env_fetched", ForecastSnapshotRecord.market_ticker, ForecastSnapshotRecord.kalshi_env, ForecastSnapshotRecord.fetched_at)
 Index("ix_climatology_priors_station_day", ClimatologyPriorRecord.station_id, ClimatologyPriorRecord.day_of_year)
 Index("ix_climatology_priors_series_day", ClimatologyPriorRecord.series_ticker, ClimatologyPriorRecord.day_of_year)
+Index("ix_source_health_logs_env_source_observed", SourceHealthLogRecord.kalshi_env, SourceHealthLogRecord.source, SourceHealthLogRecord.observed_at)
+Index("ix_source_health_logs_env_aggregate_observed", SourceHealthLogRecord.kalshi_env, SourceHealthLogRecord.is_aggregate, SourceHealthLogRecord.observed_at)
 Index(
     "ix_decision_corpus_rows_day_env_policy",
     DecisionCorpusRowRecord.local_market_day,
