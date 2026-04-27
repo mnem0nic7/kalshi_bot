@@ -20,6 +20,7 @@ jobs:
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
       DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
       ROLLBACK_REASON: ${{ github.event.inputs.reason }}
     steps:
@@ -30,6 +31,10 @@ jobs:
           test -n "${DEPLOY_USER}" || { echo "Missing DEPLOY_USER"; exit 1; }
           test -n "${DEPLOY_SSH_KEY}" || { echo "Missing DEPLOY_SSH_KEY"; exit 1; }
           test -n "${DEPLOY_APP_DIR}" || { echo "Missing DEPLOY_APP_DIR"; exit 1; }
+          if ! [[ "${DEPLOY_SSH_PORT}" =~ ^[0-9]+$ ]] || (( DEPLOY_SSH_PORT < 1 || DEPLOY_SSH_PORT > 65535 )); then
+            echo "Invalid DEPLOY_SSH_PORT: ${DEPLOY_SSH_PORT}" >&2
+            exit 1
+          fi
 
       - name: Prepare SSH
         run: |
@@ -37,19 +42,34 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          if ! ssh-keyscan -p "${DEPLOY_SSH_PORT}" -T 15 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>ssh-keyscan.err; then
+            cat ssh-keyscan.err >&2 || true
+            echo "::warning::ssh-keyscan failed for ${DEPLOY_HOST}:${DEPLOY_SSH_PORT}; SSH will use StrictHostKeyChecking=accept-new"
+          fi
 
       - name: Roll back agent pack
         run: |
           set -euo pipefail
           app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
+          ssh_cmd=(
+            ssh
+            -i ~/.ssh/id_ed25519
+            -p "${DEPLOY_SSH_PORT}"
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o ServerAliveInterval=30
+            -o ServerAliveCountMax=3
+            "${DEPLOY_USER}@${DEPLOY_HOST}"
+          )
           rollback_reason="${ROLLBACK_REASON:-github_actions_manual_rollback}"
           rollback_reason_quoted="$(printf '%q' "${rollback_reason}")"
-          rollback_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "cd ${app_dir_quoted} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh rollback --reason ${rollback_reason_quoted}")"
+          rollback_json="$("${ssh_cmd[@]}" "cd ${app_dir_quoted} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh rollback --reason ${rollback_reason_quoted}")"
           printf '%s\n' "${rollback_json}" > rollback.json
           version="$(jq -r '.version // empty' rollback.json)"
           if [[ -n "${version}" ]]; then
-            ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "cd ${app_dir_quoted} && infra/scripts/restart-color.sh blue && infra/scripts/restart-color.sh green"
+            "${ssh_cmd[@]}" "cd ${app_dir_quoted} && infra/scripts/restart-color.sh blue && infra/scripts/restart-color.sh green"
           fi
           {
             echo "## Rollback Agent Pack"

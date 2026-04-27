@@ -24,6 +24,7 @@ jobs:
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
       DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
       INPUT_COLOR: ${{ github.event.inputs.color }}
 
@@ -34,6 +35,10 @@ jobs:
           for var in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_APP_DIR; do
             test -n "${!var}" || { echo "Missing secret: ${var}"; exit 1; }
           done
+          if ! [[ "${DEPLOY_SSH_PORT}" =~ ^[0-9]+$ ]] || (( DEPLOY_SSH_PORT < 1 || DEPLOY_SSH_PORT > 65535 )); then
+            echo "Invalid DEPLOY_SSH_PORT: ${DEPLOY_SSH_PORT}" >&2
+            exit 1
+          fi
 
       - name: Prepare SSH
         run: |
@@ -41,12 +46,27 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          if ! ssh-keyscan -p "${DEPLOY_SSH_PORT}" -T 15 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>ssh-keyscan.err; then
+            cat ssh-keyscan.err >&2 || true
+            echo "::warning::ssh-keyscan failed for ${DEPLOY_HOST}:${DEPLOY_SSH_PORT}; SSH will use StrictHostKeyChecking=accept-new"
+          fi
 
       - name: Pull latest and restart
         run: |
           set -euo pipefail
           app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
+          ssh_cmd=(
+            ssh
+            -i ~/.ssh/id_ed25519
+            -p "${DEPLOY_SSH_PORT}"
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o ServerAliveInterval=30
+            -o ServerAliveCountMax=3
+            "${DEPLOY_USER}@${DEPLOY_HOST}"
+          )
 
           # Validate color to prevent injection (choice input, but be explicit)
           color="${INPUT_COLOR:-both}"
@@ -61,20 +81,20 @@ jobs:
             colors="${color}"
           fi
 
-          ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+          "${ssh_cmd[@]}" \
             "cd ${app_dir_quoted} && git pull --ff-only"
 
-          ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+          "${ssh_cmd[@]}" \
             "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml --env-file .env up -d postgres_demo postgres_production"
 
-          ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+          "${ssh_cmd[@]}" \
             "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml --env-file .env run --rm --build --no-deps migrate_demo"
 
-          ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+          "${ssh_cmd[@]}" \
             "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml --env-file .env run --rm --build --no-deps migrate_production"
 
           for c in ${colors}; do
-            ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "${ssh_cmd[@]}" \
               "cd ${app_dir_quoted} && infra/scripts/restart-color.sh ${c}"
           done
 
@@ -82,6 +102,7 @@ jobs:
             echo "## Redeploy"
             echo
             echo "- Host: \`${DEPLOY_HOST}\`"
+            echo "- SSH port: \`${DEPLOY_SSH_PORT}\`"
             echo "- Color(s): \`${color}\`"
             echo "- Ref: \`${GITHUB_SHA}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

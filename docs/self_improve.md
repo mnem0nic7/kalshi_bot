@@ -86,6 +86,7 @@ Required GitHub Secrets:
 - `DEPLOY_HOST`
 - `DEPLOY_USER`
 - `DEPLOY_SSH_KEY`
+- `DEPLOY_SSH_PORT` (optional, defaults to `22`)
 - `DEPLOY_APP_DIR`
 
 ## Canary and Live Monitoring

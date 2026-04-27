@@ -16,6 +16,7 @@ jobs:
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
       DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
       GEMINI_KEY_VALUE: ${{ secrets.GEMINI_KEY || secrets.GEMINI_API_KEY }}
     steps:
@@ -27,6 +28,10 @@ jobs:
           test -n "${DEPLOY_SSH_KEY}" || { echo "Missing DEPLOY_SSH_KEY"; exit 1; }
           test -n "${DEPLOY_APP_DIR}" || { echo "Missing DEPLOY_APP_DIR"; exit 1; }
           test -n "${GEMINI_KEY_VALUE}" || { echo "Missing GEMINI_KEY or GEMINI_API_KEY"; exit 1; }
+          if ! [[ "${DEPLOY_SSH_PORT}" =~ ^[0-9]+$ ]] || (( DEPLOY_SSH_PORT < 1 || DEPLOY_SSH_PORT > 65535 )); then
+            echo "Invalid DEPLOY_SSH_PORT: ${DEPLOY_SSH_PORT}" >&2
+            exit 1
+          fi
 
       - name: Prepare SSH
         run: |
@@ -34,12 +39,27 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          if ! ssh-keyscan -p "${DEPLOY_SSH_PORT}" -T 15 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>ssh-keyscan.err; then
+            cat ssh-keyscan.err >&2 || true
+            echo "::warning::ssh-keyscan failed for ${DEPLOY_HOST}:${DEPLOY_SSH_PORT}; SSH will use StrictHostKeyChecking=accept-new"
+          fi
 
       - name: Sync .env and recreate app services
         run: |
           set -euo pipefail
 
-          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
+          ssh_cmd=(
+            ssh
+            -i ~/.ssh/id_ed25519
+            -p "${DEPLOY_SSH_PORT}"
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o ServerAliveInterval=30
+            -o ServerAliveCountMax=3
+            "${DEPLOY_USER}@${DEPLOY_HOST}"
+          )
           app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
           gemini_quoted="$(printf '%q' "${GEMINI_KEY_VALUE}")"
           remote_prefix="cd ${app_dir_quoted} && export GEMINI_KEY=${gemini_quoted}"

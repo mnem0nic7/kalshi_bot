@@ -55,6 +55,22 @@ def test_runtime_scripts_refresh_caddy_after_app_recreate() -> None:
     assert 'docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps --force-recreate caddy' in restart_color
 
 
+def test_github_vps_workflows_use_portable_ssh_options() -> None:
+    workflow_paths = [
+        Path(".github/workflows/bootstrap-vps.yml"),
+        Path(".github/workflows/redeploy.yml"),
+        Path(".github/workflows/rollback-agent-pack.yml"),
+        Path(".github/workflows/self-improve.yml"),
+        Path(".github/workflows/sync-gemini-runtime.yml"),
+    ]
+
+    for workflow_path in workflow_paths:
+        workflow_text = workflow_path.read_text(encoding="utf-8")
+        assert "DEPLOY_SSH_PORT" in workflow_text, workflow_path
+        assert "StrictHostKeyChecking=accept-new" in workflow_text, workflow_path
+        assert "-p \"${DEPLOY_SSH_PORT}\"" in workflow_text, workflow_path
+
+
 def test_promote_script_targets_env_scoped_postgres_and_control_row() -> None:
     promote = Path("infra/scripts/promote.sh").read_text(encoding="utf-8")
 

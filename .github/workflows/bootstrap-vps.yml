@@ -16,6 +16,7 @@ jobs:
       DEPLOY_HOST:      ${{ secrets.DEPLOY_HOST }}
       DEPLOY_USER:      ${{ secrets.DEPLOY_USER }}
       DEPLOY_SSH_KEY:   ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_SSH_PORT:  ${{ secrets.DEPLOY_SSH_PORT || '22' }}
       DEPLOY_APP_DIR:   ${{ secrets.DEPLOY_APP_DIR }}
       POSTGRES_PASSWORD:           ${{ secrets.POSTGRES_PASSWORD }}
       DEMO_KALSHI_API_KEY:         ${{ secrets.DEMO_KALSHI_API_KEY }}
@@ -36,6 +37,10 @@ jobs:
                      GEMINI_KEY_VALUE; do
             test -n "${!var}" || { echo "Missing secret: ${var}"; ok=0; }
           done
+          if ! [[ "${DEPLOY_SSH_PORT}" =~ ^[0-9]+$ ]] || (( DEPLOY_SSH_PORT < 1 || DEPLOY_SSH_PORT > 65535 )); then
+            echo "Invalid DEPLOY_SSH_PORT: ${DEPLOY_SSH_PORT}" >&2
+            ok=0
+          fi
           test "${ok}" = "1" || exit 1
 
       - name: Prepare SSH
@@ -44,11 +49,17 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          if ! ssh-keyscan -p "${DEPLOY_SSH_PORT}" -T 15 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>ssh-keyscan.err; then
+            cat ssh-keyscan.err >&2 || true
+            echo "::warning::ssh-keyscan failed for ${DEPLOY_HOST}:${DEPLOY_SSH_PORT}; SSH will use StrictHostKeyChecking=accept-new"
+          fi
 
       - name: Write PEM files on VPS
         run: |
           set -euo pipefail
-          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          ssh_cmd=(ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" -p "${DEPLOY_SSH_PORT}"
                    -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
           app_dir_q="$(printf '%q' "${DEPLOY_APP_DIR}")"
 
@@ -73,7 +84,7 @@ jobs:
       - name: Write .env on VPS
         run: |
           set -euo pipefail
-          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          ssh_cmd=(ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" -p "${DEPLOY_SSH_PORT}"
                    -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
           app_dir_q="$(printf '%q' "${DEPLOY_APP_DIR}")"
 
@@ -120,7 +131,7 @@ jobs:
       - name: Start stack
         run: |
           set -euo pipefail
-          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          ssh_cmd=(ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" -p "${DEPLOY_SSH_PORT}"
                    -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
           app_dir_q="$(printf '%q' "${DEPLOY_APP_DIR}")"
 
@@ -129,7 +140,7 @@ jobs:
       - name: Verify health and capture status
         run: |
           set -euo pipefail
-          ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          ssh_cmd=(ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" -p "${DEPLOY_SSH_PORT}"
                    -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}")
           app_dir_q="$(printf '%q' "${DEPLOY_APP_DIR}")"
 

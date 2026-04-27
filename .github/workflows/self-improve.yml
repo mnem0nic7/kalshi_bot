@@ -57,6 +57,7 @@ jobs:
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
       DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.GEMINI_KEY }}
       INPUT_DAYS: ${{ github.event.inputs.days }}
@@ -80,7 +81,16 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+          if ! [[ "${DEPLOY_SSH_PORT}" =~ ^[0-9]+$ ]] || (( DEPLOY_SSH_PORT < 1 || DEPLOY_SSH_PORT > 65535 )); then
+            echo "Invalid DEPLOY_SSH_PORT: ${DEPLOY_SSH_PORT}" >&2
+            exit 1
+          fi
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          if ! ssh-keyscan -p "${DEPLOY_SSH_PORT}" -T 15 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>ssh-keyscan.err; then
+            cat ssh-keyscan.err >&2 || true
+            echo "::warning::ssh-keyscan failed for ${DEPLOY_HOST}:${DEPLOY_SSH_PORT}; SSH will use StrictHostKeyChecking=accept-new"
+          fi
 
       - name: Run critique, eval, and optional staging
         if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' && env.DEPLOY_APP_DIR != '' && env.GEMINI_API_KEY != ''
@@ -91,14 +101,24 @@ jobs:
           days="${INPUT_DAYS:-14}"
           limit="${INPUT_LIMIT:-200}"
           stage_candidate="${INPUT_STAGE_CANDIDATE:-true}"
+          ssh_cmd=(
+            ssh
+            -i ~/.ssh/id_ed25519
+            -p "${DEPLOY_SSH_PORT}"
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o ServerAliveInterval=30
+            -o ServerAliveCountMax=3
+            "${DEPLOY_USER}@${DEPLOY_HOST}"
+          )
 
           app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
           gemini_quoted="$(printf '%q' "${GEMINI_API_KEY}")"
           remote_prefix="cd ${app_dir_quoted} && export GEMINI_API_KEY=${gemini_quoted}"
 
-          sync_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && python3 -c \"from pathlib import Path; import json, os; env_path = Path('.env'); gemini = os.environ['GEMINI_API_KEY']; lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []; updated = []; found = False; [updated.append(f'GEMINI_API_KEY={gemini}') if line.startswith('GEMINI_API_KEY=') else updated.append(line) for line in lines]; found = any(line.startswith('GEMINI_API_KEY=') for line in lines); updated = updated if found else updated + [f'GEMINI_API_KEY={gemini}']; env_path.write_text('\\n'.join(updated) + '\\n', encoding='utf-8'); print(json.dumps({'synced': True}))\"")"
+          sync_json="$("${ssh_cmd[@]}" "${remote_prefix} && python3 -c \"from pathlib import Path; import json, os; env_path = Path('.env'); gemini = os.environ['GEMINI_API_KEY']; lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []; updated = []; found = False; [updated.append(f'GEMINI_API_KEY={gemini}') if line.startswith('GEMINI_API_KEY=') else updated.append(line) for line in lines]; found = any(line.startswith('GEMINI_API_KEY=') for line in lines); updated = updated if found else updated + [f'GEMINI_API_KEY={gemini}']; env_path.write_text('\\n'.join(updated) + '\\n', encoding='utf-8'); print(json.dumps({'synced': True}))\"")"
 
-          critique_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh critique --days ${days} --limit ${limit}")"
+          critique_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh critique --days ${days} --limit ${limit}")"
           printf '%s\n' "${critique_json}" > critique.json
           candidate_version="$(jq -r '.candidate_version // empty' critique.json)"
           if [[ -z "${candidate_version}" ]]; then
@@ -106,7 +126,7 @@ jobs:
             exit 1
           fi
 
-          eval_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh eval --candidate-version ${candidate_version} --days ${days} --limit ${limit}")"
+          eval_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh eval --candidate-version ${candidate_version} --days ${days} --limit ${limit}")"
           printf '%s\n' "${eval_json}" > eval.json
           evaluation_run_id="$(jq -r '.evaluation_run_id // empty' eval.json)"
           passed="$(jq -r '.passed // false' eval.json)"
@@ -114,14 +134,14 @@ jobs:
           staged="false"
           inactive_color=""
           if [[ "${passed}" == "true" && "${stage_candidate}" == "true" ]]; then
-            promote_json="$(ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh promote --evaluation-run-id ${evaluation_run_id} --reason github_actions_self_improve")"
+            promote_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh promote --evaluation-run-id ${evaluation_run_id} --reason github_actions_self_improve")"
             printf '%s\n' "${promote_json}" > promote.json
             inactive_color="$(jq -r '.inactive_color // empty' promote.json)"
             if [[ -z "${inactive_color}" ]]; then
               echo "Inactive color missing from promote output" >&2
               exit 1
             fi
-            ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" "cd ${app_dir_quoted} && infra/scripts/restart-color.sh ${inactive_color}"
+            "${ssh_cmd[@]}" "cd ${app_dir_quoted} && infra/scripts/restart-color.sh ${inactive_color}"
             staged="true"
           fi
 
