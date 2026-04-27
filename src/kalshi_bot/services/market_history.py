@@ -44,7 +44,7 @@ class MarketHistoryService:
         self._last_purge_at: datetime | None = None
 
     async def snapshot_once(self) -> int:
-        tickers = await self.discovery_service.list_stream_markets()
+        tickers = await self._snapshot_tickers()
         if not tickers:
             return 0
 
@@ -94,6 +94,22 @@ class MarketHistoryService:
 
         logger.info("market_history: snapshot_once wrote %d rows", written)
         return written
+
+    async def _snapshot_tickers(self) -> list[str]:
+        tickers = list(dict.fromkeys(await self.discovery_service.list_stream_markets()))
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            positions = await repo.list_positions(
+                limit=5000,
+                kalshi_env=self.kalshi.settings.kalshi_env,
+                subaccount=self.kalshi.settings.kalshi_subaccount,
+            )
+            await session.commit()
+
+        for position in positions:
+            if position.market_ticker not in tickers:
+                tickers.append(position.market_ticker)
+        return tickers
 
     async def purge_once(self) -> int:
         now = datetime.now(UTC)

@@ -207,7 +207,7 @@ class DaemonService:
         max_messages: int | None = None,
         run_seconds: float | None = None,
     ) -> dict[str, Any]:
-        selected_markets = markets or await self.discovery_service.list_stream_markets()
+        selected_markets = await self._select_stream_markets(markets)
         should_auto_trigger = self.settings.trigger_enable_auto_rooms if auto_trigger is None else auto_trigger
         self._auto_trigger_enabled_for_run = should_auto_trigger
 
@@ -270,6 +270,22 @@ class DaemonService:
             if follow_up_task is not None and not follow_up_task.done():
                 follow_up_task.cancel()
                 await asyncio.gather(follow_up_task, return_exceptions=True)
+
+    async def _select_stream_markets(self, markets: list[str] | None) -> list[str]:
+        selected_markets = list(dict.fromkeys(markets or await self.discovery_service.list_stream_markets()))
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            positions = await repo.list_positions(
+                limit=5000,
+                kalshi_env=self.settings.kalshi_env,
+                subaccount=self.settings.kalshi_subaccount,
+            )
+            await session.commit()
+
+        for position in positions:
+            if position.market_ticker not in selected_markets:
+                selected_markets.append(position.market_ticker)
+        return selected_markets
 
     async def _handle_market_update(self, market_ticker: str) -> None:
         await self.research_coordinator.handle_market_update(market_ticker)

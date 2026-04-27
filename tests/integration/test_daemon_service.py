@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
@@ -313,6 +314,54 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
     assert heartbeat_checkpoint.payload["app_color"] == "blue"
     assert "heartbeat_at" in heartbeat_checkpoint.payload
     assert "reconciled_at" in reconcile_checkpoint.payload
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_streams_open_position_markets_even_when_discovery_rolls_forward(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-open-position-stream.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.upsert_position(
+            market_ticker="WX-HELD",
+            subaccount=settings.kalshi_subaccount,
+            kalshi_env=settings.kalshi_env,
+            side="no",
+            count_fp=Decimal("2.00"),
+            average_price_dollars=Decimal("0.8000"),
+            raw={},
+        )
+        await session.commit()
+
+    stream_service = FakeStreamService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        stream_service,  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+    )
+
+    result = await daemon.run(max_messages=1)
+
+    assert result["completed"] == "stream"
+    assert stream_service.calls == [["WX-DISCOVERED", "WX-HELD"]]
 
     await engine.dispose()
 
