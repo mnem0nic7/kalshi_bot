@@ -118,9 +118,14 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "source_health" in autonomy
     assert "source_health_logs" in autonomy
     assert "pause_new_entries" in autonomy
+    assert "parameter_pack" in autonomy
+    assert "parameter_packs" in autonomy
+    assert "promotion_gates" in autonomy
+    assert "drift_watcher" in autonomy
     assert "LLM_TRADING_ENABLED=false" in architecture
     assert "climatology priors" in architecture
     assert "source health logs" in architecture
+    assert "parameter packs" in architecture
     assert "decision-trace replay" in strategy
 
 

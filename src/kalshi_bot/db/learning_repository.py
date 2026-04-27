@@ -24,12 +24,14 @@ from kalshi_bot.db.models import (
     HistoricalReplayRunRecord,
     HistoricalSettlementLabelRecord,
     HistoricalWeatherSnapshotRecord,
+    ParameterPackRecord,
     PromotionEventRecord,
     Room,
     TrainingDatasetBuildItemRecord,
     TrainingDatasetBuildRecord,
     TrainingReadinessRecord,
 )
+from kalshi_bot.learning.parameter_pack import ParameterPack, parameter_pack_hash
 
 
 class LearningRepositoryMixin:
@@ -72,6 +74,56 @@ class LearningRepositoryMixin:
 
     async def list_agent_packs(self, limit: int = 20) -> list[AgentPackRecord]:
         result = await self.session.execute(select(AgentPackRecord).order_by(AgentPackRecord.created_at.desc()).limit(limit))
+        return list(result.scalars())
+
+    async def create_parameter_pack(
+        self,
+        pack: ParameterPack,
+        *,
+        holdout_report: dict[str, Any] | None = None,
+    ) -> ParameterPackRecord:
+        record = ParameterPackRecord(
+            version=pack.version,
+            status=pack.status,
+            parent_version=pack.parent_version,
+            source=pack.source,
+            description=pack.description,
+            pack_hash=parameter_pack_hash(pack),
+            payload=pack.to_dict(),
+            holdout_report=holdout_report or {},
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def update_parameter_pack(
+        self,
+        pack: ParameterPack,
+        *,
+        holdout_report: dict[str, Any] | None = None,
+    ) -> ParameterPackRecord:
+        record = await self.get_parameter_pack(pack.version)
+        if record is None:
+            return await self.create_parameter_pack(pack, holdout_report=holdout_report)
+        record.status = pack.status
+        record.parent_version = pack.parent_version
+        record.source = pack.source
+        record.description = pack.description
+        record.pack_hash = parameter_pack_hash(pack)
+        record.payload = pack.to_dict()
+        if holdout_report is not None:
+            record.holdout_report = holdout_report
+        await self.session.flush()
+        return record
+
+    async def get_parameter_pack(self, version: str) -> ParameterPackRecord | None:
+        stmt = select(ParameterPackRecord).where(ParameterPackRecord.version == version).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_parameter_packs(self, limit: int = 20) -> list[ParameterPackRecord]:
+        result = await self.session.execute(
+            select(ParameterPackRecord).order_by(ParameterPackRecord.created_at.desc()).limit(limit)
+        )
         return list(result.scalars())
 
     async def create_historical_intelligence_run(

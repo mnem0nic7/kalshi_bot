@@ -61,6 +61,8 @@ Hard caps remain outside the pack and operator-only:
 
 Promotion requires complete `decision_traces`, strict-as-of replay, holdout gates, and canary shadow evidence. The existing agent-pack workflow remains available until the parameter-pack promotion service replaces it.
 
+Phase 4 scaffolding is present now: bounded `parameter_packs` records, deterministic pack hashes, hard-cap exclusion during sanitization, holdout promotion gates, and calibration drift pause criteria. These pieces are not yet wired to the nightly workflow; they exist so replay search can be added without mixing mutable trading parameters into LLM agent-pack state.
+
 ## CLI
 
 Use the self-improve commands from the host or from inside the running app container:

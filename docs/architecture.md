@@ -71,6 +71,7 @@ Postgres stores:
 - deterministic decision traces and replay hashes
 - forecast snapshots and climatology priors for future replay-gated probability promotion
 - source health logs for per-provider success, freshness, completeness, consistency, and aggregate pause audits
+- deterministic parameter packs and holdout reports for future replay-gated promotion
 - ops events and checkpoints
 - memory notes and embeddings
 - deployment control and writer lock

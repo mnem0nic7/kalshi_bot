@@ -447,6 +447,20 @@ class AgentPackRecord(Base, IdMixin, TimestampMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class ParameterPackRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "parameter_packs"
+    __table_args__ = (UniqueConstraint("version", name="uq_parameter_packs_version"),)
+
+    version: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="candidate", index=True)
+    parent_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(64), default="builtin")
+    description: Mapped[str] = mapped_column(Text(), default="")
+    pack_hash: Mapped[str] = mapped_column(String(64), index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    holdout_report: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class CritiqueRunRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "critique_runs"
 

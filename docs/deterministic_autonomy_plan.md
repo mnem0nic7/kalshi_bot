@@ -69,6 +69,14 @@ Phase 3 foundation now exists as a guarded degradation layer:
 
 Repurpose self-improve from agent-pack promotion into parameter-pack promotion. Candidate packs are tuned offline on strict-as-of replay data and promoted only after coverage, Brier, ECE, Sharpe, drawdown, city consistency, idempotency, and canary gates pass.
 
+Phase 4 foundation now exists without activating autonomous promotion:
+
+- `kalshi_bot.learning.parameter_pack` defines bounded tunable parameters, stable pack hashing, sanitization, and hard-cap exclusion.
+- `parameter_packs` stores candidate/champion parameter payloads and holdout reports separately from legacy `agent_packs`.
+- `kalshi_bot.learning.promotion_gates` evaluates the holdout gates for coverage, Brier, ECE, Sharpe, drawdown, city win-rate consistency, hard-cap touches, and idempotent hashes.
+- `kalshi_bot.learning.drift_watcher` provides the calibration pause/search trigger for Brier, ECE, and realized-vs-predicted win-rate drift.
+- The existing self-improve workflow still promotes agent packs until replay-backed parameter search is wired explicitly.
+
 Default promotion settings:
 
 - 30-year climatology normal with 14-day rolling smoother.
