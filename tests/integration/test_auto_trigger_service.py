@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -397,5 +398,75 @@ async def test_auto_trigger_blocks_when_stop_loss_is_unresolved(tmp_path) -> Non
     assert rooms == []
     assert supervisor.calls == []
     assert any("stop-loss still unresolved" in event.summary for event in ops_events)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_blocks_filled_stop_loss_reentry_during_cooldown(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_stop_loss_reentry_cooldown.db",
+        trigger_enable_auto_rooms=True,
+        stop_loss_reentry_cooldown_seconds=4 * 60 * 60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
+    directory = WeatherMarketDirectory(
+        {
+            "WX-TEST": WeatherMarketMapping(
+                market_ticker="WX-TEST",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+            )
+        }
+    )
+    service = AutoTriggerService(settings, session_factory, directory, agent_pack_service, supervisor)
+
+    stopped_at = datetime.now(UTC) - timedelta(minutes=12)
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot=_GOOD_SNAPSHOT,
+            yes_bid_dollars="0.4400",  # type: ignore[arg-type]
+            yes_ask_dollars="0.4800",  # type: ignore[arg-type]
+            last_trade_dollars=None,
+        )
+        await repo.set_checkpoint(
+            "stop_loss_reentry:demo:WX-TEST",
+            cursor=None,
+            payload={
+                "stopped_at": stopped_at.isoformat(),
+                "stopped_side": "no",
+                "outcome_status": "filled_exit",
+                "reverse_evaluated": False,
+            },
+        )
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms(limit=10)
+        ops_events = await repo.list_ops_events(limit=10, kalshi_env=settings.kalshi_env)
+        reentry_cp = await repo.get_checkpoint("stop_loss_reentry:demo:WX-TEST")
+        block_cp = await repo.get_checkpoint("auto_trigger_block:demo:WX-TEST:stop_loss_reentry_cooldown")
+        await session.commit()
+
+    assert rooms == []
+    assert supervisor.calls == []
+    assert reentry_cp is not None
+    assert reentry_cp.payload["reverse_evaluated"] is False
+    assert block_cp is not None
+    assert any("stop-loss re-entry cooldown active" in event.summary for event in ops_events)
 
     await engine.dispose()

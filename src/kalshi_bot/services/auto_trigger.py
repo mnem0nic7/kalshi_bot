@@ -5,8 +5,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
-import numpy as np
-
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
@@ -20,6 +18,8 @@ from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
     refresh_stop_loss_checkpoints,
     stop_loss_outcome_from_payloads,
+    stop_loss_reentry_blocked,
+    stop_loss_stopped_at_from_payloads,
 )
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
@@ -128,9 +128,11 @@ class AutoTriggerService:
 
             reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}")
             if reentry_cp is not None:
+                submit_payload = dict(getattr(submit_cp, "payload", {}) or {})
+                reentry_payload = dict(reentry_cp.payload or {})
                 reentry_status = stop_loss_outcome_from_payloads(
-                    dict(getattr(submit_cp, "payload", {}) or {}),
-                    dict(reentry_cp.payload or {}),
+                    submit_payload,
+                    reentry_payload,
                 )
                 if reentry_status in {
                     STOP_LOSS_OUTCOME_SUBMIT_FAILED,
@@ -153,56 +155,40 @@ class AutoTriggerService:
                 if reentry_status not in {None, STOP_LOSS_OUTCOME_FILLED_EXIT}:
                     await session.commit()
                     return
-                stopped_at_str = reentry_cp.payload.get("stopped_at")
-                try:
-                    stopped_at = datetime.fromisoformat(stopped_at_str) if stopped_at_str else None
-                except (ValueError, TypeError):
-                    stopped_at = None
-
-                now_utc = datetime.now(UTC)
-                elapsed = (now_utc - stopped_at).total_seconds() if stopped_at is not None else float("inf")
-
-                if elapsed >= self.settings.stop_loss_reentry_cooldown_seconds:
-                    # 4h elapsed — cooldown lifted, allow re-entry unconditionally.
-                    pass
-                elif not reentry_cp.payload.get("reverse_evaluated"):
-                    # First trigger after stop-loss: allow one room to evaluate the opposite
-                    # side. The signal engine will trade whichever side now has edge.
-                    await repo.set_checkpoint(
-                        f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}",
-                        cursor=None,
-                        payload={**reentry_cp.payload, "reverse_evaluated": True},
+                stopped_at = stop_loss_stopped_at_from_payloads(submit_payload, reentry_payload)
+                if stop_loss_reentry_blocked(
+                    reentry_status,
+                    stopped_at=stopped_at,
+                    cooldown_seconds=self.settings.stop_loss_reentry_cooldown_seconds,
+                ):
+                    cooldown_expires_at = (
+                        stopped_at + timedelta(seconds=self.settings.stop_loss_reentry_cooldown_seconds)
+                        if stopped_at is not None
+                        else None
                     )
-                else:
-                    # Within cooldown window: require sustained momentum confirmation.
-                    prices = await repo.fetch_recent_prices(
-                        market_ticker,
+                    await self._log_block_once_per_cooldown(
+                        repo,
+                        checkpoint_key=(
+                            f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
+                            "stop_loss_reentry_cooldown"
+                        ),
+                        cooldown_seconds=thresholds.trigger_cooldown_seconds,
+                        severity="warning",
+                        summary=f"Auto-trigger blocked for {market_ticker}: stop-loss re-entry cooldown active",
+                        payload={
+                            "market_ticker": market_ticker,
+                            "reason": "stop_loss_reentry_cooldown",
+                            "stop_loss_outcome_status": reentry_status,
+                            "stopped_at": stopped_at.isoformat() if stopped_at is not None else None,
+                            "cooldown_expires_at": (
+                                cooldown_expires_at.isoformat() if cooldown_expires_at is not None else None
+                            ),
+                            "stopped_side": reentry_payload.get("stopped_side") or submit_payload.get("stopped_side"),
+                        },
                         kalshi_env=self.settings.kalshi_env,
-                        window=timedelta(seconds=self.settings.stop_loss_momentum_reentry_window_seconds),
                     )
-                    points = [
-                        (row.observed_at.timestamp(), float(row.mid_dollars))
-                        for row in prices
-                        if row.mid_dollars is not None
-                    ]
-                    if len(points) < 5:
-                        await session.commit()
-                        return
-                    xs = np.array([p[0] for p in points])
-                    ys = np.array([p[1] for p in points])
-                    xs = xs - xs[0]
-                    slope = float(np.polyfit(xs, ys, 1)[0]) * 100 * 60  # $/s → ¢/min
-                    # Threshold stored negative (adverse-direction convention); negate for recovery direction.
-                    reentry_threshold = self.settings.stop_loss_momentum_reentry_slope_threshold_cents_per_min
-                    stopped_side = reentry_cp.payload.get("stopped_side", "yes")
-                    # Directional: require price moving back toward the stopped side.
-                    # stopped_side="yes" → need slope > -threshold (YES recovering).
-                    # stopped_side="no"  → need slope < threshold (YES falling = NO recovering).
-                    recovery = (slope > -reentry_threshold) if stopped_side == "yes" else (slope < reentry_threshold)
-                    if not recovery:
-                        await session.commit()
-                        return
-                    # Momentum confirmed — allow re-entry.
+                    await session.commit()
+                    return
 
             checkpoint = await repo.get_checkpoint(f"auto_trigger:{self.settings.kalshi_env}:{market_ticker}")
             if checkpoint is not None:
