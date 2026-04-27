@@ -16,6 +16,7 @@ from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine
+from kalshi_bot.services.decision_trace import replay_decision_trace
 from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
@@ -282,6 +283,114 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     assert audit.audit_source == "live_forward"
     assert weather_snapshots
     assert weather_snapshots[0].source_hash is not None
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path}/deterministic_trace.db"
+    settings = Settings(
+        database_url=database_url,
+        app_color="blue",
+        app_shadow_mode=False,
+        llm_trading_enabled=False,
+        risk_min_edge_bps=10,
+        risk_max_order_notional_dollars=50,
+        risk_max_position_notional_dollars=100,
+        risk_max_order_count_fp=20,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    providers = FakeProviders()
+    agent_pack_service = AgentPackService(settings)
+    agents = AgentSuite(settings, providers)  # type: ignore[arg-type]
+    signal_engine = WeatherSignalEngine(settings)
+    risk_engine = DeterministicRiskEngine(settings)
+    execution_service = ExecutionService(settings, FakeKalshi())  # type: ignore[arg-type]
+    directory = WeatherMarketDirectory(
+        {
+            "WX-TRACE": WeatherMarketMapping(
+                market_ticker="WX-TRACE",
+                market_type="weather",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+                settlement_source="NWS station observation",
+            )
+        }
+    )
+    research_coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        FakeKalshi(),  # type: ignore[arg-type]
+        FakeWeather(),  # type: ignore[arg-type]
+        directory,
+        providers,  # type: ignore[arg-type]
+        signal_engine,
+        agent_pack_service,
+    )
+    training_corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        DiscoveryService(FakeKalshi(), directory),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
+    supervisor = WorkflowSupervisor(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=FakeKalshi(),  # type: ignore[arg-type]
+        weather=FakeWeather(),  # type: ignore[arg-type]
+        weather_directory=directory,
+        agent_pack_service=agent_pack_service,
+        signal_engine=signal_engine,
+        risk_engine=risk_engine,
+        execution_service=execution_service,
+        memory_service=MemoryService(),  # type: ignore[arg-type]
+        research_coordinator=research_coordinator,
+        training_corpus_service=training_corpus_service,
+        agents=agents,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(settings.app_color)
+        await _seed_reconcile_balance(repo, kalshi_env=settings.kalshi_env)
+        room = await repo.create_room(
+            RoomCreate(name="Deterministic Trace", market_ticker="WX-TRACE"),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        await session.commit()
+
+    await supervisor.run_room(room.id, reason="deterministic_trace_test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        decision_trace = await repo.get_latest_decision_trace_for_room(room.id)
+        trade_ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        supervisor_messages = [
+            message
+            for message in await repo.list_messages(room.id)
+            if message.role == "supervisor" and message.stage == "complete"
+        ]
+        await session.commit()
+
+    assert decision_trace is not None
+    assert trade_ticket is not None
+    assert decision_trace.ticket_id == trade_ticket.id
+    assert decision_trace.decision_kind == "entry"
+    assert decision_trace.path_version == "deterministic-fast-path.v1"
+    assert decision_trace.trace["normalized_intent"]["risk_status"] == "approved"
+    assert replay_decision_trace(decision_trace.trace, expected_trace_hash=decision_trace.trace_hash).ok
+    assert supervisor_messages[-1].payload["decision_trace_id"] == decision_trace.id
 
     await engine.dispose()
 

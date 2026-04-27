@@ -31,6 +31,7 @@ from kalshi_bot.db.web_auth_repository import WebAuthRepositoryMixin
 from kalshi_bot.db.models import (
     Artifact,
     Checkpoint,
+    DecisionTraceRecord,
     FillRecord,
     MarketPriceHistory,
     MarketState,
@@ -750,6 +751,55 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         self.session.add(record)
         await self.session.flush()
         return record
+
+    async def save_decision_trace(
+        self,
+        *,
+        room_id: str | None,
+        ticket_id: str | None,
+        market_ticker: str,
+        kalshi_env: str | None,
+        decision_kind: str,
+        path_version: str,
+        source_snapshot_ids: dict[str, Any],
+        input_hash: str,
+        trace_hash: str,
+        trace: dict[str, Any],
+        decision_time: datetime | None = None,
+        agent_pack_version: str | None = None,
+        parameter_pack_version: str | None = None,
+    ) -> DecisionTraceRecord:
+        record = DecisionTraceRecord(
+            room_id=room_id,
+            ticket_id=ticket_id,
+            market_ticker=market_ticker,
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            decision_kind=decision_kind,
+            decision_time=decision_time or datetime.now(UTC),
+            path_version=path_version,
+            agent_pack_version=agent_pack_version,
+            parameter_pack_version=parameter_pack_version,
+            source_snapshot_ids=source_snapshot_ids,
+            input_hash=input_hash,
+            trace_hash=trace_hash,
+            trace=trace,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def get_decision_trace(self, decision_trace_id: str) -> DecisionTraceRecord | None:
+        stmt = select(DecisionTraceRecord).where(DecisionTraceRecord.id == decision_trace_id)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def get_latest_decision_trace_for_room(self, room_id: str) -> DecisionTraceRecord | None:
+        stmt = (
+            select(DecisionTraceRecord)
+            .where(DecisionTraceRecord.room_id == room_id)
+            .order_by(DecisionTraceRecord.created_at.desc(), DecisionTraceRecord.decision_time.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def get_latest_risk_verdict_for_room(self, room_id: str) -> RiskVerdictRecord | None:
         stmt = (

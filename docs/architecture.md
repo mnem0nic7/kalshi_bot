@@ -12,7 +12,11 @@ The platform is one async Python service with four main layers:
    - Weather fair-value estimation
    - Risk validation
    - Execution and reconciliation
-3. Agent room
+3. Decision trace and replay
+   - normalized deterministic intent
+   - source snapshot references
+   - input and intent hashes
+4. Agent room (legacy/experimental for trade decisions)
    - Researcher
    - President
    - Trader
@@ -21,7 +25,7 @@ The platform is one async Python service with four main layers:
    - Ops monitor
    - Auditor
    - Memory librarian
-4. Control room
+5. Control room
    - FastAPI
    - server-rendered UI
    - SSE transcript stream
@@ -29,25 +33,27 @@ The platform is one async Python service with four main layers:
 
 ## Workflow
 
-The supervisor runs a fixed workflow:
+The canonical supervisor path is deterministic when `LLM_TRADING_ENABLED=false` (the default):
 
 1. Trigger room
 2. Load market mapping
 3. Fetch Kalshi market snapshot
 4. Fetch weather bundle from NWS
 5. Compute deterministic signal
-6. Researcher posts evidence-backed observation
-7. President posts posture memo
-8. Trader emits either a `TradeTicket` or a stand-down message
-9. Risk officer explains deterministic verdict
-10. Execution clerk either places the order or records why execution was skipped
-11. Auditor ties the rationale chain together
-12. Memory librarian distills the room into durable semantic memory
+6. Run deterministic eligibility and marketability gates
+7. Build a `TradeTicket` only when the signal is eligible
+8. Run the deterministic risk engine
+9. Execute only approved tickets through the execution clerk and active-color lock
+10. Persist a `decision_traces` row with source references, thresholds, signal state, sizing context, risk verdict, receipt, final outcome, and stable hashes
+11. Persist strategy audit material for training and replay
+
+The LLM agent-room path still exists behind `LLM_TRADING_ENABLED=true`. It is treated as legacy/experimental scaffolding for analysis and prompt-pack work, not the production decision authority.
 
 ## Safety boundaries
 
 - LLM output never signs requests.
 - LLM output never bypasses risk rules.
+- LLM output is not part of the default trading decision path.
 - Only the execution clerk path can hit Kalshi write endpoints.
 - Only the active deployment color can acquire the execution lock.
 - The kill switch clears the execution lock and blocks new live orders.
@@ -59,6 +65,7 @@ Postgres stores:
 - room and transcript state
 - raw exchange and weather events
 - signals, tickets, verdicts, orders, fills, positions
+- deterministic decision traces and replay hashes
 - ops events and checkpoints
 - memory notes and embeddings
 - deployment control and writer lock

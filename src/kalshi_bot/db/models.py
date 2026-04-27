@@ -141,6 +141,24 @@ class TradeTicketRecord(Base, IdMixin, TimestampMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class DecisionTraceRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "decision_traces"
+
+    room_id: Mapped[str | None] = mapped_column(ForeignKey("rooms.id", ondelete="CASCADE"), nullable=True, index=True)
+    ticket_id: Mapped[str | None] = mapped_column(ForeignKey("trade_tickets.id", ondelete="SET NULL"), nullable=True, index=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    kalshi_env: Mapped[str] = mapped_column(String(16), default="demo", index=True)
+    decision_kind: Mapped[str] = mapped_column(String(32), index=True)
+    decision_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    path_version: Mapped[str] = mapped_column(String(64), index=True)
+    agent_pack_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    parameter_pack_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    source_snapshot_ids: Mapped[dict] = mapped_column(JSON, default=dict)
+    input_hash: Mapped[str] = mapped_column(String(64), index=True)
+    trace_hash: Mapped[str] = mapped_column(String(64), index=True)
+    trace: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class RiskVerdictRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "risk_verdicts"
 
@@ -789,6 +807,8 @@ class DeploymentControl(Base):
 
 Index("ix_room_messages_room_created", RoomMessage.room_id, RoomMessage.created_at)
 Index("ix_raw_exchange_events_stream_created", RawExchangeEvent.stream_name, RawExchangeEvent.created_at)
+Index("ix_decision_traces_room_created", DecisionTraceRecord.room_id, DecisionTraceRecord.created_at)
+Index("ix_decision_traces_market_env_created", DecisionTraceRecord.market_ticker, DecisionTraceRecord.kalshi_env, DecisionTraceRecord.created_at)
 Index(
     "ix_decision_corpus_rows_day_env_policy",
     DecisionCorpusRowRecord.local_market_day,

@@ -94,6 +94,58 @@ def test_python_module_cli_exposes_strategy_promotion_secondary_sync_sweep() -> 
     assert "--source" in sweep_help.stdout
 
 
+def test_python_module_cli_exposes_decision_trace_show_and_replay() -> None:
+    top_level = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    command_help = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "decision-trace", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert top_level.returncode == 0
+    assert "decision-trace" in top_level.stdout
+    assert command_help.returncode == 0
+    assert "show" in command_help.stdout
+    assert "replay" in command_help.stdout
+
+
+@pytest.mark.asyncio
+async def test_shadow_run_cli_fails_when_trace_is_missing(monkeypatch, capsys) -> None:
+    class FakeShadowTrainingService:
+        async def run_shadow_room(self, market_ticker: str, *, name=None, prompt=None, reason="shadow_run"):
+            return SimpleNamespace(
+                room_id="room-1",
+                market_ticker=market_ticker,
+                stage="complete",
+                decision_trace_id=None,
+            )
+
+    class FakeContainer:
+        shadow_training_service = FakeShadowTrainingService()
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_build(*, bootstrap_db: bool):
+        assert bootstrap_db is True
+        return FakeContainer()
+
+    monkeypatch.setattr(cli_module.AppContainer, "build", fake_build)
+    args = cli_module.build_parser().parse_args(["shadow-run", "KXHIGHNY-26APR27-T69"])
+
+    exit_code = await cli_module._run_cli(args)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "without a deterministic decision trace" in captured.err
+
+
 def test_python_module_cli_entrypoint_reports_operator_errors_cleanly(tmp_path) -> None:
     env = os.environ.copy()
     env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/cli.db"

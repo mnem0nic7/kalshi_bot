@@ -1,0 +1,79 @@
+# Deterministic Autonomy Plan
+
+## Quality Evaluation
+
+Score: **8.2/10**.
+
+The plan is pointed in the right direction: remove nondeterminism from trade decisions, make every decision replayable, promote only bounded parameters, and keep hard risk caps outside the autonomy envelope. The strongest parts are the explicit rollback triggers, the strict-as-of replay dependency, and the insistence that profitability is evidence rather than a code assertion.
+
+Repo-specific correction: `kalshi_bot` already defaults to the deterministic fast path (`LLM_TRADING_ENABLED=false`). Phase 0 is therefore not a risky removal of live LLM trading. It is an auditability phase: persist complete traces, prove replay equivalence, and update documentation so the deterministic path is the canonical architecture.
+
+## Phase 0: Audit And Replay Foundation
+
+Phase 0 is implemented as the safe first slice:
+
+- Keep current live risk thresholds, source set, and execution behavior unchanged.
+- Persist a durable `decision_traces` row for every deterministic supervisor decision.
+- Trace accepted entries, risk-blocked proposals, and stand-downs.
+- Store source snapshot references, threshold inputs, signal state, candidate trace, sizing context, risk verdict, execution receipt, final outcome, and stable hashes.
+- Add `kalshi-bot-cli decision-trace show <id>` for inspection.
+- Add `kalshi-bot-cli decision-trace replay <id>` for hash-based replay verification.
+- Make CLI `shadow-run` surface `decision_trace_id` and fail if no deterministic trace was produced.
+
+The trace table is intentionally separate from `trade_tickets`. No-ticket decisions are first-class training and calibration data.
+
+## Roadmap
+
+### Phase 1: Probability Engine
+
+Add the closed-form Gumbel + climatology shrinkage engine and run it in shadow against the current NWS-driven signal. Multi-source weather data should be introduced adapter-first, with each provider normalized behind a source adapter before ensemble fusion is allowed to affect decisions.
+
+Default source posture:
+
+- Launch adapters for GFS, ECMWF, AIFS, and NWS-point.
+- Keep AIFS at reduced weight until replay evidence validates parity.
+- Do not trade live from the ensemble engine until holdout Brier, ECE, and coverage gates pass.
+
+### Phase 2: Risk Math
+
+Wire uncertainty, fee-aware Kelly sizing, survival mode, and exit risk scoring only after Phase 1 has replay evidence. The existing deterministic risk engine remains the hard authority and must continue clipping or blocking any request that violates caps.
+
+### Phase 3: Source Health
+
+Score source success, freshness, completeness, and consistency each cycle. Broken sources are excluded from fusion; degraded aggregate health reduces size; broken aggregate health pauses entries or engages kill-switch behavior according to the operator-approved hard caps.
+
+### Phase 4: Parameter-Pack Autonomy
+
+Repurpose self-improve from agent-pack promotion into parameter-pack promotion. Candidate packs are tuned offline on strict-as-of replay data and promoted only after coverage, Brier, ECE, Sharpe, drawdown, city consistency, idempotency, and canary gates pass.
+
+Default promotion settings:
+
+- 30-year climatology normal with 14-day rolling smoother.
+- `pseudo_count` search range `[2, 32]`.
+- Nightly search budget `N=20`.
+- Starvation tolerance `K=10`.
+- 30-day holdout.
+- Survival mode threshold: 25% of starting bankroll.
+- Live autonomous promotion remains operator-only for the first 90 days after Phase 4.
+
+### Phase 5 And 6: Optional Learned Features
+
+CatBoost/River probability heads and NWS discussion parsing are optional. They must be deterministic given seed and data, must be operable at zero weight, and must beat the closed-form engine on holdout Brier, ECE, and realized trading metrics before receiving weight.
+
+## Autonomy Boundaries
+
+The autonomy loop may tune only declared parameter-pack fields inside configured ranges. It may down-size, skip, pause entries, stage a candidate on the inactive color, or roll back a candidate pack after failed gates.
+
+Operator-only actions remain:
+
+- changing hard caps
+- adding new cities or market families
+- introducing new weather sources
+- production schema migrations
+- clearing kill-switch events
+- first demo-to-live promotion
+- disabling rollback or auto-kill conditions
+
+## Acceptance Criteria
+
+The system is not ready to graduate beyond Phase 0 until deterministic shadow decisions have complete traces and `decision-trace replay` verifies the normalized intent for saved regression decisions. Later phases must use those traces and the decision corpus as evidence; threshold tuning toward more trades is not acceptable without positive net expectancy after fees, slippage, fills, and settlement.

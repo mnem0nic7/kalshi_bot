@@ -11,6 +11,7 @@ It is intentionally conservative:
 - no market making
 - no web-only markets
 - no resolved-contract cleanup trading
+- deterministic fast path by default (`LLM_TRADING_ENABLED=false`)
 
 ## Layer 1: Weather State
 
@@ -68,6 +69,23 @@ Current strategy modes:
 - `resolved_cleanup_candidate`
 
 The last mode is informational only in this slice. The platform does not trade resolved contracts under the current base strategy.
+
+## Layer 5: Decision Trace
+
+Every deterministic Strategy A decision persists a `decision_traces` row. The trace is written whether the result is an entry, a risk block, or a stand-down.
+
+The trace includes:
+
+- market and weather source references
+- effective thresholds
+- signal and eligibility state
+- candidate trace and selected side
+- sizing context
+- risk verdict
+- execution receipt when present
+- final outcome plus stable input and intent hashes
+
+Use `kalshi-bot-cli decision-trace replay <id>` to verify that the saved normalized intent still hashes to the recorded value.
 
 ## No-Trade Policy
 

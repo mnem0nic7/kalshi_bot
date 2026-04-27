@@ -26,6 +26,7 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
+from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, replay_decision_trace
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
 from kalshi_bot.services.trade_analysis import format_trade_analysis_report
 from kalshi_bot.services.trading_audit import format_trading_audit_text
@@ -102,6 +103,32 @@ async def _run_health_check_command(args: argparse.Namespace, container: AppCont
         print(json.dumps(payload, indent=2))
         return 0 if payload["healthy"] else 1
     raise ValueError(f"Unknown command: {args.command}")
+
+
+async def _run_decision_trace_command(args: argparse.Namespace, container: AppContainer) -> int:
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
+        record = await repo.get_decision_trace(args.decision_id)
+        await session.commit()
+    if record is None:
+        print(json.dumps({"error": f"Decision trace {args.decision_id} not found"}), file=sys.stderr)
+        return 1
+    if args.decision_trace_command == "show":
+        print(json.dumps(decision_trace_record_to_dict(record), indent=2))
+        return 0
+    if args.decision_trace_command == "replay":
+        result = replay_decision_trace(record.trace, expected_trace_hash=record.trace_hash)
+        payload = {
+            "decision_trace_id": record.id,
+            "room_id": record.room_id,
+            "market_ticker": record.market_ticker,
+            "kalshi_env": record.kalshi_env,
+            **result.to_dict(),
+        }
+        print(json.dumps(payload, indent=2))
+        return 0 if result.ok else 1
+    print(json.dumps({"error": f"Unknown decision-trace action {args.decision_trace_command}"}), file=sys.stderr)
+    return 1
 
 
 async def _run_watchdog_command(args: argparse.Namespace, container: AppContainer) -> int:
@@ -890,6 +917,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if args.command == "watchdog":
             return await _run_watchdog_command(args, container)
 
+        if args.command == "decision-trace":
+            return await _run_decision_trace_command(args, container)
+
         if args.command == "shadow-run":
             result = await container.shadow_training_service.run_shadow_room(
                 args.market_ticker,
@@ -897,7 +927,25 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 prompt=args.prompt,
                 reason=args.reason,
             )
-            print(json.dumps({"room_id": result.room_id, "market_ticker": result.market_ticker, "stage": result.stage}, indent=2))
+            payload = {
+                "room_id": result.room_id,
+                "market_ticker": result.market_ticker,
+                "stage": result.stage,
+                "decision_trace_id": result.decision_trace_id,
+            }
+            if result.decision_trace_id is None:
+                print(
+                    json.dumps(
+                        {
+                            **payload,
+                            "error": "Shadow run completed without a deterministic decision trace",
+                        },
+                        indent=2,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            print(json.dumps(payload, indent=2))
             return 0
 
         if args.command == "shadow-c-sweep":
@@ -1548,6 +1596,16 @@ def build_parser() -> argparse.ArgumentParser:
     shadow_run.add_argument("--name", default=None)
     shadow_run.add_argument("--prompt", default=None)
     shadow_run.add_argument("--reason", default="cli_shadow_run")
+
+    decision_trace = subparsers.add_parser("decision-trace", help="Show or replay deterministic decision traces")
+    decision_trace_subparsers = decision_trace.add_subparsers(dest="decision_trace_command", required=True)
+    decision_trace_show = decision_trace_subparsers.add_parser("show", help="Print a stored deterministic decision trace")
+    decision_trace_show.add_argument("decision_id")
+    decision_trace_replay = decision_trace_subparsers.add_parser(
+        "replay",
+        help="Recompute normalized intent hashes from a stored deterministic decision trace",
+    )
+    decision_trace_replay.add_argument("decision_id")
 
     subparsers.add_parser("shadow-c-sweep", help="Strategy C: evaluate lock-confirmation signals across all configured markets")
     subparsers.add_parser("strategy-c-status", help="Strategy C: show aggregate sweep metrics and lock tracker state")

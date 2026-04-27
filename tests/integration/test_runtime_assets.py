@@ -102,6 +102,19 @@ def test_self_improve_workflow_requires_promotion_readiness_before_staging() -> 
     assert 'ready_for_promotion="$(jq -r \'.training_readiness.ready_for_promotion\' promotion-status.json)"' in workflow_text
 
 
+def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
+    autonomy = Path("docs/deterministic_autonomy_plan.md").read_text(encoding="utf-8")
+    architecture = Path("docs/architecture.md").read_text(encoding="utf-8")
+    strategy = Path("docs/strategy/weather-temp-taker.md").read_text(encoding="utf-8")
+
+    assert "Score: **8.2/10**" in autonomy
+    assert "Phase 0" in autonomy
+    assert "decision_traces" in autonomy
+    assert "adapter-first" in autonomy
+    assert "LLM_TRADING_ENABLED=false" in architecture
+    assert "decision-trace replay" in strategy
+
+
 def test_rollback_agent_pack_targets_existing_demo_app_service() -> None:
     workflow_text = Path(".github/workflows/rollback-agent-pack.yml").read_text(encoding="utf-8")
 

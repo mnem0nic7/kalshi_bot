@@ -27,6 +27,10 @@ from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
+from kalshi_bot.services.decision_trace import (
+    DETERMINISTIC_PATH_VERSION,
+    build_deterministic_decision_trace,
+)
 
 from kalshi_bot.services.momentum_calibration import get_active_momentum_calibration_async
 from kalshi_bot.services.signal import (
@@ -328,10 +332,15 @@ class WorkflowSupervisor:
         thresholds: Any,
         market_observed_at: datetime | None = None,
         research_fallback_time: datetime | None = None,
+        source_snapshot_ids: dict[str, Any] | None = None,
     ) -> None:
         research_observed_at = _research_ref_time(signal, research_fallback_time)
         receipt = ExecReceiptPayload(status="no_trade", details={})
         final_status = "no_trade"
+        ticket_record = None
+        risk_verdict_record = None
+        sizing_trace: dict[str, Any] = {}
+        trace_thresholds = thresholds
         candidate_trace = dict(signal.candidate_trace or {})
         if signal.eligibility is not None and signal.eligibility.candidate_trace:
             candidate_trace = dict(signal.eligibility.candidate_trace)
@@ -351,18 +360,24 @@ class WorkflowSupervisor:
 
         if eligible:
             total_capital = await repo.get_total_capital_dollars(kalshi_env=room.kalshi_env)
+            sizing_trace["total_capital_dollars"] = total_capital
             if total_capital is None or total_capital <= 0:
                 eligible = False
+                sizing_trace["stand_down_reason"] = "missing_total_capital"
             else:
                 dynamic_order_cap = float(total_capital) * self.settings.risk_order_pct
+                sizing_trace["dynamic_order_cap_dollars"] = dynamic_order_cap
+                sizing_trace["risk_order_pct"] = self.settings.risk_order_pct
                 count_fp = suggested_trade_count_fp(
                     settings=self.settings,
                     signal=signal,
                     max_order_notional_dollars=dynamic_order_cap,
                     total_capital_dollars=total_capital,
                 )
+                sizing_trace["suggested_count_fp"] = count_fp
                 if count_fp is None or count_fp <= Decimal("0"):
                     eligible = False
+                    sizing_trace["stand_down_reason"] = "non_positive_suggested_count"
 
         loss_sensitivity_active = False
         if eligible:
@@ -377,6 +392,8 @@ class WorkflowSupervisor:
             )
             if signal.size_factor < Decimal("1.00"):
                 scaled = quantize_count(ticket.count_fp * signal.size_factor)
+                sizing_trace["size_factor"] = signal.size_factor
+                sizing_trace["scaled_count_fp"] = scaled
                 ticket = ticket.model_copy(update={"count_fp": scaled}) if scaled > Decimal("0") else None
 
             if ticket is not None:
@@ -416,6 +433,8 @@ class WorkflowSupervisor:
                     else Decimal("0")
                 )
                 position_cap = float(total_capital) * self.settings.risk_position_pct
+                sizing_trace["position_cap_dollars"] = position_cap
+                sizing_trace["current_position_notional_dollars"] = current_position_notional
                 daily_pnl = await repo.get_daily_pnl_dollars(kalshi_env=room.kalshi_env)
                 loss_sensitivity_active = False
                 daily_loss_hard_blocked = False
@@ -474,6 +493,16 @@ class WorkflowSupervisor:
                         effective_edge_bps * self.settings.risk_daily_loss_sensitivity_edge_multiplier
                     )
                     effective_order_cap = effective_order_cap * self.settings.risk_daily_loss_sensitivity_size_multiplier
+                sizing_trace.update(
+                    {
+                        "daily_pnl_dollars": daily_pnl,
+                        "daily_loss_ratio": daily_loss_ratio,
+                        "daily_loss_hard_blocked": daily_loss_hard_blocked,
+                        "loss_sensitivity_active": loss_sensitivity_active,
+                        "effective_edge_bps": effective_edge_bps,
+                        "effective_order_cap_dollars": effective_order_cap,
+                    }
+                )
 
                 effective_thresholds = thresholds.__class__(
                     risk_min_edge_bps=effective_edge_bps,
@@ -486,6 +515,7 @@ class WorkflowSupervisor:
                     risk_safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
                     risk_risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
                 )
+                trace_thresholds = effective_thresholds
                 portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
                     kalshi_env=room.kalshi_env,
                     subaccount=self.settings.kalshi_subaccount,
@@ -515,6 +545,14 @@ class WorkflowSupervisor:
                     open_ticker_count=open_ticker_count,
                     strategy_code=StrategyCode.DIRECTIONAL.value,
                     strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
+                )
+                sizing_trace.update(
+                    {
+                        "open_ticker_count": open_ticker_count,
+                        "pending_order_count_fp": pending_order_count_fp,
+                        "portfolio_bucket_snapshot": portfolio_bucket_snapshot.model_dump(mode="json"),
+                        "strategy_daily_realized_pnl_dollars": strategy_daily_pnl,
+                    }
                 )
                 if daily_loss_hard_blocked:
                     await repo.log_ops_event(
@@ -554,7 +592,7 @@ class WorkflowSupervisor:
                         context=risk_context,
                         thresholds=effective_thresholds,
                     )
-                await repo.save_risk_verdict(
+                risk_verdict_record = await repo.save_risk_verdict(
                     room_id=room.id,
                     ticket_id=ticket_record.id,
                     status=verdict.status,
@@ -633,6 +671,37 @@ class WorkflowSupervisor:
         candidate_trace["final_outcome"] = evaluation_outcome
         candidate_trace["final_status"] = final_status
 
+        input_hash, trace_hash, decision_trace_payload = build_deterministic_decision_trace(
+            room=room,
+            signal=signal,
+            thresholds=trace_thresholds,
+            candidate_trace=candidate_trace,
+            final_status=final_status,
+            evaluation_outcome=evaluation_outcome,
+            ticket_record=ticket_record,
+            risk_verdict_record=risk_verdict_record,
+            receipt=receipt,
+            market_observed_at=market_observed_at,
+            research_observed_at=research_observed_at,
+            source_snapshot_ids=source_snapshot_ids or {},
+            sizing=sizing_trace,
+            loss_sensitivity_active=loss_sensitivity_active,
+        )
+        decision_trace_record = await repo.save_decision_trace(
+            room_id=room.id,
+            ticket_id=ticket_record.id if ticket_record is not None else None,
+            market_ticker=room.market_ticker,
+            kalshi_env=room.kalshi_env,
+            decision_kind=decision_trace_payload["decision_kind"],
+            path_version=DETERMINISTIC_PATH_VERSION,
+            agent_pack_version=room.agent_pack_version,
+            parameter_pack_version=None,
+            source_snapshot_ids=decision_trace_payload["source_snapshot_ids"],
+            input_hash=input_hash,
+            trace_hash=trace_hash,
+            trace=decision_trace_payload,
+        )
+
         await repo.append_message(
             room.id,
             RoomMessageCreate(
@@ -644,6 +713,8 @@ class WorkflowSupervisor:
                 payload={
                     "final_status": final_status,
                     "evaluation_outcome": evaluation_outcome,
+                    "decision_trace_id": decision_trace_record.id,
+                    "decision_trace_hash": trace_hash,
                     "candidate_trace": candidate_trace,
                     "loss_sensitivity_active": loss_sensitivity_active,
                 },
@@ -654,6 +725,7 @@ class WorkflowSupervisor:
             payload_updates={
                 "final_status": final_status,
                 "room_completed_at": datetime.now(UTC).isoformat(),
+                "decision_trace_id": decision_trace_record.id,
             },
         )
         await repo.update_room_stage(room.id, RoomStage.COMPLETE)
@@ -983,6 +1055,15 @@ class WorkflowSupervisor:
                         thresholds=thresholds,
                         market_observed_at=market_state.observed_at,
                         research_fallback_time=dossier.freshness.refreshed_at,
+                        source_snapshot_ids={
+                            "market_state": {
+                                "kalshi_env": room.kalshi_env,
+                                "market_ticker": room.market_ticker,
+                                "observed_at": market_state.observed_at,
+                            },
+                            "weather_archive_source_id": f"room:{room.id}" if weather_bundle is not None else None,
+                            "research_run_id": dossier.last_run_id,
+                        },
                     )
                     return
 

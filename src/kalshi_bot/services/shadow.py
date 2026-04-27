@@ -19,6 +19,7 @@ class ShadowRunResult:
     market_ticker: str
     room_name: str
     stage: str
+    decision_trace_id: str | None = None
 
 
 class ShadowTrainingService:
@@ -103,12 +104,14 @@ class ShadowTrainingService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             room = await repo.get_room(result.room_id)
+            decision_trace = await repo.get_latest_decision_trace_for_room(result.room_id)
             await session.commit()
         return ShadowRunResult(
             room_id=result.room_id,
             market_ticker=market_ticker,
             room_name=result.room_name,
             stage=room.stage if room is not None else result.stage,
+            decision_trace_id=decision_trace.id if decision_trace is not None else None,
         )
 
     async def run_shadow_sweep(

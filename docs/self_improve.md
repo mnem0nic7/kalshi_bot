@@ -1,16 +1,20 @@
 # Self Improve
 
-This system can run Gemini-first agent packs, critique recent shadow or demo rooms, evaluate a candidate pack on a holdout slice, stage the candidate on the inactive blue or green color through a pending-promotion checkpoint, and roll back if canary or live guardrails fail.
+This system currently runs Gemini-first agent-pack self-improvement for the non-canonical agent room. The trading decision path remains deterministic by default, and Phase 0 deterministic autonomy adds durable `decision_traces` so future self-improvement can graduate from prompt packs to replay-tested parameter packs.
+
+Long-term target: promote bounded parameter packs, not LLM trade logic. A candidate parameter pack must be produced offline from strict-as-of replay data, evaluated on a holdout window, staged on the inactive blue/green color, and rolled back automatically if canary or live guardrails fail.
 
 ## Runtime Model Routing
 
 - `researcher`, `president`, `trader`, `risk_officer`, `ops_monitor`, and `memory_librarian` default to Gemini-first routing.
 - The provider router still falls back to the existing local model when Gemini is unavailable.
+- `LLM_TRADING_ENABLED=false` keeps these roles out of the default trade path.
 - Deterministic authority does not move:
   - structured weather pricing stays code-owned
   - research gating stays code-owned
   - risk approval stays code-owned
   - execution, signing, and deployment locking stay code-owned
+  - decision trace replay stays code-owned
 
 ## Agent Packs
 
@@ -42,6 +46,21 @@ Rooms now snapshot:
 - provider and model usage per role
 - optional evaluation provenance
 
+## Parameter-Pack Roadmap
+
+Parameter packs are the planned replacement mutable unit for autonomous trading improvements. Unlike agent packs, they will contain only bounded numeric or categorical parameters such as probability blending weights, uncertainty buffers, Kelly fractions, source weights, and climatology pseudo-counts.
+
+Hard caps remain outside the pack and operator-only:
+
+- max position notional and percentage caps
+- total exposure caps
+- daily loss and drawdown caps
+- kill-switch and rollback semantics
+- source addition/removal
+- first demo-to-live promotion
+
+Promotion requires complete `decision_traces`, strict-as-of replay, holdout gates, and canary shadow evidence. The existing agent-pack workflow remains available until the parameter-pack promotion service replaces it.
+
 ## CLI
 
 Use the self-improve commands from the host or from inside the running app container:
@@ -52,6 +71,8 @@ kalshi-bot-cli self-improve critique --days 14 --limit 200
 kalshi-bot-cli self-improve eval --candidate-version <VERSION> --days 14 --limit 200
 kalshi-bot-cli self-improve promote --evaluation-run-id <EVALUATION_RUN_ID>
 kalshi-bot-cli self-improve rollback --reason manual_rollback
+kalshi-bot-cli decision-trace show <DECISION_TRACE_ID>
+kalshi-bot-cli decision-trace replay <DECISION_TRACE_ID>
 ```
 
 The helper scripts wrap the same flow for Docker blue or green deployments:
