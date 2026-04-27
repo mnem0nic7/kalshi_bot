@@ -67,8 +67,10 @@ def test_github_vps_workflows_use_portable_ssh_options() -> None:
     for workflow_path in workflow_paths:
         workflow_text = workflow_path.read_text(encoding="utf-8")
         assert "DEPLOY_SSH_PORT" in workflow_text, workflow_path
+        assert "DEPLOY_SSH_ADDRESS_FAMILY" in workflow_text, workflow_path
         assert "StrictHostKeyChecking=accept-new" in workflow_text, workflow_path
         assert "-p \"${DEPLOY_SSH_PORT}\"" in workflow_text, workflow_path
+        assert "AddressFamily=${DEPLOY_SSH_ADDRESS_FAMILY}" in workflow_text, workflow_path
 
 
 def test_promote_script_targets_env_scoped_postgres_and_control_row() -> None:

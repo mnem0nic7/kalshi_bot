@@ -161,6 +161,7 @@ Add these GitHub Secrets before running them:
 - `DEPLOY_USER`
 - `DEPLOY_SSH_KEY`
 - `DEPLOY_SSH_PORT` (optional, defaults to `22`)
+- `DEPLOY_SSH_ADDRESS_FAMILY` (optional, defaults to IPv4 with `inet`; use `any` only when the runner can route IPv6)
 - `DEPLOY_APP_DIR`
 
 Each workflow writes the PEM to a temporary file at runtime, runs REST plus WebSocket auth checks, and removes the file before exit. Neither workflow places orders.

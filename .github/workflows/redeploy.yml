@@ -25,6 +25,7 @@ jobs:
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
       DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
+      DEPLOY_SSH_ADDRESS_FAMILY: ${{ secrets.DEPLOY_SSH_ADDRESS_FAMILY || 'inet' }}
       DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
       INPUT_COLOR: ${{ github.event.inputs.color }}
 
@@ -39,16 +40,25 @@ jobs:
             echo "Invalid DEPLOY_SSH_PORT: ${DEPLOY_SSH_PORT}" >&2
             exit 1
           fi
+          case "${DEPLOY_SSH_ADDRESS_FAMILY}" in
+            any|inet|inet6) ;;
+            *) echo "Invalid DEPLOY_SSH_ADDRESS_FAMILY: ${DEPLOY_SSH_ADDRESS_FAMILY}" >&2; exit 1 ;;
+          esac
 
       - name: Prepare SSH
         run: |
           set -euo pipefail
+          keyscan_family_flag=()
+          case "${DEPLOY_SSH_ADDRESS_FAMILY}" in
+            inet) keyscan_family_flag=(-4) ;;
+            inet6) keyscan_family_flag=(-6) ;;
+          esac
           mkdir -p ~/.ssh
           printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           touch ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
-          if ! ssh-keyscan -p "${DEPLOY_SSH_PORT}" -T 15 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>ssh-keyscan.err; then
+          if ! ssh-keyscan "${keyscan_family_flag[@]}" -p "${DEPLOY_SSH_PORT}" -T 15 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>ssh-keyscan.err; then
             cat ssh-keyscan.err >&2 || true
             echo "::warning::ssh-keyscan failed for ${DEPLOY_HOST}:${DEPLOY_SSH_PORT}; SSH will use StrictHostKeyChecking=accept-new"
           fi
@@ -63,6 +73,8 @@ jobs:
             -p "${DEPLOY_SSH_PORT}"
             -o StrictHostKeyChecking=accept-new
             -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o "AddressFamily=${DEPLOY_SSH_ADDRESS_FAMILY}"
+            -o ConnectTimeout=20
             -o ServerAliveInterval=30
             -o ServerAliveCountMax=3
             "${DEPLOY_USER}@${DEPLOY_HOST}"
@@ -103,6 +115,7 @@ jobs:
             echo
             echo "- Host: \`${DEPLOY_HOST}\`"
             echo "- SSH port: \`${DEPLOY_SSH_PORT}\`"
+            echo "- SSH address family: \`${DEPLOY_SSH_ADDRESS_FAMILY}\`"
             echo "- Color(s): \`${color}\`"
             echo "- Ref: \`${GITHUB_SHA}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
