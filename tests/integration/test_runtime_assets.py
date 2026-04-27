@@ -73,6 +73,42 @@ def test_github_vps_workflows_use_portable_ssh_options() -> None:
         assert "AddressFamily=${DEPLOY_SSH_ADDRESS_FAMILY}" in workflow_text, workflow_path
 
 
+def test_self_improve_workflow_preflights_training_readiness() -> None:
+    workflow_text = Path(".github/workflows/self-improve.yml").read_text(encoding="utf-8")
+
+    assert 'infra/scripts/run-self-improve.sh status")' in workflow_text
+    assert "APP_SERVICE=app_demo_blue" in workflow_text
+    assert "APP_SERVICE=app_blue" not in workflow_text
+    assert "not_ready_for_critique" in workflow_text
+    assert "ready_for_critique" in workflow_text
+    assert "missing_indicators" in workflow_text
+    assert "exit 0" in workflow_text
+
+
+def test_self_improve_workflow_preserves_hard_failures() -> None:
+    workflow_text = Path(".github/workflows/self-improve.yml").read_text(encoding="utf-8")
+
+    assert "Candidate version missing from critique output" in workflow_text
+    assert "Evaluation run id missing from eval output" in workflow_text
+    assert "Inactive color missing from promote output" in workflow_text
+    assert 'jq -e \'type == "object" and (.passed | type == "boolean")\' eval.json' in workflow_text
+
+
+def test_self_improve_workflow_requires_promotion_readiness_before_staging() -> None:
+    workflow_text = Path(".github/workflows/self-improve.yml").read_text(encoding="utf-8")
+
+    assert "not_ready_for_promotion" in workflow_text
+    assert "promotion-status.json" in workflow_text
+    assert 'ready_for_promotion="$(jq -r \'.training_readiness.ready_for_promotion\' promotion-status.json)"' in workflow_text
+
+
+def test_rollback_agent_pack_targets_existing_demo_app_service() -> None:
+    workflow_text = Path(".github/workflows/rollback-agent-pack.yml").read_text(encoding="utf-8")
+
+    assert "APP_SERVICE=app_demo_blue" in workflow_text
+    assert "APP_SERVICE=app_blue" not in workflow_text
+
+
 def test_promote_script_targets_env_scoped_postgres_and_control_row() -> None:
     promote = Path("infra/scripts/promote.sh").read_text(encoding="utf-8")
 

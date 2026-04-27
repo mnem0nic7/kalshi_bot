@@ -77,7 +77,7 @@ jobs:
           )
           rollback_reason="${ROLLBACK_REASON:-github_actions_manual_rollback}"
           rollback_reason_quoted="$(printf '%q' "${rollback_reason}")"
-          rollback_json="$("${ssh_cmd[@]}" "cd ${app_dir_quoted} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh rollback --reason ${rollback_reason_quoted}")"
+          rollback_json="$("${ssh_cmd[@]}" "cd ${app_dir_quoted} && APP_SERVICE=app_demo_blue infra/scripts/run-self-improve.sh rollback --reason ${rollback_reason_quoted}")"
           printf '%s\n' "${rollback_json}" > rollback.json
           version="$(jq -r '.version // empty' rollback.json)"
           if [[ -n "${version}" ]]; then

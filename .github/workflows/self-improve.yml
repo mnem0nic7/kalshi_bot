@@ -129,25 +129,101 @@ jobs:
           remote_prefix="cd ${app_dir_quoted} && export GEMINI_API_KEY=${gemini_quoted}"
 
           sync_json="$("${ssh_cmd[@]}" "${remote_prefix} && python3 -c \"from pathlib import Path; import json, os; env_path = Path('.env'); gemini = os.environ['GEMINI_API_KEY']; lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []; updated = []; found = False; [updated.append(f'GEMINI_API_KEY={gemini}') if line.startswith('GEMINI_API_KEY=') else updated.append(line) for line in lines]; found = any(line.startswith('GEMINI_API_KEY=') for line in lines); updated = updated if found else updated + [f'GEMINI_API_KEY={gemini}']; env_path.write_text('\\n'.join(updated) + '\\n', encoding='utf-8'); print(json.dumps({'synced': True}))\"")"
+          printf '%s\n' "${sync_json}" > sync.json
+          jq -e 'type == "object" and .synced == true' sync.json >/dev/null
 
-          critique_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh critique --days ${days} --limit ${limit}")"
+          status_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_demo_blue infra/scripts/run-self-improve.sh status")"
+          printf '%s\n' "${status_json}" > status.json
+          jq -e 'type == "object" and (.training_readiness.ready_for_critique | type == "boolean") and (.training_readiness.ready_for_promotion | type == "boolean")' status.json >/dev/null
+          ready_for_critique="$(jq -r '.training_readiness.ready_for_critique' status.json)"
+          ready_for_promotion="$(jq -r '.training_readiness.ready_for_promotion' status.json)"
+
+          if [[ "${ready_for_critique}" != "true" ]]; then
+            {
+              echo "candidate_version="
+              echo "evaluation_run_id="
+              echo "passed=false"
+              echo "staged=false"
+              echo "inactive_color="
+            } >> "${GITHUB_OUTPUT}"
+
+            {
+              echo "## Self Improve"
+              echo
+              echo "- Gemini env synced on remote host: \`$(jq -r '.synced' sync.json)\`"
+              echo "- Status: \`not_ready_for_critique\`"
+              echo "- Ready for critique: \`${ready_for_critique}\`"
+              echo "- Ready for promotion: \`${ready_for_promotion}\`"
+              echo
+              echo "### Missing Indicators"
+              echo '```json'
+              jq '.training_readiness.missing_indicators // []' status.json
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          critique_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_demo_blue infra/scripts/run-self-improve.sh critique --days ${days} --limit ${limit}")"
           printf '%s\n' "${critique_json}" > critique.json
+          jq -e 'type == "object"' critique.json >/dev/null
           candidate_version="$(jq -r '.candidate_version // empty' critique.json)"
           if [[ -z "${candidate_version}" ]]; then
             echo "Candidate version missing from critique output" >&2
             exit 1
           fi
 
-          eval_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh eval --candidate-version ${candidate_version} --days ${days} --limit ${limit}")"
+          eval_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_demo_blue infra/scripts/run-self-improve.sh eval --candidate-version ${candidate_version} --days ${days} --limit ${limit}")"
           printf '%s\n' "${eval_json}" > eval.json
+          jq -e 'type == "object" and (.passed | type == "boolean")' eval.json >/dev/null
           evaluation_run_id="$(jq -r '.evaluation_run_id // empty' eval.json)"
+          if [[ -z "${evaluation_run_id}" ]]; then
+            echo "Evaluation run id missing from eval output" >&2
+            exit 1
+          fi
           passed="$(jq -r '.passed // false' eval.json)"
 
           staged="false"
           inactive_color=""
           if [[ "${passed}" == "true" && "${stage_candidate}" == "true" ]]; then
-            promote_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_blue infra/scripts/run-self-improve.sh promote --evaluation-run-id ${evaluation_run_id} --reason github_actions_self_improve")"
+            promotion_status_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_demo_blue infra/scripts/run-self-improve.sh status")"
+            printf '%s\n' "${promotion_status_json}" > promotion-status.json
+            jq -e 'type == "object" and (.training_readiness.ready_for_promotion | type == "boolean")' promotion-status.json >/dev/null
+            ready_for_promotion="$(jq -r '.training_readiness.ready_for_promotion' promotion-status.json)"
+            if [[ "${ready_for_promotion}" != "true" ]]; then
+              {
+                echo "## Self Improve"
+                echo
+                echo "- Gemini env synced on remote host: \`$(jq -r '.synced' sync.json)\`"
+                echo "- Candidate version: \`${candidate_version}\`"
+                echo "- Evaluation run: \`${evaluation_run_id}\`"
+                echo "- Passed: \`${passed}\`"
+                echo "- Staged on inactive color: \`false\`"
+                echo "- Status: \`not_ready_for_promotion\`"
+                echo
+                echo "### Missing Indicators"
+                echo '```json'
+                jq '.training_readiness.missing_indicators // []' promotion-status.json
+                echo '```'
+                echo
+                echo "### Evaluation"
+                echo '```json'
+                cat eval.json
+                echo
+                echo '```'
+              } >> "${GITHUB_STEP_SUMMARY}"
+
+              {
+                echo "candidate_version=${candidate_version}"
+                echo "evaluation_run_id=${evaluation_run_id}"
+                echo "passed=${passed}"
+                echo "staged=false"
+                echo "inactive_color="
+              } >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            promote_json="$("${ssh_cmd[@]}" "${remote_prefix} && APP_SERVICE=app_demo_blue infra/scripts/run-self-improve.sh promote --evaluation-run-id ${evaluation_run_id} --reason github_actions_self_improve")"
             printf '%s\n' "${promote_json}" > promote.json
+            jq -e 'type == "object"' promote.json >/dev/null
             inactive_color="$(jq -r '.inactive_color // empty' promote.json)"
             if [[ -z "${inactive_color}" ]]; then
               echo "Inactive color missing from promote output" >&2
@@ -173,6 +249,7 @@ jobs:
             echo "- Evaluation run: \`${evaluation_run_id}\`"
             echo "- Passed: \`${passed}\`"
             echo "- Staged on inactive color: \`${staged}\`"
+            echo "- Ready for promotion: \`${ready_for_promotion}\`"
             if [[ -n "${inactive_color}" ]]; then
               echo "- Inactive color restarted: \`${inactive_color}\`"
             fi
