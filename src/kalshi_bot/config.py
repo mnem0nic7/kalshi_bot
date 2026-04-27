@@ -299,6 +299,7 @@ class Settings(BaseSettings):
     historical_pipeline_chunk_days: int = 14
     historical_pipeline_daily_run_seconds: int = 86400
     historical_pipeline_incremental_days: int = 7
+    decision_corpus_auto_promote_interval_seconds: int = 86400
     strategy_regression_daily_run_seconds: int = 86400
     strategy_regression_promote_floor_clusters: int = 30
     strategy_regression_min_clusters_for_ranking: int = 3

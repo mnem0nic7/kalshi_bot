@@ -575,11 +575,29 @@ class DaemonService:
     async def _maybe_run_decision_corpus_promotion(self) -> dict[str, Any] | None:
         if self.decision_corpus_service is None:
             return None
+        checkpoint_name = f"daemon_decision_corpus_promotion:{self.settings.kalshi_env}:{self.settings.app_color}"
+        last_run_at = await self._checkpoint_time(checkpoint_name)
+        now = self._utc_now()
+        min_interval = timedelta(seconds=max(3600, self.settings.decision_corpus_auto_promote_interval_seconds))
+        if last_run_at is not None and now - last_run_at < min_interval:
+            return None
         try:
-            return await self.decision_corpus_service.nightly_auto_promote(
+            result = await self.decision_corpus_service.nightly_auto_promote(
                 kalshi_env=self.settings.kalshi_env,
                 actor=f"daemon:{self.settings.app_color}",
             )
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                await repo.set_checkpoint(
+                    checkpoint_name,
+                    None,
+                    {
+                        "ran_at": now.isoformat(),
+                        "result": result,
+                    },
+                )
+                await session.commit()
+            return result
         except Exception:
             logger.warning("decision corpus auto-promotion failed", exc_info=True)
             return None

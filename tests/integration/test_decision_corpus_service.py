@@ -488,11 +488,10 @@ async def test_nightly_auto_promotion_rejects_non_full_replay_provenance(tmp_pat
         now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC),
     )
 
-    assert result["status"] == "failed"
-    assert result["reason"] == "promotion_gates_failed"
-    assert result["gates"]["failed"] == ["source_provenance"]
-    assert result["gates"]["checks"]["source_provenance"]["disallowed_rows"] == 50
-    assert result["gates"]["checks"]["source_provenance"]["disallowed_by_source_provenance"] == {
+    assert result["status"] == "skipped"
+    assert result["reason"] == "source_provenance"
+    assert result["trigger"]["source_provenance"]["disallowed_rows"] == 50
+    assert result["trigger"]["source_provenance"]["disallowed_by_source_provenance"] == {
         "historical_replay_partial_checkpoint": 50
     }
     assert (await harness.service.current(kalshi_env="demo"))["status"] == "missing"

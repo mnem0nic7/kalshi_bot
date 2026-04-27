@@ -478,6 +478,13 @@ class DecisionCorpusService:
             return {"status": "skipped", "reason": "promotion_interval", "trigger": trigger}
         if metrics["new_resolved_rooms"] < AUTO_PROMOTION_TRIGGER_NEW_RESOLVED_ROOMS:
             return {"status": "skipped", "reason": "new_resolved_rooms", "trigger": trigger}
+        if provenance_metrics["total_rows"] > 0 and provenance_metrics["allowed_rows"] == 0:
+            return {
+                "status": "skipped",
+                "reason": "source_provenance",
+                "kalshi_env": env,
+                "trigger": trigger,
+            }
 
         gates = await self._promotion_gates(
             kalshi_env=env,

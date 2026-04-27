@@ -540,6 +540,19 @@ async def test_daemon_heartbeat_runs_decision_corpus_promotion_path(tmp_path) ->
 
     assert decision_corpus.calls == [{"kalshi_env": "demo", "actor": "daemon:blue"}]
     assert payload["decision_corpus_promotion"]["reason"] == "new_resolved_rooms"
+    async with session_factory() as session:
+        checkpoint = (
+            await session.execute(
+                select(Checkpoint).where(Checkpoint.stream_name == "daemon_decision_corpus_promotion:demo:blue")
+            )
+        ).scalar_one()
+        await session.commit()
+    assert checkpoint.payload["result"]["reason"] == "new_resolved_rooms"
+
+    second_payload = await daemon.heartbeat_once()
+
+    assert decision_corpus.calls == [{"kalshi_env": "demo", "actor": "daemon:blue"}]
+    assert "decision_corpus_promotion" not in second_payload
 
     await engine.dispose()
 
