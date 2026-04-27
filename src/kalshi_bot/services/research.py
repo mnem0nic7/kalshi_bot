@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -48,6 +49,9 @@ try:
     from duckduckgo_search import DDGS
 except Exception:  # pragma: no cover - optional dependency protection
     DDGS = None  # type: ignore[assignment]
+
+
+logger = logging.getLogger(__name__)
 
 
 PRIMARY_DOMAINS = {
@@ -110,6 +114,41 @@ def _to_iso(value: datetime | None) -> str | None:
     return value.astimezone(UTC).isoformat() if value is not None else None
 
 
+def _exception_payload(exc: Exception, *, market_ticker: str, trigger_reason: str) -> dict[str, Any]:
+    error_type = str(getattr(exc, "error_type", "") or type(exc).__name__)
+    endpoint = getattr(exc, "endpoint", None)
+    status_code = getattr(exc, "status_code", None)
+    message = str(exc).strip()
+    if not message:
+        message = f"{error_type} while refreshing {market_ticker}"
+        if endpoint:
+            message = f"{message} via {endpoint}"
+    payload: dict[str, Any] = {
+        "market_ticker": market_ticker,
+        "trigger_reason": trigger_reason,
+        "error": message,
+        "error_type": error_type,
+    }
+    if endpoint:
+        payload["endpoint"] = str(endpoint)
+    if status_code is not None:
+        payload["status_code"] = status_code
+    return payload
+
+
+def _checkpoint_age_seconds(checkpoint_payload: dict[str, Any], key: str, *, now: datetime) -> float | None:
+    raw_value = checkpoint_payload.get(key)
+    if not raw_value:
+        return None
+    try:
+        recorded_at = datetime.fromisoformat(str(raw_value))
+    except ValueError:
+        return None
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=UTC)
+    return (now - recorded_at.astimezone(UTC)).total_seconds()
+
+
 class WebSynthesisPayload(BaseModel):
     narrative: str
     bullish_case: str
@@ -145,7 +184,7 @@ class ResearchCoordinator:
 
     async def get_latest_dossier(self, market_ticker: str) -> ResearchDossier | None:
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             record = await repo.get_research_dossier(market_ticker)
             await session.commit()
         if record is None:
@@ -154,7 +193,7 @@ class ResearchCoordinator:
 
     async def list_recent_runs(self, market_ticker: str, limit: int = 10, *, status: str | None = None) -> list[dict[str, Any]]:
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             runs = await repo.list_research_runs(market_ticker=market_ticker, status=status, limit=limit)
             await session.commit()
         return [
@@ -318,12 +357,30 @@ class ResearchCoordinator:
                 await session.commit()
                 return dossier
             except Exception as exc:
-                await repo.complete_research_run(run.id, status="failed", payload={}, error_text=str(exc))
+                error_payload = _exception_payload(
+                    exc,
+                    market_ticker=market_ticker,
+                    trigger_reason=trigger_reason,
+                )
+                await repo.complete_research_run(
+                    run.id,
+                    status="failed",
+                    payload={"error": error_payload},
+                    error_text=error_payload["error"],
+                )
                 await repo.log_ops_event(
                     severity="error",
                     summary=f"Research refresh failed for {market_ticker}",
                     source="research",
-                    payload={"market_ticker": market_ticker, "error": str(exc)},
+                    payload=error_payload,
+                )
+                await repo.set_checkpoint(
+                    f"research_refresh_failed:{self.settings.kalshi_env}:{market_ticker}",
+                    cursor=None,
+                    payload={
+                        "failed_at": datetime.now(UTC).isoformat(),
+                        **error_payload,
+                    },
                 )
                 await session.commit()
                 raise
@@ -335,6 +392,10 @@ class ResearchCoordinator:
             return
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            if control.active_color != self.settings.app_color:
+                await session.commit()
+                return
             checkpoint = await repo.get_checkpoint(f"research_refresh:{market_ticker}")
             if checkpoint is not None:
                 last_refresh = checkpoint.payload.get("refreshed_at")
@@ -343,6 +404,17 @@ class ResearchCoordinator:
                     if datetime.now(UTC) - refreshed_at < timedelta(seconds=self.settings.research_refresh_cooldown_seconds):
                         await session.commit()
                         return
+            failed_checkpoint = await repo.get_checkpoint(
+                f"research_refresh_failed:{self.settings.kalshi_env}:{market_ticker}"
+            )
+            if failed_checkpoint is not None:
+                age_seconds = _checkpoint_age_seconds(failed_checkpoint.payload, "failed_at", now=datetime.now(UTC))
+                if (
+                    age_seconds is not None
+                    and age_seconds < self.settings.research_refresh_failed_cooldown_seconds
+                ):
+                    await session.commit()
+                    return
             market_state = await repo.get_market_state(market_ticker)
             dossier_record = await repo.get_research_dossier(market_ticker)
             await session.commit()
@@ -370,6 +442,10 @@ class ResearchCoordinator:
     async def _refresh_task(self, market_ticker: str) -> None:
         try:
             await self.refresh_market_dossier(market_ticker, trigger_reason="market_event")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.info("Background research refresh failed for %s; failure was recorded", market_ticker)
         finally:
             self._inflight_markets.discard(market_ticker)
 

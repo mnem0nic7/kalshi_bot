@@ -78,6 +78,9 @@ class Settings(BaseSettings):
 
     weather_user_agent: str = "kalshi-bot/0.1 (ops@example.com)"
     weather_market_map_path: str = "docs/examples/weather_markets.example.yaml"
+    weather_request_timeout_seconds: float = 30.0
+    weather_retry_attempts: int = 3
+    weather_retry_base_delay_seconds: float = 0.25
 
     llm_hosted_base_url: str = "https://api.openai.com/v1"
     llm_hosted_api_key: str | None = Field(
@@ -104,6 +107,7 @@ class Settings(BaseSettings):
     llm_trading_enabled: bool = False
 
     trigger_broken_book_retry_seconds: int = 30
+    research_refresh_failed_cooldown_seconds: int = 300
     risk_order_pct: float = 0.05
     risk_position_pct: float = 0.10
     risk_daily_loss_pct: float = 0.20

@@ -288,9 +288,18 @@ class DaemonService:
         return selected_markets
 
     async def _handle_market_update(self, market_ticker: str) -> None:
+        if not await self._is_active_color():
+            return
         await self.research_coordinator.handle_market_update(market_ticker)
         if self._auto_trigger_enabled_for_run:
             await self.auto_trigger_service.handle_market_update(market_ticker)
+
+    async def _is_active_color(self) -> bool:
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            await session.commit()
+        return control.active_color == self.settings.app_color
 
     async def _periodic_reconcile_loop(self) -> None:
         while True:
@@ -317,6 +326,8 @@ class DaemonService:
             await asyncio.sleep(self.settings.daemon_market_history_interval_seconds)
             if self.market_history_service is None:
                 continue
+            if not await self._is_active_color():
+                continue
             try:
                 await self.market_history_service.snapshot_once()
                 await self.market_history_service.purge_once()
@@ -329,6 +340,8 @@ class DaemonService:
             await asyncio.sleep(interval)
             if self.strategy_cleanup_service is None:
                 continue
+            if not await self._is_active_color():
+                continue
             try:
                 await self.strategy_cleanup_service.sweep()
             except Exception:
@@ -339,6 +352,8 @@ class DaemonService:
         while True:
             await asyncio.sleep(interval)
             if self.monotonicity_arb_service is None:
+                continue
+            if not await self._is_active_color():
                 continue
             try:
                 await self.monotonicity_arb_service.sweep()

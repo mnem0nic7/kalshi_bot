@@ -18,11 +18,15 @@ from kalshi_bot.weather.models import WeatherMarketMapping
 
 
 class FakeStreamService:
-    def __init__(self) -> None:
+    def __init__(self, *, updates: list[str] | None = None) -> None:
         self.calls: list[list[str]] = []
+        self.updates = updates or []
 
     async def stream(self, *, market_tickers, include_private, max_messages, on_market_update=None):
         self.calls.append(list(market_tickers))
+        if on_market_update is not None:
+            for ticker in self.updates:
+                await on_market_update(ticker)
         return 3
 
 
@@ -49,7 +53,11 @@ class FailingReconciliationService(FakeReconciliationService):
 
 
 class FakeAutoTriggerService:
+    def __init__(self) -> None:
+        self.market_updates: list[str] = []
+
     async def handle_market_update(self, market_ticker: str) -> None:
+        self.market_updates.append(market_ticker)
         return None
 
     async def wait_for_tasks(self) -> None:
@@ -57,7 +65,11 @@ class FakeAutoTriggerService:
 
 
 class FakeResearchCoordinator:
+    def __init__(self) -> None:
+        self.market_updates: list[str] = []
+
     async def handle_market_update(self, market_ticker: str) -> None:
+        self.market_updates.append(market_ticker)
         return None
 
     async def wait_for_tasks(self) -> None:
@@ -376,6 +388,58 @@ async def test_daemon_heartbeat_uses_settings_kalshi_env_for_control_state(tmp_p
     assert payload["kill_switch_enabled"] is False
     assert checkpoint.payload["kalshi_env"] == "production"
     assert checkpoint.payload["active_color"] == "blue"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_inactive_daemon_color_does_not_run_market_update_side_effects(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-inactive-color.db",
+        kalshi_env="demo",
+        app_color="green",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        trigger_enable_auto_rooms=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(
+            "green",
+            kalshi_env="demo",
+            initial_active_color="blue",
+            initial_kill_switch_enabled=False,
+        )
+        await session.commit()
+
+    stream_service = FakeStreamService(updates=["WX-TEST"])
+    research = FakeResearchCoordinator()
+    auto_trigger = FakeAutoTriggerService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        stream_service,  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        research,  # type: ignore[arg-type]
+        auto_trigger,  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+    )
+
+    result = await daemon.run(max_messages=1)
+
+    assert result["completed"] == "stream"
+    assert stream_service.calls == [["WX-DISCOVERED"]]
+    assert research.market_updates == []
+    assert auto_trigger.market_updates == []
 
     await engine.dispose()
 
