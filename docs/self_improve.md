@@ -75,6 +75,9 @@ kalshi-bot-cli self-improve promote --evaluation-run-id <EVALUATION_RUN_ID>
 kalshi-bot-cli self-improve rollback --reason manual_rollback
 kalshi-bot-cli decision-trace show <DECISION_TRACE_ID>
 kalshi-bot-cli decision-trace replay <DECISION_TRACE_ID>
+kalshi-bot-cli parameter-pack default
+kalshi-bot-cli parameter-pack validate candidate-pack.json
+kalshi-bot-cli parameter-pack gate --candidate-report candidate-holdout.json --current-report current-holdout.json
 ```
 
 The helper scripts wrap the same flow for Docker blue or green deployments:

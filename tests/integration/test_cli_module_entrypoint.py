@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -113,6 +114,131 @@ def test_python_module_cli_exposes_decision_trace_show_and_replay() -> None:
     assert command_help.returncode == 0
     assert "show" in command_help.stdout
     assert "replay" in command_help.stdout
+
+
+def test_python_module_cli_exposes_parameter_pack_commands() -> None:
+    top_level = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    command_help = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "parameter-pack", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    gate_help = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "parameter-pack", "gate", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert top_level.returncode == 0
+    assert "parameter-pack" in top_level.stdout
+    assert command_help.returncode == 0
+    assert "validate" in command_help.stdout
+    assert "gate" in command_help.stdout
+    assert "seed-default" in command_help.stdout
+    assert gate_help.returncode == 0
+    assert "--candidate-report" in gate_help.stdout
+    assert "--current-report" in gate_help.stdout
+
+
+def test_parameter_pack_validate_cli_sanitizes_candidate_json(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/parameter-pack-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+    candidate = {
+        "version": "candidate-v1",
+        "status": "candidate",
+        "parameters": {
+            "pseudo_count": 999,
+            "kelly_fraction": -1.0,
+            "max_position_usd": 10_000,
+        },
+    }
+    candidate_path = tmp_path / "candidate.json"
+    candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "parameter-pack", "validate", str(candidate_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["pack"]["parameters"]["pseudo_count"] == 32
+    assert payload["pack"]["parameters"]["kelly_fraction"] == 0.01
+    assert payload["dropped_hard_cap_parameters"] == ["max_position_usd"]
+
+
+def test_parameter_pack_gate_cli_returns_success_for_passing_reports(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/parameter-pack-gate-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+    current_path = tmp_path / "current.json"
+    candidate_path = tmp_path / "candidate.json"
+    current_path.write_text(
+        json.dumps(
+            {
+                "coverage": 0.98,
+                "brier": 0.20,
+                "ece": 0.05,
+                "sharpe": 1.0,
+                "max_drawdown": 0.10,
+                "city_win_rates": {"NY": 0.58},
+                "pack_hash": "current",
+                "rerun_pack_hash": "current",
+            }
+        ),
+        encoding="utf-8",
+    )
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "coverage": 0.97,
+                "brier": 0.19,
+                "ece": 0.04,
+                "sharpe": 0.98,
+                "max_drawdown": 0.09,
+                "city_win_rates": {"NY": 0.56},
+                "hard_cap_touches": 0,
+                "pack_hash": "candidate",
+                "rerun_pack_hash": "candidate",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "parameter-pack",
+            "gate",
+            "--candidate-report",
+            str(candidate_path),
+            "--current-report",
+            str(current_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["passed"] is True
+    assert payload["failures"] == []
 
 
 @pytest.mark.asyncio

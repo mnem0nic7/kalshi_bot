@@ -105,6 +105,7 @@ def test_self_improve_workflow_requires_promotion_readiness_before_staging() -> 
 def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     autonomy = Path("docs/deterministic_autonomy_plan.md").read_text(encoding="utf-8")
     architecture = Path("docs/architecture.md").read_text(encoding="utf-8")
+    self_improve = Path("docs/self_improve.md").read_text(encoding="utf-8")
     strategy = Path("docs/strategy/weather-temp-taker.md").read_text(encoding="utf-8")
 
     assert "Score: **8.2/10**" in autonomy
@@ -130,6 +131,8 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "source health logs" in architecture
     assert "parameter packs" in architecture
     assert "zero-weight fallback" in architecture
+    assert "parameter-pack validate" in self_improve
+    assert "parameter-pack gate" in self_improve
     assert "decision-trace replay" in strategy
 
 
