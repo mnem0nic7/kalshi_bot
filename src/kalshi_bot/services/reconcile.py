@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from kalshi_bot.config import get_settings
+from kalshi_bot.config import Settings, get_settings
 from kalshi_bot.core.fixed_point import as_decimal, quantize_count, quantize_price
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
@@ -62,8 +62,9 @@ class ReconcileSummary:
 
 
 class ReconciliationService:
-    def __init__(self, kalshi: KalshiClient) -> None:
+    def __init__(self, kalshi: KalshiClient, settings: Settings | None = None) -> None:
         self.kalshi = kalshi
+        self.settings = settings or get_settings()
 
     async def reconcile(self, repo: PlatformRepository, *, subaccount: int = 0, kalshi_env: str = "") -> ReconcileSummary:
         historical_cutoff = await self.kalshi.get_historical_cutoff()
@@ -154,7 +155,7 @@ class ReconciliationService:
         await repo.settle_fills(settlements, kalshi_env=kalshi_env)
         await refresh_stop_loss_checkpoints(
             repo,
-            settings=get_settings(),
+            settings=self.settings,
             kalshi_env=kalshi_env,
             subaccount=subaccount,
         )

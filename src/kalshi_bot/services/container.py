@@ -168,7 +168,7 @@ class AppContainer:
             discovery_service,
             retention_hours=settings.daemon_market_history_retention_hours,
         )
-        reconciliation_service = ReconciliationService(kalshi)
+        reconciliation_service = ReconciliationService(kalshi, settings)
         stream_service = MarketStreamService(settings, session_factory, kalshi_ws)
         training_export_service = TrainingExportService(session_factory)
         historical_heuristic_service = HistoricalHeuristicService(settings)

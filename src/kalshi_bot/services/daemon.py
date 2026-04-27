@@ -101,7 +101,7 @@ class DaemonService:
 
     async def _recover_orphaned_rooms(self) -> None:
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             reaped_ids = await repo.reap_orphaned_rooms(
                 color=self.settings.app_color,
                 kalshi_env=self.settings.kalshi_env,
@@ -122,7 +122,7 @@ class DaemonService:
 
     async def reconcile_once(self) -> dict[str, Any]:
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             summary = await self.reconciliation_service.reconcile(
                 repo,
                 subaccount=self.settings.kalshi_subaccount,
@@ -157,7 +157,7 @@ class DaemonService:
             "heartbeat_at": self._now_iso(),
         }
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             control = await repo.get_deployment_control()
             active_rooms = await repo.count_active_rooms(kalshi_env=self.settings.kalshi_env)
             checkpoint = await repo.get_checkpoint(f"reconcile:{self.settings.kalshi_env}")
@@ -274,7 +274,7 @@ class DaemonService:
     async def _select_stream_markets(self, markets: list[str] | None) -> list[str]:
         selected_markets = list(dict.fromkeys(markets or await self.discovery_service.list_stream_markets()))
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             positions = await repo.list_positions(
                 limit=5000,
                 kalshi_env=self.settings.kalshi_env,
@@ -408,7 +408,7 @@ class DaemonService:
         except Exception as exc:
             logger.exception("daemon heartbeat follow-up failed")
             async with self.session_factory() as session:
-                repo = PlatformRepository(session)
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                 await repo.log_ops_event(
                     severity="error",
                     summary="Daemon heartbeat follow-up error",
@@ -458,7 +458,7 @@ class DaemonService:
             summary = await self.training_corpus_service.get_settlement_focus_summary()
 
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             await repo.log_ops_event(
                 severity="info",
                 summary="Settlement follow-up reconcile triggered",
@@ -485,7 +485,7 @@ class DaemonService:
         except Exception as exc:
             logger.warning("settlement follow-up reconcile failed", exc_info=True)
             async with self.session_factory() as session:
-                repo = PlatformRepository(session)
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                 await repo.log_ops_event(
                     severity="warning",
                     summary="Settlement follow-up reconcile failed",
@@ -536,7 +536,7 @@ class DaemonService:
             )
         )
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             await repo.set_checkpoint(
                 f"daemon_historical_intelligence:{self.settings.kalshi_env}:{self.settings.app_color}",
                 None,
@@ -560,7 +560,7 @@ class DaemonService:
             return None
         result = await self.historical_pipeline_service.daily()
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             await repo.set_checkpoint(
                 f"daemon_historical_pipeline:{self.settings.kalshi_env}:{self.settings.app_color}",
                 None,
@@ -587,7 +587,7 @@ class DaemonService:
                 actor=f"daemon:{self.settings.app_color}",
             )
             async with self.session_factory() as session:
-                repo = PlatformRepository(session)
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                 await repo.set_checkpoint(
                     checkpoint_name,
                     None,
@@ -640,7 +640,7 @@ class DaemonService:
 
         checkpoint_name = f"daemon_strategy_codex_nightly:{self.settings.kalshi_env}:{self.settings.app_color}"
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             checkpoint = await repo.get_checkpoint(checkpoint_name)
             await session.commit()
         if checkpoint is not None and isinstance(checkpoint.payload, dict):
@@ -762,7 +762,7 @@ class DaemonService:
 
     async def _set_nightly_codex_checkpoint(self, stream_name: str, payload: dict[str, Any]) -> None:
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             await repo.set_checkpoint(
                 stream_name,
                 None,
@@ -775,7 +775,7 @@ class DaemonService:
 
     async def _log_daemon_event(self, *, severity: str, summary: str, payload: dict[str, Any]) -> None:
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             await repo.log_ops_event(
                 severity=severity,
                 summary=summary,
@@ -813,7 +813,7 @@ class DaemonService:
 
         checkpoint_name = f"nightly_momentum_calibration_run:{self.settings.kalshi_env}:{self.settings.app_color}"
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             checkpoint = await repo.get_checkpoint(checkpoint_name)
             await session.commit()
         if checkpoint is not None and isinstance(checkpoint.payload, dict):
@@ -853,7 +853,7 @@ class DaemonService:
 
     async def _checkpoint_time(self, stream_name: str) -> datetime | None:
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             checkpoint = await repo.get_checkpoint(stream_name)
             await session.commit()
         if checkpoint is None or not isinstance(checkpoint.payload, dict):

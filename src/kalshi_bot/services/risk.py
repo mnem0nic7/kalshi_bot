@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 from typing import Any
 
 from kalshi_bot.config import Settings
@@ -11,6 +11,7 @@ from kalshi_bot.core.fixed_point import as_decimal, quantize_count
 from kalshi_bot.core.schemas import PortfolioBucketSnapshot, RiskVerdictPayload, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.agent_packs import RuntimeThresholds
+from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.risk_policy import probability_midband_block_reason
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
 from kalshi_bot.services.strategy_cleanup import CleanupSignal
@@ -40,6 +41,34 @@ def _quantize_money(value: Any) -> Decimal:
 
 def _ticket_unit_notional(ticket: TradeTicket) -> Decimal:
     return ticket.yes_price_dollars if ticket.side.value == "yes" else Decimal("1.0000") - ticket.yes_price_dollars
+
+
+def _fee_adjusted_edge_for_count(
+    *,
+    settings: Settings,
+    contract_price: Decimal,
+    count_fp: Decimal,
+    gross_edge_bps: int,
+) -> tuple[Decimal, int, int]:
+    fee_estimate_dollars = estimate_kalshi_taker_fee_dollars(
+        price_dollars=contract_price,
+        count=count_fp,
+        fee_rate=Decimal(str(settings.kalshi_taker_fee_rate)),
+    )
+    fee_estimate_dollars_per_contract = (
+        (fee_estimate_dollars / count_fp).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_CEILING,
+        )
+        if count_fp > Decimal("0")
+        else Decimal("0.0000")
+    )
+    fee_edge_bps = int(
+        (fee_estimate_dollars_per_contract * Decimal("10000")).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
+    return fee_estimate_dollars_per_contract, fee_edge_bps, gross_edge_bps - fee_edge_bps
 
 
 def _bucket_fit_count(*, available_notional_dollars: Decimal, ticket: TradeTicket) -> Decimal | None:
@@ -109,10 +138,15 @@ class DeterministicRiskEngine:
         order_notional = _quantize_money(estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, ticket.count_fp))
         approved_count = ticket.count_fp
         approved_notional = order_notional
+        gross_edge_bps = signal.edge_bps
+        fee_estimate_dollars_per_contract: Decimal | None = None
+        fee_edge_bps: int | None = None
+        net_edge_bps: int | None = None
         bucket_limit_dollars: Decimal | None = None
         bucket_used_dollars_before: Decimal | None = None
         bucket_used_dollars_after: Decimal | None = None
         resized_by_bucket = False
+        resized_by_count_cap = False
 
         if control.kill_switch_enabled:
             block("Global kill switch is enabled.")
@@ -146,9 +180,20 @@ class DeterministicRiskEngine:
                 f"Contract price {contract_price} is below minimum {min_price}; "
                 f"market has priced this as nearly impossible."
             )
+        if self.settings.risk_fee_aware_edge_enabled:
+            (
+                fee_estimate_dollars_per_contract,
+                fee_edge_bps,
+                net_edge_bps,
+            ) = _fee_adjusted_edge_for_count(
+                settings=self.settings,
+                contract_price=contract_price,
+                count_fp=ticket.count_fp,
+                gross_edge_bps=gross_edge_bps,
+            )
         probability_reason = probability_midband_block_reason(
             fair_yes=signal.fair_yes_dollars,
-            edge_bps=signal.edge_bps,
+            edge_bps=net_edge_bps if net_edge_bps is not None else signal.edge_bps,
             base_min_edge_bps=active_thresholds.risk_min_edge_bps,
             extremity_pct=self.settings.risk_min_probability_extremity_pct,
             max_extra_edge_bps=getattr(self.settings, "risk_probability_midband_max_extra_edge_bps", 500),
@@ -179,13 +224,42 @@ class DeterministicRiskEngine:
                 f"Existing {context.current_position_side} position in {room.market_ticker} "
                 f"blocks opposite-side {ticket.side.value} entry."
             )
-        if float(effective_position_count_fp) >= self.settings.risk_max_position_count_fp_per_ticker:
+        max_position_count_fp = Decimal(str(self.settings.risk_max_position_count_fp_per_ticker))
+        if effective_position_count_fp >= max_position_count_fp:
             block(
                 f"Position + in-flight orders in {room.market_ticker} at {effective_position_count_fp} contracts "
                 f"(max {self.settings.risk_max_position_count_fp_per_ticker:.0f})."
             )
+        else:
+            projected_position_count_fp = effective_position_count_fp + approved_count
+            if projected_position_count_fp > max_position_count_fp:
+                fitted_count = quantize_count(
+                    (max_position_count_fp - effective_position_count_fp).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_DOWN,
+                    )
+                )
+                if fitted_count < Decimal("1.00"):
+                    block(
+                        f"Projected position + in-flight orders in {room.market_ticker} would reach "
+                        f"{projected_position_count_fp} contracts "
+                        f"(max {self.settings.risk_max_position_count_fp_per_ticker:.0f})."
+                    )
+                else:
+                    original_count = approved_count
+                    approved_count = fitted_count
+                    approved_notional = _quantize_money(
+                        estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, approved_count)
+                    )
+                    order_notional = approved_notional
+                    resized_by_count_cap = True
+                    note(
+                        f"Ticket downsized from {original_count:.2f} to {approved_count:.2f} contracts "
+                        f"to fit the per-ticker count cap."
+                    )
 
-        if context.open_ticker_count >= self.settings.risk_max_concurrent_tickers:
+        opens_new_ticker = context.current_position_count_fp <= 0 and context.pending_order_count_fp <= 0
+        if opens_new_ticker and context.open_ticker_count >= self.settings.risk_max_concurrent_tickers:
             block(
                 f"Portfolio already has {context.open_ticker_count} open tickers "
                 f"(max {self.settings.risk_max_concurrent_tickers})."
@@ -263,6 +337,38 @@ class DeterministicRiskEngine:
                         f"to fit the {capital_bucket} capital bucket."
                     )
 
+        if self.settings.risk_fee_aware_edge_enabled:
+            (
+                fee_estimate_dollars_per_contract,
+                fee_edge_bps,
+                net_edge_bps,
+            ) = _fee_adjusted_edge_for_count(
+                settings=self.settings,
+                contract_price=contract_price,
+                count_fp=approved_count,
+                gross_edge_bps=gross_edge_bps,
+            )
+            if net_edge_bps < active_thresholds.risk_min_edge_bps:
+                block(
+                    f"Fee-adjusted edge {net_edge_bps}bps is below configured minimum of "
+                    f"{active_thresholds.risk_min_edge_bps}bps "
+                    f"(gross {gross_edge_bps}bps, estimated taker fee {fee_edge_bps}bps)."
+                )
+            else:
+                note(
+                    f"Fee-adjusted edge {net_edge_bps}bps clears the configured minimum "
+                    f"of {active_thresholds.risk_min_edge_bps}bps."
+                )
+            final_probability_reason = probability_midband_block_reason(
+                fair_yes=signal.fair_yes_dollars,
+                edge_bps=net_edge_bps,
+                base_min_edge_bps=active_thresholds.risk_min_edge_bps,
+                extremity_pct=self.settings.risk_min_probability_extremity_pct,
+                max_extra_edge_bps=getattr(self.settings, "risk_probability_midband_max_extra_edge_bps", 500),
+            )
+            if final_probability_reason is not None:
+                block(final_probability_reason)
+
         if room.shadow_mode:
             note("Room is in shadow mode; execution will be simulated.")
 
@@ -270,6 +376,10 @@ class DeterministicRiskEngine:
         return RiskVerdictPayload(
             status=status,
             reasons=reasons or ["All deterministic checks passed."],
+            gross_edge_bps=gross_edge_bps,
+            fee_edge_bps=fee_edge_bps,
+            net_edge_bps=net_edge_bps,
+            fee_estimate_dollars_per_contract=fee_estimate_dollars_per_contract,
             approved_notional_dollars=approved_notional if status == RiskStatus.APPROVED else None,
             approved_count_fp=approved_count if status == RiskStatus.APPROVED else None,
             capital_bucket=capital_bucket,
@@ -279,6 +389,7 @@ class DeterministicRiskEngine:
                 bucket_used_dollars_after if status == RiskStatus.APPROVED else bucket_used_dollars_before
             ),
             resized_by_bucket=resized_by_bucket if status == RiskStatus.APPROVED else False,
+            resized_by_count_cap=resized_by_count_cap if status == RiskStatus.APPROVED else False,
         )
 
 

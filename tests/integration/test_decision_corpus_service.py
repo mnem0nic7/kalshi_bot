@@ -15,7 +15,7 @@ from kalshi_bot.db.models import OpsEvent
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.decision_corpus import DecisionCorpusService
-from kalshi_bot.services.fee_model import KALSHI_TAKER_FEE_V1
+from kalshi_bot.services.fee_model import KALSHI_TAKER_FEE_V2
 
 
 async def _setup(tmp_path) -> SimpleNamespace:
@@ -233,10 +233,10 @@ async def test_build_creates_rows_with_pnl_nulls_support_and_provenance(tmp_path
     by_ticker = {row.market_ticker: row for row in rows}
     yes_row = by_ticker["KXHIGHNY-26APR20-T80"]
     assert yes_row.pnl_counterfactual_target_frictionless == Decimal("0.400000")
-    assert yes_row.fee_counterfactual_dollars == Decimal("0.016800")
-    assert yes_row.pnl_counterfactual_target_with_fees == Decimal("0.383200")
+    assert yes_row.fee_counterfactual_dollars == Decimal("0.020000")
+    assert yes_row.pnl_counterfactual_target_with_fees == Decimal("0.380000")
     assert yes_row.pnl_model_fair_frictionless == Decimal("0.450000")
-    assert yes_row.fee_model_version == KALSHI_TAKER_FEE_V1
+    assert yes_row.fee_model_version == KALSHI_TAKER_FEE_V2
     assert yes_row.source_provenance == "historical_replay_full_checkpoint"
     assert yes_row.station_id == "KNYC"
     assert yes_row.time_to_settlement_at_checkpoint_minutes is not None
@@ -247,7 +247,7 @@ async def test_build_creates_rows_with_pnl_nulls_support_and_provenance(tmp_path
     no_row = by_ticker["KXHIGHNY-26APR20-T85"]
     assert no_row.recommended_side == "no"
     assert no_row.pnl_counterfactual_target_frictionless == Decimal("0.400000")
-    assert no_row.pnl_counterfactual_target_with_fees == Decimal("0.383200")
+    assert no_row.pnl_counterfactual_target_with_fees == Decimal("0.380000")
     assert no_row.pnl_model_fair_frictionless == Decimal("0.550000")
 
     stand_down = by_ticker["KXHIGHNY-26APR20-T90"]

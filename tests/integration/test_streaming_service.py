@@ -183,6 +183,76 @@ async def test_streaming_service_deduplicates_fill_events_by_trade_id(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_streaming_service_persists_private_events_in_active_settings_env(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/stream-env.db",
+        kalshi_env="production",
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = MarketStreamService(settings, session_factory, DummyWebSocketClient())  # type: ignore[arg-type]
+
+    messages = [
+        {
+            "type": "orderbook_snapshot",
+            "sid": 4,
+            "seq": 1,
+            "msg": {
+                "market_ticker": "WX-ENV",
+                "yes_dollars_fp": [["0.4300", "4.00"]],
+                "no_dollars_fp": [["0.5200", "6.00"]],
+            },
+        },
+        {
+            "type": "user_order",
+            "sid": 8,
+            "msg": {
+                "order_id": "ord-env",
+                "client_order_id": "client-env",
+                "ticker": "WX-ENV",
+                "status": "resting",
+                "side": "yes",
+                "action": "buy",
+                "yes_price_dollars": "0.4400",
+                "remaining_count_fp": "3.00",
+            },
+        },
+        {
+            "type": "fill",
+            "sid": 9,
+            "msg": {
+                "trade_id": "trade-env",
+                "market_ticker": "WX-ENV",
+                "side": "yes",
+                "action": "buy",
+                "yes_price_dollars": "0.4400",
+                "count_fp": "1.00",
+                "is_taker": True,
+            },
+        },
+    ]
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        for message in messages:
+            await service.process_message(repo, message)
+        await session.commit()
+
+        market_state = (await session.execute(select(MarketState).where(MarketState.market_ticker == "WX-ENV"))).scalar_one()
+        order = (await session.execute(select(OrderRecord).where(OrderRecord.client_order_id == "client-env"))).scalar_one()
+        fill = (await session.execute(select(FillRecord).where(FillRecord.trade_id == "trade-env"))).scalar_one()
+        checkpoint = (await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws:production:blue:4"))).scalar_one()
+
+    assert market_state.kalshi_env == "production"
+    assert order.kalshi_env == "production"
+    assert fill.kalshi_env == "production"
+    assert checkpoint.cursor == "1"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_streaming_service_handles_interleaved_market_sequences_by_sid(tmp_path) -> None:
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/stream-interleaved.db")
     engine = create_engine(settings)

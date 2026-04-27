@@ -265,7 +265,13 @@ class WorkflowSupervisor:
                     market_edge_bps = int((signal.fair_yes_dollars - mid) * Decimal("10000"))
                 else:
                     market_edge_bps = int((mid - signal.fair_yes_dollars) * Decimal("10000"))
-                signal.edge_bps = market_edge_bps
+                candidate_trace = dict(signal.candidate_trace or {})
+                candidate_trace["market_mid_edge_bps"] = market_edge_bps
+                signal.candidate_trace = candidate_trace
+                if signal.eligibility is not None:
+                    signal.eligibility = signal.eligibility.model_copy(
+                        update={"candidate_trace": candidate_trace}
+                    )
                 if market_edge_bps <= 0:
                     return _reject(
                         StandDownReason.NEGATIVE_MARKET_EDGE,

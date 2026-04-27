@@ -171,6 +171,7 @@ class Settings(BaseSettings):
     risk_stale_market_seconds: int = 60
     risk_stale_weather_seconds: int = 900
     risk_min_edge_bps: int = 500
+    risk_fee_aware_edge_enabled: bool = True
     risk_max_credible_edge_bps: int = 5000
     # PENDING_CALIBRATION: raised from 0.60 to 0.80 based on N=3 winning trades
     # (AUS-T86/CHI-T78/SFO-T70) all having confidence ≥ 0.80 at entry. Unblocking
@@ -442,15 +443,19 @@ class Settings(BaseSettings):
 
     @property
     def kalshi_rest_base_url(self) -> str:
-        if self.kalshi_env == "production":
+        if self._is_live_kalshi_env:
             return "https://api.elections.kalshi.com/trade-api/v2"
         return "https://demo-api.kalshi.co/trade-api/v2"
 
     @property
     def kalshi_websocket_url(self) -> str:
-        if self.kalshi_env == "production":
+        if self._is_live_kalshi_env:
             return "wss://api.elections.kalshi.com/trade-api/ws/v2"
         return "wss://demo-api.kalshi.co/trade-api/ws/v2"
+
+    @property
+    def _is_live_kalshi_env(self) -> bool:
+        return str(self.kalshi_env or "").strip().lower() in {"production", "prod", "live"}
 
     @property
     def weather_market_map_file(self) -> Path:
@@ -480,7 +485,7 @@ class Settings(BaseSettings):
         direct = self.kalshi_write_api_key_id if write else self.kalshi_read_api_key_id
         if direct:
             return direct
-        if self.kalshi_env == "production":
+        if self._is_live_kalshi_env:
             return self.live_kalshi_api_key
         return self.demo_kalshi_api_key
 
@@ -489,7 +494,7 @@ class Settings(BaseSettings):
         if raw:
             return Path(raw)
         env_specific = None
-        if self.kalshi_env == "production":
+        if self._is_live_kalshi_env:
             env_specific = self.live_kalshi_write_private_key_path if write else self.live_kalshi_read_private_key_path
             if env_specific is None and write:
                 env_specific = self.live_kalshi_read_private_key_path

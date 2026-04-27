@@ -54,8 +54,8 @@ class AutoTriggerService:
             return
 
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
-            control = await repo.get_deployment_control()
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             if control.active_color != self.settings.app_color:
                 await session.commit()
                 return

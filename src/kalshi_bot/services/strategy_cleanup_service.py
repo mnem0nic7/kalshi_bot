@@ -4,7 +4,8 @@ Fetches live weather observations and Kalshi quotes for every configured market,
 evaluates lock-confirmation gates via evaluate_cleanup_signal(), and persists
 StrategyCRoom records for signal-level audit trails.
 
-Not wired into the daemon yet (Session 8). CLI-only for Session 7.
+Wired into the daemon as an optional sweep loop. Live execution stays shadow
+unless the Strategy C settings explicitly graduate it.
 """
 from __future__ import annotations
 
@@ -334,8 +335,8 @@ class StrategyCleanupService:
 
     async def _load_control(self) -> DeploymentControl:
         async with self._session_factory() as session:
-            repo = PlatformRepository(session)
-            return await repo.get_deployment_control()
+            repo = PlatformRepository(session, kalshi_env=self._settings.kalshi_env)
+            return await repo.get_deployment_control(kalshi_env=self._settings.kalshi_env)
 
     async def _load_cli_variances(self) -> dict[str, float]:
         async with self._session_factory() as session:

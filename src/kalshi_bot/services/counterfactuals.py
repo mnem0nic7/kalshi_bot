@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
+
+from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 
 
 @dataclass(frozen=True)
@@ -104,14 +105,16 @@ def strategy_c_gross_edge_cents(
 def strategy_c_fee_cents(entry_price_dollars: float) -> float:
     """Kalshi taker fee per contract at ``entry_price_dollars`` (0..1).
 
-    Formula (§ fee schedule): ceil(0.07 * price * (1-price) * 100) cents.
-    Matches kalshi_fee_cents in services/monotonicity_scanner.py and is copied
-    here rather than imported to keep the counterfactual module dependency-free.
+    Uses the shared fee model so Strategy C shadow EV and live risk gates stay
+    aligned when fee rounding changes.
     """
-    price = max(0.0, min(1.0, entry_price_dollars))
-    raw_dollars = 0.07 * price * (1.0 - price) * 100
-    fee_dollars = math.ceil(raw_dollars) / 100.0
-    return fee_dollars * 100.0  # cents
+    price = Decimal(str(max(0.0, min(1.0, entry_price_dollars))))
+    fee_dollars = estimate_kalshi_taker_fee_dollars(
+        price_dollars=price,
+        count=Decimal("1"),
+        fee_rate=Decimal("0.07"),
+    )
+    return float(fee_dollars * Decimal("100"))
 
 
 def strategy_c_net_ev_per_fill_cents(

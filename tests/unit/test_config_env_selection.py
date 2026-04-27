@@ -19,6 +19,26 @@ def test_demo_prefixed_credentials_are_selected() -> None:
     assert settings.key_path(write=True) == Path("Kalshi-2-Demo.txt")
 
 
+@pytest.mark.parametrize("kalshi_env", ["production", "prod", "live"])
+def test_live_env_aliases_select_live_credentials_and_urls(kalshi_env: str) -> None:
+    settings = Settings(
+        kalshi_env=kalshi_env,
+        live_kalshi_api_key="live-key-id",
+        live_kalshi_read_private_key_path="Kalshi-1.txt",
+        live_kalshi_write_private_key_path="Kalshi-1.txt",
+        demo_kalshi_api_key="demo-key-id",
+        demo_kalshi_read_private_key_path="Kalshi-2-Demo.txt",
+        demo_kalshi_write_private_key_path="Kalshi-2-Demo.txt",
+    )
+
+    assert settings.api_key_id(write=False) == "live-key-id"
+    assert settings.api_key_id(write=True) == "live-key-id"
+    assert settings.key_path(write=False) == Path("Kalshi-1.txt")
+    assert settings.key_path(write=True) == Path("Kalshi-1.txt")
+    assert "demo-api" not in settings.kalshi_rest_base_url
+    assert "demo-api" not in settings.kalshi_websocket_url
+
+
 def test_database_url_is_derived_from_postgres_components() -> None:
     settings = Settings(
         database_url=None,

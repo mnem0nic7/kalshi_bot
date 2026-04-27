@@ -11,6 +11,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import ExecReceiptPayload, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.integrations.kalshi import KalshiClient
+from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,24 @@ _LIMIT_TIF = "gtc"
 _POLL_INTERVAL = 3
 _FILL_TIMEOUT = 30
 _MAX_REQUOTES = 3
+
+
+def _fee_adjusted_edge_dollars(
+    *,
+    settings: Settings,
+    edge_dollars: Decimal,
+    contract_price_dollars: Decimal,
+    count_fp: Decimal,
+) -> Decimal:
+    if not settings.risk_fee_aware_edge_enabled:
+        return edge_dollars
+    fee = estimate_kalshi_taker_fee_dollars(
+        price_dollars=contract_price_dollars,
+        count=count_fp,
+        fee_rate=Decimal(str(settings.kalshi_taker_fee_rate)),
+    )
+    fee_per_contract = fee / count_fp if count_fp > Decimal("0") else Decimal("0")
+    return edge_dollars - fee_per_contract
 
 
 class ExecutionService:
@@ -36,11 +55,23 @@ class ExecutionService:
         client_order_id: str,
         fair_yes_dollars: Decimal | None = None,
     ) -> ExecReceiptPayload:
+        if self.settings.app_shadow_mode:
+            return ExecReceiptPayload(
+                status="shadow_skipped",
+                client_order_id=client_order_id,
+                details={"reason": "app shadow mode"},
+            )
         if room.shadow_mode:
             return ExecReceiptPayload(
                 status="shadow_skipped",
                 client_order_id=client_order_id,
                 details={"reason": "room is in shadow mode"},
+            )
+        if control.kill_switch_enabled:
+            return ExecReceiptPayload(
+                status="kill_switch_blocked",
+                client_order_id=client_order_id,
+                details={"reason": "kill switch enabled"},
             )
         if control.active_color != self.settings.app_color:
             return ExecReceiptPayload(
@@ -161,24 +192,41 @@ class ExecutionService:
 
             if ticket.side.value == "yes":
                 new_edge = fair_yes_dollars - new_price
+                contract_price = new_price
             else:
                 new_edge = (Decimal("1") - fair_yes_dollars) - (Decimal("1") - new_price)
+                contract_price = Decimal("1") - new_price
 
-            if new_edge < min_edge:
+            fee_adjusted_edge = _fee_adjusted_edge_dollars(
+                settings=self.settings,
+                edge_dollars=new_edge,
+                contract_price_dollars=contract_price,
+                count_fp=current_ticket.count_fp,
+            )
+
+            if fee_adjusted_edge < min_edge:
                 logger.info(
-                    "requote aborted for %s: edge %.0fbps below min",
-                    ticket.market_ticker, float(new_edge) * 10000,
+                    "requote aborted for %s: fee-adjusted edge %.0fbps below min",
+                    ticket.market_ticker, float(fee_adjusted_edge) * 10000,
                 )
                 return ExecReceiptPayload(
                     status="requote_edge_lost",
                     client_order_id=client_order_id,
-                    details={"attempts": attempt, "new_edge_bps": round(float(new_edge) * 10000)},
+                    details={
+                        "attempts": attempt,
+                        "new_edge_bps": round(float(new_edge) * 10000),
+                        "fee_adjusted_edge_bps": round(float(fee_adjusted_edge) * 10000),
+                    },
                 )
 
             current_ticket = current_ticket.model_copy(update={"yes_price_dollars": new_price})
             logger.info(
-                "requoting %s attempt=%d new_price=%s edge=%.0fbps",
-                ticket.market_ticker, attempt + 1, new_price, float(new_edge) * 10000,
+                "requoting %s attempt=%d new_price=%s edge=%.0fbps fee_adjusted=%.0fbps",
+                ticket.market_ticker,
+                attempt + 1,
+                new_price,
+                float(new_edge) * 10000,
+                float(fee_adjusted_edge) * 10000,
             )
 
         return ExecReceiptPayload(

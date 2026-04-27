@@ -143,6 +143,64 @@ async def test_auto_trigger_skips_when_color_is_inactive(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_trigger_uses_settings_kalshi_env_for_control_state(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_prod_env.db",
+        kalshi_env="production",
+        trigger_enable_auto_rooms=True,
+        app_color="blue",
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
+    directory = WeatherMarketDirectory(
+        {
+            "WX-TEST": WeatherMarketMapping(
+                market_ticker="WX-TEST",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+            )
+        }
+    )
+    service = AutoTriggerService(settings, session_factory, directory, agent_pack_service, supervisor)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("green", kalshi_env="demo", initial_active_color="green")
+        await repo.ensure_deployment_control("blue", kalshi_env="production", initial_active_color="blue")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            kalshi_env="production",
+            snapshot=_GOOD_SNAPSHOT,
+            yes_bid_dollars="0.4400",  # type: ignore[arg-type]
+            yes_ask_dollars="0.4800",  # type: ignore[arg-type]
+            last_trade_dollars=None,
+        )
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms(limit=10)
+        checkpoint = await repo.get_checkpoint("auto_trigger:production:WX-TEST")
+        await session.commit()
+
+    assert len(rooms) == 1
+    assert rooms[0].kalshi_env == "production"
+    assert checkpoint is not None
+    assert len(supervisor.calls) == 1
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_auto_trigger_blocks_when_live_position_exists(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_position_block.db",

@@ -85,6 +85,10 @@ class TradeTicket(BaseModel):
 class RiskVerdictPayload(BaseModel):
     status: RiskStatus
     reasons: list[str] = Field(default_factory=list)
+    gross_edge_bps: int | None = None
+    fee_edge_bps: int | None = None
+    net_edge_bps: int | None = None
+    fee_estimate_dollars_per_contract: Decimal | None = None
     approved_notional_dollars: Decimal | None = None
     approved_count_fp: Decimal | None = None
     capital_bucket: str | None = None
@@ -92,9 +96,11 @@ class RiskVerdictPayload(BaseModel):
     bucket_used_dollars_before: Decimal | None = None
     bucket_used_dollars_after: Decimal | None = None
     resized_by_bucket: bool = False
+    resized_by_count_cap: bool = False
 
     @field_validator(
         "approved_notional_dollars",
+        "fee_estimate_dollars_per_contract",
         "bucket_limit_dollars",
         "bucket_used_dollars_before",
         "bucket_used_dollars_after",

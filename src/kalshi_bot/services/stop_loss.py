@@ -159,7 +159,7 @@ class StopLossService:
 
         # Load positions and market states in one read session
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             if control.active_color != self.settings.app_color:
                 await session.commit()
@@ -181,7 +181,7 @@ class StopLossService:
         # Fetch the retained price and fill history for each held ticker.
         today_window = timedelta(hours=24)
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             price_histories = {}
             for ticker in tickers:
                 price_histories[ticker] = await repo.fetch_recent_prices(
@@ -231,7 +231,7 @@ class StopLossService:
     ) -> dict[str, Any] | None:
         """Evaluate one position in its own committed transaction to make the cooldown checkpoint immediately visible."""
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
 
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             kill_switch_enabled: bool = bool(control.kill_switch_enabled)

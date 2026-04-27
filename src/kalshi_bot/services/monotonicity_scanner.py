@@ -39,7 +39,6 @@ because the atomic executor is a separate follow-up.
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -47,6 +46,7 @@ from typing import Any
 
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import DeploymentControl
+from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +59,16 @@ def kalshi_fee_cents(price_dollars: float, contracts: int = 1) -> float:
     """Compute Kalshi taker fee: ceil(0.07 * C * P * (1-P) * 100) / 100 * 100.
 
     Returns fee in cents per the given number of contracts.
-    Formula: ceil(0.07 * contracts * price * (1 - price) * 100) / 100 dollars,
-    expressed here as cents (multiply by 100).
+    Delegates to the shared fee model so arb detection stays aligned with the
+    directional risk gate.
     """
-    raw_dollars = 0.07 * contracts * price_dollars * (1.0 - price_dollars) * 100
-    fee_dollars = math.ceil(raw_dollars) / 100.0
-    return fee_dollars * 100.0  # cents
+    price = Decimal(str(max(0.0, min(1.0, price_dollars))))
+    fee_dollars = estimate_kalshi_taker_fee_dollars(
+        price_dollars=price,
+        count=Decimal(str(contracts)),
+        fee_rate=Decimal("0.07"),
+    )
+    return float(fee_dollars * Decimal("100"))
 
 
 def _safe_side_fee_cents_per_leg() -> float:

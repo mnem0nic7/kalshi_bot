@@ -319,6 +319,68 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_daemon_heartbeat_uses_settings_kalshi_env_for_control_state(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-prod-control.db",
+        kalshi_env="production",
+        app_color="blue",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(
+            "green",
+            kalshi_env="demo",
+            initial_active_color="green",
+            initial_kill_switch_enabled=True,
+        )
+        await repo.ensure_deployment_control(
+            "blue",
+            kalshi_env="production",
+            initial_active_color="blue",
+            initial_kill_switch_enabled=False,
+        )
+        await session.commit()
+
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+    )
+
+    payload = await daemon.heartbeat_once(run_follow_up=False)
+
+    async with session_factory() as session:
+        checkpoint = (
+            await session.execute(
+                select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:production:blue")
+            )
+        ).scalar_one()
+        await session.commit()
+
+    assert payload["active_color"] == "blue"
+    assert payload["kill_switch_enabled"] is False
+    assert checkpoint.payload["kalshi_env"] == "production"
+    assert checkpoint.payload["active_color"] == "blue"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_daemon_streams_open_position_markets_even_when_discovery_rolls_forward(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-open-position-stream.db",

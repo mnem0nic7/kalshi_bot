@@ -119,7 +119,7 @@ class MarketStreamService:
                 backoff = 2.0  # reset after successful connect + first message
                 async for message in self.websocket_client.iter_messages():
                     async with self.session_factory() as session:
-                        repo = PlatformRepository(session)
+                        repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                         updated_market = await self.process_message(repo, message)
                         await session.commit()
                     if on_market_update is not None and updated_market is not None:
@@ -138,12 +138,13 @@ class MarketStreamService:
             except Exception as exc:
                 logger.exception("market stream loop failed")
                 async with self.session_factory() as session:
-                    repo = PlatformRepository(session)
+                    repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                     await repo.log_ops_event(
                         severity="error",
                         summary="Kalshi websocket stream error",
                         source="stream",
                         payload={"error": str(exc)},
+                        kalshi_env=self.settings.kalshi_env,
                     )
                     await session.commit()
                 await self.websocket_client.close()
@@ -257,6 +258,7 @@ class MarketStreamService:
             count_fp=quantize_count(count),
             raw=msg,
             kalshi_order_id=msg.get("order_id"),
+            kalshi_env=self.settings.kalshi_env,
         )
 
     async def _handle_fill(self, repo: PlatformRepository, message: dict[str, Any]) -> None:
@@ -278,6 +280,7 @@ class MarketStreamService:
             raw=msg,
             trade_id=msg.get("trade_id"),
             is_taker=bool(msg.get("is_taker", True)),
+            kalshi_env=self.settings.kalshi_env,
         )
 
     async def _persist_market_state(
@@ -296,6 +299,7 @@ class MarketStreamService:
         await repo.upsert_market_state(
             market_ticker,
             snapshot=snapshot,
+            kalshi_env=self.settings.kalshi_env,
             yes_bid_dollars=state.best_yes_bid if state is not None else None,
             yes_ask_dollars=state.best_yes_ask if state is not None else None,
             last_trade_dollars=None,

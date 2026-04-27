@@ -16,6 +16,7 @@ def _settings(risk_min_edge_bps: int = 50) -> Settings:
     return Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         risk_min_edge_bps=risk_min_edge_bps,
+        app_shadow_mode=False,
     )
 
 
@@ -40,6 +41,7 @@ def _room() -> Room:
 def _control() -> DeploymentControl:
     ctrl = MagicMock(spec=DeploymentControl)
     ctrl.active_color = "blue"
+    ctrl.kill_switch_enabled = False
     return ctrl
 
 
@@ -125,6 +127,26 @@ async def test_limit_order_aborts_requote_when_edge_lost():
 
 
 @pytest.mark.asyncio
+async def test_limit_order_aborts_requote_when_fee_adjusted_edge_lost():
+    kalshi = _kalshi(order_statuses=["resting"] * 10, market_ask="0.6300")
+    svc = ExecutionService(_settings(50), kalshi)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        receipt = await svc.execute(
+            room=_room(),
+            control=_control(),
+            ticket=_ticket(price="0.5800"),
+            client_order_id="coid-1",
+            fair_yes_dollars=Decimal("0.6400"),
+        )
+
+    assert receipt.status == "requote_edge_lost"
+    assert receipt.details["new_edge_bps"] == 100
+    assert receipt.details["fee_adjusted_edge_bps"] < 50
+    assert kalshi.create_order.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_limit_order_returns_unfilled_after_max_requotes():
     kalshi = _kalshi(order_statuses=["resting"] * 30, market_ask="0.5800")
     kalshi.create_order = AsyncMock(side_effect=[
@@ -180,4 +202,41 @@ async def test_shadow_mode_skips_before_any_api_call():
     )
 
     assert receipt.status == "shadow_skipped"
+    kalshi.create_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_app_shadow_mode_skips_before_any_api_call():
+    kalshi = _kalshi(order_statuses=[])
+    settings = _settings()
+    settings.app_shadow_mode = True
+    svc = ExecutionService(settings, kalshi)
+
+    receipt = await svc.execute(
+        room=_room(),
+        control=_control(),
+        ticket=_ticket(),
+        client_order_id="coid-1",
+    )
+
+    assert receipt.status == "shadow_skipped"
+    assert receipt.details["reason"] == "app shadow mode"
+    kalshi.create_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_blocks_before_any_api_call():
+    kalshi = _kalshi(order_statuses=[])
+    svc = ExecutionService(_settings(), kalshi)
+    control = _control()
+    control.kill_switch_enabled = True
+
+    receipt = await svc.execute(
+        room=_room(),
+        control=control,
+        ticket=_ticket(),
+        client_order_id="coid-1",
+    )
+
+    assert receipt.status == "kill_switch_blocked"
     kalshi.create_order.assert_not_called()

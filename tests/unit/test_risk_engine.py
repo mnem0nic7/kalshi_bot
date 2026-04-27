@@ -11,7 +11,7 @@ from kalshi_bot.services.signal import StrategySignal
 from kalshi_bot.weather.scoring import WeatherSignalSnapshot
 
 
-def make_signal(edge_bps: int = 100, *, capital_bucket: str = "safe", trade_regime: str = "standard") -> StrategySignal:
+def make_signal(edge_bps: int = 300, *, capital_bucket: str = "safe", trade_regime: str = "standard") -> StrategySignal:
     weather = WeatherSignalSnapshot(
         fair_yes_dollars=Decimal("0.6400"),
         confidence=0.8,
@@ -419,6 +419,37 @@ def test_risk_engine_blocks_runaway_edge_as_model_error() -> None:
     assert any("credibility" in r for r in verdict.reasons)
 
 
+def test_risk_engine_blocks_when_taker_fee_erases_min_edge() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(edge_bps=200),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert verdict.gross_edge_bps == 200
+    assert verdict.fee_edge_bps is not None
+    assert verdict.net_edge_bps is not None and verdict.net_edge_bps < 50
+    assert any("Fee-adjusted edge" in reason for reason in verdict.reasons)
+
+
 def test_risk_engine_allows_when_under_per_ticker_count_cap() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
@@ -448,6 +479,44 @@ def test_risk_engine_allows_when_under_per_ticker_count_cap() -> None:
         ),
     )
     assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("1.00")
+    assert verdict.resized_by_count_cap is True
+
+
+def test_risk_engine_blocks_when_resized_ticket_loses_fee_adjusted_edge() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=500,
+        risk_max_position_count_fp_per_ticker=200,
+        risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=True,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(edge_bps=240),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            current_position_count_fp=Decimal("199.00"),
+            current_position_side="yes",
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert verdict.net_edge_bps == 40
+    assert verdict.fee_edge_bps == 200
+    assert any("Fee-adjusted edge 40bps" in reason for reason in verdict.reasons)
 
 
 def test_risk_engine_blocks_midband_probability_with_weak_edge() -> None:
@@ -473,7 +542,7 @@ def test_risk_engine_blocks_midband_probability_with_weak_edge() -> None:
         context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
     )
     assert verdict.status == RiskStatus.BLOCKED
-    assert any("requires 270bps edge" in r and "actual edge is 200bps" in r for r in verdict.reasons)
+    assert any("requires 270bps edge" in r and "actual edge is 20bps" in r for r in verdict.reasons)
 
 
 def test_risk_engine_approves_midband_probability_with_strong_edge() -> None:
@@ -495,7 +564,7 @@ def test_risk_engine_approves_midband_probability_with_strong_edge() -> None:
             yes_price_dollars=Decimal("0.5800"),
             count_fp=Decimal("10.00"),
         ),
-        signal=make_signal(edge_bps=300),
+        signal=make_signal(edge_bps=500),
         context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
     )
 
@@ -512,7 +581,7 @@ def test_risk_engine_probability_boundaries_pass() -> None:
     engine = DeterministicRiskEngine(settings)
 
     for fair_yes in (Decimal("0.2500"), Decimal("0.7500")):
-        signal = replace(make_signal(edge_bps=200), fair_yes_dollars=fair_yes)
+        signal = replace(make_signal(edge_bps=300), fair_yes_dollars=fair_yes)
         verdict = engine.evaluate(
             room=make_room(),
             control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
@@ -553,7 +622,7 @@ def test_risk_engine_midpoint_requires_full_extra_edge() -> None:
     )
 
     assert verdict.status == RiskStatus.BLOCKED
-    assert any("requires 550bps edge" in r and "actual edge is 549bps" in r for r in verdict.reasons)
+    assert any("requires 550bps edge" in r and "actual edge is 369bps" in r for r in verdict.reasons)
 
 
 def test_risk_engine_approves_extreme_probability() -> None:
@@ -564,7 +633,7 @@ def test_risk_engine_approves_extreme_probability() -> None:
     )
     engine = DeterministicRiskEngine(settings)
     # fair_yes=0.80 is > 0.75 → passes the extremity filter
-    extreme_signal = replace(make_signal(edge_bps=200), fair_yes_dollars=Decimal("0.8000"))
+    extreme_signal = replace(make_signal(edge_bps=300), fair_yes_dollars=Decimal("0.8000"))
     verdict = engine.evaluate(
         room=make_room(),
         control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
@@ -611,6 +680,39 @@ def test_risk_engine_blocks_when_pending_orders_reach_cap() -> None:
     )
     assert verdict.status == RiskStatus.BLOCKED
     assert any("in-flight" in r for r in verdict.reasons)
+
+
+def test_risk_engine_downsizes_when_projected_count_would_exceed_cap() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_position_count_fp_per_ticker=200,
+        risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=True,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            current_position_count_fp=Decimal("195.00"),
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("5.00")
+    assert verdict.resized_by_count_cap is True
 
 
 def test_risk_engine_combines_filled_and_pending_for_cap() -> None:

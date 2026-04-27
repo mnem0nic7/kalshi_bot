@@ -17,7 +17,7 @@ def test_taker_fee_is_symmetric_between_yes_and_no_prices() -> None:
         fee_rate=Decimal("0.07"),
     )
 
-    assert fee_30 == Decimal("0.0147")
+    assert fee_30 == Decimal("0.02")
     assert fee_30 == fee_70
 
 
@@ -47,9 +47,17 @@ def test_taker_fee_boundaries_scaling_and_known_value() -> None:
         fee_rate=Decimal("0.14"),
     )
 
-    assert one_contract == Decimal("0.0175")
-    assert ten_contracts == Decimal("0.1750")
-    assert doubled_rate == Decimal("0.0350")
+    assert one_contract == Decimal("0.02")
+    assert ten_contracts == Decimal("0.18")
+    assert doubled_rate == Decimal("0.04")
+
+
+def test_taker_fee_can_return_raw_unrounded_estimate() -> None:
+    assert estimate_kalshi_taker_fee_dollars(
+        price_dollars=Decimal("0.30"),
+        fee_rate=Decimal("0.07"),
+        round_up_to_cent=False,
+    ) == Decimal("0.0147")
 
 
 def test_taker_fee_rejects_invalid_price_and_count() -> None:

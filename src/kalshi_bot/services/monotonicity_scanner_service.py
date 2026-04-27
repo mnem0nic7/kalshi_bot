@@ -107,8 +107,8 @@ class MonotonicityArbScannerService:
 
     async def _load_control(self):
         async with self._session_factory() as session:
-            repo = PlatformRepository(session)
-            return await repo.get_deployment_control()
+            repo = PlatformRepository(session, kalshi_env=self._settings.kalshi_env)
+            return await repo.get_deployment_control(kalshi_env=self._settings.kalshi_env)
 
     async def _persist(self, proposal: ArbProposal) -> None:
         record = MonotonicityArbProposal(

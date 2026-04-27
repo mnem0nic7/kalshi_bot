@@ -383,10 +383,11 @@ Resolution-state detection: if `current_temp_f >= threshold`, the market is `LOC
 | 2 | Signal eligibility | No recommended action, side, or price |
 | 3 | Resolution state | Market not UNRESOLVED |
 | 4 | Min edge | `edge_bps < risk_min_edge_bps` (500 bps) |
+| 4b | Fee-adjusted edge | `edge_bps - estimated_taker_fee_bps < risk_min_edge_bps`; uses Kalshi's cent-rounded taker fee formula |
 | 5 | Max edge (credibility) | `edge_bps > risk_max_credible_edge_bps` (5000 bps) — model error signal |
 | 6 | Confidence floor | `signal.confidence < risk_min_confidence` (0.70) |
 | 7 | Contract price floor | contract price < `risk_min_contract_price_dollars` (0.25) — market pricing it as nearly impossible |
-| 7b | Probability extremity | `fair_yes` strictly inside the configured midband requires extra edge that ramps linearly toward 50%; with `risk_min_probability_extremity_pct=25.0`, exact 25%/75% pass and 50% requires `risk_probability_midband_max_extra_edge_bps` additional edge |
+| 7b | Probability extremity | `fair_yes` strictly inside the configured midband requires fee-adjusted extra edge that ramps linearly toward 50%; with `risk_min_probability_extremity_pct=25.0`, exact 25%/75% pass and 50% requires `risk_probability_midband_max_extra_edge_bps` additional edge |
 | 8 | Market staleness | `market_observed_at` older than 60s |
 | 9 | Research staleness | `research_observed_at` older than 900s |
 | 10 | Order count cap | `count_fp > risk_max_order_count_fp` |
@@ -763,6 +764,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `RISK_POSITION_PCT` | 0.10 | 10% of live balance per position |
 | `RISK_DAILY_LOSS_PCT` | 0.20 | 20% daily loss limit (self-improve gate) |
 | `RISK_MIN_EDGE_BPS` | 500 | Minimum edge required; self-improvement pipeline can tune in range [5, 500] bps |
+| `RISK_FEE_AWARE_EDGE_ENABLED` | true | Require the minimum edge after estimated taker fees |
 | `RISK_MAX_CREDIBLE_EDGE_BPS` | 5000 | Maximum credible edge; larger values indicate model error |
 | `RISK_MIN_CONFIDENCE` | 0.70 | Hard block below this confidence score; 0.70–0.80 gets 50% size, 0.80–0.90 gets 75%, ≥0.90 gets 100% |
 | `RISK_MIN_CONTRACT_PRICE_DOLLARS` | 0.25 | Hard block if the traded side costs less than 25¢ |
