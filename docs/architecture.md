@@ -10,6 +10,9 @@ The platform is one async Python service with four main layers:
    - NOAA/NWS weather ingestion
 2. Deterministic engines
    - Weather fair-value estimation
+   - Shadow-first Gumbel/KDE/climatology probability primitives
+   - Adapter-first ensemble fusion primitives
+   - Shadow-first uncertainty, fee-aware Kelly, survival, and exit-risk primitives
    - Risk validation
    - Execution and reconciliation
 3. Decision trace and replay
@@ -66,6 +69,7 @@ Postgres stores:
 - raw exchange and weather events
 - signals, tickets, verdicts, orders, fills, positions
 - deterministic decision traces and replay hashes
+- forecast snapshots and climatology priors for future replay-gated probability promotion
 - ops events and checkpoints
 - memory notes and embeddings
 - deployment control and writer lock

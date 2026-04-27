@@ -28,6 +28,13 @@ The trace table is intentionally separate from `trade_tickets`. No-ticket decisi
 
 Add the closed-form Gumbel + climatology shrinkage engine and run it in shadow against the current NWS-driven signal. Multi-source weather data should be introduced adapter-first, with each provider normalized behind a source adapter before ensemble fusion is allowed to affect decisions.
 
+Phase 1 foundation now exists as shadow-first primitives:
+
+- `kalshi_bot.forecast.probability_engine` implements Gumbel fitting, bucket probability, KDE integration, climatology shrinkage, boundary mass, disagreement, and mapping-to-bucket conversion.
+- `kalshi_bot.forecast.ensemble_fuser` defines adapter-facing ensemble member types and deterministic source fusion with QC outlier rejection.
+- `forecast_snapshots` and `climatology_priors` provide storage for future strict-as-of replay and probability audits.
+- None of these primitives are wired into live order selection yet.
+
 Default source posture:
 
 - Launch adapters for GFS, ECMWF, AIFS, and NWS-point.
@@ -37,6 +44,14 @@ Default source posture:
 ### Phase 2: Risk Math
 
 Wire uncertainty, fee-aware Kelly sizing, survival mode, and exit risk scoring only after Phase 1 has replay evidence. The existing deterministic risk engine remains the hard authority and must continue clipping or blocking any request that violates caps.
+
+Phase 2 foundation now exists as shadow-first primitives:
+
+- `kalshi_bot.risk.uncertainty` computes uncertainty score, dynamic minimum EV, and size taper.
+- `kalshi_bot.risk.sizing` computes fee-aware binary Kelly and hard-cap-aware sizing breakdowns.
+- `kalshi_bot.risk.survival` switches Kelly fraction and minimum EV when bankroll falls below the survival threshold.
+- `kalshi_bot.risk.exit_score` computes exit risk and deterministic exit-rule precedence.
+- None of these primitives replace the live `services.risk` or `services.sizing` path yet.
 
 ### Phase 3: Source Health
 

@@ -159,6 +159,35 @@ class DecisionTraceRecord(Base, IdMixin, TimestampMixin):
     trace: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class ForecastSnapshotRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "forecast_snapshots"
+
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    kalshi_env: Mapped[str] = mapped_column(String(16), default="demo", index=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    parameter_pack_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    source_members: Mapped[dict] = mapped_column(JSON, default=dict)
+    fused_pdf: Mapped[dict] = mapped_column(JSON, default=dict)
+    probability_output: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_set_used: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+
+class ClimatologyPriorRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "climatology_priors"
+
+    station_id: Mapped[str] = mapped_column(String(32), index=True)
+    series_ticker: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    day_of_year: Mapped[int] = mapped_column(Integer, index=True)
+    bucket_low_f: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bucket_high_f: Mapped[float | None] = mapped_column(Float, nullable=True)
+    p_yes: Mapped[float] = mapped_column(Float, nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    normal_window_years: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    smoothing_days: Mapped[int] = mapped_column(Integer, nullable=False, default=14)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="historical_archive")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class RiskVerdictRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "risk_verdicts"
 
@@ -809,6 +838,9 @@ Index("ix_room_messages_room_created", RoomMessage.room_id, RoomMessage.created_
 Index("ix_raw_exchange_events_stream_created", RawExchangeEvent.stream_name, RawExchangeEvent.created_at)
 Index("ix_decision_traces_room_created", DecisionTraceRecord.room_id, DecisionTraceRecord.created_at)
 Index("ix_decision_traces_market_env_created", DecisionTraceRecord.market_ticker, DecisionTraceRecord.kalshi_env, DecisionTraceRecord.created_at)
+Index("ix_forecast_snapshots_market_env_fetched", ForecastSnapshotRecord.market_ticker, ForecastSnapshotRecord.kalshi_env, ForecastSnapshotRecord.fetched_at)
+Index("ix_climatology_priors_station_day", ClimatologyPriorRecord.station_id, ClimatologyPriorRecord.day_of_year)
+Index("ix_climatology_priors_series_day", ClimatologyPriorRecord.series_ticker, ClimatologyPriorRecord.day_of_year)
 Index(
     "ix_decision_corpus_rows_day_env_policy",
     DecisionCorpusRowRecord.local_market_day,

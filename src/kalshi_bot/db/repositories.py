@@ -31,8 +31,10 @@ from kalshi_bot.db.web_auth_repository import WebAuthRepositoryMixin
 from kalshi_bot.db.models import (
     Artifact,
     Checkpoint,
+    ClimatologyPriorRecord,
     DecisionTraceRecord,
     FillRecord,
+    ForecastSnapshotRecord,
     MarketPriceHistory,
     MarketState,
     MemoryEmbedding,
@@ -799,6 +801,58 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             .order_by(DecisionTraceRecord.created_at.desc(), DecisionTraceRecord.decision_time.desc())
             .limit(1)
         )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def save_forecast_snapshot(
+        self,
+        *,
+        market_ticker: str,
+        kalshi_env: str | None,
+        source_members: dict[str, Any],
+        fused_pdf: dict[str, Any],
+        probability_output: dict[str, Any],
+        source_set_used: list[str],
+        fetched_at: datetime | None = None,
+        parameter_pack_version: str | None = None,
+    ) -> ForecastSnapshotRecord:
+        record = ForecastSnapshotRecord(
+            market_ticker=market_ticker,
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            fetched_at=fetched_at or datetime.now(UTC),
+            parameter_pack_version=parameter_pack_version,
+            source_members=source_members,
+            fused_pdf=fused_pdf,
+            probability_output=probability_output,
+            source_set_used=source_set_used,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def get_climatology_prior(
+        self,
+        *,
+        station_id: str,
+        day_of_year: int,
+        bucket_low_f: float | None,
+        bucket_high_f: float | None,
+        series_ticker: str | None = None,
+    ) -> ClimatologyPriorRecord | None:
+        stmt = select(ClimatologyPriorRecord).where(
+            ClimatologyPriorRecord.station_id == station_id,
+            ClimatologyPriorRecord.day_of_year == day_of_year,
+        )
+        if series_ticker is not None:
+            stmt = stmt.where(ClimatologyPriorRecord.series_ticker == series_ticker)
+        if bucket_low_f is None:
+            stmt = stmt.where(ClimatologyPriorRecord.bucket_low_f.is_(None))
+        else:
+            stmt = stmt.where(ClimatologyPriorRecord.bucket_low_f == bucket_low_f)
+        if bucket_high_f is None:
+            stmt = stmt.where(ClimatologyPriorRecord.bucket_high_f.is_(None))
+        else:
+            stmt = stmt.where(ClimatologyPriorRecord.bucket_high_f == bucket_high_f)
+        stmt = stmt.order_by(ClimatologyPriorRecord.updated_at.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def get_latest_risk_verdict_for_room(self, room_id: str) -> RiskVerdictRecord | None:
