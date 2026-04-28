@@ -538,6 +538,19 @@ def test_parameter_pack_record_starvation_cli_writes_warning_event(tmp_path) -> 
     assert payload["status"] == "promotion_starvation"
     assert payload["consecutive_starvations"] == 1
     assert payload["escalated"] is False
+    status = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "parameter-pack", "status"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert status.returncode == 0
+    status_payload = json.loads(status.stdout)
+    assert status_payload["promotion_starvation"]["status"] == "promotion_starvation"
+    assert status_payload["promotion_starvation"]["consecutive_starvations"] == 1
+    assert status_payload["promotion_starvation"]["escalated"] is False
+    assert status_payload["promotion_starvation"]["checkpoint_name"] == "parameter_pack_promotion_starvation:demo"
     with sqlite3.connect(db_path) as conn:
         event = conn.execute(
             "select severity, source, summary, payload from ops_events order by created_at desc limit 1"

@@ -284,6 +284,23 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
                 if dict(record.payload or {}).get("kind") == "parameter_pack"
             ][: args.limit]
             champion = await repo.get_champion_parameter_pack()
+            starvation_checkpoint_name = f"parameter_pack_promotion_starvation:{container.settings.kalshi_env}"
+            starvation_checkpoint = await repo.get_checkpoint(starvation_checkpoint_name)
+            starvation_state = (
+                dict(starvation_checkpoint.payload or {})
+                if starvation_checkpoint is not None
+                else {
+                    "event_kind": "parameter_pack_promotion_starvation",
+                    "consecutive_starvations": 0,
+                    "escalated": False,
+                    "status": "none",
+                }
+            )
+            starvation_state.setdefault(
+                "status",
+                "promotion_starvation" if starvation_checkpoint is not None else "none",
+            )
+            starvation_state["checkpoint_name"] = starvation_checkpoint_name
             await session.commit()
             print(
                 json.dumps(
@@ -300,6 +317,7 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
                             if champion is not None
                             else None
                         ),
+                        "promotion_starvation": starvation_state,
                         "recent_packs": [
                             {
                                 "version": record.version,

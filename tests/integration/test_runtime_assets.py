@@ -133,6 +133,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack select" in autonomy
     assert "parameter-pack record-starvation" in autonomy
     assert "promotion_starvation" in autonomy
+    assert "`promotion_starvation` checkpoint" in autonomy
     assert "warning/error ops event" in autonomy
     assert "stalled" in autonomy
     assert "parameter-pack canary" in autonomy
@@ -162,6 +163,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack select" in self_improve
     assert "parameter-pack record-starvation" in self_improve
     assert "promotion_starvation" in self_improve
+    assert "checkpoint state" in self_improve
     assert "ops event and checkpoint" in self_improve
     assert "parameter-pack learned-gate" in self_improve
     assert "parameter-pack nws-parser-gate" in self_improve
