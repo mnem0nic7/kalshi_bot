@@ -20,6 +20,7 @@ def _holdout_report(pack_hash: str, *, max_drawdown: float = 0.08) -> dict:
         "ece": 0.04,
         "sharpe": 1.0,
         "max_drawdown": max_drawdown,
+        "resolved_trades": 100,
         "city_win_rates": {"NY": 0.56},
         "hard_cap_touches": 0,
         "pack_hash": pack_hash,

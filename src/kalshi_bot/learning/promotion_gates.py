@@ -13,6 +13,7 @@ class HoldoutMetrics:
     ece: float
     sharpe: float
     max_drawdown: float
+    resolved_trades: int = 0
     city_win_rates: dict[str, float] = field(default_factory=dict)
     hard_cap_touches: int = 0
     pack_hash: str | None = None
@@ -26,6 +27,7 @@ class HoldoutMetrics:
             ece=float(payload.get("ece", 1.0)),
             sharpe=float(payload.get("sharpe", 0.0)),
             max_drawdown=float(payload.get("max_drawdown", 1.0)),
+            resolved_trades=_resolved_trade_count(payload),
             city_win_rates={str(k): float(v) for k, v in dict(payload.get("city_win_rates") or {}).items()},
             hard_cap_touches=int(payload.get("hard_cap_touches", 0)),
             pack_hash=payload.get("pack_hash"),
@@ -36,6 +38,7 @@ class HoldoutMetrics:
 @dataclass(frozen=True, slots=True)
 class PromotionGateConfig:
     min_coverage: float = 0.95
+    min_resolved_trades: int = 30
     max_brier_ratio: float = 1.02
     max_ece: float = 0.06
     min_sharpe_ratio: float = 0.95
@@ -71,6 +74,10 @@ def evaluate_parameter_pack_promotion(
     comparisons["coverage"] = {"candidate": candidate.coverage, "minimum": cfg.min_coverage}
     if candidate.coverage < cfg.min_coverage:
         failures.append("coverage_below_minimum")
+
+    comparisons["resolved_trades"] = {"candidate": candidate.resolved_trades, "minimum": cfg.min_resolved_trades}
+    if candidate.resolved_trades < cfg.min_resolved_trades:
+        failures.append("resolved_trades_below_minimum")
 
     max_brier = current.brier * cfg.max_brier_ratio
     comparisons["brier"] = {"candidate": candidate.brier, "current": current.brier, "maximum": max_brier}
@@ -133,6 +140,13 @@ def _minimum_allowed_sharpe(current_sharpe: float, ratio: float) -> float:
     if current_sharpe > 0:
         return current_sharpe * ratio
     return current_sharpe
+
+
+def _resolved_trade_count(payload: dict[str, Any]) -> int:
+    for key in ("resolved_trades", "settled_trades", "resolved_trade_count", "settled_trade_count"):
+        if key in payload:
+            return int(payload.get(key) or 0)
+    return 0
 
 
 def _city_win_rate_drops(candidate: dict[str, float], current: dict[str, float]) -> dict[str, float]:

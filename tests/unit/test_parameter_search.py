@@ -13,6 +13,7 @@ def _current_report() -> dict[str, object]:
         "ece": 0.05,
         "sharpe": 1.00,
         "max_drawdown": 0.10,
+        "resolved_trades": 100,
         "city_win_rates": {"NY": 0.58},
         "pack_hash": "current",
         "rerun_pack_hash": "current",
@@ -26,6 +27,7 @@ def _passing_holdout() -> dict[str, object]:
         "ece": 0.04,
         "sharpe": 1.01,
         "max_drawdown": 0.09,
+        "resolved_trades": 100,
         "city_win_rates": {"NY": 0.57},
         "hard_cap_touches": 0,
     }

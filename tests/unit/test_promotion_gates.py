@@ -15,6 +15,7 @@ def test_parameter_pack_promotion_gates_pass_when_all_holdout_metrics_clear() ->
         ece=0.05,
         sharpe=1.00,
         max_drawdown=0.10,
+        resolved_trades=100,
         city_win_rates={"NY": 0.58, "MIA": 0.55},
         pack_hash="current",
         rerun_pack_hash="current",
@@ -25,6 +26,7 @@ def test_parameter_pack_promotion_gates_pass_when_all_holdout_metrics_clear() ->
         ece=0.04,
         sharpe=0.99,
         max_drawdown=0.09,
+        resolved_trades=100,
         city_win_rates={"NY": 0.56, "MIA": 0.54},
         hard_cap_touches=0,
         pack_hash="candidate",
@@ -44,6 +46,7 @@ def test_parameter_pack_promotion_gates_report_every_failure() -> None:
         ece=0.04,
         sharpe=1.00,
         max_drawdown=0.10,
+        resolved_trades=100,
         city_win_rates={"NY": 0.60},
         pack_hash="current",
         rerun_pack_hash="current",
@@ -54,6 +57,7 @@ def test_parameter_pack_promotion_gates_report_every_failure() -> None:
         ece=0.09,
         sharpe=0.80,
         max_drawdown=0.20,
+        resolved_trades=1,
         city_win_rates={"NY": 0.45},
         hard_cap_touches=1,
         pack_hash="candidate",
@@ -65,6 +69,7 @@ def test_parameter_pack_promotion_gates_report_every_failure() -> None:
     assert result.passed is False
     assert result.failures == [
         "coverage_below_minimum",
+        "resolved_trades_below_minimum",
         "brier_regression",
         "ece_above_maximum",
         "sharpe_regression",
@@ -73,6 +78,36 @@ def test_parameter_pack_promotion_gates_report_every_failure() -> None:
         "hard_cap_touch",
         "pack_hash_not_idempotent",
     ]
+
+
+def test_parameter_pack_promotion_gates_require_resolved_holdout_trades() -> None:
+    current = HoldoutMetrics(
+        coverage=0.99,
+        brier=0.20,
+        ece=0.04,
+        sharpe=1.00,
+        max_drawdown=0.10,
+        resolved_trades=100,
+        pack_hash="current",
+        rerun_pack_hash="current",
+    )
+    candidate = HoldoutMetrics(
+        coverage=0.99,
+        brier=0.19,
+        ece=0.04,
+        sharpe=1.00,
+        max_drawdown=0.09,
+        resolved_trades=29,
+        hard_cap_touches=0,
+        pack_hash="candidate",
+        rerun_pack_hash="candidate",
+    )
+
+    result = evaluate_parameter_pack_promotion(candidate=candidate, current=current)
+
+    assert result.passed is False
+    assert result.failures == ["resolved_trades_below_minimum"]
+    assert result.comparisons["resolved_trades"] == {"candidate": 29, "minimum": 30}
 
 
 def test_parameter_pack_promotion_gates_use_operator_hard_drawdown_cap() -> None:
@@ -93,6 +128,7 @@ def test_parameter_pack_promotion_gates_use_operator_hard_drawdown_cap() -> None
         ece=0.04,
         sharpe=1.00,
         max_drawdown=0.20,
+        resolved_trades=100,
         pack_hash="current",
         rerun_pack_hash="current",
     )
@@ -102,6 +138,7 @@ def test_parameter_pack_promotion_gates_use_operator_hard_drawdown_cap() -> None
         ece=0.04,
         sharpe=1.00,
         max_drawdown=0.13,
+        resolved_trades=100,
         hard_cap_touches=0,
         pack_hash="candidate",
         rerun_pack_hash="candidate",
