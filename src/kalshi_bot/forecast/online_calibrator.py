@@ -41,10 +41,14 @@ class OnlineLogisticCalibrator:
         error = prediction - target
         lr = max(0.0, float(self.config.learning_rate))
         l2 = max(0.0, float(self.config.l2))
-        self.intercept -= lr * error
+        next_intercept = self.intercept - (lr * error)
+        next_weights: dict[str, float] = {}
         for name, value in normalized.items():
             current = self.weights.get(name, 0.0)
-            self.weights[name] = current - lr * ((error * value) + (l2 * current))
+            next_weights[name] = current - lr * ((error * value) + (l2 * current))
+        _assert_finite_state(next_intercept, next_weights)
+        self.intercept = next_intercept
+        self.weights.update(next_weights)
         self.update_count += 1
         return prediction
 
@@ -87,11 +91,7 @@ class OnlineLogisticCalibrator:
         return normalized
 
     def _assert_finite_state(self) -> None:
-        if not isfinite(self.intercept):
-            raise ValueError("calibrator intercept must be finite")
-        for name, value in self.weights.items():
-            if not isfinite(value):
-                raise ValueError(f"calibrator weight {name} must be finite")
+        _assert_finite_state(self.intercept, self.weights)
 
 
 def calibration_features(
@@ -119,3 +119,11 @@ def _sigmoid(value: float) -> float:
         return 1.0 / (1.0 + z)
     z = exp(value)
     return z / (1.0 + z)
+
+
+def _assert_finite_state(intercept: float, weights: Mapping[str, float]) -> None:
+    if not isfinite(intercept):
+        raise ValueError("calibrator intercept must be finite")
+    for name, value in weights.items():
+        if not isfinite(value):
+            raise ValueError(f"calibrator weight {name} must be finite")

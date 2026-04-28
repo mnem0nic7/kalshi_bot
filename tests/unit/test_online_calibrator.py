@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from kalshi_bot.forecast.online_calibrator import OnlineLogisticCalibrator, calibration_features
+from kalshi_bot.forecast.online_calibrator import (
+    OnlineCalibratorConfig,
+    OnlineLogisticCalibrator,
+    calibration_features,
+)
 
 
 def test_online_calibrator_predicts_and_updates_deterministically() -> None:
@@ -44,3 +48,21 @@ def test_online_calibrator_rejects_non_finite_features() -> None:
 
     with pytest.raises(ValueError):
         calibrator.predict({"p_catboost_yes": float("nan")})
+
+
+def test_online_calibrator_rejects_overflowing_update_without_mutating_state() -> None:
+    calibrator = OnlineLogisticCalibrator(config=OnlineCalibratorConfig(learning_rate=10.0))
+
+    with pytest.raises(ValueError, match="calibrator weight p_catboost_yes must be finite"):
+        calibrator.update(
+            {
+                "p_catboost_yes": 1e308,
+                "source_health_aggregate": 1.0,
+                "days_since_last_settle": 0.0,
+                "recent_brier_trailing": 0.2,
+            },
+            observed_yes=True,
+        )
+
+    assert calibrator.to_dict()["weights"] == {}
+    assert calibrator.update_count == 0
