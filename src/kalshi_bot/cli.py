@@ -24,6 +24,7 @@ from kalshi_bot.core.schemas import (
 from kalshi_bot.db.models import StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
+from kalshi_bot.learning.drift_watcher import DriftWindow, evaluate_calibration_drift
 from kalshi_bot.learning.hard_caps import DEFAULT_HARD_CAPS_PATH, load_hard_caps
 from kalshi_bot.learning.parameter_pack import (
     DEFAULT_PARAMETER_PACK_PATH,
@@ -209,6 +210,10 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
         }
         print(json.dumps(payload, indent=2))
         return 0 if result.passed else 1
+    if action == "drift":
+        decision = evaluate_calibration_drift(DriftWindow.from_dict(_read_json_file(Path(args.window))))
+        print(json.dumps(decision.to_dict(), indent=2))
+        return 0 if not decision.pause_new_entries else 1
 
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
@@ -1900,6 +1905,11 @@ def build_parser() -> argparse.ArgumentParser:
     parameter_pack_gate.add_argument("--candidate-report", required=True)
     parameter_pack_gate.add_argument("--current-report", required=True)
     parameter_pack_gate.add_argument("--hard-caps", default=str(DEFAULT_HARD_CAPS_PATH))
+    parameter_pack_drift = parameter_pack_subparsers.add_parser(
+        "drift",
+        help="Evaluate calibration drift window JSON without mutating runtime state",
+    )
+    parameter_pack_drift.add_argument("--window", required=True)
     parameter_pack_stage = parameter_pack_subparsers.add_parser(
         "stage",
         help="Stage a gated parameter pack on the inactive color without changing live risk",

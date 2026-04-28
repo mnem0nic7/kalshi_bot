@@ -143,6 +143,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert command_help.returncode == 0
     assert "validate" in command_help.stdout
     assert "gate" in command_help.stdout
+    assert "drift" in command_help.stdout
     assert "stage" in command_help.stdout
     assert "rollback-staged" in command_help.stdout
     assert "canary" in command_help.stdout
@@ -368,6 +369,40 @@ def test_parameter_pack_gate_cli_uses_sealed_hard_drawdown_cap(tmp_path) -> None
     payload = json.loads(result.stdout)
     assert payload["failures"] == ["drawdown_regression"]
     assert payload["comparisons"]["max_drawdown"]["maximum"] == 0.20
+
+
+def test_parameter_pack_drift_cli_reports_pause_decision(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/parameter-pack-drift-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+    window_path = tmp_path / "drift-window.json"
+    window_path.write_text(
+        json.dumps(
+            {
+                "rolling_7d_brier": 0.24,
+                "trailing_30d_brier": 0.20,
+                "rolling_ece": 0.09,
+                "predicted_win_rate": 0.60,
+                "realized_win_rate": 0.52,
+                "trade_count": 150,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "parameter-pack", "drift", "--window", str(window_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["pause_new_entries"] is True
+    assert payload["trigger_pack_search"] is True
+    assert payload["reasons"] == ["brier_relative_drift", "ece_above_limit", "win_rate_divergence"]
 
 
 def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:

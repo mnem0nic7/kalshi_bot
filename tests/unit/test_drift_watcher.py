@@ -39,3 +39,12 @@ def test_drift_watcher_pauses_and_triggers_search_on_drift() -> None:
         "ece_above_limit",
         "win_rate_divergence",
     ]
+    assert decision.to_dict()["pause_new_entries"] is True
+
+
+def test_drift_window_from_dict_uses_numeric_defaults() -> None:
+    window = DriftWindow.from_dict({"rolling_7d_brier": "0.15", "trade_count": "7"})
+
+    assert window.rolling_7d_brier == 0.15
+    assert window.trailing_30d_brier == 0.0
+    assert window.trade_count == 7
