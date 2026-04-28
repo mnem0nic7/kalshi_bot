@@ -40,6 +40,7 @@ from kalshi_bot.learning.promotion_gates import (
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
 from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, replay_decision_trace
+from kalshi_bot.services.parameter_packs import ParameterPackPromotionService
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
 from kalshi_bot.services.trade_analysis import format_trade_analysis_report
 from kalshi_bot.services.trading_audit import format_trading_audit_text
@@ -211,6 +212,35 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
 
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
+        if action == "stage":
+            candidate = sanitize_parameter_pack(parameter_pack_from_dict(_read_json_file(Path(args.candidate_pack))))
+            dropped = candidate.metadata.get("dropped_hard_cap_parameters", [])
+            if dropped:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "candidate_contains_hard_cap_parameters",
+                            "dropped_hard_cap_parameters": dropped,
+                        },
+                        indent=2,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            service = ParameterPackPromotionService()
+            result = await service.stage_candidate(
+                repo,
+                candidate_pack=candidate,
+                candidate_report=_read_json_file(Path(args.candidate_report)),
+                current_report=_read_json_file(Path(args.current_report)),
+                hard_caps=load_hard_caps(args.hard_caps),
+                reason=args.reason,
+                target_color=args.target_color,
+            )
+            await session.commit()
+            print(json.dumps(result.to_dict(), indent=2))
+            return 0
         if action == "seed-default":
             pack = load_parameter_pack(args.path) if args.path is not None else default_parameter_pack()
             record = await repo.update_parameter_pack(pack, holdout_report={})
@@ -1785,6 +1815,16 @@ def build_parser() -> argparse.ArgumentParser:
     parameter_pack_gate.add_argument("--candidate-report", required=True)
     parameter_pack_gate.add_argument("--current-report", required=True)
     parameter_pack_gate.add_argument("--hard-caps", default=str(DEFAULT_HARD_CAPS_PATH))
+    parameter_pack_stage = parameter_pack_subparsers.add_parser(
+        "stage",
+        help="Stage a gated parameter pack on the inactive color without changing live risk",
+    )
+    parameter_pack_stage.add_argument("--candidate-pack", required=True)
+    parameter_pack_stage.add_argument("--candidate-report", required=True)
+    parameter_pack_stage.add_argument("--current-report", required=True)
+    parameter_pack_stage.add_argument("--hard-caps", default=str(DEFAULT_HARD_CAPS_PATH))
+    parameter_pack_stage.add_argument("--target-color", choices=["blue", "green"], default=None)
+    parameter_pack_stage.add_argument("--reason", default="manual_parameter_pack_stage")
 
     subparsers.add_parser("shadow-c-sweep", help="Strategy C: evaluate lock-confirmation signals across all configured markets")
     subparsers.add_parser("strategy-c-status", help="Strategy C: show aggregate sweep metrics and lock tracker state")

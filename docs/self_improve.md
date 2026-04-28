@@ -61,7 +61,7 @@ Hard caps remain outside the pack and operator-only:
 
 Promotion requires complete `decision_traces`, strict-as-of replay, holdout gates, and canary shadow evidence. The existing agent-pack workflow remains available until the parameter-pack promotion service replaces it.
 
-Phase 4 scaffolding is present now: bounded `parameter_packs` records, deterministic pack hashes, hard-cap exclusion during sanitization, holdout promotion gates, and calibration drift pause criteria. These pieces are not yet wired to the nightly workflow; they exist so replay search can be added without mixing mutable trading parameters into LLM agent-pack state.
+Phase 4 scaffolding is present now: bounded `parameter_packs` records, deterministic pack hashes, hard-cap exclusion during sanitization, holdout promotion gates, DB-audited parameter-pack staging, and calibration drift pause criteria. These pieces are not yet wired to autonomous nightly promotion; they exist so replay search can be added without mixing mutable trading parameters into LLM agent-pack state.
 
 The operator-owned caps live in `infra/config/hard_caps.yaml`. Parameter-pack validation can print a hash of that sealed config and can run in `--strict` mode to fail candidates that attempt to include hard-cap fields. The parameter-pack promotion gate loads the same sealed config and applies its `max_drawdown_pct` as the hard replay drawdown ceiling.
 
@@ -82,7 +82,10 @@ kalshi-bot-cli parameter-pack hard-caps
 kalshi-bot-cli parameter-pack validate candidate-pack.json
 kalshi-bot-cli parameter-pack validate candidate-pack.json --strict
 kalshi-bot-cli parameter-pack gate --candidate-report candidate-holdout.json --current-report current-holdout.json --hard-caps infra/config/hard_caps.yaml
+kalshi-bot-cli parameter-pack stage --candidate-pack candidate-pack.json --candidate-report candidate-holdout.json --current-report current-holdout.json --hard-caps infra/config/hard_caps.yaml
 ```
+
+`parameter-pack stage` is intentionally not an activator. It stores a sanitized candidate pack, records a `promotion_events` row with holdout-gate evidence and sealed hard-cap hash, and writes `deployment_control.notes.parameter_packs` for operator visibility. It does not change active color, live execution, hard caps, or runtime thresholds.
 
 The helper scripts wrap the same flow for Docker blue or green deployments:
 

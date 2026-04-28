@@ -74,6 +74,7 @@ Postgres stores:
 - forecast snapshots and climatology priors for future replay-gated probability promotion
 - source health logs for per-provider success, freshness, completeness, consistency, and aggregate pause audits
 - deterministic parameter packs and holdout reports for future replay-gated promotion
+- staged parameter-pack promotion evidence in `promotion_events` and `deployment_control.notes.parameter_packs`
 - sealed hard-cap config hashes so operator-owned risk caps remain outside parameter packs
 - ops events and checkpoints
 - memory notes and embeddings

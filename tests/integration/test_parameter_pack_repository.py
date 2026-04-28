@@ -23,6 +23,7 @@ async def test_parameter_pack_repository_round_trip(tmp_path) -> None:
             holdout_report={"coverage": 0.97, "brier": 0.19},
         )
         fetched = await repo.get_parameter_pack("params-v1")
+        champion = await repo.get_champion_parameter_pack()
         listed = await repo.list_parameter_packs(limit=1)
         await session.commit()
 
@@ -30,6 +31,8 @@ async def test_parameter_pack_repository_round_trip(tmp_path) -> None:
     assert fetched is not None
     assert fetched.payload["parameters"]["pseudo_count"] == 8
     assert fetched.holdout_report["coverage"] == 0.97
+    assert champion is not None
+    assert champion.version == "params-v1"
     assert listed[0].version == "params-v1"
 
     await engine.dispose()

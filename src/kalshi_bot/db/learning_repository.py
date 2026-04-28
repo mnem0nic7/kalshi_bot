@@ -120,6 +120,15 @@ class LearningRepositoryMixin:
         stmt = select(ParameterPackRecord).where(ParameterPackRecord.version == version).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def get_champion_parameter_pack(self) -> ParameterPackRecord | None:
+        stmt = (
+            select(ParameterPackRecord)
+            .where(ParameterPackRecord.status == "champion")
+            .order_by(ParameterPackRecord.updated_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def list_parameter_packs(self, limit: int = 20) -> list[ParameterPackRecord]:
         result = await self.session.execute(
             select(ParameterPackRecord).order_by(ParameterPackRecord.created_at.desc()).limit(limit)

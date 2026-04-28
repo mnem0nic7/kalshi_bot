@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from kalshi_bot import cli as cli_module
 from kalshi_bot.config import Settings
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+from kalshi_bot.learning.parameter_pack import default_parameter_pack
 
 
 def test_python_module_cli_entrypoint_runs_help() -> None:
@@ -141,12 +143,21 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert command_help.returncode == 0
     assert "validate" in command_help.stdout
     assert "gate" in command_help.stdout
+    assert "stage" in command_help.stdout
     assert "hard-caps" in command_help.stdout
     assert "seed-default" in command_help.stdout
     assert gate_help.returncode == 0
     assert "--candidate-report" in gate_help.stdout
     assert "--current-report" in gate_help.stdout
     assert "--hard-caps" in gate_help.stdout
+    stage_help = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "parameter-pack", "stage", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert stage_help.returncode == 0
+    assert "--candidate-pack" in stage_help.stdout
 
 
 def test_parameter_pack_validate_cli_sanitizes_candidate_json(tmp_path) -> None:
@@ -353,6 +364,81 @@ def test_parameter_pack_gate_cli_uses_sealed_hard_drawdown_cap(tmp_path) -> None
     payload = json.loads(result.stdout)
     assert payload["failures"] == ["drawdown_regression"]
     assert payload["comparisons"]["max_drawdown"]["maximum"] == 0.20
+
+
+def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/parameter-pack-stage-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+    current = default_parameter_pack()
+    candidate = replace(
+        default_parameter_pack(version="candidate-stage-cli-v1"),
+        status="candidate",
+        parameters={**current.parameters, "pseudo_count": 12},
+    )
+    candidate_pack_path = tmp_path / "candidate-pack.json"
+    current_report_path = tmp_path / "current-report.json"
+    candidate_report_path = tmp_path / "candidate-report.json"
+    candidate_pack_path.write_text(json.dumps(candidate.to_dict()), encoding="utf-8")
+    current_report_path.write_text(
+        json.dumps(
+            {
+                "coverage": 0.98,
+                "brier": 0.20,
+                "ece": 0.05,
+                "sharpe": 1.0,
+                "max_drawdown": 0.10,
+                "pack_hash": current.pack_hash,
+                "rerun_pack_hash": current.pack_hash,
+            }
+        ),
+        encoding="utf-8",
+    )
+    candidate_report_path.write_text(
+        json.dumps(
+            {
+                "coverage": 0.98,
+                "brier": 0.19,
+                "ece": 0.04,
+                "sharpe": 1.0,
+                "max_drawdown": 0.08,
+                "hard_cap_touches": 0,
+                "pack_hash": candidate.pack_hash,
+                "rerun_pack_hash": candidate.pack_hash,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "parameter-pack",
+            "stage",
+            "--candidate-pack",
+            str(candidate_pack_path),
+            "--candidate-report",
+            str(candidate_report_path),
+            "--current-report",
+            str(current_report_path),
+            "--reason",
+            "cli_test_stage",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "staged"
+    assert payload["candidate_version"] == candidate.version
+    assert payload["previous_version"] == current.version
+    assert payload["target_color"] == "green"
+    assert payload["gate"]["passed"] is True
 
 
 @pytest.mark.asyncio
