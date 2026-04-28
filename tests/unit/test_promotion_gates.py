@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from kalshi_bot.learning.promotion_gates import HoldoutMetrics, evaluate_parameter_pack_promotion
+from kalshi_bot.learning.hard_caps import HardCaps
+from kalshi_bot.learning.promotion_gates import (
+    HoldoutMetrics,
+    evaluate_parameter_pack_promotion,
+    promotion_gate_config_from_hard_caps,
+)
 
 
 def test_parameter_pack_promotion_gates_pass_when_all_holdout_metrics_clear() -> None:
@@ -68,3 +73,46 @@ def test_parameter_pack_promotion_gates_report_every_failure() -> None:
         "hard_cap_touch",
         "pack_hash_not_idempotent",
     ]
+
+
+def test_parameter_pack_promotion_gates_use_operator_hard_drawdown_cap() -> None:
+    hard_caps = HardCaps(
+        schema_version="hard-caps-v1",
+        operator_only=True,
+        hard_caps={
+            "max_position_pct": 0.10,
+            "max_total_exposure_pct": 0.25,
+            "daily_max_loss_pct": 0.20,
+            "max_drawdown_pct": 0.12,
+            "max_position_usd": None,
+        },
+    )
+    current = HoldoutMetrics(
+        coverage=0.99,
+        brier=0.20,
+        ece=0.04,
+        sharpe=1.00,
+        max_drawdown=0.20,
+        pack_hash="current",
+        rerun_pack_hash="current",
+    )
+    candidate = HoldoutMetrics(
+        coverage=0.99,
+        brier=0.19,
+        ece=0.04,
+        sharpe=1.00,
+        max_drawdown=0.13,
+        hard_cap_touches=0,
+        pack_hash="candidate",
+        rerun_pack_hash="candidate",
+    )
+
+    result = evaluate_parameter_pack_promotion(
+        candidate=candidate,
+        current=current,
+        config=promotion_gate_config_from_hard_caps(hard_caps),
+    )
+
+    assert result.passed is False
+    assert result.failures == ["drawdown_regression"]
+    assert result.comparisons["max_drawdown"]["maximum"] == 0.12

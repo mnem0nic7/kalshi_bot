@@ -76,6 +76,7 @@ Phase 4 foundation now exists without activating autonomous promotion:
 - `kalshi_bot.learning.promotion_gates` evaluates the holdout gates for coverage, Brier, ECE, Sharpe, drawdown, city win-rate consistency, hard-cap touches, and idempotent hashes.
 - `kalshi_bot.learning.drift_watcher` provides the calibration pause/search trigger for Brier, ECE, and realized-vs-predicted win-rate drift.
 - `infra/config/hard_caps.yaml` is the operator-owned sealed hard-cap artifact, and `kalshi_bot.learning.hard_caps` loads, validates, and hashes it.
+- `parameter-pack gate` loads the sealed hard-cap artifact and uses `max_drawdown_pct` as the promotion drawdown ceiling.
 - `infra/config/parameter_pack_default.yaml` mirrors the built-in default parameter pack for audit and operator review.
 - The existing self-improve workflow still promotes agent packs until replay-backed parameter search is wired explicitly.
 

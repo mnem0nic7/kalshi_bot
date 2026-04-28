@@ -63,7 +63,7 @@ Promotion requires complete `decision_traces`, strict-as-of replay, holdout gate
 
 Phase 4 scaffolding is present now: bounded `parameter_packs` records, deterministic pack hashes, hard-cap exclusion during sanitization, holdout promotion gates, and calibration drift pause criteria. These pieces are not yet wired to the nightly workflow; they exist so replay search can be added without mixing mutable trading parameters into LLM agent-pack state.
 
-The operator-owned caps live in `infra/config/hard_caps.yaml`. Parameter-pack validation can print a hash of that sealed config and can run in `--strict` mode to fail candidates that attempt to include hard-cap fields.
+The operator-owned caps live in `infra/config/hard_caps.yaml`. Parameter-pack validation can print a hash of that sealed config and can run in `--strict` mode to fail candidates that attempt to include hard-cap fields. The parameter-pack promotion gate loads the same sealed config and applies its `max_drawdown_pct` as the hard replay drawdown ceiling.
 
 ## CLI
 
@@ -81,7 +81,7 @@ kalshi-bot-cli parameter-pack default
 kalshi-bot-cli parameter-pack hard-caps
 kalshi-bot-cli parameter-pack validate candidate-pack.json
 kalshi-bot-cli parameter-pack validate candidate-pack.json --strict
-kalshi-bot-cli parameter-pack gate --candidate-report candidate-holdout.json --current-report current-holdout.json
+kalshi-bot-cli parameter-pack gate --candidate-report candidate-holdout.json --current-report current-holdout.json --hard-caps infra/config/hard_caps.yaml
 ```
 
 The helper scripts wrap the same flow for Docker blue or green deployments:

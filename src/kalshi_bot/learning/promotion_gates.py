@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
+
+from kalshi_bot.learning.hard_caps import HardCaps
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +116,17 @@ def evaluate_parameter_pack_promotion(
         failures=failures,
         comparisons=comparisons,
     )
+
+
+def promotion_gate_config_from_hard_caps(
+    hard_caps: HardCaps,
+    *,
+    base: PromotionGateConfig | None = None,
+) -> PromotionGateConfig:
+    max_drawdown = hard_caps.hard_caps.get("max_drawdown_pct")
+    if max_drawdown is None:
+        raise ValueError("hard_caps missing max_drawdown_pct")
+    return replace(base or PromotionGateConfig(), hard_max_drawdown=float(max_drawdown))
 
 
 def _minimum_allowed_sharpe(current_sharpe: float, ratio: float) -> float:

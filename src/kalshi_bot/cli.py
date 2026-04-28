@@ -32,7 +32,11 @@ from kalshi_bot.learning.parameter_pack import (
     parameter_pack_from_dict,
     sanitize_parameter_pack,
 )
-from kalshi_bot.learning.promotion_gates import HoldoutMetrics, evaluate_parameter_pack_promotion
+from kalshi_bot.learning.promotion_gates import (
+    HoldoutMetrics,
+    evaluate_parameter_pack_promotion,
+    promotion_gate_config_from_hard_caps,
+)
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
 from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, replay_decision_trace
@@ -191,8 +195,18 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
     if action == "gate":
         candidate = HoldoutMetrics.from_dict(_read_json_file(Path(args.candidate_report)))
         current = HoldoutMetrics.from_dict(_read_json_file(Path(args.current_report)))
-        result = evaluate_parameter_pack_promotion(candidate=candidate, current=current)
-        print(json.dumps(result.to_dict(), indent=2))
+        hard_caps = load_hard_caps(args.hard_caps)
+        result = evaluate_parameter_pack_promotion(
+            candidate=candidate,
+            current=current,
+            config=promotion_gate_config_from_hard_caps(hard_caps),
+        )
+        payload = result.to_dict()
+        payload["hard_caps"] = {
+            "config_hash": hard_caps.config_hash,
+            "max_drawdown_pct": hard_caps.hard_caps["max_drawdown_pct"],
+        }
+        print(json.dumps(payload, indent=2))
         return 0 if result.passed else 1
 
     async with container.session_factory() as session:
@@ -1770,6 +1784,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parameter_pack_gate.add_argument("--candidate-report", required=True)
     parameter_pack_gate.add_argument("--current-report", required=True)
+    parameter_pack_gate.add_argument("--hard-caps", default=str(DEFAULT_HARD_CAPS_PATH))
 
     subparsers.add_parser("shadow-c-sweep", help="Strategy C: evaluate lock-confirmation signals across all configured markets")
     subparsers.add_parser("strategy-c-status", help="Strategy C: show aggregate sweep metrics and lock tracker state")

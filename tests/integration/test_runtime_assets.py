@@ -138,6 +138,8 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack validate candidate-pack.json --strict" in self_improve
     assert "parameter-pack validate" in self_improve
     assert "parameter-pack gate" in self_improve
+    assert "--hard-caps infra/config/hard_caps.yaml" in self_improve
+    assert "max_drawdown_pct" in self_improve
     assert "decision-trace replay" in strategy
 
 

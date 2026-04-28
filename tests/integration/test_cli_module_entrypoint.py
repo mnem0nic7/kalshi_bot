@@ -146,6 +146,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert gate_help.returncode == 0
     assert "--candidate-report" in gate_help.stdout
     assert "--current-report" in gate_help.stdout
+    assert "--hard-caps" in gate_help.stdout
 
 
 def test_parameter_pack_validate_cli_sanitizes_candidate_json(tmp_path) -> None:
@@ -290,6 +291,68 @@ def test_parameter_pack_gate_cli_returns_success_for_passing_reports(tmp_path) -
     payload = json.loads(result.stdout)
     assert payload["passed"] is True
     assert payload["failures"] == []
+    assert len(payload["hard_caps"]["config_hash"]) == 64
+    assert payload["hard_caps"]["max_drawdown_pct"] == 0.20
+
+
+def test_parameter_pack_gate_cli_uses_sealed_hard_drawdown_cap(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/parameter-pack-gate-cap-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+    current_path = tmp_path / "current.json"
+    candidate_path = tmp_path / "candidate.json"
+    current_path.write_text(
+        json.dumps(
+            {
+                "coverage": 0.98,
+                "brier": 0.20,
+                "ece": 0.05,
+                "sharpe": 1.0,
+                "max_drawdown": 0.30,
+                "pack_hash": "current",
+                "rerun_pack_hash": "current",
+            }
+        ),
+        encoding="utf-8",
+    )
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "coverage": 0.97,
+                "brier": 0.19,
+                "ece": 0.04,
+                "sharpe": 0.98,
+                "max_drawdown": 0.21,
+                "hard_cap_touches": 0,
+                "pack_hash": "candidate",
+                "rerun_pack_hash": "candidate",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "parameter-pack",
+            "gate",
+            "--candidate-report",
+            str(candidate_path),
+            "--current-report",
+            str(current_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["failures"] == ["drawdown_regression"]
+    assert payload["comparisons"]["max_drawdown"]["maximum"] == 0.20
 
 
 @pytest.mark.asyncio
