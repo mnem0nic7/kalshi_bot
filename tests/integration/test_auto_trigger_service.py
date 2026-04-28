@@ -6,6 +6,8 @@ from decimal import Decimal
 import pytest
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import WeatherResolutionState
+from kalshi_bot.core.schemas import ResearchDossier, ResearchFreshness, ResearchGateVerdict, ResearchSummary, ResearchTraderContext
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.agent_packs import AgentPackService
@@ -31,6 +33,63 @@ class FakeSupervisor:
         self.calls.append((room_id, reason))
 
 
+def _directory() -> WeatherMarketDirectory:
+    return WeatherMarketDirectory(
+        {
+            "WX-TEST": WeatherMarketMapping(
+                market_ticker="WX-TEST",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+            )
+        }
+    )
+
+
+def _resolved_research_dossier(*, now: datetime) -> ResearchDossier:
+    return ResearchDossier(
+        market_ticker="WX-TEST",
+        status="ready",
+        mode="structured",
+        summary=ResearchSummary(
+            narrative="Contract is locked.",
+            bullish_case="Current temp crossed threshold.",
+            bearish_case="None.",
+            unresolved_uncertainties=[],
+            settlement_mechanics="NWS station observation",
+            current_numeric_facts={
+                "current_temp_f": 84.0,
+                "threshold_f": 80.0,
+                "resolution_state": WeatherResolutionState.LOCKED_YES.value,
+            },
+            source_coverage="structured weather",
+            research_confidence=1.0,
+        ),
+        freshness=ResearchFreshness(
+            refreshed_at=now,
+            expires_at=now + timedelta(minutes=10),
+            stale=False,
+            max_source_age_seconds=0,
+        ),
+        trader_context=ResearchTraderContext(
+            fair_yes_dollars="1.0000",
+            confidence=1.0,
+            thesis="Current observed temperature has already crossed the threshold.",
+            structured_source_used=True,
+            autonomous_ready=True,
+            resolution_state=WeatherResolutionState.LOCKED_YES,
+        ),
+        gate=ResearchGateVerdict(
+            passed=True,
+            reasons=["Research gate passed."],
+            cited_source_keys=[],
+        ),
+        settlement_covered=True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> None:
     settings = Settings(
@@ -45,18 +104,7 @@ async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> 
     await init_models(engine)
     supervisor = FakeSupervisor()
     agent_pack_service = AgentPackService(settings)
-    directory = WeatherMarketDirectory(
-        {
-            "WX-TEST": WeatherMarketMapping(
-                market_ticker="WX-TEST",
-                station_id="KNYC",
-                location_name="NYC",
-                latitude=40.0,
-                longitude=-73.0,
-                threshold_f=80,
-            )
-        }
-    )
+    directory = _directory()
     service = AutoTriggerService(settings, session_factory, directory, agent_pack_service, supervisor)
 
     async with session_factory() as session:
@@ -86,6 +134,102 @@ async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> 
     assert checkpoint is not None
     assert len(supervisor.calls) == 1
     assert supervisor.calls[0][1] == "auto_trigger"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_skips_fresh_resolved_research_before_room_creation(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_resolved_research.db",
+        trigger_enable_auto_rooms=True,
+        trigger_cooldown_seconds=600,
+        trigger_max_spread_bps=1200,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
+    service = AutoTriggerService(settings, session_factory, _directory(), agent_pack_service, supervisor)
+    now = datetime.now(UTC)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot=_GOOD_SNAPSHOT,
+            yes_bid_dollars="0.4400",  # type: ignore[arg-type]
+            yes_ask_dollars="0.4800",  # type: ignore[arg-type]
+            last_trade_dollars=None,
+        )
+        await repo.upsert_research_dossier(_resolved_research_dossier(now=now))
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms(limit=10)
+        ops_events = await repo.list_ops_events(limit=10, kalshi_env=settings.kalshi_env)
+        checkpoint = await repo.get_checkpoint("auto_trigger_block:demo:WX-TEST:resolved_contract")
+        await session.commit()
+
+    assert rooms == []
+    assert supervisor.calls == []
+    assert checkpoint is not None
+    assert checkpoint.payload["reason"] == "resolved_contract"
+    assert checkpoint.payload["resolution_state"] == "locked_yes"
+    assert any("latest research says contract is resolved" in event.summary for event in ops_events)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_skips_terminal_market_lifecycle_before_room_creation(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_terminal_lifecycle.db",
+        trigger_enable_auto_rooms=True,
+        trigger_cooldown_seconds=600,
+        trigger_max_spread_bps=1200,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
+    service = AutoTriggerService(settings, session_factory, _directory(), agent_pack_service, supervisor)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot={**_GOOD_SNAPSHOT, "lifecycle": {"status": "closed", "result": "yes"}},
+            yes_bid_dollars="0.4400",  # type: ignore[arg-type]
+            yes_ask_dollars="0.4800",  # type: ignore[arg-type]
+            last_trade_dollars=None,
+        )
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms(limit=10)
+        ops_events = await repo.list_ops_events(limit=10, kalshi_env=settings.kalshi_env)
+        checkpoint = await repo.get_checkpoint("auto_trigger_block:demo:WX-TEST:terminal_market")
+        await session.commit()
+
+    assert rooms == []
+    assert supervisor.calls == []
+    assert checkpoint is not None
+    assert checkpoint.payload["reason"] == "terminal_market"
+    assert checkpoint.payload["lifecycle_status"] == "closed"
+    assert any("market lifecycle is terminal" in event.summary for event in ops_events)
 
     await engine.dispose()
 

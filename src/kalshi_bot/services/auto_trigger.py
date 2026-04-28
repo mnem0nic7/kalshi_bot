@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import WeatherResolutionState
 from kalshi_bot.core.schemas import RoomCreate
-from kalshi_bot.db.models import MarketState
+from kalshi_bot.db.models import MarketState, ResearchDossierRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
 from kalshi_bot.services.position_governance import (
@@ -63,6 +64,39 @@ class AutoTriggerService:
             thresholds = self.agent_pack_service.runtime_thresholds(pack)
             market_state = await repo.get_market_state(market_ticker, kalshi_env=self.settings.kalshi_env)
             if market_state is None or not self._market_is_actionable(market_state, thresholds):
+                await session.commit()
+                return
+            terminal_market = self._terminal_market_lifecycle(market_state)
+            if terminal_market is not None:
+                await self._log_block_once_per_cooldown(
+                    repo,
+                    checkpoint_key=(
+                        f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
+                        "terminal_market"
+                    ),
+                    cooldown_seconds=thresholds.trigger_cooldown_seconds,
+                    severity="info",
+                    summary=f"Auto-trigger skipped for {market_ticker}: market lifecycle is terminal",
+                    payload={"market_ticker": market_ticker, "reason": "terminal_market", **terminal_market},
+                    kalshi_env=self.settings.kalshi_env,
+                )
+                await session.commit()
+                return
+            dossier_record = await repo.get_research_dossier(market_ticker)
+            resolved_research = self._fresh_resolved_research(dossier_record, now=datetime.now(UTC))
+            if resolved_research is not None:
+                await self._log_block_once_per_cooldown(
+                    repo,
+                    checkpoint_key=(
+                        f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
+                        "resolved_contract"
+                    ),
+                    cooldown_seconds=thresholds.trigger_cooldown_seconds,
+                    severity="info",
+                    summary=f"Auto-trigger skipped for {market_ticker}: latest research says contract is resolved",
+                    payload={"market_ticker": market_ticker, "reason": "resolved_contract", **resolved_research},
+                    kalshi_env=self.settings.kalshi_env,
+                )
                 await session.commit()
                 return
 
@@ -338,6 +372,113 @@ class AutoTriggerService:
         if spread_bps <= 0:
             return False
         return spread_bps <= thresholds.trigger_max_spread_bps
+
+    def _fresh_resolved_research(
+        self,
+        dossier_record: ResearchDossierRecord | None,
+        *,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        if dossier_record is None:
+            return None
+        if self._record_is_expired(dossier_record, now=now):
+            return None
+
+        payload = dict(dossier_record.payload or {})
+        freshness = payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
+        if bool(freshness.get("stale")):
+            return None
+
+        trader_context = payload.get("trader_context") if isinstance(payload.get("trader_context"), dict) else {}
+        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+        numeric_facts = (
+            summary.get("current_numeric_facts")
+            if isinstance(summary.get("current_numeric_facts"), dict)
+            else {}
+        )
+        resolution_state = (
+            trader_context.get("resolution_state")
+            or numeric_facts.get("resolution_state")
+        )
+        if resolution_state not in {
+            WeatherResolutionState.LOCKED_YES.value,
+            WeatherResolutionState.LOCKED_NO.value,
+        }:
+            return None
+
+        return {
+            "resolution_state": str(resolution_state),
+            "last_run_id": getattr(dossier_record, "last_run_id", None),
+            "expires_at": self._iso_or_none(getattr(dossier_record, "expires_at", None)),
+            "current_temp_f": numeric_facts.get("current_temp_f"),
+            "threshold_f": numeric_facts.get("threshold_f"),
+        }
+
+    def _terminal_market_lifecycle(self, market_state: MarketState) -> dict[str, Any] | None:
+        snapshot = market_state.snapshot if isinstance(market_state.snapshot, dict) else {}
+        lifecycle = snapshot.get("lifecycle") if isinstance(snapshot.get("lifecycle"), dict) else None
+        if lifecycle is None:
+            return None
+
+        status = self._lower_or_none(
+            lifecycle.get("status")
+            or lifecycle.get("state")
+            or lifecycle.get("market_status")
+            or lifecycle.get("trading_status")
+        )
+        result = self._lower_or_none(
+            lifecycle.get("result")
+            or lifecycle.get("settlement_result")
+            or lifecycle.get("settled_result")
+            or lifecycle.get("winning_side")
+        )
+        if status not in {"closed", "settled", "resolved", "finalized", "expired"} and result not in {"yes", "no"}:
+            return None
+
+        return {
+            "lifecycle_status": status,
+            "lifecycle_result": result,
+            "lifecycle_event_type": lifecycle.get("event_type") or lifecycle.get("type"),
+        }
+
+    @staticmethod
+    def _record_is_expired(dossier_record: ResearchDossierRecord, *, now: datetime) -> bool:
+        expires_at = AutoTriggerService._as_utc(getattr(dossier_record, "expires_at", None))
+        if expires_at is None:
+            payload = dict(getattr(dossier_record, "payload", {}) or {})
+            freshness = payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
+            expires_at = AutoTriggerService._parse_datetime(freshness.get("expires_at"))
+        return expires_at is not None and expires_at <= AutoTriggerService._as_utc(now)
+
+    @staticmethod
+    def _as_utc(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return AutoTriggerService._as_utc(value)
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return AutoTriggerService._as_utc(datetime.fromisoformat(value))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _iso_or_none(value: datetime | None) -> str | None:
+        parsed = AutoTriggerService._as_utc(value)
+        return parsed.isoformat() if parsed is not None else None
+
+    @staticmethod
+    def _lower_or_none(value: Any) -> str | None:
+        if value in (None, ""):
+            return None
+        return str(value).strip().lower()
 
     @staticmethod
     def _spread_bps(market_state: MarketState) -> int:
