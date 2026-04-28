@@ -651,6 +651,13 @@ class TradingAuditService:
                     selected_without_ticket.append(signal)
             elif outcome == "pre_risk_filtered" and candidate_trace.get("outcome") == "candidate_selected":
                 selected_candidate = self._selected_candidate_trace(candidate_trace)
+                forecast_delta_f = _decimal_or_none(payload.get("forecast_delta_f"))
+                abs_forecast_delta_f = float(abs(forecast_delta_f)) if forecast_delta_f is not None else None
+                forecast_delta_gap_f = (
+                    round(max(0.0, float(self.settings.strategy_min_abs_delta_f) - abs_forecast_delta_f), 2)
+                    if abs_forecast_delta_f is not None
+                    else None
+                )
                 blocked_candidates.append(
                     {
                         "room_id": signal.room_id,
@@ -671,6 +678,9 @@ class TradingAuditService:
                             selected_candidate.get("spread_bps") or eligibility.get("market_spread_bps")
                         ),
                         "forecast_delta_f": payload.get("forecast_delta_f"),
+                        "abs_forecast_delta_f": abs_forecast_delta_f,
+                        "configured_min_abs_delta_f": float(self.settings.strategy_min_abs_delta_f),
+                        "forecast_delta_gap_f": forecast_delta_gap_f,
                         "confidence": float(signal.confidence),
                         "created_at": _iso(signal.created_at),
                     }
@@ -723,9 +733,7 @@ class TradingAuditService:
             "terminal_blocked_candidate_count": len(blocked_candidates) - len(non_terminal_blocked_candidates),
             "non_terminal_blocked_candidate_count": len(non_terminal_blocked_candidates),
             "top_non_terminal_blocked_candidates": non_terminal_blocked_candidates[:20],
-            "non_terminal_blocked_reason_rollups": self._blocked_candidate_reason_rollups(
-                non_terminal_blocked_candidates
-            ),
+            "non_terminal_blocked_reason_rollups": self._blocked_candidate_reason_rollups(non_terminal_blocked_candidates),
             "recent_selected_without_ticket": recent_selected_without_ticket,
         }
 
@@ -753,8 +761,7 @@ class TradingAuditService:
         except (TypeError, ValueError):
             return None
 
-    @classmethod
-    def _blocked_candidate_reason_rollups(cls, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _blocked_candidate_reason_rollups(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for candidate in candidates:
             grouped[str(candidate.get("stand_down_reason") or "unknown")].append(candidate)
@@ -764,22 +771,27 @@ class TradingAuditService:
             edge_values = [
                 value
                 for item in items
-                if (value := cls._int_or_none(item.get("selected_edge_bps"))) is not None
+                if (value := self._int_or_none(item.get("selected_edge_bps"))) is not None
             ]
             quality_values = [
                 value
                 for item in items
-                if (value := cls._int_or_none(item.get("quality_adjusted_edge_bps"))) is not None
+                if (value := self._int_or_none(item.get("quality_adjusted_edge_bps"))) is not None
             ]
             spread_values = [
                 value
                 for item in items
-                if (value := cls._int_or_none(item.get("spread_bps"))) is not None
+                if (value := self._int_or_none(item.get("spread_bps"))) is not None
             ]
             forecast_values = [
-                abs(float(value))
+                float(value)
                 for item in items
-                if (value := _decimal_or_none(item.get("forecast_delta_f"))) is not None
+                if (value := _decimal_or_none(item.get("abs_forecast_delta_f"))) is not None
+            ]
+            forecast_gap_values = [
+                float(value)
+                for item in items
+                if (value := _decimal_or_none(item.get("forecast_delta_gap_f"))) is not None
             ]
             rows.append(
                 {
@@ -793,6 +805,10 @@ class TradingAuditService:
                     "avg_spread_bps": round(sum(spread_values) / len(spread_values), 2) if spread_values else None,
                     "avg_abs_forecast_delta_f": (
                         round(sum(forecast_values) / len(forecast_values), 2) if forecast_values else None
+                    ),
+                    "configured_min_abs_delta_f": float(self.settings.strategy_min_abs_delta_f),
+                    "avg_forecast_delta_gap_f": (
+                        round(sum(forecast_gap_values) / len(forecast_gap_values), 2) if forecast_gap_values else None
                     ),
                 }
             )

@@ -365,6 +365,9 @@ async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) 
     assert blocked["selected_edge_bps"] == 900
     assert blocked["quality_adjusted_edge_bps"] == 875
     assert blocked["forecast_delta_f"] == 1.5
+    assert blocked["abs_forecast_delta_f"] == 1.5
+    assert blocked["configured_min_abs_delta_f"] == float(settings.strategy_min_abs_delta_f)
+    assert blocked["forecast_delta_gap_f"] == round(float(settings.strategy_min_abs_delta_f) - 1.5, 2)
     assert report["signal_funnel"]["non_terminal_blocked_reason_rollups"] == [
         {
             "reason": "insufficient_forecast_separation",
@@ -374,6 +377,8 @@ async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) 
             "avg_quality_adjusted_edge_bps": 875.0,
             "avg_spread_bps": 400.0,
             "avg_abs_forecast_delta_f": 1.5,
+            "configured_min_abs_delta_f": float(settings.strategy_min_abs_delta_f),
+            "avg_forecast_delta_gap_f": round(float(settings.strategy_min_abs_delta_f) - 1.5, 2),
         }
     ]
     assert report["signal_funnel"]["recent_selected_without_ticket"][0]["room_id"] == room_selected.id
