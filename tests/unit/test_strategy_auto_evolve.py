@@ -69,6 +69,7 @@ class FakeCodexService:
         total_pnl_dollars: float | None = 2.5,
         below_support_floor: bool = False,
         insufficient_for_ranking: bool = False,
+        suggestion_status: str = "completed",
     ) -> None:
         self.available = available
         self.backtest_status = backtest_status
@@ -86,6 +87,7 @@ class FakeCodexService:
         self.total_pnl_dollars = total_pnl_dollars
         self.below_support_floor = below_support_floor
         self.insufficient_for_ranking = insufficient_for_ranking
+        self.suggestion_status = suggestion_status
         self.execute_calls = 0
         self.accept_calls = 0
         self.activate_calls = 0
@@ -110,7 +112,7 @@ class FakeCodexService:
             {
                 "id": "suggest-run",
                 "mode": "suggest",
-                "status": "completed",
+                "status": self.suggestion_status,
                 "finished_at": finished_at.isoformat() if isinstance(finished_at, datetime) else finished_at,
                 "provider": "gemini",
                 "model": "gemini-2.5-pro",
@@ -329,6 +331,24 @@ async def test_auto_evolve_same_day_is_idempotent(auto_evolve_harness) -> None:
     assert codex.execute_calls == 1
     assert codex.accept_calls == 1
     assert codex.activate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_same_day_already_completed_state_stays_idempotent(auto_evolve_harness) -> None:
+    codex = FakeCodexService(suggestion_status="failed")
+    service = await auto_evolve_harness.build(codex=codex)
+
+    first = await service.run_once(trigger_source="nightly")
+    second = await service.run_once(trigger_source="nightly")
+    third = await service.run_once(trigger_source="nightly")
+
+    assert first["status"] == "completed_with_failures"
+    assert first["errors"] == [{"stage": "accept", "reason": "suggestion_not_completed", "status": "failed"}]
+    assert second["status"] == "already_completed"
+    assert third["status"] == "already_completed"
+    assert codex.execute_calls == 1
+    assert codex.accept_calls == 0
+    assert codex.activate_calls == 0
 
 
 @pytest.mark.asyncio

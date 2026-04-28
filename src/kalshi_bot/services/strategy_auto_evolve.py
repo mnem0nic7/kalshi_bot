@@ -659,6 +659,7 @@ class StrategyAutoEvolveService:
 
         previous = await self._get_checkpoint_payload()
         if previous.get("local_date") == payload["local_date"] and previous.get("status") in {
+            "already_completed",
             "completed",
             "completed_with_failures",
         }:
