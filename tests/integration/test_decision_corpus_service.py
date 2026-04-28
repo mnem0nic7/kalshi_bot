@@ -48,6 +48,7 @@ async def _seed_historical_decision(
     coverage_class: str = "full_checkpoint_coverage",
     source_kind: str = "checkpoint_archive",
     kalshi_env: str = "demo",
+    forecast_delta_f: float | None = None,
 ) -> str:
     async with session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=kalshi_env)
@@ -73,6 +74,8 @@ async def _seed_historical_decision(
             signal_payload["recommended_side"] = recommended_side
         if target_yes_price is not None:
             signal_payload["target_yes_price_dollars"] = str(target_yes_price)
+        if forecast_delta_f is not None:
+            signal_payload["forecast_delta_f"] = forecast_delta_f
         await repo.save_signal(
             room_id=room.id,
             market_ticker=market_ticker,
@@ -189,6 +192,7 @@ async def test_build_creates_rows_with_pnl_nulls_support_and_provenance(tmp_path
         recommended_side="yes",
         target_yes_price=Decimal("0.6000"),
         settlement_result="yes",
+        forecast_delta_f=2.0,
     )
     await _seed_historical_decision(
         harness.session_factory,
@@ -240,6 +244,10 @@ async def test_build_creates_rows_with_pnl_nulls_support_and_provenance(tmp_path
     assert yes_row.source_provenance == "historical_replay_full_checkpoint"
     assert yes_row.station_id == "KNYC"
     assert yes_row.time_to_settlement_at_checkpoint_minutes is not None
+    assert yes_row.diagnostics["forecast_delta_f"] == 2.0
+    assert yes_row.diagnostics["abs_forecast_delta_f"] == 2.0
+    assert yes_row.diagnostics["configured_min_abs_delta_f"] == float(harness.settings.strategy_min_abs_delta_f)
+    assert yes_row.diagnostics["forecast_delta_gap_f"] == float(harness.settings.strategy_min_abs_delta_f) - 2.0
     assert yes_row.support_level == "L5_global"
     assert yes_row.support_status == "insufficient"
     assert yes_row.backoff_path[-1]["failed_on"] == ["n", "market_days"]

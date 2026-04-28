@@ -56,6 +56,15 @@ def _as_decimal(value: Any) -> Decimal | None:
     return Decimal(str(value))
 
 
+def _as_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _as_datetime(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
@@ -862,6 +871,13 @@ class DecisionCorpusService:
             settlement_result=settlement.kalshi_result,
         )
         source_provenance, source_details = self._source_provenance(run.payload or {})
+        forecast_delta_f = _as_float(signal_payload.get("forecast_delta_f") or eligibility.get("forecast_delta_f"))
+        abs_forecast_delta_f = abs(forecast_delta_f) if forecast_delta_f is not None else None
+        forecast_delta_gap_f = (
+            round(max(0.0, float(self.settings.strategy_min_abs_delta_f) - abs_forecast_delta_f), 2)
+            if abs_forecast_delta_f is not None
+            else None
+        )
         return {
             "room_id": room.id,
             "market_ticker": run.market_ticker,
@@ -915,6 +931,10 @@ class DecisionCorpusService:
                 "checkpoint_label": run.checkpoint_label,
                 "season_bucket": season_bucket_for_day(run.local_market_day),
                 "lead_bucket": lead_bucket_for_minutes(time_to_settlement),
+                "forecast_delta_f": forecast_delta_f,
+                "abs_forecast_delta_f": abs_forecast_delta_f,
+                "configured_min_abs_delta_f": float(self.settings.strategy_min_abs_delta_f),
+                "forecast_delta_gap_f": forecast_delta_gap_f,
             },
         }
 
