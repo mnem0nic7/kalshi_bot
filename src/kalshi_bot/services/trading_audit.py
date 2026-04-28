@@ -603,11 +603,14 @@ class TradingAuditService:
         side_counts: Counter[str] = Counter()
         top_markets: dict[str, dict[str, Any]] = {}
         selected_without_ticket: list[Signal] = []
+        blocked_candidates: list[dict[str, Any]] = []
 
         for signal in signals:
             payload = dict(signal.payload or {})
             candidate_trace = dict(payload.get("candidate_trace") or {})
             eligibility = dict(payload.get("eligibility") or {})
+            if not candidate_trace and isinstance(eligibility.get("candidate_trace"), dict):
+                candidate_trace = dict(eligibility.get("candidate_trace") or {})
             outcome = str(
                 payload.get("evaluation_outcome")
                 or eligibility.get("evaluation_outcome")
@@ -641,10 +644,43 @@ class TradingAuditService:
                 market["candidate_selected"] += 1
                 if signal.room_id not in ticketed_room_ids:
                     selected_without_ticket.append(signal)
+            elif outcome == "pre_risk_filtered" and candidate_trace.get("outcome") == "candidate_selected":
+                selected_candidate = self._selected_candidate_trace(candidate_trace)
+                blocked_candidates.append(
+                    {
+                        "room_id": signal.room_id,
+                        "market_ticker": signal.market_ticker,
+                        "stand_down_reason": stand_down_reason,
+                        "selected_side": (
+                            payload.get("recommended_side")
+                            or candidate_trace.get("selected_side")
+                            or selected_candidate.get("side")
+                        ),
+                        "selected_edge_bps": self._int_or_none(
+                            candidate_trace.get("selected_edge_bps") or selected_candidate.get("edge_bps")
+                        ),
+                        "quality_adjusted_edge_bps": self._int_or_none(
+                            selected_candidate.get("quality_adjusted_edge_bps")
+                        ),
+                        "spread_bps": self._int_or_none(
+                            selected_candidate.get("spread_bps") or eligibility.get("market_spread_bps")
+                        ),
+                        "forecast_delta_f": payload.get("forecast_delta_f"),
+                        "confidence": float(signal.confidence),
+                        "created_at": _iso(signal.created_at),
+                    }
+                )
 
         top_market_rows = sorted(
             top_markets.values(),
             key=lambda row: (int(row["candidate_selected"]), int(row["signals"]), int(row["max_edge_bps"])),
+            reverse=True,
+        )
+        blocked_candidates.sort(
+            key=lambda row: (
+                row["selected_edge_bps"] if row["selected_edge_bps"] is not None else -10_000,
+                row["created_at"] or "",
+            ),
             reverse=True,
         )
         recent_selected_without_ticket = []
@@ -672,8 +708,34 @@ class TradingAuditService:
                 for reason, count in stand_down_counts.most_common(20)
             ],
             "top_markets": top_market_rows[:20],
+            "blocked_candidate_count": len(blocked_candidates),
+            "top_blocked_candidates": blocked_candidates[:20],
             "recent_selected_without_ticket": recent_selected_without_ticket,
         }
+
+    @staticmethod
+    def _selected_candidate_trace(candidate_trace: dict[str, Any]) -> dict[str, Any]:
+        selected_side = candidate_trace.get("selected_side")
+        if isinstance(selected_side, str):
+            side_trace = candidate_trace.get(selected_side)
+            if isinstance(side_trace, dict):
+                return dict(side_trace)
+        selected = candidate_trace.get("selected_candidate")
+        if isinstance(selected, dict):
+            return dict(selected)
+        for candidate in candidate_trace.get("candidates") or []:
+            if isinstance(candidate, dict) and candidate.get("status") == "selected":
+                return dict(candidate)
+        return {}
+
+    @staticmethod
+    def _int_or_none(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _stop_loss_clusters(self, ops_events: list[OpsEvent], *, now: datetime) -> dict[str, Any]:
         stop_events = [event for event in ops_events if event.source == "stop_loss"]
