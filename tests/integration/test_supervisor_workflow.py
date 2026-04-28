@@ -421,11 +421,12 @@ async def test_supervisor_stands_down_on_resolved_contract_before_risk(tmp_path)
     memory_service = MemoryService()  # type: ignore[arg-type]
     directory = WeatherMarketDirectory(
         {
-            "KXHIGHCHI-26APR11-T51": WeatherMarketMapping(
-                market_ticker="KXHIGHCHI-26APR11-T51",
+            "KXHIGHCHI-26APR10-T51": WeatherMarketMapping(
+                market_ticker="KXHIGHCHI-26APR10-T51",
                 market_type="weather",
                 station_id="KMDW",
                 location_name="Chicago",
+                timezone_name="America/Chicago",
                 latitude=41.7868,
                 longitude=-87.7522,
                 threshold_f=51,
@@ -472,7 +473,7 @@ async def test_supervisor_stands_down_on_resolved_contract_before_risk(tmp_path)
         await repo.ensure_deployment_control(settings.app_color)
         await _seed_reconcile_balance(repo, kalshi_env=settings.kalshi_env)
         room = await repo.create_room(
-            RoomCreate(name="Resolved Room", market_ticker="KXHIGHCHI-26APR11-T51"),
+            RoomCreate(name="Resolved Room", market_ticker="KXHIGHCHI-26APR10-T51"),
             active_color="blue",
             shadow_mode=False,
             kill_switch_enabled=False,

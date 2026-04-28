@@ -81,6 +81,72 @@ def test_score_weather_market_locks_no_when_below_threshold_is_already_breached(
     assert signal.resolution_state == WeatherResolutionState.LOCKED_NO
 
 
+def test_score_weather_market_does_not_lock_future_ticker_from_prior_day_observation() -> None:
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHTHOU-26APR29-T86",
+        station_id="KHOU",
+        location_name="Houston",
+        timezone_name="America/Chicago",
+        latitude=29.76,
+        longitude=-95.36,
+        threshold_f=86,
+        operator="<",
+    )
+    forecast = {
+        "properties": {
+            "updated": "2026-04-28T18:00:00+00:00",
+            "periods": [
+                {
+                    "isDaytime": True,
+                    "startTime": "2026-04-29T06:00:00-05:00",
+                    "temperature": 82,
+                    "temperatureUnit": "F",
+                }
+            ],
+        }
+    }
+    observation = {
+        "properties": {
+            "temperature": {"value": 30.0},  # 86F, but still Apr 28 in Houston.
+            "timestamp": "2026-04-28T22:20:00+00:00",
+        }
+    }
+
+    signal = score_weather_market(mapping, forecast, observation)
+
+    assert signal.current_temp_f == 86
+    assert signal.forecast_high_f == 82
+    assert signal.resolution_state == WeatherResolutionState.UNRESOLVED
+    assert signal.confidence < 1.0
+    assert signal.summary.startswith("Forecast high 82.0F")
+
+
+def test_score_weather_market_locks_ticker_when_observation_is_on_local_settlement_day() -> None:
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHTHOU-26APR29-T86",
+        station_id="KHOU",
+        location_name="Houston",
+        timezone_name="America/Chicago",
+        latitude=29.76,
+        longitude=-95.36,
+        threshold_f=86,
+        operator="<",
+    )
+    forecast = {"properties": {"updated": "2026-04-29T18:00:00+00:00", "periods": []}}
+    observation = {
+        "properties": {
+            "temperature": {"value": 30.0},  # 86F on Apr 29 in Houston.
+            "timestamp": "2026-04-29T22:20:00+00:00",
+        }
+    }
+
+    signal = score_weather_market(mapping, forecast, observation)
+
+    assert signal.resolution_state == WeatherResolutionState.LOCKED_NO
+    assert signal.fair_yes_dollars == 0
+    assert signal.confidence == 1.0
+
+
 @pytest.mark.parametrize(
     ("operator", "expected_state"),
     [

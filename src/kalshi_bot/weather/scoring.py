@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from kalshi_bot.core.enums import StandDownReason, WeatherResolutionState
 from kalshi_bot.core.fixed_point import quantize_price
@@ -238,6 +239,31 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def _ticker_settlement_date(market_ticker: str) -> date | None:
+    parts = market_ticker.split("-")
+    if len(parts) < 2:
+        return None
+    try:
+        return datetime.strptime(parts[1], "%y%b%d").date()
+    except ValueError:
+        return None
+
+
+def _observation_matches_settlement_date(
+    *,
+    obs_ts: datetime | None,
+    settlement_date: date | None,
+    timezone_name: str | None,
+) -> bool:
+    if obs_ts is None or settlement_date is None:
+        return True
+    try:
+        timezone = ZoneInfo(timezone_name or "UTC")
+    except ZoneInfoNotFoundError:
+        timezone = UTC
+    return obs_ts.astimezone(timezone).date() == settlement_date
+
+
 def confidence_band_for(confidence: float) -> str:
     if confidence >= 0.85:
         return "high"
@@ -292,12 +318,9 @@ def score_weather_market(
     # For D-1 rooms (run the day before settlement), obs_ts is today — using it as
     # settlement_date means the model scores today's weather instead of tomorrow's.
     # Override with the ticker-encoded date whenever it parses successfully.
-    _ticker_parts = mapping.market_ticker.split("-")
-    if len(_ticker_parts) >= 2:
-        try:
-            settlement_date = datetime.strptime(_ticker_parts[1], "%y%b%d").date()
-        except ValueError:
-            pass
+    ticker_settlement_date = _ticker_settlement_date(mapping.market_ticker)
+    if ticker_settlement_date is not None:
+        settlement_date = ticker_settlement_date
 
     # Layer 2: precise gridpoint max temp (unrounded Celsius→F) via forecastGridData.
     # Falls back to Layer 1 (rounded daily period) when unavailable.
@@ -310,8 +333,13 @@ def score_weather_market(
     using_gridpoint = gridpoint_max_f is not None
 
     current_temp_f = extract_current_temp_f(observation_payload)
+    current_observation_applies = _observation_matches_settlement_date(
+        obs_ts=obs_ts,
+        settlement_date=ticker_settlement_date,
+        timezone_name=mapping.timezone_name,
+    )
     resolution_state = WeatherResolutionState.UNRESOLVED
-    if current_temp_f is not None:
+    if current_temp_f is not None and current_observation_applies:
         if mapping.operator == ">" and current_temp_f > mapping.threshold_f:
             resolution_state = WeatherResolutionState.LOCKED_YES
         elif mapping.operator == ">=" and current_temp_f >= mapping.threshold_f:
@@ -390,7 +418,10 @@ def score_weather_market(
             # Layer 1 fallback: logistic with adaptive spread.
             probability = logistic_probability(delta_f, spread_f=_adaptive_spread_f(delta_f))
         fair = quantize_price(probability)
-        confidence = min(0.95, 0.45 + min(abs(delta_f) / 12, 0.35) + (0.15 if current_temp_f is not None else 0.0))
+        confidence = min(
+            0.95,
+            0.45 + min(abs(delta_f) / 12, 0.35) + (0.15 if current_temp_f is not None and current_observation_applies else 0.0),
+        )
 
     forecast_delta_f = None
     if forecast_high_f is not None and mapping.threshold_f is not None:
