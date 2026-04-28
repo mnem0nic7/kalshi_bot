@@ -213,6 +213,10 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
         if action == "status":
+            await ParameterPackPromotionService().mark_stalled_if_expired(
+                repo,
+                max_age_seconds=container.settings.self_improve_canary_max_seconds,
+            )
             control = await repo.get_deployment_control()
             packs = await repo.list_parameter_packs(limit=args.limit)
             raw_promotions = await repo.list_promotion_events(limit=max(args.limit * 3, args.limit))

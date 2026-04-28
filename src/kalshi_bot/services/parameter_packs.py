@@ -432,6 +432,45 @@ class ParameterPackPromotionService:
             reason=reason,
         )
 
+    async def mark_stalled_if_expired(
+        self,
+        repo: PlatformRepository,
+        *,
+        max_age_seconds: int,
+    ) -> dict[str, Any] | None:
+        control = await repo.get_deployment_control()
+        notes = dict(control.notes or {})
+        staged = dict(notes.get("parameter_packs") or {})
+        if staged.get("status") not in {"staged", "canary_pending"}:
+            return None
+        staged_at = self._parse_utc_datetime(staged.get("staged_at"))
+        if staged_at is None:
+            return None
+        age_seconds = (datetime.now(UTC) - staged_at).total_seconds()
+        if age_seconds <= max_age_seconds:
+            return None
+        stalled = {
+            **staged,
+            "status": "stalled",
+            "stalled_at": datetime.now(UTC).isoformat(),
+            "stalled_age_seconds": age_seconds,
+            "stalled_threshold_seconds": max_age_seconds,
+        }
+        promotion_event_id = staged.get("promotion_event_id")
+        if promotion_event_id:
+            promotion = await repo.get_promotion_event(str(promotion_event_id))
+            if promotion is not None:
+                payload = dict(promotion.payload or {})
+                payload["stalled"] = {
+                    "stalled_at": stalled["stalled_at"],
+                    "age_seconds": age_seconds,
+                    "threshold_seconds": max_age_seconds,
+                }
+                await repo.update_promotion_event(str(promotion_event_id), status="canary_stalled", payload=payload)
+        notes["parameter_packs"] = stalled
+        await repo.update_deployment_notes(notes)
+        return stalled
+
     async def _current_champion_pack(self, repo: PlatformRepository) -> ParameterPack:
         record = await repo.get_champion_parameter_pack()
         if record is None:
@@ -532,3 +571,15 @@ class ParameterPackPromotionService:
     @staticmethod
     def _inactive_color(active_color: str) -> str:
         return DeploymentColor.GREEN.value if active_color == DeploymentColor.BLUE.value else DeploymentColor.BLUE.value
+
+    @staticmethod
+    def _parse_utc_datetime(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)

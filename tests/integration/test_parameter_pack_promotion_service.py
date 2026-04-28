@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -329,5 +330,45 @@ async def test_parameter_pack_promote_canary_passed_archives_previous_champion(t
     assert stored_previous.status == "archived"
     assert champion is not None
     assert champion.version == candidate.version
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_parameter_pack_mark_stalled_if_expired_updates_notes_and_promotion(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/parameter_pack_stalled.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    current = default_parameter_pack()
+    candidate = replace(default_parameter_pack(version="candidate-params-v1"), status="candidate")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        service = ParameterPackPromotionService()
+        staged = await service.stage_candidate(
+            repo,
+            candidate_pack=candidate,
+            candidate_report=_holdout_report(candidate.pack_hash),
+            current_report=_holdout_report(current.pack_hash, max_drawdown=0.10),
+            hard_caps=load_hard_caps(),
+        )
+        control = await repo.get_deployment_control()
+        notes = dict(control.notes)
+        parameter_notes = dict(notes["parameter_packs"])
+        parameter_notes["staged_at"] = (datetime.now(UTC) - timedelta(hours=8)).isoformat()
+        notes["parameter_packs"] = parameter_notes
+        await repo.update_deployment_notes(notes)
+
+        stalled = await service.mark_stalled_if_expired(repo, max_age_seconds=60)
+        promotion = await repo.get_promotion_event(staged.promotion_event_id)
+        control = await repo.get_deployment_control()
+        await session.commit()
+
+    assert stalled is not None
+    assert stalled["status"] == "stalled"
+    assert control.notes["parameter_packs"]["status"] == "stalled"
+    assert promotion is not None
+    assert promotion.status == "canary_stalled"
 
     await engine.dispose()
