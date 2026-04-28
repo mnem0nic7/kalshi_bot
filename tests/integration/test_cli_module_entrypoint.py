@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from dataclasses import replace
@@ -148,6 +149,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert "grid" in command_help.stdout
     assert "learned-gate" in command_help.stdout
     assert "nws-parser-gate" in command_help.stdout
+    assert "record-starvation" in command_help.stdout
     assert "stage" in command_help.stdout
     assert "rollback-staged" in command_help.stdout
     assert "canary" in command_help.stdout
@@ -493,6 +495,67 @@ def test_parameter_pack_select_cli_outputs_first_passing_candidate(tmp_path) -> 
     assert payload["selected_candidate"]["version"] == "good-candidate"
     assert payload["selected_candidate"]["holdout_report"]["pack_hash"] == payload["selected_candidate"]["pack_hash"]
     assert payload["evaluated"][0]["failures"] == ["coverage_below_minimum"]
+
+
+def test_parameter_pack_record_starvation_cli_writes_warning_event(tmp_path) -> None:
+    db_path = tmp_path / "parameter-pack-starvation-cli.db"
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{db_path}"
+    env["APP_AUTO_INIT_DB"] = "true"
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text(
+        json.dumps(
+            {
+                "selected": False,
+                "promotion_starvation": True,
+                "starvation_tolerance": 2,
+                "evaluated": [{"version": "bad-candidate", "failures": ["coverage_below_minimum"]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "parameter-pack",
+            "record-starvation",
+            "--selection",
+            str(selection_path),
+            "--escalation-threshold",
+            "2",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "promotion_starvation"
+    assert payload["consecutive_starvations"] == 1
+    assert payload["escalated"] is False
+    with sqlite3.connect(db_path) as conn:
+        event = conn.execute(
+            "select severity, source, summary, payload from ops_events order by created_at desc limit 1"
+        ).fetchone()
+        checkpoint = conn.execute(
+            "select payload from checkpoints where stream_name = ?",
+            ("parameter_pack_promotion_starvation:demo",),
+        ).fetchone()
+    assert event is not None
+    assert event[0] == "warning"
+    assert event[1] == "parameter_pack"
+    assert "promotion starvation" in event[2]
+    event_payload = json.loads(event[3])
+    assert event_payload["consecutive_starvations"] == 1
+    assert event_payload["selection"]["evaluated"][0]["version"] == "bad-candidate"
+    assert checkpoint is not None
+    checkpoint_payload = json.loads(checkpoint[0])
+    assert checkpoint_payload["escalated"] is False
 
 
 def test_parameter_pack_grid_cli_outputs_bounded_candidates(tmp_path) -> None:

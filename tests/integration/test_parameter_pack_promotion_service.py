@@ -372,3 +372,64 @@ async def test_parameter_pack_mark_stalled_if_expired_updates_notes_and_promotio
     assert promotion.status == "canary_stalled"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_parameter_pack_record_starvation_escalates_after_three_failures(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/parameter_pack_starvation.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    selection = {
+        "selected": False,
+        "promotion_starvation": True,
+        "starvation_tolerance": 2,
+        "evaluated": [{"version": "bad-1", "failures": ["coverage_below_minimum"]}],
+    }
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        service = ParameterPackPromotionService()
+        first = await service.record_promotion_starvation(
+            repo,
+            selection_payload=selection,
+            reason="test_starvation",
+            escalation_threshold=3,
+        )
+        second = await service.record_promotion_starvation(
+            repo,
+            selection_payload=selection,
+            reason="test_starvation",
+            escalation_threshold=3,
+        )
+        third = await service.record_promotion_starvation(
+            repo,
+            selection_payload=selection,
+            reason="test_starvation",
+            escalation_threshold=3,
+        )
+        checkpoint = await repo.get_checkpoint("parameter_pack_promotion_starvation:demo")
+        events = await repo.list_ops_events(limit=10, sources=["parameter_pack"], kalshi_env="demo")
+        await session.commit()
+
+    assert first.status == "promotion_starvation"
+    assert first.consecutive_starvations == 1
+    assert first.escalated is False
+    assert second.consecutive_starvations == 2
+    assert second.escalated is False
+    assert third.consecutive_starvations == 3
+    assert third.escalated is True
+    assert checkpoint is not None
+    assert checkpoint.payload["event_kind"] == "parameter_pack_promotion_starvation"
+    assert checkpoint.payload["consecutive_starvations"] == 3
+    assert checkpoint.payload["escalated"] is True
+    assert checkpoint.payload["evaluated_count"] == 1
+    assert checkpoint.payload["selection"]["evaluated"][0]["failures"] == ["coverage_below_minimum"]
+    warning_events = [event for event in events if event.severity == "warning"]
+    error_events = [event for event in events if event.severity == "error"]
+    assert len(warning_events) == 2
+    assert len(error_events) == 1
+    assert error_events[0].payload["consecutive_starvations"] == 3
+    assert error_events[0].payload["escalated"] is True
+
+    await engine.dispose()

@@ -260,6 +260,16 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
 
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
+        if action == "record-starvation":
+            result = await ParameterPackPromotionService().record_promotion_starvation(
+                repo,
+                selection_payload=_read_json_file(Path(args.selection)),
+                reason=args.reason,
+                escalation_threshold=args.escalation_threshold,
+            )
+            await session.commit()
+            print(json.dumps(result.to_dict(), indent=2))
+            return 0
         if action == "status":
             await ParameterPackPromotionService().mark_stalled_if_expired(
                 repo,
@@ -1980,6 +1990,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parameter_pack_nws_parser_gate.add_argument("--window", required=True)
     parameter_pack_nws_parser_gate.add_argument("--requested-feature-weight", type=float, default=0.0)
+    parameter_pack_record_starvation = parameter_pack_subparsers.add_parser(
+        "record-starvation",
+        help="Record a parameter-pack promotion-starvation ops event without changing live risk",
+    )
+    parameter_pack_record_starvation.add_argument("--selection", required=True)
+    parameter_pack_record_starvation.add_argument("--reason", default="manual_parameter_pack_promotion_starvation")
+    parameter_pack_record_starvation.add_argument("--escalation-threshold", type=int, default=3)
     parameter_pack_stage = parameter_pack_subparsers.add_parser(
         "stage",
         help="Stage a gated parameter pack on the inactive color without changing live risk",

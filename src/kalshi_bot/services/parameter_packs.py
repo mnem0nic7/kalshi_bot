@@ -135,7 +135,74 @@ class ParameterPackPromotionResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ParameterPackStarvationResult:
+    status: str
+    consecutive_starvations: int
+    escalated: bool
+    checkpoint_name: str
+    ops_event_id: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "consecutive_starvations": self.consecutive_starvations,
+            "escalated": self.escalated,
+            "checkpoint_name": self.checkpoint_name,
+            "ops_event_id": self.ops_event_id,
+        }
+
+
 class ParameterPackPromotionService:
+    async def record_promotion_starvation(
+        self,
+        repo: PlatformRepository,
+        *,
+        selection_payload: dict[str, Any],
+        reason: str = "parameter_pack_promotion_starvation",
+        escalation_threshold: int = 3,
+    ) -> ParameterPackStarvationResult:
+        if not bool(selection_payload.get("promotion_starvation")):
+            raise ValueError("parameter_pack_selection_not_starved")
+        tolerance = int(selection_payload.get("starvation_tolerance", 10))
+        evaluated = list(selection_payload.get("evaluated") or [])
+        kalshi_env = repo._resolved_kalshi_env()
+        checkpoint_name = f"parameter_pack_promotion_starvation:{kalshi_env}"
+        previous = await repo.get_checkpoint(checkpoint_name)
+        previous_payload = dict(previous.payload if previous is not None else {})
+        consecutive = int(previous_payload.get("consecutive_starvations", 0)) + 1
+        escalated = consecutive >= max(1, int(escalation_threshold))
+        payload = {
+            "event_kind": "parameter_pack_promotion_starvation",
+            "reason": reason,
+            "consecutive_starvations": consecutive,
+            "escalation_threshold": max(1, int(escalation_threshold)),
+            "escalated": escalated,
+            "evaluated_count": len(evaluated),
+            "starvation_tolerance": tolerance,
+            "selection": selection_payload,
+            "recorded_at": datetime.now(UTC).isoformat(),
+        }
+        await repo.set_checkpoint(checkpoint_name, cursor=None, payload=payload)
+        event = await repo.log_ops_event(
+            severity="error" if escalated else "warning",
+            summary=(
+                "Parameter-pack promotion starvation escalated: no candidate passed repeated search gates"
+                if escalated
+                else "Parameter-pack promotion starvation: no candidate passed search gates"
+            ),
+            source="parameter_pack",
+            payload=payload,
+            kalshi_env=kalshi_env,
+        )
+        return ParameterPackStarvationResult(
+            status="promotion_starvation",
+            consecutive_starvations=consecutive,
+            escalated=escalated,
+            checkpoint_name=checkpoint_name,
+            ops_event_id=event.id,
+        )
+
     async def stage_candidate(
         self,
         repo: PlatformRepository,
