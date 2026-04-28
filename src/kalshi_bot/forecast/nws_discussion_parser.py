@@ -40,8 +40,78 @@ class NwsDiscussionFeatures:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class NwsParserHealthWindow:
+    attempts: int
+    successful_parses: int
+    schema_failures: int
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "NwsParserHealthWindow":
+        return cls(
+            attempts=int(payload.get("attempts", 0)),
+            successful_parses=int(payload.get("successful_parses", payload.get("available_count", 0))),
+            schema_failures=int(payload.get("schema_failures", payload.get("schema_failure_count", 0))),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NwsParserHealthGate:
+    passed: bool
+    feature_weight: float
+    failures: list[str]
+    comparisons: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "passed": self.passed,
+            "feature_weight": self.feature_weight,
+            "failures": list(self.failures),
+            "comparisons": dict(self.comparisons),
+        }
+
+
 def neutral_discussion_features(*, reason: str | None = None) -> NwsDiscussionFeatures:
     return NwsDiscussionFeatures(valid=reason is None, discarded_reason=reason)
+
+
+def evaluate_nws_parser_health(
+    window: NwsParserHealthWindow,
+    *,
+    requested_feature_weight: float = 0.0,
+    min_availability: float = 0.95,
+    max_schema_failure_rate: float = 0.01,
+) -> NwsParserHealthGate:
+    failures: list[str] = []
+    attempts = max(0, window.attempts)
+    availability = (window.successful_parses / attempts) if attempts else 0.0
+    schema_failure_rate = (window.schema_failures / attempts) if attempts else 0.0
+    comparisons = {
+        "attempts": attempts,
+        "availability": {
+            "observed": availability,
+            "minimum": min_availability,
+        },
+        "schema_failure_rate": {
+            "observed": schema_failure_rate,
+            "maximum": max_schema_failure_rate,
+        },
+    }
+
+    if attempts <= 0:
+        failures.append("no_parser_attempts")
+    if availability < min_availability:
+        failures.append("parser_availability_below_minimum")
+    if schema_failure_rate > max_schema_failure_rate:
+        failures.append("schema_failure_rate_above_maximum")
+
+    passed = not failures
+    return NwsParserHealthGate(
+        passed=passed,
+        feature_weight=max(0.0, min(1.0, float(requested_feature_weight))) if passed else 0.0,
+        failures=failures,
+        comparisons=comparisons,
+    )
 
 
 def parse_nws_discussion_json(raw: str | bytes | Mapping[str, Any]) -> NwsDiscussionFeatures:

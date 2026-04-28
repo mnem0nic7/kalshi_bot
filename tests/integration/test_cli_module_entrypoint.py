@@ -147,6 +147,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert "select" in command_help.stdout
     assert "grid" in command_help.stdout
     assert "learned-gate" in command_help.stdout
+    assert "nws-parser-gate" in command_help.stdout
     assert "stage" in command_help.stdout
     assert "rollback-staged" in command_help.stdout
     assert "canary" in command_help.stdout
@@ -561,6 +562,41 @@ def test_parameter_pack_learned_gate_cli_forces_zero_weight_on_regression(tmp_pa
     assert payload["passed"] is False
     assert payload["learned_weight"] == 0.0
     assert payload["failures"] == ["ece_not_improved"]
+
+
+def test_parameter_pack_nws_parser_gate_cli_reports_shadow_failure(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/parameter-pack-nws-parser-gate-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+    window_path = tmp_path / "parser-window.json"
+    window_path.write_text(
+        json.dumps({"attempts": 100, "successful_parses": 92, "schema_failures": 2}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "parameter-pack",
+            "nws-parser-gate",
+            "--window",
+            str(window_path),
+            "--requested-feature-weight",
+            "0.25",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["passed"] is False
+    assert payload["feature_weight"] == 0.0
+    assert payload["failures"] == ["parser_availability_below_minimum", "schema_failure_rate_above_maximum"]
 
 
 def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:

@@ -28,6 +28,10 @@ from kalshi_bot.forecast.learned_head import (
     LearnedHeadHoldoutMetrics,
     evaluate_learned_head_gate,
 )
+from kalshi_bot.forecast.nws_discussion_parser import (
+    NwsParserHealthWindow,
+    evaluate_nws_parser_health,
+)
 from kalshi_bot.learning.drift_watcher import DriftWindow, evaluate_calibration_drift
 from kalshi_bot.learning.hard_caps import DEFAULT_HARD_CAPS_PATH, load_hard_caps
 from kalshi_bot.learning.parameter_pack import (
@@ -242,6 +246,13 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
             closed_form=LearnedHeadHoldoutMetrics.from_dict(_read_json_file(Path(args.closed_form_report))),
             learned=LearnedHeadHoldoutMetrics.from_dict(_read_json_file(Path(args.learned_report))),
             requested_weight=args.requested_weight,
+        )
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0 if result.passed else 1
+    if action == "nws-parser-gate":
+        result = evaluate_nws_parser_health(
+            NwsParserHealthWindow.from_dict(_read_json_file(Path(args.window))),
+            requested_feature_weight=args.requested_feature_weight,
         )
         print(json.dumps(result.to_dict(), indent=2))
         return 0 if result.passed else 1
@@ -1961,6 +1972,12 @@ def build_parser() -> argparse.ArgumentParser:
     parameter_pack_learned_gate.add_argument("--closed-form-report", required=True)
     parameter_pack_learned_gate.add_argument("--learned-report", required=True)
     parameter_pack_learned_gate.add_argument("--requested-weight", type=float, default=0.0)
+    parameter_pack_nws_parser_gate = parameter_pack_subparsers.add_parser(
+        "nws-parser-gate",
+        help="Gate optional NWS parser features on shadow availability and schema-validity evidence",
+    )
+    parameter_pack_nws_parser_gate.add_argument("--window", required=True)
+    parameter_pack_nws_parser_gate.add_argument("--requested-feature-weight", type=float, default=0.0)
     parameter_pack_stage = parameter_pack_subparsers.add_parser(
         "stage",
         help="Stage a gated parameter pack on the inactive color without changing live risk",

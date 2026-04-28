@@ -140,6 +140,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "holdout gate for nonzero learned weight" in autonomy
     assert "online_calibrator" in autonomy
     assert "nws_discussion_parser" in autonomy
+    assert "shadow availability/schema evidence" in autonomy
     assert "LLM_TRADING_ENABLED=false" in architecture
     assert "climatology priors" in architecture
     assert "source health logs" in architecture
@@ -157,6 +158,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack grid" in self_improve
     assert "parameter-pack select" in self_improve
     assert "parameter-pack learned-gate" in self_improve
+    assert "parameter-pack nws-parser-gate" in self_improve
     assert "does not mutate runtime state" in self_improve
     assert "SELF_IMPROVE_CANARY_MAX_SECONDS" in self_improve
     assert "parameter-pack canary" in self_improve
