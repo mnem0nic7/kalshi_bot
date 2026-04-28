@@ -416,10 +416,12 @@ class TrainingCorpusService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             dossiers = {record.market_ticker: record for record in await repo.list_research_dossiers(limit=limit * 4)}
-            failed_runs = await repo.list_research_runs(status="failed", limit=limit * 8)
+            recent_runs = await repo.list_research_runs(limit=limit * 16)
             await session.commit()
 
-        failed_counts = Counter(run.market_ticker for run in failed_runs)
+        recent_runs_by_market = defaultdict(list)
+        for run in recent_runs:
+            recent_runs_by_market[run.market_ticker].append(run)
         issues: list[ResearchAuditIssue] = []
         for mapping in monitored_mappings.values():
             if not mapping.supports_structured_weather:
@@ -443,14 +445,15 @@ class TrainingCorpusService:
                         details={"notes": discovery.notes, "raw": discovery.raw},
                     )
                 )
-            if failed_counts[mapping.market_ticker] >= 3:
+            failure_streak = self._research_failure_streak(recent_runs_by_market.get(mapping.market_ticker, []))
+            if failure_streak["failure_count"] >= 3:
                 issues.append(
                     ResearchAuditIssue(
                         market_ticker=mapping.market_ticker,
                         severity="medium",
                         code="repeated_refresh_failures",
                         summary="Research refresh is repeatedly failing for this market.",
-                        details={"failure_count": failed_counts[mapping.market_ticker]},
+                        details=failure_streak,
                     )
                 )
             dossier_record = dossiers.get(mapping.market_ticker)
@@ -489,6 +492,27 @@ class TrainingCorpusService:
                     )
                 )
         return issues[:limit]
+
+    @staticmethod
+    def _research_failure_streak(runs: list[Any]) -> dict[str, Any]:
+        failure_count = 0
+        latest_failed_at: str | None = None
+        last_success_at: str | None = None
+        for run in runs:
+            status = str(getattr(run, "status", "") or "")
+            finished_at = getattr(run, "finished_at", None) or getattr(run, "started_at", None)
+            if status == "completed":
+                last_success_at = finished_at.astimezone(UTC).isoformat() if finished_at is not None else None
+                break
+            if status == "failed":
+                failure_count += 1
+                if latest_failed_at is None and finished_at is not None:
+                    latest_failed_at = finished_at.astimezone(UTC).isoformat()
+        return {
+            "failure_count": failure_count,
+            "latest_failed_at": latest_failed_at,
+            "last_success_at": last_success_at,
+        }
 
     async def strategy_audit_room(self, room_id: str) -> StrategyAuditResult:
         bundle = await self.training_export_service.build_room_bundle(room_id)

@@ -107,6 +107,65 @@ async def _seed_reconcile_balance(
 
 
 @pytest.mark.asyncio
+async def test_research_audit_counts_only_active_failure_streaks(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/research-audit.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory(
+        {
+            "WX-ONE": WeatherMarketMapping(
+                market_ticker="WX-ONE",
+                market_type="weather",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+            ),
+            "WX-TWO": WeatherMarketMapping(
+                market_ticker="WX-TWO",
+                market_type="weather",
+                station_id="KMDW",
+                location_name="Chicago",
+                latitude=41.0,
+                longitude=-87.0,
+                threshold_f=70,
+            ),
+        }
+    )
+    service = TrainingCorpusService(
+        settings,
+        session_factory,
+        DiscoveryService(FakeKalshi(), directory),  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        directory,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        for _ in range(3):
+            failed = await repo.create_research_run(market_ticker="WX-ONE", trigger_reason="market_event")
+            await repo.complete_research_run(failed.id, status="failed", error_text="timeout")
+        recovered = await repo.create_research_run(market_ticker="WX-ONE", trigger_reason="market_event")
+        await repo.complete_research_run(recovered.id, status="completed")
+
+        for _ in range(3):
+            failed = await repo.create_research_run(market_ticker="WX-TWO", trigger_reason="market_event")
+            await repo.complete_research_run(failed.id, status="failed", error_text="timeout")
+        await session.commit()
+
+    issues = await service.research_audit(limit=20)
+    repeated = [issue for issue in issues if issue.code == "repeated_refresh_failures"]
+
+    assert [issue.market_ticker for issue in repeated] == ["WX-TWO"]
+    assert repeated[0].details["failure_count"] == 3
+    assert repeated[0].details["last_success_at"] is None
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_training_corpus_service_builds_reproducible_weather_dataset(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/training-corpus.db",
