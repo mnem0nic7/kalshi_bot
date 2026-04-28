@@ -109,12 +109,24 @@ class WeatherSeriesTemplate(BaseModel):
         operator: Literal[">", "<"]
         if strike_type == "greater":
             raw = market.get("floor_strike")
-            threshold_f = float(raw) if raw is not None else None
             operator = ">"
         else:
             raw = market.get("cap_strike")
-            threshold_f = float(raw) if raw is not None else None
             operator = "<"
+
+        # Primary: parse threshold from the ticker name, e.g. KXHIGHCHI-26APR29-T54 -> 54F.
+        # This is immune to API unit changes. Pattern: ends with -T{integer}.
+        ticker_match = re.search(r"-T(\d+)$", ticker)
+        if ticker_match:
+            threshold_f = float(ticker_match.group(1))
+        elif raw is not None:
+            # Fallback: use the API-supplied strike value, normalising for the
+            # Kalshi API unit change that occurred around 2026-04-28 where
+            # floor_strike/cap_strike values were scaled down by 1,000,000
+            # (e.g. 54F became 5.4e-05).  Any value < 1.0 is assumed to be
+            # in the new micro-unit and is converted back to Fahrenheit.
+            raw_f = float(raw)
+            threshold_f = raw_f * 1_000_000 if raw_f < 1.0 else raw_f
         if threshold_f is None:
             return None
 

@@ -45,6 +45,56 @@ def test_weather_series_template_resolves_greater_and_less_markets() -> None:
     assert less_mapping.threshold_f == 61
 
 
+def test_weather_series_template_prefers_ticker_threshold_over_scaled_api_strike() -> None:
+    template = WeatherSeriesTemplate(
+        series_ticker="KXHIGHCHI",
+        display_name="Chicago Daily High",
+        location_name="Chicago",
+        station_id="KMDW",
+        latitude=41.7868,
+        longitude=-87.7522,
+    )
+
+    mapping = template.resolve_market(
+        {
+            "ticker": "KXHIGHCHI-26APR29-T54",
+            "title": "Will the maximum temperature be >54 on Apr 29, 2026?",
+            "subtitle": "55 or above",
+            "strike_type": "greater",
+            "floor_strike": 0.000054,
+        }
+    )
+
+    assert mapping is not None
+    assert mapping.operator == ">"
+    assert mapping.threshold_f == 54
+
+
+def test_weather_series_template_normalizes_scaled_api_strike_without_ticker_threshold() -> None:
+    template = WeatherSeriesTemplate(
+        series_ticker="KXHIGHCHI",
+        display_name="Chicago Daily High",
+        location_name="Chicago",
+        station_id="KMDW",
+        latitude=41.7868,
+        longitude=-87.7522,
+    )
+
+    mapping = template.resolve_market(
+        {
+            "ticker": "KXHIGHCHI-26APR29",
+            "title": "Will the maximum temperature be <54 on Apr 29, 2026?",
+            "subtitle": "53 or below",
+            "strike_type": "less",
+            "cap_strike": 0.000054,
+        }
+    )
+
+    assert mapping is not None
+    assert mapping.operator == "<"
+    assert mapping.threshold_f == 54
+
+
 def test_weather_directory_supports_and_resolves_series_template_market() -> None:
     template = WeatherSeriesTemplate(
         series_ticker="KXHIGHCHI",
