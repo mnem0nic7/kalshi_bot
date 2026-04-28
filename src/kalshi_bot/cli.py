@@ -33,6 +33,7 @@ from kalshi_bot.learning.parameter_pack import (
     parameter_pack_from_dict,
     sanitize_parameter_pack,
 )
+from kalshi_bot.learning.parameter_search import select_parameter_pack_candidate
 from kalshi_bot.learning.promotion_gates import (
     HoldoutMetrics,
     evaluate_parameter_pack_promotion,
@@ -214,6 +215,14 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
         decision = evaluate_calibration_drift(DriftWindow.from_dict(_read_json_file(Path(args.window))))
         print(json.dumps(decision.to_dict(), indent=2))
         return 0 if not decision.pause_new_entries else 1
+    if action == "select":
+        result = select_parameter_pack_candidate(
+            search_payload=_read_json_file(Path(args.candidates)),
+            current_report=_read_json_file(Path(args.current_report)),
+            hard_caps=load_hard_caps(args.hard_caps),
+        )
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0 if result.selected is not None else 1
 
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
@@ -1910,6 +1919,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evaluate calibration drift window JSON without mutating runtime state",
     )
     parameter_pack_drift.add_argument("--window", required=True)
+    parameter_pack_select = parameter_pack_subparsers.add_parser(
+        "select",
+        help="Select the first replay-gated parameter-pack candidate without mutating runtime state",
+    )
+    parameter_pack_select.add_argument("--candidates", required=True)
+    parameter_pack_select.add_argument("--current-report", required=True)
+    parameter_pack_select.add_argument("--hard-caps", default=str(DEFAULT_HARD_CAPS_PATH))
     parameter_pack_stage = parameter_pack_subparsers.add_parser(
         "stage",
         help="Stage a gated parameter pack on the inactive color without changing live risk",

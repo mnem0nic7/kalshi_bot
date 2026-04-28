@@ -144,6 +144,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert "validate" in command_help.stdout
     assert "gate" in command_help.stdout
     assert "drift" in command_help.stdout
+    assert "select" in command_help.stdout
     assert "stage" in command_help.stdout
     assert "rollback-staged" in command_help.stdout
     assert "canary" in command_help.stdout
@@ -403,6 +404,89 @@ def test_parameter_pack_drift_cli_reports_pause_decision(tmp_path) -> None:
     assert payload["pause_new_entries"] is True
     assert payload["trigger_pack_search"] is True
     assert payload["reasons"] == ["brier_relative_drift", "ece_above_limit", "win_rate_divergence"]
+
+
+def test_parameter_pack_select_cli_outputs_first_passing_candidate(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/parameter-pack-select-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+    current_path = tmp_path / "current-report.json"
+    candidates_path = tmp_path / "candidates.json"
+    current_path.write_text(
+        json.dumps(
+            {
+                "coverage": 0.99,
+                "brier": 0.20,
+                "ece": 0.05,
+                "sharpe": 1.0,
+                "max_drawdown": 0.10,
+                "city_win_rates": {"NY": 0.58},
+                "pack_hash": "current",
+                "rerun_pack_hash": "current",
+            }
+        ),
+        encoding="utf-8",
+    )
+    candidates_path.write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {
+                        "version": "bad-candidate",
+                        "parameters": {"pseudo_count": 10},
+                        "holdout_report": {
+                            "coverage": 0.90,
+                            "brier": 0.19,
+                            "ece": 0.04,
+                            "sharpe": 1.0,
+                            "max_drawdown": 0.09,
+                            "city_win_rates": {"NY": 0.58},
+                            "hard_cap_touches": 0,
+                        },
+                    },
+                    {
+                        "version": "good-candidate",
+                        "parameters": {"pseudo_count": 12},
+                        "holdout_report": {
+                            "coverage": 0.98,
+                            "brier": 0.19,
+                            "ece": 0.04,
+                            "sharpe": 1.0,
+                            "max_drawdown": 0.09,
+                            "city_win_rates": {"NY": 0.58},
+                            "hard_cap_touches": 0,
+                        },
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "parameter-pack",
+            "select",
+            "--candidates",
+            str(candidates_path),
+            "--current-report",
+            str(current_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["selected"] is True
+    assert payload["selected_candidate"]["version"] == "good-candidate"
+    assert payload["selected_candidate"]["holdout_report"]["pack_hash"] == payload["selected_candidate"]["pack_hash"]
+    assert payload["evaluated"][0]["failures"] == ["coverage_below_minimum"]
 
 
 def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:

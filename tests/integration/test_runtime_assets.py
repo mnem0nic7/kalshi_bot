@@ -123,11 +123,13 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter_packs" in autonomy
     assert "hard_caps.yaml" in autonomy
     assert "parameter_pack_default.yaml" in autonomy
+    assert "parameter_search" in autonomy
     assert "promotion_gates" in autonomy
     assert "drift_watcher" in autonomy
     assert "parameter-pack stage" in autonomy
     assert "parameter-pack status" in autonomy
     assert "parameter-pack drift" in autonomy
+    assert "parameter-pack select" in autonomy
     assert "stalled" in autonomy
     assert "parameter-pack canary" in autonomy
     assert "parameter-pack promote-staged" in autonomy
@@ -150,6 +152,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack stage" in self_improve
     assert "parameter-pack status" in self_improve
     assert "parameter-pack drift" in self_improve
+    assert "parameter-pack select" in self_improve
     assert "does not mutate runtime state" in self_improve
     assert "SELF_IMPROVE_CANARY_MAX_SECONDS" in self_improve
     assert "parameter-pack canary" in self_improve
