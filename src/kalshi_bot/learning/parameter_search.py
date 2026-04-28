@@ -48,13 +48,20 @@ class ParameterPackCandidateResult:
 class ParameterPackSearchSelection:
     selected: ParameterPackCandidateResult | None
     evaluated: list[ParameterPackCandidateResult]
+    starvation_tolerance: int = 10
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "selected": self.selected is not None,
+            "promotion_starvation": self.promotion_starvation,
+            "starvation_tolerance": self.starvation_tolerance,
             "selected_candidate": self.selected.to_dict() if self.selected is not None else None,
             "evaluated": [candidate.to_dict() for candidate in self.evaluated],
         }
+
+    @property
+    def promotion_starvation(self) -> bool:
+        return self.selected is None and len(self.evaluated) >= self.starvation_tolerance
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +130,7 @@ def select_parameter_pack_candidate(
     current_report: dict[str, Any],
     hard_caps: HardCaps,
     base_pack: ParameterPack | None = None,
+    starvation_tolerance: int = 10,
 ) -> ParameterPackSearchSelection:
     """Select the first passing replay candidate without mutating runtime state."""
 
@@ -154,7 +162,11 @@ def select_parameter_pack_candidate(
         )
 
     selected = next((candidate for candidate in evaluated if candidate.passed), None)
-    return ParameterPackSearchSelection(selected=selected, evaluated=evaluated)
+    return ParameterPackSearchSelection(
+        selected=selected,
+        evaluated=evaluated,
+        starvation_tolerance=max(1, int(starvation_tolerance)),
+    )
 
 
 def parameter_pack_objective(metrics: HoldoutMetrics, *, hard_max_drawdown: float | None = None) -> float:

@@ -131,6 +131,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack drift" in autonomy
     assert "parameter-pack grid" in autonomy
     assert "parameter-pack select" in autonomy
+    assert "promotion_starvation" in autonomy
     assert "stalled" in autonomy
     assert "parameter-pack canary" in autonomy
     assert "parameter-pack promote-staged" in autonomy
@@ -157,6 +158,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack drift" in self_improve
     assert "parameter-pack grid" in self_improve
     assert "parameter-pack select" in self_improve
+    assert "promotion_starvation" in self_improve
     assert "parameter-pack learned-gate" in self_improve
     assert "parameter-pack nws-parser-gate" in self_improve
     assert "does not mutate runtime state" in self_improve

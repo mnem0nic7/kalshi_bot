@@ -231,6 +231,7 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
             search_payload=_read_json_file(Path(args.candidates)),
             current_report=_read_json_file(Path(args.current_report)),
             hard_caps=load_hard_caps(args.hard_caps),
+            starvation_tolerance=args.starvation_tolerance,
         )
         print(json.dumps(result.to_dict(), indent=2))
         return 0 if result.selected is not None else 1
@@ -1959,6 +1960,7 @@ def build_parser() -> argparse.ArgumentParser:
     parameter_pack_select.add_argument("--candidates", required=True)
     parameter_pack_select.add_argument("--current-report", required=True)
     parameter_pack_select.add_argument("--hard-caps", default=str(DEFAULT_HARD_CAPS_PATH))
+    parameter_pack_select.add_argument("--starvation-tolerance", type=int, default=10)
     parameter_pack_grid = parameter_pack_subparsers.add_parser(
         "grid",
         help="Generate deterministic bounded parameter-pack candidates for offline replay",

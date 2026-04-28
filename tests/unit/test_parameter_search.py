@@ -94,6 +94,22 @@ def test_select_parameter_pack_candidate_preserves_idempotency_failures() -> Non
     assert result.evaluated[0].failures == ["pack_hash_not_idempotent"]
 
 
+def test_select_parameter_pack_candidate_reports_promotion_starvation_after_tolerance() -> None:
+    result = select_parameter_pack_candidate(
+        search_payload=[
+            {"version": "bad-1", "parameters": {"pseudo_count": 10}, "holdout_report": {**_passing_holdout(), "coverage": 0.90}},
+            {"version": "bad-2", "parameters": {"pseudo_count": 12}, "holdout_report": {**_passing_holdout(), "coverage": 0.91}},
+        ],
+        current_report=_current_report(),
+        hard_caps=load_hard_caps("infra/config/hard_caps.yaml"),
+        starvation_tolerance=2,
+    )
+
+    assert result.selected is None
+    assert result.to_dict()["promotion_starvation"] is True
+    assert result.to_dict()["starvation_tolerance"] == 2
+
+
 def test_generate_parameter_pack_grid_is_bounded_and_deterministic() -> None:
     result = generate_parameter_pack_grid(
         {

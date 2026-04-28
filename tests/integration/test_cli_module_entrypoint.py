@@ -477,6 +477,8 @@ def test_parameter_pack_select_cli_outputs_first_passing_candidate(tmp_path) -> 
             str(candidates_path),
             "--current-report",
             str(current_path),
+            "--starvation-tolerance",
+            "2",
         ],
         capture_output=True,
         text=True,
@@ -487,6 +489,7 @@ def test_parameter_pack_select_cli_outputs_first_passing_candidate(tmp_path) -> 
     assert result.returncode == 0
     payload = json.loads(result.stdout)
     assert payload["selected"] is True
+    assert payload["promotion_starvation"] is False
     assert payload["selected_candidate"]["version"] == "good-candidate"
     assert payload["selected_candidate"]["holdout_report"]["pack_hash"] == payload["selected_candidate"]["pack_hash"]
     assert payload["evaluated"][0]["failures"] == ["coverage_below_minimum"]
