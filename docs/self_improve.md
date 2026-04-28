@@ -61,7 +61,7 @@ Hard caps remain outside the pack and operator-only:
 
 Promotion requires complete `decision_traces`, strict-as-of replay, holdout gates, and canary shadow evidence. The existing agent-pack workflow remains available until the parameter-pack promotion service replaces it.
 
-Phase 4 scaffolding is present now: bounded `parameter_packs` records, deterministic pack hashes, hard-cap exclusion during sanitization, holdout promotion gates, DB-audited parameter-pack staging, and calibration drift pause criteria. These pieces are not yet wired to autonomous nightly promotion; they exist so replay search can be added without mixing mutable trading parameters into LLM agent-pack state.
+Phase 4 scaffolding is present now: bounded `parameter_packs` records, deterministic pack hashes, hard-cap exclusion during sanitization, holdout promotion gates, DB-audited parameter-pack staging, and calibration drift pause criteria. Holdout gates require enough resolved trades before a candidate can pass, so missing or tiny samples stay in promotion-starvation instead of being promoted. These pieces are not yet wired to autonomous nightly promotion; they exist so replay search can be added without mixing mutable trading parameters into LLM agent-pack state.
 
 The operator-owned caps live in `infra/config/hard_caps.yaml`. Parameter-pack validation can print a hash of that sealed config and can run in `--strict` mode to fail candidates that attempt to include hard-cap fields. The parameter-pack promotion gate loads the same sealed config and applies its `max_drawdown_pct` as the hard replay drawdown ceiling.
 

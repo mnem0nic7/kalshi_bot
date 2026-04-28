@@ -74,7 +74,7 @@ Phase 4 foundation now exists without activating autonomous promotion:
 - `kalshi_bot.learning.parameter_pack` defines bounded tunable parameters, stable pack hashing, sanitization, and hard-cap exclusion.
 - `kalshi_bot.learning.parameter_search` generates bounded grid candidates for offline replay and selects the first replay-gated candidate from search JSON without writing runtime state.
 - `parameter_packs` stores candidate/champion parameter payloads and holdout reports separately from legacy `agent_packs`.
-- `kalshi_bot.learning.promotion_gates` evaluates the holdout gates for coverage, Brier, ECE, Sharpe, drawdown, city win-rate consistency, hard-cap touches, and idempotent hashes.
+- `kalshi_bot.learning.promotion_gates` evaluates the holdout gates for coverage, minimum resolved trade count, Brier, ECE, Sharpe, drawdown, city win-rate consistency, hard-cap touches, and idempotent hashes.
 - `kalshi_bot.learning.drift_watcher` provides the calibration pause/search trigger for Brier, ECE, and realized-vs-predicted win-rate drift.
 - `infra/config/hard_caps.yaml` is the operator-owned sealed hard-cap artifact, and `kalshi_bot.learning.hard_caps` loads, validates, and hashes it.
 - `parameter-pack gate` loads the sealed hard-cap artifact and uses `max_drawdown_pct` as the promotion drawdown ceiling.
