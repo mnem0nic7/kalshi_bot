@@ -117,6 +117,7 @@ class TradingAuditService:
             orders = await self._orders(session, kalshi_env=kalshi_env, cutoff=cutoff)
             tickets = await self._tickets(session, kalshi_env=kalshi_env, cutoff=cutoff)
             risk_verdicts = await self._risk_verdicts(session, kalshi_env=kalshi_env, cutoff=cutoff)
+            signals = await self._signals(session, kalshi_env=kalshi_env, cutoff=cutoff)
             positions = await self._positions(session, kalshi_env=kalshi_env)
             market_states = await self._market_states(session, kalshi_env=kalshi_env)
             price_history_count = await self._price_history_count(session, kalshi_env=kalshi_env, cutoff=cutoff)
@@ -133,6 +134,7 @@ class TradingAuditService:
             fills=fills,
             now=now,
         )
+        signal_funnel = self._signal_funnel(signals=signals, tickets=tickets)
         stop_loss = self._stop_loss_clusters(ops_events, now=now)
         risk = self._risk_summary(risk_verdicts)
         ops = self._ops_summary(ops_events)
@@ -145,6 +147,7 @@ class TradingAuditService:
             fill_summary=fill_summary,
             attribution=attribution,
             funnel=funnel,
+            signal_funnel=signal_funnel,
             stop_loss=stop_loss,
             risk=risk,
             ops=ops,
@@ -165,6 +168,7 @@ class TradingAuditService:
             "pnl": pnl,
             "attribution": attribution,
             "execution_funnel": funnel,
+            "signal_funnel": signal_funnel,
             "stop_loss": stop_loss,
             "risk": risk,
             "ops": ops,
@@ -349,6 +353,17 @@ class TradingAuditService:
             .where(Room.kalshi_env == kalshi_env)
             .where(RiskVerdictRecord.created_at >= cutoff)
             .order_by(RiskVerdictRecord.created_at.asc())
+        )
+        return list(result.scalars())
+
+    async def _signals(self, session: AsyncSession, *, kalshi_env: str, cutoff: datetime) -> list[Signal]:
+        result = await session.execute(
+            select(Signal)
+            .join(Room, Signal.room_id == Room.id)
+            .where(Room.kalshi_env == kalshi_env)
+            .where(Room.room_origin != "historical_replay")
+            .where(Signal.created_at >= cutoff)
+            .order_by(Signal.created_at.desc())
         )
         return list(result.scalars())
 
@@ -581,6 +596,85 @@ class TradingAuditService:
             ],
         }
 
+    def _signal_funnel(self, *, signals: list[Signal], tickets: list[TradeTicketRecord]) -> dict[str, Any]:
+        ticketed_room_ids = {ticket.room_id for ticket in tickets}
+        outcome_counts: Counter[str] = Counter()
+        stand_down_counts: Counter[str] = Counter()
+        side_counts: Counter[str] = Counter()
+        top_markets: dict[str, dict[str, Any]] = {}
+        selected_without_ticket: list[Signal] = []
+
+        for signal in signals:
+            payload = dict(signal.payload or {})
+            candidate_trace = dict(payload.get("candidate_trace") or {})
+            eligibility = dict(payload.get("eligibility") or {})
+            outcome = str(
+                payload.get("evaluation_outcome")
+                or eligibility.get("evaluation_outcome")
+                or candidate_trace.get("outcome")
+                or "unknown"
+            )
+            side = str(payload.get("recommended_side") or candidate_trace.get("selected_side") or "none")
+            stand_down_reason = str(
+                payload.get("stand_down_reason")
+                or eligibility.get("stand_down_reason")
+                or "none"
+            )
+            outcome_counts[outcome] += 1
+            side_counts[side] += 1
+            if stand_down_reason != "none":
+                stand_down_counts[stand_down_reason] += 1
+
+            market = top_markets.setdefault(
+                signal.market_ticker,
+                {
+                    "market_ticker": signal.market_ticker,
+                    "signals": 0,
+                    "candidate_selected": 0,
+                    "max_edge_bps": int(signal.edge_bps),
+                    "latest_at": _iso(signal.created_at),
+                },
+            )
+            market["signals"] += 1
+            market["max_edge_bps"] = max(int(market["max_edge_bps"]), int(signal.edge_bps))
+            if outcome == "candidate_selected":
+                market["candidate_selected"] += 1
+                if signal.room_id not in ticketed_room_ids:
+                    selected_without_ticket.append(signal)
+
+        top_market_rows = sorted(
+            top_markets.values(),
+            key=lambda row: (int(row["candidate_selected"]), int(row["signals"]), int(row["max_edge_bps"])),
+            reverse=True,
+        )
+        recent_selected_without_ticket = []
+        for signal in selected_without_ticket[:20]:
+            payload = dict(signal.payload or {})
+            candidate_trace = dict(payload.get("candidate_trace") or {})
+            recent_selected_without_ticket.append(
+                {
+                    "room_id": signal.room_id,
+                    "market_ticker": signal.market_ticker,
+                    "edge_bps": signal.edge_bps,
+                    "confidence": signal.confidence,
+                    "recommended_side": payload.get("recommended_side") or candidate_trace.get("selected_side"),
+                    "created_at": _iso(signal.created_at),
+                }
+            )
+        return {
+            "signals": len(signals),
+            "candidate_selected": int(outcome_counts.get("candidate_selected", 0)),
+            "selected_without_ticket_count": len(selected_without_ticket),
+            "outcome_counts": dict(outcome_counts),
+            "recommended_side_counts": dict(side_counts),
+            "top_stand_down_reasons": [
+                {"reason": reason, "count": count}
+                for reason, count in stand_down_counts.most_common(20)
+            ],
+            "top_markets": top_market_rows[:20],
+            "recent_selected_without_ticket": recent_selected_without_ticket,
+        }
+
     def _stop_loss_clusters(self, ops_events: list[OpsEvent], *, now: datetime) -> dict[str, Any]:
         stop_events = [event for event in ops_events if event.source == "stop_loss"]
         grouped: dict[tuple[str, str], list[OpsEvent]] = defaultdict(list)
@@ -697,6 +791,7 @@ class TradingAuditService:
         fill_summary: dict[str, Any],
         attribution: dict[str, Any],
         funnel: dict[str, Any],
+        signal_funnel: dict[str, Any],
         stop_loss: dict[str, Any],
         risk: dict[str, Any],
         ops: dict[str, Any],
@@ -744,6 +839,16 @@ class TradingAuditService:
                     "approved_without_order_count": funnel["approved_without_order_count"],
                     "failed_order_count": funnel["failed_order_count"],
                     "failed_orders": funnel["failed_orders"],
+                },
+            })
+        if int(signal_funnel["selected_without_ticket_count"]):
+            issues.append({
+                "severity": "high",
+                "code": "selected_signal_without_trade_ticket",
+                "summary": "Some candidate-selected signals did not produce a trade ticket for risk/execution review.",
+                "evidence": {
+                    "selected_without_ticket_count": signal_funnel["selected_without_ticket_count"],
+                    "recent": signal_funnel["recent_selected_without_ticket"],
                 },
             })
         if attribution["raw_order_id_could_recover_strategy_count"]:

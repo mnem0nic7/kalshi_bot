@@ -15,6 +15,7 @@ from kalshi_bot.db.models import (
     PositionRecord,
     RiskVerdictRecord,
     Room,
+    Signal,
     TradeTicketRecord,
 )
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -226,6 +227,70 @@ async def test_trading_audit_flags_money_safety_issues(audit_harness) -> None:
     assert "approved_trade_execution_gaps" in issue_codes
     assert "unlinked_fills_with_recoverable_order_attribution" in issue_codes
     assert report["execution_funnel"]["failed_order_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        room_selected = _room("room-selected", "KXHIGHNY-26APR24-T67")
+        room_stand_down = _room("room-stand-down", "KXHIGHCHI-26APR24-T78")
+        session.add_all([
+            room_selected,
+            room_stand_down,
+            Signal(
+                room_id=room_selected.id,
+                market_ticker=room_selected.market_ticker,
+                fair_yes_dollars=Decimal("0.7200"),
+                edge_bps=420,
+                confidence=0.82,
+                summary="Selected YES",
+                payload={
+                    "evaluation_outcome": "candidate_selected",
+                    "recommended_side": "yes",
+                    "candidate_trace": {"outcome": "candidate_selected", "selected_side": "yes"},
+                },
+                created_at=NOW - timedelta(minutes=20),
+                updated_at=NOW - timedelta(minutes=20),
+            ),
+            Signal(
+                room_id=room_stand_down.id,
+                market_ticker=room_stand_down.market_ticker,
+                fair_yes_dollars=Decimal("0.5100"),
+                edge_bps=40,
+                confidence=0.61,
+                summary="Stand down",
+                payload={
+                    "evaluation_outcome": "pre_risk_filtered",
+                    "recommended_side": None,
+                    "stand_down_reason": "spread_too_wide",
+                },
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+        ])
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    assert report["signal_funnel"]["signals"] == 2
+    assert report["signal_funnel"]["candidate_selected"] == 1
+    assert report["signal_funnel"]["selected_without_ticket_count"] == 1
+    assert report["signal_funnel"]["outcome_counts"] == {
+        "candidate_selected": 1,
+        "pre_risk_filtered": 1,
+    }
+    assert report["signal_funnel"]["recommended_side_counts"]["yes"] == 1
+    assert report["signal_funnel"]["recommended_side_counts"]["none"] == 1
+    assert report["signal_funnel"]["top_stand_down_reasons"] == [{"reason": "spread_too_wide", "count": 1}]
+    assert report["signal_funnel"]["top_markets"][0]["market_ticker"] == room_selected.market_ticker
+    assert report["signal_funnel"]["recent_selected_without_ticket"][0]["room_id"] == room_selected.id
+    issue_codes = {issue["code"] for issue in report["issues"]}
+    assert "selected_signal_without_trade_ticket" in issue_codes
 
 
 @pytest.mark.asyncio
