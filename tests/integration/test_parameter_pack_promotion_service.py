@@ -433,3 +433,63 @@ async def test_parameter_pack_record_starvation_escalates_after_three_failures(t
     assert error_events[0].payload["escalated"] is True
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_parameter_pack_stage_clears_existing_starvation_checkpoint(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/parameter_pack_starvation_clear.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    current = default_parameter_pack()
+    candidate = replace(
+        default_parameter_pack(version="candidate-params-v1"),
+        status="candidate",
+        parameters={**current.parameters, "pseudo_count": 10},
+    )
+    selection = {
+        "selected": False,
+        "promotion_starvation": True,
+        "starvation_tolerance": 2,
+        "evaluated": [{"version": "bad-1", "failures": ["coverage_below_minimum"]}],
+    }
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        service = ParameterPackPromotionService()
+        await service.record_promotion_starvation(
+            repo,
+            selection_payload=selection,
+            reason="test_starvation",
+            escalation_threshold=3,
+        )
+        await service.record_promotion_starvation(
+            repo,
+            selection_payload=selection,
+            reason="test_starvation",
+            escalation_threshold=3,
+        )
+        staged = await service.stage_candidate(
+            repo,
+            candidate_pack=candidate,
+            candidate_report=_holdout_report(candidate.pack_hash),
+            current_report=_holdout_report(current.pack_hash, max_drawdown=0.10),
+            hard_caps=load_hard_caps(),
+            reason="test_stage_after_starvation",
+        )
+        checkpoint = await repo.get_checkpoint("parameter_pack_promotion_starvation:demo")
+        events = await repo.list_ops_events(limit=10, sources=["parameter_pack"], kalshi_env="demo")
+        await session.commit()
+
+    assert staged.status == "staged"
+    assert checkpoint is not None
+    assert checkpoint.payload["status"] == "cleared"
+    assert checkpoint.payload["candidate_version"] == candidate.version
+    assert checkpoint.payload["consecutive_starvations"] == 0
+    assert checkpoint.payload["previous_consecutive_starvations"] == 2
+    info_events = [event for event in events if event.severity == "info"]
+    assert len(info_events) == 1
+    assert info_events[0].payload["status"] == "cleared"
+    assert info_events[0].payload["candidate_version"] == candidate.version
+
+    await engine.dispose()

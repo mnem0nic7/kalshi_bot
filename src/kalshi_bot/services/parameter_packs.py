@@ -203,6 +203,39 @@ class ParameterPackPromotionService:
             ops_event_id=event.id,
         )
 
+    async def _clear_promotion_starvation(
+        self,
+        repo: PlatformRepository,
+        *,
+        candidate_version: str,
+        reason: str,
+    ) -> None:
+        kalshi_env = repo._resolved_kalshi_env()
+        checkpoint_name = f"parameter_pack_promotion_starvation:{kalshi_env}"
+        previous = await repo.get_checkpoint(checkpoint_name)
+        previous_payload = dict(previous.payload if previous is not None else {})
+        previous_consecutive = int(previous_payload.get("consecutive_starvations", 0))
+        if previous_consecutive <= 0:
+            return
+        payload = {
+            "event_kind": "parameter_pack_promotion_starvation",
+            "status": "cleared",
+            "reason": reason,
+            "candidate_version": candidate_version,
+            "consecutive_starvations": 0,
+            "previous_consecutive_starvations": previous_consecutive,
+            "escalated": False,
+            "cleared_at": datetime.now(UTC).isoformat(),
+        }
+        await repo.set_checkpoint(checkpoint_name, cursor=None, payload=payload)
+        await repo.log_ops_event(
+            severity="info",
+            summary="Parameter-pack promotion starvation cleared after candidate staging",
+            source="parameter_pack",
+            payload=payload,
+            kalshi_env=kalshi_env,
+        )
+
     async def stage_candidate(
         self,
         repo: PlatformRepository,
@@ -274,6 +307,11 @@ class ParameterPackPromotionService:
             gate=gate,
             hard_caps=hard_caps,
             target_color=inactive_color,
+        )
+        await self._clear_promotion_starvation(
+            repo,
+            candidate_version=staged_pack.version,
+            reason="parameter_pack_candidate_staged",
         )
         return ParameterPackStageResult(
             status="staged",
