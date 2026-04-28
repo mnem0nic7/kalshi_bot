@@ -212,6 +212,59 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
 
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
+        if action == "status":
+            control = await repo.get_deployment_control()
+            packs = await repo.list_parameter_packs(limit=args.limit)
+            raw_promotions = await repo.list_promotion_events(limit=max(args.limit * 3, args.limit))
+            promotions = [
+                record
+                for record in raw_promotions
+                if dict(record.payload or {}).get("kind") == "parameter_pack"
+            ][: args.limit]
+            champion = await repo.get_champion_parameter_pack()
+            await session.commit()
+            print(
+                json.dumps(
+                    {
+                        "kalshi_env": container.settings.kalshi_env,
+                        "active_color": control.active_color,
+                        "parameter_packs": dict((control.notes or {}).get("parameter_packs") or {}),
+                        "champion": (
+                            {
+                                "version": champion.version,
+                                "status": champion.status,
+                                "pack_hash": champion.pack_hash,
+                            }
+                            if champion is not None
+                            else None
+                        ),
+                        "recent_packs": [
+                            {
+                                "version": record.version,
+                                "status": record.status,
+                                "parent_version": record.parent_version,
+                                "source": record.source,
+                                "pack_hash": record.pack_hash,
+                                "updated_at": record.updated_at.isoformat(),
+                            }
+                            for record in packs
+                        ],
+                        "recent_promotions": [
+                            {
+                                "id": record.id,
+                                "status": record.status,
+                                "candidate_version": record.candidate_version,
+                                "previous_version": record.previous_version,
+                                "target_color": record.target_color,
+                                "rollback_reason": record.rollback_reason,
+                            }
+                            for record in promotions
+                        ],
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         if action == "stage":
             candidate = sanitize_parameter_pack(parameter_pack_from_dict(_read_json_file(Path(args.candidate_pack))))
             dropped = candidate.metadata.get("dropped_hard_cap_parameters", [])
@@ -1816,6 +1869,8 @@ def build_parser() -> argparse.ArgumentParser:
     parameter_pack_default.add_argument("--path", default=None, help=f"Parameter pack YAML path (default: {DEFAULT_PARAMETER_PACK_PATH})")
     parameter_pack_hard_caps = parameter_pack_subparsers.add_parser("hard-caps", help="Print and hash the sealed hard-cap config")
     parameter_pack_hard_caps.add_argument("--path", default=str(DEFAULT_HARD_CAPS_PATH))
+    parameter_pack_status = parameter_pack_subparsers.add_parser("status", help="Show staged parameter-pack rollout state")
+    parameter_pack_status.add_argument("--limit", type=int, default=10)
     parameter_pack_seed_default = parameter_pack_subparsers.add_parser("seed-default", help="Persist the built-in parameter pack to the database")
     parameter_pack_seed_default.add_argument("--path", default=None, help=f"Parameter pack YAML path (default: {DEFAULT_PARAMETER_PACK_PATH})")
     parameter_pack_list = parameter_pack_subparsers.add_parser("list", help="List stored deterministic parameter packs")

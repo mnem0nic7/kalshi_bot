@@ -79,6 +79,7 @@ kalshi-bot-cli decision-trace show <DECISION_TRACE_ID>
 kalshi-bot-cli decision-trace replay <DECISION_TRACE_ID>
 kalshi-bot-cli parameter-pack default
 kalshi-bot-cli parameter-pack hard-caps
+kalshi-bot-cli parameter-pack status
 kalshi-bot-cli parameter-pack validate candidate-pack.json
 kalshi-bot-cli parameter-pack validate candidate-pack.json --strict
 kalshi-bot-cli parameter-pack gate --candidate-report candidate-holdout.json --current-report current-holdout.json --hard-caps infra/config/hard_caps.yaml
@@ -87,7 +88,7 @@ kalshi-bot-cli parameter-pack canary --report canary-report.json
 kalshi-bot-cli parameter-pack rollback-staged --reason manual_parameter_pack_rollback
 ```
 
-`parameter-pack stage` is intentionally not an activator. It stores a sanitized candidate pack, records a `promotion_events` row with holdout-gate evidence and sealed hard-cap hash, and writes `deployment_control.notes.parameter_packs` for operator visibility. `parameter-pack canary` evaluates shadow-canary evidence: Brier must stay within 20% of holdout Brier, and risk-engine bypasses, data-source kill events, and hard-cap touches must be zero. `parameter-pack rollback-staged` marks that staged candidate rolled back and rejected. None of these commands change active color, live execution, hard caps, or runtime thresholds.
+`parameter-pack status` shows the current staged rollout notes, champion pack, recent parameter packs, and recent parameter-pack promotion events. `parameter-pack stage` is intentionally not an activator. It stores a sanitized candidate pack, records a `promotion_events` row with holdout-gate evidence and sealed hard-cap hash, and writes `deployment_control.notes.parameter_packs` for operator visibility. `parameter-pack canary` evaluates shadow-canary evidence: Brier must stay within 20% of holdout Brier, and risk-engine bypasses, data-source kill events, and hard-cap touches must be zero. `parameter-pack rollback-staged` marks that staged candidate rolled back and rejected. None of these commands change active color, live execution, hard caps, or runtime thresholds.
 
 The helper scripts wrap the same flow for Docker blue or green deployments:
 
