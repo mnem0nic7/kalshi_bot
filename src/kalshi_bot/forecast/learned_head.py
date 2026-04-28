@@ -88,6 +88,45 @@ class LearnedHeadValidation:
     valid: bool
     reasons: list[str]
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "reasons": list(self.reasons),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LearnedHeadHoldoutMetrics:
+    brier: float
+    ece: float
+    sharpe: float
+    invalid_probability_count: int = 0
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "LearnedHeadHoldoutMetrics":
+        return cls(
+            brier=float(payload.get("brier", 1.0)),
+            ece=float(payload.get("ece", 1.0)),
+            sharpe=float(payload.get("sharpe", 0.0)),
+            invalid_probability_count=int(payload.get("invalid_probability_count", 0)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LearnedHeadGateResult:
+    passed: bool
+    learned_weight: float
+    failures: list[str]
+    comparisons: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "passed": self.passed,
+            "learned_weight": self.learned_weight,
+            "failures": list(self.failures),
+            "comparisons": dict(self.comparisons),
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class ProbabilityBlend:
@@ -123,6 +162,43 @@ def validate_learned_head_manifest(manifest: LearnedHeadManifest) -> LearnedHead
     if not manifest.model_version.strip():
         reasons.append("model_version_required")
     return LearnedHeadValidation(valid=not reasons, reasons=reasons)
+
+
+def evaluate_learned_head_gate(
+    *,
+    closed_form: LearnedHeadHoldoutMetrics,
+    learned: LearnedHeadHoldoutMetrics,
+    requested_weight: float,
+    max_weight: float = 0.5,
+    min_sharpe_improvement: float = 0.05,
+) -> LearnedHeadGateResult:
+    failures: list[str] = []
+    comparisons: dict[str, Any] = {}
+
+    comparisons["brier"] = {"closed_form": closed_form.brier, "learned": learned.brier, "must_be_lower": True}
+    if learned.brier >= closed_form.brier:
+        failures.append("brier_not_improved")
+
+    comparisons["ece"] = {"closed_form": closed_form.ece, "learned": learned.ece, "must_be_lower": True}
+    if learned.ece >= closed_form.ece:
+        failures.append("ece_not_improved")
+
+    min_sharpe = _minimum_learned_sharpe(closed_form.sharpe, min_sharpe_improvement)
+    comparisons["sharpe"] = {"closed_form": closed_form.sharpe, "learned": learned.sharpe, "minimum": min_sharpe}
+    if learned.sharpe < min_sharpe:
+        failures.append("sharpe_not_improved")
+
+    comparisons["invalid_probability_count"] = learned.invalid_probability_count
+    if learned.invalid_probability_count:
+        failures.append("invalid_probability")
+
+    passed = not failures
+    return LearnedHeadGateResult(
+        passed=passed,
+        learned_weight=max(0.0, min(float(requested_weight), float(max_weight), 0.5)) if passed else 0.0,
+        failures=failures,
+        comparisons=comparisons,
+    )
 
 
 def stable_feature_payload(features: StructuredForecastFeatures) -> dict[str, Any]:
@@ -194,3 +270,9 @@ def clamp_probability(value: float) -> float:
     if not isfinite(float(value)):
         raise ValueError("probability must be finite")
     return max(0.0, min(1.0, float(value)))
+
+
+def _minimum_learned_sharpe(closed_form_sharpe: float, improvement: float) -> float:
+    if closed_form_sharpe > 0:
+        return closed_form_sharpe * (1.0 + improvement)
+    return closed_form_sharpe + abs(closed_form_sharpe) * improvement

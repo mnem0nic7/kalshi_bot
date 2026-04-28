@@ -3,9 +3,11 @@ from __future__ import annotations
 import pytest
 
 from kalshi_bot.forecast.learned_head import (
+    LearnedHeadHoldoutMetrics,
     LearnedHeadManifest,
     StructuredForecastFeatures,
     blend_learned_probability,
+    evaluate_learned_head_gate,
     stable_feature_hash,
     validate_learned_head_manifest,
 )
@@ -33,6 +35,7 @@ def test_learned_head_manifest_accepts_structured_features_only() -> None:
 
     assert result.valid is True
     assert result.reasons == []
+    assert result.to_dict() == {"valid": True, "reasons": []}
 
 
 def test_learned_head_manifest_rejects_text_features() -> None:
@@ -76,3 +79,27 @@ def test_learned_probability_blend_falls_back_to_closed_form_when_unavailable() 
     assert blend.p_final == 0.40
     assert blend.learned_weight == 0.0
     assert blend.reason == "learned_head_unavailable"
+
+
+def test_learned_head_gate_allows_weight_only_when_holdout_beats_closed_form() -> None:
+    result = evaluate_learned_head_gate(
+        closed_form=LearnedHeadHoldoutMetrics(brier=0.20, ece=0.05, sharpe=1.0),
+        learned=LearnedHeadHoldoutMetrics(brier=0.19, ece=0.04, sharpe=1.06),
+        requested_weight=0.90,
+    )
+
+    assert result.passed is True
+    assert result.learned_weight == 0.5
+    assert result.failures == []
+
+
+def test_learned_head_gate_forces_zero_weight_on_partial_regression() -> None:
+    result = evaluate_learned_head_gate(
+        closed_form=LearnedHeadHoldoutMetrics(brier=0.20, ece=0.05, sharpe=1.0),
+        learned=LearnedHeadHoldoutMetrics(brier=0.19, ece=0.06, sharpe=1.01, invalid_probability_count=1),
+        requested_weight=0.25,
+    )
+
+    assert result.passed is False
+    assert result.learned_weight == 0.0
+    assert result.failures == ["ece_not_improved", "sharpe_not_improved", "invalid_probability"]

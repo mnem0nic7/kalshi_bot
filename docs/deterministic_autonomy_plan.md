@@ -98,7 +98,7 @@ CatBoost/River probability heads and NWS discussion parsing are optional. They m
 
 Phase 5/6 scaffolding now exists without adding live dependencies or changing behavior:
 
-- `kalshi_bot.forecast.learned_head` defines the structured feature contract, CatBoost manifest validation, stable feature hashes, and a learned-probability blend capped at 0.5.
+- `kalshi_bot.forecast.learned_head` defines the structured feature contract, CatBoost manifest validation, stable feature hashes, a holdout gate for nonzero learned weight, and a learned-probability blend capped at 0.5.
 - `kalshi_bot.forecast.online_calibrator` provides a deterministic pure-Python logistic calibration state that can be replaced by River later without changing saved feature semantics.
 - `kalshi_bot.forecast.nws_discussion_parser` validates strict NWS discussion JSON and returns neutral features for malformed or over-broad output.
 - None of these modules are wired into the trading decision path; default learned weight remains zero.

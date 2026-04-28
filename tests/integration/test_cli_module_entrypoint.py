@@ -146,6 +146,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert "drift" in command_help.stdout
     assert "select" in command_help.stdout
     assert "grid" in command_help.stdout
+    assert "learned-gate" in command_help.stdout
     assert "stage" in command_help.stdout
     assert "rollback-staged" in command_help.stdout
     assert "canary" in command_help.stdout
@@ -521,6 +522,45 @@ def test_parameter_pack_grid_cli_outputs_bounded_candidates(tmp_path) -> None:
     assert payload["count"] == 2
     assert payload["candidates"][0]["pack"]["parameters"]["pseudo_count"] == 4
     assert payload["candidates"][1]["pack"]["parameters"]["pseudo_count"] == 32
+
+
+def test_parameter_pack_learned_gate_cli_forces_zero_weight_on_regression(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/parameter-pack-learned-gate-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+    closed_path = tmp_path / "closed-form.json"
+    learned_path = tmp_path / "learned.json"
+    closed_path.write_text(json.dumps({"brier": 0.20, "ece": 0.05, "sharpe": 1.0}), encoding="utf-8")
+    learned_path.write_text(
+        json.dumps({"brier": 0.19, "ece": 0.07, "sharpe": 1.06}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "parameter-pack",
+            "learned-gate",
+            "--closed-form-report",
+            str(closed_path),
+            "--learned-report",
+            str(learned_path),
+            "--requested-weight",
+            "0.25",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["passed"] is False
+    assert payload["learned_weight"] == 0.0
+    assert payload["failures"] == ["ece_not_improved"]
 
 
 def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:

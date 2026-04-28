@@ -24,6 +24,10 @@ from kalshi_bot.core.schemas import (
 from kalshi_bot.db.models import StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
+from kalshi_bot.forecast.learned_head import (
+    LearnedHeadHoldoutMetrics,
+    evaluate_learned_head_gate,
+)
 from kalshi_bot.learning.drift_watcher import DriftWindow, evaluate_calibration_drift
 from kalshi_bot.learning.hard_caps import DEFAULT_HARD_CAPS_PATH, load_hard_caps
 from kalshi_bot.learning.parameter_pack import (
@@ -33,7 +37,10 @@ from kalshi_bot.learning.parameter_pack import (
     parameter_pack_from_dict,
     sanitize_parameter_pack,
 )
-from kalshi_bot.learning.parameter_search import generate_parameter_pack_grid, select_parameter_pack_candidate
+from kalshi_bot.learning.parameter_search import (
+    generate_parameter_pack_grid,
+    select_parameter_pack_candidate,
+)
 from kalshi_bot.learning.promotion_gates import (
     HoldoutMetrics,
     evaluate_parameter_pack_promotion,
@@ -230,6 +237,14 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
         )
         print(json.dumps(result.to_dict(), indent=2))
         return 0
+    if action == "learned-gate":
+        result = evaluate_learned_head_gate(
+            closed_form=LearnedHeadHoldoutMetrics.from_dict(_read_json_file(Path(args.closed_form_report))),
+            learned=LearnedHeadHoldoutMetrics.from_dict(_read_json_file(Path(args.learned_report))),
+            requested_weight=args.requested_weight,
+        )
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0 if result.passed else 1
 
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
@@ -1939,6 +1954,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parameter_pack_grid.add_argument("--grid", required=True)
     parameter_pack_grid.add_argument("--limit", type=int, default=None)
+    parameter_pack_learned_gate = parameter_pack_subparsers.add_parser(
+        "learned-gate",
+        help="Gate optional learned-head holdout metrics before allowing nonzero blend weight",
+    )
+    parameter_pack_learned_gate.add_argument("--closed-form-report", required=True)
+    parameter_pack_learned_gate.add_argument("--learned-report", required=True)
+    parameter_pack_learned_gate.add_argument("--requested-weight", type=float, default=0.0)
     parameter_pack_stage = parameter_pack_subparsers.add_parser(
         "stage",
         help="Stage a gated parameter pack on the inactive color without changing live risk",
