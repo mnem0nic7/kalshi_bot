@@ -101,3 +101,46 @@ async def test_parameter_pack_stage_rejects_failed_gate_without_promotion_event(
     assert promotions == []
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_parameter_pack_rollback_staged_marks_candidate_rejected_and_preserves_active_color(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/parameter_pack_rollback.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    current = default_parameter_pack()
+    candidate = replace(
+        default_parameter_pack(version="candidate-params-v1"),
+        status="candidate",
+        parameters={**current.parameters, "pseudo_count": 10},
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        service = ParameterPackPromotionService()
+        staged = await service.stage_candidate(
+            repo,
+            candidate_pack=candidate,
+            candidate_report=_holdout_report(candidate.pack_hash),
+            current_report=_holdout_report(current.pack_hash, max_drawdown=0.10),
+            hard_caps=load_hard_caps(),
+        )
+        rolled_back = await service.rollback_staged(repo, reason="test_rollback")
+        control = await repo.get_deployment_control()
+        promotion = await repo.get_promotion_event(staged.promotion_event_id)
+        stored_candidate = await repo.get_parameter_pack(candidate.version)
+        await session.commit()
+
+    assert rolled_back.status == "rolled_back"
+    assert rolled_back.candidate_version == candidate.version
+    assert control.active_color == "blue"
+    assert control.notes["parameter_packs"]["status"] == "rolled_back"
+    assert control.notes["parameter_packs"]["rollback_reason"] == "test_rollback"
+    assert promotion is not None
+    assert promotion.status == "rolled_back"
+    assert promotion.rollback_reason == "test_rollback"
+    assert stored_candidate is not None
+    assert stored_candidate.status == "rejected"
+
+    await engine.dispose()

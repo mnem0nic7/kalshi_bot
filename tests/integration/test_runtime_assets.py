@@ -126,6 +126,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "promotion_gates" in autonomy
     assert "drift_watcher" in autonomy
     assert "parameter-pack stage" in autonomy
+    assert "parameter-pack rollback-staged" in autonomy
     assert "deployment_control.notes.parameter_packs" in autonomy
     assert "learned_head" in autonomy
     assert "online_calibrator" in autonomy
@@ -142,6 +143,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack gate" in self_improve
     assert "--hard-caps infra/config/hard_caps.yaml" in self_improve
     assert "parameter-pack stage" in self_improve
+    assert "parameter-pack rollback-staged" in self_improve
     assert "not an activator" in self_improve
     assert "max_drawdown_pct" in self_improve
     assert "decision-trace replay" in strategy

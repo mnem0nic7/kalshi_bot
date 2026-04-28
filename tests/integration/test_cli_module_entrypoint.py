@@ -144,6 +144,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert "validate" in command_help.stdout
     assert "gate" in command_help.stdout
     assert "stage" in command_help.stdout
+    assert "rollback-staged" in command_help.stdout
     assert "hard-caps" in command_help.stdout
     assert "seed-default" in command_help.stdout
     assert gate_help.returncode == 0
@@ -439,6 +440,28 @@ def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:
     assert payload["previous_version"] == current.version
     assert payload["target_color"] == "green"
     assert payload["gate"]["passed"] is True
+
+    rollback = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "parameter-pack",
+            "rollback-staged",
+            "--reason",
+            "cli_test_rollback",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert rollback.returncode == 0
+    rollback_payload = json.loads(rollback.stdout)
+    assert rollback_payload["status"] == "rolled_back"
+    assert rollback_payload["candidate_version"] == candidate.version
+    assert rollback_payload["reason"] == "cli_test_rollback"
 
 
 @pytest.mark.asyncio

@@ -39,6 +39,24 @@ class ParameterPackStageResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ParameterPackRollbackResult:
+    status: str
+    candidate_version: str
+    previous_version: str | None
+    promotion_event_id: str | None
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "candidate_version": self.candidate_version,
+            "previous_version": self.previous_version,
+            "promotion_event_id": self.promotion_event_id,
+            "reason": self.reason,
+        }
+
+
 class ParameterPackPromotionService:
     async def stage_candidate(
         self,
@@ -120,6 +138,52 @@ class ParameterPackPromotionService:
             promotion_event_id=promotion.id,
             gate=gate,
             hard_caps_hash=hard_caps.config_hash,
+        )
+
+    async def rollback_staged(
+        self,
+        repo: PlatformRepository,
+        *,
+        reason: str = "manual_parameter_pack_rollback",
+    ) -> ParameterPackRollbackResult:
+        control = await repo.get_deployment_control()
+        notes = dict(control.notes or {})
+        staged = dict(notes.get("parameter_packs") or {})
+        if staged.get("status") != "staged":
+            raise ValueError("No staged parameter pack is available for rollback")
+        candidate_version = str(staged.get("candidate_version") or "")
+        if not candidate_version:
+            raise ValueError("Staged parameter pack notes are missing candidate_version")
+        promotion_event_id = staged.get("promotion_event_id")
+        candidate_record = await repo.get_parameter_pack(candidate_version)
+        if candidate_record is not None:
+            candidate_pack = parameter_pack_from_dict(candidate_record.payload)
+            rejected_pack = replace(
+                candidate_pack,
+                status="rejected",
+                metadata={
+                    **candidate_pack.metadata,
+                    "rollback_reason": reason,
+                    "rolled_back_at": datetime.now(UTC).isoformat(),
+                },
+            )
+            await repo.update_parameter_pack(rejected_pack, holdout_report=candidate_record.holdout_report)
+        if promotion_event_id:
+            await repo.update_promotion_event(str(promotion_event_id), status="rolled_back", rollback_reason=reason)
+        rolled_back_notes = {
+            **staged,
+            "status": "rolled_back",
+            "rollback_reason": reason,
+            "rolled_back_at": datetime.now(UTC).isoformat(),
+        }
+        notes["parameter_packs"] = rolled_back_notes
+        await repo.update_deployment_notes(notes)
+        return ParameterPackRollbackResult(
+            status="rolled_back",
+            candidate_version=candidate_version,
+            previous_version=staged.get("previous_version"),
+            promotion_event_id=str(promotion_event_id) if promotion_event_id else None,
+            reason=reason,
         )
 
     async def _current_champion_pack(self, repo: PlatformRepository) -> ParameterPack:

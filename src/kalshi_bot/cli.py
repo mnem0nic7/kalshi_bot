@@ -241,6 +241,12 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
             await session.commit()
             print(json.dumps(result.to_dict(), indent=2))
             return 0
+        if action == "rollback-staged":
+            service = ParameterPackPromotionService()
+            result = await service.rollback_staged(repo, reason=args.reason)
+            await session.commit()
+            print(json.dumps(result.to_dict(), indent=2))
+            return 0
         if action == "seed-default":
             pack = load_parameter_pack(args.path) if args.path is not None else default_parameter_pack()
             record = await repo.update_parameter_pack(pack, holdout_report={})
@@ -1825,6 +1831,11 @@ def build_parser() -> argparse.ArgumentParser:
     parameter_pack_stage.add_argument("--hard-caps", default=str(DEFAULT_HARD_CAPS_PATH))
     parameter_pack_stage.add_argument("--target-color", choices=["blue", "green"], default=None)
     parameter_pack_stage.add_argument("--reason", default="manual_parameter_pack_stage")
+    parameter_pack_rollback = parameter_pack_subparsers.add_parser(
+        "rollback-staged",
+        help="Mark the staged parameter-pack candidate rolled back without changing live risk",
+    )
+    parameter_pack_rollback.add_argument("--reason", default="manual_parameter_pack_rollback")
 
     subparsers.add_parser("shadow-c-sweep", help="Strategy C: evaluate lock-confirmation signals across all configured markets")
     subparsers.add_parser("strategy-c-status", help="Strategy C: show aggregate sweep metrics and lock tracker state")

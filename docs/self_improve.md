@@ -83,9 +83,10 @@ kalshi-bot-cli parameter-pack validate candidate-pack.json
 kalshi-bot-cli parameter-pack validate candidate-pack.json --strict
 kalshi-bot-cli parameter-pack gate --candidate-report candidate-holdout.json --current-report current-holdout.json --hard-caps infra/config/hard_caps.yaml
 kalshi-bot-cli parameter-pack stage --candidate-pack candidate-pack.json --candidate-report candidate-holdout.json --current-report current-holdout.json --hard-caps infra/config/hard_caps.yaml
+kalshi-bot-cli parameter-pack rollback-staged --reason manual_parameter_pack_rollback
 ```
 
-`parameter-pack stage` is intentionally not an activator. It stores a sanitized candidate pack, records a `promotion_events` row with holdout-gate evidence and sealed hard-cap hash, and writes `deployment_control.notes.parameter_packs` for operator visibility. It does not change active color, live execution, hard caps, or runtime thresholds.
+`parameter-pack stage` is intentionally not an activator. It stores a sanitized candidate pack, records a `promotion_events` row with holdout-gate evidence and sealed hard-cap hash, and writes `deployment_control.notes.parameter_packs` for operator visibility. `parameter-pack rollback-staged` marks that staged candidate rolled back and rejected. Neither command changes active color, live execution, hard caps, or runtime thresholds.
 
 The helper scripts wrap the same flow for Docker blue or green deployments:
 
