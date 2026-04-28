@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from itertools import product
 from typing import Any
 
 from kalshi_bot.learning.hard_caps import HardCaps
-from kalshi_bot.learning.parameter_pack import ParameterPack, default_parameter_pack, sanitize_parameter_pack
+from kalshi_bot.learning.parameter_pack import (
+    HARD_CAP_PARAMETER_NAMES,
+    ParameterPack,
+    ParameterValue,
+    default_parameter_pack,
+    sanitize_parameter_pack,
+)
 from kalshi_bot.learning.promotion_gates import (
     HoldoutMetrics,
     PromotionGateResult,
@@ -48,6 +55,66 @@ class ParameterPackSearchSelection:
             "selected_candidate": self.selected.to_dict() if self.selected is not None else None,
             "evaluated": [candidate.to_dict() for candidate in self.evaluated],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterPackGridCandidate:
+    index: int
+    pack: ParameterPack
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "version": self.pack.version,
+            "pack_hash": self.pack.pack_hash,
+            "pack": self.pack.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterPackGrid:
+    candidates: list[ParameterPackGridCandidate]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "count": len(self.candidates),
+            "candidates": [candidate.to_dict() for candidate in self.candidates],
+        }
+
+
+def generate_parameter_pack_grid(
+    grid_payload: dict[str, Any],
+    *,
+    base_pack: ParameterPack | None = None,
+    limit: int | None = None,
+) -> ParameterPackGrid:
+    """Generate deterministic bounded candidate packs for offline replay search."""
+
+    base = base_pack or default_parameter_pack()
+    grid_values = _grid_values(grid_payload, base_pack=base)
+    parameter_names = sorted(grid_values)
+    candidates: list[ParameterPackGridCandidate] = []
+    for values in product(*(grid_values[name] for name in parameter_names)):
+        overrides = dict(zip(parameter_names, values, strict=True))
+        pack = ParameterPack(
+            version="candidate-pending",
+            status="candidate",
+            parent_version=str(grid_payload.get("parent_version") or base.version),
+            source=str(grid_payload.get("source") or "parameter-grid"),
+            description=str(grid_payload.get("description") or "Deterministic grid-search candidate."),
+            parameters={**base.parameters, **overrides},
+            specs=base.specs,
+            metadata={
+                "grid_parameters": parameter_names,
+                "grid_index": len(candidates),
+            },
+        )
+        sanitized = sanitize_parameter_pack(pack, specs=base.specs)
+        candidate = replace(sanitized, version=f"grid-{len(candidates) + 1}-{sanitized.pack_hash[:12]}")
+        candidates.append(ParameterPackGridCandidate(index=len(candidates), pack=candidate))
+        if limit is not None and len(candidates) >= limit:
+            break
+    return ParameterPackGrid(candidates=candidates)
 
 
 def select_parameter_pack_candidate(
@@ -97,6 +164,36 @@ def parameter_pack_objective(metrics: HoldoutMetrics, *, hard_max_drawdown: floa
     if hard_max_drawdown is not None and metrics.max_drawdown > hard_max_drawdown:
         objective -= 1_000.0
     return objective
+
+
+def _grid_values(grid_payload: dict[str, Any], *, base_pack: ParameterPack) -> dict[str, list[ParameterValue]]:
+    raw_grid = grid_payload.get("parameters") or grid_payload.get("grid")
+    if not isinstance(raw_grid, dict) or not raw_grid:
+        raise ValueError("parameter-pack grid payload must include a non-empty parameters object")
+    values: dict[str, list[ParameterValue]] = {}
+    for name, raw_values in raw_grid.items():
+        parameter_name = str(name)
+        if parameter_name in HARD_CAP_PARAMETER_NAMES:
+            raise ValueError(f"parameter-pack grid cannot include hard cap {parameter_name}")
+        if parameter_name not in base_pack.specs:
+            raise ValueError(f"unknown parameter-pack grid parameter {parameter_name}")
+        if not isinstance(raw_values, list) or not raw_values:
+            raise ValueError(f"parameter-pack grid parameter {parameter_name} must have a non-empty list of values")
+        sanitized_pack = sanitize_parameter_pack(
+            replace(base_pack, parameters={**base_pack.parameters, parameter_name: raw_values[0]}),
+            specs=base_pack.specs,
+        )
+        sanitized_values: list[ParameterValue] = [sanitized_pack.parameters[parameter_name]]
+        for raw_value in raw_values[1:]:
+            sanitized = sanitize_parameter_pack(
+                replace(base_pack, parameters={**base_pack.parameters, parameter_name: raw_value}),
+                specs=base_pack.specs,
+            )
+            value = sanitized.parameters[parameter_name]
+            if value not in sanitized_values:
+                sanitized_values.append(value)
+        values[parameter_name] = sanitized_values
+    return values
 
 
 def _candidate_payloads(search_payload: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, Any]]:

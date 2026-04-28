@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from kalshi_bot.learning.hard_caps import load_hard_caps
-from kalshi_bot.learning.parameter_search import select_parameter_pack_candidate
+from kalshi_bot.learning.parameter_search import generate_parameter_pack_grid, select_parameter_pack_candidate
 
 
 def _current_report() -> dict[str, object]:
@@ -90,3 +92,28 @@ def test_select_parameter_pack_candidate_preserves_idempotency_failures() -> Non
 
     assert result.selected is None
     assert result.evaluated[0].failures == ["pack_hash_not_idempotent"]
+
+
+def test_generate_parameter_pack_grid_is_bounded_and_deterministic() -> None:
+    result = generate_parameter_pack_grid(
+        {
+            "parameters": {
+                "kelly_fraction": [0.20, 0.25],
+                "pseudo_count": [4, 999],
+            }
+        }
+    )
+
+    assert result.to_dict()["count"] == 4
+    assert [candidate.pack.parameters["pseudo_count"] for candidate in result.candidates] == [4, 32, 4, 32]
+    assert [candidate.pack.parameters["kelly_fraction"] for candidate in result.candidates] == [0.20, 0.20, 0.25, 0.25]
+    assert result.candidates[0].pack.version.startswith("grid-1-")
+    assert result.candidates[0].pack.metadata["grid_parameters"] == ["kelly_fraction", "pseudo_count"]
+
+
+def test_generate_parameter_pack_grid_rejects_unknown_and_hard_cap_parameters() -> None:
+    with pytest.raises(ValueError, match="hard cap"):
+        generate_parameter_pack_grid({"parameters": {"max_position_usd": [100]}})
+
+    with pytest.raises(ValueError, match="unknown"):
+        generate_parameter_pack_grid({"parameters": {"not_a_parameter": [1]}})
