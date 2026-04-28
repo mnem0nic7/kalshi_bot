@@ -65,6 +65,10 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
+def _avg_float(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 2) if values else None
+
+
 def _as_datetime(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
@@ -263,6 +267,9 @@ class DecisionCorpusService:
         clean_primary_rows = 0
         clean_primary_days: set[str] = set()
         degraded_rows = 0
+        forecast_abs_delta_values: list[float] = []
+        forecast_gap_values: list[float] = []
+        insufficient_separation_gap_values: list[float] = []
         for row in rows:
             by_station[row.station_id or row.series_ticker or "unknown"] += 1
             by_day[row.local_market_day] += 1
@@ -287,6 +294,15 @@ class DecisionCorpusService:
                 "historical_replay_unknown",
             }:
                 degraded_rows += 1
+            diagnostics = row.diagnostics or {}
+            abs_delta = _as_float(diagnostics.get("abs_forecast_delta_f"))
+            gap = _as_float(diagnostics.get("forecast_delta_gap_f"))
+            if abs_delta is not None:
+                forecast_abs_delta_values.append(abs_delta)
+            if gap is not None:
+                forecast_gap_values.append(gap)
+                if row.stand_down_reason == "insufficient_forecast_separation":
+                    insufficient_separation_gap_values.append(gap)
         return {
             "build": self._build_to_dict(build),
             "row_count": len(rows),
@@ -310,6 +326,13 @@ class DecisionCorpusService:
                 "gap_to_supported": {
                     "clean_primary_rows": max(0, SUPPORTED_N - clean_primary_rows),
                     "clean_primary_market_days": max(0, SUPPORTED_MARKET_DAYS - len(clean_primary_days)),
+                },
+                "forecast_separation": {
+                    "rows_with_delta": len(forecast_abs_delta_values),
+                    "avg_abs_delta_f": _avg_float(forecast_abs_delta_values),
+                    "avg_gap_f": _avg_float(forecast_gap_values),
+                    "insufficient_separation_rows": len(insufficient_separation_gap_values),
+                    "insufficient_separation_avg_gap_f": _avg_float(insufficient_separation_gap_values),
                 },
                 "next_check": (
                     "Run `kalshi-bot-cli historical-status --verbose` before promoting or rebuilding "

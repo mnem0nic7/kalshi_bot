@@ -49,6 +49,7 @@ async def _seed_historical_decision(
     source_kind: str = "checkpoint_archive",
     kalshi_env: str = "demo",
     forecast_delta_f: float | None = None,
+    stand_down_reason: str | None = None,
 ) -> str:
     async with session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=kalshi_env)
@@ -61,15 +62,22 @@ async def _seed_historical_decision(
             room_origin=RoomOrigin.HISTORICAL_REPLAY.value,
             agent_pack_version="model-v1",
         )
+        resolved_stand_down_reason = (
+            stand_down_reason
+            if stand_down_reason is not None
+            else (None if recommended_side else "below_min_edge")
+        )
         signal_payload = {
             "trade_regime": "standard",
             "eligibility": {
-                "eligible": bool(recommended_side and target_yes_price is not None),
-                "stand_down_reason": None if recommended_side else "below_min_edge",
+                "eligible": bool(recommended_side and target_yes_price is not None and resolved_stand_down_reason is None),
+                "stand_down_reason": resolved_stand_down_reason,
             },
             "agent_pack_version": "model-v1",
             "heuristic_pack_version": "policy-v1",
         }
+        if resolved_stand_down_reason is not None:
+            signal_payload["stand_down_reason"] = resolved_stand_down_reason
         if recommended_side is not None:
             signal_payload["recommended_side"] = recommended_side
         if target_yes_price is not None:
@@ -284,6 +292,8 @@ async def test_inspect_build_reports_source_diagnostics(tmp_path) -> None:
         checkpoint_ts=datetime(2026, 3, 31, 17, 0, tzinfo=UTC),
         coverage_class="full_checkpoint_coverage",
         source_kind="external_forecast_archive_weather_bundle",
+        forecast_delta_f=2.0,
+        stand_down_reason="insufficient_forecast_separation",
     )
 
     result = await harness.service.build(
@@ -312,6 +322,13 @@ async def test_inspect_build_reports_source_diagnostics(tmp_path) -> None:
     assert diagnostics["degraded_rows"] == 1
     assert diagnostics["gap_to_exploratory"] == {"clean_primary_rows": 0, "clean_primary_market_days": 0}
     assert diagnostics["gap_to_supported"] == {"clean_primary_rows": 70, "clean_primary_market_days": 0}
+    assert diagnostics["forecast_separation"] == {
+        "rows_with_delta": 1,
+        "avg_abs_delta_f": 2.0,
+        "avg_gap_f": 6.0,
+        "insufficient_separation_rows": 1,
+        "insufficient_separation_avg_gap_f": 6.0,
+    }
     assert "historical-status --verbose" in diagnostics["next_check"]
 
 
