@@ -314,6 +314,12 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
             await session.commit()
             print(json.dumps(result.to_dict(), indent=2))
             return 0 if result.status != "canary_failed" else 1
+        if action == "promote-staged":
+            service = ParameterPackPromotionService()
+            result = await service.promote_canary_passed(repo, reason=args.reason)
+            await session.commit()
+            print(json.dumps(result.to_dict(), indent=2))
+            return 0
         if action == "seed-default":
             pack = load_parameter_pack(args.path) if args.path is not None else default_parameter_pack()
             record = await repo.update_parameter_pack(pack, holdout_report={})
@@ -1913,6 +1919,11 @@ def build_parser() -> argparse.ArgumentParser:
     parameter_pack_canary.add_argument("--min-shadow-rooms", type=int, default=25)
     parameter_pack_canary.add_argument("--min-elapsed-seconds", type=int, default=7200)
     parameter_pack_canary.add_argument("--max-brier-ratio", type=float, default=1.20)
+    parameter_pack_promote = parameter_pack_subparsers.add_parser(
+        "promote-staged",
+        help="Mark a canary-passed parameter pack champion without changing active color",
+    )
+    parameter_pack_promote.add_argument("--reason", default="manual_parameter_pack_promote")
 
     subparsers.add_parser("shadow-c-sweep", help="Strategy C: evaluate lock-confirmation signals across all configured markets")
     subparsers.add_parser("strategy-c-status", help="Strategy C: show aggregate sweep metrics and lock tracker state")

@@ -275,3 +275,59 @@ async def test_parameter_pack_canary_failure_rolls_back_candidate(tmp_path) -> N
     assert stored_candidate.status == "rejected"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_parameter_pack_promote_canary_passed_archives_previous_champion(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/parameter_pack_promote.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    current = default_parameter_pack()
+    candidate = replace(
+        default_parameter_pack(version="candidate-params-v1"),
+        status="candidate",
+        parameters={**current.parameters, "pseudo_count": 10},
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        service = ParameterPackPromotionService()
+        staged = await service.stage_candidate(
+            repo,
+            candidate_pack=candidate,
+            candidate_report=_holdout_report(candidate.pack_hash),
+            current_report=_holdout_report(current.pack_hash, max_drawdown=0.10),
+            hard_caps=load_hard_caps(),
+        )
+        await service.evaluate_staged_canary(
+            repo,
+            canary_report={
+                "completed_shadow_rooms": 25,
+                "elapsed_seconds": 7200,
+                "brier": 0.20,
+            },
+        )
+        result = await service.promote_canary_passed(repo, reason="test_promote")
+        control = await repo.get_deployment_control()
+        promotion = await repo.get_promotion_event(staged.promotion_event_id)
+        stored_candidate = await repo.get_parameter_pack(candidate.version)
+        stored_previous = await repo.get_parameter_pack(current.version)
+        champion = await repo.get_champion_parameter_pack()
+        await session.commit()
+
+    assert result.status == "champion"
+    assert result.candidate_version == candidate.version
+    assert control.active_color == "blue"
+    assert control.notes["parameter_packs"]["status"] == "champion"
+    assert control.notes["parameter_packs"]["champion_version"] == candidate.version
+    assert promotion is not None
+    assert promotion.status == "stable"
+    assert stored_candidate is not None
+    assert stored_candidate.status == "champion"
+    assert stored_previous is not None
+    assert stored_previous.status == "archived"
+    assert champion is not None
+    assert champion.version == candidate.version
+
+    await engine.dispose()

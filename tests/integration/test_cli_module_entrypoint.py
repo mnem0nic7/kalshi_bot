@@ -146,6 +146,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert "stage" in command_help.stdout
     assert "rollback-staged" in command_help.stdout
     assert "canary" in command_help.stdout
+    assert "promote-staged" in command_help.stdout
     assert "status" in command_help.stdout
     assert "hard-caps" in command_help.stdout
     assert "seed-default" in command_help.stdout

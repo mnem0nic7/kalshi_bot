@@ -117,6 +117,24 @@ class ParameterPackCanaryResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ParameterPackPromotionResult:
+    status: str
+    candidate_version: str
+    previous_version: str | None
+    promotion_event_id: str | None
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "candidate_version": self.candidate_version,
+            "previous_version": self.previous_version,
+            "promotion_event_id": self.promotion_event_id,
+            "reason": self.reason,
+        }
+
+
 class ParameterPackPromotionService:
     async def stage_candidate(
         self,
@@ -335,6 +353,83 @@ class ParameterPackPromotionService:
             passed=True,
             failures=[],
             comparisons=comparisons,
+        )
+
+    async def promote_canary_passed(
+        self,
+        repo: PlatformRepository,
+        *,
+        reason: str = "manual_parameter_pack_promote",
+    ) -> ParameterPackPromotionResult:
+        control = await repo.get_deployment_control()
+        notes = dict(control.notes or {})
+        staged = dict(notes.get("parameter_packs") or {})
+        if staged.get("status") != "canary_passed":
+            raise ValueError("No canary-passed parameter pack is available for promotion")
+        candidate_version = str(staged.get("candidate_version") or "")
+        if not candidate_version:
+            raise ValueError("Canary-passed parameter pack notes are missing candidate_version")
+        previous_version = staged.get("previous_version")
+        promotion_event_id = staged.get("promotion_event_id")
+        candidate_record = await repo.get_parameter_pack(candidate_version)
+        if candidate_record is None:
+            raise KeyError(f"Parameter pack {candidate_version} not found")
+        candidate_pack = parameter_pack_from_dict(candidate_record.payload)
+        if previous_version is not None and previous_version != candidate_version:
+            previous_record = await repo.get_parameter_pack(str(previous_version))
+            if previous_record is not None and previous_record.status == "champion":
+                previous_pack = parameter_pack_from_dict(previous_record.payload)
+                await repo.update_parameter_pack(
+                    replace(
+                        previous_pack,
+                        status="archived",
+                        metadata={
+                            **previous_pack.metadata,
+                            "archived_at": datetime.now(UTC).isoformat(),
+                            "archived_by_parameter_pack": candidate_version,
+                        },
+                    ),
+                    holdout_report=previous_record.holdout_report,
+                )
+        promoted_pack = replace(
+            candidate_pack,
+            status="champion",
+            metadata={
+                **candidate_pack.metadata,
+                "promoted_at": datetime.now(UTC).isoformat(),
+                "promoted_reason": reason,
+                "previous_version": previous_version,
+            },
+        )
+        await repo.update_parameter_pack(promoted_pack, holdout_report=candidate_record.holdout_report)
+        if promotion_event_id:
+            payload = {}
+            promotion = await repo.get_promotion_event(str(promotion_event_id))
+            if promotion is not None:
+                payload = dict(promotion.payload or {})
+            payload["promoted"] = {
+                "reason": reason,
+                "promoted_at": datetime.now(UTC).isoformat(),
+                "candidate_version": candidate_version,
+                "previous_version": previous_version,
+            }
+            await repo.update_promotion_event(str(promotion_event_id), status="stable", payload=payload)
+        promoted_notes = {
+            **staged,
+            "status": "champion",
+            "champion_version": candidate_version,
+            "champion_hash": promoted_pack.pack_hash,
+            "promoted_reason": reason,
+            "promoted_at": datetime.now(UTC).isoformat(),
+        }
+        notes["parameter_packs"] = promoted_notes
+        await repo.update_deployment_notes(notes)
+        return ParameterPackPromotionResult(
+            status="champion",
+            candidate_version=candidate_version,
+            previous_version=str(previous_version) if previous_version is not None else None,
+            promotion_event_id=str(promotion_event_id) if promotion_event_id else None,
+            reason=reason,
         )
 
     async def _current_champion_pack(self, repo: PlatformRepository) -> ParameterPack:

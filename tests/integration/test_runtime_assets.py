@@ -128,6 +128,7 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack stage" in autonomy
     assert "parameter-pack status" in autonomy
     assert "parameter-pack canary" in autonomy
+    assert "parameter-pack promote-staged" in autonomy
     assert "parameter-pack rollback-staged" in autonomy
     assert "deployment_control.notes.parameter_packs" in autonomy
     assert "learned_head" in autonomy
@@ -147,6 +148,8 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "parameter-pack stage" in self_improve
     assert "parameter-pack status" in self_improve
     assert "parameter-pack canary" in self_improve
+    assert "parameter-pack promote-staged" in self_improve
+    assert "operator-only" in self_improve
     assert "parameter-pack rollback-staged" in self_improve
     assert "risk-engine bypasses" in self_improve
     assert "not an activator" in self_improve
