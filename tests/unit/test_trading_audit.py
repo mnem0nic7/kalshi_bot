@@ -236,10 +236,12 @@ async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) 
         room_selected = _room("room-selected", "KXHIGHNY-26APR24-T67")
         room_stand_down = _room("room-stand-down", "KXHIGHCHI-26APR24-T78")
         room_blocked_candidate = _room("room-blocked-candidate", "KXHIGHNY-26APR24-T69")
+        room_terminal_blocked = _room("room-terminal-blocked", "KXHIGHLAX-26APR24-T66")
         session.add_all([
             room_selected,
             room_stand_down,
             room_blocked_candidate,
+            room_terminal_blocked,
             Signal(
                 room_id=room_selected.id,
                 market_ticker=room_selected.market_ticker,
@@ -298,6 +300,34 @@ async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) 
                 created_at=NOW - timedelta(minutes=5),
                 updated_at=NOW - timedelta(minutes=5),
             ),
+            Signal(
+                room_id=room_terminal_blocked.id,
+                market_ticker=room_terminal_blocked.market_ticker,
+                fair_yes_dollars=Decimal("0.1200"),
+                edge_bps=1200,
+                confidence=0.91,
+                summary="Selected but terminal",
+                payload={
+                    "evaluation_outcome": "pre_risk_filtered",
+                    "recommended_side": "no",
+                    "stand_down_reason": "resolved_contract",
+                    "forecast_delta_f": -60.0,
+                    "candidate_trace": {
+                        "outcome": "candidate_selected",
+                        "selected_side": "no",
+                        "selected_edge_bps": 1200,
+                        "no": {
+                            "status": "selected",
+                            "side": "no",
+                            "edge_bps": 1200,
+                            "quality_adjusted_edge_bps": 1175,
+                            "spread_bps": 100,
+                        },
+                    },
+                },
+                created_at=NOW - timedelta(minutes=4),
+                updated_at=NOW - timedelta(minutes=4),
+            ),
         ])
         await session.commit()
 
@@ -307,27 +337,45 @@ async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) 
         now=NOW,
     )
 
-    assert report["signal_funnel"]["signals"] == 3
+    assert report["signal_funnel"]["signals"] == 4
     assert report["signal_funnel"]["candidate_selected"] == 1
     assert report["signal_funnel"]["selected_without_ticket_count"] == 1
     assert report["signal_funnel"]["outcome_counts"] == {
         "candidate_selected": 1,
-        "pre_risk_filtered": 2,
+        "pre_risk_filtered": 3,
     }
     assert report["signal_funnel"]["recommended_side_counts"]["yes"] == 2
+    assert report["signal_funnel"]["recommended_side_counts"]["no"] == 1
     assert report["signal_funnel"]["recommended_side_counts"]["none"] == 1
     assert {row["reason"]: row["count"] for row in report["signal_funnel"]["top_stand_down_reasons"]} == {
         "spread_too_wide": 1,
         "insufficient_forecast_separation": 1,
+        "resolved_contract": 1,
     }
     assert report["signal_funnel"]["top_markets"][0]["market_ticker"] == room_selected.market_ticker
-    assert report["signal_funnel"]["blocked_candidate_count"] == 1
+    assert report["signal_funnel"]["blocked_candidate_count"] == 2
     blocked = report["signal_funnel"]["top_blocked_candidates"][0]
+    assert blocked["market_ticker"] == room_terminal_blocked.market_ticker
+    assert blocked["stand_down_reason"] == "resolved_contract"
+    assert report["signal_funnel"]["terminal_blocked_candidate_count"] == 1
+    assert report["signal_funnel"]["non_terminal_blocked_candidate_count"] == 1
+    blocked = report["signal_funnel"]["top_non_terminal_blocked_candidates"][0]
     assert blocked["market_ticker"] == room_blocked_candidate.market_ticker
     assert blocked["stand_down_reason"] == "insufficient_forecast_separation"
     assert blocked["selected_edge_bps"] == 900
     assert blocked["quality_adjusted_edge_bps"] == 875
     assert blocked["forecast_delta_f"] == 1.5
+    assert report["signal_funnel"]["non_terminal_blocked_reason_rollups"] == [
+        {
+            "reason": "insufficient_forecast_separation",
+            "count": 1,
+            "max_selected_edge_bps": 900,
+            "avg_selected_edge_bps": 900.0,
+            "avg_quality_adjusted_edge_bps": 875.0,
+            "avg_spread_bps": 400.0,
+            "avg_abs_forecast_delta_f": 1.5,
+        }
+    ]
     assert report["signal_funnel"]["recent_selected_without_ticket"][0]["room_id"] == room_selected.id
     issue_codes = {issue["code"] for issue in report["issues"]}
     assert "selected_signal_without_trade_ticket" in issue_codes

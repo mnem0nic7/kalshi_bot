@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import StrategyCode
+from kalshi_bot.core.enums import StandDownReason, StrategyCode
 from kalshi_bot.db.models import (
     FillRecord,
     MarketPriceHistory,
@@ -79,6 +79,11 @@ def _current_side_price(position: PositionRecord, market_state: MarketState | No
     if market_state.yes_ask_dollars is None:
         return None
     return Decimal("1") - Decimal(market_state.yes_ask_dollars)
+
+
+_TERMINAL_BLOCKED_CANDIDATE_REASONS = {
+    StandDownReason.RESOLVED_CONTRACT.value,
+}
 
 
 @dataclass(slots=True)
@@ -683,6 +688,11 @@ class TradingAuditService:
             ),
             reverse=True,
         )
+        non_terminal_blocked_candidates = [
+            row
+            for row in blocked_candidates
+            if row["stand_down_reason"] not in _TERMINAL_BLOCKED_CANDIDATE_REASONS
+        ]
         recent_selected_without_ticket = []
         for signal in selected_without_ticket[:20]:
             payload = dict(signal.payload or {})
@@ -710,6 +720,12 @@ class TradingAuditService:
             "top_markets": top_market_rows[:20],
             "blocked_candidate_count": len(blocked_candidates),
             "top_blocked_candidates": blocked_candidates[:20],
+            "terminal_blocked_candidate_count": len(blocked_candidates) - len(non_terminal_blocked_candidates),
+            "non_terminal_blocked_candidate_count": len(non_terminal_blocked_candidates),
+            "top_non_terminal_blocked_candidates": non_terminal_blocked_candidates[:20],
+            "non_terminal_blocked_reason_rollups": self._blocked_candidate_reason_rollups(
+                non_terminal_blocked_candidates
+            ),
             "recent_selected_without_ticket": recent_selected_without_ticket,
         }
 
@@ -736,6 +752,51 @@ class TradingAuditService:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    @classmethod
+    def _blocked_candidate_reason_rollups(cls, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for candidate in candidates:
+            grouped[str(candidate.get("stand_down_reason") or "unknown")].append(candidate)
+
+        rows = []
+        for reason, items in grouped.items():
+            edge_values = [
+                value
+                for item in items
+                if (value := cls._int_or_none(item.get("selected_edge_bps"))) is not None
+            ]
+            quality_values = [
+                value
+                for item in items
+                if (value := cls._int_or_none(item.get("quality_adjusted_edge_bps"))) is not None
+            ]
+            spread_values = [
+                value
+                for item in items
+                if (value := cls._int_or_none(item.get("spread_bps"))) is not None
+            ]
+            forecast_values = [
+                abs(float(value))
+                for item in items
+                if (value := _decimal_or_none(item.get("forecast_delta_f"))) is not None
+            ]
+            rows.append(
+                {
+                    "reason": reason,
+                    "count": len(items),
+                    "max_selected_edge_bps": max(edge_values) if edge_values else None,
+                    "avg_selected_edge_bps": round(sum(edge_values) / len(edge_values), 2) if edge_values else None,
+                    "avg_quality_adjusted_edge_bps": (
+                        round(sum(quality_values) / len(quality_values), 2) if quality_values else None
+                    ),
+                    "avg_spread_bps": round(sum(spread_values) / len(spread_values), 2) if spread_values else None,
+                    "avg_abs_forecast_delta_f": (
+                        round(sum(forecast_values) / len(forecast_values), 2) if forecast_values else None
+                    ),
+                }
+            )
+        return sorted(rows, key=lambda row: (int(row["count"]), row["max_selected_edge_bps"] or -10_000), reverse=True)
 
     def _stop_loss_clusters(self, ops_events: list[OpsEvent], *, now: datetime) -> dict[str, Any]:
         stop_events = [event for event in ops_events if event.source == "stop_loss"]
