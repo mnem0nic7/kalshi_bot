@@ -1,0 +1,13 @@
+schema_version: hard-caps-v1
+description: Operator-owned hard caps. Autonomous parameter packs must not write these values.
+operator_only: true
+hard_caps:
+  max_position_pct: 0.10
+  max_total_exposure_pct: 0.25
+  daily_max_loss_pct: 0.20
+  max_drawdown_pct: 0.20
+  max_position_usd: null
+  max_order_count_fp: 500.0
+  max_position_count_fp_per_ticker: 200.0
+  strategy_c_max_order_notional_usd: 50.0
+  strategy_c_max_position_notional_usd: 50.0

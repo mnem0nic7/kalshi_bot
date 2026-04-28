@@ -24,7 +24,14 @@ from kalshi_bot.core.schemas import (
 from kalshi_bot.db.models import StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
-from kalshi_bot.learning.parameter_pack import default_parameter_pack, parameter_pack_from_dict, sanitize_parameter_pack
+from kalshi_bot.learning.hard_caps import DEFAULT_HARD_CAPS_PATH, load_hard_caps
+from kalshi_bot.learning.parameter_pack import (
+    DEFAULT_PARAMETER_PACK_PATH,
+    default_parameter_pack,
+    load_parameter_pack,
+    parameter_pack_from_dict,
+    sanitize_parameter_pack,
+)
 from kalshi_bot.learning.promotion_gates import HoldoutMetrics, evaluate_parameter_pack_promotion
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
@@ -146,17 +153,35 @@ async def _run_decision_trace_command(args: argparse.Namespace, container: AppCo
 async def _run_parameter_pack_command(args: argparse.Namespace, container: AppContainer) -> int:
     action = args.parameter_pack_command
     if action == "default":
-        pack = default_parameter_pack()
+        pack = load_parameter_pack(args.path) if args.path is not None else default_parameter_pack()
         print(json.dumps({"pack_hash": pack.pack_hash, "pack": pack.to_dict()}, indent=2))
+        return 0
+    if action == "hard-caps":
+        caps = load_hard_caps(args.path)
+        print(json.dumps({"config_hash": caps.config_hash, "hard_caps": caps.to_dict()}, indent=2))
         return 0
     if action == "validate":
         pack = sanitize_parameter_pack(parameter_pack_from_dict(_read_json_file(Path(args.path))))
+        dropped = pack.metadata.get("dropped_hard_cap_parameters", [])
+        if args.strict and dropped:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "candidate_contains_hard_cap_parameters",
+                        "dropped_hard_cap_parameters": dropped,
+                    },
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+            return 1
         print(
             json.dumps(
                 {
                     "ok": True,
                     "pack_hash": pack.pack_hash,
-                    "dropped_hard_cap_parameters": pack.metadata.get("dropped_hard_cap_parameters", []),
+                    "dropped_hard_cap_parameters": dropped,
                     "pack": pack.to_dict(),
                 },
                 indent=2,
@@ -173,7 +198,7 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
         if action == "seed-default":
-            pack = default_parameter_pack()
+            pack = load_parameter_pack(args.path) if args.path is not None else default_parameter_pack()
             record = await repo.update_parameter_pack(pack, holdout_report={})
             await session.commit()
             print(
@@ -1723,8 +1748,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inspect and validate deterministic parameter packs without promotion side effects",
     )
     parameter_pack_subparsers = parameter_pack.add_subparsers(dest="parameter_pack_command", required=True)
-    parameter_pack_subparsers.add_parser("default", help="Print the built-in deterministic parameter pack")
-    parameter_pack_subparsers.add_parser("seed-default", help="Persist the built-in parameter pack to the database")
+    parameter_pack_default = parameter_pack_subparsers.add_parser("default", help="Print the built-in deterministic parameter pack")
+    parameter_pack_default.add_argument("--path", default=None, help=f"Parameter pack YAML path (default: {DEFAULT_PARAMETER_PACK_PATH})")
+    parameter_pack_hard_caps = parameter_pack_subparsers.add_parser("hard-caps", help="Print and hash the sealed hard-cap config")
+    parameter_pack_hard_caps.add_argument("--path", default=str(DEFAULT_HARD_CAPS_PATH))
+    parameter_pack_seed_default = parameter_pack_subparsers.add_parser("seed-default", help="Persist the built-in parameter pack to the database")
+    parameter_pack_seed_default.add_argument("--path", default=None, help=f"Parameter pack YAML path (default: {DEFAULT_PARAMETER_PACK_PATH})")
     parameter_pack_list = parameter_pack_subparsers.add_parser("list", help="List stored deterministic parameter packs")
     parameter_pack_list.add_argument("--limit", type=int, default=20)
     parameter_pack_show = parameter_pack_subparsers.add_parser("show", help="Show a stored pack by version, or 'default'")
@@ -1734,6 +1763,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sanitize a candidate parameter-pack JSON file and print its deterministic hash",
     )
     parameter_pack_validate.add_argument("path")
+    parameter_pack_validate.add_argument("--strict", action="store_true", help="Fail if the candidate includes hard-cap parameters")
     parameter_pack_gate = parameter_pack_subparsers.add_parser(
         "gate",
         help="Evaluate candidate/current holdout JSON reports against promotion gates",

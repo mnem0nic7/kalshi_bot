@@ -4,6 +4,7 @@ from kalshi_bot.learning.parameter_pack import (
     HARD_CAP_PARAMETER_NAMES,
     ParameterPack,
     default_parameter_pack,
+    load_parameter_pack,
     parameter_pack_hash,
     sanitize_parameter_pack,
 )
@@ -57,3 +58,11 @@ def test_parameter_pack_hash_is_stable_across_parameter_order() -> None:
     )
 
     assert parameter_pack_hash(base) == parameter_pack_hash(reordered)
+
+
+def test_default_parameter_pack_yaml_matches_builtin_defaults() -> None:
+    from_yaml = load_parameter_pack("infra/config/parameter_pack_default.yaml")
+    builtin = default_parameter_pack()
+
+    assert from_yaml.parameters == builtin.parameters
+    assert from_yaml.pack_hash == builtin.pack_hash

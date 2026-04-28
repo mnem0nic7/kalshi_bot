@@ -141,6 +141,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert command_help.returncode == 0
     assert "validate" in command_help.stdout
     assert "gate" in command_help.stdout
+    assert "hard-caps" in command_help.stdout
     assert "seed-default" in command_help.stdout
     assert gate_help.returncode == 0
     assert "--candidate-report" in gate_help.stdout
@@ -177,6 +178,56 @@ def test_parameter_pack_validate_cli_sanitizes_candidate_json(tmp_path) -> None:
     assert payload["pack"]["parameters"]["pseudo_count"] == 32
     assert payload["pack"]["parameters"]["kelly_fraction"] == 0.01
     assert payload["dropped_hard_cap_parameters"] == ["max_position_usd"]
+
+
+def test_parameter_pack_validate_strict_cli_rejects_hard_caps(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/parameter-pack-strict-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+    candidate_path = tmp_path / "candidate.json"
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "version": "candidate-v1",
+                "status": "candidate",
+                "parameters": {"max_position_usd": 10_000},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "parameter-pack", "validate", str(candidate_path), "--strict"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stderr)
+    assert payload["ok"] is False
+    assert payload["error"] == "candidate_contains_hard_cap_parameters"
+
+
+def test_parameter_pack_hard_caps_cli_prints_sealed_config_hash(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/hard-caps-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "kalshi_bot.cli", "parameter-pack", "hard-caps"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert len(payload["config_hash"]) == 64
+    assert payload["hard_caps"]["operator_only"] is True
+    assert payload["hard_caps"]["hard_caps"]["max_position_pct"] == 0.10
 
 
 def test_parameter_pack_gate_cli_returns_success_for_passing_reports(tmp_path) -> None:

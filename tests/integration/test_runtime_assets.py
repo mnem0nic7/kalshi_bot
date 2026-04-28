@@ -121,6 +121,8 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "pause_new_entries" in autonomy
     assert "parameter_pack" in autonomy
     assert "parameter_packs" in autonomy
+    assert "hard_caps.yaml" in autonomy
+    assert "parameter_pack_default.yaml" in autonomy
     assert "promotion_gates" in autonomy
     assert "drift_watcher" in autonomy
     assert "learned_head" in autonomy
@@ -130,7 +132,10 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "climatology priors" in architecture
     assert "source health logs" in architecture
     assert "parameter packs" in architecture
+    assert "hard-cap config hashes" in architecture
     assert "zero-weight fallback" in architecture
+    assert "parameter-pack hard-caps" in self_improve
+    assert "parameter-pack validate candidate-pack.json --strict" in self_improve
     assert "parameter-pack validate" in self_improve
     assert "parameter-pack gate" in self_improve
     assert "decision-trace replay" in strategy

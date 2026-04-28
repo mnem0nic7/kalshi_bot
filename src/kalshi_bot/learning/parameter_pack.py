@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 
 ParameterValue = bool | int | float | str
@@ -101,6 +104,10 @@ HARD_CAP_PARAMETER_NAMES = {
 }
 
 
+DEFAULT_PARAMETER_PACK_PATH = Path("infra/config/parameter_pack_default.yaml")
+PARAMETER_PACK_SCHEMA_VERSION = "parameter-pack-v1"
+
+
 def default_parameter_pack(*, version: str = "builtin-parameters-v1") -> ParameterPack:
     return ParameterPack(
         version=version,
@@ -111,6 +118,17 @@ def default_parameter_pack(*, version: str = "builtin-parameters-v1") -> Paramet
         specs=dict(DEFAULT_PARAMETER_SPECS),
         metadata={"hard_caps_excluded": sorted(HARD_CAP_PARAMETER_NAMES)},
     )
+
+
+def load_parameter_pack(path: Path | str = DEFAULT_PARAMETER_PACK_PATH) -> ParameterPack:
+    source_path = Path(path)
+    payload = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source_path} must contain a YAML object")
+    schema_version = str(payload.get("schema_version") or "")
+    if schema_version != PARAMETER_PACK_SCHEMA_VERSION:
+        raise ValueError(f"parameter pack schema_version must be {PARAMETER_PACK_SCHEMA_VERSION}")
+    return sanitize_parameter_pack(parameter_pack_from_dict(payload))
 
 
 def sanitize_parameter_pack(

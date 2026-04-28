@@ -1,0 +1,19 @@
+schema_version: parameter-pack-v1
+version: builtin-parameters-v1
+status: champion
+source: builtin
+description: Built-in deterministic parameter defaults.
+parameters:
+  pseudo_count: 8
+  gumbel_weight: 0.5
+  kde_weight: 0.5
+  boundary_threshold: 0.25
+  disagreement_threshold: 0.85
+  base_min_ev: 0.02
+  uncertainty_min_ev_buffer: 0.02
+  uncertainty_size_taper: 0.60
+  kelly_fraction: 0.25
+  survival_kelly: 0.10
+  survival_ev_buffer: 0.03
+  health_degraded_size_mult: 0.5
+  catboost_blend_weight: 0.0
