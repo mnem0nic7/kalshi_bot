@@ -77,7 +77,7 @@ Phase 4 foundation now exists without activating autonomous promotion:
 - `kalshi_bot.learning.drift_watcher` provides the calibration pause/search trigger for Brier, ECE, and realized-vs-predicted win-rate drift.
 - `infra/config/hard_caps.yaml` is the operator-owned sealed hard-cap artifact, and `kalshi_bot.learning.hard_caps` loads, validates, and hashes it.
 - `parameter-pack gate` loads the sealed hard-cap artifact and uses `max_drawdown_pct` as the promotion drawdown ceiling.
-- `parameter-pack stage` records a gated candidate into `parameter_packs`, `promotion_events`, and `deployment_control.notes.parameter_packs` without changing live color or risk; `parameter-pack rollback-staged` clears that staged candidate as rejected.
+- `parameter-pack stage` records a gated candidate into `parameter_packs`, `promotion_events`, and `deployment_control.notes.parameter_packs` without changing live color or risk; `parameter-pack canary` evaluates shadow-canary Brier/risk/source evidence; `parameter-pack rollback-staged` clears that staged candidate as rejected.
 - `infra/config/parameter_pack_default.yaml` mirrors the built-in default parameter pack for audit and operator review.
 - The existing self-improve workflow still promotes agent packs until replay-backed parameter search is wired explicitly.
 

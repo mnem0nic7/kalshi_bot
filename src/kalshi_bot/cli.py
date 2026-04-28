@@ -40,7 +40,7 @@ from kalshi_bot.learning.promotion_gates import (
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
 from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, replay_decision_trace
-from kalshi_bot.services.parameter_packs import ParameterPackPromotionService
+from kalshi_bot.services.parameter_packs import ParameterPackCanaryConfig, ParameterPackPromotionService
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
 from kalshi_bot.services.trade_analysis import format_trade_analysis_report
 from kalshi_bot.services.trading_audit import format_trading_audit_text
@@ -247,6 +247,20 @@ async def _run_parameter_pack_command(args: argparse.Namespace, container: AppCo
             await session.commit()
             print(json.dumps(result.to_dict(), indent=2))
             return 0
+        if action == "canary":
+            service = ParameterPackPromotionService()
+            result = await service.evaluate_staged_canary(
+                repo,
+                canary_report=_read_json_file(Path(args.report)),
+                config=ParameterPackCanaryConfig(
+                    min_shadow_rooms=args.min_shadow_rooms,
+                    min_elapsed_seconds=args.min_elapsed_seconds,
+                    max_brier_ratio=args.max_brier_ratio,
+                ),
+            )
+            await session.commit()
+            print(json.dumps(result.to_dict(), indent=2))
+            return 0 if result.status != "canary_failed" else 1
         if action == "seed-default":
             pack = load_parameter_pack(args.path) if args.path is not None else default_parameter_pack()
             record = await repo.update_parameter_pack(pack, holdout_report={})
@@ -1836,6 +1850,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mark the staged parameter-pack candidate rolled back without changing live risk",
     )
     parameter_pack_rollback.add_argument("--reason", default="manual_parameter_pack_rollback")
+    parameter_pack_canary = parameter_pack_subparsers.add_parser(
+        "canary",
+        help="Evaluate staged parameter-pack shadow-canary evidence without activating live risk",
+    )
+    parameter_pack_canary.add_argument("--report", required=True)
+    parameter_pack_canary.add_argument("--min-shadow-rooms", type=int, default=25)
+    parameter_pack_canary.add_argument("--min-elapsed-seconds", type=int, default=7200)
+    parameter_pack_canary.add_argument("--max-brier-ratio", type=float, default=1.20)
 
     subparsers.add_parser("shadow-c-sweep", help="Strategy C: evaluate lock-confirmation signals across all configured markets")
     subparsers.add_parser("strategy-c-status", help="Strategy C: show aggregate sweep metrics and lock tracker state")

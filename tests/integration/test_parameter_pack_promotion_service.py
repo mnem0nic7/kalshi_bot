@@ -144,3 +144,134 @@ async def test_parameter_pack_rollback_staged_marks_candidate_rejected_and_prese
     assert stored_candidate.status == "rejected"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_parameter_pack_canary_passes_without_activating_candidate(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/parameter_pack_canary_pass.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    current = default_parameter_pack()
+    candidate = replace(
+        default_parameter_pack(version="candidate-params-v1"),
+        status="candidate",
+        parameters={**current.parameters, "pseudo_count": 10},
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        service = ParameterPackPromotionService()
+        staged = await service.stage_candidate(
+            repo,
+            candidate_pack=candidate,
+            candidate_report=_holdout_report(candidate.pack_hash, max_drawdown=0.10),
+            current_report=_holdout_report(current.pack_hash, max_drawdown=0.10),
+            hard_caps=load_hard_caps(),
+        )
+        result = await service.evaluate_staged_canary(
+            repo,
+            canary_report={
+                "completed_shadow_rooms": 25,
+                "elapsed_seconds": 7200,
+                "brier": 0.20,
+                "risk_engine_bypasses": 0,
+                "data_source_kill_events": 0,
+            },
+        )
+        control = await repo.get_deployment_control()
+        promotion = await repo.get_promotion_event(staged.promotion_event_id)
+        stored_candidate = await repo.get_parameter_pack(candidate.version)
+        await session.commit()
+
+    assert result.status == "canary_passed"
+    assert result.passed is True
+    assert control.active_color == "blue"
+    assert control.notes["parameter_packs"]["status"] == "canary_passed"
+    assert promotion is not None
+    assert promotion.status == "canary_passed"
+    assert stored_candidate is not None
+    assert stored_candidate.status == "canary_passed"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_parameter_pack_canary_pending_keeps_staged_candidate(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/parameter_pack_canary_pending.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    current = default_parameter_pack()
+    candidate = replace(default_parameter_pack(version="candidate-params-v1"), status="candidate")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        service = ParameterPackPromotionService()
+        await service.stage_candidate(
+            repo,
+            candidate_pack=candidate,
+            candidate_report=_holdout_report(candidate.pack_hash),
+            current_report=_holdout_report(current.pack_hash, max_drawdown=0.10),
+            hard_caps=load_hard_caps(),
+        )
+        result = await service.evaluate_staged_canary(
+            repo,
+            canary_report={"completed_shadow_rooms": 3, "elapsed_seconds": 120, "brier": 0.08},
+        )
+        control = await repo.get_deployment_control()
+        stored_candidate = await repo.get_parameter_pack(candidate.version)
+        await session.commit()
+
+    assert result.status == "canary_pending"
+    assert result.failures == ["insufficient_shadow_rooms", "insufficient_canary_duration"]
+    assert control.notes["parameter_packs"]["status"] == "canary_pending"
+    assert stored_candidate is not None
+    assert stored_candidate.status == "staged"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_parameter_pack_canary_failure_rolls_back_candidate(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/parameter_pack_canary_fail.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    current = default_parameter_pack()
+    candidate = replace(default_parameter_pack(version="candidate-params-v1"), status="candidate")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        service = ParameterPackPromotionService()
+        staged = await service.stage_candidate(
+            repo,
+            candidate_pack=candidate,
+            candidate_report=_holdout_report(candidate.pack_hash, max_drawdown=0.10),
+            current_report=_holdout_report(current.pack_hash, max_drawdown=0.10),
+            hard_caps=load_hard_caps(),
+        )
+        result = await service.evaluate_staged_canary(
+            repo,
+            canary_report={
+                "completed_shadow_rooms": 25,
+                "elapsed_seconds": 7200,
+                "brier": 0.30,
+                "risk_engine_bypasses": 1,
+            },
+        )
+        control = await repo.get_deployment_control()
+        promotion = await repo.get_promotion_event(staged.promotion_event_id)
+        stored_candidate = await repo.get_parameter_pack(candidate.version)
+        await session.commit()
+
+    assert result.status == "canary_failed"
+    assert result.rollback is not None
+    assert result.failures == ["canary_brier_regression", "risk_engine_bypass"]
+    assert control.notes["parameter_packs"]["status"] == "rolled_back"
+    assert promotion is not None
+    assert promotion.status == "rolled_back"
+    assert stored_candidate is not None
+    assert stored_candidate.status == "rejected"
+
+    await engine.dispose()

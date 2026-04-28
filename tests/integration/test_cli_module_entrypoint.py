@@ -145,6 +145,7 @@ def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     assert "gate" in command_help.stdout
     assert "stage" in command_help.stdout
     assert "rollback-staged" in command_help.stdout
+    assert "canary" in command_help.stdout
     assert "hard-caps" in command_help.stdout
     assert "seed-default" in command_help.stdout
     assert gate_help.returncode == 0
@@ -380,6 +381,7 @@ def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:
     candidate_pack_path = tmp_path / "candidate-pack.json"
     current_report_path = tmp_path / "current-report.json"
     candidate_report_path = tmp_path / "candidate-report.json"
+    canary_report_path = tmp_path / "canary-report.json"
     candidate_pack_path.write_text(json.dumps(candidate.to_dict()), encoding="utf-8")
     current_report_path.write_text(
         json.dumps(
@@ -406,6 +408,18 @@ def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:
                 "hard_cap_touches": 0,
                 "pack_hash": candidate.pack_hash,
                 "rerun_pack_hash": candidate.pack_hash,
+            }
+        ),
+        encoding="utf-8",
+    )
+    canary_report_path.write_text(
+        json.dumps(
+            {
+                "completed_shadow_rooms": 25,
+                "elapsed_seconds": 7200,
+                "brier": 0.20,
+                "risk_engine_bypasses": 0,
+                "data_source_kill_events": 0,
             }
         ),
         encoding="utf-8",
@@ -440,6 +454,27 @@ def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:
     assert payload["previous_version"] == current.version
     assert payload["target_color"] == "green"
     assert payload["gate"]["passed"] is True
+
+    canary = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "parameter-pack",
+            "canary",
+            "--report",
+            str(canary_report_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert canary.returncode == 0
+    canary_payload = json.loads(canary.stdout)
+    assert canary_payload["status"] == "canary_passed"
+    assert canary_payload["passed"] is True
 
     rollback = subprocess.run(
         [

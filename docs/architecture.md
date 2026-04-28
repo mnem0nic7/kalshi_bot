@@ -75,6 +75,7 @@ Postgres stores:
 - source health logs for per-provider success, freshness, completeness, consistency, and aggregate pause audits
 - deterministic parameter packs and holdout reports for future replay-gated promotion
 - staged parameter-pack promotion evidence in `promotion_events` and `deployment_control.notes.parameter_packs`
+- shadow-canary parameter-pack evidence before any operator promotion
 - sealed hard-cap config hashes so operator-owned risk caps remain outside parameter packs
 - ops events and checkpoints
 - memory notes and embeddings
