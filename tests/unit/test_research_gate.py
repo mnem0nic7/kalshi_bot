@@ -16,6 +16,7 @@ from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
+from kalshi_bot.weather.models import WeatherMarketMapping
 
 
 def make_coordinator() -> ResearchCoordinator:
@@ -216,6 +217,61 @@ def test_build_signal_from_dossier_fresh_dossier_passes() -> None:
 
     assert signal.stand_down_reason != StandDownReason.DOSSIER_STALE
     assert signal.edge_bps > 0
+
+
+def test_build_signal_from_dossier_derives_missing_forecast_delta_from_facts() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    ticker = "KXHIGHNY-26APR24-T67"
+    coordinator = ResearchCoordinator(  # type: ignore[arg-type]
+        settings,
+        None,
+        None,
+        None,
+        WeatherMarketDirectory(
+            {
+                ticker: WeatherMarketMapping(
+                    market_ticker=ticker,
+                    station_id="KNYC",
+                    location_name="New York",
+                    latitude=40.0,
+                    longitude=-73.0,
+                    threshold_f=67.0,
+                    series_ticker="KXHIGHNY",
+                    operator=">",
+                )
+            }
+        ),
+        None,
+        WeatherSignalEngine(settings),
+        AgentPackService(settings),
+    )
+    now = datetime.now(UTC)
+    dossier = _make_dossier_aged(now, age_seconds=60).model_copy(
+        update={
+            "market_ticker": ticker,
+            "forecast_delta_f": None,
+            "summary": _make_dossier_aged(now, age_seconds=60).summary.model_copy(
+                update={"current_numeric_facts": {"forecast_high_f": 74.0}}
+            ),
+            "trader_context": _make_dossier_aged(now, age_seconds=60).trader_context.model_copy(
+                update={"forecast_delta_f": None}
+            ),
+        }
+    )
+
+    signal = coordinator.build_signal_from_dossier(
+        dossier,
+        {
+            "market": {
+                **_MARKET_SNAPSHOT,
+                "ticker": ticker,
+            }
+        },
+    )
+
+    assert signal.forecast_delta_f == 7.0
+    assert signal.candidate_trace["forecast_delta_fallback"]["derived"] is True
+    assert signal.candidate_trace["forecast_delta_fallback"]["source"] == "numeric_facts_and_market_mapping"
 
 
 def test_build_signal_from_dossier_stale_dossier_blocked() -> None:

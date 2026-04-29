@@ -655,6 +655,7 @@ def apply_heuristic_application_to_signal(
         minimum_remaining_payout_bps=minimum_remaining_payout_bps,
         spread_limit_bps=spread_limit_bps,
     )
+    candidate_trace = {**dict(signal.candidate_trace or {}), **candidate_trace}
     summary = base_strategy_summary(signal.summary)
     if adjusted_fair != signal.fair_yes_dollars:
         adjust_bps = int(application.get("fair_yes_adjust_bps") or 0)

@@ -34,6 +34,9 @@ class FakeSession:
     async def commit(self) -> None:
         return None
 
+    async def rollback(self) -> None:
+        return None
+
 
 class FakeSessionFactory:
     def __call__(self) -> FakeSession:
@@ -71,6 +74,9 @@ class FakePlatformRepository:
     async def save_signal(self, **kwargs):
         type(self).saved_signal = kwargs
         return SimpleNamespace(id="signal-1", **kwargs)
+
+    async def save_artifact(self, **kwargs):
+        return SimpleNamespace(id="artifact-1", **kwargs)
 
     async def list_positions_for_ticker(self, *args, **kwargs) -> list:
         return []

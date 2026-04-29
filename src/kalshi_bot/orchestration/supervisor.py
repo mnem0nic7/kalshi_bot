@@ -57,6 +57,32 @@ def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
 
 
+def _market_snapshot_artifact_payload(
+    market_response: dict[str, Any],
+    *,
+    observed_at: datetime | None,
+    kalshi_env: str,
+    market_ticker: str,
+) -> dict[str, Any]:
+    observed_at_iso = observed_at.astimezone(UTC).isoformat() if observed_at is not None else None
+    payload = dict(market_response)
+    market = payload.get("market")
+    if isinstance(market, dict):
+        payload["market"] = {
+            **market,
+            "observed_at": market.get("observed_at") or observed_at_iso,
+        }
+    else:
+        payload["observed_at"] = payload.get("observed_at") or observed_at_iso
+    payload["_snapshot_meta"] = {
+        "source": "room_supervisor_rest_market",
+        "kalshi_env": kalshi_env,
+        "market_ticker": market_ticker,
+        "observed_at": observed_at_iso,
+    }
+    return payload
+
+
 def _room_message_read(record) -> RoomMessageRead:
     return RoomMessageRead(
         id=record.id,
@@ -1297,6 +1323,7 @@ class WorkflowSupervisor:
                     yes_ask_dollars=as_decimal(market["yes_ask_dollars"]) if market.get("yes_ask_dollars") is not None else None,
                     last_trade_dollars=as_decimal(market["last_price_dollars"]) if market.get("last_price_dollars") is not None else None,
                 )
+                market_snapshot_artifact = None
                 signal = self.research_coordinator.build_signal_from_dossier(
                     dossier,
                     market_response,
@@ -1460,6 +1487,18 @@ class WorkflowSupervisor:
                     await session.commit()
 
                 if not self.settings.llm_trading_enabled:
+                    market_snapshot_artifact = await repo.save_artifact(
+                        room_id=room.id,
+                        artifact_type="market_snapshot",
+                        source="kalshi_rest",
+                        title=f"Market snapshot for {room.market_ticker}",
+                        payload=_market_snapshot_artifact_payload(
+                            market_response,
+                            observed_at=market_state.observed_at,
+                            kalshi_env=room.kalshi_env,
+                            market_ticker=room.market_ticker,
+                        ),
+                    )
                     await self._run_deterministic_fast_path(
                         repo=repo,
                         session=session,
@@ -1475,6 +1514,7 @@ class WorkflowSupervisor:
                                 "market_ticker": room.market_ticker,
                                 "observed_at": market_state.observed_at,
                             },
+                            "market_snapshot_artifact_id": market_snapshot_artifact.id,
                             "weather_archive_source_id": weather_archive_source_id,
                             "research_run_id": dossier.last_run_id,
                         },

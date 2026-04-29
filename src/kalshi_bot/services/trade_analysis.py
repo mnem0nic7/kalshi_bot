@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import (
+    Artifact,
     FillRecord,
     HistoricalMarketSnapshotRecord,
     HistoricalReplayRunRecord,
@@ -63,9 +64,15 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _as_utc(value: datetime | None) -> datetime | None:
+def _as_utc(value: Any | None) -> datetime | None:
     if value is None:
         return None
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
@@ -86,6 +93,15 @@ def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
+        return None
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
         return None
 
 
@@ -344,7 +360,13 @@ class TradeAnalysisService:
                     for fill in fills_by_order.get(str(order.id), [])
                 ]
                 decision_ts = _as_utc(ticket.created_at if ticket is not None else signal.created_at) or _as_utc(room.created_at) or now
-                market_snapshot = await self._market_snapshot(session, kalshi_env, room.market_ticker, decision_ts)
+                market_snapshot = await self._market_snapshot(
+                    session,
+                    kalshi_env,
+                    room.market_ticker,
+                    decision_ts,
+                    room_id=room.id,
+                )
                 weather_snapshot = await self._weather_snapshot(session, room.market_ticker, decision_ts)
                 settlement = settlements.get(room.market_ticker)
                 row = self._row(
@@ -588,8 +610,32 @@ class TradeAnalysisService:
         kalshi_env: str,
         market_ticker: str,
         decision_ts: datetime,
+        *,
+        room_id: str | None = None,
     ) -> dict[str, Any] | None:
         candidates: list[dict[str, Any]] = []
+        if room_id is not None:
+            artifact = (
+                await session.execute(
+                    select(Artifact)
+                    .where(
+                        Artifact.room_id == room_id,
+                        Artifact.artifact_type == "market_snapshot",
+                    )
+                    .order_by(Artifact.updated_at.desc(), Artifact.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if artifact is not None:
+                artifact_snapshot = self._market_snapshot_from_artifact(artifact)
+                artifact_observed_at = (
+                    _as_utc(artifact_snapshot.get("observed_at"))
+                    if artifact_snapshot is not None
+                    else None
+                )
+                if artifact_snapshot is not None and artifact_observed_at is not None and artifact_observed_at <= decision_ts:
+                    return artifact_snapshot
+
         history = (
             await session.execute(
                 select(MarketPriceHistory)
@@ -676,6 +722,7 @@ class TradeAnalysisService:
             return None
 
         source_rank = {
+            "room_market_snapshot": 4,
             "market_state": 3,
             "market_price_history": 2,
             "historical_market_snapshots": 1,
@@ -687,6 +734,35 @@ class TradeAnalysisService:
                 source_rank.get(str(row.get("source")), 0),
             ),
         )
+
+    @staticmethod
+    def _market_snapshot_from_artifact(artifact: Artifact) -> dict[str, Any] | None:
+        payload = artifact.payload if isinstance(artifact.payload, dict) else {}
+        market = payload.get("market") if isinstance(payload.get("market"), dict) else payload
+        if not isinstance(market, dict):
+            return None
+        meta = payload.get("_snapshot_meta") if isinstance(payload.get("_snapshot_meta"), dict) else {}
+        observed_at = (
+            _as_utc(market.get("observed_at"))
+            or _as_utc(payload.get("observed_at"))
+            or _as_utc(meta.get("observed_at"))
+            or _as_utc(artifact.created_at)
+        )
+        bid = _decimal_or_none(market.get("yes_bid_dollars"))
+        ask = _decimal_or_none(market.get("yes_ask_dollars"))
+        mid = (bid + ask) / Decimal("2") if bid is not None and ask is not None else None
+        return {
+            "source": "room_market_snapshot",
+            "source_kind": artifact.source,
+            "source_id": artifact.id,
+            "snapshot_id": artifact.id,
+            "observed_at": observed_at,
+            "yes_bid_dollars": bid,
+            "yes_ask_dollars": ask,
+            "mid_dollars": mid,
+            "last_trade_dollars": _decimal_or_none(market.get("last_price_dollars")),
+            "volume": _int_or_none(market.get("volume")),
+        }
 
     async def _weather_snapshot(
         self,

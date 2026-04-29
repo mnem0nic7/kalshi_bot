@@ -433,6 +433,7 @@ async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_pa
         repo = PlatformRepository(session)
         decision_trace = await repo.get_latest_decision_trace_for_room(room.id)
         trade_ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        market_artifact = await repo.get_latest_artifact(room_id=room.id, artifact_type="market_snapshot")
         supervisor_messages = [
             message
             for message in await repo.list_messages(room.id)
@@ -446,6 +447,10 @@ async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_pa
     assert decision_trace.decision_kind == "entry"
     assert decision_trace.path_version == "deterministic-fast-path.v1"
     assert decision_trace.trace["normalized_intent"]["risk_status"] == "approved"
+    assert market_artifact is not None
+    assert market_artifact.source == "kalshi_rest"
+    assert market_artifact.payload["market"]["observed_at"] is not None
+    assert decision_trace.source_snapshot_ids["market_snapshot_artifact_id"] == market_artifact.id
     assert replay_decision_trace(decision_trace.trace, expected_trace_hash=decision_trace.trace_hash).ok
     assert supervisor_messages[-1].payload["decision_trace_id"] == decision_trace.id
 

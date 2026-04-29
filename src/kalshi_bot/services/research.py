@@ -588,6 +588,16 @@ class ResearchCoordinator:
             market_snapshot=market_response,
             spread_limit_bps=self.settings.trigger_max_spread_bps,
         )
+        forecast_delta_f = (
+            dossier.forecast_delta_f
+            if dossier.forecast_delta_f is not None
+            else dossier.trader_context.forecast_delta_f
+        )
+        candidate_trace: dict[str, Any] = {}
+        if forecast_delta_f is None:
+            forecast_delta_f, fallback_trace = self._fallback_forecast_delta_f(dossier, market)
+            if fallback_trace:
+                candidate_trace["forecast_delta_fallback"] = fallback_trace
         signal = StrategySignal(
             fair_yes_dollars=fair_yes,
             confidence=dossier.trader_context.confidence,
@@ -601,18 +611,64 @@ class ResearchCoordinator:
             strategy_mode=dossier.trader_context.strategy_mode,
             trade_regime=dossier.trade_regime or dossier.trader_context.trade_regime,
             capital_bucket=dossier.capital_bucket or dossier.trader_context.capital_bucket,
-            forecast_delta_f=(
-                dossier.forecast_delta_f
-                if dossier.forecast_delta_f is not None
-                else dossier.trader_context.forecast_delta_f
-            ),
+            forecast_delta_f=forecast_delta_f,
             confidence_band=dossier.confidence_band or dossier.trader_context.confidence_band,
+            candidate_trace=candidate_trace,
         )
         return annotate_signal_quality(
             settings=self.settings,
             signal=signal,
             market_snapshot=market_response,
         )
+
+    def _fallback_forecast_delta_f(
+        self,
+        dossier: ResearchDossier,
+        market: dict[str, Any],
+    ) -> tuple[float | None, dict[str, Any]]:
+        facts = {
+            **dict(dossier.trader_context.numeric_facts or {}),
+            **dict(dossier.summary.current_numeric_facts or {}),
+        }
+        forecast_high_f = _to_float(
+            facts.get("forecast_high_f")
+            or facts.get("forecast_high")
+            or facts.get("forecast_max_f")
+        )
+        mapping = self.weather_directory.resolve_market(dossier.market_ticker, market)
+        threshold_f = _to_float(
+            facts.get("threshold_f")
+            or (getattr(mapping, "threshold_f", None) if mapping is not None else None)
+        )
+        operator = (
+            facts.get("operator")
+            or facts.get("threshold_operator")
+            or (getattr(mapping, "operator", None) if mapping is not None else None)
+        )
+        trace: dict[str, Any] = {
+            "attempted": True,
+            "source": "numeric_facts_and_market_mapping",
+            "forecast_high_f": forecast_high_f,
+            "threshold_f": threshold_f,
+            "operator": operator,
+        }
+        if forecast_high_f is None or threshold_f is None:
+            trace["derived"] = False
+            trace["missing"] = [
+                key
+                for key, value in {
+                    "forecast_high_f": forecast_high_f,
+                    "threshold_f": threshold_f,
+                }.items()
+                if value is None
+            ]
+            return None, trace
+        delta = forecast_high_f - threshold_f
+        if str(operator or "").strip() in {"<", "<="}:
+            delta = -delta
+        trace["derived"] = True
+        trace["forecast_delta_f"] = delta
+        return delta, trace
 
     def _build_dossier(
         self,
