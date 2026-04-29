@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.enums import StrategyCode
 from kalshi_bot.db.models import (
     FillRecord,
     MarketState,
@@ -458,6 +459,8 @@ async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) 
     assert report["signal_funnel"]["signals"] == 4
     assert report["signal_funnel"]["candidate_selected"] == 1
     assert report["signal_funnel"]["selected_without_ticket_count"] == 1
+    assert report["signal_funnel"]["recent_selected_without_ticket_count"] == 1
+    assert report["signal_funnel"]["legacy_selected_without_ticket_count"] == 0
     assert report["signal_funnel"]["outcome_counts"] == {
         "candidate_selected": 1,
         "pre_risk_filtered": 3,
@@ -502,6 +505,44 @@ async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) 
     assert report["signal_funnel"]["recent_selected_without_ticket"][0]["room_id"] == room_selected.id
     issue_codes = {issue["code"] for issue in report["issues"]}
     assert "selected_signal_without_trade_ticket" in issue_codes
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_keeps_legacy_selected_without_ticket_out_of_high_blockers(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        room_selected = _room("room-legacy-selected", "KXHIGHNY-26APR24-T67")
+        session.add_all([
+            room_selected,
+            Signal(
+                room_id=room_selected.id,
+                market_ticker=room_selected.market_ticker,
+                fair_yes_dollars=Decimal("0.7200"),
+                edge_bps=420,
+                confidence=0.82,
+                summary="Selected YES",
+                payload={
+                    "evaluation_outcome": "candidate_selected",
+                    "recommended_side": "yes",
+                    "candidate_trace": {"outcome": "candidate_selected", "selected_side": "yes"},
+                },
+                created_at=NOW - timedelta(days=2),
+                updated_at=NOW - timedelta(days=2),
+            ),
+        ])
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    assert report["signal_funnel"]["selected_without_ticket_count"] == 1
+    assert report["signal_funnel"]["recent_selected_without_ticket_count"] == 0
+    assert report["signal_funnel"]["legacy_selected_without_ticket_count"] == 1
+    issue_codes = {issue["code"] for issue in report["issues"]}
+    assert "selected_signal_without_trade_ticket" not in issue_codes
 
 
 @pytest.mark.asyncio
@@ -689,3 +730,67 @@ async def test_trading_audit_repair_recovers_orphaned_bot_room_order(audit_harne
     assert fill.strategy_code == "A"
     assert fill.order_id == order.id
     assert order.strategy_code == "A"
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_repair_marks_exchange_side_orphan_as_unmanaged(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        room = _room()
+        order = OrderRecord(
+            id="order-exchange-orphan",
+            kalshi_env="production",
+            kalshi_order_id="kord-exchange-orphan",
+            client_order_id="kord-exchange-orphan",
+            market_ticker=room.market_ticker,
+            status="executed",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.0100"),
+            count_fp=Decimal("2.44"),
+            strategy_code=None,
+            raw={"client_order_id": ""},
+            created_at=NOW - timedelta(hours=1),
+            updated_at=NOW - timedelta(hours=1),
+        )
+        session.add_all([
+            room,
+            order,
+            _fill(
+                "repair-exchange-orphan",
+                ticker=room.market_ticker,
+                side="no",
+                action="buy",
+                yes_price="0.0100",
+                count="2.44",
+                strategy_code=None,
+                raw={"order_id": "kord-exchange-orphan"},
+            ),
+        ])
+        await session.commit()
+
+    result = await TradingAuditService(settings, session_factory).repair_attribution(
+        kalshi_env="production",
+        days=7,
+        dry_run=False,
+        now=NOW,
+    )
+
+    async with session_factory() as session:
+        fill = (
+            await session.execute(
+                select(FillRecord).where(FillRecord.trade_id == "repair-exchange-orphan")
+            )
+        ).scalar_one()
+        order = (
+            await session.execute(
+                select(OrderRecord).where(OrderRecord.id == "order-exchange-orphan")
+            )
+        ).scalar_one()
+
+    assert result["candidate_count"] == 1
+    assert result["updated_count"] == 1
+    assert result["candidates"][0]["reason"] == "raw_order_id_match"
+    assert fill.strategy_code == StrategyCode.UNMANAGED.value
+    assert fill.order_id == order.id
+    assert order.strategy_code == StrategyCode.UNMANAGED.value

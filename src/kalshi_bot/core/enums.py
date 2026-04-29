@@ -114,3 +114,4 @@ class StrategyCode(StrEnum):
     DIRECTIONAL = "A"  # Strategy A — directional weather taker
     CLEANUP = "C"  # Strategy C — resolution-lag cleanup
     MONOTONICITY_ARB = "ARB"  # Monotonicity arbitrage scanner
+    UNMANAGED = "UNMANAGED"  # Exchange-side/manual fills with no bot decision linkage

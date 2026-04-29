@@ -68,6 +68,8 @@ def _side_price(fill: FillRecord) -> Decimal:
 def _inferred_strategy_for_orphaned_order(order: OrderRecord) -> str | None:
     if str(order.client_order_id or "").startswith("room:"):
         return StrategyCode.DIRECTIONAL.value
+    if order.trade_ticket_id is None and str(order.market_ticker or "").startswith("KXHIGH"):
+        return StrategyCode.UNMANAGED.value
     return None
 
 
@@ -140,7 +142,7 @@ class TradingAuditService:
             fills=fills,
             now=now,
         )
-        signal_funnel = self._signal_funnel(signals=signals, tickets=tickets)
+        signal_funnel = self._signal_funnel(signals=signals, tickets=tickets, now=now)
         stop_loss = self._stop_loss_clusters(ops_events, now=now)
         risk = self._risk_summary(risk_verdicts)
         ops = self._ops_summary(ops_events)
@@ -612,13 +614,22 @@ class TradingAuditService:
             for fill in missing_fills
             if isinstance(fill.raw, dict)
             and fill.raw.get("order_id") in orders_by_kalshi_id
-            and orders_by_kalshi_id[fill.raw.get("order_id")].strategy_code
+            and (
+                orders_by_kalshi_id[fill.raw.get("order_id")].strategy_code
+                or _inferred_strategy_for_orphaned_order(orders_by_kalshi_id[fill.raw.get("order_id")])
+            )
+        ]
+        inferable_missing_orders = [
+            order
+            for order in orders
+            if order.strategy_code is None and _inferred_strategy_for_orphaned_order(order) is not None
         ]
         top_tickers = Counter(fill.market_ticker for fill in missing_fills).most_common(10)
         return {
             "missing_fill_strategy_count": len(missing_fills),
             "missing_fill_strategy_contracts": str(sum((Decimal(f.count_fp) for f in missing_fills), Decimal("0.00"))),
             "missing_order_strategy_count": sum(1 for order in orders if order.strategy_code is None),
+            "inferable_missing_order_strategy_count": len(inferable_missing_orders),
             "raw_order_id_could_recover_strategy_count": len(raw_order_matches),
             "top_missing_strategy_tickers": [
                 {"market_ticker": ticker, "fills": count}
@@ -671,8 +682,15 @@ class TradingAuditService:
             ],
         }
 
-    def _signal_funnel(self, *, signals: list[Signal], tickets: list[TradeTicketRecord]) -> dict[str, Any]:
+    def _signal_funnel(
+        self,
+        *,
+        signals: list[Signal],
+        tickets: list[TradeTicketRecord],
+        now: datetime,
+    ) -> dict[str, Any]:
         ticketed_room_ids = {ticket.room_id for ticket in tickets}
+        recent_cutoff = now - timedelta(hours=24)
         outcome_counts: Counter[str] = Counter()
         stand_down_counts: Counter[str] = Counter()
         side_counts: Counter[str] = Counter()
@@ -773,8 +791,18 @@ class TradingAuditService:
             for row in blocked_candidates
             if row["stand_down_reason"] not in _TERMINAL_BLOCKED_CANDIDATE_REASONS
         ]
+        recent_selected = [
+            signal
+            for signal in selected_without_ticket
+            if _as_utc(signal.created_at) is not None and _as_utc(signal.created_at) >= recent_cutoff
+        ]
+        legacy_selected = [
+            signal
+            for signal in selected_without_ticket
+            if _as_utc(signal.created_at) is None or _as_utc(signal.created_at) < recent_cutoff
+        ]
         recent_selected_without_ticket = []
-        for signal in selected_without_ticket[:20]:
+        for signal in recent_selected[:20]:
             payload = dict(signal.payload or {})
             candidate_trace = dict(payload.get("candidate_trace") or {})
             recent_selected_without_ticket.append(
@@ -791,6 +819,8 @@ class TradingAuditService:
             "signals": len(signals),
             "candidate_selected": int(outcome_counts.get("candidate_selected", 0)),
             "selected_without_ticket_count": len(selected_without_ticket),
+            "recent_selected_without_ticket_count": len(recent_selected),
+            "legacy_selected_without_ticket_count": len(legacy_selected),
             "outcome_counts": dict(outcome_counts),
             "recommended_side_counts": dict(side_counts),
             "top_stand_down_reasons": [
@@ -1050,13 +1080,18 @@ class TradingAuditService:
                     "failed_orders": funnel["failed_orders"],
                 },
             })
-        if int(signal_funnel["selected_without_ticket_count"]):
+        recent_selected_without_ticket = int(
+            signal_funnel.get("recent_selected_without_ticket_count", signal_funnel["selected_without_ticket_count"])
+        )
+        if recent_selected_without_ticket:
             issues.append({
                 "severity": "high",
                 "code": "selected_signal_without_trade_ticket",
                 "summary": "Some candidate-selected signals did not produce a trade ticket for risk/execution review.",
                 "evidence": {
                     "selected_without_ticket_count": signal_funnel["selected_without_ticket_count"],
+                    "recent_selected_without_ticket_count": recent_selected_without_ticket,
+                    "legacy_selected_without_ticket_count": signal_funnel.get("legacy_selected_without_ticket_count", 0),
                     "recent": signal_funnel["recent_selected_without_ticket"],
                 },
             })
