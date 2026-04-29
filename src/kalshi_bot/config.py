@@ -252,6 +252,9 @@ class Settings(BaseSettings):
     trigger_max_spread_bps: int = 1200
     trigger_max_concurrent_rooms: int = 12
     trigger_active_room_stale_seconds: int = 1800
+    trigger_marketability_recheck_seconds: int = 60
+    trigger_marketability_waitlist_ttl_seconds: int = 1800
+    trigger_marketability_recheck_limit: int = 50
     daemon_reconcile_interval_seconds: int = 60
     daemon_reconcile_stale_kill_switch_seconds: int = 300
     daemon_heartbeat_interval_seconds: int = 60

@@ -15,6 +15,7 @@ from kalshi_bot.db.models import (
     HistoricalSettlementLabelRecord,
     HistoricalWeatherSnapshotRecord,
     MarketPriceHistory,
+    MarketState,
     OrderRecord,
     RiskVerdictRecord,
     Room,
@@ -252,6 +253,75 @@ async def test_trade_analysis_builds_asof_decision_rows_without_leakage(analysis
     assert row["market_stale_threshold_seconds"] == 120.0
     assert row["market_stale_overage_seconds"] is None
     assert row["market_snapshot_age_bucket"] == "61-300s"
+
+
+@pytest.mark.asyncio
+async def test_trade_analysis_prefers_fresher_market_state_over_stale_history(analysis_harness) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-fresher-state")
+        session.add_all([
+            room,
+            _signal(room.id, created_at=NOW - timedelta(minutes=10)),
+            MarketPriceHistory(
+                kalshi_env="production",
+                market_ticker=TICKER,
+                yes_bid_dollars=Decimal("0.3000"),
+                yes_ask_dollars=Decimal("0.4000"),
+                mid_dollars=Decimal("0.3500"),
+                last_trade_dollars=Decimal("0.3600"),
+                volume=80,
+                observed_at=NOW - timedelta(minutes=20),
+            ),
+            MarketPriceHistory(
+                kalshi_env="production",
+                market_ticker=TICKER,
+                yes_bid_dollars=Decimal("0.9000"),
+                yes_ask_dollars=Decimal("0.9500"),
+                mid_dollars=Decimal("0.9250"),
+                last_trade_dollars=Decimal("0.9400"),
+                volume=999,
+                observed_at=NOW - timedelta(minutes=5),
+            ),
+            MarketState(
+                kalshi_env="production",
+                market_ticker=TICKER,
+                yes_bid_dollars=Decimal("0.6100"),
+                yes_ask_dollars=Decimal("0.6500"),
+                last_trade_dollars=Decimal("0.6200"),
+                observed_at=NOW - timedelta(minutes=11),
+                snapshot={},
+                created_at=NOW - timedelta(minutes=11),
+                updated_at=NOW - timedelta(minutes=11),
+            ),
+            HistoricalWeatherSnapshotRecord(
+                station_id="KNYC",
+                series_ticker="KXHIGHNY",
+                local_market_day="26APR24",
+                asof_ts=NOW - timedelta(minutes=11),
+                source_kind="test",
+                source_id="weather-fresh",
+                forecast_updated_ts=NOW - timedelta(minutes=11),
+                forecast_high_f=Decimal("70.00"),
+                current_temp_f=Decimal("65.00"),
+                payload={},
+            ),
+        ])
+        await session.commit()
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    assert dataset.summary["row_count"] == 1
+    row = dataset.rows[0]
+    assert row["market_snapshot_source"] == "market_state"
+    assert row["yes_bid_dollars"] == "0.6100"
+    assert row["yes_ask_dollars"] == "0.6500"
+    assert row["market_stale_seconds"] == 60.0
+    assert "stale_market_snapshot" not in row["exclusion_reasons"]
 
 
 @pytest.mark.asyncio

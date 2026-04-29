@@ -589,6 +589,7 @@ class TradeAnalysisService:
         market_ticker: str,
         decision_ts: datetime,
     ) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
         history = (
             await session.execute(
                 select(MarketPriceHistory)
@@ -602,7 +603,7 @@ class TradeAnalysisService:
             )
         ).scalar_one_or_none()
         if history is not None:
-            return {
+            candidates.append({
                 "source": "market_price_history",
                 "source_kind": "market_price_history",
                 "snapshot_id": history.id,
@@ -612,7 +613,7 @@ class TradeAnalysisService:
                 "mid_dollars": history.mid_dollars,
                 "last_trade_dollars": history.last_trade_dollars,
                 "volume": history.volume,
-            }
+            })
         state = (
             await session.execute(
                 select(MarketState).where(
@@ -622,29 +623,43 @@ class TradeAnalysisService:
                 )
             )
         ).scalar_one_or_none()
-        if state is None:
-            historical_cutoff = decision_ts - timedelta(
-                seconds=float(getattr(self.settings, "historical_replay_market_stale_seconds", self.settings.risk_stale_market_seconds))
-            )
-            historical = (
-                await session.execute(
-                    select(HistoricalMarketSnapshotRecord)
-                    .where(
-                        HistoricalMarketSnapshotRecord.market_ticker == market_ticker,
-                        HistoricalMarketSnapshotRecord.asof_ts <= decision_ts,
-                        HistoricalMarketSnapshotRecord.asof_ts >= historical_cutoff,
-                        HistoricalMarketSnapshotRecord.source_kind.in_(POINT_IN_TIME_HISTORICAL_MARKET_SOURCES),
-                    )
-                    .order_by(HistoricalMarketSnapshotRecord.asof_ts.desc(), HistoricalMarketSnapshotRecord.id.desc())
-                    .limit(1)
+        if state is not None:
+            mid = None
+            if state.yes_bid_dollars is not None and state.yes_ask_dollars is not None:
+                mid = (state.yes_bid_dollars + state.yes_ask_dollars) / Decimal("2")
+            candidates.append({
+                "source": "market_state",
+                "source_kind": "market_state",
+                "snapshot_id": f"{state.kalshi_env}:{state.market_ticker}",
+                "observed_at": state.observed_at,
+                "yes_bid_dollars": state.yes_bid_dollars,
+                "yes_ask_dollars": state.yes_ask_dollars,
+                "mid_dollars": mid,
+                "last_trade_dollars": state.last_trade_dollars,
+                "volume": None,
+            })
+
+        historical_cutoff = decision_ts - timedelta(
+            seconds=float(getattr(self.settings, "historical_replay_market_stale_seconds", self.settings.risk_stale_market_seconds))
+        )
+        historical = (
+            await session.execute(
+                select(HistoricalMarketSnapshotRecord)
+                .where(
+                    HistoricalMarketSnapshotRecord.market_ticker == market_ticker,
+                    HistoricalMarketSnapshotRecord.asof_ts <= decision_ts,
+                    HistoricalMarketSnapshotRecord.asof_ts >= historical_cutoff,
+                    HistoricalMarketSnapshotRecord.source_kind.in_(POINT_IN_TIME_HISTORICAL_MARKET_SOURCES),
                 )
-            ).scalar_one_or_none()
-            if historical is None:
-                return None
+                .order_by(HistoricalMarketSnapshotRecord.asof_ts.desc(), HistoricalMarketSnapshotRecord.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if historical is not None:
             mid = None
             if historical.yes_bid_dollars is not None and historical.yes_ask_dollars is not None:
                 mid = (historical.yes_bid_dollars + historical.yes_ask_dollars) / Decimal("2")
-            return {
+            candidates.append({
                 "source": "historical_market_snapshots",
                 "source_kind": historical.source_kind,
                 "source_id": historical.source_id,
@@ -655,21 +670,23 @@ class TradeAnalysisService:
                 "mid_dollars": mid,
                 "last_trade_dollars": historical.last_price_dollars,
                 "volume": None,
-            }
-        mid = None
-        if state.yes_bid_dollars is not None and state.yes_ask_dollars is not None:
-            mid = (state.yes_bid_dollars + state.yes_ask_dollars) / Decimal("2")
-        return {
-            "source": "market_state",
-            "source_kind": "market_state",
-            "snapshot_id": f"{state.kalshi_env}:{state.market_ticker}",
-            "observed_at": state.observed_at,
-            "yes_bid_dollars": state.yes_bid_dollars,
-            "yes_ask_dollars": state.yes_ask_dollars,
-            "mid_dollars": mid,
-            "last_trade_dollars": state.last_trade_dollars,
-            "volume": None,
+            })
+
+        if not candidates:
+            return None
+
+        source_rank = {
+            "market_state": 3,
+            "market_price_history": 2,
+            "historical_market_snapshots": 1,
         }
+        return max(
+            candidates,
+            key=lambda row: (
+                _as_utc(row.get("observed_at")) or datetime.min.replace(tzinfo=UTC),
+                source_rank.get(str(row.get("source")), 0),
+            ),
+        )
 
     async def _weather_snapshot(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -31,6 +32,16 @@ class FakeSupervisor:
 
     async def run_room(self, room_id: str, reason: str = "manual") -> None:
         self.calls.append((room_id, reason))
+
+
+class FakeKalshi:
+    def __init__(self) -> None:
+        self.responses: dict[str, dict[str, Any]] = {}
+        self.calls: list[str] = []
+
+    async def get_market(self, ticker: str) -> dict[str, Any]:
+        self.calls.append(ticker)
+        return self.responses[ticker]
 
 
 def _directory() -> WeatherMarketDirectory:
@@ -190,6 +201,85 @@ async def test_auto_trigger_logs_one_sided_book_without_room_creation(tmp_path) 
     assert checkpoint.payload["reason"] == "one_sided_book"
     assert checkpoint.payload["actionability"] == "missed_due_to_one_sided_book"
     assert checkpoint.payload["missing_quotes"] == ["no_bid", "yes_ask"]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_rechecks_waitlisted_book_with_rest_quote(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_waitlist_recheck.db",
+        trigger_enable_auto_rooms=True,
+        trigger_cooldown_seconds=600,
+        trigger_marketability_recheck_seconds=0,
+        trigger_marketability_waitlist_ttl_seconds=3600,
+        trigger_max_spread_bps=1200,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    fake_kalshi = FakeKalshi()
+    agent_pack_service = AgentPackService(settings)
+    service = AutoTriggerService(
+        settings,
+        session_factory,
+        _directory(),
+        agent_pack_service,
+        supervisor,
+        fake_kalshi,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot={
+                "market_ticker": "WX-TEST",
+                "market": {
+                    "yes_bid_dollars": "0.7300",
+                    "yes_ask_dollars": None,
+                },
+            },
+            yes_bid_dollars=Decimal("0.7300"),
+            yes_ask_dollars=None,
+            last_trade_dollars=None,
+        )
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    fake_kalshi.responses["WX-TEST"] = {
+        "market": {
+            "ticker": "WX-TEST",
+            "yes_bid_dollars": "0.4400",
+            "yes_ask_dollars": "0.4800",
+            "last_price_dollars": "0.4500",
+        }
+    }
+    result = await service.recheck_marketability_waitlist_once()
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms(limit=10)
+        waitlist = await repo.get_checkpoint("auto_trigger_waitlist:demo:WX-TEST")
+        state = await repo.get_market_state("WX-TEST", kalshi_env=settings.kalshi_env)
+        await session.commit()
+
+    assert result["due_count"] == 1
+    assert result["fetched_count"] == 1
+    assert result["rechecked_count"] == 1
+    assert fake_kalshi.calls == ["WX-TEST"]
+    assert len(rooms) == 1
+    assert len(supervisor.calls) == 1
+    assert waitlist is not None
+    assert waitlist.payload["status"] == "resolved"
+    assert waitlist.payload["resolution_reason"] == "actionable"
+    assert state is not None
+    assert state.yes_ask_dollars == Decimal("0.4800")
 
     await engine.dispose()
 

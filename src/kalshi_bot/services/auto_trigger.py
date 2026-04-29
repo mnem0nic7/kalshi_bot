@@ -29,6 +29,10 @@ class SupervisorProtocol(Protocol):
     async def run_room(self, room_id: str, reason: str = "manual") -> None: ...
 
 
+class KalshiMarketProtocol(Protocol):
+    async def get_market(self, ticker: str) -> dict[str, Any]: ...
+
+
 class AutoTriggerService:
     def __init__(
         self,
@@ -37,12 +41,14 @@ class AutoTriggerService:
         weather_directory: WeatherMarketDirectory,
         agent_pack_service: AgentPackService,
         supervisor: SupervisorProtocol,
+        kalshi: KalshiMarketProtocol | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.weather_directory = weather_directory
         self.agent_pack_service = agent_pack_service
         self.supervisor = supervisor
+        self.kalshi = kalshi
         self._inflight_markets: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
 
@@ -63,23 +69,9 @@ class AutoTriggerService:
             pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
             thresholds = self.agent_pack_service.runtime_thresholds(pack)
             market_state = await repo.get_market_state(market_ticker, kalshi_env=self.settings.kalshi_env)
-            actionability_block = self._market_actionability_block(market_state, thresholds)
-            if actionability_block is not None:
-                reason = str(actionability_block["reason"])
-                await self._log_block_once_per_cooldown(
-                    repo,
-                    checkpoint_key=f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:{reason}",
-                    cooldown_seconds=max(thresholds.trigger_cooldown_seconds, 1800),
-                    severity="info",
-                    summary=self._market_actionability_summary(market_ticker, actionability_block),
-                    payload={"market_ticker": market_ticker, **actionability_block},
-                    kalshi_env=self.settings.kalshi_env,
-                )
-                await session.commit()
-                return
-            assert market_state is not None
-            terminal_market = self._terminal_market_lifecycle(market_state)
+            terminal_market = self._terminal_market_lifecycle(market_state) if market_state is not None else None
             if terminal_market is not None:
+                await self._mark_marketability_waitlist_resolved(repo, market_ticker, reason="terminal_market")
                 await self._log_block_once_per_cooldown(
                     repo,
                     checkpoint_key=(
@@ -94,6 +86,23 @@ class AutoTriggerService:
                 )
                 await session.commit()
                 return
+            actionability_block = self._market_actionability_block(market_state, thresholds)
+            if actionability_block is not None:
+                reason = str(actionability_block["reason"])
+                await self._record_marketability_waitlist(repo, market_ticker, actionability_block)
+                await self._log_block_once_per_cooldown(
+                    repo,
+                    checkpoint_key=f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:{reason}",
+                    cooldown_seconds=max(thresholds.trigger_cooldown_seconds, 1800),
+                    severity="info",
+                    summary=self._market_actionability_summary(market_ticker, actionability_block),
+                    payload={"market_ticker": market_ticker, **actionability_block},
+                    kalshi_env=self.settings.kalshi_env,
+                )
+                await session.commit()
+                return
+            assert market_state is not None
+            await self._mark_marketability_waitlist_resolved(repo, market_ticker, reason="actionable")
             dossier_record = await repo.get_research_dossier(market_ticker)
             resolved_research = self._fresh_resolved_research(dossier_record, now=datetime.now(UTC))
             if resolved_research is not None:
@@ -393,6 +402,95 @@ class AutoTriggerService:
         if self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
+    async def recheck_marketability_waitlist_once(self) -> dict[str, Any]:
+        if self.kalshi is None or not self.settings.trigger_enable_auto_rooms:
+            return {"status": "disabled", "due_count": 0, "fetched_count": 0, "rechecked_count": 0}
+
+        now = datetime.now(UTC)
+        due: list[str] = []
+        prefix = f"auto_trigger_waitlist:{self.settings.kalshi_env}:"
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            if control.active_color != self.settings.app_color:
+                await session.commit()
+                return {"status": "inactive_color", "due_count": 0, "fetched_count": 0, "rechecked_count": 0}
+            checkpoints = await repo.list_checkpoints(
+                prefix=prefix,
+                limit=max(1, int(self.settings.trigger_marketability_recheck_limit)),
+            )
+            for checkpoint in checkpoints:
+                payload = dict(checkpoint.payload or {})
+                if payload.get("status") != "waiting":
+                    continue
+                ticker = checkpoint.stream_name.removeprefix(prefix)
+                if not ticker or ticker in self._inflight_markets:
+                    continue
+                first_seen_at = self._parse_datetime(payload.get("first_seen_at"))
+                if (
+                    first_seen_at is not None
+                    and now - first_seen_at > timedelta(seconds=self.settings.trigger_marketability_waitlist_ttl_seconds)
+                ):
+                    await repo.set_checkpoint(
+                        checkpoint.stream_name,
+                        cursor=None,
+                        payload={
+                            **payload,
+                            "status": "expired",
+                            "expired_at": now.isoformat(),
+                        },
+                    )
+                    continue
+                next_recheck_at = self._parse_datetime(payload.get("next_recheck_at"))
+                if next_recheck_at is not None and next_recheck_at > now:
+                    continue
+                due.append(ticker)
+            await session.commit()
+
+        fetched_count = 0
+        rechecked_count = 0
+        for ticker in due:
+            try:
+                response = await self.kalshi.get_market(ticker)
+            except Exception:
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                    await self._log_block_once_per_cooldown(
+                        repo,
+                        checkpoint_key=f"auto_trigger_block:{self.settings.kalshi_env}:{ticker}:marketability_recheck_error",
+                        cooldown_seconds=max(self.settings.trigger_marketability_recheck_seconds, 300),
+                        severity="warning",
+                        summary=f"Auto-trigger marketability recheck failed for {ticker}",
+                        payload={"market_ticker": ticker, "reason": "marketability_recheck_error"},
+                        kalshi_env=self.settings.kalshi_env,
+                    )
+                    await session.commit()
+                continue
+
+            market = response.get("market", response)
+            fetched_count += 1
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                await repo.upsert_market_state(
+                    ticker,
+                    kalshi_env=self.settings.kalshi_env,
+                    snapshot=market,
+                    yes_bid_dollars=self._market_decimal(market.get("yes_bid_dollars")),
+                    yes_ask_dollars=self._market_decimal(market.get("yes_ask_dollars")),
+                    last_trade_dollars=self._market_decimal(market.get("last_price_dollars")),
+                )
+                await session.commit()
+
+            await self.handle_market_update(ticker)
+            rechecked_count += 1
+
+        return {
+            "status": "ok",
+            "due_count": len(due),
+            "fetched_count": fetched_count,
+            "rechecked_count": rechecked_count,
+        }
+
     async def _log_block_once_per_cooldown(
         self,
         repo: PlatformRepository,
@@ -432,6 +530,64 @@ class AutoTriggerService:
             },
         )
         return True
+
+    async def _record_marketability_waitlist(
+        self,
+        repo: PlatformRepository,
+        market_ticker: str,
+        block: dict[str, Any],
+    ) -> None:
+        if block.get("reason") not in {"one_sided_book", "spread_too_wide", "non_positive_spread", "market_state_missing"}:
+            return
+        now = datetime.now(UTC)
+        checkpoint_key = f"auto_trigger_waitlist:{self.settings.kalshi_env}:{market_ticker}"
+        checkpoint = await repo.get_checkpoint(checkpoint_key)
+        payload = dict(checkpoint.payload or {}) if checkpoint is not None else {}
+        first_seen_at = payload.get("first_seen_at") or now.isoformat()
+        miss_count = int(payload.get("miss_count") or 0) + 1
+        await repo.set_checkpoint(
+            checkpoint_key,
+            cursor=None,
+            payload={
+                **payload,
+                "status": "waiting",
+                "market_ticker": market_ticker,
+                "first_seen_at": first_seen_at,
+                "last_seen_at": now.isoformat(),
+                "next_recheck_at": (
+                    now + timedelta(seconds=max(0, self.settings.trigger_marketability_recheck_seconds))
+                ).isoformat(),
+                "miss_count": miss_count,
+                "last_reason": block.get("reason"),
+                "last_actionability": block.get("actionability"),
+                "last_block": block,
+            },
+        )
+
+    async def _mark_marketability_waitlist_resolved(
+        self,
+        repo: PlatformRepository,
+        market_ticker: str,
+        *,
+        reason: str,
+    ) -> None:
+        checkpoint_key = f"auto_trigger_waitlist:{self.settings.kalshi_env}:{market_ticker}"
+        checkpoint = await repo.get_checkpoint(checkpoint_key)
+        if checkpoint is None:
+            return
+        payload = dict(checkpoint.payload or {})
+        if payload.get("status") != "waiting":
+            return
+        await repo.set_checkpoint(
+            checkpoint_key,
+            cursor=None,
+            payload={
+                **payload,
+                "status": "resolved",
+                "resolved_at": datetime.now(UTC).isoformat(),
+                "resolution_reason": reason,
+            },
+        )
 
     def _price_move_bypasses_checkpoint(
         self,
@@ -549,6 +705,16 @@ class AutoTriggerService:
         if reason == "market_state_missing":
             return f"Auto-trigger skipped for {market_ticker}: missing market state"
         return f"Auto-trigger skipped for {market_ticker}: market is not actionable"
+
+    @staticmethod
+    def _market_decimal(value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        try:
+            parsed = Decimal(str(value))
+        except Exception:
+            return None
+        return parsed if parsed > 0 else None
 
     def _fresh_resolved_research(
         self,

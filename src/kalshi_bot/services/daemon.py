@@ -331,6 +331,8 @@ class DaemonService:
             try:
                 await self.market_history_service.snapshot_once()
                 await self.market_history_service.purge_once()
+                if self._auto_trigger_enabled_for_run:
+                    await self.auto_trigger_service.recheck_marketability_waitlist_once()
             except Exception:
                 logger.warning("market_history loop error", exc_info=True)
 
