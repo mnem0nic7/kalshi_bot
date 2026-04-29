@@ -441,8 +441,10 @@ def score_weather_market(
         trade_regime = "standard"
     elif forecast_high_f is not None:
         layer_tag = "gridpoint" if using_gridpoint else "daily-period"
+        contract_phrase = "below-threshold" if mapping.operator in ("<", "<=") else "above-threshold"
         summary = (
-            f"Forecast high {forecast_high_f:.1f}F [{layer_tag}] versus threshold {mapping.threshold_f:.1f}F "
+            f"Forecast high {forecast_high_f:.1f}F [{layer_tag}] versus {contract_phrase} "
+            f"{mapping.threshold_f:.1f}F contract "
             f"implies fair yes near {fair} with confidence {confidence:.2f}."
         )
     return WeatherSignalSnapshot(

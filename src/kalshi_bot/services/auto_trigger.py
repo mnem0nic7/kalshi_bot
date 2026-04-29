@@ -129,6 +129,10 @@ class AutoTriggerService:
                 await session.commit()
                 return
 
+            if await self._recent_risk_block_suppressed(repo, market_ticker, market_state, thresholds):
+                await session.commit()
+                return
+
             open_position = await repo.get_position(
                 market_ticker,
                 self.settings.kalshi_subaccount,
@@ -141,8 +145,8 @@ class AutoTriggerService:
                         f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
                         "open_position_governance"
                     ),
-                    cooldown_seconds=thresholds.trigger_cooldown_seconds,
-                    severity="warning",
+                    cooldown_seconds=max(thresholds.trigger_cooldown_seconds, 1800),
+                    severity="info",
                     summary=f"Auto-trigger blocked for {market_ticker}: live position already open",
                     payload={"market_ticker": market_ticker, "reason": "open_position_governance"},
                     kalshi_env=self.settings.kalshi_env,
@@ -206,8 +210,8 @@ class AutoTriggerService:
                             f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
                             "stop_loss_reentry_cooldown"
                         ),
-                        cooldown_seconds=thresholds.trigger_cooldown_seconds,
-                        severity="warning",
+                        cooldown_seconds=max(thresholds.trigger_cooldown_seconds, 1800),
+                        severity="info",
                         summary=f"Auto-trigger blocked for {market_ticker}: stop-loss re-entry cooldown active",
                         payload={
                             "market_ticker": market_ticker,
@@ -302,6 +306,49 @@ class AutoTriggerService:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    async def _recent_risk_block_suppressed(
+        self,
+        repo: PlatformRepository,
+        market_ticker: str,
+        market_state: MarketState,
+        thresholds: RuntimeThresholds,
+    ) -> bool:
+        latest_trace = await repo.get_latest_decision_trace_for_market(
+            market_ticker,
+            kalshi_env=self.settings.kalshi_env,
+        )
+        if latest_trace is None or latest_trace.decision_kind != "risk_block":
+            return False
+
+        now = datetime.now(UTC)
+        decision_time = self._as_utc(latest_trace.decision_time)
+        cooldown_seconds = max(thresholds.trigger_cooldown_seconds, 1800)
+        if decision_time is None or now - decision_time >= timedelta(seconds=cooldown_seconds):
+            return False
+
+        checkpoint = await repo.get_checkpoint(f"auto_trigger:{self.settings.kalshi_env}:{market_ticker}")
+        if self._price_move_bypasses_checkpoint(checkpoint_payload=getattr(checkpoint, "payload", None), market_state=market_state):
+            return False
+
+        trace_payload = dict(latest_trace.trace or {})
+        risk_payload = trace_payload.get("risk") if isinstance(trace_payload.get("risk"), dict) else {}
+        await self._log_block_once_per_cooldown(
+            repo,
+            checkpoint_key=f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:recent_risk_block",
+            cooldown_seconds=cooldown_seconds,
+            severity="info",
+            summary=f"Auto-trigger suppressed for {market_ticker}: recent risk block still cooling down",
+            payload={
+                "market_ticker": market_ticker,
+                "reason": "recent_risk_block",
+                "decision_trace_id": latest_trace.id,
+                "blocked_at": decision_time.isoformat(),
+                "risk_reasons": risk_payload.get("reasons") or [],
+            },
+            kalshi_env=self.settings.kalshi_env,
+        )
+        return True
+
     async def _run_room(self, market_ticker: str, room_id: str) -> None:
         try:
             await self.supervisor.run_room(room_id, reason="auto_trigger")
@@ -351,6 +398,28 @@ class AutoTriggerService:
             },
         )
         return True
+
+    def _price_move_bypasses_checkpoint(
+        self,
+        *,
+        checkpoint_payload: dict[str, Any] | None,
+        market_state: MarketState,
+    ) -> bool:
+        if self.settings.trigger_price_move_bypass_bps <= 0:
+            return False
+        if not isinstance(checkpoint_payload, dict):
+            return False
+        last_mid_raw = checkpoint_payload.get("last_trigger_mid")
+        if last_mid_raw in (None, ""):
+            return False
+        state_observed_at = self._as_utc(market_state.observed_at)
+        if state_observed_at is None or datetime.now(UTC) - state_observed_at > timedelta(seconds=self.settings.risk_stale_market_seconds):
+            return False
+        current_mid = self._mid_dollars(market_state)
+        if current_mid is None:
+            return False
+        move_bps = int(abs(current_mid - Decimal(str(last_mid_raw))) * Decimal("10000"))
+        return move_bps >= self.settings.trigger_price_move_bypass_bps
 
     def _book_is_broken(self, market_state: MarketState) -> bool:
         yes_ask = market_state.yes_ask_dollars

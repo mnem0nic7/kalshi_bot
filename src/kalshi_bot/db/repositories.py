@@ -804,6 +804,23 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def get_latest_decision_trace_for_market(
+        self,
+        market_ticker: str,
+        *,
+        kalshi_env: str | None = None,
+    ) -> DecisionTraceRecord | None:
+        stmt = (
+            select(DecisionTraceRecord)
+            .where(
+                DecisionTraceRecord.market_ticker == market_ticker,
+                DecisionTraceRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+            )
+            .order_by(DecisionTraceRecord.decision_time.desc(), DecisionTraceRecord.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def save_forecast_snapshot(
         self,
         *,
@@ -1152,7 +1169,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
     ) -> FillRecord:
         env = self._resolved_kalshi_env(kalshi_env)
         raw_order_id = raw.get("order_id") if isinstance(raw, dict) else None
-        resolved_order_id, resolved_strategy = await self._resolve_fill_links(
+        resolved_order_id, resolved_strategy, resolved_side = await self._resolve_fill_links(
             strategy_code=strategy_code,
             order_id=order_id,
             kalshi_order_id=raw_order_id,
@@ -1161,12 +1178,13 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             side=side,
             action=action,
         )
+        economic_side = resolved_side or side
         record = FillRecord(
             order_id=resolved_order_id,
             trade_id=trade_id,
             kalshi_env=env,
             market_ticker=market_ticker,
-            side=side,
+            side=economic_side,
             action=action,
             yes_price_dollars=yes_price_dollars,
             count_fp=count_fp,
@@ -1247,15 +1265,19 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         side: str,
         action: str,
         before: datetime | None = None,
-    ) -> tuple[str | None, str | None]:
-        """Return (order_id, strategy_code) for a fill using bounded evidence."""
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return (order_id, strategy_code, economic_side) for a fill using bounded evidence."""
         if strategy_code is not None:
             matched = await self._resolve_order_for_fill(
                 order_id=order_id,
                 kalshi_order_id=kalshi_order_id,
                 kalshi_env=kalshi_env,
             )
-            return (order_id or (matched.id if matched is not None else None), strategy_code)
+            return (
+                order_id or (matched.id if matched is not None else None),
+                strategy_code,
+                matched.side if matched is not None else None,
+            )
 
         matched_order = await self._resolve_order_for_fill(
             order_id=order_id,
@@ -1272,7 +1294,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 )
                 if matched_strategy is not None:
                     matched_order.strategy_code = matched_strategy
-            return matched_order.id, matched_strategy
+            return matched_order.id, matched_strategy, matched_order.side
 
         if action == "sell":
             latest_buy = await self._latest_attributed_buy_fill(
@@ -1282,9 +1304,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 before=before,
             )
             if latest_buy is not None:
-                return order_id, latest_buy.strategy_code
+                return order_id, latest_buy.strategy_code, latest_buy.side
 
-        return order_id, None
+        return order_id, None, None
 
     async def upsert_fill(
         self,
@@ -1303,7 +1325,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
     ) -> FillRecord:
         env = self._resolved_kalshi_env(kalshi_env)
         raw_order_id = raw.get("order_id") if isinstance(raw, dict) else None
-        resolved_order_id, resolved_strategy = await self._resolve_fill_links(
+        resolved_order_id, resolved_strategy, resolved_side = await self._resolve_fill_links(
             strategy_code=strategy_code,
             order_id=order_id,
             kalshi_order_id=raw_order_id,
@@ -1312,6 +1334,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             side=side,
             action=action,
         )
+        economic_side = resolved_side or side
         if trade_id is not None:
             observed_at = datetime.now(UTC)
             insert_values = {
@@ -1320,7 +1343,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 "trade_id": trade_id,
                 "kalshi_env": env,
                 "market_ticker": market_ticker,
-                "side": side,
+                "side": economic_side,
                 "action": action,
                 "yes_price_dollars": yes_price_dollars,
                 "count_fp": count_fp,
@@ -1376,7 +1399,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 trade_id=trade_id,
                 kalshi_env=env,
                 market_ticker=market_ticker,
-                side=side,
+                side=economic_side,
                 action=action,
                 yes_price_dollars=yes_price_dollars,
                 count_fp=count_fp,
@@ -1388,7 +1411,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         else:
             record.order_id = resolved_order_id or record.order_id
             record.market_ticker = market_ticker
-            record.side = side
+            record.side = economic_side
             record.action = action
             record.yes_price_dollars = yes_price_dollars
             record.count_fp = count_fp

@@ -92,14 +92,21 @@ def _signal(room_id: str, *, created_at: datetime | None = None, edge_bps: int =
     )
 
 
-def _ticket(room_id: str, *, status: str = "approved", strategy_code: str | None = "A") -> TradeTicketRecord:
+def _ticket(
+    room_id: str,
+    *,
+    status: str = "approved",
+    strategy_code: str | None = "A",
+    side: str = "yes",
+    yes_price: str = "0.5000",
+) -> TradeTicketRecord:
     return TradeTicketRecord(
         id=f"ticket-{room_id}",
         room_id=room_id,
         market_ticker=TICKER,
         action="buy",
-        side="yes",
-        yes_price_dollars=Decimal("0.5000"),
+        side=side,
+        yes_price_dollars=Decimal(yes_price),
         count_fp=Decimal("10.00"),
         time_in_force="immediate_or_cancel",
         client_order_id=f"coid-{room_id}",
@@ -272,7 +279,7 @@ async def test_trade_analysis_keeps_excluded_rows_with_reasons(analysis_harness)
     assert row["training_eligible"] is False
     assert "missing_market_snapshot" in row["exclusion_reasons"]
     assert "missing_weather_snapshot" in row["exclusion_reasons"]
-    assert "missing_settlement_label" in row["exclusion_reasons"]
+    assert "pending_settlement" in row["exclusion_reasons"]
     assert "missing_strategy_attribution" in row["exclusion_reasons"]
 
     report = await TradeAnalysisService(settings, session_factory, directory).build_report(
@@ -286,6 +293,62 @@ async def test_trade_analysis_keeps_excluded_rows_with_reasons(analysis_harness)
         "reason": "missing_market_snapshot",
         "rows": 1,
     }
+    assert report["pending_settlement_count"] == 1
+    assert report["data_defect_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_trade_analysis_marks_signal_only_unresolved_rows_pending_not_missing_execution_fields(
+    analysis_harness,
+) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-signal-only")
+        session.add_all([
+            room,
+            _signal(room.id),
+            MarketPriceHistory(
+                kalshi_env="production",
+                market_ticker=TICKER,
+                yes_bid_dollars=Decimal("0.4800"),
+                yes_ask_dollars=Decimal("0.5200"),
+                mid_dollars=Decimal("0.5000"),
+                last_trade_dollars=Decimal("0.5100"),
+                volume=100,
+                observed_at=NOW - timedelta(minutes=26),
+            ),
+            HistoricalWeatherSnapshotRecord(
+                station_id="KNYC",
+                series_ticker="KXHIGHNY",
+                local_market_day="26APR24",
+                asof_ts=NOW - timedelta(minutes=26),
+                source_kind="test",
+                source_id="weather-before",
+                forecast_updated_ts=NOW - timedelta(minutes=26),
+                forecast_high_f=Decimal("70.00"),
+                current_temp_f=Decimal("65.00"),
+                payload={},
+            ),
+        ])
+        await session.commit()
+
+    report = await TradeAnalysisService(settings, session_factory, directory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+    row = dataset.rows[0]
+    assert row["decision_status"] == "signal_only"
+    assert row["training_eligible"] is False
+    assert row["exclusion_reasons"] == ["pending_settlement"]
+    assert report["pending_settlement_count"] == 1
+    assert report["data_defect_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -353,6 +416,98 @@ async def test_trade_analysis_historical_market_fallback_requires_fresh_point_in
     assert row["market_snapshot_source_kind"] == "captured_market_snapshot"
     assert row["market_snapshot_source_id"] == "fresh-captured"
     assert row["yes_bid_dollars"] == "0.4400"
+
+
+@pytest.mark.asyncio
+async def test_trade_analysis_links_exit_fills_without_ticket_into_trade_lifecycle(analysis_harness) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-exited")
+        ticket = _ticket(room.id, side="no", yes_price="0.1000")
+        entry_order = OrderRecord(
+            id="order-entry-no",
+            trade_ticket_id=ticket.id,
+            kalshi_env="production",
+            kalshi_order_id="kord-entry-no",
+            client_order_id=ticket.client_order_id,
+            market_ticker=TICKER,
+            status="executed",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.1000"),
+            count_fp=Decimal("4.22"),
+            strategy_code="A",
+            raw={},
+            created_at=NOW - timedelta(minutes=18),
+            updated_at=NOW - timedelta(minutes=18),
+        )
+        exit_order = OrderRecord(
+            id="order-exit-no",
+            trade_ticket_id=None,
+            kalshi_env="production",
+            kalshi_order_id="kord-exit-no",
+            client_order_id="exit-no",
+            market_ticker=TICKER,
+            status="canceled",
+            side="no",
+            action="sell",
+            yes_price_dollars=Decimal("0.2300"),
+            count_fp=Decimal("4.22"),
+            strategy_code="A",
+            raw={},
+            created_at=NOW - timedelta(minutes=10),
+            updated_at=NOW - timedelta(minutes=10),
+        )
+        session.add_all([
+            room,
+            _signal(room.id),
+            ticket,
+            _risk(ticket.id, room.id),
+            entry_order,
+            exit_order,
+            FillRecord(
+                order_id=entry_order.id,
+                kalshi_env="production",
+                trade_id="entry-no",
+                market_ticker=TICKER,
+                side="no",
+                action="buy",
+                yes_price_dollars=Decimal("0.1000"),
+                count_fp=Decimal("4.22"),
+                strategy_code="A",
+                raw={"fee_cost": "0.0420"},
+                created_at=NOW - timedelta(minutes=17),
+                updated_at=NOW - timedelta(minutes=17),
+            ),
+            FillRecord(
+                order_id=exit_order.id,
+                kalshi_env="production",
+                trade_id="exit-no",
+                market_ticker=TICKER,
+                side="no",
+                action="sell",
+                yes_price_dollars=Decimal("0.2300"),
+                count_fp=Decimal("4.22"),
+                strategy_code="A",
+                raw={"fee_cost": "0.0524"},
+                created_at=NOW - timedelta(minutes=9),
+                updated_at=NOW - timedelta(minutes=9),
+            ),
+            *_snapshots(),
+        ])
+        await session.commit()
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    row = dataset.rows[0]
+    assert row["decision_status"] == "filled"
+    assert row["filled_contracts"] == "4.22"
+    assert row["gross_pnl_dollars"] == "-0.5486"
+    assert row["training_eligible"] is True
 
 
 @pytest.mark.asyncio

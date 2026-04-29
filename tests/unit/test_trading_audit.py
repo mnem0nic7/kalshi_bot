@@ -111,9 +111,127 @@ async def test_trading_audit_scores_settled_and_exit_pnl(audit_harness) -> None:
     )
 
     assert report["pnl"]["gross_pnl_dollars"] == "6.5000"
+    assert report["pnl"]["fill_ledger_realized_pnl_dollars"] == "3.0000"
+    assert report["pnl"]["settlement_pnl_dollars"] == "3.5000"
     assert report["pnl"]["net_pnl_dollars"] == "6.4600"
+    assert report["pnl"]["open_lot_count"] == 1
     assert report["pnl"]["unsettled_open_contracts"] == "2.00"
+    assert report["exchange_position_discrepancy"]["discrepancy_count"] == 1
     assert report["fill_summary"]["total_fills"] == 4
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_scores_no_partial_exit_without_false_open_contracts(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        ticker = "KXHIGHTDAL-26APR29-T70"
+        session.add_all([
+            _room("room-dal", ticker=ticker),
+            _fill(
+                "dal-buy-1",
+                ticker=ticker,
+                side="no",
+                action="buy",
+                yes_price="0.1000",
+                count="2.11",
+                raw={"fee_cost": "0.0210"},
+            ),
+            _fill(
+                "dal-buy-2",
+                ticker=ticker,
+                side="no",
+                action="buy",
+                yes_price="0.1000",
+                count="2.11",
+                raw={"fee_cost": "0.0210"},
+            ),
+            _fill(
+                "dal-exit-partial",
+                ticker=ticker,
+                side="no",
+                action="sell",
+                yes_price="0.2300",
+                count="4.12",
+                raw={"fee_cost": "0.0524"},
+            ),
+            _fill(
+                "dal-exit-rest",
+                ticker=ticker,
+                side="no",
+                action="sell",
+                yes_price="0.2700",
+                count="0.10",
+                raw={"fee_cost": "0.0030"},
+            ),
+        ])
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    assert report["pnl"]["realized_exit_matches"] == 3
+    assert report["pnl"]["gross_pnl_dollars"] == "-0.5526"
+    assert report["pnl"]["fill_ledger_realized_pnl_dollars"] == "-0.5526"
+    assert report["pnl"]["fee_total_dollars"] == "0.0974"
+    assert report["pnl"]["net_pnl_dollars"] == "-0.6500"
+    assert report["pnl"]["open_lot_count"] == 0
+    assert report["pnl"]["unsettled_open_contracts"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_repair_attribution_corrects_existing_raw_side_mismatch(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        ticker = "KXHIGHTDAL-26APR29-T70"
+        session.add_all([
+            _room("room-dal-repair", ticker=ticker),
+            OrderRecord(
+                id="order-exit-no",
+                trade_ticket_id=None,
+                kalshi_env="production",
+                kalshi_order_id="kord-exit-no",
+                client_order_id="exit-no",
+                market_ticker=ticker,
+                status="canceled",
+                side="no",
+                action="sell",
+                yes_price_dollars=Decimal("0.2300"),
+                count_fp=Decimal("4.12"),
+                strategy_code="A",
+                raw={},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+            _fill(
+                "dal-raw-side-wrong",
+                ticker=ticker,
+                side="yes",
+                action="sell",
+                yes_price="0.2300",
+                count="4.12",
+                strategy_code="A",
+                raw={"order_id": "kord-exit-no", "fee_cost": "0.0524"},
+                created_at=NOW - timedelta(minutes=9),
+            ),
+        ])
+        await session.commit()
+
+    result = await TradingAuditService(settings, session_factory).repair_attribution(
+        kalshi_env="production",
+        days=7,
+        dry_run=False,
+        now=NOW,
+    )
+
+    async with session_factory() as session:
+        fill = (await session.execute(select(FillRecord).where(FillRecord.trade_id == "dal-raw-side-wrong"))).scalar_one()
+
+    assert result["updated_count"] == 1
+    assert fill.side == "no"
+    assert fill.order_id == "order-exit-no"
 
 
 @pytest.mark.asyncio

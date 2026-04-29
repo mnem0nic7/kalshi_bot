@@ -131,6 +131,7 @@ class TradingAuditService:
 
         fill_summary = self._fill_summary(fills)
         pnl = self._gross_pnl(fills)
+        position_discrepancy = self._exchange_position_discrepancy(fills=fills, positions=positions)
         attribution = self._attribution_gaps(fills=fills, orders=orders)
         funnel = self._execution_funnel(
             tickets=tickets,
@@ -171,6 +172,7 @@ class TradingAuditService:
             "counts": {**counts, "market_price_history": price_history_count},
             "fill_summary": fill_summary,
             "pnl": pnl,
+            "exchange_position_discrepancy": position_discrepancy,
             "attribution": attribution,
             "execution_funnel": funnel,
             "signal_funnel": signal_funnel,
@@ -218,13 +220,13 @@ class TradingAuditService:
             result = await session.execute(
                 select(FillRecord)
                 .where(FillRecord.kalshi_env == kalshi_env, FillRecord.created_at >= cutoff)
-                .where((FillRecord.strategy_code.is_(None)) | (FillRecord.order_id.is_(None)))
                 .order_by(FillRecord.created_at.asc())
             )
             fills = list(result.scalars())
             for fill in fills:
                 new_order_id = fill.order_id
                 new_strategy = fill.strategy_code
+                new_side = fill.side
                 reason: str | None = None
                 evidence: dict[str, Any] = {}
 
@@ -246,11 +248,14 @@ class TradingAuditService:
                         strategy_source = "bot_room_client_order_id"
                     new_order_id = new_order_id or matched_order.id
                     new_strategy = new_strategy or matched_order_strategy
+                    if matched_order.side in {"yes", "no"}:
+                        new_side = matched_order.side
                     reason = "raw_order_id_match"
                     evidence = {
                         "raw_order_id": raw_order_id,
                         "local_order_id": matched_order.id,
                         "order_strategy_code": matched_order_strategy,
+                        "order_side": matched_order.side,
                         "strategy_source": strategy_source,
                     }
 
@@ -271,6 +276,7 @@ class TradingAuditService:
                     buy_fill = buy_result.scalar_one_or_none()
                     if buy_fill is not None:
                         new_strategy = buy_fill.strategy_code
+                        new_side = buy_fill.side
                         reason = reason or "same_ticker_side_buy_lot"
                         evidence = {
                             **evidence,
@@ -281,7 +287,8 @@ class TradingAuditService:
 
                 order_changed = new_order_id is not None and fill.order_id != new_order_id
                 strategy_changed = new_strategy is not None and fill.strategy_code != new_strategy
-                if not (order_changed or strategy_changed):
+                side_changed = new_side in {"yes", "no"} and fill.side != new_side
+                if not (order_changed or strategy_changed or side_changed):
                     continue
 
                 candidate = {
@@ -294,6 +301,8 @@ class TradingAuditService:
                     "reason": reason,
                     "old_order_id": fill.order_id,
                     "new_order_id": new_order_id,
+                    "old_side": fill.side,
+                    "new_side": new_side,
                     "old_strategy_code": fill.strategy_code,
                     "new_strategy_code": new_strategy,
                     "evidence": evidence,
@@ -304,6 +313,8 @@ class TradingAuditService:
                         fill.order_id = new_order_id
                     if strategy_changed:
                         fill.strategy_code = new_strategy
+                    if side_changed:
+                        fill.side = new_side
                     updated += 1
                     if updated >= limit:
                         break
@@ -478,9 +489,12 @@ class TradingAuditService:
     def _gross_pnl(self, fills: list[FillRecord]) -> dict[str, Any]:
         lots_by_key: dict[tuple[str, str, str], list[_Lot]] = defaultdict(list)
         gross_pnl = Decimal("0")
+        realized_pnl = Decimal("0")
+        settlement_pnl = Decimal("0")
         realized_trades = 0
         settled_trades = 0
         unsettled_open_contracts = Decimal("0")
+        open_lot_count = 0
         fee_total = Decimal("0")
         fee_seen = 0
 
@@ -505,7 +519,9 @@ class TradingAuditService:
                 if lot.count <= 0:
                     continue
                 matched = min(lot.count, remaining)
-                gross_pnl += (price - lot.price) * matched
+                matched_pnl = (price - lot.price) * matched
+                gross_pnl += matched_pnl
+                realized_pnl += matched_pnl
                 lot.count -= matched
                 remaining -= matched
                 realized_trades += 1
@@ -515,23 +531,77 @@ class TradingAuditService:
                 if lot.count <= 0:
                     continue
                 if lot.settlement_result == "win":
-                    gross_pnl += (Decimal("1") - lot.price) * lot.count
+                    lot_pnl = (Decimal("1") - lot.price) * lot.count
+                    gross_pnl += lot_pnl
+                    settlement_pnl += lot_pnl
                     settled_trades += 1
                 elif lot.settlement_result == "loss":
-                    gross_pnl -= lot.price * lot.count
+                    lot_pnl = -lot.price * lot.count
+                    gross_pnl += lot_pnl
+                    settlement_pnl += lot_pnl
                     settled_trades += 1
                 else:
+                    open_lot_count += 1
                     unsettled_open_contracts += lot.count
 
         all_fees_present = bool(fills) and fee_seen == len(fills)
         return {
             "gross_pnl_dollars": _money(gross_pnl),
+            "fill_ledger_realized_pnl_dollars": _money(realized_pnl),
+            "settlement_pnl_dollars": _money(settlement_pnl),
             "fee_total_dollars": _money(fee_total) if fee_seen else None,
             "net_pnl_dollars": _money(gross_pnl - fee_total) if all_fees_present else None,
             "fee_coverage": {"fills_with_fee": fee_seen, "total_fills": len(fills), "complete": all_fees_present},
             "realized_exit_matches": realized_trades,
             "settled_lots_scored": settled_trades,
+            "open_lot_count": open_lot_count,
             "unsettled_open_contracts": str(unsettled_open_contracts),
+        }
+
+    def _exchange_position_discrepancy(
+        self,
+        *,
+        fills: list[FillRecord],
+        positions: list[PositionRecord],
+    ) -> dict[str, Any]:
+        ledger_open: dict[tuple[str, str], Decimal] = defaultdict(lambda: Decimal("0"))
+        for fill in fills:
+            if fill.settlement_result in {"win", "loss"}:
+                continue
+            key = (fill.market_ticker, fill.side)
+            count = Decimal(fill.count_fp)
+            if fill.action == "buy":
+                ledger_open[key] += count
+            elif fill.action == "sell":
+                ledger_open[key] -= count
+        ledger_open = {key: value for key, value in ledger_open.items() if value != 0}
+
+        exchange_open: dict[tuple[str, str], Decimal] = defaultdict(lambda: Decimal("0"))
+        for position in positions:
+            exchange_open[(position.market_ticker, position.side)] += Decimal(position.count_fp)
+
+        rows: list[dict[str, Any]] = []
+        for key in sorted(set(ledger_open) | set(exchange_open)):
+            ledger_count = ledger_open.get(key, Decimal("0"))
+            exchange_count = exchange_open.get(key, Decimal("0"))
+            discrepancy = ledger_count - exchange_count
+            if discrepancy == 0:
+                continue
+            rows.append(
+                {
+                    "market_ticker": key[0],
+                    "side": key[1],
+                    "ledger_open_contracts": str(ledger_count),
+                    "exchange_open_contracts": str(exchange_count),
+                    "discrepancy_contracts": str(discrepancy),
+                }
+            )
+        return {
+            "discrepancy_count": len(rows),
+            "total_abs_discrepancy_contracts": str(
+                sum((abs(Decimal(row["discrepancy_contracts"])) for row in rows), Decimal("0"))
+            ),
+            "rows": rows[:20],
         }
 
     def _attribution_gaps(self, *, fills: list[FillRecord], orders: list[OrderRecord]) -> dict[str, Any]:

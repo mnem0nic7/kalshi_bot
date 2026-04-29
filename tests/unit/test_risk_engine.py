@@ -455,6 +455,14 @@ def test_risk_engine_blocks_runaway_edge_as_model_error() -> None:
     )
     assert verdict.status == RiskStatus.BLOCKED
     assert any("credibility" in r for r in verdict.reasons)
+    assert "max_credible_edge" in verdict.reason_codes
+    diagnostics = verdict.diagnostics["max_credible_edge"]
+    assert diagnostics["selected_side"] == "yes"
+    assert diagnostics["fair_yes_dollars"] == "0.6400"
+    assert diagnostics["side_fair_dollars"] == "0.6400"
+    assert diagnostics["traded_price_dollars"] == "0.0200"
+    assert diagnostics["forecast_high_f"] == 86
+    assert diagnostics["forecast_delta_f"] == 6.0
 
 
 def test_risk_engine_blocks_when_taker_fee_erases_min_edge() -> None:

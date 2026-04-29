@@ -81,6 +81,58 @@ def _bucket_fit_count(*, available_notional_dollars: Decimal, ticket: TradeTicke
     return quantize_count(raw_count)
 
 
+def _decimal_text(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    try:
+        return str(Decimal(str(value)).quantize(Decimal("0.0001")))
+    except Exception:
+        return str(value)
+
+
+def _candidate_for_side(candidate_trace: dict[str, Any], side: str | None) -> dict[str, Any]:
+    if side in {"yes", "no"} and isinstance(candidate_trace.get(side), dict):
+        return dict(candidate_trace[side])
+    selected = candidate_trace.get("selected_candidate")
+    if isinstance(selected, dict):
+        return dict(selected)
+    for candidate in candidate_trace.get("candidates") or []:
+        if isinstance(candidate, dict) and (side is None or candidate.get("side") == side):
+            return dict(candidate)
+    return {}
+
+
+def _max_credible_edge_diagnostics(
+    *,
+    ticket: TradeTicket,
+    signal: StrategySignal,
+    context: RiskContext,
+) -> dict[str, Any]:
+    selected_side = ticket.side.value
+    candidate_trace = dict(signal.candidate_trace or {})
+    selected = _candidate_for_side(candidate_trace, selected_side)
+    weather = signal.weather
+    side_fair = signal.fair_yes_dollars if selected_side == "yes" else Decimal("1.0000") - signal.fair_yes_dollars
+    traded_price = _ticket_unit_notional(ticket)
+    target_yes = signal.target_yes_price_dollars or ticket.yes_price_dollars
+    return {
+        "fair_yes_dollars": _decimal_text(signal.fair_yes_dollars),
+        "selected_side": selected_side,
+        "side_fair_dollars": _decimal_text(selected.get("fair_side_dollars") or side_fair),
+        "target_yes_price_dollars": _decimal_text(target_yes),
+        "ticket_yes_price_dollars": _decimal_text(ticket.yes_price_dollars),
+        "traded_price_dollars": _decimal_text(selected.get("traded_price_dollars") or traded_price),
+        "spread_bps": selected.get("spread_bps") if selected else candidate_trace.get("spread_bps"),
+        "forecast_high_f": getattr(weather, "forecast_high_f", None) if weather is not None else None,
+        "threshold_f": selected.get("threshold_f") or candidate_trace.get("threshold_f"),
+        "operator": selected.get("operator") or candidate_trace.get("operator"),
+        "forecast_delta_f": getattr(weather, "forecast_delta_f", None) if weather is not None else signal.forecast_delta_f,
+        "market_observed_at": context.market_observed_at.isoformat() if context.market_observed_at else None,
+        "research_observed_at": context.research_observed_at.isoformat() if context.research_observed_at else None,
+        "source_snapshot_ids": candidate_trace.get("source_snapshot_ids") or {},
+    }
+
+
 def approved_ticket_for_verdict(ticket: TradeTicket, verdict: RiskVerdictPayload) -> TradeTicket:
     approved_count = verdict.approved_count_fp or ticket.count_fp
     return ticket.model_copy(update={"count_fp": approved_count})
@@ -122,6 +174,8 @@ class DeterministicRiskEngine:
     ) -> RiskVerdictPayload:
         reasons: list[str] = []
         blocking_reasons: list[str] = []
+        reason_codes: list[str] = []
+        diagnostics: dict[str, Any] = {}
 
         def note(reason: str) -> None:
             if reason not in reasons:
@@ -131,6 +185,10 @@ class DeterministicRiskEngine:
             note(reason)
             if reason not in blocking_reasons:
                 blocking_reasons.append(reason)
+
+        def code(value: str) -> None:
+            if value not in reason_codes:
+                reason_codes.append(value)
 
         now = self._as_utc(context.decision_time) or datetime.now(UTC)
         market_observed_at = self._as_utc(context.market_observed_at)
@@ -178,6 +236,12 @@ class DeterministicRiskEngine:
             block(
                 f"Edge {signal.edge_bps}bps exceeds credibility limit of "
                 f"{self.settings.risk_max_credible_edge_bps}bps; likely model error."
+            )
+            code("max_credible_edge")
+            diagnostics["max_credible_edge"] = _max_credible_edge_diagnostics(
+                ticket=ticket,
+                signal=signal,
+                context=context,
             )
         if signal.confidence < self.settings.risk_min_confidence:
             block(
@@ -369,11 +433,13 @@ class DeterministicRiskEngine:
                     f"{active_thresholds.risk_min_edge_bps}bps "
                     f"(gross {gross_edge_bps}bps, estimated taker fee {fee_edge_bps}bps)."
                 )
+                code("fee_adjusted_edge_below_min")
             else:
                 note(
                     f"Fee-adjusted edge {net_edge_bps}bps clears the configured minimum "
                     f"of {active_thresholds.risk_min_edge_bps}bps."
                 )
+                code("fee_adjusted_edge_pass")
             final_probability_reason = probability_midband_block_reason(
                 fair_yes=signal.fair_yes_dollars,
                 edge_bps=net_edge_bps,
@@ -391,6 +457,8 @@ class DeterministicRiskEngine:
         return RiskVerdictPayload(
             status=status,
             reasons=reasons or ["All deterministic checks passed."],
+            reason_codes=reason_codes,
+            diagnostics=diagnostics,
             gross_edge_bps=gross_edge_bps,
             fee_edge_bps=fee_edge_bps,
             net_edge_bps=net_edge_bps,

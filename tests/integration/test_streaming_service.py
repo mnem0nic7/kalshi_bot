@@ -4,13 +4,28 @@ import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import Checkpoint, FillRecord, MarketState, OrderRecord
+from kalshi_bot.db.models import Checkpoint, FillRecord, MarketState, OpsEvent, OrderRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.streaming import MarketStreamService
 
 
 class DummyWebSocketClient:
+    async def close(self) -> None:
+        return None
+
+
+class FailingWebSocketClient:
+    async def connect(self) -> None:
+        return None
+
+    async def subscribe(self, channels: list[str], market_tickers: list[str] | None = None) -> None:
+        return None
+
+    async def iter_messages(self):
+        raise TimeoutError("ws timeout")
+        yield {}
+
     async def close(self) -> None:
         return None
 
@@ -307,5 +322,38 @@ async def test_streaming_service_handles_interleaved_market_sequences_by_sid(tmp
     assert str(alpha.yes_bid_dollars) == "0.4400"
     assert str(beta.yes_bid_dollars) == "0.3300"
     assert checkpoint.cursor == "3"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_service_rate_limits_repeated_stream_errors(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/stream-errors.db",
+        stream_error_log_cooldown_seconds=900,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = MarketStreamService(settings, session_factory, FailingWebSocketClient())  # type: ignore[arg-type]
+
+    for _ in range(2):
+        with pytest.raises(TimeoutError):
+            await service.stream(market_tickers=["WX-TEST"], include_private=False, max_messages=1)
+
+    async with session_factory() as session:
+        ops_events = list((await session.execute(select(OpsEvent))).scalars())
+        checkpoint = (
+            await session.execute(
+                select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws_error:demo:blue:TimeoutError")
+            )
+        ).scalar_one()
+
+    stream_errors = [event for event in ops_events if event.source == "stream" and "websocket stream error" in event.summary]
+    assert len(stream_errors) == 1
+    assert stream_errors[0].payload["error_type"] == "TimeoutError"
+    assert stream_errors[0].payload["message"] == "ws timeout"
+    assert checkpoint.payload["occurrence_count"] == 2
+    assert checkpoint.payload["last_seen_at"] is not None
 
     await engine.dispose()

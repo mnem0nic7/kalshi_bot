@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from collections.abc import Awaitable, Callable
@@ -139,13 +140,7 @@ class MarketStreamService:
                 logger.exception("market stream loop failed")
                 async with self.session_factory() as session:
                     repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
-                    await repo.log_ops_event(
-                        severity="error",
-                        summary="Kalshi websocket stream error",
-                        source="stream",
-                        payload={"error": str(exc)},
-                        kalshi_env=self.settings.kalshi_env,
-                    )
+                    await self._record_stream_error(repo, exc)
                     await session.commit()
                 await self.websocket_client.close()
                 if max_messages is not None:
@@ -203,6 +198,44 @@ class MarketStreamService:
                 payload=message,
             )
         return None
+
+    async def _record_stream_error(self, repo: PlatformRepository, exc: Exception) -> None:
+        now = datetime.now(UTC)
+        error_type = type(exc).__name__
+        message = str(exc) or repr(exc)
+        checkpoint_key = f"kalshi_ws_error:{self.settings.kalshi_env}:{self.settings.app_color}:{error_type}"
+        checkpoint = await repo.get_checkpoint(checkpoint_key)
+        existing = dict(checkpoint.payload or {}) if checkpoint is not None else {}
+        occurrence_count = int(existing.get("occurrence_count") or 0) + 1
+        first_seen_at = existing.get("first_seen_at") or now.isoformat()
+        last_logged_at = self._parse_datetime(existing.get("last_logged_at"))
+        cooldown = timedelta(seconds=max(0, int(self.settings.stream_error_log_cooldown_seconds)))
+        should_log = last_logged_at is None or now - last_logged_at >= cooldown
+        payload = {
+            "error_type": error_type,
+            "message": message,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": now.isoformat(),
+            "occurrence_count": occurrence_count,
+            "last_logged_at": now.isoformat() if should_log else existing.get("last_logged_at"),
+        }
+        if should_log:
+            await repo.log_ops_event(
+                severity="error",
+                summary=(
+                    "Kalshi websocket stream error"
+                    if occurrence_count == 1
+                    else f"Kalshi websocket stream error repeated {occurrence_count} times"
+                ),
+                source="stream",
+                payload=payload,
+                kalshi_env=self.settings.kalshi_env,
+            )
+        await repo.set_checkpoint(
+            checkpoint_key,
+            cursor=None,
+            payload=payload,
+        )
 
     async def _handle_orderbook_snapshot(self, repo: PlatformRepository, message: dict[str, Any], *, sid: int, seq: int | None) -> None:
         msg = message["msg"]
@@ -312,6 +345,18 @@ class MarketStreamService:
 
     def _checkpoint_name(self, sid: int) -> str:
         return f"kalshi_ws:{self.settings.kalshi_env}:{self.settings.app_color}:{sid}"
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
     def _reset_connection_state(self) -> None:
         self.orderbooks.clear()

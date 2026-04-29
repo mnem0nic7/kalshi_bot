@@ -473,6 +473,98 @@ async def test_auto_trigger_throttles_repeated_live_position_block_logs(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_auto_trigger_suppresses_recent_identical_risk_block_unless_price_moves(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_recent_risk_block.db",
+        trigger_enable_auto_rooms=True,
+        trigger_cooldown_seconds=600,
+        trigger_price_move_bypass_bps=50,
+        trigger_max_spread_bps=1200,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
+    service = AutoTriggerService(settings, session_factory, _directory(), agent_pack_service, supervisor)
+    blocked_at = datetime.now(UTC) - timedelta(seconds=1000)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot=_GOOD_SNAPSHOT,
+            yes_bid_dollars="0.4400",  # type: ignore[arg-type]
+            yes_ask_dollars="0.4800",  # type: ignore[arg-type]
+            last_trade_dollars=None,
+        )
+        await repo.set_checkpoint(
+            "auto_trigger:demo:WX-TEST",
+            cursor=None,
+            payload={
+                "last_triggered_at": blocked_at.isoformat(),
+                "last_trigger_mid": "0.4600",
+            },
+        )
+        await repo.save_decision_trace(
+            room_id=None,
+            ticket_id=None,
+            market_ticker="WX-TEST",
+            kalshi_env=settings.kalshi_env,
+            decision_kind="risk_block",
+            path_version="deterministic",
+            source_snapshot_ids={},
+            input_hash="input",
+            trace_hash="trace",
+            decision_time=blocked_at,
+            trace={
+                "decision_kind": "risk_block",
+                "final_status": "blocked",
+                "ticket": {"side": "no", "yes_price_dollars": "0.4800"},
+                "risk": {"status": "blocked", "reasons": ["Edge exceeds credibility limit."]},
+                "candidate_trace": {"selected_side": "no"},
+            },
+        )
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms(limit=10)
+        ops_events = await repo.list_ops_events(limit=10, kalshi_env=settings.kalshi_env)
+        block_cp = await repo.get_checkpoint("auto_trigger_block:demo:WX-TEST:recent_risk_block")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot=_GOOD_SNAPSHOT,
+            yes_bid_dollars="0.4600",  # type: ignore[arg-type]
+            yes_ask_dollars="0.5000",  # type: ignore[arg-type]
+            last_trade_dollars=None,
+        )
+        await session.commit()
+
+    assert rooms == []
+    assert supervisor.calls == []
+    assert block_cp is not None
+    assert any("recent risk block" in event.summary for event in ops_events)
+
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms(limit=10)
+        await session.commit()
+
+    assert len(rooms) == 1
+    assert len(supervisor.calls) == 1
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_auto_trigger_blocks_when_stop_loss_is_unresolved(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_stop_loss_block.db",

@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -321,6 +321,47 @@ class WorkflowSupervisor:
 
         return True
 
+    async def _recent_duplicate_risk_block_trace_id(
+        self,
+        *,
+        repo: PlatformRepository,
+        room: Room,
+        ticket: TradeTicket,
+        thresholds: RuntimeThresholds,
+    ) -> str | None:
+        latest_trace = await repo.get_latest_decision_trace_for_market(
+            room.market_ticker,
+            kalshi_env=room.kalshi_env,
+        )
+        if latest_trace is None or latest_trace.decision_kind != "risk_block":
+            return None
+        decision_time = latest_trace.decision_time
+        if decision_time.tzinfo is None:
+            decision_time = decision_time.replace(tzinfo=UTC)
+        cooldown_seconds = max(int(thresholds.trigger_cooldown_seconds), 1800)
+        if datetime.now(UTC) - decision_time >= timedelta(seconds=cooldown_seconds):
+            return None
+
+        trace = dict(latest_trace.trace or {})
+        previous_ticket = trace.get("ticket") if isinstance(trace.get("ticket"), dict) else {}
+        previous_side = previous_ticket.get("side")
+        previous_price = previous_ticket.get("yes_price_dollars")
+        previous_risk = trace.get("risk") if isinstance(trace.get("risk"), dict) else {}
+        if previous_side != ticket.side.value:
+            return None
+        if previous_price in (None, ""):
+            return None
+        try:
+            previous_bucket = int(Decimal(str(previous_price)) * Decimal("100"))
+            current_bucket = int(ticket.yes_price_dollars * Decimal("100"))
+        except Exception:
+            return None
+        if previous_bucket != current_bucket:
+            return None
+        if not previous_risk.get("reasons"):
+            return None
+        return latest_trace.id
+
     async def _run_deterministic_fast_path(
         self,
         *,
@@ -395,6 +436,21 @@ class WorkflowSupervisor:
                 sizing_trace["size_factor"] = signal.size_factor
                 sizing_trace["scaled_count_fp"] = scaled
                 ticket = ticket.model_copy(update={"count_fp": scaled}) if scaled > Decimal("0") else None
+
+            if ticket is not None:
+                duplicate_trace_id = await self._recent_duplicate_risk_block_trace_id(
+                    repo=repo,
+                    room=room,
+                    ticket=ticket,
+                    thresholds=thresholds,
+                )
+                if duplicate_trace_id is not None:
+                    sizing_trace["stand_down_reason"] = "duplicate_suppressed"
+                    sizing_trace["duplicate_decision_trace_id"] = duplicate_trace_id
+                    evaluation_outcome = "duplicate_suppressed"
+                    candidate_trace["final_outcome"] = "duplicate_suppressed"
+                    candidate_trace["eligibility_stand_down_reason"] = "duplicate_suppressed"
+                    ticket = None
 
             if ticket is not None:
                 client_order_id = make_client_order_id(room.id, room.market_ticker, ticket.nonce)
@@ -664,10 +720,18 @@ class WorkflowSupervisor:
                 final_status = receipt.status
             else:
                 final_status = "stand_down"
-                evaluation_outcome = evaluation_outcome if evaluation_outcome in {"no_candidate", "pre_risk_filtered"} else "pre_risk_filtered"
+                evaluation_outcome = (
+                    evaluation_outcome
+                    if evaluation_outcome in {"no_candidate", "pre_risk_filtered", "duplicate_suppressed"}
+                    else "pre_risk_filtered"
+                )
         else:
             final_status = "stand_down"
-            evaluation_outcome = evaluation_outcome if evaluation_outcome in {"no_candidate", "pre_risk_filtered"} else "pre_risk_filtered"
+            evaluation_outcome = (
+                evaluation_outcome
+                if evaluation_outcome in {"no_candidate", "pre_risk_filtered", "duplicate_suppressed"}
+                else "pre_risk_filtered"
+            )
         candidate_trace["final_outcome"] = evaluation_outcome
         candidate_trace["final_status"] = final_status
 

@@ -206,6 +206,41 @@ async def test_upsert_fill_inherits_strategy_code_from_kalshi_order(repo_factory
 
 
 @pytest.mark.asyncio
+async def test_upsert_sell_fill_uses_linked_order_side_when_raw_fill_side_disagrees(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        await repo.upsert_order(
+            client_order_id="exit-no",
+            market_ticker="KXHIGHTDAL-26APR29-T70",
+            status="canceled",
+            side="no",
+            action="sell",
+            yes_price_dollars=Decimal("0.2300"),
+            count_fp=Decimal("4.22"),
+            raw={},
+            kalshi_order_id="kord-exit-no",
+            kalshi_env="demo",
+            strategy_code=StrategyCode.DIRECTIONAL.value,
+        )
+
+        fill = await repo.upsert_fill(
+            market_ticker="KXHIGHTDAL-26APR29-T70",
+            side="yes",
+            action="sell",
+            yes_price_dollars=Decimal("0.2300"),
+            count_fp=Decimal("4.12"),
+            raw={"order_id": "kord-exit-no"},
+            trade_id="exit-fill-no",
+            kalshi_env="demo",
+        )
+
+        assert fill.side == "no"
+        assert fill.strategy_code == StrategyCode.DIRECTIONAL.value
+        assert fill.order_id is not None
+
+
+@pytest.mark.asyncio
 async def test_upsert_sell_fill_inherits_strategy_from_latest_same_side_buy(repo_factory, room_id):
     session_ctx = await repo_factory()
     async with session_ctx as session:

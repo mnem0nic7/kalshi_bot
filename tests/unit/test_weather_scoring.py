@@ -34,6 +34,7 @@ def test_score_weather_market_above_threshold_is_bullish() -> None:
     assert signal.fair_yes_dollars > 0.5
     assert signal.confidence > 0.45
     assert signal.resolution_state == WeatherResolutionState.UNRESOLVED
+    assert "above-threshold 80.0F contract" in signal.summary
 
 
 def test_score_weather_market_locks_yes_when_above_threshold_is_already_met() -> None:
@@ -249,6 +250,7 @@ def test_score_weather_market_penalizes_longshot_no_setup() -> None:
 
     assert signal.trade_regime == "longshot_no"
     assert signal.fair_yes_dollars == Decimal("0.9736")
+    assert "below-threshold 73.0F contract" in signal.summary
 
 
 def test_extract_forecast_high_f_returns_target_date_not_hottest_day() -> None:

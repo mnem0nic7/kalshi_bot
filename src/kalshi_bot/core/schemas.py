@@ -85,6 +85,8 @@ class TradeTicket(BaseModel):
 class RiskVerdictPayload(BaseModel):
     status: RiskStatus
     reasons: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
     gross_edge_bps: int | None = None
     fee_edge_bps: int | None = None
     net_edge_bps: int | None = None

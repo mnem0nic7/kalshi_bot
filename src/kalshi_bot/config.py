@@ -245,6 +245,7 @@ class Settings(BaseSettings):
     research_refresh_cooldown_seconds: int = 120
     research_web_max_results: int = 5
     research_web_max_queries: int = 2
+    stream_error_log_cooldown_seconds: int = 900
     trigger_enable_auto_rooms: bool = False
     trigger_cooldown_seconds: int = 300
     trigger_price_move_bypass_bps: int = 1500

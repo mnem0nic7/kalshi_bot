@@ -36,10 +36,12 @@ MODEL_CARD_VERSION = "trade-analysis-model-card-v1"
 TRAINING_EXCLUDED_REASONS = {
     "missing_market_snapshot",
     "missing_weather_snapshot",
+    "pending_settlement",
     "missing_settlement_label",
     "missing_side",
     "missing_ticket_price",
 }
+PENDING_EXCLUSION_REASONS = {"pending_settlement"}
 MODEL_REQUIRED_FEATURES = {
     "edge_bps",
     "confidence",
@@ -129,6 +131,16 @@ def _market_day_from_ticker(ticker: str) -> str | None:
     return parts[1] if len(parts) >= 2 else None
 
 
+def _market_date_from_ticker(ticker: str) -> datetime | None:
+    market_day = _market_day_from_ticker(ticker)
+    if market_day is None:
+        return None
+    try:
+        return datetime.strptime(market_day, "%y%b%d").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 def _series_from_ticker(ticker: str) -> str | None:
     prefix = ticker.split("-")[0] if ticker else ""
     return prefix or None
@@ -174,6 +186,73 @@ def _gross_pnl_for_side(
     yes_value = Decimal(settlement_value)
     payout = yes_value if side == "yes" else Decimal("1") - yes_value
     return (payout - entry) * Decimal(count)
+
+
+@dataclass(slots=True)
+class _LifecycleLot:
+    count: Decimal
+    price: Decimal
+
+
+def _gross_pnl_for_lifecycle(
+    *,
+    side: str | None,
+    fills: list[FillRecord],
+    buy_yes_price: Decimal | None,
+    fallback_count: Decimal | None,
+    settlement_value: Decimal | None,
+) -> Decimal | None:
+    if side not in {"yes", "no"}:
+        return None
+    lots: list[_LifecycleLot] = []
+    gross = Decimal("0")
+    saw_buy = False
+    matched_exit = False
+
+    for fill in sorted(fills, key=lambda item: (_as_utc(item.created_at) or datetime.min.replace(tzinfo=UTC), item.id)):
+        if fill.side != side:
+            continue
+        price = _side_cost_from_yes_price(side, fill.yes_price_dollars)
+        if price is None:
+            continue
+        count = Decimal(fill.count_fp)
+        if fill.action == "buy":
+            saw_buy = True
+            lots.append(_LifecycleLot(count=count, price=price))
+            continue
+        if fill.action != "sell":
+            continue
+        remaining = count
+        for lot in lots:
+            if remaining <= 0:
+                break
+            if lot.count <= 0:
+                continue
+            matched = min(lot.count, remaining)
+            gross += (price - lot.price) * matched
+            lot.count -= matched
+            remaining -= matched
+            matched_exit = True
+
+    unsettled_count = sum((lot.count for lot in lots if lot.count > 0), Decimal("0"))
+    if unsettled_count and settlement_value is not None:
+        yes_value = Decimal(settlement_value)
+        payout = yes_value if side == "yes" else Decimal("1") - yes_value
+        for lot in lots:
+            if lot.count <= 0:
+                continue
+            gross += (payout - lot.price) * lot.count
+
+    if saw_buy and (matched_exit or settlement_value is not None):
+        return gross
+
+    return _gross_pnl_for_side(
+        side=side,
+        count=fallback_count,
+        buy_yes_price=buy_yes_price,
+        avg_fill_yes_price=None,
+        settlement_value=settlement_value,
+    )
 
 
 @dataclass(slots=True)
@@ -252,6 +331,7 @@ class TradeAnalysisService:
                 ticket = tickets.get(room.id)
                 risk = risks.get(ticket.id) if ticket is not None else None
                 related_orders = self._related_orders(ticket, orders_by_ticket, orders_by_client)
+                related_orders = self._related_lifecycle_orders(ticket, related_orders, orders)
                 related_fills = [
                     fill
                     for order in related_orders
@@ -304,6 +384,16 @@ class TradeAnalysisService:
                     for reason in row.get("exclusion_reasons", [])
                 ).most_common(20)
             ],
+            "pending_settlement_count": sum(
+                1
+                for row in dataset.rows
+                if any(reason in PENDING_EXCLUSION_REASONS for reason in row.get("exclusion_reasons", []))
+            ),
+            "data_defect_count": sum(
+                1
+                for row in dataset.rows
+                if any(reason not in PENDING_EXCLUSION_REASONS for reason in row.get("exclusion_reasons", []))
+            ),
             "stale_market_snapshot_diagnostics": self._stale_market_snapshot_diagnostics(dataset.rows),
             "by_decision_status": dict(Counter(row.get("decision_status") for row in dataset.rows)),
             "by_series": dict(Counter(row.get("series_ticker") or "<unknown>" for row in dataset.rows)),
@@ -625,6 +715,41 @@ class TradeAnalysisService:
         out.sort(key=lambda order: (order.created_at, order.id))
         return out
 
+    def _related_lifecycle_orders(
+        self,
+        ticket: TradeTicketRecord | None,
+        base_orders: list[OrderRecord],
+        all_orders: list[OrderRecord],
+    ) -> list[OrderRecord]:
+        if ticket is None:
+            return base_orders
+        seen = {order.id for order in base_orders}
+        out = list(base_orders)
+        side = ticket.side if ticket.side in {"yes", "no"} else None
+        strategy_code = ticket.strategy_code or next((order.strategy_code for order in base_orders if order.strategy_code), None)
+        start_at = _as_utc(ticket.created_at)
+        if side is None or start_at is None:
+            return out
+
+        for order in all_orders:
+            if order.id in seen:
+                continue
+            if order.market_ticker != ticket.market_ticker:
+                continue
+            if order.side != side or order.action != "sell":
+                continue
+            if _as_utc(order.created_at) is None or _as_utc(order.created_at) < start_at:
+                continue
+            if order.trade_ticket_id and order.trade_ticket_id != ticket.id:
+                continue
+            if strategy_code is not None and order.strategy_code not in {strategy_code, None}:
+                continue
+            seen.add(order.id)
+            out.append(order)
+
+        out.sort(key=lambda order: (order.created_at, order.id))
+        return out
+
     def _row(
         self,
         *,
@@ -650,20 +775,21 @@ class TradeAnalysisService:
             else next((order.strategy_code for order in orders if order.strategy_code), None)
         )
         order_statuses = [order.status for order in orders]
-        fill_count = sum(Decimal(fill.count_fp) for fill in fills) if fills else Decimal("0")
-        fill_notional = sum((Decimal(fill.yes_price_dollars) * Decimal(fill.count_fp)) for fill in fills) if fills else Decimal("0")
-        avg_fill_yes = (fill_notional / fill_count) if fill_count else None
         ticket_price = Decimal(ticket.yes_price_dollars) if ticket is not None else None
         ticket_count = Decimal(ticket.count_fp) if ticket is not None else None
         settlement_value = settlement.settlement_value_dollars if settlement is not None else None
         kalshi_result = settlement.kalshi_result if settlement is not None else None
         side = ticket.side if ticket is not None else None
+        entry_fills = [fill for fill in fills if fill.action == "buy" and (side is None or fill.side == side)]
+        fill_count = sum(Decimal(fill.count_fp) for fill in entry_fills) if entry_fills else Decimal("0")
+        fill_notional = sum((Decimal(fill.yes_price_dollars) * Decimal(fill.count_fp)) for fill in entry_fills) if entry_fills else Decimal("0")
+        avg_fill_yes = (fill_notional / fill_count) if fill_count else None
         label_win = _label_win_for_side(side, kalshi_result, settlement_value)
-        gross_pnl = _gross_pnl_for_side(
+        gross_pnl = _gross_pnl_for_lifecycle(
             side=side,
-            count=fill_count if fill_count else ticket_count,
             buy_yes_price=ticket_price,
-            avg_fill_yes_price=avg_fill_yes,
+            fallback_count=fill_count if fill_count else ticket_count,
+            fills=fills,
             settlement_value=settlement_value,
         )
         market_observed_at = _as_utc(market_snapshot.get("observed_at")) if market_snapshot else None
@@ -691,7 +817,9 @@ class TradeAnalysisService:
         fair = Decimal(signal.fair_yes_dollars)
         side_cost = _side_cost_from_yes_price(side, ticket_price)
         model_edge = (Decimal("1") - fair if side == "no" else fair) - side_cost if side_cost is not None else None
+        decision_status = self._decision_status(ticket=ticket, risk=risk, orders=orders, fills=fills)
         exclusion_reasons = self._exclusion_reasons(
+            market_ticker=room.market_ticker,
             market_snapshot=market_snapshot,
             weather_snapshot=weather_snapshot,
             settlement=settlement,
@@ -700,8 +828,9 @@ class TradeAnalysisService:
             stale_market_seconds=stale_market_seconds,
             stale_weather_seconds=stale_weather_seconds,
             strategy_code=strategy_code,
+            decision_status=decision_status,
+            now=now,
         )
-        decision_status = self._decision_status(ticket=ticket, risk=risk, orders=orders, fills=fills)
         return {
             "schema_version": SCHEMA_VERSION,
             "kalshi_env": room.kalshi_env,
@@ -806,6 +935,7 @@ class TradeAnalysisService:
     def _exclusion_reasons(
         self,
         *,
+        market_ticker: str,
         market_snapshot: dict[str, Any] | None,
         weather_snapshot: dict[str, Any] | None,
         settlement: HistoricalSettlementLabelRecord | None,
@@ -814,6 +944,8 @@ class TradeAnalysisService:
         stale_market_seconds: float | None,
         stale_weather_seconds: float | None,
         strategy_code: str | None,
+        decision_status: str,
+        now: datetime,
     ) -> list[str]:
         reasons: list[str] = []
         if market_snapshot is None:
@@ -825,14 +957,26 @@ class TradeAnalysisService:
         elif stale_weather_seconds is not None and stale_weather_seconds > self.settings.risk_stale_weather_seconds:
             reasons.append("stale_weather_snapshot")
         if settlement is None or (settlement.settlement_value_dollars is None and settlement.kalshi_result is None):
-            reasons.append("missing_settlement_label")
-        if side not in {"yes", "no"}:
+            reason = self._settlement_missing_reason(market_ticker=market_ticker, now=now)
+            reasons.append(reason)
+        expects_execution_fields = decision_status != "signal_only"
+        if expects_execution_fields and side not in {"yes", "no"}:
             reasons.append("missing_side")
-        if ticket_price is None:
+        if expects_execution_fields and ticket_price is None:
             reasons.append("missing_ticket_price")
-        if strategy_code is None:
+        if expects_execution_fields and strategy_code is None:
             reasons.append("missing_strategy_attribution")
         return reasons
+
+    @staticmethod
+    def _settlement_missing_reason(*, market_ticker: str, now: datetime) -> str:
+        market_date = _market_date_from_ticker(market_ticker)
+        if market_date is None:
+            return "missing_settlement_label"
+        now_utc = _as_utc(now) or _utc_now()
+        if market_date.date() >= (now_utc.date() - timedelta(days=2)):
+            return "pending_settlement"
+        return "missing_settlement_label"
 
     def _forecast_residual(self, weather_snapshot: dict[str, Any] | None, mapping: Any | None) -> float | None:
         if weather_snapshot is None or mapping is None or getattr(mapping, "threshold_f", None) is None:
