@@ -146,6 +146,7 @@ class TradingAuditService:
         stop_loss = self._stop_loss_clusters(ops_events, now=now)
         risk = self._risk_summary(risk_verdicts)
         ops = self._ops_summary(ops_events)
+        trigger_diagnostics = self._trigger_diagnostics(ops_events)
         exposure = self._position_exposure(
             positions=positions,
             market_states=market_states,
@@ -181,6 +182,7 @@ class TradingAuditService:
             "stop_loss": stop_loss,
             "risk": risk,
             "ops": ops,
+            "trigger_diagnostics": trigger_diagnostics,
             "open_positions": exposure,
             "issues": issues,
         }
@@ -983,6 +985,73 @@ class TradingAuditService:
             ],
         }
 
+    def _trigger_diagnostics(self, ops_events: list[OpsEvent]) -> dict[str, Any]:
+        tracked_reasons = {
+            "market_state_missing",
+            "one_sided_book",
+            "non_positive_spread",
+            "spread_too_wide",
+        }
+        reason_counts: Counter[str] = Counter()
+        actionability_counts: Counter[str] = Counter()
+        market_rollups: dict[str, dict[str, Any]] = {}
+
+        for event in ops_events:
+            if event.source != "auto_trigger":
+                continue
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            reason = str(payload.get("reason") or "")
+            if reason not in tracked_reasons:
+                continue
+            ticker = str(payload.get("market_ticker") or "unknown")
+            reason_counts[reason] += 1
+            actionability = str(payload.get("actionability") or reason)
+            actionability_counts[actionability] += 1
+            latest_at = _as_utc(event.created_at)
+            row = market_rollups.setdefault(
+                ticker,
+                {
+                    "market_ticker": ticker,
+                    "count": 0,
+                    "reason_counts": Counter(),
+                    "latest_at": latest_at,
+                    "latest_reason": reason,
+                    "latest_summary": event.summary,
+                },
+            )
+            row["count"] += 1
+            row["reason_counts"][reason] += 1
+            current_latest = row.get("latest_at")
+            if latest_at is not None and (current_latest is None or latest_at > current_latest):
+                row["latest_at"] = latest_at
+                row["latest_reason"] = reason
+                row["latest_summary"] = event.summary
+
+        top_markets = []
+        for row in market_rollups.values():
+            top_markets.append(
+                {
+                    "market_ticker": row["market_ticker"],
+                    "count": row["count"],
+                    "reason_counts": dict(row["reason_counts"]),
+                    "latest_reason": row["latest_reason"],
+                    "latest_summary": row["latest_summary"],
+                    "latest_at": _iso(row["latest_at"]),
+                }
+            )
+        top_markets.sort(key=lambda row: (int(row["count"]), row["latest_at"] or ""), reverse=True)
+
+        return {
+            "pre_room_miss_count": sum(reason_counts.values()),
+            "one_sided_book_count": int(reason_counts.get("one_sided_book", 0)),
+            "wide_spread_count": int(reason_counts.get("spread_too_wide", 0)),
+            "invalid_spread_count": int(reason_counts.get("non_positive_spread", 0)),
+            "missing_market_state_count": int(reason_counts.get("market_state_missing", 0)),
+            "reason_counts": dict(reason_counts),
+            "actionability_counts": dict(actionability_counts),
+            "top_markets": top_markets[:20],
+        }
+
     def _position_exposure(
         self,
         *,
@@ -1144,6 +1213,7 @@ def format_trading_audit_text(report: dict[str, Any]) -> str:
     exposure = report["open_positions"]
     stop_loss = report["stop_loss"]
     risk = report["risk"]
+    trigger = report.get("trigger_diagnostics", {})
     issues = report["issues"]
 
     lines = [
@@ -1158,6 +1228,12 @@ def format_trading_audit_text(report: dict[str, Any]) -> str:
         f"Approved without order: {funnel['approved_without_order_count']}  Failed orders: {funnel['failed_order_count']}",
         f"Open positions: {exposure['position_count']}  stale/missing marks: {exposure['stale_or_missing_mark_count']}",
         f"Stop-loss events: {stop_loss['event_count']}",
+        (
+            "Auto-trigger pre-room misses: "
+            f"{trigger.get('pre_room_miss_count', 0)} "
+            f"(one-sided book: {trigger.get('one_sided_book_count', 0)}, "
+            f"wide spread: {trigger.get('wide_spread_count', 0)})"
+        ),
         "",
         "Top risk reasons:",
     ]

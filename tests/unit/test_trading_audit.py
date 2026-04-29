@@ -508,6 +508,88 @@ async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) 
 
 
 @pytest.mark.asyncio
+async def test_trading_audit_tracks_pre_room_liquidity_misses_separately_from_no_edge(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        room = _room("room-no-edge", "KXHIGHNY-26APR24-T67")
+        session.add_all([
+            room,
+            Signal(
+                room_id=room.id,
+                market_ticker=room.market_ticker,
+                fair_yes_dollars=Decimal("0.5100"),
+                edge_bps=25,
+                confidence=0.55,
+                summary="Stand down: no edge",
+                payload={
+                    "evaluation_outcome": "pre_risk_filtered",
+                    "stand_down_reason": "no_actionable_edge",
+                },
+                created_at=NOW - timedelta(minutes=30),
+                updated_at=NOW - timedelta(minutes=30),
+            ),
+            OpsEvent(
+                kalshi_env="production",
+                severity="info",
+                source="auto_trigger",
+                summary="Auto-trigger skipped for KXHIGHAUS-26APR29-T83: one-sided order book (no_bid, yes_ask)",
+                payload={
+                    "market_ticker": "KXHIGHAUS-26APR29-T83",
+                    "reason": "one_sided_book",
+                    "diagnostic_class": "pre_room_liquidity",
+                    "actionability": "missed_due_to_one_sided_book",
+                    "missing_quotes": ["no_bid", "yes_ask"],
+                },
+                created_at=NOW - timedelta(minutes=20),
+                updated_at=NOW - timedelta(minutes=20),
+            ),
+            OpsEvent(
+                kalshi_env="production",
+                severity="info",
+                source="auto_trigger",
+                summary="Auto-trigger skipped for KXHIGHAUS-26APR29-T83: spread 1700bps exceeds trigger limit 1200bps",
+                payload={
+                    "market_ticker": "KXHIGHAUS-26APR29-T83",
+                    "reason": "spread_too_wide",
+                    "diagnostic_class": "pre_room_liquidity",
+                    "actionability": "missed_due_to_wide_spread",
+                    "spread_bps": 1700,
+                    "max_spread_bps": 1200,
+                },
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+        ])
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=1,
+        now=NOW,
+    )
+
+    assert {row["reason"]: row["count"] for row in report["signal_funnel"]["top_stand_down_reasons"]} == {
+        "no_actionable_edge": 1,
+    }
+    assert report["trigger_diagnostics"]["pre_room_miss_count"] == 2
+    assert report["trigger_diagnostics"]["one_sided_book_count"] == 1
+    assert report["trigger_diagnostics"]["wide_spread_count"] == 1
+    assert report["trigger_diagnostics"]["reason_counts"] == {
+        "one_sided_book": 1,
+        "spread_too_wide": 1,
+    }
+    assert report["trigger_diagnostics"]["actionability_counts"] == {
+        "missed_due_to_one_sided_book": 1,
+        "missed_due_to_wide_spread": 1,
+    }
+    assert report["trigger_diagnostics"]["top_markets"][0]["market_ticker"] == "KXHIGHAUS-26APR29-T83"
+    assert report["trigger_diagnostics"]["top_markets"][0]["reason_counts"] == {
+        "one_sided_book": 1,
+        "spread_too_wide": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_trading_audit_keeps_legacy_selected_without_ticket_out_of_high_blockers(audit_harness) -> None:
     settings, session_factory = audit_harness
     async with session_factory() as session:

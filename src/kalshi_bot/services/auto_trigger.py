@@ -63,9 +63,21 @@ class AutoTriggerService:
             pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
             thresholds = self.agent_pack_service.runtime_thresholds(pack)
             market_state = await repo.get_market_state(market_ticker, kalshi_env=self.settings.kalshi_env)
-            if market_state is None or not self._market_is_actionable(market_state, thresholds):
+            actionability_block = self._market_actionability_block(market_state, thresholds)
+            if actionability_block is not None:
+                reason = str(actionability_block["reason"])
+                await self._log_block_once_per_cooldown(
+                    repo,
+                    checkpoint_key=f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:{reason}",
+                    cooldown_seconds=max(thresholds.trigger_cooldown_seconds, 1800),
+                    severity="info",
+                    summary=self._market_actionability_summary(market_ticker, actionability_block),
+                    payload={"market_ticker": market_ticker, **actionability_block},
+                    kalshi_env=self.settings.kalshi_env,
+                )
                 await session.commit()
                 return
+            assert market_state is not None
             terminal_market = self._terminal_market_lifecycle(market_state)
             if terminal_market is not None:
                 await self._log_block_once_per_cooldown(
@@ -455,14 +467,88 @@ class AutoTriggerService:
         )
 
     def _market_is_actionable(self, market_state: MarketState, thresholds: RuntimeThresholds) -> bool:
+        return self._market_actionability_block(market_state, thresholds) is None
+
+    def _market_actionability_block(
+        self,
+        market_state: MarketState | None,
+        thresholds: RuntimeThresholds,
+    ) -> dict[str, Any] | None:
+        if market_state is None:
+            return {
+                "reason": "market_state_missing",
+                "diagnostic_class": "pre_room_liquidity",
+                "actionability": "missed_due_to_missing_market_state",
+            }
+
         yes_bid = market_state.yes_bid_dollars
         yes_ask = market_state.yes_ask_dollars
-        if yes_bid is None or yes_ask is None:
-            return False
+        missing_quotes = []
+        if yes_bid is None or yes_bid <= 0:
+            missing_quotes.extend(["yes_bid", "no_ask"])
+        if yes_ask is None or yes_ask <= 0:
+            missing_quotes.extend(["yes_ask", "no_bid"])
+        if missing_quotes:
+            return {
+                "reason": "one_sided_book",
+                "diagnostic_class": "pre_room_liquidity",
+                "actionability": "missed_due_to_one_sided_book",
+                "missing_quotes": sorted(set(missing_quotes)),
+                "yes_bid_dollars": self._decimal_or_none_str(yes_bid),
+                "yes_ask_dollars": self._decimal_or_none_str(yes_ask),
+                "derived_no_bid_dollars": (
+                    self._decimal_or_none_str(Decimal("1") - yes_ask)
+                    if yes_ask is not None
+                    else None
+                ),
+                "derived_no_ask_dollars": (
+                    self._decimal_or_none_str(Decimal("1") - yes_bid)
+                    if yes_bid is not None
+                    else None
+                ),
+                "market_observed_at": self._iso_or_none(market_state.observed_at),
+            }
+
         spread_bps = self._spread_bps(market_state)
         if spread_bps <= 0:
-            return False
-        return spread_bps <= thresholds.trigger_max_spread_bps
+            return {
+                "reason": "non_positive_spread",
+                "diagnostic_class": "pre_room_liquidity",
+                "actionability": "missed_due_to_invalid_spread",
+                "spread_bps": spread_bps,
+                "yes_bid_dollars": self._decimal_or_none_str(yes_bid),
+                "yes_ask_dollars": self._decimal_or_none_str(yes_ask),
+                "market_observed_at": self._iso_or_none(market_state.observed_at),
+            }
+        if spread_bps > thresholds.trigger_max_spread_bps:
+            return {
+                "reason": "spread_too_wide",
+                "diagnostic_class": "pre_room_liquidity",
+                "actionability": "missed_due_to_wide_spread",
+                "spread_bps": spread_bps,
+                "max_spread_bps": thresholds.trigger_max_spread_bps,
+                "yes_bid_dollars": self._decimal_or_none_str(yes_bid),
+                "yes_ask_dollars": self._decimal_or_none_str(yes_ask),
+                "market_observed_at": self._iso_or_none(market_state.observed_at),
+            }
+        return None
+
+    @staticmethod
+    def _market_actionability_summary(market_ticker: str, block: dict[str, Any]) -> str:
+        reason = str(block.get("reason") or "unknown")
+        if reason == "one_sided_book":
+            missing = ", ".join(str(item) for item in block.get("missing_quotes") or [])
+            return f"Auto-trigger skipped for {market_ticker}: one-sided order book ({missing})"
+        if reason == "spread_too_wide":
+            return (
+                f"Auto-trigger skipped for {market_ticker}: spread "
+                f"{block.get('spread_bps')}bps exceeds trigger limit {block.get('max_spread_bps')}bps"
+            )
+        if reason == "non_positive_spread":
+            return f"Auto-trigger skipped for {market_ticker}: non-positive order-book spread"
+        if reason == "market_state_missing":
+            return f"Auto-trigger skipped for {market_ticker}: missing market state"
+        return f"Auto-trigger skipped for {market_ticker}: market is not actionable"
 
     def _fresh_resolved_research(
         self,
@@ -564,6 +650,10 @@ class AutoTriggerService:
     def _iso_or_none(value: datetime | None) -> str | None:
         parsed = AutoTriggerService._as_utc(value)
         return parsed.isoformat() if parsed is not None else None
+
+    @staticmethod
+    def _decimal_or_none_str(value: Decimal | None) -> str | None:
+        return str(value) if value is not None else None
 
     @staticmethod
     def _lower_or_none(value: Any) -> str | None:

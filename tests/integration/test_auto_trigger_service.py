@@ -139,6 +139,62 @@ async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_auto_trigger_logs_one_sided_book_without_room_creation(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_one_sided.db",
+        trigger_enable_auto_rooms=True,
+        trigger_cooldown_seconds=600,
+        trigger_max_spread_bps=1200,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
+    service = AutoTriggerService(settings, session_factory, _directory(), agent_pack_service, supervisor)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot={
+                "market_ticker": "WX-TEST",
+                "market": {
+                    "yes_bid_dollars": "0.7300",
+                    "yes_ask_dollars": None,
+                },
+            },
+            yes_bid_dollars=Decimal("0.7300"),
+            yes_ask_dollars=None,
+            last_trade_dollars=None,
+        )
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms(limit=10)
+        ops_events = await repo.list_ops_events(limit=10, kalshi_env=settings.kalshi_env)
+        checkpoint = await repo.get_checkpoint("auto_trigger_block:demo:WX-TEST:one_sided_book")
+        await session.commit()
+
+    matching = [event for event in ops_events if "one-sided order book" in event.summary]
+    assert rooms == []
+    assert supervisor.calls == []
+    assert len(matching) == 1
+    assert checkpoint is not None
+    assert checkpoint.payload["reason"] == "one_sided_book"
+    assert checkpoint.payload["actionability"] == "missed_due_to_one_sided_book"
+    assert checkpoint.payload["missing_quotes"] == ["no_bid", "yes_ask"]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_auto_trigger_skips_fresh_resolved_research_before_room_creation(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_resolved_research.db",
