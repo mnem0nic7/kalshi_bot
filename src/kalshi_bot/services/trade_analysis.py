@@ -56,6 +56,7 @@ POINT_IN_TIME_HISTORICAL_MARKET_SOURCES = {
     "captured_market_snapshot",
     "reconstructed_market_checkpoint",
 }
+IN_CLAUSE_BATCH_SIZE = 10_000
 
 
 def _utc_now() -> datetime:
@@ -124,6 +125,11 @@ def _counter_rows(rows: list[dict[str, Any]], key: str, *, limit: int = 20) -> l
         {"value": value, "rows": count}
         for value, count in Counter(str(row.get(key) or "<unknown>") for row in rows).most_common(limit)
     ]
+
+
+def _batches(values: list[str], size: int = IN_CLAUSE_BATCH_SIZE) -> list[list[str]]:
+    batch_size = max(1, int(size))
+    return [values[idx: idx + batch_size] for idx in range(0, len(values), batch_size)]
 
 
 def _market_day_from_ticker(ticker: str) -> str | None:
@@ -506,8 +512,10 @@ class TradeAnalysisService:
     ) -> dict[str, Any]:
         if not room_ids:
             return {}
-        result = await session.execute(select(model).where(model.room_id.in_(room_ids)))
-        records = list(result.scalars())
+        records: list[Any] = []
+        for batch in _batches(room_ids):
+            result = await session.execute(select(model).where(model.room_id.in_(batch)))
+            records.extend(result.scalars())
         records.sort(key=lambda r: (r.room_id, order_fields[0].__get__(r, model), order_fields[1].__get__(r, model)))
         latest: dict[str, Any] = {}
         for record in records:
@@ -517,7 +525,10 @@ class TradeAnalysisService:
     async def _latest_risk_by_ticket(self, session: AsyncSession, ticket_ids: list[str]) -> dict[str, RiskVerdictRecord]:
         if not ticket_ids:
             return {}
-        records = list((await session.execute(select(RiskVerdictRecord).where(RiskVerdictRecord.ticket_id.in_(ticket_ids)))).scalars())
+        records: list[RiskVerdictRecord] = []
+        for batch in _batches(ticket_ids):
+            result = await session.execute(select(RiskVerdictRecord).where(RiskVerdictRecord.ticket_id.in_(batch)))
+            records.extend(result.scalars())
         records.sort(key=lambda r: (r.ticket_id, r.created_at, r.id))
         latest: dict[str, RiskVerdictRecord] = {}
         for record in records:
@@ -565,13 +576,10 @@ class TradeAnalysisService:
     async def _replay_by_room(self, session: AsyncSession, room_ids: list[str]) -> dict[str, HistoricalReplayRunRecord]:
         if not room_ids:
             return {}
-        rows = list(
-            (
-                await session.execute(
-                    select(HistoricalReplayRunRecord).where(HistoricalReplayRunRecord.room_id.in_(room_ids))
-                )
-            ).scalars()
-        )
+        rows: list[HistoricalReplayRunRecord] = []
+        for batch in _batches(room_ids):
+            result = await session.execute(select(HistoricalReplayRunRecord).where(HistoricalReplayRunRecord.room_id.in_(batch)))
+            rows.extend(result.scalars())
         return {str(row.room_id): row for row in rows if row.room_id}
 
     async def _market_snapshot(

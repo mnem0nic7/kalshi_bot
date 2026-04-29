@@ -22,6 +22,7 @@ from kalshi_bot.db.models import (
     TradeTicketRecord,
 )
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+import kalshi_bot.services.trade_analysis as trade_analysis_module
 from kalshi_bot.services.trade_analysis import TradeAnalysisService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 from kalshi_bot.weather.models import WeatherMarketMapping
@@ -349,6 +350,29 @@ async def test_trade_analysis_marks_signal_only_unresolved_rows_pending_not_miss
     assert row["exclusion_reasons"] == ["pending_settlement"]
     assert report["pending_settlement_count"] == 1
     assert report["data_defect_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_trade_analysis_batches_large_room_id_loads(analysis_harness, monkeypatch) -> None:
+    monkeypatch.setattr(trade_analysis_module, "IN_CLAUSE_BATCH_SIZE", 2)
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        records: list[object] = []
+        for idx in range(5):
+            room_id = f"room-batch-{idx}"
+            records.extend([_room(room_id), _signal(room_id)])
+        records.extend(_snapshots())
+        session.add_all(records)
+        await session.commit()
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    assert len(dataset.rows) == 5
+    assert {row["decision_status"] for row in dataset.rows} == {"signal_only"}
 
 
 @pytest.mark.asyncio
