@@ -15,6 +15,13 @@ name: Self Improve
         description: Stage a passing candidate on the inactive color
         type: boolean
         default: true
+      target:
+        description: Improvement target to run
+        type: choice
+        options:
+          - parameter_pack
+          - agent_pack_legacy
+        default: parameter_pack
 
 permissions:
   contents: read
@@ -46,6 +53,13 @@ jobs:
             tests/unit/test_provider_router_gemini.py \
             tests/unit/test_agent_pack_service.py \
             tests/unit/test_self_improve_service.py \
+            tests/unit/test_parameter_pack.py \
+            tests/unit/test_promotion_gates.py \
+            tests/unit/test_drift_watcher.py \
+            tests/unit/test_learned_head.py \
+            tests/unit/test_nws_discussion_parser.py \
+            tests/integration/test_parameter_pack_repository.py \
+            tests/integration/test_parameter_pack_promotion_service.py \
             tests/integration/test_training_export_service.py
 
   remote-loop:
@@ -64,19 +78,20 @@ jobs:
       INPUT_DAYS: ${{ github.event.inputs.days }}
       INPUT_LIMIT: ${{ github.event.inputs.limit }}
       INPUT_STAGE_CANDIDATE: ${{ github.event.inputs.stage_candidate }}
+      INPUT_TARGET: ${{ github.event.inputs.target }}
     steps:
-      - name: Skip when deploy or Gemini secrets are missing
-        if: env.DEPLOY_HOST == '' || env.DEPLOY_USER == '' || env.DEPLOY_SSH_KEY == '' || env.DEPLOY_APP_DIR == '' || env.GEMINI_API_KEY == ''
+      - name: Skip when deploy secrets are missing
+        if: env.DEPLOY_HOST == '' || env.DEPLOY_USER == '' || env.DEPLOY_SSH_KEY == '' || env.DEPLOY_APP_DIR == ''
         run: |
           {
             echo "## Self Improve"
             echo
-            echo "Skipped remote self-improve because one or more required secrets are missing."
-            echo "Needed: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_APP_DIR, GEMINI_KEY or GEMINI_API_KEY"
+            echo "Skipped remote self-improve because one or more required deploy secrets are missing."
+            echo "Needed: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_APP_DIR"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Prepare SSH
-        if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' && env.DEPLOY_APP_DIR != '' && env.GEMINI_API_KEY != ''
+        if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' && env.DEPLOY_APP_DIR != ''
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
@@ -102,8 +117,8 @@ jobs:
             echo "::warning::ssh-keyscan failed for ${DEPLOY_HOST}:${DEPLOY_SSH_PORT}; SSH will use StrictHostKeyChecking=accept-new"
           fi
 
-      - name: Run critique, eval, and optional staging
-        if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' && env.DEPLOY_APP_DIR != '' && env.GEMINI_API_KEY != ''
+      - name: Run parameter-pack or legacy agent self-improve
+        if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' && env.DEPLOY_APP_DIR != ''
         id: self_improve
         run: |
           set -euo pipefail
@@ -111,6 +126,11 @@ jobs:
           days="${INPUT_DAYS:-14}"
           limit="${INPUT_LIMIT:-200}"
           stage_candidate="${INPUT_STAGE_CANDIDATE:-true}"
+          target="${INPUT_TARGET:-parameter_pack}"
+          case "${target}" in
+            parameter_pack|agent_pack_legacy) ;;
+            *) echo "Invalid self-improve target: ${target}" >&2; exit 1 ;;
+          esac
           ssh_cmd=(
             ssh
             -i ~/.ssh/id_ed25519
@@ -125,8 +145,67 @@ jobs:
           )
 
           app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
+          remote_cd="cd ${app_dir_quoted}"
+
+          if [[ "${target}" == "parameter_pack" ]]; then
+            hard_caps_json="$("${ssh_cmd[@]}" "${remote_cd} && APP_SERVICE=app_demo_blue infra/scripts/run-parameter-pack.sh hard-caps")"
+            printf '%s\n' "${hard_caps_json}" > parameter-hard-caps.json
+            jq -e 'type == "object" and (.config_hash | type == "string") and (.hard_caps | type == "object")' parameter-hard-caps.json >/dev/null
+
+            parameter_status_json="$("${ssh_cmd[@]}" "${remote_cd} && APP_SERVICE=app_demo_blue infra/scripts/run-parameter-pack.sh status")"
+            printf '%s\n' "${parameter_status_json}" > parameter-status.json
+            jq -e 'type == "object" and (.kalshi_env | type == "string") and (.parameter_packs | type == "object") and (.promotion_starvation | type == "object")' parameter-status.json >/dev/null
+
+            {
+              echo "candidate_version="
+              echo "evaluation_run_id="
+              echo "passed=false"
+              echo "staged=false"
+              echo "inactive_color="
+            } >> "${GITHUB_OUTPUT}"
+
+            {
+              echo "## Self Improve"
+              echo
+              echo "- Target: \`parameter_pack\`"
+              echo "- Status: \`not_ready_for_parameter_pack_replay\`"
+              echo "- Live risk changed: \`false\`"
+              echo "- Hard-cap config hash: \`$(jq -r '.config_hash' parameter-hard-caps.json)\`"
+              echo "- Active color: \`$(jq -r '.active_color' parameter-status.json)\`"
+              echo
+              echo "Parameter-pack scheduled automation is active only as a preflight in this pass."
+              echo "It requires replay search artifacts and passing holdout gates before staging any candidate."
+              echo
+              echo "### Parameter-Pack Status"
+              echo '```json'
+              cat parameter-status.json
+              echo
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          if [[ -z "${GEMINI_API_KEY}" ]]; then
+            {
+              echo "candidate_version="
+              echo "evaluation_run_id="
+              echo "passed=false"
+              echo "staged=false"
+              echo "inactive_color="
+            } >> "${GITHUB_OUTPUT}"
+
+            {
+              echo "## Self Improve"
+              echo
+              echo "- Target: \`agent_pack_legacy\`"
+              echo "- Status: \`skipped_missing_gemini_secret\`"
+              echo "Needed for legacy agent-pack mode only: GEMINI_KEY or GEMINI_API_KEY"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
           gemini_quoted="$(printf '%q' "${GEMINI_API_KEY}")"
-          remote_prefix="cd ${app_dir_quoted} && export GEMINI_API_KEY=${gemini_quoted}"
+          remote_prefix="${remote_cd} && export GEMINI_API_KEY=${gemini_quoted}"
 
           sync_json="$("${ssh_cmd[@]}" "${remote_prefix} && python3 -c \"from pathlib import Path; import json, os; env_path = Path('.env'); gemini = os.environ['GEMINI_API_KEY']; lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []; updated = []; found = False; [updated.append(f'GEMINI_API_KEY={gemini}') if line.startswith('GEMINI_API_KEY=') else updated.append(line) for line in lines]; found = any(line.startswith('GEMINI_API_KEY=') for line in lines); updated = updated if found else updated + [f'GEMINI_API_KEY={gemini}']; env_path.write_text('\\n'.join(updated) + '\\n', encoding='utf-8'); print(json.dumps({'synced': True}))\"")"
           printf '%s\n' "${sync_json}" > sync.json

@@ -17,6 +17,7 @@ COPY src ./src
 COPY alembic ./alembic
 COPY alembic.ini ./
 COPY docs ./docs
+COPY infra/config ./infra/config
 
 # Re-register editable install with real source (no dep download)
 RUN pip install --no-cache-dir -e .

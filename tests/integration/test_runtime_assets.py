@@ -32,10 +32,12 @@ def test_compose_file_declares_service_healthchecks() -> None:
 def test_runtime_scripts_rebuild_migrate_image_before_using_it() -> None:
     start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
     watchdog = Path("infra/scripts/watchdog-run-once.sh").read_text(encoding="utf-8")
+    dockerfile = Path("infra/docker/Dockerfile").read_text(encoding="utf-8")
 
     assert 'docker compose -f "${compose_file}" ${compose_env_file} build "migrate_${env_name}" >/dev/null' in start_stack
     assert "run_migrate" in start_stack
     assert 'docker compose -f "${compose_file}" build "migrate_${env_name}" >/dev/null' in watchdog
+    assert "COPY infra/config ./infra/config" in dockerfile
 
 
 def test_runtime_scripts_refresh_caddy_after_app_recreate() -> None:
@@ -76,6 +78,13 @@ def test_github_vps_workflows_use_portable_ssh_options() -> None:
 def test_self_improve_workflow_preflights_training_readiness() -> None:
     workflow_text = Path(".github/workflows/self-improve.yml").read_text(encoding="utf-8")
 
+    assert "target:" in workflow_text
+    assert "parameter_pack" in workflow_text
+    assert "agent_pack_legacy" in workflow_text
+    assert 'target="${INPUT_TARGET:-parameter_pack}"' in workflow_text
+    assert "infra/scripts/run-parameter-pack.sh hard-caps" in workflow_text
+    assert "infra/scripts/run-parameter-pack.sh status" in workflow_text
+    assert "not_ready_for_parameter_pack_replay" in workflow_text
     assert 'infra/scripts/run-self-improve.sh status")' in workflow_text
     assert "APP_SERVICE=app_demo_blue" in workflow_text
     assert "APP_SERVICE=app_blue" not in workflow_text
@@ -83,6 +92,16 @@ def test_self_improve_workflow_preflights_training_readiness() -> None:
     assert "ready_for_critique" in workflow_text
     assert "missing_indicators" in workflow_text
     assert "exit 0" in workflow_text
+
+
+def test_parameter_pack_wrapper_targets_parameter_pack_cli() -> None:
+    script = Path("infra/scripts/run-parameter-pack.sh")
+    script_text = script.read_text(encoding="utf-8")
+
+    assert script.stat().st_mode & 0o111
+    assert "usage: run-parameter-pack.sh" in script_text
+    assert 'service="${APP_SERVICE:-app_demo_blue}"' in script_text
+    assert 'python -m kalshi_bot.cli parameter-pack "$@"' in script_text
 
 
 def test_self_improve_workflow_preserves_hard_failures() -> None:
@@ -178,6 +197,8 @@ def test_deterministic_autonomy_docs_anchor_phase_zero_trace_replay() -> None:
     assert "risk-engine bypasses" in self_improve
     assert "not an activator" in self_improve
     assert "max_drawdown_pct" in self_improve
+    assert "not_ready_for_parameter_pack_replay" in self_improve
+    assert "run-parameter-pack.sh status" in self_improve
     assert "decision-trace replay" in strategy
 
 

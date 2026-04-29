@@ -1,6 +1,8 @@
 # Self Improve
 
-This system currently runs Gemini-first agent-pack self-improvement for the non-canonical agent room. The trading decision path remains deterministic by default, and Phase 0 deterministic autonomy adds durable `decision_traces` so future self-improvement can graduate from prompt packs to replay-tested parameter packs.
+This system now treats parameter-pack preflight as the scheduled self-improve path. The trading decision path remains deterministic by default, and Phase 0 deterministic autonomy adds durable `decision_traces` so self-improvement can graduate from prompt packs to replay-tested parameter packs.
+
+Gemini-first agent-pack self-improvement still exists for the non-canonical agent room, but it is a manual legacy target. Scheduled automation should not require Gemini just to discover that replay-backed parameter evidence is not ready yet.
 
 Long-term target: promote bounded parameter packs, not LLM trade logic. A candidate parameter pack must be produced offline from strict-as-of replay data, evaluated on a holdout window, staged on the inactive blue/green color, and rolled back automatically if canary or live guardrails fail.
 
@@ -61,7 +63,7 @@ Hard caps remain outside the pack and operator-only:
 
 Promotion requires complete `decision_traces`, strict-as-of replay, holdout gates, and canary shadow evidence. The existing agent-pack workflow remains available until the parameter-pack promotion service replaces it.
 
-Phase 4 scaffolding is present now: bounded `parameter_packs` records, deterministic pack hashes, hard-cap exclusion during sanitization, holdout promotion gates, DB-audited parameter-pack staging, and calibration drift pause criteria. Holdout gates require enough resolved trades before a candidate can pass, so missing or tiny samples stay in promotion-starvation instead of being promoted. These pieces are not yet wired to autonomous nightly promotion; they exist so replay search can be added without mixing mutable trading parameters into LLM agent-pack state.
+Phase 4 scaffolding is present now: bounded `parameter_packs` records, deterministic pack hashes, hard-cap exclusion during sanitization, holdout promotion gates, DB-audited parameter-pack staging, and calibration drift pause criteria. Holdout gates require enough resolved trades before a candidate can pass, so missing or tiny samples stay in promotion-starvation instead of being promoted. The scheduled workflow runs the parameter-pack hard-cap/status preflight and exits success as `not_ready_for_parameter_pack_replay` until replay search artifacts and holdout evidence exist.
 
 The operator-owned caps live in `infra/config/hard_caps.yaml`. Parameter-pack validation can print a hash of that sealed config and can run in `--strict` mode to fail candidates that attempt to include hard-cap fields. The parameter-pack promotion gate loads the same sealed config and applies its `max_drawdown_pct` as the hard replay drawdown ceiling.
 
@@ -102,6 +104,8 @@ The helper scripts wrap the same flow for Docker blue or green deployments:
 ```bash
 infra/scripts/run-self-improve.sh status
 infra/scripts/run-self-improve.sh critique --days 14 --limit 200
+infra/scripts/run-parameter-pack.sh hard-caps
+infra/scripts/run-parameter-pack.sh status
 infra/scripts/restart-color.sh green
 ```
 
@@ -112,10 +116,19 @@ Two workflows support the control plane:
 - `.github/workflows/self-improve.yml`
 - `.github/workflows/rollback-agent-pack.yml`
 
-`Self Improve` does three things:
+`Self Improve` defaults to the `parameter_pack` target:
 
-1. Runs a local offline test slice for Gemini, agent-pack, and training export logic.
-2. SSHes to the VPS, syncs the configured Gemini key into the remote `.env`, then runs:
+1. Runs a local offline test slice for Gemini legacy code plus parameter-pack gates, drift, canary, and repository logic.
+2. SSHes to the VPS without requiring Gemini secrets.
+3. Runs:
+   - `parameter-pack hard-caps`
+   - `parameter-pack status`
+4. Exits success with `not_ready_for_parameter_pack_replay` unless replay search artifacts and holdout gates are explicitly wired for candidate staging.
+
+Manual dispatch may choose the `agent_pack_legacy` target. That legacy path:
+
+1. Requires `GEMINI_KEY` or `GEMINI_API_KEY`.
+2. Syncs the configured Gemini key into the remote `.env`, then runs:
    - `self-improve critique`
    - `self-improve eval`
    - `self-improve promote` when the holdout summary passes
