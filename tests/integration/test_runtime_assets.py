@@ -33,11 +33,15 @@ def test_runtime_scripts_rebuild_migrate_image_before_using_it() -> None:
     start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
     watchdog = Path("infra/scripts/watchdog-run-once.sh").read_text(encoding="utf-8")
     dockerfile = Path("infra/docker/Dockerfile").read_text(encoding="utf-8")
+    dockerignore = Path(".dockerignore").read_text(encoding="utf-8")
 
     assert 'docker compose -f "${compose_file}" ${compose_env_file} build "migrate_${env_name}" >/dev/null' in start_stack
     assert "run_migrate" in start_stack
     assert 'docker compose -f "${compose_file}" build "migrate_${env_name}" >/dev/null' in watchdog
     assert "COPY infra/config ./infra/config" in dockerfile
+    assert "infra/*" in dockerignore
+    assert "!infra/config/" in dockerignore
+    assert "!infra/config/**" in dockerignore
 
 
 def test_runtime_scripts_refresh_caddy_after_app_recreate() -> None:

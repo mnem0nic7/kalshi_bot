@@ -8,7 +8,9 @@ __pycache__
 .ruff_cache
 tests/
 data/
-infra/
+infra/*
+!infra/config/
+!infra/config/**
 *.pem
 *.key
 Kalshi-*.txt
