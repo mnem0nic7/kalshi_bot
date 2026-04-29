@@ -17,9 +17,30 @@ from kalshi_bot.core.schemas import AgentRoleRuntime
 logger = logging.getLogger(__name__)
 
 
+def _redacted_url(value: httpx.URL | str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        url = value if isinstance(value, httpx.URL) else httpx.URL(str(value))
+        return str(url.copy_with(query=None))
+    except Exception:
+        text = str(value)
+        return text.split("?", 1)[0]
+
+
+def _llm_error_summary(exc: BaseException | None) -> str:
+    if exc is None:
+        return "unknown provider error"
+    if isinstance(exc, httpx.HTTPStatusError):
+        request = exc.request
+        endpoint = _redacted_url(request.url)
+        return f"HTTP {exc.response.status_code} from {request.method} {endpoint}"
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _is_retryable_llm_error(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in {429, 500, 502, 503}
+        return exc.response.status_code in {500, 502, 503, 504}
     return False
 
 
@@ -31,7 +52,7 @@ _llm_retry = retry(
     before_sleep=lambda retry_state: logger.warning(
         "LLM provider call failed (attempt %d), retrying: %s",
         retry_state.attempt_number,
-        retry_state.outcome.exception(),
+        _llm_error_summary(retry_state.outcome.exception() if retry_state.outcome is not None else None),
     ),
 )
 

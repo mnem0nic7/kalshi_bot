@@ -6,7 +6,14 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
-from kalshi_bot.agents.providers import NativeGeminiProvider, OpenAICompatibleProvider, ProviderConfig, ProviderRouter
+from kalshi_bot.agents.providers import (
+    NativeGeminiProvider,
+    OpenAICompatibleProvider,
+    ProviderConfig,
+    ProviderRouter,
+    _is_retryable_llm_error,
+    _llm_error_summary,
+)
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import AgentRoleRuntime
@@ -113,6 +120,55 @@ async def test_provider_router_uses_openai_key_alias_and_never_builds_codex() ->
     assert codex_usage.fallback_used is True
 
     await router.close()
+
+
+def test_llm_retry_policy_does_not_retry_rate_limits_and_redacts_keys() -> None:
+    request = httpx.Request(
+        "POST",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent?key=gemini-key",
+    )
+    rate_limited = httpx.HTTPStatusError(
+        "rate limited",
+        request=request,
+        response=httpx.Response(429, request=request),
+    )
+    unavailable = httpx.HTTPStatusError(
+        "unavailable",
+        request=request,
+        response=httpx.Response(503, request=request),
+    )
+
+    assert _is_retryable_llm_error(rate_limited) is False
+    assert _is_retryable_llm_error(unavailable) is True
+    summary = _llm_error_summary(unavailable)
+    assert "HTTP 503" in summary
+    assert "generateContent" in summary
+    assert "gemini-key" not in summary
+    assert "key=" not in summary
+
+
+@pytest.mark.asyncio
+async def test_gemini_rate_limit_raises_without_retrying() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, request=request, json={"error": {"message": "quota"}})
+
+    provider = _gemini_provider_with_transport(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await provider.complete_json(
+            system_prompt="system",
+            user_prompt="user",
+            model="gemini-2.5-pro",
+            temperature=0.2,
+            schema_model=SampleProviderPayload,
+        )
+
+    assert calls == 1
+    await provider.close()
 
 
 def test_provider_router_uses_gemini_defaults_for_llm_roles() -> None:

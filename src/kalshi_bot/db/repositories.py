@@ -2252,6 +2252,38 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         return list(result.scalars())
 
     async def set_checkpoint(self, stream_name: str, cursor: str | None, payload: dict[str, Any]) -> Checkpoint:
+        bind = self.session.get_bind()
+        dialect_name = bind.dialect.name if bind is not None else ""
+        now = datetime.now(UTC)
+        insert_values = {
+            "id": str(uuid4()),
+            "stream_name": stream_name,
+            "cursor": cursor,
+            "payload": payload,
+            "created_at": now,
+            "updated_at": now,
+        }
+        if dialect_name in {"postgresql", "sqlite"}:
+            insert_stmt = (pg_insert if dialect_name == "postgresql" else sqlite_insert)(Checkpoint).values(
+                **insert_values
+            )
+            stmt = (
+                insert_stmt.on_conflict_do_update(
+                    index_elements=["stream_name"],
+                    set_={
+                        "cursor": insert_stmt.excluded.cursor,
+                        "payload": insert_stmt.excluded.payload,
+                        "updated_at": now,
+                    },
+                )
+                .returning(Checkpoint.id)
+            )
+            checkpoint_id = (await self.session.execute(stmt)).scalar_one()
+            checkpoint = await self.session.get(Checkpoint, checkpoint_id, populate_existing=True)
+            if checkpoint is None:
+                raise RuntimeError(f"checkpoint upsert returned missing id for {stream_name}")
+            return checkpoint
+
         stmt = select(Checkpoint).where(Checkpoint.stream_name == stream_name)
         checkpoint = (await self.session.execute(stmt)).scalar_one_or_none()
         if checkpoint is None:

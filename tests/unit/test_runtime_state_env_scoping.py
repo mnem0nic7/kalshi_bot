@@ -158,6 +158,37 @@ async def test_reconcile_checkpoints_and_fill_metrics_are_env_scoped(tmp_path) -
 
 
 @pytest.mark.asyncio
+async def test_set_checkpoint_upserts_existing_stream(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/checkpoint_upsert.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        first = await repo.set_checkpoint("auto_trigger_waitlist:demo:WX-TEST", None, {"miss_count": 1})
+        first_id = first.id
+        await session.commit()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        second = await repo.set_checkpoint("auto_trigger_waitlist:demo:WX-TEST", "2", {"miss_count": 2})
+        await session.commit()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        checkpoint = await repo.get_checkpoint("auto_trigger_waitlist:demo:WX-TEST")
+        await session.commit()
+
+    assert second.id == first_id
+    assert checkpoint is not None
+    assert checkpoint.id == first_id
+    assert checkpoint.cursor == "2"
+    assert checkpoint.payload == {"miss_count": 2}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_ops_events_are_filtered_by_env(tmp_path) -> None:
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/runtime_events.db")
     engine = create_engine(settings)

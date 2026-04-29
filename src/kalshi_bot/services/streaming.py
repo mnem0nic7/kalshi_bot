@@ -126,7 +126,7 @@ class MarketStreamService:
                     if on_market_update is not None and updated_market is not None:
                         task = asyncio.create_task(on_market_update(updated_market))
                         pending_tasks.add(task)
-                        task.add_done_callback(pending_tasks.discard)
+                        task.add_done_callback(lambda done: self._discard_market_update_task(pending_tasks, done))
                     processed += 1
                     if max_messages is not None and processed >= max_messages:
                         await self.websocket_client.close()
@@ -147,6 +147,16 @@ class MarketStreamService:
                     raise
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
+
+    @staticmethod
+    def _discard_market_update_task(pending_tasks: set[asyncio.Task], task: asyncio.Task) -> None:
+        pending_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.exception("market update callback failed")
 
     async def _subscribe(self, market_tickers: list[str], *, include_private: bool) -> None:
         await self.websocket_client.subscribe(["market_lifecycle_v2"])
