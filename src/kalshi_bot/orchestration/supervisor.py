@@ -12,10 +12,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage, StrategyCode
+from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage, StandDownReason, StrategyCode
 from kalshi_bot.core.fixed_point import as_decimal, make_client_order_id, quantize_count
 from kalshi_bot.core.metrics import ACTIVE_ROOMS, ORDERS_TOTAL, ROOM_RUNS_TOTAL
-from kalshi_bot.core.schemas import ExecReceiptPayload, RiskVerdictPayload, RoomMessageCreate, RoomMessageRead, TradeTicket
+from kalshi_bot.core.schemas import ExecReceiptPayload, RiskVerdictPayload, RoomMessageCreate, RoomMessageRead, TradeEligibilityVerdict, TradeTicket
 from kalshi_bot.db.models import Room
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
@@ -48,6 +48,9 @@ from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 logger = logging.getLogger(__name__)
+
+EXTREME_EDGE_DAILY_HIGH_AGREEMENT_TOLERANCE_F = 3.0
+EXTREME_EDGE_CURRENT_TEMP_TOLERANCE_F = 1.0
 
 
 def _hash_payload(payload: dict[str, Any]) -> str:
@@ -106,6 +109,66 @@ def _research_ref_time(
     """
     obs = signal.weather.observation_time if signal.weather is not None else None
     return obs or fallback
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ticker_threshold_f(market_ticker: str) -> float | None:
+    tail = market_ticker.rsplit("-T", 1)
+    if len(tail) != 2:
+        return None
+    return _float_or_none(tail[1])
+
+
+def _ticker_local_market_day(market_ticker: str) -> str | None:
+    parts = market_ticker.split("-")
+    if len(parts) < 2:
+        return None
+    try:
+        return datetime.strptime(parts[1].upper(), "%y%b%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def _normalised_strike_f(raw: Any) -> float | None:
+    value = _float_or_none(raw)
+    if value is None:
+        return None
+    return value * 1_000_000 if 0 < value < 1.0 else value
+
+
+def _yes_contract_true_for_daily_high(operator: str | None, daily_high_f: float, threshold_f: float) -> bool | None:
+    if operator == ">":
+        return daily_high_f > threshold_f
+    if operator == ">=":
+        return daily_high_f >= threshold_f
+    if operator == "<":
+        return daily_high_f < threshold_f
+    if operator == "<=":
+        return daily_high_f <= threshold_f
+    return None
+
+
+def _selected_side_impossible_from_current(
+    *,
+    operator: str | None,
+    selected_side: ContractSide | None,
+    current_temp_f: float,
+    threshold_f: float,
+) -> bool:
+    yes_now = _yes_contract_true_for_daily_high(operator, current_temp_f, threshold_f)
+    if yes_now is True and selected_side == ContractSide.NO and operator in {">", ">="}:
+        return True
+    if yes_now is False and selected_side == ContractSide.YES and operator in {"<", "<="}:
+        return True
+    return False
 
 
 class WorkflowSupervisor:
@@ -320,6 +383,283 @@ class WorkflowSupervisor:
             signal.size_factor = min(Decimal(volume) / Decimal("50"), Decimal("1.00"))
 
         return True
+
+    async def _apply_extreme_edge_diagnostic_gate(
+        self,
+        repo: "PlatformRepository",
+        signal: StrategySignal,
+        *,
+        market_ticker: str,
+        market: dict[str, Any] | None,
+        kalshi_env: str,
+        room_id: str | None,
+        weather_archive_source_id: str | None,
+    ) -> bool:
+        if signal.edge_bps <= int(self.settings.risk_max_credible_edge_bps):
+            return True
+        if signal.eligibility is not None and not signal.eligibility.eligible:
+            return False
+
+        candidate_trace = dict(signal.candidate_trace or {})
+        existing = candidate_trace.get("extreme_edge_diagnostic")
+        if isinstance(existing, dict) and existing.get("passed") is False:
+            return False
+
+        diagnostic = await self._build_extreme_edge_diagnostic(
+            repo=repo,
+            signal=signal,
+            market_ticker=market_ticker,
+            market=market,
+            weather_archive_source_id=weather_archive_source_id,
+        )
+        candidate_trace["extreme_edge_diagnostic"] = diagnostic
+        reason_codes = list(candidate_trace.get("reason_codes") or [])
+        if not diagnostic["passed"]:
+            reason_codes.extend(["extreme_edge_diagnostic_failed", *diagnostic["reason_codes"]])
+        candidate_trace["reason_codes"] = sorted({str(code) for code in reason_codes})
+        signal.candidate_trace = candidate_trace
+
+        if diagnostic["passed"]:
+            if signal.eligibility is not None:
+                signal.eligibility = signal.eligibility.model_copy(update={"candidate_trace": candidate_trace})
+            return True
+
+        reason = StandDownReason.EXTREME_EDGE_DIAGNOSTIC_FAILED
+        candidate_trace["eligibility_outcome"] = "pre_risk_filtered"
+        candidate_trace["eligibility_stand_down_reason"] = reason.value
+        signal.candidate_trace = candidate_trace
+        msg = (
+            f"Extreme edge {signal.edge_bps}bps exceeds credibility limit of "
+            f"{self.settings.risk_max_credible_edge_bps}bps and failed diagnostic checks: "
+            f"{', '.join(diagnostic['reason_codes'])}."
+        )
+        if signal.eligibility is None:
+            signal.eligibility = TradeEligibilityVerdict(
+                eligible=False,
+                stand_down_reason=reason,
+                evaluation_outcome="pre_risk_filtered",
+                candidate_trace=candidate_trace,
+                reasons=[msg],
+            )
+        else:
+            signal.eligibility = signal.eligibility.model_copy(
+                update={
+                    "eligible": False,
+                    "stand_down_reason": reason,
+                    "evaluation_outcome": "pre_risk_filtered",
+                    "candidate_trace": candidate_trace,
+                    "reasons": [*list(signal.eligibility.reasons), msg],
+                }
+            )
+        signal.stand_down_reason = reason
+        signal.evaluation_outcome = "pre_risk_filtered"
+        signal.summary = f"Stand down: {msg}"
+        await repo.log_ops_event(
+            severity="info",
+            summary=f"Extreme-edge diagnostic failed for {market_ticker}",
+            source="supervisor",
+            room_id=room_id,
+            kalshi_env=kalshi_env,
+            payload={
+                "market_ticker": market_ticker,
+                "edge_bps": signal.edge_bps,
+                "limit_bps": self.settings.risk_max_credible_edge_bps,
+                "reason_codes": diagnostic["reason_codes"],
+                "diagnostic": diagnostic,
+            },
+        )
+        return False
+
+    async def _build_extreme_edge_diagnostic(
+        self,
+        *,
+        repo: "PlatformRepository",
+        signal: StrategySignal,
+        market_ticker: str,
+        market: dict[str, Any] | None,
+        weather_archive_source_id: str | None,
+    ) -> dict[str, Any]:
+        reason_codes: list[str] = []
+        checks: dict[str, Any] = {}
+        diagnostics: dict[str, Any] = {
+            "diagnostic_class": "extreme_edge_over_5000bps",
+            "edge_bps": signal.edge_bps,
+            "limit_bps": self.settings.risk_max_credible_edge_bps,
+            "selected_side": signal.recommended_side.value if signal.recommended_side is not None else None,
+            "target_yes_price_dollars": str(signal.target_yes_price_dollars) if signal.target_yes_price_dollars is not None else None,
+            "fair_yes_dollars": str(signal.fair_yes_dollars),
+            "weather_archive_source_id": weather_archive_source_id,
+        }
+
+        mapping = self.weather_directory.resolve_market(market_ticker, market) if market is not None else self.weather_directory.resolve_market_stub(market_ticker)
+        operator = getattr(mapping, "operator", None) if mapping is not None else None
+        threshold_f = _float_or_none(getattr(mapping, "threshold_f", None)) if mapping is not None else None
+        station_id = getattr(mapping, "station_id", None) if mapping is not None else None
+        local_market_day = _ticker_local_market_day(market_ticker)
+        diagnostics["market_metadata"] = {
+            "resolved": mapping.model_dump(mode="json") if mapping is not None else None,
+            "ticker_threshold_f": _ticker_threshold_f(market_ticker),
+            "strike_type": market.get("strike_type") if isinstance(market, dict) else None,
+            "floor_strike": market.get("floor_strike") if isinstance(market, dict) else None,
+            "cap_strike": market.get("cap_strike") if isinstance(market, dict) else None,
+            "title": market.get("title") if isinstance(market, dict) else None,
+            "subtitle": market.get("subtitle") if isinstance(market, dict) else None,
+        }
+
+        metadata_ok = mapping is not None and operator is not None and threshold_f is not None
+        strike_type = str(market.get("strike_type") or "") if isinstance(market, dict) else ""
+        strike_operator = ">" if strike_type == "greater" else "<" if strike_type == "less" else None
+        if strike_operator is not None and operator != strike_operator:
+            metadata_ok = False
+            reason_codes.append("market_metadata_polarity_conflict")
+        ticker_threshold = _ticker_threshold_f(market_ticker)
+        if ticker_threshold is not None and threshold_f is not None and abs(ticker_threshold - threshold_f) > 0.01:
+            metadata_ok = False
+            reason_codes.append("market_metadata_threshold_conflict")
+        raw_strike = None
+        if strike_operator == ">":
+            raw_strike = market.get("floor_strike") if isinstance(market, dict) else None
+        elif strike_operator == "<":
+            raw_strike = market.get("cap_strike") if isinstance(market, dict) else None
+        api_threshold = _normalised_strike_f(raw_strike)
+        if api_threshold is not None and threshold_f is not None and abs(api_threshold - threshold_f) > 0.01:
+            metadata_ok = False
+            reason_codes.append("market_metadata_api_strike_conflict")
+        if not metadata_ok:
+            reason_codes.append("market_metadata_polarity_unverified")
+
+        current_snapshot = None
+        comparison_snapshot = None
+        if station_id:
+            if weather_archive_source_id:
+                current_snapshot = await repo.get_historical_weather_snapshot_by_source(
+                    station_id=str(station_id),
+                    source_kind="archived_weather_bundle",
+                    source_id=weather_archive_source_id,
+                )
+            if current_snapshot is None:
+                current_snapshot = await repo.get_latest_historical_weather_snapshot(
+                    station_id=str(station_id),
+                    before_asof=datetime.now(UTC),
+                    local_market_day=local_market_day,
+                )
+            if current_snapshot is not None:
+                local_market_day = current_snapshot.local_market_day or local_market_day
+                snapshots = await repo.list_historical_weather_snapshots(
+                    station_id=str(station_id),
+                    local_market_day=local_market_day,
+                    before_asof=current_snapshot.asof_ts,
+                    limit=8,
+                )
+                for snapshot in snapshots:
+                    if snapshot.id == current_snapshot.id:
+                        continue
+                    if weather_archive_source_id and snapshot.source_id == weather_archive_source_id:
+                        continue
+                    if current_snapshot.source_hash and snapshot.source_hash == current_snapshot.source_hash:
+                        continue
+                    comparison_snapshot = snapshot
+                    break
+
+        current_high = _float_or_none(getattr(current_snapshot, "forecast_high_f", None))
+        comparison_high = _float_or_none(getattr(comparison_snapshot, "forecast_high_f", None))
+        current_temp = _float_or_none(getattr(current_snapshot, "current_temp_f", None))
+        if current_temp is None and signal.weather is not None:
+            current_temp = signal.weather.current_temp_f
+        if current_high is None and signal.weather is not None:
+            current_high = signal.weather.forecast_high_f
+        diagnostics["station_daily_high_sources"] = {
+            "station_id": station_id,
+            "local_market_day": local_market_day,
+            "current": self._historical_weather_snapshot_summary(current_snapshot),
+            "comparison": self._historical_weather_snapshot_summary(comparison_snapshot),
+            "agreement_tolerance_f": EXTREME_EDGE_DAILY_HIGH_AGREEMENT_TOLERANCE_F,
+        }
+
+        source_agreement_ok = current_high is not None and comparison_high is not None
+        if not source_agreement_ok:
+            reason_codes.append("station_daily_high_source_missing")
+        else:
+            high_delta = abs(current_high - comparison_high)
+            source_agreement_ok = high_delta <= EXTREME_EDGE_DAILY_HIGH_AGREEMENT_TOLERANCE_F
+            diagnostics["station_daily_high_sources"]["forecast_high_delta_f"] = round(high_delta, 3)
+            if not source_agreement_ok:
+                reason_codes.append("station_daily_high_source_disagreement")
+        checks["station_daily_high_source_agreement"] = {
+            "passed": source_agreement_ok,
+            "current_forecast_high_f": current_high,
+            "comparison_forecast_high_f": comparison_high,
+        }
+
+        current_sanity_ok = current_temp is not None and current_high is not None
+        current_sanity_reasons: list[str] = []
+        if not current_sanity_ok:
+            current_sanity_reasons.append("current_observed_temp_missing")
+        else:
+            if current_temp > current_high + EXTREME_EDGE_CURRENT_TEMP_TOLERANCE_F:
+                current_sanity_ok = False
+                current_sanity_reasons.append("current_observed_temp_exceeds_forecast_high")
+            if threshold_f is not None and _selected_side_impossible_from_current(
+                operator=operator,
+                selected_side=signal.recommended_side,
+                current_temp_f=current_temp,
+                threshold_f=threshold_f,
+            ):
+                current_sanity_ok = False
+                current_sanity_reasons.append("current_observed_temp_contradicts_selected_side")
+        reason_codes.extend(current_sanity_reasons)
+        checks["current_observed_temp_sanity"] = {
+            "passed": current_sanity_ok,
+            "current_temp_f": current_temp,
+            "forecast_high_f": current_high,
+            "reasons": current_sanity_reasons,
+        }
+
+        polarity_ok = metadata_ok and current_high is not None and threshold_f is not None
+        polarity_reasons: list[str] = []
+        if not polarity_ok:
+            polarity_reasons.append("market_metadata_polarity_unverified")
+        else:
+            yes_supported = _yes_contract_true_for_daily_high(operator, current_high, threshold_f)
+            fair_yes = float(signal.fair_yes_dollars)
+            if yes_supported is True and fair_yes < 0.45:
+                polarity_ok = False
+                polarity_reasons.append("market_metadata_polarity_forecast_conflict")
+            elif yes_supported is False and fair_yes > 0.55:
+                polarity_ok = False
+                polarity_reasons.append("market_metadata_polarity_forecast_conflict")
+        reason_codes.extend(polarity_reasons)
+        checks["market_metadata_polarity_verification"] = {
+            "passed": polarity_ok,
+            "operator": operator,
+            "threshold_f": threshold_f,
+            "forecast_high_f": current_high,
+            "fair_yes_dollars": str(signal.fair_yes_dollars),
+            "reasons": polarity_reasons,
+        }
+
+        unique_reason_codes = sorted({code for code in reason_codes if code})
+        return {
+            "passed": not unique_reason_codes,
+            "reason_codes": unique_reason_codes,
+            "checks": checks,
+            "diagnostics": diagnostics,
+        }
+
+    @staticmethod
+    def _historical_weather_snapshot_summary(snapshot: Any | None) -> dict[str, Any] | None:
+        if snapshot is None:
+            return None
+        return {
+            "id": snapshot.id,
+            "source_kind": snapshot.source_kind,
+            "source_id": snapshot.source_id,
+            "asof_ts": snapshot.asof_ts.isoformat() if snapshot.asof_ts is not None else None,
+            "observation_ts": snapshot.observation_ts.isoformat() if snapshot.observation_ts is not None else None,
+            "forecast_updated_ts": snapshot.forecast_updated_ts.isoformat() if snapshot.forecast_updated_ts is not None else None,
+            "forecast_high_f": str(snapshot.forecast_high_f) if snapshot.forecast_high_f is not None else None,
+            "current_temp_f": str(snapshot.current_temp_f) if snapshot.current_temp_f is not None else None,
+        }
 
     async def _recent_duplicate_risk_block_trace_id(
         self,
@@ -917,12 +1257,13 @@ class WorkflowSupervisor:
                 )
 
                 await repo.log_exchange_event("rest_market", "market_snapshot", market_response, market_ticker=room.market_ticker)
+                weather_archive_source_id = f"room:{room.id}" if weather_bundle is not None else None
                 if mapping is not None and mapping.station_id is not None and weather_bundle is not None:
                     await repo.log_weather_event(mapping.station_id, "weather_bundle", weather_bundle)
                     archive_record = append_weather_bundle_archive(
                         self.settings,
                         weather_bundle,
-                        source_id=f"room:{room.id}",
+                        source_id=weather_archive_source_id,
                         archive_source="room_supervisor",
                     )
                     archive_meta = weather_bundle_archive_metadata(weather_bundle)
@@ -944,7 +1285,7 @@ class WorkflowSupervisor:
                                 "_archive": {
                                     "archive_path": archive_record["archive_path"] if archive_record is not None else None,
                                     "archive_source": "room_supervisor",
-                                    "source_id": f"room:{room.id}",
+                                    "source_id": weather_archive_source_id,
                                 },
                             },
                         )
@@ -1012,6 +1353,15 @@ class WorkflowSupervisor:
                 # Market structure gates mutate the signal in-place. Run them before
                 # persistence so audit, dashboards, and corpus exports match execution.
                 await self._run_market_gates(repo, signal, market, room.market_ticker)
+                await self._apply_extreme_edge_diagnostic_gate(
+                    repo,
+                    signal,
+                    market_ticker=room.market_ticker,
+                    market=market,
+                    kalshi_env=room.kalshi_env,
+                    room_id=room.id,
+                    weather_archive_source_id=weather_archive_source_id,
+                )
                 await repo.save_signal(
                     room_id=room.id,
                     market_ticker=room.market_ticker,
@@ -1125,7 +1475,7 @@ class WorkflowSupervisor:
                                 "market_ticker": room.market_ticker,
                                 "observed_at": market_state.observed_at,
                             },
-                            "weather_archive_source_id": f"room:{room.id}" if weather_bundle is not None else None,
+                            "weather_archive_source_id": weather_archive_source_id,
                             "research_run_id": dossier.last_run_id,
                         },
                     )

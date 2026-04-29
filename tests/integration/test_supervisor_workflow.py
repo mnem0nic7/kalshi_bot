@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,7 +23,7 @@ from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
-from kalshi_bot.weather.models import WeatherMarketMapping
+from kalshi_bot.weather.models import WeatherMarketMapping, WeatherSeriesTemplate
 
 
 class FakeProviders:
@@ -156,6 +157,62 @@ class WideChicagoKalshi:
 
     async def create_order(self, payload: dict) -> dict:
         return {"order": {"order_id": "order-should-not-exist", "status": "submitted"}, "echo": payload}
+
+    async def close(self) -> None:
+        return None
+
+
+class ExtremeEdgeKalshi:
+    write_credentials = object()
+
+    async def get_market(self, ticker: str) -> dict:
+        return {
+            "market": {
+                "ticker": ticker,
+                "title": "Will the high temp in Austin be >83 on Apr 29, 2026?",
+                "subtitle": "84 or above",
+                "strike_type": "greater",
+                "floor_strike": 0.000083,
+                "yes_bid_dollars": "0.2300",
+                "yes_ask_dollars": "0.2500",
+                "no_ask_dollars": "0.7700",
+                "last_price_dollars": "0.2400",
+                "volume": 200,
+            }
+        }
+
+    async def create_order(self, payload: dict) -> dict:
+        raise AssertionError("extreme-edge diagnostic should stand down before order creation")
+
+    async def close(self) -> None:
+        return None
+
+
+class ExtremeEdgeWeather:
+    async def build_market_snapshot(self, mapping: WeatherMarketMapping) -> dict:
+        return {
+            "mapping": mapping.model_dump(mode="json"),
+            "forecast": {
+                "properties": {
+                    "updated": "2026-04-29T11:45:00+00:00",
+                    "periods": [
+                        {
+                            "isDaytime": True,
+                            "temperature": 95,
+                            "temperatureUnit": "F",
+                            "startTime": "2026-04-29T07:00:00-05:00",
+                        },
+                    ],
+                }
+            },
+            "observation": {
+                "properties": {
+                    "temperature": {"value": 23.8889},
+                    "timestamp": "2026-04-29T12:00:00+00:00",
+                }
+            },
+            "points": {},
+        }
 
     async def close(self) -> None:
         return None
@@ -391,6 +448,131 @@ async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_pa
     assert decision_trace.trace["normalized_intent"]["risk_status"] == "approved"
     assert replay_decision_trace(decision_trace.trace, expected_trace_hash=decision_trace.trace_hash).ok
     assert supervisor_messages[-1].payload["decision_trace_id"] == decision_trace.id
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_extreme_edge_diagnostic_stands_down_before_ticket_creation(tmp_path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path}/extreme_edge_diagnostic.db"
+    settings = Settings(
+        database_url=database_url,
+        historical_weather_archive_path=str(tmp_path / "weather_archive"),
+        app_color="blue",
+        app_shadow_mode=False,
+        llm_trading_enabled=False,
+        risk_min_edge_bps=10,
+        risk_max_order_notional_dollars=50,
+        risk_max_position_notional_dollars=100,
+        risk_max_order_count_fp=20,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    providers = FakeProviders()
+    agent_pack_service = AgentPackService(settings)
+    agents = AgentSuite(settings, providers)  # type: ignore[arg-type]
+    signal_engine = WeatherSignalEngine(settings)
+    risk_engine = DeterministicRiskEngine(settings)
+    kalshi = ExtremeEdgeKalshi()
+    weather = ExtremeEdgeWeather()
+    directory = WeatherMarketDirectory(
+        {},
+        {
+            "KXHIGHAUS": WeatherSeriesTemplate(
+                series_ticker="KXHIGHAUS",
+                location_name="Austin",
+                station_id="KAUS",
+                timezone_name="America/Chicago",
+                latitude=30.1975,
+                longitude=-97.6664,
+            )
+        },
+    )
+    research_coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        kalshi,  # type: ignore[arg-type]
+        weather,  # type: ignore[arg-type]
+        directory,
+        providers,  # type: ignore[arg-type]
+        signal_engine,
+        agent_pack_service,
+    )
+    training_corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        DiscoveryService(kalshi, directory),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
+    supervisor = WorkflowSupervisor(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=kalshi,  # type: ignore[arg-type]
+        weather=weather,  # type: ignore[arg-type]
+        weather_directory=directory,
+        agent_pack_service=agent_pack_service,
+        signal_engine=signal_engine,
+        risk_engine=risk_engine,
+        execution_service=ExecutionService(settings, kalshi),  # type: ignore[arg-type]
+        memory_service=MemoryService(),  # type: ignore[arg-type]
+        research_coordinator=research_coordinator,
+        training_corpus_service=training_corpus_service,
+        agents=agents,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(settings.app_color)
+        await _seed_reconcile_balance(repo, kalshi_env=settings.kalshi_env)
+        await repo.upsert_historical_weather_snapshot(
+            station_id="KAUS",
+            series_ticker="KXHIGHAUS",
+            local_market_day="2026-04-29",
+            asof_ts=datetime(2026, 4, 29, 10, 0, tzinfo=UTC),
+            source_kind="archived_weather_bundle",
+            source_id="seed:prior",
+            source_hash="seed",
+            observation_ts=datetime(2026, 4, 29, 10, 0, tzinfo=UTC),
+            forecast_updated_ts=datetime(2026, 4, 29, 9, 45, tzinfo=UTC),
+            forecast_high_f=Decimal("83.00"),
+            current_temp_f=Decimal("74.00"),
+            payload={"source": "prior_station_day_snapshot"},
+        )
+        room = await repo.create_room(
+            RoomCreate(name="Extreme Edge", market_ticker="KXHIGHAUS-26APR29-T83"),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        await session.commit()
+
+    await supervisor.run_room(room.id, reason="extreme_edge_diagnostic_test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        decision_trace = await repo.get_latest_decision_trace_for_room(room.id)
+        trade_ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        risk_verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        signal = await repo.get_latest_signal_for_room(room.id)
+        await session.commit()
+
+    assert trade_ticket is None
+    assert risk_verdict is None
+    assert decision_trace is not None
+    assert decision_trace.decision_kind == "stand_down"
+    trace_candidate = decision_trace.trace["candidate_trace"]
+    diagnostic = trace_candidate["extreme_edge_diagnostic"]
+    assert trace_candidate["eligibility_stand_down_reason"] == "extreme_edge_diagnostic_failed"
+    assert diagnostic["passed"] is False
+    assert "station_daily_high_source_disagreement" in diagnostic["reason_codes"]
+    assert diagnostic["checks"]["current_observed_temp_sanity"]["passed"] is True
+    assert diagnostic["checks"]["market_metadata_polarity_verification"]["passed"] is True
+    assert signal is not None
+    assert signal.payload["eligibility"]["eligible"] is False
 
     await engine.dispose()
 

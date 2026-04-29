@@ -8,7 +8,7 @@ from typing import Any, Protocol
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import WeatherResolutionState
+from kalshi_bot.core.enums import StandDownReason, WeatherResolutionState
 from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.models import MarketState, ResearchDossierRecord
 from kalshi_bot.db.repositories import PlatformRepository
@@ -129,7 +129,7 @@ class AutoTriggerService:
                 await session.commit()
                 return
 
-            if await self._recent_risk_block_suppressed(repo, market_ticker, market_state, thresholds):
+            if await self._recent_blocking_decision_suppressed(repo, market_ticker, market_state, thresholds):
                 await session.commit()
                 return
 
@@ -306,7 +306,7 @@ class AutoTriggerService:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _recent_risk_block_suppressed(
+    async def _recent_blocking_decision_suppressed(
         self,
         repo: PlatformRepository,
         market_ticker: str,
@@ -317,7 +317,23 @@ class AutoTriggerService:
             market_ticker,
             kalshi_env=self.settings.kalshi_env,
         )
-        if latest_trace is None or latest_trace.decision_kind != "risk_block":
+        if latest_trace is None:
+            return False
+
+        trace_payload = dict(latest_trace.trace or {})
+        candidate_payload = trace_payload.get("candidate_trace") if isinstance(trace_payload.get("candidate_trace"), dict) else {}
+        risk_payload = trace_payload.get("risk") if isinstance(trace_payload.get("risk"), dict) else {}
+        normalized_intent = trace_payload.get("normalized_intent") if isinstance(trace_payload.get("normalized_intent"), dict) else {}
+        stand_down_reason = (
+            candidate_payload.get("eligibility_stand_down_reason")
+            or normalized_intent.get("stand_down_reason")
+        )
+        is_recent_risk_block = latest_trace.decision_kind == "risk_block"
+        is_extreme_edge_diagnostic = (
+            latest_trace.decision_kind == "stand_down"
+            and stand_down_reason == StandDownReason.EXTREME_EDGE_DIAGNOSTIC_FAILED.value
+        )
+        if not is_recent_risk_block and not is_extreme_edge_diagnostic:
             return False
 
         now = datetime.now(UTC)
@@ -330,20 +346,26 @@ class AutoTriggerService:
         if self._price_move_bypasses_checkpoint(checkpoint_payload=getattr(checkpoint, "payload", None), market_state=market_state):
             return False
 
-        trace_payload = dict(latest_trace.trace or {})
-        risk_payload = trace_payload.get("risk") if isinstance(trace_payload.get("risk"), dict) else {}
+        reason = "recent_risk_block" if is_recent_risk_block else "recent_extreme_edge_diagnostic"
+        summary_tail = "recent risk block" if is_recent_risk_block else "recent extreme-edge diagnostic"
         await self._log_block_once_per_cooldown(
             repo,
-            checkpoint_key=f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:recent_risk_block",
+            checkpoint_key=f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:{reason}",
             cooldown_seconds=cooldown_seconds,
             severity="info",
-            summary=f"Auto-trigger suppressed for {market_ticker}: recent risk block still cooling down",
+            summary=f"Auto-trigger suppressed for {market_ticker}: {summary_tail} still cooling down",
             payload={
                 "market_ticker": market_ticker,
-                "reason": "recent_risk_block",
+                "reason": reason,
                 "decision_trace_id": latest_trace.id,
                 "blocked_at": decision_time.isoformat(),
                 "risk_reasons": risk_payload.get("reasons") or [],
+                "stand_down_reason": stand_down_reason,
+                "diagnostic_reason_codes": (
+                    (candidate_payload.get("extreme_edge_diagnostic") or {}).get("reason_codes")
+                    if isinstance(candidate_payload.get("extreme_edge_diagnostic"), dict)
+                    else []
+                ),
             },
             kalshi_env=self.settings.kalshi_env,
         )

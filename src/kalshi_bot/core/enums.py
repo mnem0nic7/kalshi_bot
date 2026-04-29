@@ -91,6 +91,7 @@ class StandDownReason(StrEnum):
     CONFIDENCE_TOO_LOW = "confidence_too_low"
     DOSSIER_STALE = "dossier_stale"
     FORECAST_DELTA_MISSING = "forecast_delta_missing"
+    EXTREME_EDGE_DIAGNOSTIC_FAILED = "extreme_edge_diagnostic_failed"
 
 
 class RiskStatus(StrEnum):
