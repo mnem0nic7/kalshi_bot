@@ -236,7 +236,11 @@ class TradingAuditService:
                 matched_order = orders_by_kalshi_id.get(raw_order_id)
                 if matched_order is not None:
                     matched_order_strategy = matched_order.strategy_code or order_strategy_overrides.get(matched_order.id)
-                    strategy_source = "order_strategy_code" if matched_order.strategy_code else None
+                    strategy_source = (
+                        "order_strategy_code"
+                        if matched_order.strategy_code and matched_order.id not in order_strategy_overrides
+                        else None
+                    )
                     if matched_order_strategy is None:
                         ticket = (
                             tickets_by_id.get(str(matched_order.trade_ticket_id))
@@ -246,8 +250,12 @@ class TradingAuditService:
                         ticket = ticket or tickets_by_client_order_id.get(matched_order.client_order_id)
                         matched_order_strategy = ticket.strategy_code if ticket is not None else None
                         strategy_source = "ticket_strategy_code" if matched_order_strategy else None
-                    elif matched_order.id in order_strategy_overrides and matched_order.strategy_code is None:
-                        strategy_source = "bot_room_client_order_id"
+                    elif matched_order.id in order_strategy_overrides:
+                        strategy_source = (
+                            "bot_room_client_order_id"
+                            if str(matched_order.client_order_id or "").startswith("room:")
+                            else "unmanaged_exchange_order"
+                        )
                     new_order_id = new_order_id or matched_order.id
                     new_strategy = new_strategy or matched_order_strategy
                     if matched_order.side in {"yes", "no"}:

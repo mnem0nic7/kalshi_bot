@@ -791,6 +791,7 @@ async def test_trading_audit_repair_marks_exchange_side_orphan_as_unmanaged(audi
     assert result["candidate_count"] == 1
     assert result["updated_count"] == 1
     assert result["candidates"][0]["reason"] == "raw_order_id_match"
+    assert result["candidates"][0]["evidence"]["strategy_source"] == "unmanaged_exchange_order"
     assert fill.strategy_code == StrategyCode.UNMANAGED.value
     assert fill.order_id == order.id
     assert order.strategy_code == StrategyCode.UNMANAGED.value
