@@ -102,6 +102,37 @@ class CancelledExecutionService(FakeExecutionService):
         )
 
 
+class KillSwitchAwareExecutionService(FakeExecutionService):
+    async def close_position(
+        self,
+        *,
+        market_ticker: str,
+        side: str,
+        count_fp: Decimal,
+        yes_price_dollars: Decimal,
+        client_order_id: str,
+        kill_switch_enabled: bool,
+        active_color: str,
+        subaccount: int | None = None,
+    ) -> ExecReceiptPayload:
+        if kill_switch_enabled:
+            return ExecReceiptPayload(
+                status="kill_switch_blocked",
+                client_order_id=client_order_id,
+                details={"reason": "kill switch enabled"},
+            )
+        return await super().close_position(
+            market_ticker=market_ticker,
+            side=side,
+            count_fp=count_fp,
+            yes_price_dollars=yes_price_dollars,
+            client_order_id=client_order_id,
+            kill_switch_enabled=kill_switch_enabled,
+            active_color=active_color,
+            subaccount=subaccount,
+        )
+
+
 @pytest.mark.asyncio
 async def test_stop_loss_skips_when_color_is_inactive(tmp_path) -> None:
     settings = Settings(
@@ -162,6 +193,112 @@ async def test_stop_loss_skips_when_color_is_inactive(tmp_path) -> None:
     assert kalshi.calls == []
     assert ops_events == []
     assert checkpoints == []
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stop_loss_kill_switch_suppression_records_provenance(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/stop_loss_kill_switch.db",
+        app_color="blue",
+        kalshi_env="demo",
+        stop_loss_threshold_pct=0.10,
+        daemon_reconcile_stale_kill_switch_seconds=300,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    kalshi = KillSwitchAwareExecutionService()
+    service = StopLossService(settings, session_factory, kalshi)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_active_color="blue")
+        now = datetime.now(UTC)
+        await repo.set_checkpoint(
+            "daemon_reconcile:demo:blue",
+            cursor=None,
+            payload={"reconciled_at": (now - timedelta(seconds=420)).isoformat()},
+        )
+        await repo.set_kill_switch(
+            True,
+            source="watchdog",
+            reason="reconcile_stale",
+            payload={
+                "kalshi_env": "demo",
+                "active_color": "blue",
+                "reconcile_age_seconds": 420,
+                "threshold_seconds": 300,
+            },
+        )
+        entry_at = now - timedelta(minutes=10)
+        position = await repo.upsert_position(
+            market_ticker="KXHIGHTSFO-26APR23-T70",
+            subaccount=settings.kalshi_subaccount,
+            kalshi_env=settings.kalshi_env,
+            side="yes",
+            count_fp=Decimal("10.00"),
+            average_price_dollars=Decimal("0.8000"),
+            raw={},
+        )
+        position.created_at = entry_at
+        entry_fill = await repo.save_fill(
+            market_ticker="KXHIGHTSFO-26APR23-T70",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.8000"),
+            count_fp=Decimal("10.00"),
+            raw={},
+            trade_id="entry-stop-loss-kill-switch",
+            kalshi_env=settings.kalshi_env,
+            strategy_code="A",
+        )
+        entry_fill.created_at = entry_at
+        await repo.upsert_market_state(
+            "KXHIGHTSFO-26APR23-T70",
+            kalshi_env=settings.kalshi_env,
+            snapshot={"market_ticker": "KXHIGHTSFO-26APR23-T70"},
+            yes_bid_dollars=Decimal("0.1200"),
+            yes_ask_dollars=Decimal("0.1400"),
+            last_trade_dollars=Decimal("0.1300"),
+        )
+        for offset_minutes, mid in enumerate(["0.9200", "0.9100", "0.9000", "0.8900", "0.8800"]):
+            await repo.record_market_price_snapshot(
+                market_ticker="KXHIGHTSFO-26APR23-T70",
+                kalshi_env=settings.kalshi_env,
+                yes_bid_dollars=Decimal(mid) - Decimal("0.0100"),
+                yes_ask_dollars=Decimal(mid) + Decimal("0.0100"),
+                mid_dollars=Decimal(mid),
+                last_trade_dollars=Decimal(mid),
+                volume=10,
+                observed_at=entry_at + timedelta(minutes=offset_minutes + 1),
+            )
+        await session.commit()
+
+    triggered = await service.check_once()
+
+    async with session_factory() as session:
+        ops_event = (await session.execute(select(OpsEvent))).scalar_one()
+        checkpoints = {
+            cp.stream_name: cp
+            for cp in (await session.execute(select(Checkpoint))).scalars()
+        }
+        orders = list((await session.execute(select(OrderRecord))).scalars())
+        await session.commit()
+
+    assert triggered[0]["action"] == "stop_loss_kill_switch_suppressed"
+    assert triggered[0]["kill_switch"]["source"] == "watchdog"
+    assert triggered[0]["kill_switch"]["reason"] == "reconcile_stale"
+    assert triggered[0]["reconcile"]["threshold_seconds"] == 300
+    assert triggered[0]["reconcile"]["age_seconds"] >= 300
+    assert ops_event.payload["kill_switch"]["source"] == "watchdog"
+    assert ops_event.payload["reconcile"]["stale"] is True
+    assert "stop_loss_submit:demo:KXHIGHTSFO-26APR23-T70" not in checkpoints
+    assert "stop_loss_reentry:demo:KXHIGHTSFO-26APR23-T70" not in checkpoints
+    assert checkpoints["stop_loss_kill_switch_suppressed:demo:KXHIGHTSFO-26APR23-T70"].payload["kill_switch"]["reason"] == "reconcile_stale"
+    assert orders == []
+    assert kalshi.calls == []
 
     await engine.dispose()
 

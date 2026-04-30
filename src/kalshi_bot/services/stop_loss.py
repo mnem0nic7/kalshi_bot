@@ -111,6 +111,15 @@ def _position_opened_at(position: PositionRecord, fills: list[FillRecord]) -> da
     return _position_opened_at_from_fills(position, fills) or _as_utc(position.created_at)
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
 def _trailing_loss_ratio(peak: Decimal, current: Decimal) -> float:
     """Drop from peak as a fraction of peak: (peak - current) / peak."""
     if peak <= 0:
@@ -269,6 +278,7 @@ class StopLossService:
                             repo, position, sell_px, mid, trailing_ratio, now,
                             kill_switch_enabled=kill_switch_enabled,
                             active_color=active_color,
+                            control=control,
                             trigger="trailing_stop", peak=peak, opened_at=opened_at,
                         )
                         await session.commit()
@@ -299,10 +309,66 @@ class StopLossService:
                 repo, position, sell_px, mid, trailing_ratio, now,
                 kill_switch_enabled=kill_switch_enabled,
                 active_color=active_color,
+                control=control,
                 trigger=trigger, slope=slope, peak=peak, opened_at=opened_at,
             )
             await session.commit()
             return result
+
+    async def _kill_switch_suppression_context(
+        self,
+        repo: PlatformRepository,
+        control: Any,
+        now: datetime,
+    ) -> dict[str, Any]:
+        notes = dict(control.notes or {})
+        kill_switch_notes = dict(notes.get("kill_switch") or {})
+        active_color = str(getattr(control, "active_color", None) or self.settings.app_color)
+        threshold_seconds = self.settings.daemon_reconcile_stale_kill_switch_seconds
+        stream_name = f"daemon_reconcile:{self.settings.kalshi_env}:{active_color}"
+        checkpoint = await repo.get_checkpoint(stream_name)
+        reconciled_at: datetime | None = None
+        if checkpoint is not None and isinstance(checkpoint.payload, dict):
+            reconciled_at = _parse_iso_datetime(checkpoint.payload.get("reconciled_at"))
+        if reconciled_at is None:
+            fallback = await repo.get_checkpoint(f"reconcile:{self.settings.kalshi_env}")
+            if fallback is not None and isinstance(fallback.payload, dict):
+                reconciled_at = _parse_iso_datetime(fallback.payload.get("reconciled_at"))
+                stream_name = fallback.stream_name
+
+        reconcile_age_seconds = None
+        if reconciled_at is not None:
+            reconcile_age_seconds = max(0.0, (now - reconciled_at).total_seconds())
+        else:
+            watchdog = dict(notes.get("watchdog") or {})
+            colors = watchdog.get("colors") if isinstance(watchdog.get("colors"), dict) else {}
+            active = colors.get(active_color) if isinstance(colors, dict) else {}
+            daemon = active.get("daemon") if isinstance(active, dict) else {}
+            raw_age = daemon.get("last_reconcile_age_seconds") if isinstance(daemon, dict) else None
+            try:
+                reconcile_age_seconds = float(raw_age) if raw_age is not None else None
+            except (TypeError, ValueError):
+                reconcile_age_seconds = None
+
+        return {
+            "active_color": active_color,
+            "kill_switch": {
+                key: kill_switch_notes.get(key)
+                for key in ("mode", "source", "reason", "enabled_at", "payload")
+                if key in kill_switch_notes
+            },
+            "reconcile": {
+                "stream_name": stream_name,
+                "reconciled_at": reconciled_at.isoformat() if reconciled_at is not None else None,
+                "age_seconds": round(reconcile_age_seconds, 3) if reconcile_age_seconds is not None else None,
+                "threshold_seconds": threshold_seconds,
+                "stale": (
+                    reconcile_age_seconds is not None
+                    and threshold_seconds > 0
+                    and reconcile_age_seconds > threshold_seconds
+                ),
+            },
+        }
 
     async def _submit(
         self,
@@ -315,6 +381,7 @@ class StopLossService:
         *,
         kill_switch_enabled: bool,
         active_color: str,
+        control: Any,
         trigger: str = "trailing_stop",
         slope: float | None = None,
         peak: Decimal | None = None,
@@ -363,6 +430,7 @@ class StopLossService:
 
         # Kill switch: clean noop — no submit/reentry checkpoints, rate-limited warning.
         if receipt.status == "kill_switch_blocked":
+            suppression_context = await self._kill_switch_suppression_context(repo, control, now)
             ks_cp_key = f"stop_loss_kill_switch_suppressed:{self.settings.kalshi_env}:{market_ticker}"
             ks_cp = await repo.get_checkpoint(ks_cp_key)
             rate_limited = (
@@ -387,12 +455,19 @@ class StopLossService:
                         "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
                         "peak_price": str(peak) if peak is not None else None,
                         "action": "stop_loss_kill_switch_suppressed",
+                        **suppression_context,
                     },
                 )
                 await repo.set_checkpoint(
                     ks_cp_key,
                     cursor=None,
-                    payload={"suppressed_at": now.isoformat(), "trigger": trigger},
+                    payload={
+                        "suppressed_at": now.isoformat(),
+                        "trigger": trigger,
+                        "market_ticker": market_ticker,
+                        "side": position.side,
+                        **suppression_context,
+                    },
                 )
             logger.warning(
                 "Stop-loss suppressed by kill switch [%s]: %s %s loss=%s",
@@ -408,6 +483,7 @@ class StopLossService:
                 "trigger": trigger,
                 "kill_switch_blocked": True,
                 "rate_limited_event": rate_limited,
+                **suppression_context,
             }
 
         shadow = receipt.status == "shadow_skipped"

@@ -349,6 +349,80 @@ async def test_trading_audit_flags_money_safety_issues(audit_harness) -> None:
 
 
 @pytest.mark.asyncio
+async def test_trading_audit_flags_kill_switch_suppressed_stop_loss_exits(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    room = _room("room-suppressed-exit", "KXHIGHTNOLA-26APR30-T79")
+    async with session_factory() as session:
+        session.add_all([
+            room,
+            PositionRecord(
+                market_ticker=room.market_ticker,
+                kalshi_env="production",
+                subaccount=0,
+                side="no",
+                count_fp=Decimal("2.25"),
+                average_price_dollars=Decimal("0.8300"),
+                raw={},
+                created_at=NOW - timedelta(hours=2),
+                updated_at=NOW - timedelta(hours=2),
+            ),
+            MarketState(
+                kalshi_env="production",
+                market_ticker=room.market_ticker,
+                yes_bid_dollars=Decimal("0.9100"),
+                yes_ask_dollars=Decimal("0.9600"),
+                observed_at=NOW - timedelta(seconds=10),
+                snapshot={},
+                created_at=NOW - timedelta(seconds=10),
+                updated_at=NOW - timedelta(seconds=10),
+            ),
+        ])
+        for idx, minutes_ago in enumerate([20, 10]):
+            session.add(
+                OpsEvent(
+                    kalshi_env="production",
+                    severity="warning",
+                    source="stop_loss",
+                    summary="Stop-loss suppressed by kill switch [trailing_stop]: KXHIGHTNOLA-26APR30-T79 no",
+                    payload={
+                        "market_ticker": room.market_ticker,
+                        "side": "no",
+                        "trigger": "trailing_stop",
+                        "action": "stop_loss_kill_switch_suppressed",
+                        "kill_switch": {
+                            "mode": "auto",
+                            "source": "watchdog",
+                            "reason": "reconcile_stale",
+                        },
+                        "reconcile": {
+                            "stream_name": "daemon_reconcile:production:blue",
+                            "age_seconds": 420 + idx,
+                            "threshold_seconds": 300,
+                            "stale": True,
+                        },
+                    },
+                    created_at=NOW - timedelta(minutes=minutes_ago),
+                    updated_at=NOW - timedelta(minutes=minutes_ago),
+                )
+            )
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    issue = next(
+        item for item in report["issues"] if item["code"] == "risk_reducing_exit_suppressed_by_kill_switch"
+    )
+    assert issue["severity"] == "critical"
+    assert issue["evidence"]["clusters"][0]["market_ticker"] == room.market_ticker
+    assert issue["evidence"]["clusters"][0]["repeated"] is True
+    assert issue["evidence"]["clusters"][0]["persisted_past_cooldown"] is True
+
+
+@pytest.mark.asyncio
 async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) -> None:
     settings, session_factory = audit_harness
     async with session_factory() as session:

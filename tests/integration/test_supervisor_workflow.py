@@ -68,6 +68,11 @@ class FakeKalshi:
         return None
 
 
+class ExecutedKalshi(FakeKalshi):
+    async def create_order(self, payload: dict) -> dict:
+        return {"order": {"order_id": "order-123", "status": "executed"}, "echo": payload}
+
+
 class FakeWeather:
     async def build_market_snapshot(self, mapping: WeatherMarketMapping) -> dict:
         return {
@@ -260,7 +265,8 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     agents = AgentSuite(settings, providers)  # type: ignore[arg-type]
     signal_engine = WeatherSignalEngine(settings)
     risk_engine = DeterministicRiskEngine(settings)
-    execution_service = ExecutionService(settings, FakeKalshi())  # type: ignore[arg-type]
+    executed_kalshi = ExecutedKalshi()
+    execution_service = ExecutionService(settings, executed_kalshi)  # type: ignore[arg-type]
     memory_service = MemoryService()  # type: ignore[arg-type]
     directory = WeatherMarketDirectory(
         {
@@ -296,7 +302,7 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     supervisor = WorkflowSupervisor(
         settings=settings,
         session_factory=session_factory,
-        kalshi=FakeKalshi(),  # type: ignore[arg-type]
+        kalshi=executed_kalshi,  # type: ignore[arg-type]
         weather=FakeWeather(),  # type: ignore[arg-type]
         weather_directory=directory,
         agent_pack_service=agent_pack_service,
@@ -366,7 +372,8 @@ async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_pa
     agents = AgentSuite(settings, providers)  # type: ignore[arg-type]
     signal_engine = WeatherSignalEngine(settings)
     risk_engine = DeterministicRiskEngine(settings)
-    execution_service = ExecutionService(settings, FakeKalshi())  # type: ignore[arg-type]
+    executed_kalshi = ExecutedKalshi()
+    execution_service = ExecutionService(settings, executed_kalshi)  # type: ignore[arg-type]
     directory = WeatherMarketDirectory(
         {
             "WX-TRACE": WeatherMarketMapping(
@@ -401,7 +408,7 @@ async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_pa
     supervisor = WorkflowSupervisor(
         settings=settings,
         session_factory=session_factory,
-        kalshi=FakeKalshi(),  # type: ignore[arg-type]
+        kalshi=executed_kalshi,  # type: ignore[arg-type]
         weather=FakeWeather(),  # type: ignore[arg-type]
         weather_directory=directory,
         agent_pack_service=agent_pack_service,
@@ -433,6 +440,7 @@ async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_pa
         repo = PlatformRepository(session)
         decision_trace = await repo.get_latest_decision_trace_for_room(room.id)
         trade_ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        orders = await repo.list_orders_for_room(room.id)
         market_artifact = await repo.get_latest_artifact(room_id=room.id, artifact_type="market_snapshot")
         supervisor_messages = [
             message
@@ -444,6 +452,8 @@ async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_pa
     assert decision_trace is not None
     assert trade_ticket is not None
     assert decision_trace.ticket_id == trade_ticket.id
+    assert trade_ticket.status == "executed"
+    assert orders[0].status == "executed"
     assert decision_trace.decision_kind == "entry"
     assert decision_trace.path_version == "deterministic-fast-path.v1"
     assert decision_trace.trace["normalized_intent"]["risk_status"] == "approved"
@@ -941,10 +951,13 @@ async def test_supervisor_blocks_opposite_side_entry_end_to_end(tmp_path) -> Non
     async with session_factory() as session:
         repo = PlatformRepository(session)
         risk_verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        trade_ticket = await repo.get_latest_trade_ticket_for_room(room.id)
         orders = await repo.list_orders_for_room(room.id)
         await session.commit()
 
     assert risk_verdict is not None
+    assert trade_ticket is not None
+    assert trade_ticket.status == "blocked"
     assert risk_verdict.status == "blocked"
     assert any("opposite-side" in r for r in risk_verdict.reasons)
     assert len(orders) == 0, "No orders should be placed when the opposite-side guard fires"
@@ -990,11 +1003,14 @@ async def test_supervisor_guard_fires_when_both_sides_already_held(tmp_path) -> 
     async with session_factory() as session:
         repo = PlatformRepository(session)
         risk_verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        trade_ticket = await repo.get_latest_trade_ticket_for_room(room.id)
         ops_events = await repo.list_ops_events(sources=["supervisor"])
         orders = await repo.list_orders_for_room(room.id)
         await session.commit()
 
     assert risk_verdict is not None
+    assert trade_ticket is not None
+    assert trade_ticket.status == "blocked"
     assert risk_verdict.status == "blocked"
     assert any("opposite-side" in r for r in risk_verdict.reasons)
     assert any("data_inconsistency" in e.summary for e in ops_events), (

@@ -755,6 +755,14 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         await self.session.flush()
         return record
 
+    async def update_trade_ticket_status(self, ticket_id: str, status: str) -> TradeTicketRecord | None:
+        record = await self.session.get(TradeTicketRecord, ticket_id)
+        if record is None:
+            return None
+        record.status = status
+        await self.session.flush()
+        return record
+
     async def save_decision_trace(
         self,
         *,

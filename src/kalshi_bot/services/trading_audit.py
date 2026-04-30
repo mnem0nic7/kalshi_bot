@@ -927,11 +927,14 @@ class TradingAuditService:
     def _stop_loss_clusters(self, ops_events: list[OpsEvent], *, now: datetime) -> dict[str, Any]:
         stop_events = [event for event in ops_events if event.source == "stop_loss"]
         grouped: dict[tuple[str, str], list[OpsEvent]] = defaultdict(list)
+        kill_switch_grouped: dict[tuple[str, str], list[OpsEvent]] = defaultdict(list)
         for event in stop_events:
             payload = event.payload or {}
             ticker = str(payload.get("market_ticker") or "unknown")
             trigger = str(payload.get("trigger") or "unknown")
             grouped[(ticker, trigger)].append(event)
+            if payload.get("action") == "stop_loss_kill_switch_suppressed":
+                kill_switch_grouped[(ticker, trigger)].append(event)
 
         clusters = []
         cooldown = max(1, int(self.settings.stop_loss_submit_cooldown_seconds or 300))
@@ -952,7 +955,34 @@ class TradingAuditService:
                 "exceeds_cooldown_expectation": len(events) > expected_max,
             })
         clusters.sort(key=lambda item: item["events"], reverse=True)
-        return {"event_count": len(stop_events), "clusters": clusters[:20]}
+
+        kill_switch_clusters = []
+        for (ticker, trigger), events in kill_switch_grouped.items():
+            first_at = min((_as_utc(event.created_at) for event in events if event.created_at), default=None)
+            last_at = max((_as_utc(event.created_at) for event in events if event.created_at), default=None)
+            span_seconds = max(0, int(((last_at or now) - (first_at or now)).total_seconds()))
+            latest = max(events, key=lambda event: _as_utc(event.created_at) or datetime.min.replace(tzinfo=UTC))
+            latest_payload = latest.payload if isinstance(latest.payload, dict) else {}
+            kill_switch_clusters.append({
+                "market_ticker": ticker,
+                "trigger": trigger,
+                "events": len(events),
+                "first_at": _iso(first_at),
+                "last_at": _iso(last_at),
+                "span_minutes": round(span_seconds / 60, 1),
+                "cooldown_seconds": cooldown,
+                "repeated": len(events) > 1,
+                "persisted_past_cooldown": span_seconds >= cooldown,
+                "latest_kill_switch": latest_payload.get("kill_switch") or {},
+                "latest_reconcile": latest_payload.get("reconcile") or {},
+            })
+        kill_switch_clusters.sort(key=lambda item: (int(item["events"]), item["span_minutes"]), reverse=True)
+        return {
+            "event_count": len(stop_events),
+            "clusters": clusters[:20],
+            "kill_switch_suppressed_event_count": sum(len(events) for events in kill_switch_grouped.values()),
+            "kill_switch_suppressed_clusters": kill_switch_clusters[:20],
+        }
 
     def _risk_summary(self, risk_verdicts: list[RiskVerdictRecord]) -> dict[str, Any]:
         status_counts = Counter(verdict.status for verdict in risk_verdicts)
@@ -1153,6 +1183,25 @@ class TradingAuditService:
                 "code": "repeated_stop_loss_events",
                 "summary": "Stop-loss events repeatedly targeted the same market, suggesting exits may not be resolving cleanly.",
                 "evidence": {"clusters": repeated_clusters[:10]},
+            })
+        suppressed_exit_clusters = [
+            cluster
+            for cluster in stop_loss.get("kill_switch_suppressed_clusters", [])
+            if cluster.get("repeated") or cluster.get("persisted_past_cooldown")
+        ]
+        if suppressed_exit_clusters:
+            open_tickers = {row["market_ticker"] for row in exposure["positions"]}
+            exposed_clusters = [
+                cluster for cluster in suppressed_exit_clusters if cluster["market_ticker"] in open_tickers
+            ]
+            issues.append({
+                "severity": "critical" if exposed_clusters else "high",
+                "code": "risk_reducing_exit_suppressed_by_kill_switch",
+                "summary": "Risk-reducing stop-loss exits were suppressed while the kill switch was enabled.",
+                "evidence": {
+                    "clusters": suppressed_exit_clusters[:10],
+                    "open_position_markets": sorted(open_tickers),
+                },
             })
         if funnel["approved_without_order_count"] or funnel["recent_failed_order_count"]:
             issues.append({

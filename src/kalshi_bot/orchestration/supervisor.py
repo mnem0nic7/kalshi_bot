@@ -1028,6 +1028,7 @@ class WorkflowSupervisor:
                     payload=verdict.model_dump(mode="json"),
                 )
                 if verdict.status == RiskStatus.APPROVED:
+                    await repo.update_trade_ticket_status(ticket_record.id, "approved")
                     evaluation_outcome = "approved"
                     approved_ticket = approved_ticket_for_verdict(ticket, verdict)
                     await repo.update_room_stage(room.id, RoomStage.EXECUTING)
@@ -1075,7 +1076,9 @@ class WorkflowSupervisor:
                             kalshi_order_id=receipt.external_order_id,
                             kalshi_env=room.kalshi_env,
                         )
+                    await repo.update_trade_ticket_status(ticket_record.id, receipt.status)
                 else:
+                    await repo.update_trade_ticket_status(ticket_record.id, "blocked")
                     evaluation_outcome = "risk_blocked"
                     receipt = ExecReceiptPayload(
                         status="blocked",
@@ -1788,6 +1791,10 @@ class WorkflowSupervisor:
                         risk_evaluation_outcome = (
                             "approved" if verdict.status == RiskStatus.APPROVED else "risk_blocked"
                         )
+                        await repo.update_trade_ticket_status(
+                            ticket_record.id,
+                            "approved" if verdict.status == RiskStatus.APPROVED else "blocked",
+                        )
                         candidate_trace["final_outcome"] = risk_evaluation_outcome
                         risk_message, risk_usage = await self.agents.risk_message(
                             verdict=verdict,
@@ -1845,6 +1852,7 @@ class WorkflowSupervisor:
                                     kalshi_order_id=receipt.external_order_id,
                                     kalshi_env=room.kalshi_env,
                                 )
+                            await repo.update_trade_ticket_status(ticket_record.id, receipt.status)
                         else:
                             receipt = ExecReceiptPayload(
                                 status="blocked",

@@ -561,6 +561,7 @@ class StrategyCleanupService:
                     "approved_count_fp": str(count_fp),
                 },
             )
+            await repo.update_trade_ticket_status(ticket_record.id, "approved")
             lock_acquired = await repo.acquire_execution_lock(
                 holder=self._settings.app_color,
                 color=self._settings.app_color,
@@ -600,6 +601,7 @@ class StrategyCleanupService:
                     kalshi_env=self._settings.kalshi_env,
                     strategy_code=StrategyCode.CLEANUP.value,
                 )
+            await repo.update_trade_ticket_status(ticket_record.id, receipt.status)
             input_hash, trace_hash, trace = build_deterministic_decision_trace(
                 room=room,
                 signal=trace_signal,
