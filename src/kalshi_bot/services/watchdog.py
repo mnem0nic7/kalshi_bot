@@ -201,18 +201,34 @@ class WatchdogService:
                     "reason": reason,
                 }
 
-        # Auto-enable kill switch if active color's reconcile is stale.
+        # Auto-enable kill switch if active color's reconcile is stale, and
+        # auto-clear only that same watchdog-owned latch once reconcile recovers.
         reconcile_stale_threshold = self.settings.daemon_reconcile_stale_kill_switch_seconds
         active_daemon = colors[active_color]["daemon"]
         reconcile_age = active_daemon.get("last_reconcile_age_seconds")
+        kill_switch_notes = dict(notes.get("kill_switch") or {})
         if (
             reconcile_stale_threshold > 0
             and reconcile_age is not None
             and reconcile_age > reconcile_stale_threshold
             and not control.kill_switch_enabled
         ):
-            await repo.set_kill_switch(True, kalshi_env=env)
+            kill_switch_payload = {
+                "kalshi_env": env,
+                "active_color": active_color,
+                "reconcile_age_seconds": reconcile_age,
+                "threshold_seconds": reconcile_stale_threshold,
+            }
+            await repo.set_kill_switch(
+                True,
+                kalshi_env=env,
+                source="watchdog",
+                reason="reconcile_stale",
+                payload=kill_switch_payload,
+            )
             control = await repo.get_deployment_control(kalshi_env=env)
+            notes = dict(control.notes or {})
+            watchdog = dict(notes.get("watchdog") or watchdog)
             logger.critical(
                 "Reconcile stale for %.0fs (threshold %ds) — kill switch auto-enabled",
                 reconcile_age,
@@ -225,12 +241,47 @@ class WatchdogService:
                     f"(threshold {reconcile_stale_threshold}s)"
                 ),
                 source="watchdog",
-                payload={
-                    "kalshi_env": env,
-                    "active_color": active_color,
-                    "reconcile_age_seconds": reconcile_age,
-                    "threshold_seconds": reconcile_stale_threshold,
-                },
+                payload=kill_switch_payload,
+            )
+        elif (
+            reconcile_stale_threshold > 0
+            and reconcile_age is not None
+            and reconcile_age <= reconcile_stale_threshold
+            and active_healthy
+            and control.kill_switch_enabled
+            and kill_switch_notes.get("mode") == "auto"
+            and kill_switch_notes.get("source") == "watchdog"
+            and kill_switch_notes.get("reason") == "reconcile_stale"
+        ):
+            kill_switch_payload = {
+                "kalshi_env": env,
+                "active_color": active_color,
+                "reconcile_age_seconds": reconcile_age,
+                "threshold_seconds": reconcile_stale_threshold,
+            }
+            await repo.set_kill_switch(
+                False,
+                kalshi_env=env,
+                source="watchdog",
+                reason="reconcile_recovered",
+                payload=kill_switch_payload,
+            )
+            control = await repo.get_deployment_control(kalshi_env=env)
+            notes = dict(control.notes or {})
+            watchdog = dict(notes.get("watchdog") or watchdog)
+            logger.warning(
+                "Reconcile recovered at %.0fs (threshold %ds) — watchdog auto-cleared stale-reconcile kill switch",
+                reconcile_age,
+                reconcile_stale_threshold,
+            )
+            await repo.log_ops_event(
+                severity="warning",
+                summary=(
+                    "Kill switch auto-cleared: reconcile recovered "
+                    f"at {reconcile_age:.0f}s (threshold {reconcile_stale_threshold}s)"
+                ),
+                source="watchdog",
+                payload=kill_switch_payload,
             )
 
         source_health_pause = await self._evaluate_source_health_pause(repo, env=env, now=now, notes=notes)

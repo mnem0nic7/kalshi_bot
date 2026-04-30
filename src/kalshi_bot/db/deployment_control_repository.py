@@ -68,20 +68,61 @@ class DeploymentControlRepositoryMixin:
         await self.session.flush()
         return control
 
-    async def set_kill_switch(self, enabled: bool, *, kalshi_env: str | None = None) -> DeploymentControl:
+    async def set_kill_switch(
+        self,
+        enabled: bool,
+        *,
+        kalshi_env: str | None = None,
+        source: str | None = None,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> DeploymentControl:
         control = await self.ensure_deployment_control(
             DeploymentColor.BLUE.value,
             kalshi_env=kalshi_env,
         )
+        now = datetime.now(UTC)
         control.kill_switch_enabled = enabled
+        notes = dict(control.notes or {})
+        kill_switch_notes = dict(notes.get("kill_switch") or {})
         if enabled:
             control.execution_lock_holder = None
+            if source or reason:
+                notes["kill_switch"] = {
+                    "mode": "auto" if source == "watchdog" else "external",
+                    "source": source,
+                    "reason": reason,
+                    "enabled_at": now.isoformat(),
+                    "payload": payload or {},
+                }
+            elif kill_switch_notes.get("mode") == "auto":
+                notes["kill_switch"] = {
+                    "mode": "manual_or_external",
+                    "enabled_at": now.isoformat(),
+                    "previous_auto_source": kill_switch_notes.get("source"),
+                    "previous_auto_reason": kill_switch_notes.get("reason"),
+                    "previous_auto_enabled_at": kill_switch_notes.get("enabled_at"),
+                }
         else:
             # Record when the kill switch was cleared so execution can require a
             # post-clear reconcile before the first live order goes out.
-            notes = dict(control.notes or {})
-            notes["kill_switch_cleared_at"] = datetime.now(UTC).isoformat()
-            control.notes = notes
+            notes["kill_switch_cleared_at"] = now.isoformat()
+            if source or reason:
+                notes["kill_switch"] = {
+                    **kill_switch_notes,
+                    "mode": "auto_cleared" if source == "watchdog" else "external_cleared",
+                    "source": source,
+                    "reason": reason,
+                    "cleared_at": now.isoformat(),
+                    "clear_payload": payload or {},
+                }
+            elif kill_switch_notes.get("mode") == "auto":
+                notes["kill_switch"] = {
+                    **kill_switch_notes,
+                    "mode": "manual_or_external_cleared",
+                    "cleared_at": now.isoformat(),
+                }
+        control.notes = notes
         await self.session.flush()
         return control
 

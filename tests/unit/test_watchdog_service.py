@@ -31,6 +31,21 @@ async def _seed_daemon_checkpoint(
     )
 
 
+async def _seed_reconcile_checkpoint(
+    repo: PlatformRepository,
+    *,
+    color: str,
+    age_seconds: int,
+    kalshi_env: str = "demo",
+) -> None:
+    observed_at = (datetime.now(UTC) - timedelta(seconds=age_seconds)).isoformat()
+    await repo.set_checkpoint(
+        f"daemon_reconcile:{kalshi_env}:{color}",
+        None,
+        {"reconciled_at": observed_at},
+    )
+
+
 @pytest.mark.asyncio
 async def test_watchdog_marks_daemon_unhealthy_when_heartbeat_is_stale(tmp_path) -> None:
     settings = Settings(
@@ -170,6 +185,87 @@ async def test_watchdog_does_not_restart_stack_while_apps_are_starting(tmp_path)
 
     assert payload["action"] == "none"
     assert payload["reason"] == "all colors healthy"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_auto_clears_stale_reconcile_kill_switch_after_recovery(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/watchdog.db",
+        daemon_heartbeat_interval_seconds=60,
+        daemon_reconcile_stale_kill_switch_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = WatchdogService(settings)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_active_color="blue")
+        await _seed_daemon_checkpoint(repo, color="blue", age_seconds=0)
+        await _seed_daemon_checkpoint(repo, color="green", age_seconds=0)
+        await _seed_reconcile_checkpoint(repo, color="blue", age_seconds=90)
+
+        tripped = await service.run_once(
+            repo,
+            app_statuses={"blue": "healthy", "green": "healthy"},
+            source="test_watchdog",
+        )
+        control = await repo.get_deployment_control()
+
+        assert tripped["action"] == "none"
+        assert control.kill_switch_enabled is True
+        assert control.notes["kill_switch"]["mode"] == "auto"
+        assert control.notes["kill_switch"]["source"] == "watchdog"
+        assert control.notes["kill_switch"]["reason"] == "reconcile_stale"
+
+        await _seed_reconcile_checkpoint(repo, color="blue", age_seconds=0)
+        recovered = await service.run_once(
+            repo,
+            app_statuses={"blue": "healthy", "green": "healthy"},
+            source="test_watchdog",
+        )
+        control = await repo.get_deployment_control()
+        await session.commit()
+
+    assert recovered["action"] == "none"
+    assert control.kill_switch_enabled is False
+    assert control.notes["kill_switch"]["mode"] == "auto_cleared"
+    assert control.notes["kill_switch"]["reason"] == "reconcile_recovered"
+    assert "kill_switch_cleared_at" in control.notes
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_does_not_auto_clear_manual_kill_switch(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/watchdog.db",
+        daemon_heartbeat_interval_seconds=60,
+        daemon_reconcile_stale_kill_switch_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = WatchdogService(settings)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_active_color="blue")
+        await _seed_daemon_checkpoint(repo, color="blue", age_seconds=0)
+        await _seed_daemon_checkpoint(repo, color="green", age_seconds=0)
+        await repo.set_kill_switch(True)
+        payload = await service.run_once(
+            repo,
+            app_statuses={"blue": "healthy", "green": "healthy"},
+            source="test_watchdog",
+        )
+        control = await repo.get_deployment_control()
+        await session.commit()
+
+    assert payload["action"] == "none"
+    assert control.kill_switch_enabled is True
+    assert "kill_switch_cleared_at" not in control.notes
     await engine.dispose()
 
 
