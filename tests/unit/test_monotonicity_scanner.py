@@ -362,19 +362,17 @@ def test_evaluate_arb_risk_shadow_off_without_atomic_flag_is_blocked() -> None:
     assert "atomic" in reason.lower()
 
 
-def test_evaluate_arb_risk_shadow_off_with_atomic_flag_is_still_blocked_today() -> None:
-    """Even with both flags set, live execution is blocked until the executor
-    ships. This prevents a partially-configured environment from placing a
-    naked leg 1 with no unwind path."""
+def test_evaluate_arb_risk_shadow_off_with_atomic_flag_is_live_ready() -> None:
+    """With both live flags set, the scanner service may hand the proposal to
+    the paired executor."""
     violation = _make_violation()
     settings = _settings(
         monotonicity_arb_shadow_only=False,
         monotonicity_arb_atomic_execution_ready=True,
     )
     outcome, reason = evaluate_arb_risk(violation, control=_control(), settings=settings)
-    assert outcome == "risk_blocked"
-    assert reason is not None
-    assert "executor" in reason.lower() or "not yet implemented" in reason.lower()
+    assert outcome == "live_ready"
+    assert reason is None
 
 
 def test_evaluate_arb_risk_shadow_only_stays_shadow_regardless_of_atomic_flag() -> None:

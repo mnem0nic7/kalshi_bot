@@ -423,6 +423,7 @@ class TradeAnalysisService:
                 if any(reason not in PENDING_EXCLUSION_REASONS for reason in row.get("exclusion_reasons", []))
             ),
             "stale_market_snapshot_diagnostics": self._stale_market_snapshot_diagnostics(dataset.rows),
+            "opportunity_metrics": self._opportunity_metrics(dataset.rows),
             "by_decision_status": dict(Counter(row.get("decision_status") for row in dataset.rows)),
             "by_series": dict(Counter(row.get("series_ticker") or "<unknown>" for row in dataset.rows)),
             "pnl": self._pnl_summary(dataset.rows),
@@ -870,6 +871,25 @@ class TradeAnalysisService:
         mapping = self.weather_directory.resolve_market_stub(room.market_ticker)
         signal_payload = signal.payload or {}
         eligibility = signal_payload.get("eligibility") or {}
+        candidate_trace = signal_payload.get("candidate_trace")
+        if not isinstance(candidate_trace, dict):
+            candidate_trace = eligibility.get("candidate_trace") if isinstance(eligibility, dict) else None
+        if not isinstance(candidate_trace, dict):
+            candidate_trace = {}
+        forecast_delta_fallback = candidate_trace.get("forecast_delta_fallback")
+        if not isinstance(forecast_delta_fallback, dict):
+            forecast_delta_fallback = {}
+        side_marketability = candidate_trace.get("selected_side_marketability")
+        if not isinstance(side_marketability, dict):
+            side_marketability = {}
+        extreme_edge_diagnostic = candidate_trace.get("extreme_edge_diagnostic")
+        if not isinstance(extreme_edge_diagnostic, dict):
+            extreme_edge_diagnostic = {}
+        stand_down_reason = (
+            signal_payload.get("stand_down_reason")
+            or eligibility.get("stand_down_reason")
+            or candidate_trace.get("stand_down_reason")
+        )
         strategy_code = (
             ticket.strategy_code
             if ticket is not None and ticket.strategy_code is not None
@@ -955,6 +975,17 @@ class TradeAnalysisService:
             "signal_summary": signal.summary,
             "signal_trade_regime": signal_payload.get("trade_regime"),
             "signal_candidate_outcome": (signal_payload.get("trade_selection") or {}).get("evaluation_outcome"),
+            "stand_down_reason": stand_down_reason,
+            "forecast_delta_fallback_derived": forecast_delta_fallback.get("derived"),
+            "forecast_delta_fallback_source": forecast_delta_fallback.get("source"),
+            "forecast_delta_fallback_forecast_high_source": forecast_delta_fallback.get("forecast_high_source"),
+            "forecast_delta_fallback_threshold_source": forecast_delta_fallback.get("threshold_source"),
+            "selected_side_marketability_status": side_marketability.get("status"),
+            "selected_side_marketability_side": side_marketability.get("selected_side"),
+            "selected_side_marketability_taker_price_dollars": side_marketability.get("taker_price_dollars"),
+            "extreme_edge_diagnostic_passed": extreme_edge_diagnostic.get("passed"),
+            "extreme_edge_diagnostic_reason": extreme_edge_diagnostic.get("failure_reason"),
+            "validated_extreme_edge": candidate_trace.get("validated_extreme_edge"),
             "eligibility_market_spread_bps": _int_or_none(eligibility.get("market_spread_bps")),
             "eligibility_remaining_payout_dollars": eligibility.get("remaining_payout_dollars"),
             "ticket_id": ticket.id if ticket is not None else None,
@@ -1147,6 +1178,41 @@ class TradeAnalysisService:
                 {"value": bucket, "rows": count}
                 for bucket, count in Counter(row.get("market_snapshot_age_bucket") or "missing" for row in stale_rows).most_common()
             ],
+        }
+
+    def _opportunity_metrics(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        stand_down_counts = Counter(str(row.get("stand_down_reason") or "none") for row in rows)
+        stale_market_rows = [row for row in rows if "stale_market_snapshot" in row.get("exclusion_reasons", [])]
+        stale_weather_rows = [row for row in rows if "stale_weather_snapshot" in row.get("exclusion_reasons", [])]
+        return {
+            "selected_side_unmarketable_count": int(stand_down_counts.get("selected_side_unmarketable", 0)),
+            "no_actionable_edge_count": int(stand_down_counts.get("no_actionable_edge", 0)),
+            "insufficient_forecast_separation_count": int(
+                stand_down_counts.get("insufficient_forecast_separation", 0)
+            ),
+            "forecast_delta_missing_count": int(stand_down_counts.get("forecast_delta_missing", 0)),
+            "missing_delta_recovered_count": sum(1 for row in rows if row.get("forecast_delta_fallback_derived") is True),
+            "extreme_edge_diagnostic_failed_count": sum(
+                1 for row in rows if row.get("extreme_edge_diagnostic_passed") is False
+            ),
+            "extreme_edge_diagnostic_passed_count": sum(
+                1 for row in rows if row.get("extreme_edge_diagnostic_passed") is True
+            ),
+            "validated_extreme_edge_count": sum(1 for row in rows if row.get("validated_extreme_edge") is True),
+            "selected_side_unmarketable_rows": [
+                {
+                    "room_id": row.get("room_id"),
+                    "market_ticker": row.get("market_ticker"),
+                    "selected_side": row.get("selected_side_marketability_side") or row.get("side"),
+                }
+                for row in rows
+                if row.get("stand_down_reason") == "selected_side_unmarketable"
+            ][:20],
+            "stale_snapshot_count": len(stale_market_rows) + len(stale_weather_rows),
+            "stale_market_snapshot_count": len(stale_market_rows),
+            "stale_weather_snapshot_count": len(stale_weather_rows),
+            "strategy_c_eligible_count": sum(1 for row in rows if row.get("strategy_code") == "C"),
+            "monotonicity_eligible_count": sum(1 for row in rows if row.get("strategy_code") == "ARB"),
         }
 
     async def _promotion_blockers(self, *, kalshi_env: str) -> list[dict[str, Any]]:

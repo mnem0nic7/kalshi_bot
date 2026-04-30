@@ -289,6 +289,7 @@ class AutoTriggerService:
                 return
 
             spread_bps = self._spread_bps(market_state)
+            one_sided_probe = self._one_sided_tradeable_probe(market_state)
             room = await repo.create_room(
                 RoomCreate(
                     name=f"auto {market_ticker}",
@@ -311,13 +312,20 @@ class AutoTriggerService:
                     "spread_bps": spread_bps,
                     "agent_pack_version": pack.version,
                     "last_trigger_mid": str(current_mid) if current_mid is not None else None,
+                    "one_sided_tradeable_probe": one_sided_probe,
                 },
             )
             await repo.log_ops_event(
                 severity="info",
                 summary=f"Auto-trigger launched room for {market_ticker}",
                 source="auto_trigger",
-                payload={"market_ticker": market_ticker, "room_id": room.id, "spread_bps": spread_bps, "agent_pack_version": pack.version},
+                payload={
+                    "market_ticker": market_ticker,
+                    "room_id": room.id,
+                    "spread_bps": spread_bps,
+                    "agent_pack_version": pack.version,
+                    "one_sided_tradeable_probe": one_sided_probe,
+                },
                 room_id=room.id,
             )
             await session.commit()
@@ -537,7 +545,7 @@ class AutoTriggerService:
         market_ticker: str,
         block: dict[str, Any],
     ) -> None:
-        if block.get("reason") not in {"one_sided_book", "spread_too_wide", "non_positive_spread", "market_state_missing"}:
+        if block.get("reason") not in {"one_sided_book", "no_taker_quote", "spread_too_wide", "non_positive_spread", "market_state_missing"}:
             return
         now = datetime.now(UTC)
         checkpoint_key = f"auto_trigger_waitlist:{self.settings.kalshi_env}:{market_ticker}"
@@ -614,8 +622,12 @@ class AutoTriggerService:
     def _book_is_broken(self, market_state: MarketState) -> bool:
         yes_ask = market_state.yes_ask_dollars
         yes_bid = market_state.yes_bid_dollars
-        if yes_ask is None or yes_bid is None:
+        has_yes_taker = yes_ask is not None and yes_ask > 0
+        has_no_taker = yes_bid is not None and yes_bid > 0
+        if not has_yes_taker and not has_no_taker:
             return True
+        if not has_yes_taker or not has_no_taker:
+            return False
         no_ask = Decimal("1") - yes_bid
         return (
             (yes_ask >= Decimal("0.9900") and no_ask >= Decimal("0.9400"))
@@ -639,16 +651,14 @@ class AutoTriggerService:
 
         yes_bid = market_state.yes_bid_dollars
         yes_ask = market_state.yes_ask_dollars
-        missing_quotes = []
-        if yes_bid is None or yes_bid <= 0:
-            missing_quotes.extend(["yes_bid", "no_ask"])
-        if yes_ask is None or yes_ask <= 0:
-            missing_quotes.extend(["yes_ask", "no_bid"])
-        if missing_quotes:
+        has_yes_taker = yes_ask is not None and yes_ask > 0
+        has_no_taker = yes_bid is not None and yes_bid > 0
+        missing_quotes = self._missing_quote_names(yes_bid=yes_bid, yes_ask=yes_ask)
+        if not has_yes_taker and not has_no_taker:
             return {
-                "reason": "one_sided_book",
+                "reason": "no_taker_quote",
                 "diagnostic_class": "pre_room_liquidity",
-                "actionability": "missed_due_to_one_sided_book",
+                "actionability": "missed_due_to_no_taker_quote",
                 "missing_quotes": sorted(set(missing_quotes)),
                 "yes_bid_dollars": self._decimal_or_none_str(yes_bid),
                 "yes_ask_dollars": self._decimal_or_none_str(yes_ask),
@@ -664,8 +674,12 @@ class AutoTriggerService:
                 ),
                 "market_observed_at": self._iso_or_none(market_state.observed_at),
             }
+        if missing_quotes:
+            return None
 
         spread_bps = self._spread_bps(market_state)
+        if spread_bps is None:
+            return None
         if spread_bps <= 0:
             return {
                 "reason": "non_positive_spread",
@@ -690,11 +704,58 @@ class AutoTriggerService:
         return None
 
     @staticmethod
+    def _missing_quote_names(*, yes_bid: Decimal | None, yes_ask: Decimal | None) -> list[str]:
+        missing_quotes = []
+        if yes_bid is None or yes_bid <= 0:
+            missing_quotes.extend(["yes_bid", "no_ask"])
+        if yes_ask is None or yes_ask <= 0:
+            missing_quotes.extend(["yes_ask", "no_bid"])
+        return sorted(set(missing_quotes))
+
+    def _one_sided_tradeable_probe(self, market_state: MarketState) -> dict[str, Any]:
+        yes_bid = market_state.yes_bid_dollars
+        yes_ask = market_state.yes_ask_dollars
+        has_yes_taker = yes_ask is not None and yes_ask > 0
+        has_no_taker = yes_bid is not None and yes_bid > 0
+        tradeable_sides = []
+        if has_yes_taker:
+            tradeable_sides.append("yes")
+        if has_no_taker:
+            tradeable_sides.append("no")
+        return {
+            "diagnostic_class": "pre_room_liquidity",
+            "actionability": (
+                "one_sided_book_side_aware_probe"
+                if len(tradeable_sides) == 1
+                else "two_sided_book"
+            ),
+            "one_sided": len(tradeable_sides) == 1,
+            "tradeable_sides": tradeable_sides,
+            "missing_quotes": self._missing_quote_names(yes_bid=yes_bid, yes_ask=yes_ask),
+            "yes_bid_dollars": self._decimal_or_none_str(yes_bid),
+            "yes_ask_dollars": self._decimal_or_none_str(yes_ask),
+            "derived_no_ask_dollars": (
+                self._decimal_or_none_str(Decimal("1") - yes_bid)
+                if yes_bid is not None and yes_bid > 0
+                else None
+            ),
+            "derived_no_bid_dollars": (
+                self._decimal_or_none_str(Decimal("1") - yes_ask)
+                if yes_ask is not None and yes_ask > 0
+                else None
+            ),
+            "market_observed_at": self._iso_or_none(market_state.observed_at),
+        }
+
+    @staticmethod
     def _market_actionability_summary(market_ticker: str, block: dict[str, Any]) -> str:
         reason = str(block.get("reason") or "unknown")
         if reason == "one_sided_book":
             missing = ", ".join(str(item) for item in block.get("missing_quotes") or [])
             return f"Auto-trigger skipped for {market_ticker}: one-sided order book ({missing})"
+        if reason == "no_taker_quote":
+            missing = ", ".join(str(item) for item in block.get("missing_quotes") or [])
+            return f"Auto-trigger skipped for {market_ticker}: no taker quote available ({missing})"
         if reason == "spread_too_wide":
             return (
                 f"Auto-trigger skipped for {market_ticker}: spread "
@@ -828,9 +889,11 @@ class AutoTriggerService:
         return str(value).strip().lower()
 
     @staticmethod
-    def _spread_bps(market_state: MarketState) -> int:
-        yes_bid = Decimal(str(market_state.yes_bid_dollars or 0))
-        yes_ask = Decimal(str(market_state.yes_ask_dollars or 0))
+    def _spread_bps(market_state: MarketState) -> int | None:
+        if market_state.yes_bid_dollars is None or market_state.yes_ask_dollars is None:
+            return None
+        yes_bid = Decimal(str(market_state.yes_bid_dollars))
+        yes_ask = Decimal(str(market_state.yes_ask_dollars))
         return int(((yes_ask - yes_bid) * Decimal("10000")).to_integral_value())
 
     @staticmethod
@@ -838,7 +901,7 @@ class AutoTriggerService:
         yes_bid = market_state.yes_bid_dollars
         yes_ask = market_state.yes_ask_dollars
         if yes_bid is None:
-            return None
+            return yes_ask
         if yes_ask is None:
             return yes_bid
         return (yes_bid + yes_ask) / Decimal("2")

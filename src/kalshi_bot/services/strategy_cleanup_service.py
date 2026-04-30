@@ -10,24 +10,31 @@ unless the Strategy C settings explicitly graduate it.
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import WeatherResolutionState
+from kalshi_bot.core.enums import ContractSide, RiskStatus, RoomOrigin, StrategyCode, StrategyMode, TradeAction, WeatherResolutionState
+from kalshi_bot.core.fixed_point import make_client_order_id, quantize_count, quantize_price
+from kalshi_bot.core.schemas import ExecReceiptPayload, RoomCreate, TradeTicket
 from kalshi_bot.db.models import CliStationVariance, DeploymentControl, MarketPriceHistory, StrategyCRoom
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.integrations.weather import NWSWeatherClient
+from kalshi_bot.services.decision_trace import build_deterministic_decision_trace
+from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.counterfactuals import (
     strategy_c_fee_cents,
     strategy_c_gross_edge_cents,
     strategy_c_target_cents,
 )
 from kalshi_bot.services.risk import evaluate_cleanup_risk
+from kalshi_bot.services.signal import StrategySignal
 from kalshi_bot.services.strategy_cleanup import (
     CleanupSignal,
     LockStateTracker,
@@ -48,12 +55,14 @@ class StrategyCleanupService:
         kalshi: KalshiClient,
         weather: NWSWeatherClient,
         weather_directory: WeatherMarketDirectory,
+        execution_service: ExecutionService | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._kalshi = kalshi
         self._weather = weather
         self._weather_directory = weather_directory
+        self._execution_service = execution_service
         self._lock_tracker = LockStateTracker()
 
     async def sweep(self) -> list[CleanupSignal]:
@@ -83,11 +92,25 @@ class StrategyCleanupService:
                 continue
             signals.append(signal)
             if signal.suppression_reason is None:
-                verdict = evaluate_cleanup_risk(signal, control=control, settings=self._settings)
-                outcome = "shadow" if verdict.status.value == "approved" else "risk_blocked"
+                position_context = await self._position_context(signal)
+                verdict = evaluate_cleanup_risk(
+                    signal,
+                    control=control,
+                    settings=self._settings,
+                    current_position_notional_dollars=position_context["notional"],
+                    current_position_side=position_context["side"],
+                )
+                if verdict.status == RiskStatus.APPROVED:
+                    outcome = "shadow" if self._settings.strategy_c_shadow_only else "live_pending"
+                else:
+                    outcome = "risk_blocked"
             else:
+                verdict = None
                 outcome = "suppressed"
-            await self._persist_signal(signal, execution_outcome=outcome)
+            record = await self._persist_signal(signal, execution_outcome=outcome)
+            if outcome == "live_pending":
+                live_outcome = await self._execute_live_signal(signal, record, control, verdict)
+                await self._update_record_outcome(record.room_id, live_outcome)
 
         logger.info(
             "strategy_c: sweep complete — %d evaluated, %d actionable",
@@ -398,9 +421,25 @@ class StrategyCleanupService:
             reference_time=now,
         )
 
-    async def _persist_signal(self, signal: CleanupSignal, *, execution_outcome: str) -> None:
+    async def _position_context(self, signal: CleanupSignal) -> dict[str, Any]:
+        async with self._session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self._settings.kalshi_env)
+            position = await repo.get_position(
+                signal.ticker,
+                self._settings.kalshi_subaccount,
+                kalshi_env=self._settings.kalshi_env,
+            )
+            await session.commit()
+        if position is None:
+            return {"notional": Decimal("0"), "side": None}
+        return {
+            "notional": Decimal(str(position.average_price_dollars or 0)) * Decimal(str(position.count_fp or 0)),
+            "side": position.side,
+        }
+
+    async def _persist_signal(self, signal: CleanupSignal, *, execution_outcome: str) -> StrategyCRoom:
         contracts_requested = 0
-        if execution_outcome == "shadow" and signal.target_price_cents > 0:
+        if execution_outcome in {"shadow", "live_pending"} and signal.target_price_cents > 0:
             unit_cost = signal.target_price_cents / 100.0
             contracts_requested = max(1, int(
                 self._settings.strategy_c_max_order_notional_dollars / unit_cost
@@ -430,4 +469,211 @@ class StrategyCleanupService:
             signal.edge_cents,
             execution_outcome,
             signal.suppression_reason or "none",
+        )
+        return record
+
+    async def _update_record_outcome(self, strategy_c_room_id: str, outcome: str) -> None:
+        async with self._session_factory() as session:
+            record = await session.get(StrategyCRoom, strategy_c_room_id)
+            if record is not None:
+                record.execution_outcome = outcome
+            await session.commit()
+
+    async def _execute_live_signal(
+        self,
+        signal: CleanupSignal,
+        strategy_c_record: StrategyCRoom,
+        control: DeploymentControl,
+        verdict: Any,
+    ) -> str:
+        if self._execution_service is None:
+            return "risk_blocked"
+        if self._settings.app_shadow_mode:
+            return "shadow"
+
+        count_fp = quantize_count(Decimal(str(strategy_c_record.contracts_requested or 0)))
+        if count_fp <= Decimal("0"):
+            return "risk_blocked"
+        yes_price = self._yes_price_for_signal(signal)
+        ticket = TradeTicket(
+            market_ticker=signal.ticker,
+            action=TradeAction.BUY,
+            side=signal.side,
+            yes_price_dollars=yes_price,
+            count_fp=count_fp,
+            capital_bucket="safe",
+            time_in_force="immediate_or_cancel",
+            note=f"strategy_c_room_id={strategy_c_record.room_id}",
+        )
+        unit_notional = ticket.yes_price_dollars if signal.side == ContractSide.YES else Decimal("1.0000") - ticket.yes_price_dollars
+        approved_notional = (unit_notional * count_fp).quantize(Decimal("0.0001"))
+
+        async with self._session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self._settings.kalshi_env)
+            room = await repo.create_room(
+                RoomCreate(
+                    name=f"strategy C {signal.ticker}",
+                    market_ticker=signal.ticker,
+                    prompt=f"Strategy C cleanup signal linked to {strategy_c_record.room_id}.",
+                ),
+                active_color=self._settings.app_color,
+                shadow_mode=False,
+                kill_switch_enabled=control.kill_switch_enabled,
+                kalshi_env=self._settings.kalshi_env,
+                room_origin=RoomOrigin.LIVE.value,
+                agent_pack_version="strategy-c-deterministic",
+            )
+            trace_signal = self._trace_signal(signal, yes_price)
+            trace_signal.candidate_trace["strategy_c_room_id"] = strategy_c_record.room_id
+            await repo.save_signal(
+                room_id=room.id,
+                market_ticker=signal.ticker,
+                fair_yes_dollars=trace_signal.fair_yes_dollars,
+                edge_bps=trace_signal.edge_bps,
+                confidence=trace_signal.confidence,
+                summary=trace_signal.summary,
+                payload={
+                    "strategy_code": StrategyCode.CLEANUP.value,
+                    "strategy_c_room_id": strategy_c_record.room_id,
+                    "resolution_state": signal.resolution_state.value,
+                    "recommended_side": signal.side.value,
+                    "candidate_trace": trace_signal.candidate_trace,
+                },
+            )
+            client_order_id = make_client_order_id(room.id, signal.ticker, ticket.nonce)
+            ticket_record = await repo.save_trade_ticket(
+                room.id,
+                ticket,
+                client_order_id,
+                strategy_code=StrategyCode.CLEANUP.value,
+            )
+            risk_record = await repo.save_risk_verdict(
+                room_id=room.id,
+                ticket_id=ticket_record.id,
+                status=verdict.status,
+                reasons=verdict.reasons,
+                approved_notional_dollars=verdict.approved_notional_dollars or approved_notional,
+                approved_count_fp=verdict.approved_count_fp or count_fp,
+                payload={
+                    **verdict.model_dump(mode="json"),
+                    "strategy_c_room_id": strategy_c_record.room_id,
+                    "approved_notional_dollars": str(approved_notional),
+                    "approved_count_fp": str(count_fp),
+                },
+            )
+            lock_acquired = await repo.acquire_execution_lock(
+                holder=self._settings.app_color,
+                color=self._settings.app_color,
+                kalshi_env=self._settings.kalshi_env,
+            )
+            await session.commit()
+
+        if not lock_acquired:
+            receipt = ExecReceiptPayload(
+                status="lock_denied",
+                client_order_id=client_order_id,
+                details={"reason": "execution lock held by another deployment color"},
+            )
+        else:
+            receipt = await self._execution_service.execute(
+                room=room,
+                control=control,
+                ticket=ticket,
+                client_order_id=client_order_id,
+                fair_yes_dollars=trace_signal.fair_yes_dollars,
+            )
+
+        async with self._session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self._settings.kalshi_env)
+            if receipt.external_order_id or receipt.status not in ("shadow_skipped", "inactive_color_skipped"):
+                await repo.save_order(
+                    ticket_id=ticket_record.id,
+                    client_order_id=client_order_id,
+                    market_ticker=ticket.market_ticker,
+                    status=receipt.status,
+                    side=ticket.side.value,
+                    action=ticket.action.value,
+                    yes_price_dollars=ticket.yes_price_dollars,
+                    count_fp=ticket.count_fp,
+                    raw={**receipt.details, "strategy_c_room_id": strategy_c_record.room_id},
+                    kalshi_order_id=receipt.external_order_id,
+                    kalshi_env=self._settings.kalshi_env,
+                    strategy_code=StrategyCode.CLEANUP.value,
+                )
+            input_hash, trace_hash, trace = build_deterministic_decision_trace(
+                room=room,
+                signal=trace_signal,
+                thresholds=SimpleNamespace(
+                    strategy_c_min_edge_cents=self._settings.strategy_c_min_edge_cents,
+                    strategy_c_max_order_notional_dollars=self._settings.strategy_c_max_order_notional_dollars,
+                    strategy_c_max_position_notional_dollars=self._settings.strategy_c_max_position_notional_dollars,
+                    strategy_c_shadow_only=self._settings.strategy_c_shadow_only,
+                ),
+                candidate_trace=trace_signal.candidate_trace,
+                final_status=receipt.status,
+                evaluation_outcome="approved" if verdict.status == RiskStatus.APPROVED else "risk_blocked",
+                ticket_record=ticket_record,
+                risk_verdict_record=risk_record,
+                receipt=receipt,
+                market_observed_at=None,
+                research_observed_at=datetime.now(UTC),
+                source_snapshot_ids={"strategy_c_room_id": strategy_c_record.room_id},
+            )
+            await repo.save_decision_trace(
+                room_id=room.id,
+                ticket_id=ticket_record.id,
+                market_ticker=ticket.market_ticker,
+                kalshi_env=self._settings.kalshi_env,
+                decision_kind=trace["decision_kind"],
+                path_version="strategy-c-live.v1",
+                agent_pack_version="strategy-c-deterministic",
+                parameter_pack_version=None,
+                source_snapshot_ids=trace["source_snapshot_ids"],
+                input_hash=input_hash,
+                trace_hash=trace_hash,
+                trace=trace,
+            )
+            await session.commit()
+        if receipt.status == "filled":
+            return "live_filled"
+        if receipt.status in {"submitted", "resting", "open"}:
+            return "live_submitted"
+        return f"live_{receipt.status}"
+
+    @staticmethod
+    def _yes_price_for_signal(signal: CleanupSignal) -> Decimal:
+        target = Decimal(str(signal.target_price_cents)) / Decimal("100")
+        if signal.side == ContractSide.YES:
+            return quantize_price(target)
+        return quantize_price(Decimal("1.0000") - target)
+
+    @staticmethod
+    def _trace_signal(signal: CleanupSignal, yes_price: Decimal) -> StrategySignal:
+        fair_yes = signal.fair_value_dollars
+        side_fair = fair_yes if signal.side == ContractSide.YES else Decimal("1.0000") - fair_yes
+        target = Decimal(str(signal.target_price_cents)) / Decimal("100")
+        edge_bps = int(((side_fair - target) * Decimal("10000")).to_integral_value())
+        return StrategySignal(
+            fair_yes_dollars=fair_yes,
+            confidence=1.0,
+            edge_bps=edge_bps,
+            recommended_action=TradeAction.BUY,
+            recommended_side=signal.side,
+            target_yes_price_dollars=yes_price,
+            summary=f"Strategy C cleanup {signal.side.value.upper()} for locked {signal.resolution_state.value}.",
+            resolution_state=signal.resolution_state,
+            strategy_mode=StrategyMode.RESOLUTION_CLEANUP,
+            trade_regime="strategy_c_cleanup",
+            capital_bucket="safe",
+            forecast_delta_f=signal.observed_max_f - signal.threshold_f,
+            confidence_band="high",
+            candidate_trace={
+                "strategy_code": StrategyCode.CLEANUP.value,
+                "strategy_c_room_id": None,
+                "resolution_state": signal.resolution_state.value,
+                "selected_side": signal.side.value,
+                "target_side_price_dollars": str(target.quantize(Decimal("0.0001"))),
+                "target_yes_price_dollars": str(yes_price),
+                "edge_cents": signal.edge_cents,
+            },
         )

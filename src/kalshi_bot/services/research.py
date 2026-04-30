@@ -39,6 +39,7 @@ from kalshi_bot.services.signal import (
     annotate_signal_quality,
     base_strategy_summary,
     capital_bucket_for_trade_regime,
+    market_quotes,
     summarize_signal_action,
 )
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -108,6 +109,14 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_float(*values: Any) -> tuple[float | None, str | None]:
+    for label, value in values:
+        parsed = _to_float(value)
+        if parsed is not None:
+            return parsed, str(label)
+    return None, None
 
 
 def _to_iso(value: datetime | None) -> str | None:
@@ -552,9 +561,10 @@ class ResearchCoordinator:
                 summary="Stand down: dossier fair value is unavailable or neutral sentinel.",
                 stand_down_reason=StandDownReason.FORECAST_UNAVAILABLE,
             )
-        ask_yes = quantize_price(market.get("yes_ask_dollars")) if market.get("yes_ask_dollars") is not None else None
-        bid_yes = quantize_price(market.get("yes_bid_dollars")) if market.get("yes_bid_dollars") is not None else None
-        ask_no = quantize_price(market.get("no_ask_dollars")) if market.get("no_ask_dollars") is not None else None
+        quotes = market_quotes(market)
+        ask_yes = quotes["yes_ask"]
+        bid_yes = quotes["yes_bid"]
+        ask_no = quotes["no_ask"]
         effective_min_edge_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
         min_edge = Decimal(effective_min_edge_bps) / Decimal("10000")
 
@@ -630,15 +640,25 @@ class ResearchCoordinator:
             **dict(dossier.trader_context.numeric_facts or {}),
             **dict(dossier.summary.current_numeric_facts or {}),
         }
-        forecast_high_f = _to_float(
-            facts.get("forecast_high_f")
-            or facts.get("forecast_high")
-            or facts.get("forecast_max_f")
+        forecast_high_f, forecast_source = _first_float(
+            ("forecast_high_f", facts.get("forecast_high_f")),
+            ("forecast_high", facts.get("forecast_high")),
+            ("forecast_max_f", facts.get("forecast_max_f")),
+            ("forecast_max", facts.get("forecast_max")),
+            ("predicted_high_f", facts.get("predicted_high_f")),
+            ("predicted_high", facts.get("predicted_high")),
+            ("nws_forecast_high_f", facts.get("nws_forecast_high_f")),
+            ("nws_forecast_high", facts.get("nws_forecast_high")),
+            ("ensemble_mean_high_f", facts.get("ensemble_mean_high_f")),
+            ("ensemble_mean_high", facts.get("ensemble_mean_high")),
+            ("model_mean_high_f", facts.get("model_mean_high_f")),
+            ("model_mean_high", facts.get("model_mean_high")),
         )
         mapping = self.weather_directory.resolve_market(dossier.market_ticker, market)
-        threshold_f = _to_float(
-            facts.get("threshold_f")
-            or (getattr(mapping, "threshold_f", None) if mapping is not None else None)
+        threshold_f, threshold_source = _first_float(
+            ("threshold_f", facts.get("threshold_f")),
+            ("threshold", facts.get("threshold")),
+            ("market_mapping", getattr(mapping, "threshold_f", None) if mapping is not None else None),
         )
         operator = (
             facts.get("operator")
@@ -649,7 +669,9 @@ class ResearchCoordinator:
             "attempted": True,
             "source": "numeric_facts_and_market_mapping",
             "forecast_high_f": forecast_high_f,
+            "forecast_high_source": forecast_source,
             "threshold_f": threshold_f,
+            "threshold_source": threshold_source,
             "operator": operator,
         }
         if forecast_high_f is None or threshold_f is None:

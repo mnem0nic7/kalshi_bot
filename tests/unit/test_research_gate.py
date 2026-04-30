@@ -274,6 +274,103 @@ def test_build_signal_from_dossier_derives_missing_forecast_delta_from_facts() -
     assert signal.candidate_trace["forecast_delta_fallback"]["source"] == "numeric_facts_and_market_mapping"
 
 
+def test_build_signal_from_dossier_derives_delta_from_new_high_keys_and_preserves_zero() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    ticker = "KXHIGHNY-26APR24-T0"
+    coordinator = ResearchCoordinator(  # type: ignore[arg-type]
+        settings,
+        None,
+        None,
+        None,
+        WeatherMarketDirectory(
+            {
+                ticker: WeatherMarketMapping(
+                    market_ticker=ticker,
+                    station_id="KNYC",
+                    location_name="New York",
+                    latitude=40.0,
+                    longitude=-73.0,
+                    threshold_f=0.0,
+                    series_ticker="KXHIGHNY",
+                    operator=">",
+                )
+            }
+        ),
+        None,
+        WeatherSignalEngine(settings),
+        AgentPackService(settings),
+    )
+    now = datetime.now(UTC)
+    base = _make_dossier_aged(now, age_seconds=60)
+    dossier = base.model_copy(
+        update={
+            "market_ticker": ticker,
+            "forecast_delta_f": None,
+            "summary": base.summary.model_copy(
+                update={"current_numeric_facts": {"predicted_high_f": 0.0}}
+            ),
+            "trader_context": base.trader_context.model_copy(update={"forecast_delta_f": None}),
+        }
+    )
+
+    signal = coordinator.build_signal_from_dossier(
+        dossier,
+        {"market": {**_MARKET_SNAPSHOT, "ticker": ticker}},
+    )
+
+    assert signal.forecast_delta_f == 0.0
+    fallback = signal.candidate_trace["forecast_delta_fallback"]
+    assert fallback["derived"] is True
+    assert fallback["forecast_high_source"] == "predicted_high_f"
+
+
+def test_build_signal_from_dossier_derives_less_than_delta_with_correct_polarity() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    ticker = "KXLOWCHI-26APR24-T60"
+    coordinator = ResearchCoordinator(  # type: ignore[arg-type]
+        settings,
+        None,
+        None,
+        None,
+        WeatherMarketDirectory(
+            {
+                ticker: WeatherMarketMapping(
+                    market_ticker=ticker,
+                    station_id="KMDW",
+                    location_name="Chicago",
+                    latitude=41.0,
+                    longitude=-87.0,
+                    threshold_f=60.0,
+                    series_ticker="KXLOWCHI",
+                    operator="<",
+                )
+            }
+        ),
+        None,
+        WeatherSignalEngine(settings),
+        AgentPackService(settings),
+    )
+    now = datetime.now(UTC)
+    base = _make_dossier_aged(now, age_seconds=60)
+    dossier = base.model_copy(
+        update={
+            "market_ticker": ticker,
+            "forecast_delta_f": None,
+            "summary": base.summary.model_copy(
+                update={"current_numeric_facts": {"nws_forecast_high_f": 55.0}}
+            ),
+            "trader_context": base.trader_context.model_copy(update={"forecast_delta_f": None}),
+        }
+    )
+
+    signal = coordinator.build_signal_from_dossier(
+        dossier,
+        {"market": {**_MARKET_SNAPSHOT, "ticker": ticker}},
+    )
+
+    assert signal.forecast_delta_f == 5.0
+
+
 def test_build_signal_from_dossier_stale_dossier_blocked() -> None:
     coordinator = make_coordinator()
     now = datetime.now(UTC)

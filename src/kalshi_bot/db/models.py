@@ -1250,6 +1250,14 @@ class MonotonicityArbProposal(Base):
     contracts_proposed: Mapped[int] = mapped_column(Integer, nullable=False)
     execution_outcome: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     suppression_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    pair_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    leg1_client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    leg2_client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    unwind_client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    leg1_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    leg2_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    unwind_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    execution_payload: Mapped[dict] = mapped_column(JSON, default=dict)
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

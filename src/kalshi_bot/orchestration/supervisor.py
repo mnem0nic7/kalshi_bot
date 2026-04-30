@@ -446,6 +446,10 @@ class WorkflowSupervisor:
         signal.candidate_trace = candidate_trace
 
         if diagnostic["passed"]:
+            candidate_trace["validated_extreme_edge"] = True
+            reason_codes.append("max_credible_edge_validated")
+            candidate_trace["reason_codes"] = sorted({str(code) for code in reason_codes})
+            signal.candidate_trace = candidate_trace
             if signal.eligibility is not None:
                 signal.eligibility = signal.eligibility.model_copy(update={"candidate_trace": candidate_trace})
             return True

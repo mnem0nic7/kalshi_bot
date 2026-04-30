@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import MonotonicityArbProposal
+from kalshi_bot.db.models import DecisionTraceRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.monotonicity_scanner_service import MonotonicityArbScannerService
@@ -60,11 +61,34 @@ def _settings(**overrides) -> Settings:
 class _FakeKalshi:
     """Returns a configurable list of markets from list_markets()."""
 
-    def __init__(self, markets: list[dict[str, Any]]) -> None:
+    write_credentials = object()
+
+    def __init__(self, markets: list[dict[str, Any]], *, reject_leg2: bool = False, unwind_bid: float = 0.30) -> None:
         self._markets = markets
+        self.reject_leg2 = reject_leg2
+        self.unwind_bid = unwind_bid
+        self.orders: list[dict[str, Any]] = []
 
     async def list_markets(self, **_kwargs: Any) -> dict[str, Any]:
         return {"markets": self._markets}
+
+    async def get_market(self, ticker: str) -> dict[str, Any]:
+        market = next(m for m in self._markets if m["ticker"] == ticker)
+        if "unwind" in [order["client_order_id"].split("-")[-1] for order in self.orders]:
+            market = {**market, "yes_bid_dollars": self.unwind_bid}
+        return {"market": market}
+
+    async def create_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.orders.append(payload)
+        status = "filled"
+        if self.reject_leg2 and payload["client_order_id"].endswith("-leg2"):
+            status = "rejected"
+        return {
+            "order": {
+                "order_id": f"order-{len(self.orders)}",
+                "status": status,
+            }
+        }
 
 
 async def _setup_db(settings: Settings):
@@ -244,3 +268,64 @@ async def test_get_status_returns_counts() -> None:
     assert status["total_proposals"] >= 1
     assert status["shadow_proposals"] >= 1
     assert isinstance(status["recent"], list)
+
+
+@pytest.mark.asyncio
+async def test_live_ready_pair_executes_both_legs_and_persists_order_links() -> None:
+    settings = _settings(
+        monotonicity_arb_shadow_only=False,
+        monotonicity_arb_atomic_execution_ready=True,
+    )
+    session_factory = await _setup_db(settings)
+    fake = _FakeKalshi(VIOLATION_MARKETS)
+    svc = MonotonicityArbScannerService(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=fake,
+    )
+
+    proposals = await svc.sweep()
+
+    assert proposals[0].execution_outcome == "live_filled"
+    assert proposals[0].pair_id
+    assert len(fake.orders) == 2
+    async with session_factory() as session:
+        row = (await session.execute(select(MonotonicityArbProposal))).scalar_one()
+        trace = (await session.execute(select(DecisionTraceRecord))).scalar_one()
+
+    assert row.execution_outcome == "live_filled"
+    assert row.pair_id == proposals[0].pair_id
+    assert row.leg1_order_id == "order-1"
+    assert row.leg2_order_id == "order-2"
+    assert row.execution_payload["events"][0]["event"] == "leg1"
+    assert trace.path_version == "monotonicity-pair.v1"
+    assert trace.input_hash
+    assert trace.trace_hash
+    assert trace.source_snapshot_ids["pair_id"] == row.pair_id
+
+
+@pytest.mark.asyncio
+async def test_live_pair_unwinds_leg1_when_leg2_fails() -> None:
+    settings = _settings(
+        monotonicity_arb_shadow_only=False,
+        monotonicity_arb_atomic_execution_ready=True,
+    )
+    session_factory = await _setup_db(settings)
+    fake = _FakeKalshi(VIOLATION_MARKETS, reject_leg2=True)
+    svc = MonotonicityArbScannerService(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=fake,
+    )
+
+    proposals = await svc.sweep()
+
+    assert proposals[0].execution_outcome == "leg2_failed_unwind_submitted"
+    assert len(fake.orders) == 3
+    async with session_factory() as session:
+        row = (await session.execute(select(MonotonicityArbProposal))).scalar_one()
+        trace = (await session.execute(select(DecisionTraceRecord))).scalar_one()
+
+    assert row.unwind_order_id == "order-3"
+    assert row.execution_payload["events"][-1]["event"] == "unwind"
+    assert trace.trace["final_status"] == "leg2_failed_unwind_submitted"

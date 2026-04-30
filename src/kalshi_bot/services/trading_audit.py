@@ -989,17 +989,23 @@ class TradingAuditService:
         tracked_reasons = {
             "market_state_missing",
             "one_sided_book",
+            "no_taker_quote",
             "non_positive_spread",
             "spread_too_wide",
         }
         reason_counts: Counter[str] = Counter()
         actionability_counts: Counter[str] = Counter()
+        one_sided_tradeable_count = 0
         market_rollups: dict[str, dict[str, Any]] = {}
 
         for event in ops_events:
             if event.source != "auto_trigger":
                 continue
             payload = event.payload if isinstance(event.payload, dict) else {}
+            probe = payload.get("one_sided_tradeable_probe") if isinstance(payload.get("one_sided_tradeable_probe"), dict) else None
+            if probe is not None and probe.get("one_sided") is True:
+                one_sided_tradeable_count += 1
+                actionability_counts[str(probe.get("actionability") or "one_sided_book_side_aware_probe")] += 1
             reason = str(payload.get("reason") or "")
             if reason not in tracked_reasons:
                 continue
@@ -1044,6 +1050,8 @@ class TradingAuditService:
         return {
             "pre_room_miss_count": sum(reason_counts.values()),
             "one_sided_book_count": int(reason_counts.get("one_sided_book", 0)),
+            "no_taker_quote_count": int(reason_counts.get("no_taker_quote", 0)),
+            "one_sided_tradeable_probe_count": one_sided_tradeable_count,
             "wide_spread_count": int(reason_counts.get("spread_too_wide", 0)),
             "invalid_spread_count": int(reason_counts.get("non_positive_spread", 0)),
             "missing_market_state_count": int(reason_counts.get("market_state_missing", 0)),

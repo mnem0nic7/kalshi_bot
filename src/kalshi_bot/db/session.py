@@ -37,6 +37,23 @@ async def init_models(engine: AsyncEngine) -> None:
         )
         if "trigger_source" not in existing_codex_columns:
             await conn.execute(text("ALTER TABLE strategy_codex_runs ADD COLUMN trigger_source VARCHAR(32) NOT NULL DEFAULT 'manual'"))
+        existing_arb_columns = set(
+            await conn.run_sync(lambda sync_conn: [column["name"] for column in inspect(sync_conn).get_columns("monotonicity_arb_proposals")])
+        )
+        arb_columns = {
+            "pair_id": "VARCHAR(64)",
+            "leg1_client_order_id": "VARCHAR(128)",
+            "leg2_client_order_id": "VARCHAR(128)",
+            "unwind_client_order_id": "VARCHAR(128)",
+            "leg1_order_id": "VARCHAR(128)",
+            "leg2_order_id": "VARCHAR(128)",
+            "unwind_order_id": "VARCHAR(128)",
+        }
+        for column_name, column_type in arb_columns.items():
+            if column_name not in existing_arb_columns:
+                await conn.execute(text(f"ALTER TABLE monotonicity_arb_proposals ADD COLUMN {column_name} {column_type}"))
+        if "execution_payload" not in existing_arb_columns:
+            await conn.execute(text("ALTER TABLE monotonicity_arb_proposals ADD COLUMN execution_payload JSON NOT NULL DEFAULT '{}'"))
 
 
 async def session_scope(factory: async_sessionmaker[AsyncSession]) -> AsyncIterator[AsyncSession]:

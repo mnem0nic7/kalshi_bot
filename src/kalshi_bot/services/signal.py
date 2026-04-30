@@ -101,11 +101,34 @@ def market_quotes(market_snapshot: dict[str, Any]) -> dict[str, Decimal | None]:
         # Kalshi returns 0 when no resting orders exist on that side — treat as no quote.
         return price if price > Decimal("0") else None
 
+    yes_bid = _price_or_none(market.get("yes_bid_dollars"))
+    yes_ask = _price_or_none(market.get("yes_ask_dollars"))
+    no_ask = _price_or_none(market.get("no_ask_dollars"))
+    if no_ask is None and yes_bid is not None:
+        no_ask = quantize_price(Decimal("1.0000") - yes_bid)
+        if no_ask <= Decimal("0"):
+            no_ask = None
+
     return {
-        "yes_bid": _price_or_none(market.get("yes_bid_dollars")),
-        "yes_ask": _price_or_none(market.get("yes_ask_dollars")),
-        "no_ask": _price_or_none(market.get("no_ask_dollars")),
+        "yes_bid": yes_bid,
+        "yes_ask": yes_ask,
+        "no_ask": no_ask,
     }
+
+
+def selected_side_taker_price_dollars(
+    market_snapshot: dict[str, Any],
+    side: ContractSide | str | None,
+) -> Decimal | None:
+    if side is None:
+        return None
+    quotes = market_quotes(market_snapshot)
+    side_value = side.value if isinstance(side, ContractSide) else str(side).lower()
+    if side_value == ContractSide.YES.value:
+        return quotes["yes_ask"]
+    if side_value == ContractSide.NO.value:
+        return quotes["no_ask"]
+    return None
 
 
 def base_strategy_summary(summary: str) -> str:
@@ -136,17 +159,34 @@ def non_trade_market_reason(
     no_ask = quotes["no_ask"]
     spread_bps = market_spread_bps(market_snapshot)
 
-    if yes_ask is None or no_ask is None:
+    if yes_ask is None and no_ask is None:
         return (
             StandDownReason.BOOK_EFFECTIVELY_BROKEN,
-            "Order book is effectively broken because one or more taker quotes are missing.",
+            "Order book is effectively broken because no taker quote is available for either side.",
         )
 
     if (
-        (yes_ask >= Decimal("0.9900") and no_ask >= Decimal("0.9400"))
-        or (no_ask >= Decimal("0.9900") and yes_ask >= Decimal("0.9400"))
+        (
+            yes_ask is not None
+            and no_ask is not None
+            and yes_ask >= Decimal("0.9900")
+            and no_ask >= Decimal("0.9400")
+        )
+        or (
+            yes_ask is not None
+            and no_ask is not None
+            and no_ask >= Decimal("0.9900")
+            and yes_ask >= Decimal("0.9400")
+        )
         or (spread_bps is not None and spread_bps >= 9000)
-        or (yes_bid is not None and yes_bid <= Decimal("0.0100") and yes_ask >= Decimal("0.9900") and no_ask >= Decimal("0.9400"))
+        or (
+            yes_bid is not None
+            and yes_bid <= Decimal("0.0100")
+            and yes_ask is not None
+            and no_ask is not None
+            and yes_ask >= Decimal("0.9900")
+            and no_ask >= Decimal("0.9400")
+        )
     ):
         return (
             StandDownReason.BOOK_EFFECTIVELY_BROKEN,
@@ -833,6 +873,18 @@ def evaluate_trade_eligibility(
                 f"{Decimal(minimum_remaining_payout_bps) / Decimal('10000'):.4f}."
             )
             stand_down_reason = StandDownReason.INSUFFICIENT_REMAINING_PAYOUT
+        elif selected_side_taker_price_dollars(market_snapshot, signal.recommended_side) is None:
+            side_value = signal.recommended_side.value if signal.recommended_side is not None else "unknown"
+            reasons.append(f"Selected {side_value.upper()} side has no currently marketable taker quote.")
+            stand_down_reason = StandDownReason.SELECTED_SIDE_UNMARKETABLE
+            candidate_trace["selected_side_marketability"] = {
+                "selected_side": side_value,
+                "has_taker_quote": False,
+                "quotes": {
+                    key: str(value) if value is not None else None
+                    for key, value in market_quotes(market_snapshot).items()
+                },
+            }
         elif no_trade_reason == StandDownReason.BOOK_EFFECTIVELY_BROKEN:
             reasons.append(no_trade_text)
             stand_down_reason = no_trade_reason

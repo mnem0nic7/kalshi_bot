@@ -559,6 +559,23 @@ async def test_trading_audit_tracks_pre_room_liquidity_misses_separately_from_no
                 created_at=NOW - timedelta(minutes=10),
                 updated_at=NOW - timedelta(minutes=10),
             ),
+            OpsEvent(
+                kalshi_env="production",
+                severity="info",
+                source="auto_trigger",
+                summary="Auto-trigger launched room for KXHIGHNY-26APR29-T70",
+                payload={
+                    "market_ticker": "KXHIGHNY-26APR29-T70",
+                    "room_id": "room-one-sided",
+                    "one_sided_tradeable_probe": {
+                        "one_sided": True,
+                        "tradeable_sides": ["no"],
+                        "actionability": "one_sided_book_side_aware_probe",
+                    },
+                },
+                created_at=NOW - timedelta(minutes=5),
+                updated_at=NOW - timedelta(minutes=5),
+            ),
         ])
         await session.commit()
 
@@ -573,6 +590,8 @@ async def test_trading_audit_tracks_pre_room_liquidity_misses_separately_from_no
     }
     assert report["trigger_diagnostics"]["pre_room_miss_count"] == 2
     assert report["trigger_diagnostics"]["one_sided_book_count"] == 1
+    assert report["trigger_diagnostics"]["one_sided_tradeable_probe_count"] == 1
+    assert report["trigger_diagnostics"]["no_taker_quote_count"] == 0
     assert report["trigger_diagnostics"]["wide_spread_count"] == 1
     assert report["trigger_diagnostics"]["reason_counts"] == {
         "one_sided_book": 1,
@@ -581,6 +600,7 @@ async def test_trading_audit_tracks_pre_room_liquidity_misses_separately_from_no
     assert report["trigger_diagnostics"]["actionability_counts"] == {
         "missed_due_to_one_sided_book": 1,
         "missed_due_to_wide_spread": 1,
+        "one_sided_book_side_aware_probe": 1,
     }
     assert report["trigger_diagnostics"]["top_markets"][0]["market_ticker"] == "KXHIGHAUS-26APR29-T83"
     assert report["trigger_diagnostics"]["top_markets"][0]["reason_counts"] == {

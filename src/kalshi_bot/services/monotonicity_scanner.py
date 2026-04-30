@@ -22,19 +22,15 @@ implementation must:
 5. Persist the leg-pair as a single logical unit (both leg order_ids + the
    terminal state: both_filled / leg1_unwound / stuck_partial).
 
-Until that executor exists, ``evaluate_arb_risk`` returns ``"risk_blocked"``
-for any configuration that would attempt live execution. Scanner remains free
-to run in shadow mode, which never calls ExecutionService; the operator sees
-proposals in the control room and can monitor detection quality without
-exposure.
+Live execution is allowed only when ``monotonicity_arb_shadow_only=False`` and
+``monotonicity_arb_atomic_execution_ready=True``. The scanner service then owns
+the two-leg lifecycle and must unwind leg 1 if leg 2 fails.
 
 Flag sequence to eventually enable live:
 - ``monotonicity_arb_enabled = True``
 - ``monotonicity_arb_shadow_only = False``
 - ``monotonicity_arb_atomic_execution_ready = True``  (acknowledges the above)
 
-Even with all three set, today the gate still returns ``"risk_blocked"``
-because the atomic executor is a separate follow-up.
 """
 from __future__ import annotations
 
@@ -271,6 +267,14 @@ class ArbProposal:
     execution_outcome: str
     suppression_reason: str | None
     detected_at: datetime
+    pair_id: str | None = None
+    leg1_client_order_id: str | None = None
+    leg2_client_order_id: str | None = None
+    unwind_client_order_id: str | None = None
+    leg1_order_id: str | None = None
+    leg2_order_id: str | None = None
+    unwind_order_id: str | None = None
+    execution_payload: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -286,13 +290,8 @@ def evaluate_arb_risk(
     """Return (execution_outcome, suppression_reason) for a monotonicity arb violation.
 
     Applies: kill switch, enabled flag, shadow-only flag, notional cap.
-    Returns one of ``"shadow"``, ``"risk_blocked"`` with an optional reason.
-
-    Live execution is not yet available — see the module docstring for the
-    atomicity contract. When ``monotonicity_arb_shadow_only=False`` the gate
-    returns ``"risk_blocked"`` instead of silently downgrading to shadow, so
-    an operator flipping the flag without a two-leg executor sees an explicit
-    refusal rather than a misleading green light.
+    Returns one of ``"shadow"``, ``"live_ready"``, or ``"risk_blocked"`` with an
+    optional reason.
     """
     if control.kill_switch_enabled:
         return "risk_blocked", "Global kill switch is enabled."
@@ -311,8 +310,6 @@ def evaluate_arb_risk(
     if settings.monotonicity_arb_shadow_only:
         return "shadow", None
 
-    # Live execution demands an atomic two-leg executor with rollback on
-    # leg-2 failure. Until that lands, block rather than silently downgrade.
     if not settings.monotonicity_arb_atomic_execution_ready:
         return "risk_blocked", (
             "Live monotonicity arb requires monotonicity_arb_atomic_execution_ready=True "
@@ -320,13 +317,7 @@ def evaluate_arb_risk(
             "Flip shadow_only back on or implement the atomic executor first."
         )
 
-    # Even with the readiness flag set, the atomic executor is not yet built.
-    # Refuse live execution so a misconfigured environment cannot place naked
-    # legs. Remove this gate only in the same commit that ships the executor.
-    return "risk_blocked", (
-        "monotonicity_arb_atomic_execution_ready=True but atomic executor is not yet "
-        "implemented. See services/monotonicity_scanner.py docstring."
-    )
+    return "live_ready", None
 
 
 def size_proposal(
@@ -374,7 +365,7 @@ def scan_for_violations(
             outcome, reason = evaluate_arb_risk(
                 violation, control=control, settings=settings
             )
-            contracts = size_proposal(violation, settings=settings) if outcome == "shadow" else 0
+            contracts = size_proposal(violation, settings=settings) if outcome in {"shadow", "live_ready"} else 0
             proposals.append(ArbProposal(
                 station=violation.station,
                 event_date=violation.event_date,

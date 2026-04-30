@@ -85,6 +85,8 @@ class _FakeWeather:
 class _FakeKalshi:
     """Returns a fresh market snapshot with configurable prices."""
 
+    write_credentials = object()
+
     def __init__(
         self,
         yes_ask: float = 0.97,
@@ -92,6 +94,7 @@ class _FakeKalshi:
     ) -> None:
         self._yes_ask = yes_ask
         self._last_price = last_price
+        self.orders: list[dict[str, Any]] = []
 
     async def get_market(self, ticker: str) -> dict[str, Any]:
         now = datetime.now(UTC).isoformat()
@@ -105,6 +108,13 @@ class _FakeKalshi:
             "yes_bid_dollars": yes_bid,
             "observed_at": now,
         }
+
+    async def create_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.orders.append(payload)
+        return {"order": {"order_id": f"order-{len(self.orders)}", "status": "filled"}}
+
+    async def get_order(self, order_id: str) -> dict[str, Any]:
+        return {"order": {"order_id": order_id, "status": "filled"}}
 
 
 async def _setup_db(settings: Settings):
@@ -129,13 +139,20 @@ def _make_service(
     weather: _FakeWeather | None = None,
     kalshi: _FakeKalshi | None = None,
     directory: WeatherMarketDirectory | None = None,
+    execution_service: Any | None = None,
 ) -> StrategyCleanupService:
+    chosen_kalshi = kalshi or _FakeKalshi()
+    if execution_service is None:
+        from kalshi_bot.services.execution import ExecutionService
+
+        execution_service = ExecutionService(settings, chosen_kalshi)  # type: ignore[arg-type]
     return StrategyCleanupService(
         settings=settings,
         session_factory=session_factory,
-        kalshi=kalshi or _FakeKalshi(),
+        kalshi=chosen_kalshi,
         weather=weather or _FakeWeather(),
         weather_directory=directory or _directory(),
+        execution_service=execution_service,
     )
 
 
@@ -290,6 +307,36 @@ async def test_sweep_persists_strategy_c_room_records() -> None:
         assert row.ticker == TICKER
         assert row.station == STATION
         assert row.execution_outcome in ("shadow", "suppressed", "risk_blocked")
+
+
+@pytest.mark.asyncio
+async def test_sweep_live_strategy_c_creates_ticket_order_and_trace() -> None:
+    settings = _settings(
+        strategy_c_shadow_only=False,
+        app_shadow_mode=False,
+    )
+    session_factory = await _setup_db(settings)
+    fake_kalshi = _FakeKalshi(yes_ask=0.95)
+    svc = _make_service(settings, session_factory, kalshi=fake_kalshi)
+
+    await svc.sweep()
+
+    async with session_factory() as session:
+        from kalshi_bot.db.models import DecisionTraceRecord, OrderRecord, TradeTicketRecord
+
+        strategy_rows = (await session.execute(select(StrategyCRoom))).scalars().all()
+        tickets = (await session.execute(select(TradeTicketRecord))).scalars().all()
+        orders = (await session.execute(select(OrderRecord))).scalars().all()
+        traces = (await session.execute(select(DecisionTraceRecord))).scalars().all()
+
+    assert any(row.execution_outcome == "live_filled" for row in strategy_rows)
+    assert len(tickets) == 1
+    assert tickets[0].strategy_code == "C"
+    assert len(orders) == 1
+    assert orders[0].strategy_code == "C"
+    assert len(traces) == 1
+    assert traces[0].source_snapshot_ids["strategy_c_room_id"] == strategy_rows[0].room_id
+    assert fake_kalshi.orders[0]["side"] == "yes"
 
 
 # ---------------------------------------------------------------------------

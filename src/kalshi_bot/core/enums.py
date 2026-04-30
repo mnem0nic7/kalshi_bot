@@ -92,6 +92,7 @@ class StandDownReason(StrEnum):
     DOSSIER_STALE = "dossier_stale"
     FORECAST_DELTA_MISSING = "forecast_delta_missing"
     EXTREME_EDGE_DIAGNOSTIC_FAILED = "extreme_edge_diagnostic_failed"
+    SELECTED_SIDE_UNMARKETABLE = "selected_side_unmarketable"
 
 
 class RiskStatus(StrEnum):

@@ -49,6 +49,12 @@ def _signal(*, resolution_state: WeatherResolutionState = WeatherResolutionState
     )
 
 
+def _signal_with_delta() -> StrategySignal:
+    signal = _signal()
+    signal.forecast_delta_f = 4.0
+    return signal
+
+
 def _freshness(*, stale: bool) -> ResearchFreshness:
     now = datetime.now(UTC)
     return ResearchFreshness(
@@ -145,7 +151,7 @@ def test_trade_eligibility_prioritizes_stale_research_then_market() -> None:
 
     verdict = evaluate_trade_eligibility(
         settings=settings,
-        signal=_signal(),
+        signal=_signal_with_delta(),
         market_snapshot=market_snapshot,
         market_observed_at=datetime.now(UTC) - timedelta(minutes=10),
         research_freshness=_freshness(stale=True),
@@ -172,6 +178,61 @@ def test_trade_eligibility_blocks_resolved_contract_before_ticketing() -> None:
     assert verdict.eligible is False
     assert verdict.resolution_state == WeatherResolutionState.LOCKED_NO
     assert verdict.stand_down_reason == StandDownReason.RESOLVED_CONTRACT
+
+
+def test_trade_eligibility_allows_selected_yes_on_yes_ask_only_book() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", strategy_min_abs_delta_f=1.0)
+    market_snapshot = {"market": {"yes_bid_dollars": None, "yes_ask_dollars": "0.5800"}}
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=_signal_with_delta(),
+        market_snapshot=market_snapshot,
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.eligible is True
+
+
+def test_trade_eligibility_blocks_selected_yes_when_only_no_side_is_marketable() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", strategy_min_abs_delta_f=1.0)
+    market_snapshot = {"market": {"yes_bid_dollars": "0.4200", "yes_ask_dollars": None}}
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=_signal(),
+        market_snapshot=market_snapshot,
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.eligible is False
+    assert verdict.stand_down_reason == StandDownReason.SELECTED_SIDE_UNMARKETABLE
+    assert verdict.candidate_trace["selected_side_marketability"]["selected_side"] == "yes"
+
+
+def test_trade_eligibility_allows_selected_no_from_derived_no_ask() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", strategy_min_abs_delta_f=1.0)
+    signal = _signal_with_delta()
+    signal.recommended_side = ContractSide.NO
+    signal.target_yes_price_dollars = Decimal("0.4200")
+    signal.fair_yes_dollars = Decimal("0.2000")
+    signal.edge_bps = 2000
+    market_snapshot = {"market": {"yes_bid_dollars": "0.4200", "yes_ask_dollars": None}}
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot=market_snapshot,
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.eligible is True
 
 
 def test_trade_eligibility_blocks_tiny_remaining_payout() -> None:

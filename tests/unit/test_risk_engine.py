@@ -465,6 +465,43 @@ def test_risk_engine_blocks_runaway_edge_as_model_error() -> None:
     assert diagnostics["forecast_delta_f"] == 6.0
 
 
+def test_risk_engine_allows_validated_extreme_edge_without_lifting_other_gates() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_max_credible_edge_bps=5000,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+    signal = make_signal(edge_bps=7382)
+    signal.candidate_trace = {
+        "validated_extreme_edge": True,
+        "extreme_edge_diagnostic": {"passed": True, "reason_codes": []},
+    }
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.0200"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert "max_credible_edge" not in verdict.reason_codes
+    assert "max_credible_edge_validated" in verdict.reason_codes
+    assert any("nearly impossible" in reason for reason in verdict.reasons)
+
+
 def test_risk_engine_blocks_when_taker_fee_erases_min_edge() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",

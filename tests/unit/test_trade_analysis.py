@@ -492,6 +492,50 @@ async def test_trade_analysis_marks_signal_only_unresolved_rows_pending_not_miss
 
 
 @pytest.mark.asyncio
+async def test_trade_analysis_reports_opportunity_metrics_from_signal_trace(analysis_harness) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-opportunity")
+        signal = _signal(room.id)
+        signal.payload = {
+            "stand_down_reason": "selected_side_unmarketable",
+            "candidate_trace": {
+                "forecast_delta_fallback": {
+                    "derived": True,
+                    "source": "numeric_facts_and_market_mapping",
+                    "forecast_high_source": "predicted_high_f",
+                    "threshold_source": "ticker_mapping",
+                },
+                "selected_side_marketability": {
+                    "status": "unmarketable",
+                    "selected_side": "yes",
+                    "taker_price_dollars": None,
+                },
+                "extreme_edge_diagnostic": {
+                    "passed": False,
+                    "failure_reason": "station_daily_high_source_mismatch",
+                },
+            },
+        }
+        session.add_all([room, signal])
+        await session.commit()
+
+    report = await TradeAnalysisService(settings, session_factory, directory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    metrics = report["opportunity_metrics"]
+    assert metrics["selected_side_unmarketable_count"] == 1
+    assert metrics["missing_delta_recovered_count"] == 1
+    assert metrics["extreme_edge_diagnostic_failed_count"] == 1
+    assert metrics["selected_side_unmarketable_rows"] == [
+        {"room_id": "room-opportunity", "market_ticker": TICKER, "selected_side": "yes"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_trade_analysis_batches_large_room_id_loads(analysis_harness, monkeypatch) -> None:
     monkeypatch.setattr(trade_analysis_module, "IN_CLAUSE_BATCH_SIZE", 2)
     settings, session_factory, directory = analysis_harness

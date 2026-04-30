@@ -233,16 +233,39 @@ class DeterministicRiskEngine:
         if signal.edge_bps < active_thresholds.risk_min_edge_bps:
             block(f"Edge {signal.edge_bps}bps is below configured minimum of {active_thresholds.risk_min_edge_bps}bps.")
         if signal.edge_bps > self.settings.risk_max_credible_edge_bps:
-            block(
-                f"Edge {signal.edge_bps}bps exceeds credibility limit of "
-                f"{self.settings.risk_max_credible_edge_bps}bps; likely model error."
+            candidate_trace = dict(signal.candidate_trace or {})
+            extreme_diag = candidate_trace.get("extreme_edge_diagnostic")
+            validated_extreme_edge = (
+                candidate_trace.get("validated_extreme_edge") is True
+                and isinstance(extreme_diag, dict)
+                and extreme_diag.get("passed") is True
             )
-            code("max_credible_edge")
-            diagnostics["max_credible_edge"] = _max_credible_edge_diagnostics(
-                ticket=ticket,
-                signal=signal,
-                context=context,
-            )
+            if validated_extreme_edge:
+                note(
+                    f"Edge {signal.edge_bps}bps exceeds credibility limit but passed "
+                    "the extreme-edge diagnostic class."
+                )
+                code("max_credible_edge_validated")
+                diagnostics["max_credible_edge"] = {
+                    **_max_credible_edge_diagnostics(
+                        ticket=ticket,
+                        signal=signal,
+                        context=context,
+                    ),
+                    "validated_extreme_edge": True,
+                    "extreme_edge_diagnostic": extreme_diag,
+                }
+            else:
+                block(
+                    f"Edge {signal.edge_bps}bps exceeds credibility limit of "
+                    f"{self.settings.risk_max_credible_edge_bps}bps; likely model error."
+                )
+                code("max_credible_edge")
+                diagnostics["max_credible_edge"] = _max_credible_edge_diagnostics(
+                    ticket=ticket,
+                    signal=signal,
+                    context=context,
+                )
         if signal.confidence < self.settings.risk_min_confidence:
             block(
                 f"Signal confidence {signal.confidence:.2f} is below minimum "

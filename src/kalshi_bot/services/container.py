@@ -288,6 +288,7 @@ class AppContainer:
             kalshi,
             weather,
             weather_directory,
+            execution_service=execution_service,
         )
         monotonicity_arb_service = MonotonicityArbScannerService(
             settings,
