@@ -635,6 +635,59 @@ async def test_daemon_heartbeat_runs_historical_pipeline_when_available(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_daemon_promotes_decision_corpus_after_historical_pipeline(tmp_path) -> None:
+    events: list[str] = []
+
+    class RecordingHistoricalPipelineService(FakeHistoricalPipelineService):
+        async def daily(self):
+            events.append("historical_pipeline")
+            return await super().daily()
+
+    class RecordingDecisionCorpusService(FakeDecisionCorpusService):
+        async def nightly_auto_promote(self, *, kalshi_env: str, actor: str = "daemon"):
+            events.append("decision_corpus_promotion")
+            return await super().nightly_auto_promote(kalshi_env=kalshi_env, actor=actor)
+
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-pipeline-promotion.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        historical_pipeline_daily_run_seconds=60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    pipeline = RecordingHistoricalPipelineService()
+    decision_corpus = RecordingDecisionCorpusService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        FakeHistoricalTrainingService(),  # type: ignore[arg-type]
+        historical_pipeline_service=pipeline,  # type: ignore[arg-type]
+        decision_corpus_service=decision_corpus,  # type: ignore[arg-type]
+    )
+
+    payload = await daemon.heartbeat_once()
+
+    assert events == ["historical_pipeline", "decision_corpus_promotion"]
+    assert payload["historical_pipeline"]["pipeline_kind"] == "daily"
+    assert payload["decision_corpus_promotion"]["reason"] == "new_resolved_rooms"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_daemon_heartbeat_runs_decision_corpus_promotion_path(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-decision-corpus.db",

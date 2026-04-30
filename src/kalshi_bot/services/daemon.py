@@ -387,9 +387,6 @@ class DaemonService:
             strategy_promotion_watchdog = await self._maybe_run_strategy_promotion_watchdog()
             if strategy_promotion_watchdog is not None:
                 payload["strategy_promotion_watchdog"] = strategy_promotion_watchdog
-            decision_corpus_promotion = await self._maybe_run_decision_corpus_promotion()
-            if decision_corpus_promotion is not None:
-                payload["decision_corpus_promotion"] = decision_corpus_promotion
             strategy_codex_nightly = await self._maybe_run_strategy_codex_nightly()
             if strategy_codex_nightly is not None:
                 if strategy_codex_nightly.get("mode") == "auto_evolve":
@@ -406,6 +403,9 @@ class DaemonService:
                 historical_intelligence = await self._maybe_run_historical_intelligence()
                 if historical_intelligence is not None:
                     payload["historical_intelligence"] = historical_intelligence
+            decision_corpus_promotion = await self._maybe_run_decision_corpus_promotion()
+            if decision_corpus_promotion is not None:
+                payload["decision_corpus_promotion"] = decision_corpus_promotion
         rollout_result = await self.self_improve_service.monitor_rollouts()
         if rollout_result.status == "canary_running":
             canary = rollout_result.payload
