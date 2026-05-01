@@ -43,5 +43,9 @@ def test_crypto_static_asset_mode_controls_are_present() -> None:
     )
 
     assert "crypto-mode-select" in crypto_js
+    assert "data-current-mode" in crypto_js
+    assert "crypto-alert" in crypto_js
     assert 'method: "PATCH"' in crypto_js
+    assert "Could not set" in crypto_js
+    assert "crypto-alert" in crypto_css
     assert "crypto-live-blockers" in crypto_css

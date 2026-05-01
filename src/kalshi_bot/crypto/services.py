@@ -216,13 +216,20 @@ class CryptoAssetControlService:
         env = kalshi_env or self.settings.kalshi_env
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=env)
-            control = await repo.get_deployment_control(kalshi_env=env)
-            notes = dict(control.notes or {})
-            modes = self.modes_from_notes(notes)
-            previous_mode = modes.get(symbol, CRYPTO_ASSET_MODE_SHADOW)
-            modes[symbol] = normalized_mode
-            notes[CRYPTO_ASSET_MODES_KEY] = modes
-            control = await repo.update_deployment_notes(notes, kalshi_env=env)
+            previous_mode = CRYPTO_ASSET_MODE_SHADOW
+
+            def update_modes(previous_value: Any) -> dict[str, str]:
+                nonlocal previous_mode
+                modes = self.modes_from_notes({CRYPTO_ASSET_MODES_KEY: previous_value})
+                previous_mode = modes.get(symbol, CRYPTO_ASSET_MODE_SHADOW)
+                modes[symbol] = normalized_mode
+                return modes
+
+            control, _ = await repo.update_deployment_note_key(
+                CRYPTO_ASSET_MODES_KEY,
+                update_modes,
+                kalshi_env=env,
+            )
             await repo.log_ops_event(
                 severity="info",
                 summary=f"Crypto asset mode set: {symbol} {normalized_mode}",
@@ -1033,6 +1040,16 @@ class CryptoExecutionService:
             )
             await session.commit()
         if asset_mode != CRYPTO_ASSET_MODE_LIVE:
+            if self.settings.app_shadow_mode or room.shadow_mode:
+                return ExecReceiptPayload(
+                    status="shadow_skipped",
+                    client_order_id=client_order_id,
+                    details={
+                        "reason": "crypto asset is shadowed",
+                        "asset_symbol": market.asset_symbol,
+                        "asset_mode": asset_mode,
+                    },
+                )
             return ExecReceiptPayload(
                 status="crypto_asset_live_disabled",
                 client_order_id=client_order_id,
@@ -1282,7 +1299,8 @@ class CryptoWorkflowService:
                     market=market,
                     signal=signal,
                 )
-                if receipt.external_order_id or receipt.status not in {"shadow_skipped", "inactive_color_skipped"}:
+                no_order_statuses = {"shadow_skipped", "inactive_color_skipped", "crypto_asset_live_disabled"}
+                if receipt.external_order_id or receipt.status not in no_order_statuses:
                     await repo.save_order(
                         ticket_id=ticket_record.id,
                         client_order_id=client_order_id,
@@ -1412,28 +1430,16 @@ class CryptoAutonomyService:
             }
 
         discovered = await self.market_service.discover_markets(frequency=freq, status="open", persist=True)
-        markets = _nearest_market_per_asset(discovered)
         created: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         min_seconds = max(0, int(self.settings.crypto_autonomy_min_seconds_to_close))
+        markets, ineligible = _eligible_market_per_asset(discovered, min_seconds_to_close=min_seconds)
+        skipped.extend(ineligible)
 
         for market in markets:
             try:
-                if market.close_time is None:
-                    skipped.append({"market_ticker": market.market_ticker, "asset_symbol": market.asset_symbol, "reason": "missing_close_time"})
-                    continue
                 seconds_to_close = int((market.close_time - datetime.now(UTC)).total_seconds())
-                if seconds_to_close < min_seconds:
-                    skipped.append(
-                        {
-                            "market_ticker": market.market_ticker,
-                            "asset_symbol": market.asset_symbol,
-                            "reason": "too_close_to_close",
-                            "seconds_to_close": seconds_to_close,
-                        }
-                    )
-                    continue
 
                 live_status = self.asset_control_service.market_live_status(
                     control=control,
@@ -1494,7 +1500,8 @@ class CryptoAutonomyService:
         return {
             "status": "ok",
             "frequency": freq,
-            "checked_markets": len(markets),
+            "checked_markets": len(discovered),
+            "eligible_markets": len(markets),
             "created": created,
             "skipped": skipped,
             "errors": errors,
@@ -1558,6 +1565,54 @@ def _market_sort_key(market: CryptoMarket, now: datetime) -> tuple[int, float, s
     if seconds >= 0:
         return (0, seconds, market.market_ticker)
     return (1, abs(seconds), market.market_ticker)
+
+
+def _eligible_market_per_asset(
+    markets: list[CryptoMarket],
+    *,
+    min_seconds_to_close: int,
+) -> tuple[list[CryptoMarket], list[dict[str, Any]]]:
+    now = datetime.now(UTC)
+    grouped: dict[str, list[CryptoMarket]] = {}
+    for market in markets:
+        grouped.setdefault(market.asset_symbol, []).append(market)
+
+    selected: list[CryptoMarket] = []
+    skipped: list[dict[str, Any]] = []
+    for asset_symbol, asset_markets in sorted(grouped.items()):
+        ordered = sorted(asset_markets, key=lambda market: _market_sort_key(market, now))
+        chosen: CryptoMarket | None = None
+        latest_skip: dict[str, Any] | None = None
+        for market in ordered:
+            if market.close_time is None:
+                latest_skip = {
+                    "market_ticker": market.market_ticker,
+                    "asset_symbol": market.asset_symbol,
+                    "reason": "missing_close_time",
+                }
+                continue
+            seconds_to_close = int((market.close_time - now).total_seconds())
+            if seconds_to_close < min_seconds_to_close:
+                latest_skip = {
+                    "market_ticker": market.market_ticker,
+                    "asset_symbol": market.asset_symbol,
+                    "reason": "too_close_to_close",
+                    "seconds_to_close": seconds_to_close,
+                }
+                continue
+            chosen = market
+            break
+        if chosen is not None:
+            selected.append(chosen)
+        elif latest_skip is not None:
+            skipped.append(latest_skip)
+        else:
+            skipped.append({"asset_symbol": asset_symbol, "reason": "no_markets"})
+
+    return (
+        sorted(selected, key=lambda market: (market.close_time or datetime.max.replace(tzinfo=UTC), market.asset_symbol)),
+        skipped,
+    )
 
 
 def _row_mid(row: CryptoMarketSnapshotRecord) -> Decimal | None:

@@ -4,11 +4,24 @@
   const statusEl = document.getElementById("crypto-status-strip");
   const refreshBtn = document.getElementById("crypto-refresh");
   const sortEl = document.getElementById("crypto-sort");
+  const alertEl = document.getElementById("crypto-alert");
 
   const state = {
     payload: bootstrapEl ? JSON.parse(bootstrapEl.textContent || "{}") : { markets: [] },
     loading: false,
   };
+
+  function showAlert(message) {
+    if (!alertEl) return;
+    alertEl.textContent = message;
+    alertEl.hidden = false;
+  }
+
+  function clearAlert() {
+    if (!alertEl) return;
+    alertEl.textContent = "";
+    alertEl.hidden = true;
+  }
 
   function money(value, digits) {
     if (value === null || value === undefined || value === "") return "n/a";
@@ -138,7 +151,7 @@
             </div>
           </div>
           <div class="crypto-card-actions">
-            <select class="crypto-mode-select" data-asset-mode="${escapeHtml(market.asset_symbol || "")}" aria-label="${escapeHtml(market.asset_symbol || "crypto")} mode">
+            <select class="crypto-mode-select" data-asset-mode="${escapeHtml(market.asset_symbol || "")}" data-current-mode="${escapeHtml(mode)}" aria-label="${escapeHtml(market.asset_symbol || "crypto")} mode">
               <option value="off"${mode === "off" ? " selected" : ""}>Off</option>
               <option value="shadow"${mode === "shadow" ? " selected" : ""}>Shadow</option>
               <option value="live"${mode === "live" ? " selected" : ""}>Live</option>
@@ -185,6 +198,7 @@
       const response = await fetch("/api/crypto/markets?frequency=15m", { headers: { Accept: "application/json" } });
       if (response.ok) {
         state.payload = await response.json();
+        clearAlert();
         render();
       }
     } finally {
@@ -202,17 +216,42 @@
     if (payload.redirect) window.location.href = payload.redirect;
   }
 
-  async function setAssetMode(symbol, mode) {
+  async function errorMessage(response, symbol) {
+    let message = `Could not set ${symbol} mode.`;
+    try {
+      const payload = await response.json();
+      if (payload.detail) message = payload.detail;
+      if (payload.error) message = payload.error;
+    } catch (_err) {
+      // Keep the generic message when the server did not return JSON.
+    }
+    return message;
+  }
+
+  async function setAssetMode(symbol, mode, select) {
     if (!symbol) return;
-    const response = await fetch(`/api/crypto/assets/${encodeURIComponent(symbol)}/mode`, {
-      method: "PATCH",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ mode }),
-    });
-    if (response.ok) {
-      await refresh();
-    } else {
+    const previousMode = select ? select.getAttribute("data-current-mode") : null;
+    clearAlert();
+    if (select) select.disabled = true;
+    try {
+      const response = await fetch(`/api/crypto/assets/${encodeURIComponent(symbol)}/mode`, {
+        method: "PATCH",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      if (response.ok) {
+        await refresh();
+        return;
+      }
+      if (select && previousMode) select.value = previousMode;
+      showAlert(await errorMessage(response, symbol));
       render();
+    } catch (_err) {
+      if (select && previousMode) select.value = previousMode;
+      showAlert(`Could not set ${symbol} mode.`);
+      render();
+    } finally {
+      if (select && select.isConnected) select.disabled = false;
     }
   }
 
@@ -226,7 +265,7 @@
   gridEl.addEventListener("change", (event) => {
     const select = event.target.closest("[data-asset-mode]");
     if (select) {
-      setAssetMode(select.getAttribute("data-asset-mode"), select.value);
+      setAssetMode(select.getAttribute("data-asset-mode"), select.value, select);
     }
   });
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kalshi_bot.core.enums import DeploymentColor
@@ -164,3 +165,29 @@ class DeploymentControlRepositoryMixin:
         control.notes = notes
         await self.session.flush()
         return control
+
+    async def update_deployment_note_key(
+        self,
+        key: str,
+        updater: Callable[[Any], Any],
+        *,
+        kalshi_env: str | None = None,
+    ) -> tuple[DeploymentControl, Any]:
+        """Update one deployment-control notes key from a fresh locked row."""
+        env = self._resolved_kalshi_env(kalshi_env)
+        await self.ensure_deployment_control(
+            DeploymentColor.BLUE.value,
+            kalshi_env=env,
+        )
+        result = await self.session.execute(
+            select(DeploymentControl)
+            .where(DeploymentControl.id == env)
+            .with_for_update()
+        )
+        control = result.scalar_one()
+        notes = dict(control.notes or {})
+        previous_value = notes.get(key)
+        notes[key] = updater(previous_value)
+        control.notes = notes
+        await self.session.flush()
+        return control, previous_value

@@ -4,18 +4,21 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import ContractSide, RoomOrigin, StandDownReason, TradeAction
-from kalshi_bot.core.schemas import ExecReceiptPayload, RoomCreate, TradeTicket
+from kalshi_bot.core.enums import ContractSide, RiskStatus, RoomOrigin, StandDownReason, TradeAction
+from kalshi_bot.core.schemas import ExecReceiptPayload, RiskVerdictPayload, RoomCreate, TradeEligibilityVerdict, TradeTicket
 from kalshi_bot.crypto.models import CryptoMarket
 from kalshi_bot.crypto.services import (
     CryptoAssetControlService,
     CryptoAutonomyService,
+    CryptoWorkflowService,
     CryptoExecutionService,
     CryptoForecastService,
     CryptoReplayService,
 )
+from kalshi_bot.db.models import OrderRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.signal import StrategySignal
@@ -64,6 +67,7 @@ def _signal() -> StrategySignal:
         recommended_side=ContractSide.YES,
         target_yes_price_dollars=Decimal("0.4900"),
         summary="BTC crypto test signal.",
+        eligibility=TradeEligibilityVerdict(eligible=True),
     )
 
 
@@ -77,6 +81,33 @@ class _FakeBaseExecution:
             status="submitted",
             client_order_id=kwargs["client_order_id"],
             details={"called": True},
+        )
+
+
+class _FakeWorkflowMarketService:
+    def __init__(self, market: CryptoMarket) -> None:
+        self.market = market
+        self.kalshi = type("_FakeKalshi", (), {"write_credentials": None})()
+
+    async def get_market(self, market_ticker: str, *, persist: bool = True) -> CryptoMarket:
+        assert market_ticker == self.market.market_ticker
+        assert persist is True
+        return self.market
+
+
+class _FakeForecastService:
+    async def forecast(self, market: CryptoMarket) -> StrategySignal:
+        del market
+        return _signal()
+
+
+class _ApproveRiskEngine:
+    def evaluate(self, *, ticket: TradeTicket, **kwargs) -> RiskVerdictPayload:
+        del kwargs
+        return RiskVerdictPayload(
+            status=RiskStatus.APPROVED,
+            approved_count_fp=ticket.count_fp,
+            approved_notional_dollars=ticket.yes_price_dollars * ticket.count_fp,
         )
 
 
@@ -178,15 +209,34 @@ async def test_crypto_asset_modes_default_shadow_and_persist(tmp_path) -> None:
     await init_models(engine)
     service = CryptoAssetControlService(settings=settings, session_factory=session_factory)
 
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.update_deployment_notes(
+            {
+                "kill_switch": {"mode": "manual_or_external"},
+                "agent_packs": {"active_version": "green-pack"},
+                "crypto_replay_gate": {"status": "passed"},
+            }
+        )
+        await session.commit()
+
     default_modes = await service.list_asset_modes(asset_symbols=["btc", "ETH"])
     updated = await service.set_asset_mode("btc", "live", actor="test")
     listed = await service.list_asset_modes(asset_symbols=["BTC", "ETH"])
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        control = await repo.get_deployment_control()
+        preserved_notes = control.notes
+        await session.commit()
 
     assert default_modes["modes"] == {"BTC": "shadow", "ETH": "shadow"}
     assert updated["previous_mode"] == "shadow"
     assert listed["modes"]["BTC"] == "live"
     assert listed["modes"]["ETH"] == "shadow"
     assert listed["counts"]["live"] == 1
+    assert preserved_notes["kill_switch"] == {"mode": "manual_or_external"}
+    assert preserved_notes["agent_packs"] == {"active_version": "green-pack"}
+    assert preserved_notes["crypto_replay_gate"] == {"status": "passed"}
     await engine.dispose()
 
 
@@ -249,6 +299,59 @@ async def test_crypto_execution_blocks_non_live_asset_before_base_execution(tmp_
     )
 
     assert receipt.status == "crypto_asset_live_disabled"
+    assert receipt.details["asset_mode"] == "shadow"
+    assert fake_base.calls == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_execution_preserves_shadow_status_for_shadow_room(tmp_path) -> None:
+    settings = _settings(tmp_path, app_shadow_mode=False, crypto_trading_enabled=True)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeBaseExecution()
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC shadow crypto", market_ticker=_market().market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=True,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.SHADOW.value,
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.4900"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-shadow-test",
+        fair_yes_dollars=Decimal("0.6500"),
+        market=_market(),
+        signal=_signal(),
+    )
+
+    assert receipt.status == "shadow_skipped"
     assert receipt.details["asset_mode"] == "shadow"
     assert fake_base.calls == []
     await engine.dispose()
@@ -319,6 +422,60 @@ async def test_crypto_execution_live_asset_reaches_base_execution(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_crypto_workflow_non_live_asset_receipt_does_not_save_order(tmp_path) -> None:
+    settings = _settings(tmp_path, app_shadow_mode=False, crypto_trading_enabled=True)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    market = _market(close_time=datetime.now(UTC) + timedelta(minutes=10))
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    execution = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=_FakeBaseExecution(),  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    workflow = CryptoWorkflowService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=_FakeWorkflowMarketService(market),  # type: ignore[arg-type]
+        forecast_service=_FakeForecastService(),  # type: ignore[arg-type]
+        risk_engine=_ApproveRiskEngine(),  # type: ignore[arg-type]
+        execution_service=execution,
+        asset_control_service=asset_control,
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC non-live workflow", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await session.commit()
+
+    await workflow.run_room(room.id, reason="test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        orders = list((await session.execute(select(OrderRecord))).scalars())
+        await session.commit()
+
+    assert ticket is not None
+    assert ticket.status == "crypto_asset_live_disabled"
+    assert orders == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_crypto_autonomy_skips_off_assets_and_existing_rooms(tmp_path) -> None:
     settings = _settings(
         tmp_path,
@@ -355,10 +512,13 @@ async def test_crypto_autonomy_skips_off_assets_and_existing_rooms(tmp_path) -> 
         def __init__(self) -> None:
             self.kalshi = _FakeKalshi()
             self.created: list[str] = []
+            base = datetime.now(UTC)
             self.markets = [
-                _market(market_ticker="KXBTC15M-TEST", asset_symbol="BTC", close_time=datetime.now(UTC) + timedelta(minutes=10)),
-                _market(market_ticker="KXETH15M-TEST", asset_symbol="ETH", close_time=datetime.now(UTC) + timedelta(minutes=10)),
-                _market(market_ticker="KXSOL15M-TEST", asset_symbol="SOL", close_time=datetime.now(UTC) + timedelta(minutes=10)),
+                _market(market_ticker="KXBTC15M-TEST", asset_symbol="BTC", close_time=base + timedelta(minutes=10)),
+                _market(market_ticker="KXETH15M-TEST", asset_symbol="ETH", close_time=base + timedelta(minutes=10)),
+                _market(market_ticker="KXSOL15M-TEST", asset_symbol="SOL", close_time=base + timedelta(minutes=10)),
+                _market(market_ticker="KXADA15M-SOON", asset_symbol="ADA", close_time=base + timedelta(seconds=45)),
+                _market(market_ticker="KXADA15M-LATER", asset_symbol="ADA", close_time=base + timedelta(minutes=5)),
             ]
 
         async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
@@ -394,7 +554,8 @@ async def test_crypto_autonomy_skips_off_assets_and_existing_rooms(tmp_path) -> 
     ).run_once()
 
     assert result["status"] == "ok"
-    assert market_service.created == ["KXSOL15M-TEST"]
-    assert workflow_service.ran == ["room-KXSOL15M-TEST"]
+    assert set(market_service.created) == {"KXADA15M-LATER", "KXSOL15M-TEST"}
+    assert set(workflow_service.ran) == {"room-KXADA15M-LATER", "room-KXSOL15M-TEST"}
     assert {item["reason"] for item in result["skipped"]} == {"asset_mode_off", "room_already_exists"}
+    assert "KXADA15M-SOON" not in market_service.created
     await engine.dispose()
