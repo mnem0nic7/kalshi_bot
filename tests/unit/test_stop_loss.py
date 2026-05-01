@@ -65,6 +65,11 @@ def test_sell_price_yes_is_bid():
     assert _sell_price(ms, "yes") == Decimal("0.22")
 
 
+def test_sell_price_none_when_bid_boundary_for_yes():
+    assert _sell_price(_ms("0.00", "0.02"), "yes") is None
+    assert _sell_price(_ms("1.00", "1.00"), "yes") is None
+
+
 def test_sell_price_no_is_yes_ask():
     # SELL NO at yes_price_dollars=yes_ask: "fill when NO bid ≥ 1-yes_ask = no_bid". ✓
     ms = _ms("0.22", "0.30")
@@ -74,6 +79,11 @@ def test_sell_price_no_is_yes_ask():
 def test_sell_price_none_when_ask_missing_for_no():
     ms = _ms("0.22", None)
     assert _sell_price(ms, "no") is None
+
+
+def test_sell_price_none_when_ask_boundary_for_no():
+    assert _sell_price(_ms("0.00", "0.00"), "no") is None
+    assert _sell_price(_ms("0.98", "1.00"), "no") is None
 
 
 # ── trailing loss ratio ──────────────────────────────────────────────────────

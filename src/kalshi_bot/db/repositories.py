@@ -1420,6 +1420,59 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 return found
         return None
 
+    async def _resolve_ticket_id_for_order(
+        self,
+        *,
+        ticket_id: str | None,
+        client_order_id: str | None,
+    ) -> str | None:
+        if ticket_id is not None:
+            return ticket_id
+        if not client_order_id:
+            return None
+        stmt = select(TradeTicketRecord.id).where(TradeTicketRecord.client_order_id == client_order_id)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    @staticmethod
+    def _ticket_status_rank(status: str | None) -> int:
+        normalized = str(status or "").strip().lower()
+        if normalized in {"filled", "executed"}:
+            return 50
+        if (
+            normalized
+            in {
+                "blocked",
+                "canceled",
+                "cancelled",
+                "expired",
+                "lock_denied",
+                "order_id_missing",
+                "rejected",
+                "requote_edge_lost",
+                "unfilled_cancelled",
+                "write_credentials_missing",
+            }
+            or normalized.startswith("rejected_")
+        ):
+            return 40
+        if normalized in {"submitted", "resting", "accepted", "open", "pending"}:
+            return 20
+        if normalized == "approved":
+            return 10
+        if normalized == "proposed":
+            return 0
+        return 20
+
+    async def _sync_trade_ticket_status_from_order(self, ticket_id: str | None, status: str) -> None:
+        if ticket_id is None:
+            return
+        ticket = await self.session.get(TradeTicketRecord, ticket_id)
+        if ticket is None:
+            return
+        if self._ticket_status_rank(status) >= self._ticket_status_rank(ticket.status):
+            ticket.status = status
+            await self.session.flush()
+
     async def upsert_order(
         self,
         *,
@@ -1437,9 +1490,13 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         strategy_code: str | None = None,
     ) -> OrderRecord:
         from kalshi_bot.db.models import OrderRecord as _OR
+        resolved_ticket_id = await self._resolve_ticket_id_for_order(
+            ticket_id=ticket_id,
+            client_order_id=client_order_id,
+        )
         resolved_strategy = await self._resolve_strategy_code_for_order(
             strategy_code=strategy_code,
-            ticket_id=ticket_id,
+            ticket_id=resolved_ticket_id,
             client_order_id=client_order_id,
         )
         record_id = str(uuid4())
@@ -1447,7 +1504,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         env = self._resolved_kalshi_env(kalshi_env)
         insert_values = {
             "id": record_id,
-            "trade_ticket_id": ticket_id,
+            "trade_ticket_id": resolved_ticket_id,
             "client_order_id": client_order_id,
             "kalshi_env": env,
             "market_ticker": market_ticker,
@@ -1493,13 +1550,14 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             else:
                 for k, v in update_values.items():
                     setattr(existing, k, v)
-                if ticket_id and not existing.trade_ticket_id:
-                    existing.trade_ticket_id = ticket_id
+                if resolved_ticket_id and not existing.trade_ticket_id:
+                    existing.trade_ticket_id = resolved_ticket_id
                 if kalshi_order_id and not existing.kalshi_order_id:
                     existing.kalshi_order_id = kalshi_order_id
                 if resolved_strategy and not existing.strategy_code:
                     existing.strategy_code = resolved_strategy
             await self.session.flush()
+            await self._sync_trade_ticket_status_from_order(existing.trade_ticket_id, existing.status)
             return existing
 
         # COALESCE lets later, richer execution records repair placeholder rows
@@ -1527,6 +1585,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 )
             )
         ).scalar_one()
+        await self._sync_trade_ticket_status_from_order(result.trade_ticket_id, result.status)
         return result
 
     async def list_orders_for_room(self, room_id: str) -> list[OrderRecord]:

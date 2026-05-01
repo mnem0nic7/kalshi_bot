@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from kalshi_bot.config import Settings
@@ -183,6 +184,34 @@ async def test_ioc_order_bypasses_limit_state_machine():
     )
 
     assert receipt.status == "filled"
+    kalshi.get_order.assert_not_called()
+    kalshi.cancel_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_limit_order_preserves_rejected_status_when_place_order_fails():
+    kalshi = _kalshi(order_statuses=[])
+    request = httpx.Request("POST", "https://kalshi.example.test/orders")
+    response = httpx.Response(
+        400,
+        json={"error": {"code": "invalid_parameters", "message": "invalid time_in_force"}},
+        request=request,
+    )
+    kalshi.create_order = AsyncMock(
+        side_effect=httpx.HTTPStatusError("bad request", request=request, response=response)
+    )
+    svc = ExecutionService(_settings(), kalshi)
+
+    receipt = await svc.execute(
+        room=_room(),
+        control=_control(),
+        ticket=_ticket(price="0.5800"),
+        client_order_id="coid-1",
+        fair_yes_dollars=Decimal("0.6400"),
+    )
+
+    assert receipt.status == "rejected_400"
+    assert receipt.client_order_id == "coid-1"
     kalshi.get_order.assert_not_called()
     kalshi.cancel_order.assert_not_called()
 

@@ -48,12 +48,15 @@ def _midpoint(market_state: MarketState, side: str) -> Decimal | None:
 
 def _sell_price(market_state: MarketState, side: str) -> Decimal | None:
     if side == "yes":
-        return market_state.yes_bid_dollars
-    # For NO sell: yes_price_dollars = yes_ask.
-    # SELL NO at P means min acceptable NO price = 1-P; fills when NO bid ≥ 1-P.
-    # yes_ask = 1 - no_bid, so P = yes_ask → 1-P = no_bid → fills at the NO bid. ✓
-    # The old formula (1 - yes_ask) inverted this: min NO = 0.82 when market NO = 0.18 → never fills.
-    return market_state.yes_ask_dollars
+        price = market_state.yes_bid_dollars
+    else:
+        # For NO sell: yes_price_dollars = yes_ask.
+        # SELL NO at P means min acceptable NO price = 1-P; fills when NO bid >= 1-P.
+        # yes_ask = 1 - no_bid, so P = yes_ask -> 1-P = no_bid -> fills at the NO bid.
+        price = market_state.yes_ask_dollars
+    if price is None or price <= Decimal("0") or price >= Decimal("1"):
+        return None
+    return price
 
 
 def _side_price(mid_yes: Decimal, side: str) -> Decimal:

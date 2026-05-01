@@ -148,6 +148,12 @@ class ExecutionService:
             order_id = receipt.external_order_id
 
             if order_id is None:
+                if receipt.status.startswith("rejected_"):
+                    return ExecReceiptPayload(
+                        status=receipt.status,
+                        client_order_id=client_order_id,
+                        details=receipt.details,
+                    )
                 logger.warning(
                     "limit order for %s returned no order_id on attempt %d",
                     ticket.market_ticker, attempt,

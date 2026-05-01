@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, StrategyCode, TradeAction
-from kalshi_bot.db.models import OrderRecord, Room
+from kalshi_bot.db.models import OrderRecord, Room, TradeTicketRecord
 from kalshi_bot.core.schemas import TradeTicket
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -84,7 +84,7 @@ async def test_upsert_order_inherits_strategy_code_from_ticket(repo_factory, roo
     session_ctx = await repo_factory()
     async with session_ctx as session:
         repo = PlatformRepository(session, kalshi_env="demo")
-        await repo.save_trade_ticket(
+        ticket = await repo.save_trade_ticket(
             room_id,
             _ticket("KXHIGHNY-26APR23-T68"),
             client_order_id="coid-A1",
@@ -103,7 +103,9 @@ async def test_upsert_order_inherits_strategy_code_from_ticket(repo_factory, roo
             kalshi_order_id="kord-1",
             kalshi_env="demo",
         )
+        assert order.trade_ticket_id == ticket.id
         assert order.strategy_code == "A"
+        assert ticket.status == "submitted"
 
 
 @pytest.mark.asyncio
@@ -166,6 +168,48 @@ async def test_save_order_repairs_stream_placeholder_with_ticket_attribution(rep
         assert order.id == rows[0].id
         assert order.trade_ticket_id == ticket.id
         assert order.strategy_code == StrategyCode.DIRECTIONAL.value
+        assert ticket.status == "executed"
+
+
+@pytest.mark.asyncio
+async def test_upsert_order_does_not_downgrade_executed_ticket_status(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        ticket = await repo.save_trade_ticket(
+            room_id,
+            _ticket("KXHIGHNY-26APR23-T68"),
+            client_order_id="coid-terminal",
+            strategy_code=StrategyCode.DIRECTIONAL.value,
+        )
+        await repo.upsert_order(
+            client_order_id="coid-terminal",
+            market_ticker="KXHIGHNY-26APR23-T68",
+            status="executed",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.4000"),
+            count_fp=Decimal("10.00"),
+            raw={"source": "fill"},
+            kalshi_order_id="kord-terminal",
+            kalshi_env="demo",
+        )
+        await repo.upsert_order(
+            client_order_id="coid-terminal",
+            market_ticker="KXHIGHNY-26APR23-T68",
+            status="resting",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.4000"),
+            count_fp=Decimal("10.00"),
+            raw={"source": "late-stale-reconcile"},
+            kalshi_order_id="kord-terminal",
+            kalshi_env="demo",
+        )
+
+        refreshed = await session.get(TradeTicketRecord, ticket.id)
+        assert refreshed is not None
+        assert refreshed.status == "executed"
 
 
 @pytest.mark.asyncio
