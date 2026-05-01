@@ -675,6 +675,21 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
             assert kalshi_env == "demo"
             return {"won_contracts": 47.0, "total_contracts": 68.0}
 
+        async def get_session_fill_pnl_summary(self, *, kalshi_env: str | None = None) -> dict:
+            assert kalshi_env == "demo"
+            return {
+                "date": "2026-04-17",
+                "fill_count": 3,
+                "trade_count": 2,
+                "win_count": 1,
+                "loss_count": 1,
+                "unresolved_trade_count": 1,
+                "total_pnl_dollars": 2.50,
+                "mean_return_dollars": 1.25,
+                "max_drawdown_dollars": 1.00,
+                "sharpe_per_trade": 0.5,
+            }
+
         async def get_broken_book_rate_30d(self, *, kalshi_env: str | None = None) -> dict:
             assert kalshi_env == "demo"
             return {"broken_count": 189, "total_count": 257}
@@ -774,6 +789,10 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert payload["daily_pnl_display"] == "+$3.21"
     assert payload["daily_pnl_percent_display"] == "0.52%"
     assert payload["daily_pnl_line_display"] == "+$3.21 (0.52%) today (PT)"
+    assert payload["session_pnl"]["date_display"] == "2026-04-17 PT"
+    assert payload["session_pnl"]["total_pnl_display"] == "+$3.21"
+    assert payload["session_pnl"]["trade_count_display"] == "2 scored / 1 pending"
+    assert payload["session_pnl"]["summary"] == "2 scored trades; 1 buy fill still open or unsettled."
     assert payload["positions_summary"]["has_pnl_summary"] is True
     assert payload["positions"][0]["current_price_display"] == "$0.5000"
     assert payload["positions"][0]["unrealized_pnl_display"] == "-$1.44"

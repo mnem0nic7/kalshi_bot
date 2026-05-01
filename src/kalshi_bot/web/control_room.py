@@ -257,6 +257,71 @@ def _balance_summary(balance_checkpoint: Any | None, position_views: list[dict[s
     }
 
 
+def _session_pnl_summary(session_metrics: dict[str, Any], daily_pnl: Decimal | None) -> dict[str, Any]:
+    def _int_value(key: str) -> int:
+        try:
+            return int(session_metrics.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _money(value: Any, *, signed: bool = True) -> str:
+        amount = _decimal_or_none(value)
+        return _money_display(amount, signed=signed)
+
+    def _label(count: int, singular: str, plural: str | None = None) -> str:
+        return f"{count} {singular if count == 1 else (plural or singular + 's')}"
+
+    fill_count = _int_value("fill_count")
+    trade_count = _int_value("trade_count")
+    win_count = _int_value("win_count")
+    unresolved_trade_count = _int_value("unresolved_trade_count")
+    scored_fill_pnl = _decimal_or_none(session_metrics.get("total_pnl_dollars")) or Decimal("0")
+    display_pnl = daily_pnl if daily_pnl is not None else scored_fill_pnl.quantize(Decimal("0.01"))
+    win_rate = (win_count / trade_count) if trade_count else None
+
+    if fill_count <= 0:
+        status = "empty"
+        summary = "No fills recorded today."
+    elif trade_count <= 0 and unresolved_trade_count > 0:
+        status = "pending"
+        summary = f"{_label(fill_count, 'fill')} today, but none are sold or settled yet."
+    elif unresolved_trade_count > 0:
+        status = "partial"
+        scored_label = _label(trade_count, "scored trade")
+        pending_label = _label(unresolved_trade_count, "buy fill")
+        summary = f"{scored_label}; {pending_label} still open or unsettled."
+    else:
+        status = "ready"
+        summary = f"{_label(trade_count, 'scored trade')} from {_label(fill_count, 'fill')} today."
+
+    trade_count_display = str(trade_count)
+    if unresolved_trade_count:
+        trade_count_display = f"{trade_count} scored / {unresolved_trade_count} pending"
+
+    total_pnl_source = "Daily portfolio" if daily_pnl is not None else "Scored fills"
+    return {
+        "date": session_metrics.get("date"),
+        "date_display": f"{session_metrics.get('date')} PT" if session_metrics.get("date") else "Today (PT)",
+        "status": status,
+        "summary": summary,
+        "total_pnl_dollars": str(display_pnl) if display_pnl is not None else None,
+        "total_pnl_display": _money_display(display_pnl, signed=True),
+        "total_pnl_tone": _pnl_tone(display_pnl),
+        "total_pnl_source": total_pnl_source,
+        "fill_count": fill_count,
+        "trade_count": trade_count,
+        "trade_count_display": trade_count_display,
+        "win_rate": win_rate,
+        "win_rate_display": _ratio_display(win_rate),
+        "mean_return_dollars": session_metrics.get("mean_return_dollars"),
+        "mean_return_display": _money(session_metrics.get("mean_return_dollars"), signed=True),
+        "max_drawdown_dollars": session_metrics.get("max_drawdown_dollars"),
+        "max_drawdown_display": _money(session_metrics.get("max_drawdown_dollars"), signed=False),
+        "sharpe": session_metrics.get("sharpe_per_trade"),
+        "sharpe_display": _sortino_display(_float_or_none(session_metrics.get("sharpe_per_trade"))),
+    }
+
+
 def _confidence_band(value: float | None) -> str:
     if value is None:
         return "none"
@@ -1859,6 +1924,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         total_capital = await repo.get_total_capital_dollars(kalshi_env=kalshi_env)
         daily_pnl_baseline = await repo.get_daily_portfolio_baseline_dollars(kalshi_env=kalshi_env)
         win_rate_data = await repo.get_fill_win_rate_30d(kalshi_env=kalshi_env)
+        session_fill_pnl = await repo.get_session_fill_pnl_summary(kalshi_env=kalshi_env)
         broken_book_data = await repo.get_broken_book_rate_30d(kalshi_env=kalshi_env)
         recent_trade_proposals = await _recent_trade_proposal_views(session, kalshi_env=kalshi_env)
         fallback_capital = thresholds.risk_max_position_notional_dollars
@@ -1932,6 +1998,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         "daily_pnl_percent_display": _percent_display(daily_pnl_percent),
         "daily_pnl_line_display": _daily_pnl_line_display(daily_pnl, daily_pnl_percent),
         "daily_pnl_tone": _pnl_tone(daily_pnl),
+        "session_pnl": _session_pnl_summary(session_fill_pnl, daily_pnl),
         "win_rate_display": _win_rate_display(win_rate_data),
         "win_rate_contracts": f"{int(win_rate_data.get('won_contracts', 0))}W / {int(win_rate_data.get('total_contracts', 0))}T",
         "win_rate_trades": (

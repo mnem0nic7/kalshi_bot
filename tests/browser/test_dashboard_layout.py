@@ -114,6 +114,7 @@ def _build_env_payload(
     total_unrealized_pnl_display: str = "+$7.20",
     total_unrealized_pnl_tone: str = "good",
     has_pnl_summary: bool = True,
+    session_pnl: dict[str, object] | None = None,
     recent_trade_proposals: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
@@ -128,6 +129,20 @@ def _build_env_payload(
         "daily_pnl_display": daily_pnl_display,
         "daily_pnl_tone": daily_pnl_tone,
         "daily_pnl_line_display": daily_pnl_line_display,
+        "session_pnl": session_pnl
+        or {
+            "date_display": "2026-04-22 PT",
+            "status": "ready",
+            "summary": "2 scored trades from 3 fills today.",
+            "total_pnl_display": daily_pnl_display,
+            "total_pnl_tone": daily_pnl_tone,
+            "total_pnl_source": "Daily portfolio",
+            "trade_count_display": "2",
+            "win_rate_display": "50%",
+            "mean_return_display": "+$1.20",
+            "max_drawdown_display": "$0.80",
+            "sharpe_display": "+0.62",
+        },
         "alerts": [],
         "active_rooms": [],
         "positions": _build_positions(positions_count),
@@ -770,6 +785,32 @@ def _portfolio_recent_line(page: Page, env_key: str = "demo") -> str | None:
     )
 
 
+def _session_pnl_card(page: Page, env_key: str = "demo") -> dict[str, str | None] | None:
+    return page.evaluate(
+        """
+        (envKey) => {
+          const panel = document.querySelector(`#panel-${envKey}`);
+          const card = panel?.querySelector('[data-testid="session-pnl-summary"]');
+          if (!card) return null;
+          const text = (key) => card.querySelector(`[data-session-pnl-key="${key}"]`)?.textContent?.trim() ?? null;
+          return {
+            date: text("date_display"),
+            status: text("status"),
+            total: text("total_pnl_display"),
+            source: text("total_pnl_source"),
+            trades: text("trade_count_display"),
+            winRate: text("win_rate_display"),
+            mean: text("mean_return_display"),
+            drawdown: text("max_drawdown_display"),
+            sharpe: text("sharpe_display"),
+            summary: text("summary"),
+          };
+        }
+        """,
+        env_key,
+    )
+
+
 def test_positions_total_row_shows_notional_and_pnl_when_marked(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -821,6 +862,53 @@ def test_portfolio_card_shows_recent_pnl_line(
                 page.goto(base_url, wait_until="load", timeout=15_000)
                 page.wait_for_selector("#panel-demo .dash-stat-portfolio .dash-stat-detail", timeout=15_000)
                 assert _portfolio_recent_line(page) == "+$65.30 (9.96%) today (PT)"
+            finally:
+                browser.close()
+
+
+def test_session_pnl_card_shows_status_and_trade_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payloads = {
+        "demo": _build_env_payload(
+            "$1,250.00",
+            positions_count=1,
+            session_pnl={
+                "date_display": "2026-05-01 PT",
+                "status": "pending",
+                "summary": "1 fill today, but none are sold or settled yet.",
+                "total_pnl_display": "$0.00",
+                "total_pnl_tone": "neutral",
+                "total_pnl_source": "Scored fills",
+                "trade_count_display": "0 scored / 1 pending",
+                "win_rate_display": "—",
+                "mean_return_display": "—",
+                "max_drawdown_display": "—",
+                "sharpe_display": "—",
+            },
+        ),
+        "production": _build_env_payload("$2,500.00", positions_count=1),
+    }
+    with _serve_dashboard(monkeypatch, tmp_path, payloads=payloads) as base_url:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                page.goto(base_url, wait_until="load", timeout=15_000)
+                page.wait_for_selector('#panel-demo [data-testid="session-pnl-summary"]', timeout=15_000)
+                card = _session_pnl_card(page)
+                assert card == {
+                    "date": "2026-05-01 PT",
+                    "status": "Pending",
+                    "total": "$0.00",
+                    "source": "Scored fills",
+                    "trades": "0 scored / 1 pending",
+                    "winRate": "—",
+                    "mean": "—",
+                    "drawdown": "—",
+                    "sharpe": "—",
+                    "summary": "1 fill today, but none are sold or settled yet.",
+                }
             finally:
                 browser.close()
 

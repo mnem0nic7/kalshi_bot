@@ -339,6 +339,38 @@
     });
   }
 
+  function sessionPnlStatusTone(status) {
+    if (status === "ready") return "good";
+    if (status === "partial" || status === "pending") return "warning";
+    return "neutral";
+  }
+
+  function sessionPnlStatusLabel(status) {
+    if (!status) return "Empty";
+    return String(status)
+      .replaceAll("_", " ")
+      .replace(/\b\w/g, (char) => char.toUpperCase());
+  }
+
+  function renderSessionPnl(card, summary) {
+    if (!card) return;
+    const payload = summary || {};
+    card.querySelectorAll("[data-session-pnl-key]").forEach((node) => {
+      const key = node.dataset.sessionPnlKey;
+      if (key === "status") {
+        node.textContent = sessionPnlStatusLabel(payload.status || "empty");
+        node.className = `status-pill ${statusPillClass(sessionPnlStatusTone(payload.status))}`;
+        return;
+      }
+      node.textContent = payload[key] || (key === "summary" ? "No fills recorded today." : "—");
+      const toneKey = node.dataset.sessionPnlTone;
+      if (toneKey) {
+        node.classList.remove("value-positive", "value-negative", "value-neutral");
+        node.classList.add(toneClass(payload[toneKey] || "neutral"));
+      }
+    });
+  }
+
   function renderActiveRooms(card, rooms) {
     const section = card.querySelector(".active-rooms-section");
     if (!section) return;
@@ -641,6 +673,7 @@
         daily_pnl_line_display: data.daily_pnl_line_display,
         daily_pnl_tone: data.daily_pnl_tone,
       });
+      renderSessionPnl(panel.querySelector(".dash-card-session-pnl"), data.session_pnl || {});
       renderActiveRooms(panel.querySelector(".dash-card-alerts"), data.active_rooms || []);
       renderAlerts(panel.querySelector(".dash-card-alerts"), data.alerts || []);
       renderCapitalBuckets(panel.querySelector(".dash-card-positions"), data.positions_summary || {});

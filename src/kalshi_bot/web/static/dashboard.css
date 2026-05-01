@@ -166,6 +166,34 @@
   border-color: rgba(255, 255, 255, 0.15);
 }
 
+.dash-card-session-pnl {
+  gap: 0.75rem;
+}
+
+.session-pnl-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.session-pnl-stat {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.session-pnl-value {
+  color: #eef4fd;
+  font-size: 1.08rem;
+  font-weight: 700;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.session-pnl-note {
+  margin: 0;
+}
+
 .dash-card-header {
   display: flex;
   justify-content: space-between;
@@ -1287,6 +1315,10 @@
     grid-template-columns: 1fr;
   }
 
+  .session-pnl-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .strategies-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1325,6 +1357,10 @@
 
   .dash-stat-portfolio {
     grid-column: auto;
+  }
+
+  .session-pnl-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .strategies-summary,

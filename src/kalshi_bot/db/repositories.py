@@ -82,6 +82,117 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             parts.append(suffix)
         return ":".join(parts)
 
+    @staticmethod
+    def _fill_pnl_metrics(all_fills: list[FillRecord]) -> dict[str, Any]:
+        """Summarize buy-fill trade P&L from a bounded fill set."""
+        buys: dict[tuple[str, str], list[FillRecord]] = {}
+        sells: dict[tuple[str, str], list[FillRecord]] = {}
+        for fill in all_fills:
+            key = (fill.market_ticker, fill.side)
+            if fill.action == "buy":
+                buys.setdefault(key, []).append(fill)
+            elif fill.action == "sell":
+                sells.setdefault(key, []).append(fill)
+
+        def _fill_time(fill: FillRecord) -> datetime:
+            value = fill.created_at
+            if value is None:
+                return datetime.min.replace(tzinfo=UTC)
+            if value.tzinfo is None:
+                return value.replace(tzinfo=UTC)
+            return value.astimezone(UTC)
+
+        won = 0.0
+        total = 0.0
+        scored_contracts = 0.0
+        unresolved_contracts = 0.0
+        unresolved_trade_count = 0
+        trade_pnls_with_time: list[tuple[datetime, float]] = []
+        for key, buy_fills in buys.items():
+            _ticker, side = key
+            sell_fills = sells.get(key, [])
+            avg_sell: float | None = None
+            if sell_fills:
+                sell_count = sum(float(s.count_fp) for s in sell_fills)
+                if sell_count > 0:
+                    avg_sell = (
+                        sum(float(s.yes_price_dollars) * float(s.count_fp) for s in sell_fills)
+                        / sell_count
+                    )
+            for buy_fill in buy_fills:
+                count = float(buy_fill.count_fp)
+                buy_px = float(buy_fill.yes_price_dollars)
+                total += count
+                pnl: float | None = None
+                profitable = False
+                if avg_sell is not None:
+                    if side == "yes":
+                        pnl = (avg_sell - buy_px) * count
+                    else:
+                        pnl = (buy_px - avg_sell) * count
+                    profitable = pnl > 0
+                elif buy_fill.settlement_result is not None:
+                    won_leg = buy_fill.settlement_result == "win"
+                    if side == "yes":
+                        pnl = ((1.0 if won_leg else 0.0) - buy_px) * count
+                    else:
+                        pnl = ((1.0 if won_leg else 0.0) - (1.0 - buy_px)) * count
+                    profitable = won_leg
+                if profitable:
+                    won += count
+                if pnl is None:
+                    unresolved_trade_count += 1
+                    unresolved_contracts += count
+                else:
+                    scored_contracts += count
+                    trade_pnls_with_time.append((_fill_time(buy_fill), pnl))
+
+        ordered_pnls = [
+            pnl for _created_at, pnl in sorted(trade_pnls_with_time, key=lambda item: item[0])
+        ]
+        trade_count = len(ordered_pnls)
+        wins_pnl = [p for p in ordered_pnls if p > 0]
+        losses_pnl = [p for p in ordered_pnls if p < 0]
+        total_pnl = sum(ordered_pnls)
+        avg_win_dollars = (sum(wins_pnl) / len(wins_pnl)) if wins_pnl else None
+        avg_loss_dollars = (sum(losses_pnl) / len(losses_pnl)) if losses_pnl else None
+        mean_return_dollars = (total_pnl / trade_count) if trade_count else None
+
+        stdev_dollars: float | None = None
+        sharpe_per_trade: float | None = None
+        if trade_count >= 2 and mean_return_dollars is not None:
+            variance = sum((p - mean_return_dollars) ** 2 for p in ordered_pnls) / trade_count
+            stdev = variance ** 0.5
+            stdev_dollars = stdev
+            if stdev > 0:
+                sharpe_per_trade = mean_return_dollars / stdev
+
+        running_pnl = 0.0
+        peak_pnl = 0.0
+        max_drawdown = 0.0
+        for pnl in ordered_pnls:
+            running_pnl += pnl
+            peak_pnl = max(peak_pnl, running_pnl)
+            max_drawdown = max(max_drawdown, peak_pnl - running_pnl)
+
+        return {
+            "won_contracts": won,
+            "total_contracts": total,
+            "scored_contracts": scored_contracts,
+            "unresolved_contracts": unresolved_contracts,
+            "trade_count": trade_count,
+            "win_count": len(wins_pnl),
+            "loss_count": len(losses_pnl),
+            "unresolved_trade_count": unresolved_trade_count,
+            "avg_win_dollars": avg_win_dollars,
+            "avg_loss_dollars": avg_loss_dollars,
+            "total_pnl_dollars": total_pnl,
+            "mean_return_dollars": mean_return_dollars,
+            "max_drawdown_dollars": max_drawdown if trade_count else None,
+            "stdev_dollars": stdev_dollars,
+            "sharpe_per_trade": sharpe_per_trade,
+        }
+
     async def create_room(
         self,
         room: RoomCreate,
@@ -1806,84 +1917,52 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(FillRecord.strategy_code == strategy_code)
         all_fills = list((await self.session.execute(stmt)).scalars())
 
-        # Group by (market_ticker, side)
-        buys: dict[tuple[str, str], list[FillRecord]] = {}
-        sells: dict[tuple[str, str], list[FillRecord]] = {}
-        for fill in all_fills:
-            key = (fill.market_ticker, fill.side)
-            if fill.action == "buy":
-                buys.setdefault(key, []).append(fill)
-            elif fill.action == "sell":
-                sells.setdefault(key, []).append(fill)
+        return self._fill_pnl_metrics(all_fills)
 
-        won = 0.0
-        total = 0.0
-        trade_pnls: list[float] = []  # per-trade dollar P&L (one observation per buy fill)
-        for key, buy_fills in buys.items():
-            _ticker, side = key
-            sell_fills = sells.get(key, [])
-            # Shared weighted-average sell price for the (ticker, side) group.
-            avg_sell: float | None = None
-            if sell_fills:
-                sell_count = sum(float(s.count_fp) for s in sell_fills)
-                if sell_count > 0:
-                    avg_sell = sum(
-                        float(s.yes_price_dollars) * float(s.count_fp) for s in sell_fills
-                    ) / sell_count
-            for buy_fill in buy_fills:
-                count = float(buy_fill.count_fp)
-                buy_px = float(buy_fill.yes_price_dollars)
-                total += count
-                pnl: float | None = None
-                profitable = False
-                if avg_sell is not None:
-                    # Realized exit: weight-average sell price across any partial fills.
-                    if side == "yes":
-                        pnl = (avg_sell - buy_px) * count
-                    else:
-                        pnl = (buy_px - avg_sell) * count
-                    profitable = pnl > 0
-                elif buy_fill.settlement_result is not None:
-                    # Settled without a sell fill. Payoff is $1 on win, $0 on loss.
-                    # For YES side: entry cost = buy_px, for NO side: entry cost = 1 - buy_px.
-                    won_leg = buy_fill.settlement_result == "win"
-                    if side == "yes":
-                        pnl = ((1.0 if won_leg else 0.0) - buy_px) * count
-                    else:
-                        pnl = ((1.0 if won_leg else 0.0) - (1.0 - buy_px)) * count
-                    profitable = won_leg
-                if profitable:
-                    won += count
-                if pnl is not None:
-                    trade_pnls.append(pnl)
+    async def get_session_fill_pnl_summary(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        pacific_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Return scored fill P&L metrics for one Pacific trading day."""
+        import zoneinfo
+        from datetime import date as date_cls
+        from datetime import time
 
-        trade_count = len(trade_pnls)
-        wins_pnl = [p for p in trade_pnls if p > 0]
-        losses_pnl = [p for p in trade_pnls if p < 0]
-        avg_win_dollars = (sum(wins_pnl) / len(wins_pnl)) if wins_pnl else None
-        avg_loss_dollars = (sum(losses_pnl) / len(losses_pnl)) if losses_pnl else None
-
-        stdev_dollars: float | None = None
-        sharpe_per_trade: float | None = None
-        if trade_count >= 2:
-            mean_pnl = sum(trade_pnls) / trade_count
-            variance = sum((p - mean_pnl) ** 2 for p in trade_pnls) / trade_count
-            stdev = variance ** 0.5
-            stdev_dollars = stdev
-            if stdev > 0:
-                sharpe_per_trade = mean_pnl / stdev
-
-        return {
-            "won_contracts": won,
-            "total_contracts": total,
-            "trade_count": trade_count,
-            "win_count": len(wins_pnl),
-            "loss_count": len(losses_pnl),
-            "avg_win_dollars": avg_win_dollars,
-            "avg_loss_dollars": avg_loss_dollars,
-            "stdev_dollars": stdev_dollars,
-            "sharpe_per_trade": sharpe_per_trade,
-        }
+        pacific_zone = zoneinfo.ZoneInfo("America/Los_Angeles")
+        local_date = (
+            date_cls.fromisoformat(pacific_date)
+            if pacific_date is not None
+            else datetime.now(pacific_zone).date()
+        )
+        start_local = datetime.combine(local_date, time.min, tzinfo=pacific_zone)
+        end_local = start_local + timedelta(days=1)
+        start_utc = start_local.astimezone(UTC)
+        end_utc = end_local.astimezone(UTC)
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = (
+            select(FillRecord)
+            .where(
+                FillRecord.kalshi_env == env,
+                FillRecord.created_at >= start_utc,
+                FillRecord.created_at < end_utc,
+            )
+            .order_by(FillRecord.created_at.asc())
+        )
+        all_fills = list((await self.session.execute(stmt)).scalars())
+        metrics = self._fill_pnl_metrics(all_fills)
+        metrics.update(
+            {
+                "date": local_date.isoformat(),
+                "window_start": start_utc.isoformat(),
+                "window_end": end_utc.isoformat(),
+                "fill_count": len(all_fills),
+                "buy_fill_count": sum(1 for fill in all_fills if fill.action == "buy"),
+                "sell_fill_count": sum(1 for fill in all_fills if fill.action == "sell"),
+            }
+        )
+        return metrics
 
     async def get_strategy_city_fill_metrics_since(
         self,

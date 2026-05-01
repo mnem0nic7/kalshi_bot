@@ -94,6 +94,50 @@
       </article>
     </div>
 
+    {% set session_pnl = env_data.session_pnl or {} %}
+    {% set session_status = session_pnl.status or "empty" %}
+    <article class="dash-card dash-card-session-pnl" data-testid="session-pnl-summary">
+      <div class="dash-card-header">
+        <div class="dash-card-title-block">
+          <h2>Session P&amp;L Summary</h2>
+          <span class="muted-label" data-session-pnl-key="date_display">{{ session_pnl.date_display or "Today (PT)" }}</span>
+        </div>
+        <span class="status-pill {% if session_status == 'ready' %}status-good{% elif session_status in ['partial', 'pending'] %}status-warning{% else %}status-neutral{% endif %}" data-session-pnl-key="status">{{ session_status | replace("_", " ") | title }}</span>
+      </div>
+      <div class="session-pnl-grid">
+        <div class="session-pnl-stat">
+          <span class="muted-label">Total P&amp;L</span>
+          <strong
+            class="session-pnl-value {% if session_pnl.total_pnl_tone == 'good' %}value-positive{% elif session_pnl.total_pnl_tone == 'bad' %}value-negative{% else %}value-neutral{% endif %}"
+            data-session-pnl-key="total_pnl_display"
+            data-session-pnl-tone="total_pnl_tone"
+          >{{ session_pnl.total_pnl_display or "—" }}</strong>
+          <span class="muted-label" data-session-pnl-key="total_pnl_source">{{ session_pnl.total_pnl_source or "Scored fills" }}</span>
+        </div>
+        <div class="session-pnl-stat">
+          <span class="muted-label">Trades</span>
+          <strong class="session-pnl-value" data-session-pnl-key="trade_count_display">{{ session_pnl.trade_count_display or "0" }}</strong>
+        </div>
+        <div class="session-pnl-stat">
+          <span class="muted-label">Win Rate</span>
+          <strong class="session-pnl-value" data-session-pnl-key="win_rate_display">{{ session_pnl.win_rate_display or "—" }}</strong>
+        </div>
+        <div class="session-pnl-stat">
+          <span class="muted-label">Mean Return</span>
+          <strong class="session-pnl-value" data-session-pnl-key="mean_return_display">{{ session_pnl.mean_return_display or "—" }}</strong>
+        </div>
+        <div class="session-pnl-stat">
+          <span class="muted-label">Max Drawdown</span>
+          <strong class="session-pnl-value" data-session-pnl-key="max_drawdown_display">{{ session_pnl.max_drawdown_display or "—" }}</strong>
+        </div>
+        <div class="session-pnl-stat">
+          <span class="muted-label">Sharpe</span>
+          <strong class="session-pnl-value" data-session-pnl-key="sharpe_display">{{ session_pnl.sharpe_display or "—" }}</strong>
+        </div>
+      </div>
+      <p class="session-pnl-note muted-label" data-session-pnl-key="summary">{{ session_pnl.summary or "No fills recorded today." }}</p>
+    </article>
+
     <div class="dash-grid">
 
       <article class="dash-card dash-card-alerts">

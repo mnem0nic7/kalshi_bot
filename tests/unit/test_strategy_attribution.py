@@ -8,6 +8,7 @@ Verifies:
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -614,6 +615,55 @@ async def test_win_rate_mixed_outcomes_report_both_magnitudes_and_sharpe(repo_fa
         assert result["stdev_dollars"] == pytest.approx(4.320, abs=0.01)
         # sharpe = mean / stdev = 2.0 / 4.320 ≈ 0.463
         assert result["sharpe_per_trade"] == pytest.approx(0.463, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_session_fill_pnl_summary_explains_scored_and_unresolved_fills(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        winning = await _seed_buy_with_settlement(
+            repo,
+            market_ticker="KXHIGHNY-26MAY01-T68",
+            yes_price="0.4000",
+            count="10.00",
+            trade_id="t1",
+            settlement_result="win",
+        )
+        winning.created_at = datetime(2026, 5, 1, 15, 0, tzinfo=UTC)
+        losing = await _seed_buy_with_settlement(
+            repo,
+            market_ticker="KXHIGHCHI-26MAY01-T82",
+            yes_price="0.8000",
+            count="5.00",
+            trade_id="t2",
+            settlement_result="loss",
+        )
+        losing.created_at = datetime(2026, 5, 1, 16, 0, tzinfo=UTC)
+        pending = await repo.upsert_fill(
+            market_ticker="KXHIGHAUS-26MAY01-T90",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("8.00"),
+            raw={},
+            trade_id="t3",
+            kalshi_env="demo",
+            strategy_code="A",
+        )
+        pending.created_at = datetime(2026, 5, 1, 17, 0, tzinfo=UTC)
+        await session.flush()
+
+        result = await repo.get_session_fill_pnl_summary(kalshi_env="demo", pacific_date="2026-05-01")
+
+        assert result["date"] == "2026-05-01"
+        assert result["fill_count"] == 3
+        assert result["buy_fill_count"] == 3
+        assert result["trade_count"] == 2
+        assert result["unresolved_trade_count"] == 1
+        assert result["total_pnl_dollars"] == pytest.approx(2.0)
+        assert result["mean_return_dollars"] == pytest.approx(1.0)
+        assert result["max_drawdown_dollars"] == pytest.approx(4.0)
 
 
 @pytest.mark.asyncio
