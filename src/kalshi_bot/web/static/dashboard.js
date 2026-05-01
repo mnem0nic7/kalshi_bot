@@ -58,9 +58,9 @@
 
   function tradeProposalTone(status) {
     const normalized = String(status || "").trim().toLowerCase();
-    if (normalized === "approved") return "good";
-    if (normalized === "blocked") return "bad";
-    if (normalized === "review") return "warning";
+    if (["approved", "executed", "filled"].includes(normalized)) return "good";
+    if (["blocked", "rejected", "rejected_400", "failed"].includes(normalized)) return "bad";
+    if (["review", "canceled", "cancelled"].includes(normalized)) return "warning";
     return "neutral";
   }
 
@@ -575,13 +575,13 @@
   function renderRecentTradeProposals(card, proposals) {
     if (!card) return;
     const countLabel = card.querySelector(".trade-proposals-count-label");
-    if (countLabel) countLabel.textContent = `${proposals.length} ticket${proposals.length !== 1 ? "s" : ""}`;
+    if (countLabel) countLabel.textContent = `${proposals.length} event${proposals.length !== 1 ? "s" : ""}`;
 
     const empty = card.querySelector("p.empty-state");
     if (!proposals.length) {
       const wrap = card.querySelector(".table-wrap");
       if (wrap) wrap.remove();
-      if (!empty) card.appendChild(el("p", "empty-state", "No recent proposed tickets."));
+      if (!empty) card.appendChild(el("p", "empty-state", "No recent trading activity."));
       return;
     }
     if (empty) empty.remove();
@@ -595,7 +595,7 @@
     const table = el("table", "positions-table");
     const thead = el("thead");
     const headerRow = el("tr");
-    ["Market", "Side", "Yes Price", "Contracts", "Status", "Risk", "Approved Notional"].forEach((h) => {
+    ["Event", "Market", "Side", "Yes Price", "Contracts", "Status", "Risk", "Notional"].forEach((h) => {
       headerRow.appendChild(el("th", null, h));
     });
     thead.appendChild(headerRow);
@@ -633,14 +633,16 @@
         riskWrap.appendChild(el("div", "proposal-risk-reasons", riskReasonText));
       }
       riskTd.appendChild(riskWrap);
+      const eventLabel = proposal.event_label || (proposal.event_type ? String(proposal.event_type).replaceAll("_", " ") : "Event");
       tr.append(
+        el("td", null, eventLabel.replace(/^\w/, (ch) => ch.toUpperCase())),
         marketTd,
         sideTd,
         el("td", "mono", proposal.yes_price_dollars || "—"),
         el("td", "mono", proposal.count_fp || "—"),
         statusTd,
         riskTd,
-        el("td", "mono", proposal.approved_notional_dollars || "—"),
+        el("td", "mono", proposal.notional_dollars || proposal.approved_notional_dollars || "—"),
       );
       tbody.appendChild(tr);
     });
@@ -678,7 +680,10 @@
       renderAlerts(panel.querySelector(".dash-card-alerts"), data.alerts || []);
       renderCapitalBuckets(panel.querySelector(".dash-card-positions"), data.positions_summary || {});
       renderPositions(panel.querySelector(".dash-card-positions"), data.positions || [], data.positions_summary || {});
-      renderRecentTradeProposals(panel.querySelector(".dash-card-proposals"), data.recent_trade_proposals || []);
+      renderRecentTradeProposals(
+        panel.querySelector(".dash-card-proposals"),
+        data.recent_trading_activity || data.recent_trade_proposals || [],
+      );
     } catch (_) {
       // skip on network error
     }

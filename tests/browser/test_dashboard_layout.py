@@ -69,6 +69,8 @@ def _build_positions(count: int) -> list[dict[str, object]]:
 def _build_recent_trade_proposals() -> list[dict[str, object]]:
     return [
         {
+            "event_type": "ticket",
+            "event_label": "Ticket",
             "market_ticker": "KXHIGHTPHX-26APR23-T92",
             "side": "yes",
             "side_tone": "good",
@@ -80,21 +82,46 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "risk_status_tone": "bad",
             "risk_reasons": ["Spread too wide for entry."],
             "approved_notional_dollars": None,
+            "notional_dollars": "3.7500",
             "updated_at": "2026-04-22T21:05:00+00:00",
         },
         {
-            "market_ticker": "KXHIGHNY-26APR23-T75",
-            "side": "yes",
-            "side_tone": "good",
-            "yes_price_dollars": "0.4000",
-            "count_fp": "12.50",
-            "status": "proposed",
-            "status_tone": "neutral",
+            "event_type": "order",
+            "event_label": "Order",
+            "market_ticker": "KXHIGHDEN-26MAY01-T63",
+            "side": "no",
+            "side_tone": "warning",
+            "yes_price_dollars": "0.2000",
+            "count_fp": "2.00",
+            "status": "executed",
+            "status_tone": "good",
             "risk_status": "approved",
             "risk_status_tone": "good",
             "risk_reasons": [],
             "approved_notional_dollars": "5.0000",
+            "notional_dollars": "1.6000",
+            "trade_ticket_id": "ticket-den",
+            "order_id": "order-den",
             "updated_at": "2026-04-22T21:03:00+00:00",
+        },
+        {
+            "event_type": "fill",
+            "event_label": "Fill",
+            "market_ticker": "KXHIGHTHOU-26MAY01-T70",
+            "side": "no",
+            "side_tone": "warning",
+            "yes_price_dollars": "0.1800",
+            "count_fp": "1.00",
+            "status": "filled",
+            "status_tone": "good",
+            "risk_status": None,
+            "risk_status_tone": "neutral",
+            "risk_reasons": [],
+            "approved_notional_dollars": None,
+            "notional_dollars": "0.8200",
+            "trade_ticket_id": None,
+            "order_id": "order-hou",
+            "updated_at": "2026-04-22T21:02:00+00:00",
         },
     ]
 
@@ -115,8 +142,10 @@ def _build_env_payload(
     total_unrealized_pnl_tone: str = "good",
     has_pnl_summary: bool = True,
     session_pnl: dict[str, object] | None = None,
+    recent_trading_activity: list[dict[str, object]] | None = None,
     recent_trade_proposals: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
+    activity = recent_trading_activity if recent_trading_activity is not None else recent_trade_proposals or []
     return {
         "portfolio": {
             "cash_display": cash_display,
@@ -146,7 +175,8 @@ def _build_env_payload(
         "alerts": [],
         "active_rooms": [],
         "positions": _build_positions(positions_count),
-        "recent_trade_proposals": recent_trade_proposals or [],
+        "recent_trading_activity": activity,
+        "recent_trade_proposals": activity,
         "positions_summary": {
             "capital_buckets": None,
             "total_current_value_dollars": total_value_dollars if total_value_is_marked else None,
@@ -913,7 +943,7 @@ def test_session_pnl_card_shows_status_and_trade_context(
                 browser.close()
 
 
-def test_recent_trade_proposals_render_at_bottom_of_demo_and_production(
+def test_recent_trading_activity_renders_at_bottom_of_demo_and_production(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payloads = {
@@ -936,9 +966,17 @@ def test_recent_trade_proposals_render_at_bottom_of_demo_and_production(
                 page.goto(base_url, wait_until="load", timeout=15_000)
                 page.wait_for_selector('#panel-demo [data-testid="recent-trade-proposals"]', timeout=15_000)
                 demo_text = page.locator('#panel-demo [data-testid="recent-trade-proposals"]').text_content(timeout=15_000) or ""
-                assert "Recent Trade Proposals" in demo_text
+                assert "Recent Trading Activity" in demo_text
+                assert "3 events" in demo_text
+                assert "Ticket" in demo_text
+                assert "Order" in demo_text
+                assert "Fill" in demo_text
                 assert "KXHIGHTPHX-26APR23-T92" in demo_text
+                assert "KXHIGHDEN-26MAY01-T63" in demo_text
+                assert "KXHIGHTHOU-26MAY01-T70" in demo_text
                 assert "0.0400" in demo_text
+                assert "executed" in demo_text
+                assert "filled" in demo_text
                 assert "blocked" in demo_text
                 assert "Spread too wide for entry." in demo_text
                 demo_timestamp = page.locator('#panel-demo [data-testid="recent-trade-proposals"] [data-timestamp="2026-04-22T21:05:00+00:00"]').first
@@ -947,8 +985,10 @@ def test_recent_trade_proposals_render_at_bottom_of_demo_and_production(
                 page.locator('.dash-tab[data-env="production"]').click(timeout=15_000)
                 page.wait_for_selector('#panel-production [data-testid="recent-trade-proposals"]', timeout=15_000)
                 production_text = page.locator('#panel-production [data-testid="recent-trade-proposals"]').text_content(timeout=15_000) or ""
-                assert "KXHIGHNY-26APR23-T75" in production_text
-                assert "5.0000" in production_text
+                assert "KXHIGHDEN-26MAY01-T63" in production_text
+                assert "KXHIGHTHOU-26MAY01-T70" in production_text
+                assert "1.6000" in production_text
+                assert "0.8200" in production_text
                 assert "Spread too wide for entry." in production_text
                 production_timestamp = page.locator('#panel-production [data-testid="recent-trade-proposals"] [data-timestamp="2026-04-22T21:03:00+00:00"]').first
                 assert production_timestamp.count() == 1

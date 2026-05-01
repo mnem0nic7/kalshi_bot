@@ -130,6 +130,15 @@ class _OutcomeSession(_FakeSession):
         return _FakeResult(self._rows)
 
 
+class _SequenceSession(_FakeSession):
+    def __init__(self, result_sets: list[list[tuple]]) -> None:
+        self._result_sets = list(result_sets)
+
+    async def execute(self, _stmt) -> _FakeResult:
+        rows = self._result_sets.pop(0) if self._result_sets else []
+        return _FakeResult(rows)
+
+
 class _OutcomeSessionFactory(_FakeSessionFactory):
     def __init__(self, rows: list[tuple]) -> None:
         self._rows = rows
@@ -410,75 +419,137 @@ async def test_build_control_room_bootstrap_skips_live_market_discovery(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_recent_trade_proposal_views_formats_rows() -> None:
-    now = datetime(2026, 4, 22, 20, 0, tzinfo=UTC)
-    session = _OutcomeSession(
-        [
-            SimpleNamespace(
-                market_ticker="KXHIGHNY-26APR23-T75",
-                side="yes",
-                yes_price_dollars=Decimal("0.4000"),
-                count_fp=Decimal("12.50"),
-                status="proposed",
-                risk_status="blocked",
-                risk_reasons=["Spread too wide for entry.", "Remaining payout below threshold."],
-                approved_notional_dollars=None,
-                updated_at=now,
-            ),
-            SimpleNamespace(
-                market_ticker="KXHIGHCHI-26APR23-T68",
-                side="no",
-                yes_price_dollars=Decimal("0.2100"),
-                count_fp=Decimal("8.00"),
-                status="proposed",
-                risk_status="approved",
-                risk_reasons=[],
-                approved_notional_dollars=Decimal("1.6800"),
-                updated_at=now,
-            ),
-        ]
-    )
-
-    views = await control_room_module._recent_trade_proposal_views(session, kalshi_env="demo")
-
-    assert views == [
-        {
-            "market_ticker": "KXHIGHNY-26APR23-T75",
-            "side": "yes",
-            "selected_side": "yes",
-            "skipped_side": None,
-            "skipped_side_reason": None,
-            "candidate_trace": {},
-            "side_tone": "good",
-            "yes_price_dollars": "0.4000",
-            "count_fp": "12.50",
-            "status": "proposed",
-            "status_tone": "neutral",
-            "risk_status": "blocked",
-            "risk_status_tone": "bad",
-            "risk_reasons": ["Spread too wide for entry.", "Remaining payout below threshold."],
-            "approved_notional_dollars": None,
-            "updated_at": now.isoformat(),
-        },
-        {
-            "market_ticker": "KXHIGHCHI-26APR23-T68",
-            "side": "no",
-            "selected_side": "no",
-            "skipped_side": None,
-            "skipped_side_reason": None,
-            "candidate_trace": {},
-            "side_tone": "warning",
-            "yes_price_dollars": "0.2100",
-            "count_fp": "8.00",
-            "status": "proposed",
-            "status_tone": "neutral",
-            "risk_status": "approved",
-            "risk_status_tone": "good",
-            "risk_reasons": [],
-            "approved_notional_dollars": "1.6800",
-            "updated_at": now.isoformat(),
-        },
+async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -> None:
+    now = datetime(2026, 5, 1, 20, 0, tzinfo=UTC)
+    ticket_rows = [
+        SimpleNamespace(
+            trade_ticket_id="ticket-executed",
+            market_ticker="KXHIGHTHOU-26MAY01-T70",
+            side="no",
+            yes_price_dollars=Decimal("0.2000"),
+            count_fp=Decimal("2.00"),
+            status="executed",
+            risk_status="approved",
+            risk_reasons=[],
+            approved_notional_dollars=Decimal("1.6000"),
+            signal_payload={"candidate_trace": {"selected_side": "no", "yes": {"reason": "below_min_edge"}}},
+            updated_at=now - timedelta(minutes=3),
+        ),
+        SimpleNamespace(
+            trade_ticket_id="ticket-blocked",
+            market_ticker="KXHIGHCHI-26MAY01-T68",
+            side="yes",
+            yes_price_dollars=Decimal("0.4500"),
+            count_fp=Decimal("4.00"),
+            status="blocked",
+            risk_status="blocked",
+            risk_reasons=["Book effectively broken."],
+            approved_notional_dollars=None,
+            signal_payload=None,
+            updated_at=now - timedelta(minutes=4),
+        ),
+        SimpleNamespace(
+            trade_ticket_id="ticket-proposed",
+            market_ticker="KXHIGHTNY-26MAY01-T75",
+            side="yes",
+            yes_price_dollars=Decimal("0.4000"),
+            count_fp=Decimal("12.50"),
+            status="proposed",
+            risk_status="review",
+            risk_reasons=[],
+            approved_notional_dollars=None,
+            signal_payload=None,
+            updated_at=now - timedelta(minutes=5),
+        ),
     ]
+    order_rows = [
+        SimpleNamespace(
+            order_id="order-orphan",
+            trade_ticket_id=None,
+            market_ticker="KXHIGHTATL-26MAY01-T67",
+            side="no",
+            yes_price_dollars=Decimal("0.2500"),
+            count_fp=Decimal("3.00"),
+            status="executed",
+            risk_status=None,
+            risk_reasons=None,
+            approved_notional_dollars=None,
+            created_at=now,
+            updated_at=now,
+        ),
+        SimpleNamespace(
+            order_id="order-linked",
+            trade_ticket_id="ticket-executed",
+            market_ticker="KXHIGHTHOU-26MAY01-T70",
+            side="no",
+            yes_price_dollars=Decimal("0.2000"),
+            count_fp=Decimal("2.00"),
+            status="executed",
+            risk_status="approved",
+            risk_reasons=[],
+            approved_notional_dollars=Decimal("1.6000"),
+            created_at=now - timedelta(minutes=1),
+            updated_at=now - timedelta(minutes=1),
+        ),
+        SimpleNamespace(
+            order_id="order-backfilled",
+            trade_ticket_id=None,
+            market_ticker="KXHIGHNY-26APR27-T69",
+            side="no",
+            yes_price_dollars=Decimal("0.1500"),
+            count_fp=Decimal("1.00"),
+            status="executed",
+            risk_status=None,
+            risk_reasons=None,
+            approved_notional_dollars=None,
+            created_at=now - timedelta(days=4),
+            updated_at=now + timedelta(hours=1),
+        ),
+    ]
+    fill_rows = [
+        SimpleNamespace(
+            order_id="order-linked",
+            trade_ticket_id="ticket-executed",
+            market_ticker="KXHIGHTHOU-26MAY01-T70",
+            side="no",
+            yes_price_dollars=Decimal("0.2000"),
+            count_fp=Decimal("2.00"),
+            risk_status="approved",
+            risk_reasons=[],
+            approved_notional_dollars=Decimal("1.6000"),
+            created_at=now - timedelta(minutes=2),
+            updated_at=now - timedelta(minutes=2),
+        ),
+    ]
+    session = _SequenceSession([ticket_rows, order_rows, fill_rows])
+
+    views = await control_room_module._recent_trading_activity_views(session, kalshi_env="demo")
+
+    assert [item["event_type"] for item in views] == ["order", "order", "fill", "ticket", "ticket", "ticket", "order"]
+    assert [item["market_ticker"] for item in views[:3]] == [
+        "KXHIGHTATL-26MAY01-T67",
+        "KXHIGHTHOU-26MAY01-T70",
+        "KXHIGHTHOU-26MAY01-T70",
+    ]
+    assert views[0]["trade_ticket_id"] is None
+    assert views[0]["order_id"] == "order-orphan"
+    assert views[0]["risk_status"] is None
+    assert views[0]["notional_dollars"] == "2.2500"
+    assert views[1]["risk_status"] == "approved"
+    assert views[1]["notional_dollars"] == "1.6000"
+    assert views[2]["event_label"] == "Fill"
+    assert views[2]["risk_status"] == "approved"
+    assert views[3]["status"] == "executed"
+    assert views[3]["status_tone"] == "good"
+    assert views[3]["approved_notional_dollars"] == "1.6000"
+    assert views[3]["selected_side"] == "no"
+    assert views[3]["skipped_side"] == "yes"
+    assert views[3]["skipped_side_reason"] == "below_min_edge"
+    assert views[4]["status"] == "blocked"
+    assert views[4]["risk_reasons"] == ["Book effectively broken."]
+    assert views[5]["status"] == "proposed"
+    assert views[6]["market_ticker"] == "KXHIGHNY-26APR27-T69"
+    assert views[6]["updated_at"] == (now - timedelta(days=4)).isoformat()
 
 
 @pytest.mark.asyncio
@@ -759,10 +830,12 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     )
     monkeypatch.setattr(
         control_room_module,
-        "_recent_trade_proposal_views",
+        "_recent_trading_activity_views",
         AsyncMock(
             return_value=[
                 {
+                    "event_type": "ticket",
+                    "event_label": "Ticket",
                     "market_ticker": "KXHIGHCHI-26APR17-T79",
                     "side": "yes",
                     "side_tone": "good",
@@ -774,6 +847,7 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
                     "risk_status_tone": "bad",
                     "risk_reasons": ["Book effectively broken."],
                     "approved_notional_dollars": None,
+                    "notional_dollars": None,
                     "updated_at": now.isoformat(),
                 }
             ]
@@ -809,7 +883,9 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert "Legacy" in payload["positions"][1]["position_badges"]
     assert payload["positions"][1]["entry_lot_count"] == 2
     assert payload["positions_summary"]["capital_buckets"]["risky_limit_display"] == "$75.00"
+    assert payload["recent_trading_activity"][0]["event_type"] == "ticket"
     assert payload["recent_trade_proposals"][0]["market_ticker"] == "KXHIGHCHI-26APR17-T79"
+    assert payload["recent_trade_proposals"] == payload["recent_trading_activity"]
     assert payload["recent_trade_proposals"][0]["risk_status"] == "blocked"
     assert payload["recent_trade_proposals"][0]["risk_reasons"] == ["Book effectively broken."]
     assert payload["recent_trade_proposals"][0]["updated_at"] == now.isoformat()

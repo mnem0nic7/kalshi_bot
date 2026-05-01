@@ -612,16 +612,84 @@ def _positions_summary(positions: list[Any], position_views: list[dict[str, Any]
 
 def _trade_proposal_tone(status: Any) -> str:
     normalized = str(status or "").strip().lower()
-    if normalized == "approved":
+    if normalized in {"approved", "executed", "filled"}:
         return "good"
-    if normalized == "blocked":
+    if normalized in {"blocked", "rejected", "rejected_400", "failed"}:
         return "bad"
-    if normalized == "review":
+    if normalized in {"review", "canceled", "cancelled"}:
         return "warning"
     return "neutral"
 
 
-async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: int = RECENT_TRADE_PROPOSAL_LIMIT) -> list[dict[str, Any]]:
+def _side_cost_notional(side: Any, yes_price: Decimal | None, count: Decimal | None) -> Decimal | None:
+    if yes_price is None or count is None:
+        return None
+    normalized_side = str(side or "").strip().lower()
+    if normalized_side == "yes":
+        return (yes_price * count).quantize(Decimal("0.0001"))
+    if normalized_side == "no":
+        return ((Decimal("1.0000") - yes_price) * count).quantize(Decimal("0.0001"))
+    return None
+
+
+def _trading_activity_row(
+    *,
+    event_type: str,
+    event_label: str,
+    market_ticker: Any,
+    side: Any,
+    yes_price_dollars: Any,
+    count_fp: Any,
+    status: Any,
+    updated_at: Any,
+    risk_status: Any = None,
+    risk_reasons: Any = None,
+    approved_notional_dollars: Any = None,
+    signal_payload: Any = None,
+    trade_ticket_id: Any = None,
+    order_id: Any = None,
+) -> dict[str, Any]:
+    yes_price = _decimal_or_none(yes_price_dollars) or Decimal("0")
+    count = _decimal_or_none(count_fp) or Decimal("0")
+    approved_notional = _decimal_or_none(approved_notional_dollars)
+    side_text = str(side or "")
+    status_text = str(status or "")
+    risk_status_text = str(risk_status or "") if risk_status is not None else None
+    cleaned_reasons = [str(reason) for reason in (risk_reasons or []) if str(reason or "").strip()]
+    payload = signal_payload if isinstance(signal_payload, dict) else {}
+    candidate_trace = payload.get("candidate_trace") if isinstance(payload.get("candidate_trace"), dict) else {}
+    selected_side = str(candidate_trace.get("selected_side") or "").lower() or None
+    skipped_side = "no" if candidate_trace and selected_side == "yes" else "yes" if candidate_trace and selected_side == "no" else None
+    skipped_candidate = _candidate_from_trace(candidate_trace, skipped_side)
+    side_notional = _side_cost_notional(side_text, yes_price, count)
+    notional = approved_notional if event_type == "ticket" and approved_notional is not None else side_notional
+    return {
+        "event_type": event_type,
+        "event_label": event_label,
+        "market_ticker": str(market_ticker or ""),
+        "side": side_text,
+        "selected_side": selected_side,
+        "skipped_side": skipped_side,
+        "skipped_side_reason": skipped_candidate.get("reason"),
+        "candidate_trace": candidate_trace,
+        "side_tone": "good" if side_text == "yes" else "warning" if side_text == "no" else "neutral",
+        "yes_price_dollars": str(yes_price.quantize(Decimal("0.0001"))),
+        "count_fp": str(count.quantize(Decimal("0.01"))),
+        "status": status_text,
+        "status_tone": _trade_proposal_tone(status_text),
+        "risk_status": risk_status_text,
+        "risk_status_tone": _trade_proposal_tone(risk_status_text),
+        "risk_reasons": cleaned_reasons,
+        "approved_notional_dollars": str(approved_notional.quantize(Decimal("0.0001"))) if approved_notional is not None else None,
+        "notional_dollars": str(notional.quantize(Decimal("0.0001"))) if notional is not None else None,
+        "trade_ticket_id": str(trade_ticket_id) if trade_ticket_id else None,
+        "order_id": str(order_id) if order_id else None,
+        "updated_at": _iso_or_none(updated_at),
+        "_sort_at": updated_at,
+    }
+
+
+async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit: int = RECENT_TRADE_PROPOSAL_LIMIT) -> list[dict[str, Any]]:
     latest_signal = (
         select(
             Signal.room_id.label("room_id"),
@@ -642,8 +710,10 @@ async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: 
         )
         .subquery()
     )
-    result = await session.execute(
+    query_limit = max(limit * 3, limit)
+    ticket_result = await session.execute(
         select(
+            TradeTicketRecord.id.label("trade_ticket_id"),
             TradeTicketRecord.market_ticker.label("market_ticker"),
             TradeTicketRecord.side.label("side"),
             TradeTicketRecord.yes_price_dollars.label("yes_price_dollars"),
@@ -667,47 +737,121 @@ async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: 
         )
         .where(
             Room.kalshi_env == kalshi_env,
-            TradeTicketRecord.status == "proposed",
         )
         .order_by(TradeTicketRecord.updated_at.desc())
-        .limit(limit)
+        .limit(query_limit)
     )
-    rows = []
-    for row in result.all():
-        yes_price = _decimal_or_zero(row.yes_price_dollars).quantize(Decimal("0.0001"))
-        count = _decimal_or_zero(row.count_fp).quantize(Decimal("0.01"))
-        approved_notional = _decimal_or_none(row.approved_notional_dollars)
-        side = str(row.side or "")
-        status = str(row.status or "")
-        risk_status = str(row.risk_status or "") if row.risk_status is not None else None
-        risk_reasons = [str(reason) for reason in (row.risk_reasons or []) if str(reason or "").strip()]
-        raw_signal_payload = getattr(row, "signal_payload", None)
-        signal_payload = raw_signal_payload if isinstance(raw_signal_payload, dict) else {}
-        candidate_trace = signal_payload.get("candidate_trace") if isinstance(signal_payload.get("candidate_trace"), dict) else {}
-        selected_side = str(candidate_trace.get("selected_side") or side or "").lower() or None
-        skipped_side = "no" if candidate_trace and selected_side == "yes" else "yes" if candidate_trace and selected_side == "no" else None
-        skipped_candidate = _candidate_from_trace(candidate_trace, skipped_side)
-        rows.append(
-            {
-                "market_ticker": str(row.market_ticker or ""),
-                "side": side,
-                "selected_side": selected_side,
-                "skipped_side": skipped_side,
-                "skipped_side_reason": skipped_candidate.get("reason"),
-                "candidate_trace": candidate_trace,
-                "side_tone": "good" if side == "yes" else "warning" if side == "no" else "neutral",
-                "yes_price_dollars": str(yes_price),
-                "count_fp": str(count),
-                "status": status,
-                "status_tone": _trade_proposal_tone(status),
-                "risk_status": risk_status,
-                "risk_status_tone": _trade_proposal_tone(risk_status),
-                "risk_reasons": risk_reasons,
-                "approved_notional_dollars": str(approved_notional.quantize(Decimal("0.0001"))) if approved_notional is not None else None,
-                "updated_at": _iso_or_none(row.updated_at),
-            }
+    order_result = await session.execute(
+        select(
+            OrderRecord.id.label("order_id"),
+            OrderRecord.trade_ticket_id.label("trade_ticket_id"),
+            OrderRecord.market_ticker.label("market_ticker"),
+            OrderRecord.side.label("side"),
+            OrderRecord.yes_price_dollars.label("yes_price_dollars"),
+            OrderRecord.count_fp.label("count_fp"),
+            OrderRecord.status.label("status"),
+            OrderRecord.created_at.label("created_at"),
+            OrderRecord.updated_at.label("updated_at"),
+            latest_risk.c.risk_status,
+            latest_risk.c.risk_reasons,
+            latest_risk.c.approved_notional_dollars,
         )
-    return rows
+        .select_from(OrderRecord)
+        .outerjoin(
+            latest_risk,
+            (latest_risk.c.ticket_id == OrderRecord.trade_ticket_id) & (latest_risk.c.rn == 1),
+        )
+        .where(OrderRecord.kalshi_env == kalshi_env)
+        .order_by(OrderRecord.created_at.desc())
+        .limit(query_limit)
+    )
+    fill_result = await session.execute(
+        select(
+            FillRecord.order_id.label("order_id"),
+            OrderRecord.trade_ticket_id.label("trade_ticket_id"),
+            FillRecord.market_ticker.label("market_ticker"),
+            FillRecord.side.label("side"),
+            FillRecord.yes_price_dollars.label("yes_price_dollars"),
+            FillRecord.count_fp.label("count_fp"),
+            FillRecord.created_at.label("created_at"),
+            FillRecord.updated_at.label("updated_at"),
+            latest_risk.c.risk_status,
+            latest_risk.c.risk_reasons,
+            latest_risk.c.approved_notional_dollars,
+        )
+        .select_from(FillRecord)
+        .outerjoin(OrderRecord, FillRecord.order_id == OrderRecord.id)
+        .outerjoin(
+            latest_risk,
+            (latest_risk.c.ticket_id == OrderRecord.trade_ticket_id) & (latest_risk.c.rn == 1),
+        )
+        .where(FillRecord.kalshi_env == kalshi_env)
+        .order_by(FillRecord.created_at.desc())
+        .limit(query_limit)
+    )
+    rows = [
+        _trading_activity_row(
+            event_type="ticket",
+            event_label="Ticket",
+            market_ticker=row.market_ticker,
+            side=row.side,
+            yes_price_dollars=row.yes_price_dollars,
+            count_fp=row.count_fp,
+            status=row.status,
+            updated_at=row.updated_at,
+            risk_status=row.risk_status,
+            risk_reasons=row.risk_reasons,
+            approved_notional_dollars=row.approved_notional_dollars,
+            signal_payload=getattr(row, "signal_payload", None),
+            trade_ticket_id=row.trade_ticket_id,
+        )
+        for row in ticket_result.all()
+    ]
+    rows.extend(
+        _trading_activity_row(
+            event_type="order",
+            event_label="Order",
+            market_ticker=row.market_ticker,
+            side=row.side,
+            yes_price_dollars=row.yes_price_dollars,
+            count_fp=row.count_fp,
+            status=row.status,
+            updated_at=getattr(row, "created_at", None) or row.updated_at,
+            risk_status=row.risk_status,
+            risk_reasons=row.risk_reasons,
+            approved_notional_dollars=row.approved_notional_dollars,
+            trade_ticket_id=row.trade_ticket_id,
+            order_id=row.order_id,
+        )
+        for row in order_result.all()
+    )
+    rows.extend(
+        _trading_activity_row(
+            event_type="fill",
+            event_label="Fill",
+            market_ticker=row.market_ticker,
+            side=row.side,
+            yes_price_dollars=row.yes_price_dollars,
+            count_fp=row.count_fp,
+            status="filled",
+            updated_at=getattr(row, "created_at", None) or row.updated_at,
+            risk_status=row.risk_status,
+            risk_reasons=row.risk_reasons,
+            approved_notional_dollars=row.approved_notional_dollars,
+            trade_ticket_id=row.trade_ticket_id,
+            order_id=row.order_id,
+        )
+        for row in fill_result.all()
+    )
+    rows.sort(key=lambda item: item.get("_sort_at") or datetime.min.replace(tzinfo=UTC), reverse=True)
+    trimmed = rows[:limit]
+    for item in trimmed:
+        item.pop("_sort_at", None)
+    return trimmed
+
+
+async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: int = RECENT_TRADE_PROPOSAL_LIMIT) -> list[dict[str, Any]]:
+    return await _recent_trading_activity_views(session, kalshi_env=kalshi_env, limit=limit)
 
 
 def _series_from_market_ticker(market_ticker: str | None) -> str:
@@ -1927,7 +2071,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         win_rate_data = await repo.get_fill_win_rate_30d(kalshi_env=kalshi_env)
         session_fill_pnl = await repo.get_session_fill_pnl_summary(kalshi_env=kalshi_env)
         broken_book_data = await repo.get_broken_book_rate_30d(kalshi_env=kalshi_env)
-        recent_trade_proposals = await _recent_trade_proposal_views(session, kalshi_env=kalshi_env)
+        recent_trading_activity = await _recent_trading_activity_views(session, kalshi_env=kalshi_env)
         fallback_capital = thresholds.risk_max_position_notional_dollars
         if fallback_capital is None:
             fallback_capital = 0
@@ -2012,7 +2156,8 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         "broken_book_counts": f"{broken_book_data.get('broken_count', 0)} / {broken_book_data.get('total_count', 0)} rooms (30d)",
         "positions_summary": positions_summary,
         "positions": position_views,
-        "recent_trade_proposals": recent_trade_proposals,
+        "recent_trading_activity": recent_trading_activity,
+        "recent_trade_proposals": recent_trading_activity,
         "alerts": [_ops_event_view(e) for e in alerts],
         "active_rooms": [_active_room_view(r) for r in active_rooms],
         "runtime_health": runtime_health,

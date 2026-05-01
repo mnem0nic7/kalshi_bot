@@ -270,24 +270,25 @@
 
     </div>
 
-    {% set recent_trade_proposals = env_data.recent_trade_proposals or [] %}
+    {% set recent_trade_proposals = env_data.recent_trading_activity or env_data.recent_trade_proposals or [] %}
     <article class="dash-card dash-card-proposals" data-testid="recent-trade-proposals">
       <div class="dash-card-header">
         <div class="dash-card-title-block">
-          <h2>Recent Trade Proposals</h2>
-          <span class="muted-label">Latest proposed tickets and their risk verdicts</span>
+          <h2>Recent Trading Activity</h2>
+          <span class="muted-label">Latest tickets, orders, fills, and risk verdicts</span>
         </div>
-        <span class="muted-label trade-proposals-count-label">{{ recent_trade_proposals | length }} ticket{{ "s" if recent_trade_proposals | length != 1 }}</span>
+        <span class="muted-label trade-proposals-count-label">{{ recent_trade_proposals | length }} event{{ "s" if recent_trade_proposals | length != 1 }}</span>
       </div>
       {% if recent_trade_proposals %}
       <div class="table-wrap">
         <table class="positions-table">
           <thead>
-            <tr><th>Market</th><th>Side</th><th>Yes Price</th><th>Contracts</th><th>Status</th><th>Risk</th><th>Approved Notional</th></tr>
+            <tr><th>Event</th><th>Market</th><th>Side</th><th>Yes Price</th><th>Contracts</th><th>Status</th><th>Risk</th><th>Notional</th></tr>
           </thead>
           <tbody>
             {% for item in recent_trade_proposals %}
             <tr>
+              <td>{{ item.event_label or item.event_type | title or "Event" }}</td>
               <td class="mono">
                 <div class="proposal-market-cell">
                   <span>{{ item.market_ticker }}</span>
@@ -315,14 +316,14 @@
                   {% endif %}
                 </div>
               </td>
-              <td class="mono">{{ item.approved_notional_dollars or "—" }}</td>
+              <td class="mono">{{ item.notional_dollars or item.approved_notional_dollars or "—" }}</td>
             </tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
       {% else %}
-      <p class="empty-state">No recent proposed tickets.</p>
+      <p class="empty-state">No recent trading activity.</p>
       {% endif %}
     </article>
   </section>
