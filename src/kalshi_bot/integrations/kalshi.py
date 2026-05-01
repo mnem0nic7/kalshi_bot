@@ -146,7 +146,11 @@ class KalshiClient:
         backoff = 5.0
         await self._rate_limiter.acquire()
         for attempt in range(max_retries + 1):
-            headers = self._auth_headers(method, path, write=write)
+            headers = (
+                self._auth_headers(method, path, write=write)
+                if write or self.read_credentials is not None
+                else {}
+            )
             response = await self.client.request(
                 method=method,
                 url=f"{self.settings.kalshi_rest_base_url}{path}",
@@ -174,6 +178,9 @@ class KalshiClient:
     async def get_market(self, ticker: str) -> dict[str, Any]:
         return await self._request("GET", f"/markets/{ticker}")
 
+    async def list_series(self, **params: Any) -> dict[str, Any]:
+        return await self._request("GET", "/series", params=params)
+
     async def list_markets(self, **params: Any) -> dict[str, Any]:
         return await self._request("GET", "/markets", params=params)
 
@@ -187,6 +194,18 @@ class KalshiClient:
         **params: Any,
     ) -> dict[str, Any]:
         return await self._request("GET", f"/series/{series_ticker}/markets/{market_ticker}/candlesticks", params=params)
+
+    async def get_historical_market_candlesticks(
+        self,
+        series_ticker: str,
+        market_ticker: str,
+        **params: Any,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            f"/historical/markets/{market_ticker}/candlesticks",
+            params=params,
+        )
 
     async def get_balance(self) -> dict[str, Any]:
         return await self._request("GET", "/portfolio/balance")

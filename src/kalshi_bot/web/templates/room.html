@@ -205,18 +205,25 @@
     <section class="panel">
       <div class="panel-heading">
         <div>
-          <p class="eyebrow">Weather</p>
-          <h2>Threshold Lens</h2>
+          <p class="eyebrow" id="domain-lens-eyebrow">{{ "Crypto" if snapshot.analytics.crypto.market_domain == "crypto" else "Weather" }}</p>
+          <h2 id="domain-lens-title">{{ "Market Lens" if snapshot.analytics.crypto.market_domain == "crypto" else "Threshold Lens" }}</h2>
         </div>
       </div>
       <div class="chart-shell">
-        <svg id="weather-chart" class="analytics-chart" viewBox="0 0 360 220" aria-label="Weather chart"></svg>
+        <svg id="weather-chart" class="analytics-chart" viewBox="0 0 360 220" aria-label="Domain chart"></svg>
       </div>
       <div id="weather-metrics" class="metric-grid">
+        {% if snapshot.analytics.crypto.market_domain == "crypto" %}
+        <div class="metric-card"><span class="metric-label">Asset</span><strong>{{ snapshot.analytics.crypto.asset_symbol or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Target</span><strong>{{ snapshot.analytics.crypto.target_price_dollars or "n/a" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Model Side</span><strong>{{ snapshot.analytics.crypto.recommended_side or "stand down" }}</strong></div>
+        <div class="metric-card"><span class="metric-label">Spread</span><strong>{{ snapshot.analytics.crypto.spread_bps if snapshot.analytics.crypto.spread_bps is not none else "n/a" }}</strong></div>
+        {% else %}
         <div class="metric-card"><span class="metric-label">Threshold</span><strong>{{ snapshot.analytics.weather.threshold_f or "n/a" }}</strong></div>
         <div class="metric-card"><span class="metric-label">Forecast High</span><strong>{{ snapshot.analytics.weather.forecast_high_f or "n/a" }}</strong></div>
         <div class="metric-card"><span class="metric-label">Current Temp</span><strong>{{ snapshot.analytics.weather.current_temp_f or "n/a" }}</strong></div>
         <div class="metric-card"><span class="metric-label">Station</span><strong>{{ snapshot.analytics.weather.station_id or "n/a" }}</strong></div>
+        {% endif %}
       </div>
     </section>
 

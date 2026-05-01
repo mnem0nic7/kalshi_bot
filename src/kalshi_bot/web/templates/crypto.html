@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block extra_head %}
+  <link rel="stylesheet" href="/static/crypto.css" />
+{% endblock %}
+{% block main_class %}shell-main-wide crypto-main{% endblock %}
+{% block content %}
+<script id="crypto-bootstrap" type="application/json">{{ crypto_bootstrap|tojson }}</script>
+
+<section class="crypto-toolbar" aria-label="Crypto controls">
+  <div>
+    <p class="crypto-eyebrow">15 Minute Crypto</p>
+    <h1>Crypto Markets</h1>
+  </div>
+  <div class="crypto-actions">
+    <select id="crypto-sort" aria-label="Sort crypto markets">
+      <option value="trending">Trending</option>
+      <option value="closing">Closing</option>
+      <option value="volume">Volume</option>
+      <option value="asset">Asset</option>
+    </select>
+    <button id="crypto-refresh" type="button" title="Refresh markets">Refresh</button>
+  </div>
+</section>
+
+<section class="crypto-status-strip" id="crypto-status-strip" aria-label="Crypto status"></section>
+<section class="crypto-grid" id="crypto-grid" aria-label="15 minute crypto markets"></section>
+{% endblock %}
+
+{% block extra_scripts %}
+  <script src="/static/crypto.js"></script>
+{% endblock %}

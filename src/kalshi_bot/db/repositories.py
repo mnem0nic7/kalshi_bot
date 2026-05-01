@@ -32,6 +32,9 @@ from kalshi_bot.db.models import (
     Artifact,
     Checkpoint,
     ClimatologyPriorRecord,
+    CryptoMarketCandlestickRecord,
+    CryptoMarketSnapshotRecord,
+    CryptoModelArtifactRecord,
     DecisionTraceRecord,
     FillRecord,
     ForecastSnapshotRecord,
@@ -617,6 +620,278 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             .order_by(MarketPriceHistory.observed_at.asc())
         )
         return list((await self.session.execute(stmt)).scalars())
+
+    async def record_crypto_market_snapshot(
+        self,
+        *,
+        series_ticker: str,
+        market_ticker: str,
+        asset_symbol: str,
+        frequency: str = "15m",
+        kalshi_env: str | None = None,
+        event_ticker: str | None = None,
+        title: str | None = None,
+        status: str | None = None,
+        open_time: datetime | None = None,
+        close_time: datetime | None = None,
+        expected_expiration_time: datetime | None = None,
+        target_price_dollars: Decimal | None = None,
+        yes_bid_dollars: Decimal | None = None,
+        yes_ask_dollars: Decimal | None = None,
+        no_bid_dollars: Decimal | None = None,
+        no_ask_dollars: Decimal | None = None,
+        last_price_dollars: Decimal | None = None,
+        volume: int | None = None,
+        open_interest: int | None = None,
+        settlement_result: str | None = None,
+        observed_at: datetime | None = None,
+        source_kind: str = "live",
+        payload: dict[str, Any] | None = None,
+    ) -> CryptoMarketSnapshotRecord:
+        now = datetime.now(UTC)
+        observed = observed_at or now
+        env = self._resolved_kalshi_env(kalshi_env)
+        insert_values = {
+            "id": str(uuid4()),
+            "kalshi_env": env,
+            "series_ticker": series_ticker,
+            "market_ticker": market_ticker,
+            "event_ticker": event_ticker,
+            "asset_symbol": asset_symbol,
+            "frequency": frequency,
+            "title": title,
+            "status": status,
+            "open_time": open_time,
+            "close_time": close_time,
+            "expected_expiration_time": expected_expiration_time,
+            "target_price_dollars": target_price_dollars,
+            "yes_bid_dollars": yes_bid_dollars,
+            "yes_ask_dollars": yes_ask_dollars,
+            "no_bid_dollars": no_bid_dollars,
+            "no_ask_dollars": no_ask_dollars,
+            "last_price_dollars": last_price_dollars,
+            "volume": volume,
+            "open_interest": open_interest,
+            "settlement_result": settlement_result,
+            "observed_at": observed,
+            "source_kind": source_kind,
+            "payload": payload or {},
+            "created_at": now,
+            "updated_at": now,
+        }
+        update_values = {key: value for key, value in insert_values.items() if key not in {"id", "created_at"}}
+        dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
+        if dialect_name == "postgresql":
+            stmt = pg_insert(CryptoMarketSnapshotRecord).values(**insert_values)
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(CryptoMarketSnapshotRecord).values(**insert_values)
+        else:
+            record = CryptoMarketSnapshotRecord(**insert_values)
+            self.session.add(record)
+            await self.session.flush()
+            return record
+
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoMarketSnapshotRecord.kalshi_env,
+                    CryptoMarketSnapshotRecord.market_ticker,
+                    CryptoMarketSnapshotRecord.observed_at,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+        result = (
+            await self.session.execute(
+                select(CryptoMarketSnapshotRecord).where(
+                    CryptoMarketSnapshotRecord.kalshi_env == env,
+                    CryptoMarketSnapshotRecord.market_ticker == market_ticker,
+                    CryptoMarketSnapshotRecord.observed_at == observed,
+                )
+            )
+        ).scalar_one()
+        return result
+
+    async def list_crypto_market_snapshots(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        status: str | None = None,
+        since: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[CryptoMarketSnapshotRecord]:
+        stmt = select(CryptoMarketSnapshotRecord).where(
+            CryptoMarketSnapshotRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+        )
+        if frequency is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
+        if status is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.status == status)
+        if since is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
+        stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def list_latest_crypto_market_snapshots(
+        self,
+        *,
+        frequency: str = "15m",
+        kalshi_env: str | None = None,
+        limit: int = 200,
+    ) -> list[CryptoMarketSnapshotRecord]:
+        rows = await self.list_crypto_market_snapshots(
+            frequency=frequency,
+            kalshi_env=kalshi_env,
+            limit=max(limit * 6, limit),
+        )
+        latest: list[CryptoMarketSnapshotRecord] = []
+        seen: set[str] = set()
+        for row in rows:
+            if row.market_ticker in seen:
+                continue
+            seen.add(row.market_ticker)
+            latest.append(row)
+            if len(latest) >= limit:
+                break
+        return latest
+
+    async def get_latest_crypto_market_snapshot(
+        self,
+        market_ticker: str,
+        *,
+        kalshi_env: str | None = None,
+    ) -> CryptoMarketSnapshotRecord | None:
+        stmt = (
+            select(CryptoMarketSnapshotRecord)
+            .where(
+                CryptoMarketSnapshotRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+                CryptoMarketSnapshotRecord.market_ticker == market_ticker,
+            )
+            .order_by(CryptoMarketSnapshotRecord.observed_at.desc(), CryptoMarketSnapshotRecord.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def upsert_crypto_market_candlestick(
+        self,
+        *,
+        series_ticker: str,
+        market_ticker: str,
+        asset_symbol: str,
+        end_period_ts: datetime,
+        frequency: str = "15m",
+        kalshi_env: str | None = None,
+        period_interval: int = 1,
+        open_dollars: Decimal | None = None,
+        high_dollars: Decimal | None = None,
+        low_dollars: Decimal | None = None,
+        close_dollars: Decimal | None = None,
+        volume: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> CryptoMarketCandlestickRecord:
+        now = datetime.now(UTC)
+        env = self._resolved_kalshi_env(kalshi_env)
+        insert_values = {
+            "id": str(uuid4()),
+            "kalshi_env": env,
+            "series_ticker": series_ticker,
+            "market_ticker": market_ticker,
+            "asset_symbol": asset_symbol,
+            "frequency": frequency,
+            "period_interval": period_interval,
+            "end_period_ts": end_period_ts,
+            "open_dollars": open_dollars,
+            "high_dollars": high_dollars,
+            "low_dollars": low_dollars,
+            "close_dollars": close_dollars,
+            "volume": volume,
+            "payload": payload or {},
+            "created_at": now,
+            "updated_at": now,
+        }
+        update_values = {key: value for key, value in insert_values.items() if key not in {"id", "created_at"}}
+        dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
+        if dialect_name == "postgresql":
+            stmt = pg_insert(CryptoMarketCandlestickRecord).values(**insert_values)
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(CryptoMarketCandlestickRecord).values(**insert_values)
+        else:
+            record = CryptoMarketCandlestickRecord(**insert_values)
+            self.session.add(record)
+            await self.session.flush()
+            return record
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoMarketCandlestickRecord.kalshi_env,
+                    CryptoMarketCandlestickRecord.market_ticker,
+                    CryptoMarketCandlestickRecord.period_interval,
+                    CryptoMarketCandlestickRecord.end_period_ts,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+        result = (
+            await self.session.execute(
+                select(CryptoMarketCandlestickRecord).where(
+                    CryptoMarketCandlestickRecord.kalshi_env == env,
+                    CryptoMarketCandlestickRecord.market_ticker == market_ticker,
+                    CryptoMarketCandlestickRecord.period_interval == period_interval,
+                    CryptoMarketCandlestickRecord.end_period_ts == end_period_ts,
+                )
+            )
+        ).scalar_one()
+        return result
+
+    async def record_crypto_model_artifact(
+        self,
+        *,
+        frequency: str,
+        artifact_type: str,
+        version: str,
+        status: str,
+        sample_count: int,
+        metrics: dict[str, Any],
+        payload: dict[str, Any],
+        kalshi_env: str | None = None,
+        trained_at: datetime | None = None,
+    ) -> CryptoModelArtifactRecord:
+        record = CryptoModelArtifactRecord(
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            frequency=frequency,
+            artifact_type=artifact_type,
+            version=version,
+            status=status,
+            trained_at=trained_at,
+            sample_count=sample_count,
+            metrics=metrics,
+            payload=payload,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def get_latest_crypto_model_artifact(
+        self,
+        *,
+        frequency: str = "15m",
+        artifact_type: str,
+        kalshi_env: str | None = None,
+    ) -> CryptoModelArtifactRecord | None:
+        stmt = (
+            select(CryptoModelArtifactRecord)
+            .where(
+                CryptoModelArtifactRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+                CryptoModelArtifactRecord.frequency == frequency,
+                CryptoModelArtifactRecord.artifact_type == artifact_type,
+            )
+            .order_by(CryptoModelArtifactRecord.created_at.desc(), CryptoModelArtifactRecord.id.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def get_momentum_shadow_metrics(
         self,

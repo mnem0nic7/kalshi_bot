@@ -81,6 +81,11 @@ body {
   color: #f9d77e;
 }
 
+.header-links a[aria-current="page"] {
+  color: #f9d77e;
+  font-weight: 700;
+}
+
 .header-auth {
   display: flex;
   align-items: center;

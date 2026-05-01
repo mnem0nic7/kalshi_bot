@@ -543,8 +543,41 @@ async def _run_run_room_command(
     session: AsyncSession,
 ) -> int:
     await session.commit()
-    await container.supervisor.run_room(args.room_id, reason=args.reason)
+    await container.run_room(args.room_id, reason=args.reason)
     print(f"room {args.room_id} completed")
+    return 0
+
+
+async def _run_crypto_history_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.crypto_history_command == "bootstrap":
+        result = await container.crypto_history_service.bootstrap(days=args.days, frequency=args.frequency)
+    elif args.crypto_history_command == "daily":
+        result = await container.crypto_history_service.daily(frequency=args.frequency)
+    else:
+        raise ValueError(f"unknown crypto-history command {args.crypto_history_command}")
+    print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
+async def _run_crypto_model_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.crypto_model_command != "train":
+        raise ValueError(f"unknown crypto-model command {args.crypto_model_command}")
+    result = await container.crypto_forecast_service.train(frequency=args.frequency)
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("status") == "trained" else 1
+
+
+async def _run_crypto_replay_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.crypto_replay_command != "gate":
+        raise ValueError(f"unknown crypto-replay command {args.crypto_replay_command}")
+    result = await container.crypto_replay_service.gate(frequency=args.frequency)
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("status") == "passed" else 1
+
+
+async def _run_crypto_status_command(container: AppContainer) -> int:
+    result = await container.crypto_market_service.status(frequency="15m")
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 
@@ -793,6 +826,18 @@ async def _run_cli(args: argparse.Namespace) -> int:
             )
             print(json.dumps(result, indent=2))
             return 0
+
+        if args.command == "crypto-history":
+            return await _run_crypto_history_command(args, container)
+
+        if args.command == "crypto-model":
+            return await _run_crypto_model_command(args, container)
+
+        if args.command == "crypto-replay":
+            return await _run_crypto_replay_command(args, container)
+
+        if args.command == "crypto-status":
+            return await _run_crypto_status_command(container)
 
         if args.command == "research-refresh":
             dossier = await container.research_coordinator.refresh_market_dossier(
@@ -1633,6 +1678,26 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_trigger_group = daemon.add_mutually_exclusive_group()
     daemon_trigger_group.add_argument("--auto-trigger", action="store_true")
     daemon_trigger_group.add_argument("--no-auto-trigger", action="store_true")
+
+    crypto_history = subparsers.add_parser("crypto-history")
+    crypto_history_subparsers = crypto_history.add_subparsers(dest="crypto_history_command", required=True)
+    crypto_history_bootstrap = crypto_history_subparsers.add_parser("bootstrap")
+    crypto_history_bootstrap.add_argument("--days", type=int, default=180)
+    crypto_history_bootstrap.add_argument("--frequency", default="15m")
+    crypto_history_daily = crypto_history_subparsers.add_parser("daily")
+    crypto_history_daily.add_argument("--frequency", default="15m")
+
+    crypto_model = subparsers.add_parser("crypto-model")
+    crypto_model_subparsers = crypto_model.add_subparsers(dest="crypto_model_command", required=True)
+    crypto_model_train = crypto_model_subparsers.add_parser("train")
+    crypto_model_train.add_argument("--frequency", default="15m")
+
+    crypto_replay = subparsers.add_parser("crypto-replay")
+    crypto_replay_subparsers = crypto_replay.add_subparsers(dest="crypto_replay_command", required=True)
+    crypto_replay_gate = crypto_replay_subparsers.add_parser("gate")
+    crypto_replay_gate.add_argument("--frequency", default="15m")
+
+    subparsers.add_parser("crypto-status")
 
     create_room = subparsers.add_parser("create-room")
     create_room.add_argument("--name", required=True)

@@ -318,6 +318,33 @@ def _weather_summary(research_dossier: dict | None, weather_bundle: dict | None)
     }
 
 
+def _crypto_summary(signal: dict | None, market_snapshot: dict | None) -> dict:
+    market = (market_snapshot or {}).get("market") or {}
+    signal_payload = (signal or {}).get("payload") or {}
+    trace = signal_payload.get("candidate_trace") if isinstance(signal_payload, dict) else {}
+    if (market_snapshot or {}).get("market_domain") != "crypto" and signal_payload.get("market_domain") != "crypto":
+        return {"market_domain": None}
+    return {
+        "market_domain": "crypto",
+        "frequency": market.get("frequency") or signal_payload.get("frequency"),
+        "asset_symbol": market.get("asset_symbol"),
+        "target_price_dollars": market.get("target_price_dollars"),
+        "close_time": market.get("close_time"),
+        "status": market.get("status"),
+        "volume": market.get("volume"),
+        "open_interest": market.get("open_interest"),
+        "spread_bps": market.get("spread_bps"),
+        "mid_yes_dollars": market.get("mid_yes_dollars"),
+        "fair_yes_dollars": (signal or {}).get("fair_yes_dollars"),
+        "recommended_side": signal_payload.get("recommended_side"),
+        "edge_bps": (signal or {}).get("edge_bps"),
+        "confidence": (signal or {}).get("confidence"),
+        "stand_down_reason": signal_payload.get("stand_down_reason"),
+        "model_version": (trace or {}).get("model_version") if isinstance(trace, dict) else None,
+        "features": (trace or {}).get("features") if isinstance(trace, dict) else {},
+    }
+
+
 def _research_quality_summary(research_dossier: dict | None, research_health: dict | None) -> dict:
     quality = (research_dossier or {}).get("quality") or {}
     return {
@@ -468,6 +495,7 @@ async def load_room_snapshot(app_container: AppContainer, room_id: str, *, inclu
         "analytics": {
             "pricing": _pricing_summary(serialized_signal, market_snapshot, serialized_ticket),
             "weather": _weather_summary(research_dossier, weather_bundle),
+            "crypto": _crypto_summary(serialized_signal, market_snapshot),
             "research_quality": _research_quality_summary(research_dossier, serialized_research_health),
             "decision": _decision_summary(
                 serialized_room,

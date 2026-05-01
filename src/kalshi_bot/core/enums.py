@@ -93,6 +93,10 @@ class StandDownReason(StrEnum):
     FORECAST_DELTA_MISSING = "forecast_delta_missing"
     EXTREME_EDGE_DIAGNOSTIC_FAILED = "extreme_edge_diagnostic_failed"
     SELECTED_SIDE_UNMARKETABLE = "selected_side_unmarketable"
+    CRYPTO_DISABLED = "crypto_disabled"
+    CRYPTO_MODEL_UNAVAILABLE = "crypto_model_unavailable"
+    CRYPTO_DATA_INSUFFICIENT = "crypto_data_insufficient"
+    CRYPTO_REPLAY_GATE_NOT_PASSED = "crypto_replay_gate_not_passed"
 
 
 class RiskStatus(StrEnum):
@@ -116,4 +120,5 @@ class StrategyCode(StrEnum):
     DIRECTIONAL = "A"  # Strategy A — directional weather taker
     CLEANUP = "C"  # Strategy C — resolution-lag cleanup
     MONOTONICITY_ARB = "ARB"  # Monotonicity arbitrage scanner
+    CRYPTO_15M = "CRYPTO_15M"  # Kalshi 15-minute crypto microstructure strategy
     UNMANAGED = "UNMANAGED"  # Exchange-side/manual fills with no bot decision linkage

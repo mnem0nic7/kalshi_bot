@@ -404,6 +404,28 @@
   }
 
   function renderWeatherPanel() {
+    const crypto = ((state.snapshot || {}).analytics || {}).crypto || {};
+    const eyebrow = document.getElementById("domain-lens-eyebrow");
+    const title = document.getElementById("domain-lens-title");
+    if (crypto.market_domain === "crypto") {
+      if (eyebrow) eyebrow.textContent = "Crypto";
+      if (title) title.textContent = "Market Lens";
+      renderMetricGrid("weather-metrics", [
+        { label: "Asset", value: crypto.asset_symbol || "n/a" },
+        { label: "Target", value: formatDecimal(crypto.target_price_dollars) },
+        { label: "Model Side", value: crypto.recommended_side || "stand down" },
+        { label: "Spread", value: formatInteger(crypto.spread_bps) },
+      ]);
+      const bars = [
+        { label: "Mid", value: crypto.mid_yes_dollars, display: formatDecimal(crypto.mid_yes_dollars) },
+        { label: "Fair", value: crypto.fair_yes_dollars, display: formatDecimal(crypto.fair_yes_dollars) },
+        { label: "Edge", value: Math.abs(Number(crypto.edge_bps || 0)) / 10000, display: formatInteger(crypto.edge_bps) },
+      ].filter((item) => item.value !== null && item.value !== undefined && item.value !== "");
+      renderSvgBars("weather-chart", bars, "chart-bar-weather", 1, { emptyLabel: "No crypto model output yet" });
+      return;
+    }
+    if (eyebrow) eyebrow.textContent = "Weather";
+    if (title) title.textContent = "Threshold Lens";
     const weather = ((state.snapshot || {}).analytics || {}).weather || {};
     renderMetricGrid("weather-metrics", [
       { label: "Threshold", value: formatInteger(weather.threshold_f) },

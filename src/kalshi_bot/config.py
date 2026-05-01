@@ -129,6 +129,22 @@ class Settings(BaseSettings):
     # Per-strategy dollar-denominated hard-loss cap. Empty = no per-strategy cap.
     # Example env var value: '{"A": 500, "C": 100}' (JSON-parsed by pydantic-settings).
     risk_daily_loss_dollars_by_strategy: dict[str, float] = Field(default_factory=dict)
+
+    crypto_enabled: bool = True
+    crypto_15m_enabled: bool = True
+    crypto_trading_enabled: bool = False
+    crypto_history_lookback_days: int = 180
+    crypto_order_mode: str = "passive_then_taker"
+    crypto_passive_timeout_seconds: int = 5
+    crypto_taker_fallback_close_seconds: int = 90
+    crypto_min_training_samples: int = 250
+    crypto_replay_min_resolved_markets: int = 500
+    crypto_replay_min_trade_candidates: int = 50
+    crypto_replay_min_net_pl_dollars: float = 0.0
+    crypto_replay_max_hard_cap_breaches: int = 0
+    crypto_replay_require_calibration_better_than_mid: bool = True
+    crypto_default_order_count_fp: float = 1.0
+
     stop_loss_threshold_pct: float = 0.10
     stop_loss_profit_protection_threshold_pct: float = 0.15
     stop_loss_reentry_cooldown_seconds: int = 14400

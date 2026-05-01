@@ -15,8 +15,9 @@
       <div class="header-nav">
         <a href="/" class="brand">{{ dashboard_shell.brand_label if dashboard_shell else "Kalshi Bot Control Room" }}</a>
         <nav class="header-links" aria-label="Primary">
-          <a href="/">{% if dashboard_shell and dashboard_shell.mode == "single_site" %}{{ dashboard_shell.active_label }}{% else %}Control Room{% endif %}</a>
-          <a href="/faq">FAQ</a>
+          <a href="/" {% if request.url.path == "/" %}aria-current="page"{% endif %}>Weather</a>
+          <a href="/crypto" {% if request.url.path.startswith("/crypto") %}aria-current="page"{% endif %}>Crypto</a>
+          <a href="/faq" {% if request.url.path == "/faq" %}aria-current="page"{% endif %}>FAQ</a>
         </nav>
       </div>
       <div class="header-meta">

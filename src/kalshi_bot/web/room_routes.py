@@ -53,7 +53,7 @@ def create_room_router(
         payload = await parse_json_model(request, TriggerRequest, default_on_empty=True)
         app_container = container(request)
         schedule_logged_task(
-            app_container.supervisor.run_room(room_id, reason=payload.reason),
+            app_container.run_room(room_id, reason=payload.reason),
             name=f"room_run:{room_id}",
             logger=logger,
         )
@@ -69,7 +69,7 @@ def create_room_router(
             prompt=payload.prompt,
         )
         schedule_logged_task(
-            app_container.supervisor.run_room(result.room_id, reason=payload.reason),
+            app_container.run_room(result.room_id, reason=payload.reason),
             name=f"shadow_room_run:{result.room_id}",
             logger=logger,
         )

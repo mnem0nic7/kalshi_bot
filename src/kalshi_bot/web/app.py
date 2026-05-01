@@ -26,6 +26,7 @@ from kalshi_bot.web.control_room import (
     build_strategies_dashboard,  # noqa: F401 - tests monkeypatch this app-module seam.
     build_control_room_bootstrap,  # noqa: F401 - tests monkeypatch this app-module seam.
 )
+from kalshi_bot.web.crypto_routes import create_crypto_router
 from kalshi_bot.web.learning_routes import create_learning_router
 from kalshi_bot.web.page_routes import SITE_LABELS, create_page_router
 from kalshi_bot.web.research_routes import create_research_router
@@ -285,6 +286,14 @@ def create_app() -> FastAPI:
             dashboard_shell=dashboard_shell,
             build_env_dashboard_func=build_env_dashboard,
             build_strategies_dashboard_func=build_strategies_dashboard,
+        )
+    )
+    app.include_router(
+        create_crypto_router(
+            container=container,
+            templates=templates,
+            template_context=template_context,
+            logger=logger,
         )
     )
     app.include_router(

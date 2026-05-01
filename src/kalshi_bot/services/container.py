@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
@@ -9,6 +10,14 @@ from kalshi_bot.agents.providers import ProviderRouter
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings, get_settings
 from kalshi_bot.core.enums import DeploymentColor
+from kalshi_bot.crypto.services import (
+    CryptoExecutionService,
+    CryptoForecastService,
+    CryptoHistoryService,
+    CryptoMarketService,
+    CryptoReplayService,
+    CryptoWorkflowService,
+)
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.integrations.forecast_archive import OpenMeteoForecastArchiveClient
@@ -105,6 +114,12 @@ class AppContainer:
     trade_analysis_service: TradeAnalysisService
     trading_audit_service: TradingAuditService
     market_history_service: MarketHistoryService
+    crypto_market_service: CryptoMarketService
+    crypto_history_service: CryptoHistoryService
+    crypto_forecast_service: CryptoForecastService
+    crypto_replay_service: CryptoReplayService
+    crypto_execution_service: CryptoExecutionService
+    crypto_workflow_service: CryptoWorkflowService
     watchdog_service: WatchdogService
     agents: AgentSuite
     supervisor: WorkflowSupervisor
@@ -157,6 +172,25 @@ class AppContainer:
         signal_calibration_service = SignalCalibrationService(session_factory)
         risk_engine = DeterministicRiskEngine(settings)
         execution_service = ExecutionService(settings, kalshi)
+        crypto_market_service = CryptoMarketService(
+            settings=settings,
+            session_factory=session_factory,
+            kalshi=kalshi,
+            agent_pack_service=agent_pack_service,
+        )
+        crypto_forecast_service = CryptoForecastService(
+            settings=settings,
+            session_factory=session_factory,
+        )
+        crypto_replay_service = CryptoReplayService(
+            settings=settings,
+            session_factory=session_factory,
+        )
+        crypto_execution_service = CryptoExecutionService(
+            settings=settings,
+            session_factory=session_factory,
+            base_execution_service=execution_service,
+        )
         memory_service = MemoryService()
         watchdog_service = WatchdogService(settings)
         decision_corpus_service = DecisionCorpusService(settings, session_factory)
@@ -244,6 +278,20 @@ class AppContainer:
             research_coordinator=research_coordinator,
             training_corpus_service=training_corpus_service,
             agents=agents,
+        )
+        crypto_history_service = CryptoHistoryService(
+            settings=settings,
+            session_factory=session_factory,
+            kalshi=kalshi,
+            market_service=crypto_market_service,
+        )
+        crypto_workflow_service = CryptoWorkflowService(
+            settings=settings,
+            session_factory=session_factory,
+            market_service=crypto_market_service,
+            forecast_service=crypto_forecast_service,
+            risk_engine=risk_engine,
+            execution_service=crypto_execution_service,
         )
         shadow_training_service = ShadowTrainingService(
             settings,
@@ -402,6 +450,12 @@ class AppContainer:
             trade_analysis_service=trade_analysis_service,
             trading_audit_service=trading_audit_service,
             market_history_service=market_history_service,
+            crypto_market_service=crypto_market_service,
+            crypto_history_service=crypto_history_service,
+            crypto_forecast_service=crypto_forecast_service,
+            crypto_replay_service=crypto_replay_service,
+            crypto_execution_service=crypto_execution_service,
+            crypto_workflow_service=crypto_workflow_service,
             watchdog_service=watchdog_service,
             agents=agents,
             supervisor=supervisor,
@@ -430,3 +484,14 @@ class AppContainer:
         await self.engine.dispose()
         if self.secondary_engine is not None:
             await self.secondary_engine.dispose()
+
+    async def run_room(self, room_id: str, *, reason: str = "manual") -> None:
+        try:
+            UUID(str(room_id))
+        except ValueError:
+            await self.supervisor.run_room(room_id, reason=reason)
+            return
+        if await self.crypto_market_service.is_crypto_room(room_id):
+            await self.crypto_workflow_service.run_room(room_id, reason=reason)
+            return
+        await self.supervisor.run_room(room_id, reason=reason)

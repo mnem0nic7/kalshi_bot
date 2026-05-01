@@ -111,6 +111,85 @@ class MarketPriceHistory(Base, IdMixin):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
+class CryptoMarketSnapshotRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "crypto_market_snapshots"
+    __table_args__ = (
+        UniqueConstraint("kalshi_env", "market_ticker", "observed_at", name="uq_crypto_market_snapshot_observed"),
+        Index("ix_crypto_market_snapshots_frequency_status", "frequency", "status"),
+        Index("ix_crypto_market_snapshots_market_observed", "market_ticker", "observed_at"),
+    )
+
+    kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False, default="demo", index=True)
+    series_ticker: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    event_ticker: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    asset_symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    frequency: Mapped[str] = mapped_column(String(32), nullable=False, default="15m", index=True)
+    title: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    open_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    expected_expiration_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    target_price_dollars: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    yes_bid_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    yes_ask_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    no_bid_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    no_ask_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    last_price_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    volume: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    open_interest: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    settlement_result: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="live")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class CryptoMarketCandlestickRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "crypto_market_candlesticks"
+    __table_args__ = (
+        UniqueConstraint(
+            "kalshi_env",
+            "market_ticker",
+            "period_interval",
+            "end_period_ts",
+            name="uq_crypto_candle_period",
+        ),
+        Index("ix_crypto_candles_market_period", "market_ticker", "end_period_ts"),
+        Index("ix_crypto_candles_series_period", "series_ticker", "end_period_ts"),
+    )
+
+    kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False, default="demo", index=True)
+    series_ticker: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    asset_symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    frequency: Mapped[str] = mapped_column(String(32), nullable=False, default="15m", index=True)
+    period_interval: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    end_period_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    open_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    high_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    low_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    close_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    volume: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class CryptoModelArtifactRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "crypto_model_artifacts"
+    __table_args__ = (
+        Index("ix_crypto_model_artifacts_frequency_type", "frequency", "artifact_type", "created_at"),
+    )
+
+    kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False, default="demo", index=True)
+    frequency: Mapped[str] = mapped_column(String(32), nullable=False, default="15m", index=True)
+    artifact_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    trained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class Signal(Base, IdMixin, TimestampMixin):
     __tablename__ = "signals"
 
