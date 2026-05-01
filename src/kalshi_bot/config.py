@@ -211,7 +211,9 @@ class Settings(BaseSettings):
     # Unblocking experiment: collect ≥ 30 settled trades with |delta_f| 4–12°F and
     # verify loss rate drops materially above 8°F versus below.
     strategy_min_abs_delta_f: float = 8.0
-    strategy_min_remaining_payout_bps: int = 300
+    # Symmetric with risk_min_contract_price_dollars: avoid buying a side
+    # priced so high that the remaining upside is too small for the tail risk.
+    strategy_min_remaining_payout_bps: int = 2500
     strategy_quality_edge_buffer_bps: int = 25
     sigma_lead_correction_enabled: bool = True
 

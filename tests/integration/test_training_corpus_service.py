@@ -631,6 +631,55 @@ async def test_strategy_audit_classifies_correct_thesis_but_weak_trade(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_strategy_audit_marks_low_remaining_payout_trade_weak(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-audit-low-payout.db")
+    corpus_service = TrainingCorpusService(
+        settings,
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        WeatherMarketDirectory({}),
+    )
+
+    bundle = TrainingRoomBundle(
+        room={"id": "room-low-payout", "market_ticker": "KXHIGHTHOU-26MAY01-T70"},
+        signal={
+            "fair_yes_dollars": "0.0000",
+            "payload": {
+                "resolution_state": "unresolved",
+                "eligibility": {
+                    "eligible": True,
+                    "remaining_payout_dollars": "0.2300",
+                    "market_spread_bps": 50,
+                },
+            },
+        },
+        trade_ticket={"market_ticker": "KXHIGHTHOU-26MAY01-T70", "side": "no", "yes_price_dollars": "0.2300"},
+        risk_verdict={"status": "approved", "reasons": ["All deterministic checks passed."]},
+        weather_bundle={
+            "mapping": {"operator": ">", "threshold_f": 70},
+            "observation": {"properties": {"temperature": {"value": 20.0}}},
+        },
+        outcome=TrainingRoomOutcome(
+            final_status="complete",
+            room_stage="complete",
+            shadow_mode=True,
+            kill_switch_enabled=True,
+            research_gate_passed=True,
+            risk_status="approved",
+            resolution_state="unresolved",
+            eligibility_passed=True,
+            ticket_generated=True,
+        ),
+    )
+
+    audit = corpus_service._audit_bundle(bundle)
+
+    assert audit.trade_quality == "weak_trade"
+    assert audit.missed_stand_down is True
+
+
+@pytest.mark.asyncio
 async def test_strategy_audit_classifies_incorrect_locked_yes_thesis(tmp_path) -> None:
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-audit-incorrect.db")
     corpus_service = TrainingCorpusService(

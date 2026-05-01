@@ -13,7 +13,7 @@ from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.agent_packs import RuntimeThresholds
 from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.risk_policy import probability_midband_block_reason
-from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
+from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars, remaining_payout_dollars
 from kalshi_bot.services.strategy_cleanup import CleanupSignal
 
 
@@ -282,6 +282,23 @@ class DeterministicRiskEngine:
                 f"Contract price {contract_price} is below minimum {min_price}; "
                 f"market has priced this as nearly impossible."
             )
+        remaining_payout = remaining_payout_dollars(ticket.side, ticket.yes_price_dollars)
+        minimum_remaining_payout_bps = max(
+            int(active_thresholds.strategy_min_remaining_payout_bps),
+            int(self.settings.strategy_min_remaining_payout_bps),
+        )
+        minimum_remaining_payout = Decimal(minimum_remaining_payout_bps) / Decimal("10000")
+        diagnostics["remaining_payout"] = {
+            "remaining_payout_dollars": _decimal_text(remaining_payout),
+            "minimum_remaining_payout_dollars": _decimal_text(minimum_remaining_payout),
+            "minimum_remaining_payout_bps": minimum_remaining_payout_bps,
+        }
+        if remaining_payout <= minimum_remaining_payout:
+            block(
+                f"Remaining payout {remaining_payout} is below configured minimum of "
+                f"{minimum_remaining_payout:.4f}; payoff is too asymmetric for a new entry."
+            )
+            code("insufficient_remaining_payout")
         if self.settings.risk_fee_aware_edge_enabled:
             (
                 fee_estimate_dollars_per_contract,

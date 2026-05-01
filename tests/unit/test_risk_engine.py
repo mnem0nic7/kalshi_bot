@@ -6,6 +6,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, DeploymentColor, RiskStatus, TradeAction, WeatherResolutionState
 from kalshi_bot.core.schemas import PortfolioBucketSnapshot, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
+from kalshi_bot.services.agent_packs import RuntimeThresholds
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
 from kalshi_bot.services.signal import StrategySignal
 from kalshi_bot.weather.scoring import WeatherSignalSnapshot
@@ -219,6 +220,47 @@ def test_risk_engine_blocks_same_ticker_add_ons_by_default() -> None:
 
     assert verdict.status == RiskStatus.BLOCKED
     assert any("no pyramiding" in reason.lower() for reason in verdict.reasons)
+
+
+def test_risk_engine_blocks_high_cost_side_with_tiny_remaining_payout() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    signal = make_signal(edge_bps=2300)
+    signal.recommended_side = ContractSide.NO
+    signal.target_yes_price_dollars = Decimal("0.2300")
+    signal.fair_yes_dollars = Decimal("0.0000")
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.NO,
+            yes_price_dollars=Decimal("0.2300"),
+            count_fp=Decimal("2.31"),
+        ),
+        signal=signal,
+        context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
+        thresholds=RuntimeThresholds(
+            risk_min_edge_bps=50,
+            risk_max_order_notional_dollars=100,
+            risk_max_position_notional_dollars=300,
+            trigger_max_spread_bps=1200,
+            trigger_cooldown_seconds=300,
+            strategy_quality_edge_buffer_bps=25,
+            strategy_min_remaining_payout_bps=300,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert "insufficient_remaining_payout" in verdict.reason_codes
+    assert any("Remaining payout 0.2300" in reason for reason in verdict.reasons)
+    assert verdict.diagnostics["remaining_payout"]["minimum_remaining_payout_bps"] == 2500
 
 
 def test_risk_engine_blocks_near_threshold_regime() -> None:

@@ -75,13 +75,13 @@ def test_conservative_rejects_wide_spread(conservative):
 
 
 def test_conservative_rejects_low_remaining_payout(conservative):
-    # remaining_payout_bps = 0.05 * 10000 = 500, conservative requires 800
+    # remaining_payout_bps = 0.05 * 10000 = 500, below the conservative safety floor.
     room = _room(edge_bps=150, spread_bps=100, remaining_payout_dollars=0.05)
     assert _would_have_traded(room, conservative) is False
 
 
 def test_conservative_trades_high_quality(conservative):
-    room = _room(edge_bps=150, spread_bps=100, remaining_payout_dollars=0.15)
+    room = _room(edge_bps=150, spread_bps=100, remaining_payout_dollars=0.40)
     assert _would_have_traded(room, conservative) is True
 
 

@@ -1026,7 +1026,8 @@ class TrainingCorpusService:
         if isinstance(eligibility, dict):
             remaining = eligibility.get("remaining_payout_dollars")
             try:
-                if remaining is not None and Decimal(str(remaining)) < Decimal("0.0300"):
+                min_remaining = Decimal(str(self.settings.strategy_min_remaining_payout_bps)) / Decimal("10000")
+                if remaining is not None and Decimal(str(remaining)) <= min_remaining:
                     return "weak_trade"
             except Exception:
                 pass

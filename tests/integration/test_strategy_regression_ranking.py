@@ -31,7 +31,7 @@ def _thresholds(*, min_edge_bps: int = 0) -> dict:
         "trigger_max_spread_bps": 800,
         "trigger_cooldown_seconds": 180,
         "strategy_quality_edge_buffer_bps": 0,
-        "strategy_min_remaining_payout_bps": 0,
+        "strategy_min_remaining_payout_bps": 2500,
         "risk_safe_capital_reserve_ratio": 0.60,
         "risk_risky_capital_max_ratio": 0.40,
     }
