@@ -72,6 +72,8 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "event_type": "ticket",
             "event_label": "Ticket",
             "market_ticker": "KXHIGHTPHX-26APR23-T92",
+            "action": "buy",
+            "action_tone": "good",
             "side": "yes",
             "side_tone": "good",
             "yes_price_dollars": "0.0400",
@@ -89,6 +91,8 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "event_type": "order",
             "event_label": "Order",
             "market_ticker": "KXHIGHDEN-26MAY01-T63",
+            "action": "buy",
+            "action_tone": "good",
             "side": "no",
             "side_tone": "warning",
             "yes_price_dollars": "0.2000",
@@ -108,6 +112,8 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "event_type": "fill",
             "event_label": "Fill",
             "market_ticker": "KXHIGHTHOU-26MAY01-T70",
+            "action": "sell",
+            "action_tone": "warning",
             "side": "no",
             "side_tone": "warning",
             "yes_price_dollars": "0.1800",
@@ -971,6 +977,9 @@ def test_recent_trading_activity_renders_at_bottom_of_demo_and_production(
                 assert "Ticket" in demo_text
                 assert "Order" in demo_text
                 assert "Fill" in demo_text
+                assert "Action" in demo_text
+                assert "buy" in demo_text
+                assert "sell" in demo_text
                 assert "KXHIGHTPHX-26APR23-T92" in demo_text
                 assert "KXHIGHDEN-26MAY01-T63" in demo_text
                 assert "KXHIGHTHOU-26MAY01-T70" in demo_text

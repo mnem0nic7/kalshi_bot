@@ -283,7 +283,7 @@
       <div class="table-wrap">
         <table class="positions-table">
           <thead>
-            <tr><th>Event</th><th>Market</th><th>Side</th><th>Yes Price</th><th>Contracts</th><th>Status</th><th>Risk</th><th>Notional</th></tr>
+            <tr><th>Event</th><th>Market</th><th>Action</th><th>Side</th><th>Yes Price</th><th>Contracts</th><th>Status</th><th>Risk</th><th>Notional</th></tr>
           </thead>
           <tbody>
             {% for item in recent_trade_proposals %}
@@ -296,6 +296,9 @@
                   <span class="muted-label proposal-updated-at" data-timestamp="{{ item.updated_at }}" title="{{ item.updated_at }}">{{ item.updated_at }}</span>
                   {% endif %}
                 </div>
+              </td>
+              <td>
+                <span class="status-pill {% if item.action_tone == 'good' %}status-good{% elif item.action_tone == 'warning' %}status-warning{% elif item.action_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.action or "—" }}</span>
               </td>
               <td>
                 <span class="status-pill {% if item.side_tone == 'good' %}status-good{% elif item.side_tone == 'warning' %}status-warning{% elif item.side_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.side }}</span>

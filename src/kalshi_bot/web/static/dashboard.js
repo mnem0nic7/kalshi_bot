@@ -595,7 +595,7 @@
     const table = el("table", "positions-table");
     const thead = el("thead");
     const headerRow = el("tr");
-    ["Event", "Market", "Side", "Yes Price", "Contracts", "Status", "Risk", "Notional"].forEach((h) => {
+    ["Event", "Market", "Action", "Side", "Yes Price", "Contracts", "Status", "Risk", "Notional"].forEach((h) => {
       headerRow.appendChild(el("th", null, h));
     });
     thead.appendChild(headerRow);
@@ -617,6 +617,9 @@
       const sideTd = el("td");
       const sideTone = proposal.side_tone || (proposal.side === "yes" ? "good" : proposal.side === "no" ? "warning" : "neutral");
       sideTd.appendChild(el("span", `status-pill ${statusPillClass(sideTone)}`, proposal.side || "—"));
+      const actionTd = el("td");
+      const actionTone = proposal.action_tone || (proposal.action === "buy" ? "good" : proposal.action === "sell" ? "warning" : "neutral");
+      actionTd.appendChild(el("span", `status-pill ${statusPillClass(actionTone)}`, proposal.action || "—"));
       const candidateText = proposalCandidateText(proposal);
       if (candidateText) {
         sideTd.appendChild(el("div", "proposal-risk-reasons", candidateText));
@@ -637,6 +640,7 @@
       tr.append(
         el("td", null, eventLabel.replace(/^\w/, (ch) => ch.toUpperCase())),
         marketTd,
+        actionTd,
         sideTd,
         el("td", "mono", proposal.yes_price_dollars || "—"),
         el("td", "mono", proposal.count_fp || "—"),

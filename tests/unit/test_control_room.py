@@ -425,6 +425,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
         SimpleNamespace(
             trade_ticket_id="ticket-executed",
             market_ticker="KXHIGHTHOU-26MAY01-T70",
+            action="buy",
             side="no",
             yes_price_dollars=Decimal("0.2000"),
             count_fp=Decimal("2.00"),
@@ -439,6 +440,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
         SimpleNamespace(
             trade_ticket_id="ticket-blocked",
             market_ticker="KXHIGHCHI-26MAY01-T68",
+            action="buy",
             side="yes",
             yes_price_dollars=Decimal("0.4500"),
             count_fp=Decimal("4.00"),
@@ -453,6 +455,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
         SimpleNamespace(
             trade_ticket_id="ticket-proposed",
             market_ticker="KXHIGHTNY-26MAY01-T75",
+            action="buy",
             side="yes",
             yes_price_dollars=Decimal("0.4000"),
             count_fp=Decimal("12.50"),
@@ -467,6 +470,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
         SimpleNamespace(
             trade_ticket_id="ticket-backfilled-status",
             market_ticker="KXHIGHNY-26APR24-T67",
+            action="buy",
             side="no",
             yes_price_dollars=Decimal("0.3200"),
             count_fp=Decimal("5.83"),
@@ -484,6 +488,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
             order_id="order-orphan",
             trade_ticket_id=None,
             market_ticker="KXHIGHTATL-26MAY01-T67",
+            action="sell",
             side="no",
             yes_price_dollars=Decimal("0.2500"),
             count_fp=Decimal("3.00"),
@@ -498,6 +503,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
             order_id="order-linked",
             trade_ticket_id="ticket-executed",
             market_ticker="KXHIGHTHOU-26MAY01-T70",
+            action="buy",
             side="no",
             yes_price_dollars=Decimal("0.2000"),
             count_fp=Decimal("2.00"),
@@ -512,6 +518,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
             order_id="order-backfilled",
             trade_ticket_id=None,
             market_ticker="KXHIGHNY-26APR27-T69",
+            action="sell",
             side="no",
             yes_price_dollars=Decimal("0.1500"),
             count_fp=Decimal("1.00"),
@@ -528,6 +535,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
             order_id="order-linked",
             trade_ticket_id="ticket-executed",
             market_ticker="KXHIGHTHOU-26MAY01-T70",
+            action="buy",
             side="no",
             yes_price_dollars=Decimal("0.2000"),
             count_fp=Decimal("2.00"),
@@ -550,9 +558,13 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
     ]
     assert views[0]["trade_ticket_id"] is None
     assert views[0]["order_id"] == "order-orphan"
+    assert views[0]["action"] == "sell"
+    assert views[0]["action_tone"] == "warning"
     assert views[0]["risk_status"] is None
     assert views[0]["notional_dollars"] == "2.2500"
     assert views[1]["risk_status"] == "approved"
+    assert views[1]["action"] == "buy"
+    assert views[1]["action_tone"] == "good"
     assert views[1]["notional_dollars"] == "1.6000"
     assert views[2]["event_label"] == "Fill"
     assert views[2]["risk_status"] == "approved"

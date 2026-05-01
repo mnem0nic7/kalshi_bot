@@ -637,6 +637,7 @@ def _trading_activity_row(
     event_type: str,
     event_label: str,
     market_ticker: Any,
+    action: Any,
     side: Any,
     yes_price_dollars: Any,
     count_fp: Any,
@@ -652,6 +653,7 @@ def _trading_activity_row(
     yes_price = _decimal_or_none(yes_price_dollars) or Decimal("0")
     count = _decimal_or_none(count_fp) or Decimal("0")
     approved_notional = _decimal_or_none(approved_notional_dollars)
+    action_text = str(action or "")
     side_text = str(side or "")
     status_text = str(status or "")
     risk_status_text = str(risk_status or "") if risk_status is not None else None
@@ -667,6 +669,8 @@ def _trading_activity_row(
         "event_type": event_type,
         "event_label": event_label,
         "market_ticker": str(market_ticker or ""),
+        "action": action_text,
+        "action_tone": "good" if action_text == "buy" else "warning" if action_text == "sell" else "neutral",
         "side": side_text,
         "selected_side": selected_side,
         "skipped_side": skipped_side,
@@ -715,6 +719,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
         select(
             TradeTicketRecord.id.label("trade_ticket_id"),
             TradeTicketRecord.market_ticker.label("market_ticker"),
+            TradeTicketRecord.action.label("action"),
             TradeTicketRecord.side.label("side"),
             TradeTicketRecord.yes_price_dollars.label("yes_price_dollars"),
             TradeTicketRecord.count_fp.label("count_fp"),
@@ -747,6 +752,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
             OrderRecord.id.label("order_id"),
             OrderRecord.trade_ticket_id.label("trade_ticket_id"),
             OrderRecord.market_ticker.label("market_ticker"),
+            OrderRecord.action.label("action"),
             OrderRecord.side.label("side"),
             OrderRecord.yes_price_dollars.label("yes_price_dollars"),
             OrderRecord.count_fp.label("count_fp"),
@@ -771,6 +777,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
             FillRecord.order_id.label("order_id"),
             OrderRecord.trade_ticket_id.label("trade_ticket_id"),
             FillRecord.market_ticker.label("market_ticker"),
+            FillRecord.action.label("action"),
             FillRecord.side.label("side"),
             FillRecord.yes_price_dollars.label("yes_price_dollars"),
             FillRecord.count_fp.label("count_fp"),
@@ -795,6 +802,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
             event_type="ticket",
             event_label="Ticket",
             market_ticker=row.market_ticker,
+            action=row.action,
             side=row.side,
             yes_price_dollars=row.yes_price_dollars,
             count_fp=row.count_fp,
@@ -813,6 +821,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
             event_type="order",
             event_label="Order",
             market_ticker=row.market_ticker,
+            action=row.action,
             side=row.side,
             yes_price_dollars=row.yes_price_dollars,
             count_fp=row.count_fp,
@@ -831,6 +840,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
             event_type="fill",
             event_label="Fill",
             market_ticker=row.market_ticker,
+            action=row.action,
             side=row.side,
             yes_price_dollars=row.yes_price_dollars,
             count_fp=row.count_fp,
