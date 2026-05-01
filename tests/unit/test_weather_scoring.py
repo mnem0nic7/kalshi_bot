@@ -4,7 +4,12 @@ import pytest
 
 from kalshi_bot.core.enums import WeatherResolutionState
 from kalshi_bot.weather.models import WeatherMarketMapping
-from kalshi_bot.weather.scoring import extract_forecast_high_f, score_weather_market
+from kalshi_bot.weather.scoring import (
+    UNRESOLVED_FAIR_CEILING,
+    UNRESOLVED_FAIR_FLOOR,
+    extract_forecast_high_f,
+    score_weather_market,
+)
 
 
 def test_score_weather_market_above_threshold_is_bullish() -> None:
@@ -80,6 +85,80 @@ def test_score_weather_market_locks_no_when_below_threshold_is_already_breached(
     assert signal.fair_yes_dollars == 0
     assert signal.confidence == 1.0
     assert signal.resolution_state == WeatherResolutionState.LOCKED_NO
+
+
+def test_score_weather_market_clamps_extreme_unresolved_low_probability() -> None:
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHTBOS-26APR22-T80",
+        station_id="KBOS",
+        location_name="Boston",
+        timezone_name="America/New_York",
+        latitude=42.4,
+        longitude=-71.0,
+        threshold_f=80,
+        operator=">",
+    )
+    forecast = {
+        "properties": {
+            "updated": "2026-04-21T18:00:00+00:00",
+            "periods": [
+                {
+                    "isDaytime": True,
+                    "startTime": "2026-04-22T06:00:00-04:00",
+                    "temperature": 50,
+                    "temperatureUnit": "F",
+                }
+            ],
+        }
+    }
+    observation = {
+        "properties": {
+            "temperature": {"value": 7.0},
+            "timestamp": "2026-04-21T22:00:00+00:00",
+        }
+    }
+
+    signal = score_weather_market(mapping, forecast, observation)
+
+    assert signal.resolution_state == WeatherResolutionState.UNRESOLVED
+    assert signal.fair_yes_dollars == UNRESOLVED_FAIR_FLOOR
+
+
+def test_score_weather_market_clamps_extreme_unresolved_high_probability() -> None:
+    mapping = WeatherMarketMapping(
+        market_ticker="KXHIGHTBOS-26APR22-T50",
+        station_id="KBOS",
+        location_name="Boston",
+        timezone_name="America/New_York",
+        latitude=42.4,
+        longitude=-71.0,
+        threshold_f=50,
+        operator=">",
+    )
+    forecast = {
+        "properties": {
+            "updated": "2026-04-21T18:00:00+00:00",
+            "periods": [
+                {
+                    "isDaytime": True,
+                    "startTime": "2026-04-22T06:00:00-04:00",
+                    "temperature": 80,
+                    "temperatureUnit": "F",
+                }
+            ],
+        }
+    }
+    observation = {
+        "properties": {
+            "temperature": {"value": 7.0},
+            "timestamp": "2026-04-21T22:00:00+00:00",
+        }
+    }
+
+    signal = score_weather_market(mapping, forecast, observation)
+
+    assert signal.resolution_state == WeatherResolutionState.UNRESOLVED
+    assert signal.fair_yes_dollars == UNRESOLVED_FAIR_CEILING
 
 
 def test_score_weather_market_does_not_lock_future_ticker_from_prior_day_observation() -> None:
@@ -249,7 +328,7 @@ def test_score_weather_market_penalizes_longshot_no_setup() -> None:
     signal = score_weather_market(mapping, forecast, observation)
 
     assert signal.trade_regime == "longshot_no"
-    assert signal.fair_yes_dollars == Decimal("0.9736")
+    assert signal.fair_yes_dollars == Decimal("0.9500")
     assert "below-threshold 73.0F contract" in signal.summary
 
 

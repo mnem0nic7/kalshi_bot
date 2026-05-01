@@ -15,6 +15,8 @@ NEAR_THRESHOLD_DELTA_F = 2.0
 LONGSHOT_FAIR_THRESHOLD = Decimal("0.0800")
 NEAR_THRESHOLD_PENALTY = Decimal("0.0500")
 LONGSHOT_PENALTY = Decimal("0.0150")
+UNRESOLVED_FAIR_FLOOR = Decimal("0.0500")
+UNRESOLVED_FAIR_CEILING = Decimal("0.9500")
 
 
 def celsius_to_fahrenheit(value_c: float | None) -> float | None:
@@ -298,6 +300,10 @@ def apply_trade_regime_penalty(*, fair_yes_dollars: Decimal, trade_regime: str) 
     return quantize_price(fair_yes_dollars)
 
 
+def clamp_unresolved_fair_yes(fair_yes_dollars: Decimal) -> Decimal:
+    return quantize_price(min(UNRESOLVED_FAIR_CEILING, max(UNRESOLVED_FAIR_FLOOR, fair_yes_dollars)))
+
+
 def score_weather_market(
     mapping: WeatherMarketMapping,
     forecast_payload: dict[str, Any],
@@ -436,6 +442,8 @@ def score_weather_market(
         fair_yes_dollars=fair,
         trade_regime=trade_regime,
     )
+    if resolution_state == WeatherResolutionState.UNRESOLVED:
+        fair = clamp_unresolved_fair_yes(fair)
     confidence_band = confidence_band_for(confidence)
     if resolution_state in {WeatherResolutionState.LOCKED_YES, WeatherResolutionState.LOCKED_NO}:
         trade_regime = "standard"

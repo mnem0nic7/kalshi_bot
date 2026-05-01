@@ -426,6 +426,7 @@ class StopLossService:
             kill_switch_enabled=kill_switch_enabled,
             active_color=active_color,
             subaccount=self.settings.kalshi_subaccount or None,
+            allow_risk_reducing_exit=True,
         )
 
         # Kill switch: clean noop — no submit/reentry checkpoints, rate-limited warning.

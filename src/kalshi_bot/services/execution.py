@@ -246,12 +246,14 @@ class ExecutionService:
         kill_switch_enabled: bool,
         active_color: str,
         subaccount: int | None = None,
+        allow_risk_reducing_exit: bool = False,
     ) -> ExecReceiptPayload:
         """Submit an IOC sell order for an existing position.
 
         Returns a sentinel status without hitting the API in three cases:
         - ``shadow_skipped``: app is in shadow mode
-        - ``kill_switch_blocked``: kill switch is enabled (caller must NOT write submit cooldown)
+        - ``kill_switch_blocked``: kill switch is enabled and the caller has not
+          explicitly marked this as a risk-reducing exit
         - ``inactive_color_skipped``: this deployment color is not active
         """
         if self.settings.app_shadow_mode:
@@ -260,7 +262,7 @@ class ExecutionService:
                 client_order_id=client_order_id,
                 details={"reason": "shadow mode"},
             )
-        if kill_switch_enabled:
+        if kill_switch_enabled and not allow_risk_reducing_exit:
             return ExecReceiptPayload(
                 status="kill_switch_blocked",
                 client_order_id=client_order_id,

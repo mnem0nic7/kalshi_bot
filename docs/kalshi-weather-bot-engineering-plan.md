@@ -410,7 +410,7 @@ Resolution-state detection: if `current_temp_f >= threshold`, the market is `LOC
 | Safe capital reserve | 0% | Disabled — no reserve held back |
 | Risky capital max | 0% | Disabled — risky-regime trades blocked upstream at guard #13 |
 
-**Kill switch.** `DeploymentControl.kill_switch_enabled` blocks all execution. Toggleable via the control room UI. Default: enabled. The watchdog auto-enables it if the active color's `daemon_reconcile` checkpoint is stale by more than `daemon_reconcile_stale_kill_switch_seconds` (300s, ~5 missed reconcile cycles) and logs a `critical` ops event. Clearing the kill switch after an auto-trip still requires a successful post-clear reconcile (see below).
+**Kill switch.** `DeploymentControl.kill_switch_enabled` blocks new entry execution. Risk-reducing close orders from the stop-loss loop may still submit so an already-open position can be reduced while the system is in a protective state. Toggleable via the control room UI. Default: enabled. The watchdog auto-enables it if the active color's `daemon_reconcile` checkpoint is stale by more than `daemon_reconcile_stale_kill_switch_seconds` (300s, ~5 missed reconcile cycles) and logs a `critical` ops event. Clearing the kill switch after an auto-trip still requires a successful post-clear reconcile (see below).
 
 **Post-clear reconcile gate.** When the kill switch is cleared, `kill_switch_cleared_at` is stamped in `DeploymentControl.notes`. The supervisor refuses to execute until the `daemon_reconcile:{color}` checkpoint carries a `reconciled_at` timestamp newer than that clear time — typically one 60s reconcile cycle. This ensures positions and orders are synchronized before any live order is submitted after a kill switch event.
 

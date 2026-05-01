@@ -29,6 +29,7 @@ class FakeExecutionService:
         kill_switch_enabled: bool,
         active_color: str,
         subaccount: int | None = None,
+        allow_risk_reducing_exit: bool = False,
     ) -> ExecReceiptPayload:
         payload: dict[str, object] = {
             "ticker": market_ticker,
@@ -39,6 +40,8 @@ class FakeExecutionService:
             "yes_price_dollars": f"{yes_price_dollars:.4f}",
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
+            "kill_switch_enabled": kill_switch_enabled,
+            "allow_risk_reducing_exit": allow_risk_reducing_exit,
         }
         if subaccount:
             payload["subaccount"] = subaccount
@@ -63,6 +66,7 @@ class FailingExecutionService:
         kill_switch_enabled: bool,
         active_color: str,
         subaccount: int | None = None,
+        allow_risk_reducing_exit: bool = False,
     ) -> ExecReceiptPayload:
         return ExecReceiptPayload(
             status="rejected_500",
@@ -83,6 +87,7 @@ class CancelledExecutionService(FakeExecutionService):
         kill_switch_enabled: bool,
         active_color: str,
         subaccount: int | None = None,
+        allow_risk_reducing_exit: bool = False,
     ) -> ExecReceiptPayload:
         self.calls.append({
             "ticker": market_ticker,
@@ -93,6 +98,8 @@ class CancelledExecutionService(FakeExecutionService):
             "yes_price_dollars": f"{yes_price_dollars:.4f}",
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
+            "kill_switch_enabled": kill_switch_enabled,
+            "allow_risk_reducing_exit": allow_risk_reducing_exit,
         })
         return ExecReceiptPayload(
             status="canceled",
@@ -114,8 +121,9 @@ class KillSwitchAwareExecutionService(FakeExecutionService):
         kill_switch_enabled: bool,
         active_color: str,
         subaccount: int | None = None,
+        allow_risk_reducing_exit: bool = False,
     ) -> ExecReceiptPayload:
-        if kill_switch_enabled:
+        if kill_switch_enabled and not allow_risk_reducing_exit:
             return ExecReceiptPayload(
                 status="kill_switch_blocked",
                 client_order_id=client_order_id,
@@ -130,6 +138,7 @@ class KillSwitchAwareExecutionService(FakeExecutionService):
             kill_switch_enabled=kill_switch_enabled,
             active_color=active_color,
             subaccount=subaccount,
+            allow_risk_reducing_exit=allow_risk_reducing_exit,
         )
 
 
@@ -198,7 +207,7 @@ async def test_stop_loss_skips_when_color_is_inactive(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_loss_kill_switch_suppression_records_provenance(tmp_path) -> None:
+async def test_stop_loss_submits_risk_reducing_exit_when_kill_switch_enabled(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/stop_loss_kill_switch.db",
         app_color="blue",
@@ -279,26 +288,25 @@ async def test_stop_loss_kill_switch_suppression_records_provenance(tmp_path) ->
     triggered = await service.check_once()
 
     async with session_factory() as session:
-        ops_event = (await session.execute(select(OpsEvent))).scalar_one()
         checkpoints = {
             cp.stream_name: cp
             for cp in (await session.execute(select(Checkpoint))).scalars()
         }
+        ops_event = (await session.execute(select(OpsEvent))).scalar_one()
         orders = list((await session.execute(select(OrderRecord))).scalars())
         await session.commit()
 
-    assert triggered[0]["action"] == "stop_loss_kill_switch_suppressed"
-    assert triggered[0]["kill_switch"]["source"] == "watchdog"
-    assert triggered[0]["kill_switch"]["reason"] == "reconcile_stale"
-    assert triggered[0]["reconcile"]["threshold_seconds"] == 300
-    assert triggered[0]["reconcile"]["age_seconds"] >= 300
-    assert ops_event.payload["kill_switch"]["source"] == "watchdog"
-    assert ops_event.payload["reconcile"]["stale"] is True
-    assert "stop_loss_submit:demo:KXHIGHTSFO-26APR23-T70" not in checkpoints
-    assert "stop_loss_reentry:demo:KXHIGHTSFO-26APR23-T70" not in checkpoints
-    assert checkpoints["stop_loss_kill_switch_suppressed:demo:KXHIGHTSFO-26APR23-T70"].payload["kill_switch"]["reason"] == "reconcile_stale"
-    assert orders == []
-    assert kalshi.calls == []
+    assert triggered[0]["action"] == "stop_loss_trailing_stop"
+    assert triggered[0]["exec_status"] == "submitted"
+    assert triggered[0]["order_response"]["order"]["order_id"] == "stop-loss-order"
+    assert ops_event.payload["action"] == "stop_loss_trailing_stop"
+    assert checkpoints["stop_loss_submit:demo:KXHIGHTSFO-26APR23-T70"].payload["outcome_status"] == "submitted_pending_fill"
+    assert checkpoints["stop_loss_reentry:demo:KXHIGHTSFO-26APR23-T70"].payload["outcome_status"] == "submitted_pending_fill"
+    assert "stop_loss_kill_switch_suppressed:demo:KXHIGHTSFO-26APR23-T70" not in checkpoints
+    assert len(orders) == 1
+    assert len(kalshi.calls) == 1
+    assert kalshi.calls[0]["kill_switch_enabled"] is True
+    assert kalshi.calls[0]["allow_risk_reducing_exit"] is True
 
     await engine.dispose()
 
@@ -390,6 +398,8 @@ async def test_stop_loss_uses_fractional_count_fp_payload_and_sets_reentry_check
             "yes_price_dollars": "0.1200",
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
+            "kill_switch_enabled": False,
+            "allow_risk_reducing_exit": True,
         }
     ]
     assert "count" not in kalshi.calls[0]

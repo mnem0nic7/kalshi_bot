@@ -240,3 +240,46 @@ async def test_kill_switch_blocks_before_any_api_call():
 
     assert receipt.status == "kill_switch_blocked"
     kalshi.create_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_position_allows_risk_reducing_exit_when_kill_switch_enabled():
+    kalshi = _kalshi(order_statuses=[])
+    kalshi.create_order.return_value = {"order": {"order_id": "exit-1", "status": "submitted"}}
+    svc = ExecutionService(_settings(), kalshi)
+
+    receipt = await svc.close_position(
+        market_ticker="WX-TEST",
+        side="no",
+        count_fp=Decimal("2.31"),
+        yes_price_dollars=Decimal("0.3800"),
+        client_order_id="exit-coid",
+        kill_switch_enabled=True,
+        active_color="blue",
+        allow_risk_reducing_exit=True,
+    )
+
+    assert receipt.status == "submitted"
+    kalshi.create_order.assert_awaited_once()
+    payload = kalshi.create_order.await_args.args[0]
+    assert payload["action"] == "sell"
+    assert payload["time_in_force"] == "immediate_or_cancel"
+
+
+@pytest.mark.asyncio
+async def test_close_position_still_blocks_kill_switch_without_exit_bypass():
+    kalshi = _kalshi(order_statuses=[])
+    svc = ExecutionService(_settings(), kalshi)
+
+    receipt = await svc.close_position(
+        market_ticker="WX-TEST",
+        side="no",
+        count_fp=Decimal("2.31"),
+        yes_price_dollars=Decimal("0.3800"),
+        client_order_id="exit-coid",
+        kill_switch_enabled=True,
+        active_color="blue",
+    )
+
+    assert receipt.status == "kill_switch_blocked"
+    kalshi.create_order.assert_not_called()
