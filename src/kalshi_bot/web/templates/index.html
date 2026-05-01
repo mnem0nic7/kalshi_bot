@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block extra_head %}
-  <link rel="stylesheet" href="/static/dashboard.css" />
+  <link rel="stylesheet" href="/static/dashboard.css?v={{ static_asset_version }}" />
 {% endblock %}
 {% block main_class %}shell-main-wide{% endblock %}
 {% block content %}
@@ -500,5 +500,5 @@
 </div>
 {% endblock %}
 {% block extra_scripts %}
-  <script src="/static/dashboard.js"></script>
+  <script src="/static/dashboard.js?v={{ static_asset_version }}"></script>
 {% endblock %}

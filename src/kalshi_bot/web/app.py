@@ -37,6 +37,7 @@ from kalshi_bot.web.system_routes import create_system_router
 
 templates = Jinja2Templates(directory="src/kalshi_bot/web/templates")
 logger = logging.getLogger(__name__)
+STATIC_ASSET_VERSION = "20260501-trading-activity"
 
 
 @asynccontextmanager
@@ -155,6 +156,7 @@ def create_app() -> FastAPI:
             "current_user": current_user,
             "current_user_email": getattr(current_user, "email", None),
             "dashboard_shell": dashboard_shell(),
+            "static_asset_version": STATIC_ASSET_VERSION,
             **extra,
         }
 
