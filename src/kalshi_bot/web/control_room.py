@@ -719,6 +719,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
             TradeTicketRecord.yes_price_dollars.label("yes_price_dollars"),
             TradeTicketRecord.count_fp.label("count_fp"),
             TradeTicketRecord.status.label("status"),
+            TradeTicketRecord.created_at.label("created_at"),
             TradeTicketRecord.updated_at.label("updated_at"),
             latest_risk.c.risk_status,
             latest_risk.c.risk_reasons,
@@ -738,7 +739,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
         .where(
             Room.kalshi_env == kalshi_env,
         )
-        .order_by(TradeTicketRecord.updated_at.desc())
+        .order_by(TradeTicketRecord.created_at.desc())
         .limit(query_limit)
     )
     order_result = await session.execute(
@@ -798,7 +799,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
             yes_price_dollars=row.yes_price_dollars,
             count_fp=row.count_fp,
             status=row.status,
-            updated_at=row.updated_at,
+            updated_at=getattr(row, "created_at", None) or row.updated_at,
             risk_status=row.risk_status,
             risk_reasons=row.risk_reasons,
             approved_notional_dollars=row.approved_notional_dollars,

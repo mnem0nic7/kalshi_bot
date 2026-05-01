@@ -433,6 +433,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
             risk_reasons=[],
             approved_notional_dollars=Decimal("1.6000"),
             signal_payload={"candidate_trace": {"selected_side": "no", "yes": {"reason": "below_min_edge"}}},
+            created_at=now - timedelta(minutes=3),
             updated_at=now - timedelta(minutes=3),
         ),
         SimpleNamespace(
@@ -446,6 +447,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
             risk_reasons=["Book effectively broken."],
             approved_notional_dollars=None,
             signal_payload=None,
+            created_at=now - timedelta(minutes=4),
             updated_at=now - timedelta(minutes=4),
         ),
         SimpleNamespace(
@@ -459,7 +461,22 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
             risk_reasons=[],
             approved_notional_dollars=None,
             signal_payload=None,
+            created_at=now - timedelta(minutes=5),
             updated_at=now - timedelta(minutes=5),
+        ),
+        SimpleNamespace(
+            trade_ticket_id="ticket-backfilled-status",
+            market_ticker="KXHIGHNY-26APR24-T67",
+            side="no",
+            yes_price_dollars=Decimal("0.3200"),
+            count_fp=Decimal("5.83"),
+            status="executed",
+            risk_status="approved",
+            risk_reasons=[],
+            approved_notional_dollars=Decimal("3.9644"),
+            signal_payload=None,
+            created_at=now - timedelta(days=7),
+            updated_at=now + timedelta(minutes=10),
         ),
     ]
     order_rows = [
@@ -525,7 +542,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
 
     views = await control_room_module._recent_trading_activity_views(session, kalshi_env="demo")
 
-    assert [item["event_type"] for item in views] == ["order", "order", "fill", "ticket", "ticket", "ticket", "order"]
+    assert [item["event_type"] for item in views] == ["order", "order", "fill", "ticket", "ticket", "ticket", "order", "ticket"]
     assert [item["market_ticker"] for item in views[:3]] == [
         "KXHIGHTATL-26MAY01-T67",
         "KXHIGHTHOU-26MAY01-T70",
@@ -550,6 +567,8 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
     assert views[5]["status"] == "proposed"
     assert views[6]["market_ticker"] == "KXHIGHNY-26APR27-T69"
     assert views[6]["updated_at"] == (now - timedelta(days=4)).isoformat()
+    assert views[7]["market_ticker"] == "KXHIGHNY-26APR24-T67"
+    assert views[7]["updated_at"] == (now - timedelta(days=7)).isoformat()
 
 
 @pytest.mark.asyncio
