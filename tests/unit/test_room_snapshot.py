@@ -58,6 +58,18 @@ class FakeRoomSnapshotRepo:
                 created_at=now,
             )
         ]
+        self.decision_trace = SimpleNamespace(
+            id="trace-1",
+            room_id="room-1",
+            market_ticker="KXHIGHBOS-26APR26-T70",
+            kalshi_env="demo",
+            decision_kind="stand_down",
+            path_version="deterministic-fast-path.v1",
+            input_hash="input-hash",
+            trace_hash="trace-hash",
+            decision_time=now,
+            created_at=now,
+        )
 
     async def get_room(self, room_id: str):
         return self.room if room_id == "room-1" else None
@@ -92,6 +104,9 @@ class FakeRoomSnapshotRepo:
     async def get_room_strategy_audit(self, room_id: str):
         return None
 
+    async def get_latest_decision_trace_for_room(self, room_id: str):
+        return self.decision_trace if room_id == "room-1" else None
+
     async def get_latest_artifact(self, *, room_id: str, artifact_type: str):
         return None
 
@@ -117,6 +132,7 @@ async def test_load_room_snapshot_builds_payload_and_controls_message_inclusion(
     assert without_messages["room"]["id"] == "room-1"
     assert without_messages["stage_timeline"][1]["stage"] == "researching"
     assert without_messages["analytics"]["decision"]["execution_status"] == "stand_down"
+    assert without_messages["decision_trace"]["id"] == "trace-1"
     assert "messages" not in without_messages
     assert with_messages["messages"][0]["role"] == AgentRole.RESEARCHER.value
 

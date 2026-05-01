@@ -1790,6 +1790,7 @@ async def _build_training_tab(container: AppContainer) -> dict[str, Any]:
         "as_of": now.isoformat(),
         "quality": {
             "summary": training_status.get("quality_debt_summary") or {},
+            "shadow_weather_readiness": training_status.get("shadow_weather_readiness") or {},
             "exclusion_reasons": training_status.get("quality_exclusion_reasons") or {},
             "recent_exclusion_memory": (training_status.get("recent_exclusion_memory") or {}).get("by_market") or [],
             "top_blockers": training_status.get("top_blockers") or [],

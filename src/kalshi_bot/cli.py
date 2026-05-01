@@ -52,6 +52,7 @@ from kalshi_bot.learning.promotion_gates import (
 )
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
+from kalshi_bot.services.baseline_model_card import write_baseline_model_card
 from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, replay_decision_trace
 from kalshi_bot.services.parameter_packs import ParameterPackCanaryConfig, ParameterPackPromotionService
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
@@ -74,6 +75,16 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
         for record in records:
             handle.write(json.dumps(record))
             handle.write("\n")
+
+
+def _shadow_run_payload(result) -> dict[str, object | None]:
+    return {
+        "room_id": result.room_id,
+        "market_ticker": result.market_ticker,
+        "room_name": getattr(result, "room_name", None),
+        "stage": result.stage,
+        "decision_trace_id": result.decision_trace_id,
+    }
 
 
 def _read_json_file(path: Path) -> dict:
@@ -791,6 +802,15 @@ async def _run_create_web_user_command(
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
+    if args.command == "baseline-model-card":
+        result = write_baseline_model_card(
+            historical_path=Path(args.historical),
+            shadow_path=Path(args.shadow),
+            output_path=Path(args.output),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
     container = await AppContainer.build(bootstrap_db=args.command not in {"init-db", "trading-audit", "trade-analysis"})
     try:
         if args.command == "init-db":
@@ -1016,6 +1036,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 good_research_only=args.good_research_only,
                 quality_cleaned_only=args.quality_cleaned_only,
                 market_ticker=args.market_ticker,
+                origins=args.origins,
                 output=args.output,
             )
             print(json.dumps(await container.training_corpus_service.build_dataset(request), indent=2))
@@ -1339,12 +1360,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 prompt=args.prompt,
                 reason=args.reason,
             )
-            payload = {
-                "room_id": result.room_id,
-                "market_ticker": result.market_ticker,
-                "stage": result.stage,
-                "decision_trace_id": result.decision_trace_id,
-            }
+            payload = _shadow_run_payload(result)
             if result.decision_trace_id is None:
                 print(
                     json.dumps(
@@ -1582,29 +1598,41 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 limit=args.limit,
                 reason=args.reason,
             )
-            print(
-                json.dumps(
-                    [
-                        {"room_id": item.room_id, "market_ticker": item.market_ticker, "room_name": item.room_name, "stage": item.stage}
-                        for item in results
-                    ],
-                    indent=2,
+            payload = [_shadow_run_payload(item) for item in results]
+            missing_traces = [item for item in payload if item.get("decision_trace_id") is None]
+            if missing_traces:
+                print(
+                    json.dumps(
+                        {
+                            "results": payload,
+                            "error": "Shadow sweep completed with rooms missing deterministic decision traces",
+                        },
+                        indent=2,
+                    ),
+                    file=sys.stderr,
                 )
-            )
+                return 1
+            print(json.dumps(payload, indent=2))
             return 0
 
         if args.command == "shadow-campaign" and args.shadow_campaign_command == "run":
             request = ShadowCampaignRequest(limit=args.limit, reason=args.reason)
             results = await container.shadow_campaign_service.run(request)
-            print(
-                json.dumps(
-                    [
-                        {"room_id": item.room_id, "market_ticker": item.market_ticker, "room_name": item.room_name, "stage": item.stage}
-                        for item in results
-                    ],
-                    indent=2,
+            payload = [_shadow_run_payload(item) for item in results]
+            missing_traces = [item for item in payload if item.get("decision_trace_id") is None]
+            if missing_traces:
+                print(
+                    json.dumps(
+                        {
+                            "results": payload,
+                            "error": "Shadow campaign completed with rooms missing deterministic decision traces",
+                        },
+                        indent=2,
+                    ),
+                    file=sys.stderr,
                 )
-            )
+                return 1
+            print(json.dumps(payload, indent=2))
             return 0
 
         if args.command == "calibrate-momentum":
@@ -1836,6 +1864,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     training_build_list = subparsers.add_parser("training-build-list")
     training_build_list.add_argument("--limit", type=int, default=20)
+
+    baseline_model_card = subparsers.add_parser(
+        "baseline-model-card",
+        help="Write a read-only historical plus shadow baseline model card.",
+    )
+    baseline_model_card.add_argument("--historical", default="data/training/historical_decision_baseline.jsonl")
+    baseline_model_card.add_argument("--shadow", default="data/training/forward_shadow_bundles.jsonl")
+    baseline_model_card.add_argument("--output", default="data/training/baseline_model_card.json")
 
     decision_corpus = subparsers.add_parser("decision-corpus")
     decision_corpus_subparsers = decision_corpus.add_subparsers(dest="decision_corpus_command", required=True)

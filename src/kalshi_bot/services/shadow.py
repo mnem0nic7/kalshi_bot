@@ -54,7 +54,7 @@ class ShadowTrainingService:
             room = await repo.create_room(
                 RoomCreate(name=room_name, market_ticker=market_ticker, prompt=room_prompt),
                 active_color=self.settings.app_color,
-                shadow_mode=self.settings.app_shadow_mode,
+                shadow_mode=True,
                 kill_switch_enabled=control.kill_switch_enabled,
                 kalshi_env=self.settings.kalshi_env,
                 agent_pack_version=pack.version,
@@ -78,6 +78,8 @@ class ShadowTrainingService:
                     "room_id": room.id,
                     "market_ticker": market_ticker,
                     "agent_pack_version": pack.version,
+                    "app_shadow_mode": self.settings.app_shadow_mode,
+                    "forced_room_shadow_mode": True,
                     "campaign": campaign,
                 },
                 room_id=room.id,

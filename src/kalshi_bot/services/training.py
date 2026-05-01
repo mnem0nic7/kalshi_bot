@@ -47,6 +47,7 @@ class TrainingExportService:
             campaign = await repo.get_room_campaign(room_id)
             research_health = await repo.get_room_research_health(room_id)
             strategy_audit = await repo.get_room_strategy_audit(room_id)
+            decision_trace = await repo.get_latest_decision_trace_for_room(room_id)
             historical_replay = await repo.get_historical_replay_run_by_room(room_id)
             settlement = await self._latest_settlement_for_market(repo, room.market_ticker)
             settlement_label = await repo.get_historical_settlement_label(room.market_ticker)
@@ -90,6 +91,8 @@ class TrainingExportService:
             orders=[self._order_dict(order) for order in orders],
             fills=[self._fill_dict(fill) for fill in fills],
             memory_note=self._memory_note_dict(memory_note) if memory_note is not None else None,
+            decision_trace_id=(decision_trace.id if decision_trace is not None else None),
+            decision_trace_hash=(decision_trace.trace_hash if decision_trace is not None else None),
             historical_provenance=(
                 dict((historical_replay.payload or {}).get("historical_provenance") or {})
                 if historical_replay is not None

@@ -863,6 +863,94 @@ async def test_shadow_run_cli_fails_when_trace_is_missing(monkeypatch, capsys) -
     assert "without a deterministic decision trace" in captured.err
 
 
+@pytest.mark.asyncio
+async def test_shadow_sweep_cli_reports_trace_ids_and_fails_when_any_are_missing(monkeypatch, capsys) -> None:
+    class FakeShadowTrainingService:
+        async def run_shadow_sweep(self, *, markets=None, limit=None, reason="shadow_sweep"):
+            return [
+                SimpleNamespace(
+                    room_id="room-1",
+                    market_ticker="KXHIGHNY-26APR27-T69",
+                    room_name="shadow one",
+                    stage="complete",
+                    decision_trace_id="trace-1",
+                ),
+                SimpleNamespace(
+                    room_id="room-2",
+                    market_ticker="KXHIGHCHI-26APR27-T66",
+                    room_name="shadow two",
+                    stage="complete",
+                    decision_trace_id=None,
+                ),
+            ]
+
+    class FakeContainer:
+        shadow_training_service = FakeShadowTrainingService()
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_build(*, bootstrap_db: bool):
+        assert bootstrap_db is True
+        return FakeContainer()
+
+    monkeypatch.setattr(cli_module.AppContainer, "build", fake_build)
+    args = cli_module.build_parser().parse_args(["shadow-sweep", "--limit", "2"])
+
+    exit_code = await cli_module._run_cli(args)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    payload = json.loads(captured.err)
+    assert payload["results"][0]["decision_trace_id"] == "trace-1"
+    assert payload["results"][1]["decision_trace_id"] is None
+    assert "missing deterministic decision traces" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_shadow_campaign_cli_reports_trace_ids_and_fails_when_any_are_missing(monkeypatch, capsys) -> None:
+    class FakeShadowCampaignService:
+        async def run(self, request):
+            return [
+                SimpleNamespace(
+                    room_id="room-1",
+                    market_ticker="KXHIGHNY-26APR27-T69",
+                    room_name="shadow one",
+                    stage="complete",
+                    decision_trace_id="trace-1",
+                ),
+                SimpleNamespace(
+                    room_id="room-2",
+                    market_ticker="KXHIGHCHI-26APR27-T66",
+                    room_name="shadow two",
+                    stage="complete",
+                    decision_trace_id=None,
+                ),
+            ]
+
+    class FakeContainer:
+        shadow_campaign_service = FakeShadowCampaignService()
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_build(*, bootstrap_db: bool):
+        assert bootstrap_db is True
+        return FakeContainer()
+
+    monkeypatch.setattr(cli_module.AppContainer, "build", fake_build)
+    args = cli_module.build_parser().parse_args(["shadow-campaign", "run", "--limit", "2"])
+
+    exit_code = await cli_module._run_cli(args)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    payload = json.loads(captured.err)
+    assert payload["results"][0]["decision_trace_id"] == "trace-1"
+    assert payload["results"][1]["decision_trace_id"] is None
+    assert "missing deterministic decision traces" in payload["error"]
+
+
 def test_python_module_cli_entrypoint_reports_operator_errors_cleanly(tmp_path) -> None:
     env = os.environ.copy()
     env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/cli.db"
@@ -890,6 +978,70 @@ def test_python_module_cli_entrypoint_reports_operator_errors_cleanly(tmp_path) 
     assert '"error"' in result.stderr
     assert "Training corpus is not ready for evaluation" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_baseline_model_card_cli_writes_read_only_card_without_db(tmp_path) -> None:
+    historical = tmp_path / "historical.jsonl"
+    shadow = tmp_path / "shadow.jsonl"
+    output = tmp_path / "baseline-card.json"
+    historical.write_text(
+        json.dumps(
+            {
+                "market_ticker": "KXHIGHNY-26APR01-T70",
+                "coverage_class": "full_checkpoint_coverage",
+                "split": "holdout",
+                "historical_provenance": {
+                    "local_market_day": "2026-04-01",
+                    "coverage_class": "full_checkpoint_coverage",
+                    "settlement_label_signature": json.dumps({"settlement_value_dollars": "1.0000"}),
+                },
+                "signal": {"fair_yes_dollars": "0.7500"},
+                "outcome": {"final_status": "stand_down", "orders_submitted": 0},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shadow.write_text(
+        json.dumps(
+            {
+                "room_origin": "shadow",
+                "room": {"market_ticker": "KXHIGHCHI-26MAY01-T66", "room_origin": "shadow"},
+                "decision_trace_id": "trace-1",
+                "signal": {"fair_yes_dollars": "0.2500"},
+                "settlement": {"settlement_value_dollars": "0.0000"},
+                "outcome": {"final_status": "stand_down", "orders_submitted": 0},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "baseline-model-card",
+            "--historical",
+            str(historical),
+            "--shadow",
+            str(shadow),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert output.exists()
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    stdout_payload = json.loads(result.stdout)
+    assert payload["read_only"] is True
+    assert stdout_payload["output"] == str(output)
+    assert payload["row_counts"]["total"] == 2
 
 
 def test_trading_audit_cli_json_smoke(tmp_path) -> None:

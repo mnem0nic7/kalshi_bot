@@ -131,7 +131,8 @@ The fastest shadow-mode collection loop is now:
 ```bash
 kalshi-bot-cli shadow-campaign run --limit 3
 kalshi-bot-cli training-status
-kalshi-bot-cli training-build --mode room-bundles --good-research-only
+kalshi-bot-cli training-build --mode room-bundles --origins shadow --no-quality-cleaned-only --output data/training/forward_shadow_bundles.jsonl
+kalshi-bot-cli baseline-model-card
 ```
 
 You can also launch one room at a time from the control room homepage with `Run Shadow Room`.
@@ -272,8 +273,13 @@ Create a reproducible dataset build and persist its metadata:
 ```bash
 kalshi-bot-cli training-build \
   --mode room-bundles \
-  --good-research-only \
-  --output data/training/builds/weather_room_bundles.jsonl
+  --origins shadow \
+  --no-quality-cleaned-only \
+  --output data/training/forward_shadow_bundles.jsonl
+kalshi-bot-cli baseline-model-card \
+  --historical data/training/historical_decision_baseline.jsonl \
+  --shadow data/training/forward_shadow_bundles.jsonl \
+  --output data/training/baseline_model_card.json
 ```
 
 List recent dataset builds:

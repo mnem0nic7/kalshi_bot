@@ -328,7 +328,11 @@ def test_shadow_run_endpoint_creates_room_and_schedules_workflow(tmp_path, monke
             captured["reason"] = reason
             called.set()
 
+        async def fake_is_crypto_room(room_id: str) -> bool:
+            return False
+
         client.app.state.container.supervisor.run_room = fake_run_room  # type: ignore[method-assign]
+        client.app.state.container.crypto_market_service.is_crypto_room = fake_is_crypto_room  # type: ignore[method-assign]
         response = client.post(
             "/api/markets/KXHIGHNY-26APR11-T68/shadow-run",
             json={"name": "shadow nyc", "reason": "ui_shadow_run"},

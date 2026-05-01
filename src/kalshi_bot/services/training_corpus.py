@@ -69,6 +69,7 @@ class TrainingCorpusService:
         audits = [self._bundle_strategy_audit(bundle) for bundle in bundles]
         readiness_bundles = await self._selected_bundles(request.model_copy(update={"quality_cleaned_only": True}))
         readiness = self._readiness_for_bundles(readiness_bundles)
+        shadow_weather_readiness = await self._shadow_weather_readiness(days=request.days, limit=request.limit)
         if persist_readiness:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session)
@@ -198,6 +199,7 @@ class TrainingCorpusService:
             "quality_exclusion_reasons": dict(exclusion_reason_counts.most_common()),
             "recent_exclusion_memory": recent_exclusion_memory,
             "settlement_maturity": settlement_maturity,
+            "shadow_weather_readiness": shadow_weather_readiness,
             "readiness": readiness.model_dump(mode="json"),
             "last_readiness_snapshot": latest_snapshot.payload if latest_snapshot is not None else None,
             "top_missing_data": readiness.missing_indicators,
@@ -265,6 +267,9 @@ class TrainingCorpusService:
         readiness = self._readiness_for_bundles(
             [bundle for bundle in dashboard_bundles if bundle.trainable_default is not False]
         )
+        shadow_weather_readiness = self._shadow_weather_readiness_from_bundles(
+            [bundle for bundle in dashboard_bundles if self._is_weather_shadow_bundle(bundle)]
+        )
         top_blockers = self._top_blockers(
             readiness=readiness,
             quality_debt_summary=quality_debt_summary,
@@ -284,6 +289,7 @@ class TrainingCorpusService:
             "quality_debt_summary": quality_debt_summary,
             "top_blockers": top_blockers,
             "next_actions": next_actions,
+            "shadow_weather_readiness": shadow_weather_readiness,
         }
 
     async def build_dataset(self, request: TrainingBuildRequest) -> dict[str, Any]:
@@ -627,6 +633,7 @@ class TrainingCorpusService:
                 since=since,
                 limit=room_limit,
                 market_ticker=request.market_ticker,
+                origins=request.origins,
             )
             await session.commit()
         bundles = await self.training_export_service.export_room_bundles(
@@ -691,10 +698,104 @@ class TrainingCorpusService:
                 continue
             if not request.include_non_complete and bundle.room.get("stage") != "complete":
                 continue
+            if request.origins:
+                origin = bundle.room_origin or bundle.room.get("room_origin")
+                if origin not in request.origins:
+                    continue
             filtered.append(bundle)
             if len(filtered) >= request.limit:
                 break
         return filtered
+
+    async def _shadow_weather_readiness(self, *, days: int, limit: int) -> dict[str, Any]:
+        request = TrainingBuildRequest(
+            mode="room-bundles",
+            limit=limit,
+            days=days,
+            include_non_complete=False,
+            good_research_only=False,
+            quality_cleaned_only=False,
+            origins=[RoomOrigin.SHADOW.value],
+        )
+        bundles = await self._selected_bundles(request)
+        return self._shadow_weather_readiness_from_bundles(
+            [bundle for bundle in bundles if self._is_weather_shadow_bundle(bundle)]
+        )
+
+    def _shadow_weather_readiness_from_bundles(self, bundles: list[TrainingRoomBundle]) -> dict[str, Any]:
+        complete_bundles = [bundle for bundle in bundles if bundle.room.get("stage") == "complete"]
+        complete_count = len(complete_bundles)
+        market_tickers = [str(bundle.room.get("market_ticker") or "") for bundle in complete_bundles]
+        series_tickers = sorted({self._series_ticker_for_bundle(bundle) for bundle in complete_bundles})
+        trace_count = sum(1 for bundle in complete_bundles if bundle.decision_trace_id)
+        missing_trace_count = max(0, complete_count - trace_count)
+        ticket_count = sum(1 for bundle in complete_bundles if bundle.outcome.ticket_generated)
+        risk_verdict_count = sum(1 for bundle in complete_bundles if bundle.risk_verdict is not None)
+        risk_approved_count = sum(1 for bundle in complete_bundles if (bundle.outcome.risk_status or "").lower() == "approved")
+        risk_blocked_count = sum(1 for bundle in complete_bundles if (bundle.outcome.risk_status or "").lower() == "blocked")
+        good_research_count = sum(1 for bundle in complete_bundles if bool((bundle.research_health or {}).get("good_for_training")))
+        research_health_present_count = sum(1 for bundle in complete_bundles if bundle.research_health is not None)
+        settled_count = sum(1 for bundle in complete_bundles if bundle.outcome.settlement_seen)
+        orders_submitted_count = sum(int(bundle.outcome.orders_submitted or 0) for bundle in complete_bundles)
+
+        thresholds = {
+            "min_complete_shadow_rooms": self.settings.training_min_complete_rooms,
+            "min_series_diversity": self.settings.training_min_market_diversity,
+            "min_settled_shadow_rooms": self.settings.training_min_settled_rooms,
+            "min_trade_positive_shadow_rooms": self.settings.training_min_trade_positive_rooms,
+            "required_trace_coverage": 1.0,
+        }
+        blockers: list[str] = []
+        if complete_count < thresholds["min_complete_shadow_rooms"]:
+            blockers.append("not_enough_shadow_rooms")
+        if len(series_tickers) < thresholds["min_series_diversity"]:
+            blockers.append("not_enough_series_diversity")
+        if ticket_count < thresholds["min_trade_positive_shadow_rooms"]:
+            blockers.append("no_trade_positive_shadow_examples")
+        if settled_count < thresholds["min_settled_shadow_rooms"]:
+            blockers.append("not_enough_settled_shadow_rooms")
+        if missing_trace_count:
+            blockers.append("missing_decision_traces")
+        if research_health_present_count < complete_count:
+            blockers.append("research_health_missing")
+
+        return {
+            "window_days": self.settings.training_window_days,
+            "complete_weather_shadow_rooms": complete_count,
+            "market_diversity_count": len(set(market_tickers)),
+            "series_diversity_count": len(series_tickers),
+            "series_tickers": series_tickers,
+            "deterministic_trace_count": trace_count,
+            "deterministic_trace_coverage": round(trace_count / complete_count, 4) if complete_count else 0.0,
+            "missing_trace_count": missing_trace_count,
+            "trade_ticket_count": ticket_count,
+            "risk_verdict_count": risk_verdict_count,
+            "risk_approved_count": risk_approved_count,
+            "risk_blocked_count": risk_blocked_count,
+            "orders_submitted_count": orders_submitted_count,
+            "good_research_room_count": good_research_count,
+            "research_health_present_count": research_health_present_count,
+            "settled_room_count": settled_count,
+            "ready_for_baseline_collection": not blockers,
+            "top_blockers": blockers,
+            "thresholds": thresholds,
+        }
+
+    def _is_weather_shadow_bundle(self, bundle: TrainingRoomBundle) -> bool:
+        origin = bundle.room_origin or bundle.room.get("room_origin")
+        if origin != RoomOrigin.SHADOW.value:
+            return False
+        ticker = str(bundle.room.get("market_ticker") or "")
+        if not ticker:
+            return False
+        return self.weather_directory.supports_market_ticker(ticker)
+
+    def _series_ticker_for_bundle(self, bundle: TrainingRoomBundle) -> str:
+        ticker = str(bundle.room.get("market_ticker") or "")
+        mapping = self.weather_directory.resolve_market_stub(ticker)
+        if mapping is not None and mapping.series_ticker:
+            return mapping.series_ticker
+        return ticker.split("-")[0] if ticker else "unknown"
 
     def _apply_mode_slice(self, mode: str, bundles: list[TrainingRoomBundle]) -> list[TrainingRoomBundle]:
         if mode != "evaluation-holdout":

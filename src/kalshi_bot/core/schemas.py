@@ -480,6 +480,8 @@ class TrainingRoomBundle(BaseModel):
     orders: list[dict[str, Any]] = Field(default_factory=list)
     fills: list[dict[str, Any]] = Field(default_factory=list)
     memory_note: dict[str, Any] | None = None
+    decision_trace_id: str | None = None
+    decision_trace_hash: str | None = None
     historical_provenance: dict[str, Any] | None = None
     market_source_kind: str | None = None
     weather_source_kind: str | None = None

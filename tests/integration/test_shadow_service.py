@@ -62,3 +62,41 @@ async def test_shadow_service_runs_sweep_and_creates_rooms(tmp_path) -> None:
     assert supervisor.calls == [(rooms[0].id, "shadow_test")]
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shadow_service_forces_room_shadow_mode_when_app_is_live_capable(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/shadow-live-capable.db",
+        app_shadow_mode=False,
+        app_enable_kill_switch=False,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_kill_switch_enabled=False)
+        await session.commit()
+
+    service = ShadowTrainingService(
+        settings,
+        session_factory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        AgentPackService(settings),
+        FakeSupervisor(),
+    )
+
+    result = await service.create_shadow_room("KXHIGHNY-26APR11-T68")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        room = await repo.get_room(result.room_id)
+        await session.commit()
+
+    assert room is not None
+    assert room.shadow_mode is True
+    assert room.kill_switch_enabled is False
+
+    await engine.dispose()

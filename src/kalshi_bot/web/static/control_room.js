@@ -157,6 +157,17 @@
     return String(Math.round(numeric));
   }
 
+  function formatPercent(value) {
+    if (value === null || value === undefined || value === "") {
+      return "0%";
+    }
+    const numeric = Number(value);
+    if (Number.isNaN(numeric)) {
+      return String(value);
+    }
+    return `${Math.round(numeric * 100)}%`;
+  }
+
   function formatRelativeTime(value, options) {
     const date = parseDate(value);
     if (!date) {
@@ -758,6 +769,7 @@
 
     if (tabKey === "quality") {
       const quality = payload.quality || {};
+      const shadowWeather = quality.shadow_weather_readiness || {};
       shell.append(
         accordionCard(
           "Build Actions",
@@ -774,6 +786,30 @@
             );
             wrap.append(rows);
             return wrap;
+          })(),
+          true
+        ),
+        accordionCard(
+          "Shadow Weather Coverage",
+          `${formatInteger(shadowWeather.complete_weather_shadow_rooms || 0)} rooms · ${formatPercent(shadowWeather.deterministic_trace_coverage || 0)} trace coverage`,
+          (() => {
+            const stack = element("div", "stack");
+            stack.append(
+              compactStatGrid([
+                { label: "Complete Rooms", value: formatInteger(shadowWeather.complete_weather_shadow_rooms || 0) },
+                { label: "Series", value: formatInteger(shadowWeather.series_diversity_count || 0) },
+                { label: "Traces", value: `${formatInteger(shadowWeather.deterministic_trace_count || 0)}/${formatInteger(shadowWeather.complete_weather_shadow_rooms || 0)}` },
+                { label: "Trade Tickets", value: formatInteger(shadowWeather.trade_ticket_count || 0) },
+                { label: "Risk Verdicts", value: formatInteger(shadowWeather.risk_verdict_count || 0) },
+                { label: "Settled", value: formatInteger(shadowWeather.settled_room_count || 0) },
+              ])
+            );
+            const blockers = element("div", "token-list");
+            (shadowWeather.top_blockers || []).forEach((item) => blockers.append(element("span", ["token-chip", "token-chip-bad"], formatKey(item))));
+            if (blockers.childNodes.length) {
+              stack.append(blockers);
+            }
+            return stack;
           })(),
           true
         ),

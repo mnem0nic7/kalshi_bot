@@ -119,6 +119,39 @@ kalshi-bot-cli shadow-sweep --limit 3
 kalshi-bot-cli shadow-campaign run --limit 3
 ```
 
+`shadow-run`, `shadow-sweep`, and `shadow-campaign run` always create room-level shadow rooms, even when the app is configured live-capable. A shadow CLI run should emit a `decision_trace_id`; treat a missing trace as a failed shadow environment check.
+
+## Baseline + Shadow Loop
+
+Use this loop when the goal is a buildable baseline, not autonomous promotion:
+
+```bash
+kalshi-bot-cli historical-status --verbose
+kalshi-bot-cli training-build historical \
+  --mode bundles \
+  --date-from 2025-05-01 \
+  --date-to 2026-04-30 \
+  --output data/training/historical_baseline_bundles.jsonl
+kalshi-bot-cli training-build historical \
+  --mode decision-eval \
+  --date-from 2025-05-01 \
+  --date-to 2026-04-30 \
+  --output data/training/historical_decision_baseline.jsonl
+kalshi-bot-cli shadow-campaign run --limit 3 --reason baseline_shadow_collection
+kalshi-bot-cli training-build \
+  --mode room-bundles \
+  --origins shadow \
+  --no-quality-cleaned-only \
+  --output data/training/forward_shadow_bundles.jsonl
+kalshi-bot-cli baseline-model-card \
+  --historical data/training/historical_decision_baseline.jsonl \
+  --shadow data/training/forward_shadow_bundles.jsonl \
+  --output data/training/baseline_model_card.json
+kalshi-bot-cli training-build-list
+```
+
+The first usable baseline is the broad historical replay bundle, the full-checkpoint decision-eval slice, and trace-checked shadow rooms. Keep candidate promotion blocked until `historical-status` shows the support thresholds met: 60 execution-usable market-days, 30 full-checkpoint directional market-days, and 7 full-checkpoint holdout days.
+
 The control room index page now uses a top-tabbed dashboard layout with a summary strip at the top and lazy-loaded `Overview`, `Training & Historical`, `Research`, `Rooms`, and `Operations` tabs.
 It still offers the same operator actions like `Run Shadow Room`, grouped dataset builds, kill-switch and color promotion controls, but the heavy historical and training views now stay out of the initial page load until their tab is opened.
 The summary strip and bootstrap path now compute `Research Confidence` from cached research dossiers instead of live all-city discovery, and the `Room Outcomes` card uses lightweight room outcome snapshots instead of full room-bundle exports. `/` and `/api/control-room/summary` should stay fast even after expanding to every configured city and a larger 24-hour room history.
@@ -138,7 +171,8 @@ Use the training-first commands to keep the weather corpus clean and reproducibl
 ```bash
 kalshi-bot-cli training-status
 kalshi-bot-cli research-audit --limit 20
-kalshi-bot-cli training-build --mode room-bundles --good-research-only
+kalshi-bot-cli training-build --mode room-bundles --origins shadow --no-quality-cleaned-only --output data/training/forward_shadow_bundles.jsonl
+kalshi-bot-cli baseline-model-card
 kalshi-bot-cli training-build --mode role-sft --good-research-only
 kalshi-bot-cli training-build --mode evaluation-holdout --settled-only
 kalshi-bot-cli training-build-list

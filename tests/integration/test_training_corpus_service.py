@@ -7,8 +7,8 @@ import pytest
 
 from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import RoomStage
-from kalshi_bot.core.schemas import RoomCreate, StrategyAuditResult, TrainingBuildRequest, TrainingRoomBundle, TrainingRoomOutcome
+from kalshi_bot.core.enums import ContractSide, RiskStatus, RoomStage, TradeAction
+from kalshi_bot.core.schemas import RoomCreate, StrategyAuditResult, TradeTicket, TrainingBuildRequest, TrainingRoomBundle, TrainingRoomOutcome
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.orchestration.supervisor import WorkflowSupervisor
@@ -431,6 +431,146 @@ async def test_training_status_separates_active_and_legacy_failure_noise(tmp_pat
     assert status["quality_debt_summary"]["recent_stale_mismatch_count"] == 1
     assert status["settlement_maturity"]["status_counts"]["possible_ingestion_gap"] == 1
     assert status["unsettled_backlog_by_market"] == {"KXHIGHNY-26APR12-T70": 1}
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_training_build_origins_shadow_and_shadow_weather_readiness_excludes_crypto(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/shadow-origin-filter.db",
+        app_color="blue",
+        app_shadow_mode=False,
+        training_status_room_limit=20,
+        training_min_complete_rooms=25,
+        training_min_market_diversity=4,
+        training_min_settled_rooms=10,
+        training_min_trade_positive_rooms=8,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    directory = WeatherMarketDirectory(
+        {},
+        {
+            "KXHIGHNY": WeatherSeriesTemplate(
+                series_ticker="KXHIGHNY",
+                display_name="NYC Daily High Temperature",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+            )
+        },
+    )
+
+    class NoopDiscoveryService:
+        async def discover_configured_markets(self):
+            return []
+
+    corpus_service = TrainingCorpusService(
+        settings,
+        session_factory,
+        NoopDiscoveryService(),  # type: ignore[arg-type]
+        TrainingExportService(session_factory),
+        directory,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue", initial_kill_switch_enabled=False)
+        traced_shadow = await repo.create_room(
+            RoomCreate(name="shadow traced", market_ticker="KXHIGHNY-26APR12-T70"),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        untraced_shadow = await repo.create_room(
+            RoomCreate(name="shadow untraced", market_ticker="KXHIGHNY-26APR13-T71"),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        crypto_shadow = await repo.create_room(
+            RoomCreate(name="crypto shadow", market_ticker="KXBNB15M-26MAY011015-15"),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        live_room = await repo.create_room(
+            RoomCreate(name="live room", market_ticker="KXHIGHNY-26APR14-T72"),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+        )
+        for room in (traced_shadow, untraced_shadow, crypto_shadow, live_room):
+            await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+        ticket = await repo.save_trade_ticket(
+            traced_shadow.id,
+            TradeTicket(
+                market_ticker=traced_shadow.market_ticker,
+                action=TradeAction.BUY,
+                side=ContractSide.YES,
+                yes_price_dollars="0.5000",
+                count_fp="1.00",
+            ),
+            client_order_id="shadow-origin-filter-ticket",
+        )
+        await repo.save_risk_verdict(
+            room_id=traced_shadow.id,
+            ticket_id=ticket.id,
+            status=RiskStatus.BLOCKED,
+            reasons=["test block"],
+            approved_notional_dollars=None,
+            approved_count_fp=None,
+            payload={"status": "blocked"},
+        )
+        await repo.save_decision_trace(
+            room_id=traced_shadow.id,
+            ticket_id=ticket.id,
+            market_ticker=traced_shadow.market_ticker,
+            kalshi_env=settings.kalshi_env,
+            decision_kind="stand_down",
+            path_version="test.v1",
+            source_snapshot_ids={},
+            input_hash="a" * 64,
+            trace_hash="b" * 64,
+            trace={"normalized_intent": {"decision_kind": "stand_down"}},
+        )
+        await session.commit()
+
+    build = await corpus_service.build_dataset(
+        TrainingBuildRequest(
+            mode="room-bundles",
+            limit=10,
+            days=30,
+            origins=["shadow"],
+            quality_cleaned_only=False,
+        )
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        items = await repo.list_training_dataset_build_items(build["build"]["id"])
+        await session.commit()
+
+    status = await corpus_service.get_status(persist_readiness=False)
+    shadow_readiness = status["shadow_weather_readiness"]
+
+    assert build["build"]["filters"]["origins"] == ["shadow"]
+    assert build["build"]["room_count"] == 3
+    assert {item.room_id for item in items} == {traced_shadow.id, untraced_shadow.id, crypto_shadow.id}
+    assert shadow_readiness["complete_weather_shadow_rooms"] == 2
+    assert shadow_readiness["series_diversity_count"] == 1
+    assert shadow_readiness["deterministic_trace_count"] == 1
+    assert shadow_readiness["trade_ticket_count"] == 1
+    assert shadow_readiness["risk_verdict_count"] == 1
+    assert "missing_decision_traces" in shadow_readiness["top_blockers"]
+    assert "not_enough_shadow_rooms" in shadow_readiness["top_blockers"]
 
     await engine.dispose()
 

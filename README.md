@@ -86,7 +86,8 @@ kalshi-bot-cli research-show KXHIGHNY-26APR11-T68
 kalshi-bot-cli research-failures
 kalshi-bot-cli research-audit --limit 20
 kalshi-bot-cli training-status
-kalshi-bot-cli training-build --mode room-bundles --good-research-only
+kalshi-bot-cli training-build --mode room-bundles --origins shadow --no-quality-cleaned-only --output data/training/forward_shadow_bundles.jsonl
+kalshi-bot-cli baseline-model-card
 kalshi-bot-cli historical-status --verbose
 kalshi-bot-cli historical-import weather --date-from 2026-03-01 --date-to 2026-03-31
 kalshi-bot-cli historical-backfill market --date-from 2026-03-01 --date-to 2026-03-31

@@ -230,6 +230,23 @@ def _serialize_research_run(run) -> dict:
     }
 
 
+def _serialize_decision_trace(record) -> dict | None:
+    if record is None:
+        return None
+    return {
+        "id": record.id,
+        "room_id": record.room_id,
+        "market_ticker": record.market_ticker,
+        "kalshi_env": record.kalshi_env,
+        "decision_kind": record.decision_kind,
+        "path_version": record.path_version,
+        "input_hash": record.input_hash,
+        "trace_hash": record.trace_hash,
+        "decision_time": record.decision_time.isoformat(),
+        "created_at": record.created_at.isoformat(),
+    }
+
+
 def _latest_message_by_role(messages: list[dict], role: str) -> dict | None:
     for message in reversed(messages):
         if message["role"] == role:
@@ -447,6 +464,7 @@ async def load_room_snapshot(app_container: AppContainer, room_id: str, *, inclu
         campaign = await repo.get_room_campaign(room_id)
         research_health = await repo.get_room_research_health(room_id)
         strategy_audit = await repo.get_room_strategy_audit(room_id)
+        decision_trace = await repo.get_latest_decision_trace_for_room(room_id)
         dossier_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="research_dossier_snapshot")
         delta_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="research_delta")
         market_artifact = await repo.get_latest_artifact(room_id=room_id, artifact_type="market_snapshot")
@@ -467,6 +485,7 @@ async def load_room_snapshot(app_container: AppContainer, room_id: str, *, inclu
     serialized_campaign = _serialize_campaign(campaign)
     serialized_research_health = _serialize_research_health(research_health)
     serialized_strategy_audit = dict(strategy_audit.payload or {}) if strategy_audit is not None else None
+    serialized_decision_trace = _serialize_decision_trace(decision_trace)
     serialized_sources = [artifact.payload for artifact in source_artifacts]
     research_dossier = (
         dossier_artifact.payload
@@ -489,6 +508,7 @@ async def load_room_snapshot(app_container: AppContainer, room_id: str, *, inclu
         "campaign": serialized_campaign,
         "research_health": serialized_research_health,
         "strategy_audit": serialized_strategy_audit,
+        "decision_trace": serialized_decision_trace,
         "research_dossier": research_dossier,
         "research_delta": research_delta,
         "research_sources": serialized_sources,
