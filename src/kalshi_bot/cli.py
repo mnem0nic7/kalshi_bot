@@ -581,6 +581,31 @@ async def _run_crypto_status_command(container: AppContainer) -> int:
     return 0
 
 
+async def _run_crypto_asset_mode_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.crypto_asset_mode_command == "list":
+        asset_symbols: list[str] | None = None
+        try:
+            markets = await container.crypto_market_service.discover_markets(
+                frequency=args.frequency,
+                status="open",
+                persist=False,
+            )
+            asset_symbols = sorted({market.asset_symbol for market in markets})
+        except Exception:
+            asset_symbols = None
+        result = await container.crypto_asset_control_service.list_asset_modes(asset_symbols=asset_symbols)
+    elif args.crypto_asset_mode_command == "set":
+        result = await container.crypto_asset_control_service.set_asset_mode(
+            args.symbol,
+            args.mode,
+            actor="cli",
+        )
+    else:
+        raise ValueError(f"unknown crypto-asset-mode command {args.crypto_asset_mode_command}")
+    print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
 async def _run_reconcile_command(
     container: AppContainer,
     repo: PlatformRepository,
@@ -838,6 +863,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "crypto-status":
             return await _run_crypto_status_command(container)
+
+        if args.command == "crypto-asset-mode":
+            return await _run_crypto_asset_mode_command(args, container)
 
         if args.command == "research-refresh":
             dossier = await container.research_coordinator.refresh_market_dossier(
@@ -1698,6 +1726,14 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_replay_gate.add_argument("--frequency", default="15m")
 
     subparsers.add_parser("crypto-status")
+
+    crypto_asset_mode = subparsers.add_parser("crypto-asset-mode")
+    crypto_asset_mode_subparsers = crypto_asset_mode.add_subparsers(dest="crypto_asset_mode_command", required=True)
+    crypto_asset_mode_list = crypto_asset_mode_subparsers.add_parser("list")
+    crypto_asset_mode_list.add_argument("--frequency", default="15m")
+    crypto_asset_mode_set = crypto_asset_mode_subparsers.add_parser("set")
+    crypto_asset_mode_set.add_argument("symbol")
+    crypto_asset_mode_set.add_argument("mode", choices=["off", "shadow", "live"])
 
     create_room = subparsers.add_parser("create-room")
     create_room.add_argument("--name", required=True)

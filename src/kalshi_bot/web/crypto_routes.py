@@ -7,9 +7,14 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from kalshi_bot.services.container import AppContainer
 from kalshi_bot.web.background_tasks import schedule_logged_task
+
+
+class CryptoAssetModeRequest(BaseModel):
+    mode: str
 
 
 def create_crypto_router(
@@ -73,5 +78,26 @@ def create_crypto_router(
             logger=logger,
         )
         return JSONResponse({"status": "scheduled", **result})
+
+    @router.patch("/api/crypto/assets/{asset_symbol}/mode")
+    async def set_crypto_asset_mode(
+        asset_symbol: str,
+        payload: CryptoAssetModeRequest,
+        request: Request,
+    ) -> JSONResponse:
+        app_container = container(request)
+        actor = "operator"
+        current_user = getattr(request.state, "current_user", None)
+        if current_user is not None:
+            actor = str(getattr(current_user, "email", None) or getattr(current_user, "id", None) or actor)
+        try:
+            result = await app_container.crypto_asset_control_service.set_asset_mode(
+                asset_symbol,
+                payload.mode,
+                actor=actor,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(jsonable_encoder(result))
 
     return router

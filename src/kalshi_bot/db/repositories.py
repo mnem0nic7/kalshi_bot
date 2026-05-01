@@ -316,6 +316,17 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(Room.kalshi_env == kalshi_env)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def get_latest_room_for_market(
+        self,
+        market_ticker: str,
+        *,
+        kalshi_env: str | None = None,
+    ) -> Room | None:
+        stmt = select(Room).where(Room.market_ticker == market_ticker).order_by(Room.updated_at.desc()).limit(1)
+        if kalshi_env is not None:
+            stmt = stmt.where(Room.kalshi_env == kalshi_env)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def reap_orphaned_rooms(self, *, color: str, kalshi_env: str | None = None) -> list[str]:
         """Mark all non-terminal rooms for *color* as failed. Returns IDs reaped."""
         stmt = select(Room).where(

@@ -45,6 +45,7 @@ def test_extracted_web_routers_preserve_registered_paths() -> None:
         "/api/crypto/markets",
         "/api/crypto/markets/{market_ticker}",
         "/api/crypto/markets/{market_ticker}/rooms",
+        "/api/crypto/assets/{asset_symbol}/mode",
         "/api/strategies/codex/runs",
         "/api/strategies/codex/runs/{run_id}",
         "/api/strategies/codex/runs/{run_id}/accept",

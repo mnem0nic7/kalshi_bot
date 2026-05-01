@@ -32,7 +32,8 @@
 
 .crypto-actions select,
 .crypto-actions button,
-.crypto-room-button {
+.crypto-room-button,
+.crypto-mode-select {
   min-height: 2.2rem;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 999px;
@@ -42,7 +43,8 @@
   font-size: 0.88rem;
 }
 
-.crypto-actions select {
+.crypto-actions select,
+.crypto-mode-select {
   padding: 0 2rem 0 0.8rem;
 }
 
@@ -59,7 +61,7 @@
 
 .crypto-status-strip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 0.75rem;
 }
 
@@ -109,6 +111,12 @@
   gap: 0.75rem;
 }
 
+.crypto-card-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+}
+
 .crypto-asset {
   display: flex;
   align-items: center;
@@ -131,6 +139,39 @@
   color: #a9b4c2;
   font-size: 0.74rem;
   font-weight: 800;
+}
+
+.crypto-mode {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.25rem;
+  padding: 0 0.45rem;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.crypto-mode-shadow {
+  color: #dfe8f5;
+  background: rgba(111, 140, 255, 0.15);
+}
+
+.crypto-mode-live {
+  color: #23f0a2;
+  background: rgba(35, 240, 162, 0.12);
+}
+
+.crypto-mode-off {
+  color: #ffcc66;
+  background: rgba(255, 204, 102, 0.12);
+}
+
+.crypto-mode-select {
+  width: 7.4rem;
+  min-width: 7.4rem;
+  font-size: 0.78rem;
 }
 
 .crypto-title {
@@ -158,6 +199,15 @@
 .crypto-live-label {
   color: #ff4f7b;
   font-weight: 800;
+}
+
+.crypto-live-blockers {
+  padding: 0.55rem 0.65rem;
+  border-left: 3px solid #ffcc66;
+  color: #ffde99;
+  background: rgba(255, 204, 102, 0.08);
+  font-size: 0.76rem;
+  line-height: 1.35;
 }
 
 .crypto-sides {
@@ -242,6 +292,15 @@
 
   .crypto-actions {
     justify-content: space-between;
+  }
+
+  .crypto-card-header {
+    align-items: flex-start;
+  }
+
+  .crypto-card-actions {
+    align-items: flex-end;
+    flex-direction: column;
   }
 
   .crypto-status-strip,

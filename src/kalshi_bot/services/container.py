@@ -11,6 +11,8 @@ from kalshi_bot.agents.room_agents import AgentSuite
 from kalshi_bot.config import Settings, get_settings
 from kalshi_bot.core.enums import DeploymentColor
 from kalshi_bot.crypto.services import (
+    CryptoAssetControlService,
+    CryptoAutonomyService,
     CryptoExecutionService,
     CryptoForecastService,
     CryptoHistoryService,
@@ -114,6 +116,8 @@ class AppContainer:
     trade_analysis_service: TradeAnalysisService
     trading_audit_service: TradingAuditService
     market_history_service: MarketHistoryService
+    crypto_asset_control_service: CryptoAssetControlService
+    crypto_autonomy_service: CryptoAutonomyService
     crypto_market_service: CryptoMarketService
     crypto_history_service: CryptoHistoryService
     crypto_forecast_service: CryptoForecastService
@@ -172,11 +176,16 @@ class AppContainer:
         signal_calibration_service = SignalCalibrationService(session_factory)
         risk_engine = DeterministicRiskEngine(settings)
         execution_service = ExecutionService(settings, kalshi)
+        crypto_asset_control_service = CryptoAssetControlService(
+            settings=settings,
+            session_factory=session_factory,
+        )
         crypto_market_service = CryptoMarketService(
             settings=settings,
             session_factory=session_factory,
             kalshi=kalshi,
             agent_pack_service=agent_pack_service,
+            asset_control_service=crypto_asset_control_service,
         )
         crypto_forecast_service = CryptoForecastService(
             settings=settings,
@@ -190,6 +199,7 @@ class AppContainer:
             settings=settings,
             session_factory=session_factory,
             base_execution_service=execution_service,
+            asset_control_service=crypto_asset_control_service,
         )
         memory_service = MemoryService()
         watchdog_service = WatchdogService(settings)
@@ -292,6 +302,14 @@ class AppContainer:
             forecast_service=crypto_forecast_service,
             risk_engine=risk_engine,
             execution_service=crypto_execution_service,
+            asset_control_service=crypto_asset_control_service,
+        )
+        crypto_autonomy_service = CryptoAutonomyService(
+            settings=settings,
+            session_factory=session_factory,
+            market_service=crypto_market_service,
+            asset_control_service=crypto_asset_control_service,
+            workflow_service=crypto_workflow_service,
         )
         shadow_training_service = ShadowTrainingService(
             settings,
@@ -403,6 +421,7 @@ class AppContainer:
             stop_loss_service=stop_loss_service,
             momentum_calibration_service=momentum_calibration_service,
             decision_corpus_service=decision_corpus_service,
+            crypto_autonomy_service=crypto_autonomy_service,
         )
         container = cls(
             settings=settings,
@@ -450,6 +469,8 @@ class AppContainer:
             trade_analysis_service=trade_analysis_service,
             trading_audit_service=trading_audit_service,
             market_history_service=market_history_service,
+            crypto_asset_control_service=crypto_asset_control_service,
+            crypto_autonomy_service=crypto_autonomy_service,
             crypto_market_service=crypto_market_service,
             crypto_history_service=crypto_history_service,
             crypto_forecast_service=crypto_forecast_service,

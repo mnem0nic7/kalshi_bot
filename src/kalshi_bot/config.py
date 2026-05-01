@@ -144,6 +144,9 @@ class Settings(BaseSettings):
     crypto_replay_max_hard_cap_breaches: int = 0
     crypto_replay_require_calibration_better_than_mid: bool = True
     crypto_default_order_count_fp: float = 1.0
+    crypto_autonomy_enabled: bool = False
+    crypto_autonomy_interval_seconds: int = 60
+    crypto_autonomy_min_seconds_to_close: int = 120
 
     stop_loss_threshold_pct: float = 0.10
     stop_loss_profit_protection_threshold_pct: float = 0.15

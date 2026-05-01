@@ -38,6 +38,27 @@
     return `$${number.toLocaleString()} vol`;
   }
 
+  function escapeHtml(value) {
+    return String(value === null || value === undefined ? "" : value).replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    })[char]);
+  }
+
+  function modeLabel(mode) {
+    if (mode === "live") return "Live";
+    if (mode === "off") return "Off";
+    return "Shadow";
+  }
+
+  function blockerText(market) {
+    const blockers = Array.isArray(market.live_blockers) ? market.live_blockers : [];
+    return blockers.slice(0, 3).join(" ");
+  }
+
   function assetColor(symbol) {
     const colors = {
       BTC: "#ff9f1c",
@@ -71,11 +92,14 @@
   function renderStatus() {
     const gate = (state.payload || {}).replay_gate || {};
     const settings = (state.payload || {}).settings || {};
+    const counts = (state.payload || {}).asset_mode_counts || {};
     const markets = (state.payload || {}).markets || [];
     const items = [
       ["Markets", markets.length],
       ["Replay Gate", gate.status || "missing"],
       ["Trading", settings.crypto_trading_enabled ? "enabled" : "disabled"],
+      ["Autonomy", settings.crypto_autonomy_enabled ? "enabled" : "disabled"],
+      ["Live Assets", counts.live || 0],
       ["Updated", timeLabel((state.payload || {}).updated_at)],
     ];
     statusEl.innerHTML = items
@@ -92,27 +116,41 @@
     const title = `${market.asset_symbol || "CRYPTO"} 15 min · ${target} target`;
     const iconText = String(market.asset_symbol || "?").slice(0, 2);
     const iconColor = assetColor(market.asset_symbol);
+    const mode = market.asset_mode || ((state.payload || {}).asset_modes || {})[market.asset_symbol] || "shadow";
+    const blockers = blockerText(market);
+    const blockersHtml = mode === "live" && blockers
+      ? `<div class="crypto-live-blockers">Live blocked: ${escapeHtml(blockers)}</div>`
+      : "";
     return `
-      <article class="crypto-card" data-market="${market.market_ticker}">
+      <article class="crypto-card crypto-card-${mode}" data-market="${escapeHtml(market.market_ticker)}">
         <div class="crypto-card-header">
           <div>
             <div class="crypto-asset">
-              <span class="crypto-icon" style="background:${iconColor}">${iconText}</span>
-              <span class="crypto-symbol">${market.asset_symbol || "CRYPTO"}</span>
+              <span class="crypto-icon" style="background:${iconColor}">${escapeHtml(iconText)}</span>
+              <span class="crypto-symbol">${escapeHtml(market.asset_symbol || "CRYPTO")}</span>
+              <span class="crypto-mode crypto-mode-${mode}">${modeLabel(mode)}</span>
             </div>
-            <h2 class="crypto-title">${title}</h2>
+            <h2 class="crypto-title">${escapeHtml(title)}</h2>
             <div class="crypto-meta">
               <span class="crypto-live-dot"></span>
-              <span class="crypto-live-label">${market.status || "live"}</span>
-              <span>${timeLabel(market.close_time)}</span>
+              <span class="crypto-live-label">${escapeHtml(market.status || "live")}</span>
+              <span>${escapeHtml(timeLabel(market.close_time))}</span>
             </div>
           </div>
-          ${
-            room
-              ? `<a class="crypto-room-button" href="/rooms/${room.id}">Room</a>`
-              : `<button class="crypto-room-button" type="button" data-room-market="${market.market_ticker}">Room</button>`
-          }
+          <div class="crypto-card-actions">
+            <select class="crypto-mode-select" data-asset-mode="${escapeHtml(market.asset_symbol || "")}" aria-label="${escapeHtml(market.asset_symbol || "crypto")} mode">
+              <option value="off"${mode === "off" ? " selected" : ""}>Off</option>
+              <option value="shadow"${mode === "shadow" ? " selected" : ""}>Shadow</option>
+              <option value="live"${mode === "live" ? " selected" : ""}>Live</option>
+            </select>
+            ${
+              room
+                ? `<a class="crypto-room-button" href="/rooms/${escapeHtml(room.id)}">Room</a>`
+                : `<button class="crypto-room-button" type="button" data-room-market="${escapeHtml(market.market_ticker)}">Room</button>`
+            }
+          </div>
         </div>
+        ${blockersHtml}
         <div class="crypto-sides">
           <div class="crypto-side-row">
             <span class="crypto-side-name">Up</span>
@@ -126,8 +164,8 @@
           </div>
         </div>
         <div class="crypto-card-footer">
-          <span>${formatVolume(market.volume)}</span>
-          <span class="crypto-gate crypto-gate-${gateStatus}">${gateStatus}</span>
+          <span>${escapeHtml(formatVolume(market.volume))}</span>
+          <span class="crypto-gate crypto-gate-${escapeHtml(gateStatus)}">${escapeHtml(gateStatus)}</span>
           <span>${Math.abs(Number(signal.edge_bps || 0))} bps</span>
         </div>
       </article>
@@ -164,10 +202,31 @@
     if (payload.redirect) window.location.href = payload.redirect;
   }
 
+  async function setAssetMode(symbol, mode) {
+    if (!symbol) return;
+    const response = await fetch(`/api/crypto/assets/${encodeURIComponent(symbol)}/mode`, {
+      method: "PATCH",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    if (response.ok) {
+      await refresh();
+    } else {
+      render();
+    }
+  }
+
   gridEl.addEventListener("click", (event) => {
     const button = event.target.closest("[data-room-market]");
     if (button) {
       createRoom(button.getAttribute("data-room-market"));
+    }
+  });
+
+  gridEl.addEventListener("change", (event) => {
+    const select = event.target.closest("[data-asset-mode]");
+    if (select) {
+      setAssetMode(select.getAttribute("data-asset-mode"), select.value);
     }
   });
 

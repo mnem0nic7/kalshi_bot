@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -31,7 +31,6 @@ from kalshi_bot.crypto.parsing import (
     normalize_frequency,
     parse_crypto_market,
     parse_crypto_series,
-    parse_datetime,
 )
 from kalshi_bot.db.models import CryptoMarketSnapshotRecord, Room
 from kalshi_bot.db.repositories import PlatformRepository
@@ -42,6 +41,16 @@ from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext, appro
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
 
 logger = logging.getLogger(__name__)
+
+CRYPTO_ASSET_MODES_KEY = "crypto_asset_modes"
+CRYPTO_ASSET_MODE_OFF = "off"
+CRYPTO_ASSET_MODE_SHADOW = "shadow"
+CRYPTO_ASSET_MODE_LIVE = "live"
+CRYPTO_ASSET_MODES = {
+    CRYPTO_ASSET_MODE_OFF,
+    CRYPTO_ASSET_MODE_SHADOW,
+    CRYPTO_ASSET_MODE_LIVE,
+}
 
 
 def _version(prefix: str, payload: dict[str, Any]) -> str:
@@ -66,6 +75,177 @@ def _rows_from_response(response: dict[str, Any], key: str) -> list[dict[str, An
     return []
 
 
+def normalize_asset_symbol(asset_symbol: str) -> str:
+    normalized = "".join(ch for ch in str(asset_symbol or "").strip().upper() if ch.isalnum())
+    if not normalized:
+        raise ValueError("asset_symbol is required")
+    return normalized
+
+
+def normalize_asset_mode(mode: str) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized not in CRYPTO_ASSET_MODES:
+        raise ValueError(f"unsupported crypto asset mode: {mode}")
+    return normalized
+
+
+class CryptoAssetControlService:
+    def __init__(self, *, settings: Settings, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self.settings = settings
+        self.session_factory = session_factory
+
+    @staticmethod
+    def normalize_symbol(asset_symbol: str) -> str:
+        return normalize_asset_symbol(asset_symbol)
+
+    @staticmethod
+    def normalize_mode(mode: str) -> str:
+        return normalize_asset_mode(mode)
+
+    def modes_from_notes(self, notes: dict[str, Any] | None) -> dict[str, str]:
+        raw_modes = (notes or {}).get(CRYPTO_ASSET_MODES_KEY) or {}
+        if not isinstance(raw_modes, dict):
+            return {}
+        modes: dict[str, str] = {}
+        for raw_symbol, raw_mode in raw_modes.items():
+            try:
+                symbol = normalize_asset_symbol(str(raw_symbol))
+                mode = normalize_asset_mode(str(raw_mode))
+            except ValueError:
+                continue
+            modes[symbol] = mode
+        return modes
+
+    def mode_for_control(self, control: Any, asset_symbol: str) -> str:
+        symbol = normalize_asset_symbol(asset_symbol)
+        return self.modes_from_notes(getattr(control, "notes", None)).get(symbol, CRYPTO_ASSET_MODE_SHADOW)
+
+    def asset_mode_summary(
+        self,
+        *,
+        asset_symbols: list[str] | None,
+        modes: dict[str, str],
+    ) -> dict[str, Any]:
+        symbols = {normalize_asset_symbol(symbol) for symbol in (asset_symbols or []) if str(symbol or "").strip()}
+        symbols.update(modes)
+        resolved = {symbol: modes.get(symbol, CRYPTO_ASSET_MODE_SHADOW) for symbol in sorted(symbols)}
+        counts = {mode: 0 for mode in sorted(CRYPTO_ASSET_MODES)}
+        for mode in resolved.values():
+            counts[mode] = counts.get(mode, 0) + 1
+        return {"modes": resolved, "counts": counts}
+
+    def global_live_blockers(
+        self,
+        *,
+        control: Any,
+        replay_gate: Any | None,
+        has_write_credentials: bool,
+        frequency: str = "15m",
+    ) -> list[str]:
+        blockers: list[str] = []
+        normalized_frequency = normalize_frequency(frequency) or "15m"
+        if not self.settings.crypto_enabled:
+            blockers.append("Crypto is disabled.")
+        if normalized_frequency == "15m" and not self.settings.crypto_15m_enabled:
+            blockers.append("15-minute crypto is disabled.")
+        if not self.settings.crypto_trading_enabled:
+            blockers.append("Global crypto trading is disabled.")
+        if self.settings.app_shadow_mode:
+            blockers.append("App shadow mode is enabled.")
+        if getattr(control, "kill_switch_enabled", False):
+            blockers.append("Kill switch is enabled.")
+        active_color = str(getattr(control, "active_color", "") or "")
+        if active_color and active_color != self.settings.app_color:
+            blockers.append(f"Active color is {active_color}; this app is {self.settings.app_color}.")
+        gate_status = getattr(replay_gate, "status", None) if replay_gate is not None else None
+        if gate_status != "passed":
+            blockers.append(f"Crypto replay gate is {gate_status or 'missing'}.")
+        if not has_write_credentials:
+            blockers.append("Kalshi write credentials are missing.")
+        return blockers
+
+    def market_live_status(
+        self,
+        *,
+        control: Any,
+        replay_gate: Any | None,
+        market: CryptoMarket,
+        has_write_credentials: bool,
+    ) -> dict[str, Any]:
+        mode = self.mode_for_control(control, market.asset_symbol)
+        global_blockers = self.global_live_blockers(
+            control=control,
+            replay_gate=replay_gate,
+            has_write_credentials=has_write_credentials,
+            frequency=market.frequency,
+        )
+        blockers = list(global_blockers) if mode == CRYPTO_ASSET_MODE_LIVE else [
+            f"Asset {market.asset_symbol} mode is {mode}; set it to live to allow live orders."
+        ]
+        return {
+            "asset_mode": mode,
+            "live_eligible": mode == CRYPTO_ASSET_MODE_LIVE and not global_blockers,
+            "live_blockers": blockers,
+            "global_live_blockers": global_blockers,
+        }
+
+    async def list_asset_modes(
+        self,
+        *,
+        asset_symbols: list[str] | None = None,
+        kalshi_env: str | None = None,
+    ) -> dict[str, Any]:
+        env = kalshi_env or self.settings.kalshi_env
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=env)
+            control = await repo.get_deployment_control(kalshi_env=env)
+            modes = self.modes_from_notes(control.notes)
+            await session.commit()
+        return self.asset_mode_summary(asset_symbols=asset_symbols, modes=modes)
+
+    async def set_asset_mode(
+        self,
+        asset_symbol: str,
+        mode: str,
+        *,
+        kalshi_env: str | None = None,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        symbol = normalize_asset_symbol(asset_symbol)
+        normalized_mode = normalize_asset_mode(mode)
+        env = kalshi_env or self.settings.kalshi_env
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=env)
+            control = await repo.get_deployment_control(kalshi_env=env)
+            notes = dict(control.notes or {})
+            modes = self.modes_from_notes(notes)
+            previous_mode = modes.get(symbol, CRYPTO_ASSET_MODE_SHADOW)
+            modes[symbol] = normalized_mode
+            notes[CRYPTO_ASSET_MODES_KEY] = modes
+            control = await repo.update_deployment_notes(notes, kalshi_env=env)
+            await repo.log_ops_event(
+                severity="info",
+                summary=f"Crypto asset mode set: {symbol} {normalized_mode}",
+                source="crypto_asset_control",
+                payload={
+                    "asset_symbol": symbol,
+                    "mode": normalized_mode,
+                    "previous_mode": previous_mode,
+                    "actor": actor,
+                    "kalshi_env": env,
+                },
+                kalshi_env=env,
+            )
+            await session.commit()
+        return {
+            "status": "ok",
+            "asset_symbol": symbol,
+            "mode": normalized_mode,
+            "previous_mode": previous_mode,
+            "asset_modes": self.modes_from_notes(control.notes),
+        }
+
+
 class CryptoMarketService:
     def __init__(
         self,
@@ -74,11 +254,13 @@ class CryptoMarketService:
         session_factory: async_sessionmaker[AsyncSession],
         kalshi: KalshiClient,
         agent_pack_service: AgentPackService,
+        asset_control_service: CryptoAssetControlService,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.kalshi = kalshi
         self.agent_pack_service = agent_pack_service
+        self.asset_control_service = asset_control_service
 
     async def discover_series(self, *, frequency: str = "15m") -> list[CryptoSeries]:
         if not self.settings.crypto_enabled:
@@ -194,6 +376,7 @@ class CryptoMarketService:
             markets = _nearest_market_per_asset(markets)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             signal_payloads = await repo.latest_signal_payloads_for_markets(
                 market_tickers=[market.market_ticker for market in markets],
                 kalshi_env=self.settings.kalshi_env,
@@ -213,6 +396,17 @@ class CryptoMarketService:
                     active_rooms[market.market_ticker] = {"id": room.id, "stage": room.stage}
             await session.commit()
         gate_payload = gate.payload if gate is not None else {}
+        asset_symbols = sorted({market.asset_symbol for market in markets})
+        mode_summary = self.asset_control_service.asset_mode_summary(
+            asset_symbols=asset_symbols,
+            modes=self.asset_control_service.modes_from_notes(control.notes),
+        )
+        global_live_blockers = self.asset_control_service.global_live_blockers(
+            control=control,
+            replay_gate=gate,
+            has_write_credentials=self.kalshi.write_credentials is not None,
+            frequency=frequency,
+        )
         return {
             "market_domain": "crypto",
             "frequency": normalize_frequency(frequency) or "15m",
@@ -223,8 +417,12 @@ class CryptoMarketService:
                 "crypto_enabled": self.settings.crypto_enabled,
                 "crypto_15m_enabled": self.settings.crypto_15m_enabled,
                 "crypto_trading_enabled": self.settings.crypto_trading_enabled,
+                "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
                 "crypto_order_mode": self.settings.crypto_order_mode,
             },
+            "asset_modes": mode_summary["modes"],
+            "asset_mode_counts": mode_summary["counts"],
+            "global_live_blockers": global_live_blockers,
             "replay_gate": {
                 "status": gate.status if gate is not None else "missing",
                 "version": gate.version if gate is not None else None,
@@ -234,6 +432,12 @@ class CryptoMarketService:
             "markets": [
                 {
                     **market.to_payload(),
+                    **self.asset_control_service.market_live_status(
+                        control=control,
+                        replay_gate=gate,
+                        market=market,
+                        has_write_credentials=self.kalshi.write_credentials is not None,
+                    ),
                     "signal": signal_payloads.get(market.market_ticker),
                     "active_room": active_rooms.get(market.market_ticker),
                 }
@@ -248,6 +452,18 @@ class CryptoMarketService:
             repo = PlatformRepository(session)
             control = await repo.ensure_deployment_control(self.settings.app_color)
             pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+            gate = await repo.get_latest_crypto_model_artifact(
+                frequency=market.frequency,
+                artifact_type="replay_gate",
+                kalshi_env=self.settings.kalshi_env,
+            )
+            live_status = self.asset_control_service.market_live_status(
+                control=control,
+                replay_gate=gate,
+                market=market,
+                has_write_credentials=self.kalshi.write_credentials is not None,
+            )
+            shadow_mode = self.settings.app_shadow_mode or not live_status["live_eligible"]
             room = await repo.create_room(
                 RoomCreate(
                     name=f"{market.asset_symbol} 15 Minute Crypto",
@@ -256,14 +472,15 @@ class CryptoMarketService:
                         "Crypto 15m workflow. "
                         f"asset={market.asset_symbol} target={_money_text(market.target_price_dollars)} "
                         f"close_time={market.close_time.isoformat() if market.close_time else 'unknown'} "
+                        f"asset_mode={live_status['asset_mode']} live_eligible={live_status['live_eligible']} "
                         f"reason={reason}"
                     ),
                 ),
                 active_color=control.active_color,
-                shadow_mode=self.settings.app_shadow_mode or not self.settings.crypto_trading_enabled,
+                shadow_mode=shadow_mode,
                 kill_switch_enabled=control.kill_switch_enabled,
                 kalshi_env=self.settings.kalshi_env,
-                room_origin=RoomOrigin.SHADOW.value if self.settings.app_shadow_mode or not self.settings.crypto_trading_enabled else RoomOrigin.LIVE.value,
+                room_origin=RoomOrigin.SHADOW.value if shadow_mode else RoomOrigin.LIVE.value,
                 agent_pack_version=pack.version,
             )
             await repo.save_artifact(
@@ -275,15 +492,29 @@ class CryptoMarketService:
                     "market_domain": "crypto",
                     "frequency": market.frequency,
                     "strategy_code": StrategyCode.CRYPTO_15M.value,
+                    "asset_mode": live_status["asset_mode"],
+                    "live_eligible": live_status["live_eligible"],
+                    "live_blockers": live_status["live_blockers"],
+                    "global_live_blockers": live_status["global_live_blockers"],
+                    "reason": reason,
                     "market": market.to_payload(),
                 },
             )
             await session.commit()
-        return {"room_id": room.id, "redirect": f"/rooms/{room.id}", "market_ticker": market.market_ticker}
+        return {
+            "room_id": room.id,
+            "redirect": f"/rooms/{room.id}",
+            "market_ticker": market.market_ticker,
+            "asset_symbol": market.asset_symbol,
+            "asset_mode": live_status["asset_mode"],
+            "live_eligible": live_status["live_eligible"],
+            "live_blockers": live_status["live_blockers"],
+        }
 
     async def status(self, *, frequency: str = "15m") -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             snapshots = await repo.list_latest_crypto_market_snapshots(frequency=normalize_frequency(frequency) or "15m")
             model = await repo.get_latest_crypto_model_artifact(
                 frequency=normalize_frequency(frequency) or "15m",
@@ -296,13 +527,27 @@ class CryptoMarketService:
                 kalshi_env=self.settings.kalshi_env,
             )
             await session.commit()
+        asset_symbols = sorted({snapshot.asset_symbol for snapshot in snapshots})
+        mode_summary = self.asset_control_service.asset_mode_summary(
+            asset_symbols=asset_symbols,
+            modes=self.asset_control_service.modes_from_notes(control.notes),
+        )
         return {
             "market_domain": "crypto",
             "frequency": normalize_frequency(frequency) or "15m",
             "crypto_enabled": self.settings.crypto_enabled,
             "crypto_15m_enabled": self.settings.crypto_15m_enabled,
             "crypto_trading_enabled": self.settings.crypto_trading_enabled,
+            "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
             "stored_market_count": len(snapshots),
+            "asset_modes": mode_summary["modes"],
+            "asset_mode_counts": mode_summary["counts"],
+            "global_live_blockers": self.asset_control_service.global_live_blockers(
+                control=control,
+                replay_gate=gate,
+                has_write_credentials=self.kalshi.write_credentials is not None,
+                frequency=frequency,
+            ),
             "model": _artifact_summary(model),
             "replay_gate": _artifact_summary(gate),
         }
@@ -739,10 +984,12 @@ class CryptoExecutionService:
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
         base_execution_service: ExecutionService,
+        asset_control_service: CryptoAssetControlService,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.base_execution_service = base_execution_service
+        self.asset_control_service = asset_control_service
 
     @staticmethod
     def passive_yes_price(market: CryptoMarket, side: ContractSide) -> Decimal | None:
@@ -775,20 +1022,32 @@ class CryptoExecutionService:
         market: CryptoMarket,
         signal: StrategySignal,
     ) -> ExecReceiptPayload:
-        if not self.settings.crypto_trading_enabled:
-            return ExecReceiptPayload(
-                status="crypto_trading_disabled",
-                client_order_id=client_order_id,
-                details={"reason": "crypto_trading_enabled is false"},
-            )
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
+            repo = PlatformRepository(session, kalshi_env=room.kalshi_env)
+            fresh_control = await repo.get_deployment_control(kalshi_env=room.kalshi_env)
+            asset_mode = self.asset_control_service.mode_for_control(fresh_control, market.asset_symbol)
             gate = await repo.get_latest_crypto_model_artifact(
                 frequency=market.frequency,
                 artifact_type="replay_gate",
                 kalshi_env=room.kalshi_env,
             )
             await session.commit()
+        if asset_mode != CRYPTO_ASSET_MODE_LIVE:
+            return ExecReceiptPayload(
+                status="crypto_asset_live_disabled",
+                client_order_id=client_order_id,
+                details={
+                    "reason": "crypto asset mode is not live",
+                    "asset_symbol": market.asset_symbol,
+                    "asset_mode": asset_mode,
+                },
+            )
+        if not self.settings.crypto_trading_enabled:
+            return ExecReceiptPayload(
+                status="crypto_trading_disabled",
+                client_order_id=client_order_id,
+                details={"reason": "crypto_trading_enabled is false"},
+            )
         if gate is None or gate.status != "passed":
             return ExecReceiptPayload(
                 status="crypto_replay_gate_blocked",
@@ -806,7 +1065,7 @@ class CryptoExecutionService:
             )
             passive_receipt = await self.base_execution_service.execute(
                 room=room,
-                control=control,
+                control=fresh_control,
                 ticket=passive_ticket,
                 client_order_id=f"{client_order_id}:maker",
                 fair_yes_dollars=fair_yes_dollars,
@@ -822,7 +1081,7 @@ class CryptoExecutionService:
                 )
         return await self.base_execution_service.execute(
             room=room,
-            control=control,
+            control=fresh_control,
             ticket=ticket,
             client_order_id=f"{client_order_id}:taker",
             fair_yes_dollars=fair_yes_dollars,
@@ -845,6 +1104,7 @@ class CryptoWorkflowService:
         forecast_service: CryptoForecastService,
         risk_engine: DeterministicRiskEngine,
         execution_service: CryptoExecutionService,
+        asset_control_service: CryptoAssetControlService,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -852,6 +1112,7 @@ class CryptoWorkflowService:
         self.forecast_service = forecast_service
         self.risk_engine = risk_engine
         self.execution_service = execution_service
+        self.asset_control_service = asset_control_service
 
     async def run_room(self, room_id: str, *, reason: str = "manual") -> None:
         market: CryptoMarket | None = None
@@ -883,6 +1144,17 @@ class CryptoWorkflowService:
                 if room is None:
                     raise KeyError(room_id)
                 control = await repo.ensure_deployment_control(self.settings.app_color)
+                gate = await repo.get_latest_crypto_model_artifact(
+                    frequency=market.frequency,
+                    artifact_type="replay_gate",
+                    kalshi_env=room.kalshi_env,
+                )
+                live_status = self.asset_control_service.market_live_status(
+                    control=control,
+                    replay_gate=gate,
+                    market=market,
+                    has_write_credentials=self.market_service.kalshi.write_credentials is not None,
+                )
                 market_artifact = await repo.save_artifact(
                     room_id=room.id,
                     artifact_type="market_snapshot",
@@ -892,6 +1164,10 @@ class CryptoWorkflowService:
                         "market_domain": "crypto",
                         "frequency": market.frequency,
                         "strategy_code": StrategyCode.CRYPTO_15M.value,
+                        "asset_mode": live_status["asset_mode"],
+                        "live_eligible": live_status["live_eligible"],
+                        "live_blockers": live_status["live_blockers"],
+                        "global_live_blockers": live_status["global_live_blockers"],
                         "market": market.to_payload(),
                     },
                 )
@@ -1096,6 +1372,133 @@ class CryptoWorkflowService:
             strategy_code=StrategyCode.CRYPTO_15M.value,
             strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
         )
+
+
+class CryptoAutonomyService:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        session_factory: async_sessionmaker[AsyncSession],
+        market_service: CryptoMarketService,
+        asset_control_service: CryptoAssetControlService,
+        workflow_service: CryptoWorkflowService,
+    ) -> None:
+        self.settings = settings
+        self.session_factory = session_factory
+        self.market_service = market_service
+        self.asset_control_service = asset_control_service
+        self.workflow_service = workflow_service
+
+    async def run_once(self, *, frequency: str = "15m") -> dict[str, Any]:
+        freq = normalize_frequency(frequency) or "15m"
+        if not self.settings.crypto_autonomy_enabled:
+            return {"status": "disabled", "frequency": freq, "reason": "crypto_autonomy_enabled is false"}
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            gate = await repo.get_latest_crypto_model_artifact(
+                frequency=freq,
+                artifact_type="replay_gate",
+                kalshi_env=self.settings.kalshi_env,
+            )
+            await session.commit()
+        if control.active_color != self.settings.app_color:
+            return {
+                "status": "inactive_color",
+                "frequency": freq,
+                "active_color": control.active_color,
+                "app_color": self.settings.app_color,
+            }
+
+        discovered = await self.market_service.discover_markets(frequency=freq, status="open", persist=True)
+        markets = _nearest_market_per_asset(discovered)
+        created: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        min_seconds = max(0, int(self.settings.crypto_autonomy_min_seconds_to_close))
+
+        for market in markets:
+            try:
+                if market.close_time is None:
+                    skipped.append({"market_ticker": market.market_ticker, "asset_symbol": market.asset_symbol, "reason": "missing_close_time"})
+                    continue
+                seconds_to_close = int((market.close_time - datetime.now(UTC)).total_seconds())
+                if seconds_to_close < min_seconds:
+                    skipped.append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "reason": "too_close_to_close",
+                            "seconds_to_close": seconds_to_close,
+                        }
+                    )
+                    continue
+
+                live_status = self.asset_control_service.market_live_status(
+                    control=control,
+                    replay_gate=gate,
+                    market=market,
+                    has_write_credentials=self.market_service.kalshi.write_credentials is not None,
+                )
+                if live_status["asset_mode"] == CRYPTO_ASSET_MODE_OFF:
+                    skipped.append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "reason": "asset_mode_off",
+                        }
+                    )
+                    continue
+
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                    existing = await repo.get_latest_room_for_market(
+                        market.market_ticker,
+                        kalshi_env=self.settings.kalshi_env,
+                    )
+                    await session.commit()
+                if existing is not None:
+                    skipped.append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "reason": "room_already_exists",
+                            "room_id": existing.id,
+                        }
+                    )
+                    continue
+
+                result = await self.market_service.create_room_for_market(
+                    market.market_ticker,
+                    reason="crypto_autonomy",
+                )
+                await self.workflow_service.run_room(result["room_id"], reason="crypto_autonomy")
+                created.append(
+                    {
+                        **result,
+                        "seconds_to_close": seconds_to_close,
+                        "requested_asset_mode": live_status["asset_mode"],
+                    }
+                )
+            except Exception as exc:
+                logger.warning("crypto autonomy failed for %s", market.market_ticker, exc_info=True)
+                errors.append(
+                    {
+                        "market_ticker": market.market_ticker,
+                        "asset_symbol": market.asset_symbol,
+                        "error": str(exc),
+                    }
+                )
+
+        return {
+            "status": "ok",
+            "frequency": freq,
+            "checked_markets": len(markets),
+            "created": created,
+            "skipped": skipped,
+            "errors": errors,
+        }
 
 
 def _market_from_snapshot(row: CryptoMarketSnapshotRecord) -> CryptoMarket:
