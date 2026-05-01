@@ -632,6 +632,41 @@ def _side_cost_notional(side: Any, yes_price: Decimal | None, count: Decimal | N
     return None
 
 
+def _side_price_dollars(side: Any, yes_price: Decimal | None) -> Decimal | None:
+    if yes_price is None:
+        return None
+    normalized_side = str(side or "").strip().lower()
+    if normalized_side == "yes":
+        return yes_price.quantize(Decimal("0.0001"))
+    if normalized_side == "no":
+        return (Decimal("1.0000") - yes_price).quantize(Decimal("0.0001"))
+    return None
+
+
+def _activity_label(*, action: str, side: str, status: str) -> str:
+    action_text = action.strip().lower()
+    side_text = side.strip().upper()
+    status_text = status.strip().lower()
+    if status_text == "blocked":
+        verb = "Blocked"
+        action_part = action_text or "trade"
+    elif action_text == "buy":
+        verb = "Bought"
+        action_part = ""
+    elif action_text == "sell":
+        verb = "Sold"
+        action_part = ""
+    else:
+        verb = action_text.title() if action_text else "Trade"
+        action_part = ""
+    parts = [verb]
+    if action_part:
+        parts.append(action_part)
+    if side_text:
+        parts.append(side_text)
+    return " ".join(parts)
+
+
 def _trading_activity_row(
     *,
     event_type: str,
@@ -649,6 +684,7 @@ def _trading_activity_row(
     signal_payload: Any = None,
     trade_ticket_id: Any = None,
     order_id: Any = None,
+    fill_id: Any = None,
 ) -> dict[str, Any]:
     yes_price = _decimal_or_none(yes_price_dollars) or Decimal("0")
     count = _decimal_or_none(count_fp) or Decimal("0")
@@ -664,26 +700,33 @@ def _trading_activity_row(
     skipped_side = "no" if candidate_trace and selected_side == "yes" else "yes" if candidate_trace and selected_side == "no" else None
     skipped_candidate = _candidate_from_trace(candidate_trace, skipped_side)
     side_notional = _side_cost_notional(side_text, yes_price, count)
+    side_price = _side_price_dollars(side_text, yes_price)
     notional = approved_notional if event_type == "ticket" and approved_notional is not None else side_notional
+    note = " ".join(cleaned_reasons) if risk_status_text == "blocked" else ""
     return {
         "event_type": event_type,
         "event_label": event_label,
+        "fill_id": str(fill_id) if fill_id else None,
         "market_ticker": str(market_ticker or ""),
         "action": action_text,
         "action_tone": "good" if action_text == "buy" else "warning" if action_text == "sell" else "neutral",
         "side": side_text,
+        "activity_label": _activity_label(action=action_text, side=side_text, status=status_text),
+        "activity_tone": "bad" if status_text == "blocked" else "warning" if action_text == "sell" else "good" if action_text == "buy" else "neutral",
         "selected_side": selected_side,
         "skipped_side": skipped_side,
         "skipped_side_reason": skipped_candidate.get("reason"),
         "candidate_trace": candidate_trace,
         "side_tone": "good" if side_text == "yes" else "warning" if side_text == "no" else "neutral",
         "yes_price_dollars": str(yes_price.quantize(Decimal("0.0001"))),
+        "side_price_dollars": str(side_price.quantize(Decimal("0.0001"))) if side_price is not None else None,
         "count_fp": str(count.quantize(Decimal("0.01"))),
         "status": status_text,
         "status_tone": _trade_proposal_tone(status_text),
         "risk_status": risk_status_text,
         "risk_status_tone": _trade_proposal_tone(risk_status_text),
         "risk_reasons": cleaned_reasons,
+        "note": note,
         "approved_notional_dollars": str(approved_notional.quantize(Decimal("0.0001"))) if approved_notional is not None else None,
         "notional_dollars": str(notional.quantize(Decimal("0.0001"))) if notional is not None else None,
         "trade_ticket_id": str(trade_ticket_id) if trade_ticket_id else None,
@@ -691,6 +734,42 @@ def _trading_activity_row(
         "updated_at": _iso_or_none(updated_at),
         "_sort_at": updated_at,
     }
+
+
+def _collapse_trading_activity_rows(rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    fill_order_ids = {row["order_id"] for row in rows if row.get("event_type") == "fill" and row.get("order_id")}
+    execution_ticket_ids = {
+        row["trade_ticket_id"]
+        for row in rows
+        if row.get("event_type") in {"fill", "order"} and row.get("trade_ticket_id")
+    }
+    visible: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    for row in sorted(rows, key=lambda item: item.get("_sort_at") or datetime.min.replace(tzinfo=UTC), reverse=True):
+        event_type = row.get("event_type")
+        order_id = row.get("order_id")
+        ticket_id = row.get("trade_ticket_id")
+        if event_type == "order" and order_id in fill_order_ids:
+            continue
+        if event_type == "ticket" and ticket_id in execution_ticket_ids and row.get("status") not in {"blocked", "proposed", "review"}:
+            continue
+        if event_type == "fill":
+            key = ("fill", row.get("fill_id") or order_id or row.get("_sort_at"))
+        elif event_type == "order":
+            key = ("order", order_id or row.get("_sort_at"))
+        elif event_type == "ticket":
+            key = ("ticket", ticket_id or row.get("_sort_at"))
+        else:
+            key = (event_type, row.get("market_ticker"), row.get("action"), row.get("side"), row.get("_sort_at"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        visible.append(row)
+        if len(visible) >= limit:
+            break
+    for item in visible:
+        item.pop("_sort_at", None)
+    return visible
 
 
 async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit: int = RECENT_TRADE_PROPOSAL_LIMIT) -> list[dict[str, Any]]:
@@ -714,7 +793,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
         )
         .subquery()
     )
-    query_limit = max(limit * 3, limit)
+    query_limit = max(limit * 6, limit)
     ticket_result = await session.execute(
         select(
             TradeTicketRecord.id.label("trade_ticket_id"),
@@ -774,6 +853,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
     )
     fill_result = await session.execute(
         select(
+            FillRecord.id.label("fill_id"),
             FillRecord.order_id.label("order_id"),
             OrderRecord.trade_ticket_id.label("trade_ticket_id"),
             FillRecord.market_ticker.label("market_ticker"),
@@ -839,6 +919,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
         _trading_activity_row(
             event_type="fill",
             event_label="Fill",
+            fill_id=row.fill_id,
             market_ticker=row.market_ticker,
             action=row.action,
             side=row.side,
@@ -854,11 +935,7 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
         )
         for row in fill_result.all()
     )
-    rows.sort(key=lambda item: item.get("_sort_at") or datetime.min.replace(tzinfo=UTC), reverse=True)
-    trimmed = rows[:limit]
-    for item in trimmed:
-        item.pop("_sort_at", None)
-    return trimmed
+    return _collapse_trading_activity_rows(rows, limit=limit)
 
 
 async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: int = RECENT_TRADE_PROPOSAL_LIMIT) -> list[dict[str, Any]]:

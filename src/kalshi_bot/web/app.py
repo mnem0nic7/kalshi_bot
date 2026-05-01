@@ -37,7 +37,7 @@ from kalshi_bot.web.system_routes import create_system_router
 
 templates = Jinja2Templates(directory="src/kalshi_bot/web/templates")
 logger = logging.getLogger(__name__)
-STATIC_ASSET_VERSION = "20260501-trading-activity-action"
+STATIC_ASSET_VERSION = "20260501-trading-activity-simple"
 
 
 @asynccontextmanager

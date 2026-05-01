@@ -377,6 +377,14 @@
   word-break: break-word;
 }
 
+.proposal-note {
+  color: #b8c7da;
+  font-size: 0.86rem;
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .position-flag {
   display: inline-flex;
   align-items: center;

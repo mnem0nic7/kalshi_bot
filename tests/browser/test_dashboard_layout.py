@@ -76,13 +76,17 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "action_tone": "good",
             "side": "yes",
             "side_tone": "good",
+            "activity_label": "Bought YES",
+            "activity_tone": "good",
             "yes_price_dollars": "0.0400",
+            "side_price_dollars": "0.0400",
             "count_fp": "93.75",
             "status": "proposed",
             "status_tone": "neutral",
             "risk_status": "blocked",
             "risk_status_tone": "bad",
             "risk_reasons": ["Spread too wide for entry."],
+            "note": "Spread too wide for entry.",
             "approved_notional_dollars": None,
             "notional_dollars": "3.7500",
             "updated_at": "2026-04-22T21:05:00+00:00",
@@ -95,13 +99,17 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "action_tone": "good",
             "side": "no",
             "side_tone": "warning",
+            "activity_label": "Bought NO",
+            "activity_tone": "good",
             "yes_price_dollars": "0.2000",
+            "side_price_dollars": "0.8000",
             "count_fp": "2.00",
             "status": "executed",
             "status_tone": "good",
             "risk_status": "approved",
             "risk_status_tone": "good",
             "risk_reasons": [],
+            "note": "",
             "approved_notional_dollars": "5.0000",
             "notional_dollars": "1.6000",
             "trade_ticket_id": "ticket-den",
@@ -116,13 +124,17 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
             "action_tone": "warning",
             "side": "no",
             "side_tone": "warning",
+            "activity_label": "Sold NO",
+            "activity_tone": "warning",
             "yes_price_dollars": "0.1800",
+            "side_price_dollars": "0.8200",
             "count_fp": "1.00",
             "status": "filled",
             "status_tone": "good",
             "risk_status": None,
             "risk_status_tone": "neutral",
             "risk_reasons": [],
+            "note": "",
             "approved_notional_dollars": None,
             "notional_dollars": "0.8200",
             "trade_ticket_id": None,
@@ -973,17 +985,17 @@ def test_recent_trading_activity_renders_at_bottom_of_demo_and_production(
                 page.wait_for_selector('#panel-demo [data-testid="recent-trade-proposals"]', timeout=15_000)
                 demo_text = page.locator('#panel-demo [data-testid="recent-trade-proposals"]').text_content(timeout=15_000) or ""
                 assert "Recent Trading Activity" in demo_text
-                assert "3 events" in demo_text
-                assert "Ticket" in demo_text
-                assert "Order" in demo_text
-                assert "Fill" in demo_text
-                assert "Action" in demo_text
-                assert "buy" in demo_text
-                assert "sell" in demo_text
+                assert "3 activities" in demo_text
+                assert "Trade" in demo_text
+                assert "Bought YES" in demo_text
+                assert "Bought NO" in demo_text
+                assert "Sold NO" in demo_text
                 assert "KXHIGHTPHX-26APR23-T92" in demo_text
                 assert "KXHIGHDEN-26MAY01-T63" in demo_text
                 assert "KXHIGHTHOU-26MAY01-T70" in demo_text
                 assert "0.0400" in demo_text
+                assert "0.8000" in demo_text
+                assert "0.8200" in demo_text
                 assert "executed" in demo_text
                 assert "filled" in demo_text
                 assert "blocked" in demo_text

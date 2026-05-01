@@ -575,7 +575,7 @@
   function renderRecentTradeProposals(card, proposals) {
     if (!card) return;
     const countLabel = card.querySelector(".trade-proposals-count-label");
-    if (countLabel) countLabel.textContent = `${proposals.length} event${proposals.length !== 1 ? "s" : ""}`;
+    if (countLabel) countLabel.textContent = `${proposals.length} activit${proposals.length !== 1 ? "ies" : "y"}`;
 
     const empty = card.querySelector("p.empty-state");
     if (!proposals.length) {
@@ -595,7 +595,7 @@
     const table = el("table", "positions-table");
     const thead = el("thead");
     const headerRow = el("tr");
-    ["Event", "Market", "Action", "Side", "Yes Price", "Contracts", "Status", "Risk", "Notional"].forEach((h) => {
+    ["Market", "Trade", "Price", "Contracts", "Status", "Value", "Note"].forEach((h) => {
       headerRow.appendChild(el("th", null, h));
     });
     thead.appendChild(headerRow);
@@ -614,39 +614,22 @@
         marketWrap.appendChild(timeNode);
       }
       marketTd.appendChild(marketWrap);
-      const sideTd = el("td");
-      const sideTone = proposal.side_tone || (proposal.side === "yes" ? "good" : proposal.side === "no" ? "warning" : "neutral");
-      sideTd.appendChild(el("span", `status-pill ${statusPillClass(sideTone)}`, proposal.side || "—"));
-      const actionTd = el("td");
-      const actionTone = proposal.action_tone || (proposal.action === "buy" ? "good" : proposal.action === "sell" ? "warning" : "neutral");
-      actionTd.appendChild(el("span", `status-pill ${statusPillClass(actionTone)}`, proposal.action || "—"));
-      const candidateText = proposalCandidateText(proposal);
-      if (candidateText) {
-        sideTd.appendChild(el("div", "proposal-risk-reasons", candidateText));
-      }
+      const activityTd = el("td");
+      const activityTone = proposal.activity_tone || proposal.action_tone || "neutral";
+      const activityLabel = proposal.activity_label || `${proposal.action || "trade"} ${String(proposal.side || "").toUpperCase()}`.trim();
+      activityTd.appendChild(el("span", `status-pill ${statusPillClass(activityTone)}`, activityLabel || "—"));
       const statusTd = el("td");
       const statusTone = proposal.status_tone || tradeProposalTone(proposal.status);
       statusTd.appendChild(el("span", `status-pill ${statusPillClass(statusTone)}`, proposal.status || "—"));
-      const riskTd = el("td");
-      const riskTone = proposal.risk_status_tone || tradeProposalTone(proposal.risk_status);
-      const riskWrap = el("div", "proposal-risk-cell");
-      riskWrap.appendChild(el("span", `status-pill ${statusPillClass(riskTone)}`, proposal.risk_status || "—"));
-      const riskReasonText = proposalRiskReasonText(proposal);
-      if (riskReasonText) {
-        riskWrap.appendChild(el("div", "proposal-risk-reasons", riskReasonText));
-      }
-      riskTd.appendChild(riskWrap);
-      const eventLabel = proposal.event_label || (proposal.event_type ? String(proposal.event_type).replaceAll("_", " ") : "Event");
+      const noteText = proposal.note || proposalRiskReasonText(proposal) || "";
       tr.append(
-        el("td", null, eventLabel.replace(/^\w/, (ch) => ch.toUpperCase())),
         marketTd,
-        actionTd,
-        sideTd,
-        el("td", "mono", proposal.yes_price_dollars || "—"),
+        activityTd,
+        el("td", "mono", proposal.side_price_dollars || proposal.yes_price_dollars || "—"),
         el("td", "mono", proposal.count_fp || "—"),
         statusTd,
-        riskTd,
         el("td", "mono", proposal.notional_dollars || proposal.approved_notional_dollars || "—"),
+        el("td", "proposal-note", noteText || "—"),
       );
       tbody.appendChild(tr);
     });

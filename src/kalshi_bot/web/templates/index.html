@@ -275,20 +275,19 @@
       <div class="dash-card-header">
         <div class="dash-card-title-block">
           <h2>Recent Trading Activity</h2>
-          <span class="muted-label">Latest tickets, orders, fills, and risk verdicts</span>
+          <span class="muted-label">Latest buys, sells, and blocked attempts</span>
         </div>
-        <span class="muted-label trade-proposals-count-label">{{ recent_trade_proposals | length }} event{{ "s" if recent_trade_proposals | length != 1 }}</span>
+        <span class="muted-label trade-proposals-count-label">{{ recent_trade_proposals | length }} activit{{ "ies" if recent_trade_proposals | length != 1 else "y" }}</span>
       </div>
       {% if recent_trade_proposals %}
       <div class="table-wrap">
         <table class="positions-table">
           <thead>
-            <tr><th>Event</th><th>Market</th><th>Action</th><th>Side</th><th>Yes Price</th><th>Contracts</th><th>Status</th><th>Risk</th><th>Notional</th></tr>
+            <tr><th>Market</th><th>Trade</th><th>Price</th><th>Contracts</th><th>Status</th><th>Value</th><th>Note</th></tr>
           </thead>
           <tbody>
             {% for item in recent_trade_proposals %}
             <tr>
-              <td>{{ item.event_label or item.event_type | title or "Event" }}</td>
               <td class="mono">
                 <div class="proposal-market-cell">
                   <span>{{ item.market_ticker }}</span>
@@ -298,28 +297,13 @@
                 </div>
               </td>
               <td>
-                <span class="status-pill {% if item.action_tone == 'good' %}status-good{% elif item.action_tone == 'warning' %}status-warning{% elif item.action_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.action or "—" }}</span>
+                <span class="status-pill {% if item.activity_tone == 'good' %}status-good{% elif item.activity_tone == 'warning' %}status-warning{% elif item.activity_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.activity_label or "—" }}</span>
               </td>
-              <td>
-                <span class="status-pill {% if item.side_tone == 'good' %}status-good{% elif item.side_tone == 'warning' %}status-warning{% elif item.side_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.side }}</span>
-                {% if item.selected_side %}
-                <div class="proposal-risk-reasons">
-                  Selected {{ item.selected_side | upper }}{% if item.skipped_side %}; {{ item.skipped_side | upper }} {{ (item.skipped_side_reason or "checked") | replace("_", " ") }}{% endif %}
-                </div>
-                {% endif %}
-              </td>
-              <td class="mono">{{ item.yes_price_dollars }}</td>
+              <td class="mono">{{ item.side_price_dollars or item.yes_price_dollars }}</td>
               <td class="mono">{{ item.count_fp }}</td>
               <td><span class="status-pill {% if item.status_tone == 'good' %}status-good{% elif item.status_tone == 'warning' %}status-warning{% elif item.status_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.status }}</span></td>
-              <td>
-                <div class="proposal-risk-cell">
-                  <span class="status-pill {% if item.risk_status_tone == 'good' %}status-good{% elif item.risk_status_tone == 'warning' %}status-warning{% elif item.risk_status_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.risk_status or "—" }}</span>
-                  {% if item.risk_status == "blocked" and item.risk_reasons %}
-                  <div class="proposal-risk-reasons">{{ item.risk_reasons | join(" ") }}</div>
-                  {% endif %}
-                </div>
-              </td>
               <td class="mono">{{ item.notional_dollars or item.approved_notional_dollars or "—" }}</td>
+              <td class="proposal-note">{{ item.note or "—" }}</td>
             </tr>
             {% endfor %}
           </tbody>

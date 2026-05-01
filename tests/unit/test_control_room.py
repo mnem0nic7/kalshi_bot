@@ -532,6 +532,7 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
     ]
     fill_rows = [
         SimpleNamespace(
+            fill_id="fill-linked",
             order_id="order-linked",
             trade_ticket_id="ticket-executed",
             market_ticker="KXHIGHTHOU-26MAY01-T70",
@@ -550,37 +551,37 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
 
     views = await control_room_module._recent_trading_activity_views(session, kalshi_env="demo")
 
-    assert [item["event_type"] for item in views] == ["order", "order", "fill", "ticket", "ticket", "ticket", "order", "ticket"]
+    assert [item["event_type"] for item in views] == ["order", "fill", "ticket", "ticket", "order", "ticket"]
     assert [item["market_ticker"] for item in views[:3]] == [
         "KXHIGHTATL-26MAY01-T67",
         "KXHIGHTHOU-26MAY01-T70",
-        "KXHIGHTHOU-26MAY01-T70",
+        "KXHIGHCHI-26MAY01-T68",
     ]
     assert views[0]["trade_ticket_id"] is None
     assert views[0]["order_id"] == "order-orphan"
     assert views[0]["action"] == "sell"
     assert views[0]["action_tone"] == "warning"
+    assert views[0]["activity_label"] == "Sold NO"
+    assert views[0]["side_price_dollars"] == "0.7500"
     assert views[0]["risk_status"] is None
     assert views[0]["notional_dollars"] == "2.2500"
+    assert views[1]["event_label"] == "Fill"
     assert views[1]["risk_status"] == "approved"
     assert views[1]["action"] == "buy"
     assert views[1]["action_tone"] == "good"
+    assert views[1]["activity_label"] == "Bought NO"
+    assert views[1]["side_price_dollars"] == "0.8000"
     assert views[1]["notional_dollars"] == "1.6000"
-    assert views[2]["event_label"] == "Fill"
-    assert views[2]["risk_status"] == "approved"
-    assert views[3]["status"] == "executed"
-    assert views[3]["status_tone"] == "good"
-    assert views[3]["approved_notional_dollars"] == "1.6000"
-    assert views[3]["selected_side"] == "no"
-    assert views[3]["skipped_side"] == "yes"
-    assert views[3]["skipped_side_reason"] == "below_min_edge"
-    assert views[4]["status"] == "blocked"
-    assert views[4]["risk_reasons"] == ["Book effectively broken."]
-    assert views[5]["status"] == "proposed"
-    assert views[6]["market_ticker"] == "KXHIGHNY-26APR27-T69"
-    assert views[6]["updated_at"] == (now - timedelta(days=4)).isoformat()
-    assert views[7]["market_ticker"] == "KXHIGHNY-26APR24-T67"
-    assert views[7]["updated_at"] == (now - timedelta(days=7)).isoformat()
+    assert views[2]["status"] == "blocked"
+    assert views[2]["activity_label"] == "Blocked buy YES"
+    assert views[2]["risk_reasons"] == ["Book effectively broken."]
+    assert views[2]["note"] == "Book effectively broken."
+    assert views[3]["status"] == "proposed"
+    assert views[4]["market_ticker"] == "KXHIGHNY-26APR27-T69"
+    assert views[4]["activity_label"] == "Sold NO"
+    assert views[4]["updated_at"] == (now - timedelta(days=4)).isoformat()
+    assert views[5]["market_ticker"] == "KXHIGHNY-26APR24-T67"
+    assert views[5]["updated_at"] == (now - timedelta(days=7)).isoformat()
 
 
 @pytest.mark.asyncio
