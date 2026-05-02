@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import StandDownReason
 from kalshi_bot.core.schemas import TradeEligibilityVerdict
-from kalshi_bot.db.models import FillRecord
+from kalshi_bot.db.models import FillRecord, OrderRecord
 from kalshi_bot.services.agent_packs import RuntimeThresholds
 
 
@@ -57,6 +57,59 @@ def price_band(price: Decimal | None) -> str:
     return f"{lower:02d}-{upper:02d}c"
 
 
+def forecast_delta_band(value: Any) -> str:
+    if value in (None, ""):
+        return "unknown"
+    try:
+        delta = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if delta <= -5:
+        return "<=-5f"
+    if delta < -2:
+        return "-5--2f"
+    if delta < 0:
+        return "-2-0f"
+    if delta < 2:
+        return "0-2f"
+    if delta < 5:
+        return "2-5f"
+    return ">=5f"
+
+
+def confidence_bucket(value: Any) -> str:
+    if value in (None, ""):
+        return "unknown"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized or "unknown"
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if confidence < 0.5:
+        return "low"
+    if confidence < 0.75:
+        return "medium"
+    return "high"
+
+
+def spread_band(value: Any) -> str:
+    if value in (None, ""):
+        return "unknown"
+    try:
+        spread = int(float(value))
+    except (TypeError, ValueError):
+        return "unknown"
+    if spread < 100:
+        return "000-099bps"
+    if spread < 250:
+        return "100-249bps"
+    if spread < 500:
+        return "250-499bps"
+    return "500bps+"
+
+
 def bucket_key(
     *,
     market_ticker: str | None,
@@ -64,6 +117,10 @@ def bucket_key(
     strategy_code: str | None,
     yes_price_dollars: Any = None,
     include_price_band: bool = False,
+    forecast_delta_f: Any = None,
+    confidence_band: Any = None,
+    spread_bps: Any = None,
+    include_context_bands: bool = False,
 ) -> str:
     series = series_from_ticker(market_ticker)
     station = station_from_series(series) or "unknown"
@@ -72,7 +129,85 @@ def bucket_key(
     parts = [series or "unknown", station, side_value, strategy]
     if include_price_band:
         parts.append(price_band(side_price_from_yes_price(side, yes_price_dollars)))
+    if include_context_bands:
+        parts.extend([
+            f"delta:{forecast_delta_band(forecast_delta_f)}",
+            f"conf:{confidence_bucket(confidence_band)}",
+            f"spread:{spread_band(spread_bps)}",
+        ])
     return "|".join(parts)
+
+
+def trade_behavior_context_payload(
+    *,
+    market_ticker: str | None,
+    side: str | None,
+    strategy_code: str | None,
+    yes_price_dollars: Any = None,
+    forecast_delta_f: Any = None,
+    confidence_band: Any = None,
+    spread_bps: Any = None,
+) -> dict[str, Any]:
+    try:
+        forecast_delta_value = float(forecast_delta_f) if forecast_delta_f not in (None, "") else None
+    except (TypeError, ValueError):
+        forecast_delta_value = None
+    try:
+        spread_value = int(float(spread_bps)) if spread_bps not in (None, "") else None
+    except (TypeError, ValueError):
+        spread_value = None
+    entry_price_band = price_band(side_price_from_yes_price(side, yes_price_dollars))
+    delta_band = forecast_delta_band(forecast_delta_f)
+    confidence = confidence_bucket(confidence_band)
+    spread = spread_band(spread_bps)
+    return {
+        "bucket_key": bucket_key(
+            market_ticker=market_ticker,
+            side=side,
+            strategy_code=strategy_code,
+            yes_price_dollars=yes_price_dollars,
+            include_price_band=True,
+            forecast_delta_f=forecast_delta_f,
+            confidence_band=confidence_band,
+            spread_bps=spread_bps,
+            include_context_bands=True,
+        ),
+        "series_ticker": series_from_ticker(market_ticker),
+        "station": station_from_series(series_from_ticker(market_ticker)) or "unknown",
+        "side": side if side in {"yes", "no"} else "unknown",
+        "strategy_code": strategy_code or "<unknown>",
+        "entry_price_band": entry_price_band,
+        "forecast_delta_band": delta_band,
+        "confidence_band": confidence,
+        "spread_band": spread,
+        "forecast_delta_f": forecast_delta_value,
+        "market_spread_bps": spread_value,
+    }
+
+
+def _context_from_raw(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    for key in ("trade_behavior_context", "empirical_bucket_context"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def bucket_key_for_fill(fill: FillRecord, order: OrderRecord | None = None) -> str:
+    context = _context_from_raw(fill.raw) or _context_from_raw(order.raw if order is not None else None)
+    return bucket_key(
+        market_ticker=fill.market_ticker,
+        side=fill.side,
+        strategy_code=fill.strategy_code,
+        yes_price_dollars=fill.yes_price_dollars,
+        include_price_band=True,
+        forecast_delta_f=context.get("forecast_delta_f"),
+        confidence_band=context.get("confidence_band"),
+        spread_bps=context.get("market_spread_bps"),
+        include_context_bands=True,
+    )
 
 
 def _fee_dollars(fill: FillRecord) -> Decimal:
@@ -193,12 +328,22 @@ async def evaluate_empirical_gate(
     action: str | None,
     strategy_code: str | None,
     shadow_mode: bool,
+    yes_price_dollars: Any = None,
+    forecast_delta_f: Any = None,
+    confidence_band: Any = None,
+    spread_bps: Any = None,
     now: datetime | None = None,
 ) -> EmpiricalGateDecision:
     gate_bucket_key = bucket_key(
         market_ticker=market_ticker,
         side=side,
         strategy_code=strategy_code,
+        yes_price_dollars=yes_price_dollars,
+        include_price_band=True,
+        forecast_delta_f=forecast_delta_f,
+        confidence_band=confidence_band,
+        spread_bps=spread_bps,
+        include_context_bands=True,
     )
     if not settings.trade_behavior_empirical_gate_enabled:
         return EmpiricalGateDecision(
@@ -237,7 +382,17 @@ async def evaluate_empirical_gate(
         stmt = stmt.where(FillRecord.market_ticker.like(f"{series}-%"))
     if strategy_code:
         stmt = stmt.where(FillRecord.strategy_code == strategy_code)
-    fills = list((await session.execute(stmt)).scalars())
+    candidate_fills = list((await session.execute(stmt)).scalars())
+    order_ids = [fill.order_id for fill in candidate_fills if fill.order_id is not None]
+    orders_by_id: dict[str, OrderRecord] = {}
+    if order_ids:
+        order_rows = list((await session.execute(select(OrderRecord).where(OrderRecord.id.in_(order_ids)))).scalars())
+        orders_by_id = {order.id: order for order in order_rows}
+    fills = [
+        fill
+        for fill in candidate_fills
+        if bucket_key_for_fill(fill, orders_by_id.get(str(fill.order_id))) == gate_bucket_key
+    ]
 
     sample_count = len(fills)
     wins = sum(1 for fill in fills if fill.settlement_result == "win")

@@ -509,6 +509,72 @@ async def test_trade_analysis_recovers_market_snapshot_from_order_raw(analysis_h
 
 
 @pytest.mark.asyncio
+async def test_trade_analysis_recovers_market_snapshot_from_signal_payload(analysis_harness) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-signal-snapshot")
+        signal = _signal(room.id)
+        signal.payload = {
+            **signal.payload,
+            "market_snapshot": {
+                "observed_at": (NOW - timedelta(minutes=26)).isoformat(),
+                "market": {
+                    "ticker": TICKER,
+                    "yes_bid_dollars": "0.4800",
+                    "yes_ask_dollars": "0.5200",
+                    "last_price_dollars": "0.5000",
+                    "volume": 42,
+                },
+                "snapshot_provenance": {
+                    "recovered": False,
+                    "source": "signal_payload_market_snapshot",
+                    "source_kind": "room_supervisor_rest_market",
+                    "source_id": "sig-snapshot-1",
+                },
+            },
+        }
+        session.add_all([
+            room,
+            signal,
+            HistoricalWeatherSnapshotRecord(
+                station_id="KNYC",
+                series_ticker="KXHIGHNY",
+                local_market_day="26APR24",
+                asof_ts=NOW - timedelta(minutes=27),
+                source_kind="test",
+                source_id="weather-signal",
+                forecast_updated_ts=NOW - timedelta(minutes=27),
+                forecast_high_f=Decimal("70.00"),
+                current_temp_f=Decimal("65.00"),
+                payload={},
+            ),
+            HistoricalSettlementLabelRecord(
+                market_ticker=TICKER,
+                series_ticker="KXHIGHNY",
+                local_market_day="26APR24",
+                kalshi_result="yes",
+                settlement_value_dollars=Decimal("1.0000"),
+                settlement_ts=NOW,
+                crosscheck_status="matched",
+                payload={},
+            ),
+        ])
+        await session.commit()
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    row = dataset.rows[0]
+    assert row["decision_status"] == "signal_only"
+    assert row["market_snapshot_source"] == "signal_payload_market_snapshot"
+    assert row["snapshot_provenance"]["source_id"] == "sig-snapshot-1"
+    assert "missing_market_snapshot" not in row["exclusion_reasons"]
+
+
+@pytest.mark.asyncio
 async def test_trade_analysis_marks_signal_only_unresolved_rows_pending_not_missing_execution_fields(
     analysis_harness,
 ) -> None:

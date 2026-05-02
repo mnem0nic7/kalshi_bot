@@ -57,6 +57,10 @@ from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, re
 from kalshi_bot.services.parameter_packs import ParameterPackCanaryConfig, ParameterPackPromotionService
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
 from kalshi_bot.services.trade_analysis import format_trade_analysis_report
+from kalshi_bot.services.trade_behavior_validation import (
+    build_trade_behavior_validation_report,
+    format_trade_behavior_validation_report,
+)
 from kalshi_bot.services.trading_audit import format_trading_audit_text
 
 
@@ -959,12 +963,20 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if args.command == "trading-audit":
             audit_days = 3650 if args.full_history else args.days
             if args.trading_audit_command == "repair":
-                result = await container.trading_audit_service.repair_attribution(
-                    kalshi_env=args.kalshi_env,
-                    days=audit_days,
-                    dry_run=args.dry_run,
-                    limit=args.limit,
-                )
+                if args.repair_target == "stale-positions":
+                    result = await container.trading_audit_service.repair_stale_positions(
+                        kalshi_env=args.kalshi_env,
+                        dry_run=args.dry_run,
+                        limit=args.limit,
+                        subaccount=container.settings.kalshi_subaccount,
+                    )
+                else:
+                    result = await container.trading_audit_service.repair_attribution(
+                        kalshi_env=args.kalshi_env,
+                        days=audit_days,
+                        dry_run=args.dry_run,
+                        limit=args.limit,
+                    )
                 print(json.dumps(result, indent=2))
                 return 0
             report = await container.trading_audit_service.build_report(
@@ -1005,6 +1017,24 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 print(json.dumps(report, indent=2))
             else:
                 print(format_trade_analysis_report(report))
+            return 0
+
+        if args.command == "trade-behavior":
+            validation_days = 3650 if args.full_history else args.days
+            report = await build_trade_behavior_validation_report(
+                settings=container.settings,
+                session_factory=container.session_factory,
+                watchdog_service=container.watchdog_service,
+                trading_audit_service=container.trading_audit_service,
+                trade_analysis_service=container.trade_analysis_service,
+                kalshi_env=args.kalshi_env,
+                days=validation_days,
+                since_hours=args.since_hours,
+            )
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(format_trade_behavior_validation_report(report))
             return 0
 
         if args.command == "training-build":
@@ -1823,6 +1853,7 @@ def build_parser() -> argparse.ArgumentParser:
     trading_audit.add_argument("--json", action="store_true")
     trading_audit.add_argument("--limit", type=int, default=500)
     trading_audit.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
+    trading_audit.add_argument("--repair-target", choices=["attribution", "stale-positions"], default="attribution")
 
     trade_analysis = subparsers.add_parser(
         "trade-analysis",
@@ -1837,6 +1868,18 @@ def build_parser() -> argparse.ArgumentParser:
     trade_analysis.add_argument("--json", action="store_true")
     trade_analysis.add_argument("--output", default="data/trade_analysis.jsonl")
     trade_analysis.add_argument("--dataset", default="data/trade_analysis.jsonl")
+
+    trade_behavior = subparsers.add_parser(
+        "trade-behavior",
+        help="Validate trade behavior gates, audits, and training coverage.",
+    )
+    trade_behavior_subparsers = trade_behavior.add_subparsers(dest="trade_behavior_command", required=True)
+    trade_behavior_validate = trade_behavior_subparsers.add_parser("validate")
+    trade_behavior_validate.add_argument("--kalshi-env", default="production")
+    trade_behavior_validate.add_argument("--days", type=int, default=7)
+    trade_behavior_validate.add_argument("--full-history", action="store_true")
+    trade_behavior_validate.add_argument("--since-hours", type=int, default=24)
+    trade_behavior_validate.add_argument("--json", action="store_true")
 
     training_build = subparsers.add_parser("training-build")
     training_build.add_argument("training_build_scope", nargs="?", choices=["historical"])

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import StandDownReason, StrategyCode
 from kalshi_bot.db.models import (
+    Checkpoint,
     FillRecord,
     MarketPriceHistory,
     MarketState,
@@ -23,7 +24,7 @@ from kalshi_bot.db.models import (
     Signal,
     TradeTicketRecord,
 )
-from kalshi_bot.services.trade_behavior import bucket_key
+from kalshi_bot.services.trade_behavior import bucket_key_for_fill
 
 
 def _utc_now() -> datetime:
@@ -36,6 +37,17 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except ValueError:
+        return None
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -142,7 +154,7 @@ class TradingAuditService:
 
         fill_summary = self._fill_summary(fills)
         pnl = self._gross_pnl(fills)
-        lifecycle = self._lifecycle_ledger(fills)
+        lifecycle = self._lifecycle_ledger(fills, orders=orders)
         position_discrepancy = self._exchange_position_discrepancy(fills=fills, positions=positions)
         attribution = self._attribution_gaps(fills=fills, orders=orders)
         funnel = self._execution_funnel(
@@ -356,6 +368,105 @@ class TradingAuditService:
             "candidate_count": len(candidates),
             "updated_count": 0 if dry_run else updated,
             "candidates": candidates[:50],
+        }
+
+    async def repair_stale_positions(
+        self,
+        *,
+        kalshi_env: str = "demo",
+        dry_run: bool = True,
+        now: datetime | None = None,
+        limit: int = 500,
+        subaccount: int = 0,
+    ) -> dict[str, Any]:
+        now = _as_utc(now) or _utc_now()
+        max_age_seconds = max(1, int(self.settings.daemon_reconcile_stale_kill_switch_seconds))
+
+        def position_payload(position: PositionRecord) -> dict[str, Any]:
+            return {
+                "market_ticker": position.market_ticker,
+                "side": position.side,
+                "count_fp": str(position.count_fp),
+                "average_price_dollars": str(position.average_price_dollars),
+                "updated_at": _iso(position.updated_at),
+            }
+
+        async with self.session_factory() as session:
+            checkpoint = (
+                await session.execute(
+                    select(Checkpoint).where(Checkpoint.stream_name == f"reconcile:{kalshi_env}")
+                )
+            ).scalar_one_or_none()
+            payload = dict(checkpoint.payload or {}) if checkpoint is not None else {}
+            reconciled_at = _parse_utc(payload.get("reconciled_at"))
+            reconcile_age_seconds = (
+                int((now - reconciled_at).total_seconds()) if reconciled_at is not None else None
+            )
+            fresh = reconcile_age_seconds is not None and reconcile_age_seconds <= max_age_seconds
+            live_tickers = {str(ticker) for ticker in payload.get("live_tickers") or []}
+
+            positions = list(
+                (
+                    await session.execute(
+                        select(PositionRecord)
+                        .where(
+                            PositionRecord.kalshi_env == kalshi_env,
+                            PositionRecord.subaccount == subaccount,
+                            PositionRecord.count_fp != 0,
+                        )
+                        .order_by(PositionRecord.updated_at.desc(), PositionRecord.market_ticker.asc())
+                    )
+                ).scalars()
+            )
+            candidates = [
+                position for position in positions if fresh and position.market_ticker not in live_tickers
+            ][:limit]
+            protected = [
+                position for position in positions if (not fresh or position.market_ticker in live_tickers)
+            ]
+            updated = 0
+            repaired_at = now.isoformat()
+            for position in candidates:
+                raw = dict(position.raw or {})
+                candidate_payload = {
+                    "repaired_at": repaired_at,
+                    "reason": "absent_from_fresh_exchange_reconcile",
+                    "reconcile_stream": f"reconcile:{kalshi_env}",
+                    "reconciled_at": reconciled_at.isoformat() if reconciled_at is not None else None,
+                    "old_count_fp": str(position.count_fp),
+                    "old_side": position.side,
+                    "live_tickers_count": len(live_tickers),
+                }
+                if not dry_run:
+                    raw["trade_behavior_stale_position_repair"] = candidate_payload
+                    position.raw = raw
+                    position.count_fp = Decimal("0")
+                    updated += 1
+            candidate_rows = [position_payload(position) for position in candidates[:50]]
+            protected_rows = [position_payload(position) for position in protected[:50]]
+            if dry_run:
+                await session.rollback()
+            else:
+                if updated:
+                    await session.flush()
+                await session.commit()
+
+        return {
+            "kalshi_env": kalshi_env,
+            "dry_run": dry_run,
+            "repair_target": "stale-positions",
+            "fresh_reconcile": fresh,
+            "reconcile_stream": f"reconcile:{kalshi_env}",
+            "reconciled_at": reconciled_at.isoformat() if reconciled_at is not None else None,
+            "reconcile_age_seconds": reconcile_age_seconds,
+            "max_reconcile_age_seconds": max_age_seconds,
+            "live_tickers": sorted(live_tickers),
+            "candidate_count": len(candidates),
+            "protected_count": len(protected),
+            "updated_count": 0 if dry_run else updated,
+            "candidates": candidate_rows,
+            "protected": protected_rows,
+            "status": "ready" if fresh else "stale_reconcile_checkpoint",
         }
 
     async def _fills(self, session: AsyncSession, *, kalshi_env: str, cutoff: datetime) -> list[FillRecord]:
@@ -581,9 +692,10 @@ class TradingAuditService:
             "unsettled_open_contracts": str(unsettled_open_contracts),
         }
 
-    def _lifecycle_ledger(self, fills: list[FillRecord]) -> dict[str, Any]:
+    def _lifecycle_ledger(self, fills: list[FillRecord], *, orders: list[OrderRecord] | None = None) -> dict[str, Any]:
         lots_by_key: dict[tuple[str, str, str], list[_LedgerLot]] = defaultdict(list)
         rows: dict[str, dict[str, Any]] = {}
+        orders_by_id = {order.id: order for order in orders or []}
 
         def ensure(bucket: str, fill: FillRecord) -> dict[str, Any]:
             row = rows.setdefault(
@@ -614,13 +726,7 @@ class TradingAuditService:
             count = Decimal(fill.count_fp)
             fee = _decimal_or_none((fill.raw or {}).get("fee_cost")) or Decimal("0")
             if fill.action == "buy":
-                bucket = bucket_key(
-                    market_ticker=fill.market_ticker,
-                    side=fill.side,
-                    strategy_code=fill.strategy_code,
-                    yes_price_dollars=fill.yes_price_dollars,
-                    include_price_band=True,
-                )
+                bucket = bucket_key_for_fill(fill, orders_by_id.get(str(fill.order_id)))
                 row = ensure(bucket, fill)
                 row["fills"] += 1
                 row["contracts"] += count

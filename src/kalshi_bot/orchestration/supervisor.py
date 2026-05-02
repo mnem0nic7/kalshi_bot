@@ -48,6 +48,7 @@ from kalshi_bot.services.trade_behavior import (
     apply_empirical_gate_to_eligibility,
     evaluate_empirical_gate,
     thresholds_with_production_freeze_floor,
+    trade_behavior_context_payload,
 )
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -60,6 +61,12 @@ EXTREME_EDGE_CURRENT_TEMP_TOLERANCE_F = 1.0
 
 def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
+
+
+def _payload_with_trade_behavior_context(payload: Any, context: dict[str, Any]) -> dict[str, Any]:
+    base = dict(payload) if isinstance(payload, dict) else {}
+    base["trade_behavior_context"] = context
+    return base
 
 
 def _market_snapshot_artifact_payload(
@@ -86,6 +93,42 @@ def _market_snapshot_artifact_payload(
         "observed_at": observed_at_iso,
     }
     return payload
+
+
+def _signal_market_snapshot_payload(
+    market_response: dict[str, Any],
+    *,
+    observed_at: datetime | None,
+    kalshi_env: str,
+    market_ticker: str,
+) -> dict[str, Any]:
+    observed_at_iso = observed_at.astimezone(UTC).isoformat() if observed_at is not None else None
+    market = market_response.get("market") if isinstance(market_response.get("market"), dict) else market_response
+    compact_market = {
+        "ticker": market.get("ticker") or market.get("market_ticker") or market_ticker,
+        "yes_bid_dollars": market.get("yes_bid_dollars"),
+        "yes_ask_dollars": market.get("yes_ask_dollars"),
+        "no_ask_dollars": market.get("no_ask_dollars"),
+        "last_price_dollars": market.get("last_price_dollars"),
+        "volume": market.get("volume"),
+        "close_ts": market.get("close_ts"),
+    }
+    return {
+        "market": compact_market,
+        "observed_at": observed_at_iso,
+        "snapshot_provenance": {
+            "recovered": False,
+            "source": "signal_payload_market_snapshot",
+            "source_kind": "room_supervisor_rest_market",
+            "source_id": _hash_payload({
+                "kalshi_env": kalshi_env,
+                "market_ticker": market_ticker,
+                "observed_at": observed_at_iso,
+                "market": compact_market,
+            }),
+            "leakage_risk": "none",
+        },
+    }
 
 
 def _room_message_read(record) -> RoomMessageRead:
@@ -760,6 +803,15 @@ class WorkflowSupervisor:
         candidate_trace = dict(signal.candidate_trace or {})
         if signal.eligibility is not None and signal.eligibility.candidate_trace:
             candidate_trace = dict(signal.eligibility.candidate_trace)
+        trade_behavior_context = trade_behavior_context_payload(
+            market_ticker=room.market_ticker,
+            side=signal.recommended_side.value if signal.recommended_side is not None else None,
+            strategy_code=StrategyCode.DIRECTIONAL.value,
+            yes_price_dollars=signal.target_yes_price_dollars,
+            forecast_delta_f=signal.forecast_delta_f,
+            confidence_band=signal.confidence_band,
+            spread_bps=signal.eligibility.market_spread_bps if signal.eligibility is not None else None,
+        )
         evaluation_outcome = (
             signal.evaluation_outcome
             or (signal.eligibility.evaluation_outcome if signal.eligibility is not None else None)
@@ -834,6 +886,10 @@ class WorkflowSupervisor:
                     ticket,
                     client_order_id,
                     strategy_code=StrategyCode.DIRECTIONAL.value,
+                )
+                ticket_record.payload = _payload_with_trade_behavior_context(
+                    ticket_record.payload,
+                    trade_behavior_context,
                 )
                 ticker_positions = await repo.list_positions_for_ticker(
                     room.market_ticker,
@@ -1068,6 +1124,7 @@ class WorkflowSupervisor:
                             )
                     ORDERS_TOTAL.labels(status=receipt.status).inc()
                     if receipt.external_order_id or receipt.status not in ("shadow_skipped", "inactive_color_skipped"):
+                        order_raw = _payload_with_trade_behavior_context(receipt.details, trade_behavior_context)
                         await repo.save_order(
                             ticket_id=ticket_record.id,
                             client_order_id=client_order_id,
@@ -1077,7 +1134,7 @@ class WorkflowSupervisor:
                             action=approved_ticket.action.value,
                             yes_price_dollars=approved_ticket.yes_price_dollars,
                             count_fp=approved_ticket.count_fp,
-                            raw=receipt.details,
+                            raw=order_raw,
                             kalshi_order_id=receipt.external_order_id,
                             kalshi_env=room.kalshi_env,
                             strategy_code=StrategyCode.DIRECTIONAL.value,
@@ -1208,6 +1265,10 @@ class WorkflowSupervisor:
             action=signal.recommended_action.value,
             strategy_code=StrategyCode.DIRECTIONAL.value,
             shadow_mode=bool(getattr(room, "shadow_mode", self.settings.app_shadow_mode)),
+            yes_price_dollars=signal.target_yes_price_dollars,
+            forecast_delta_f=signal.forecast_delta_f,
+            confidence_band=signal.confidence_band,
+            spread_bps=signal.eligibility.market_spread_bps if signal.eligibility is not None else None,
         )
         payload = decision.to_payload()
         signal.candidate_trace = {**dict(signal.candidate_trace or {}), "empirical_gate": payload}
@@ -1459,6 +1520,21 @@ class WorkflowSupervisor:
                     room=room,
                     signal=signal,
                 )
+                signal_market_snapshot = _signal_market_snapshot_payload(
+                    market_response,
+                    observed_at=market_state.observed_at,
+                    kalshi_env=room.kalshi_env,
+                    market_ticker=room.market_ticker,
+                )
+                signal_trade_behavior_context = trade_behavior_context_payload(
+                    market_ticker=room.market_ticker,
+                    side=signal.recommended_side.value if signal.recommended_side is not None else None,
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                    yes_price_dollars=signal.target_yes_price_dollars,
+                    forecast_delta_f=signal.forecast_delta_f,
+                    confidence_band=signal.confidence_band,
+                    spread_bps=signal.eligibility.market_spread_bps if signal.eligibility is not None else None,
+                )
                 await repo.save_signal(
                     room_id=room.id,
                     market_ticker=room.market_ticker,
@@ -1474,6 +1550,8 @@ class WorkflowSupervisor:
                         "trader_context": dossier.trader_context.model_dump(mode="json"),
                         "research_freshness": dossier.freshness.model_dump(mode="json"),
                         "effective_research_freshness": dossier.freshness.model_dump(mode="json"),
+                        "market_snapshot": signal_market_snapshot,
+                        "trade_behavior_context": signal_trade_behavior_context,
                         "resolution_state": signal.resolution_state.value,
                         "strategy_mode": signal.strategy_mode.value,
                         "evaluation_outcome": signal.evaluation_outcome,
@@ -1743,6 +1821,19 @@ class WorkflowSupervisor:
                             message_id=trader_record.id,
                             strategy_code=StrategyCode.DIRECTIONAL.value,
                         )
+                        llm_trade_behavior_context = trade_behavior_context_payload(
+                            market_ticker=room.market_ticker,
+                            side=ticket.side.value,
+                            strategy_code=StrategyCode.DIRECTIONAL.value,
+                            yes_price_dollars=ticket.yes_price_dollars,
+                            forecast_delta_f=signal.forecast_delta_f,
+                            confidence_band=signal.confidence_band,
+                            spread_bps=signal.eligibility.market_spread_bps if signal.eligibility is not None else None,
+                        )
+                        ticket_record.payload = _payload_with_trade_behavior_context(
+                            ticket_record.payload,
+                            llm_trade_behavior_context,
+                        )
                         _ticker_positions = await repo.list_positions_for_ticker(
                             room.market_ticker,
                             self.settings.kalshi_subaccount,
@@ -1907,6 +1998,10 @@ class WorkflowSupervisor:
                                     )
                             ORDERS_TOTAL.labels(status=receipt.status).inc()
                             if receipt.external_order_id or receipt.status not in ("shadow_skipped", "inactive_color_skipped"):
+                                order_raw = _payload_with_trade_behavior_context(
+                                    receipt.details,
+                                    llm_trade_behavior_context,
+                                )
                                 await repo.save_order(
                                     ticket_id=ticket_record.id,
                                     client_order_id=client_order_id,
@@ -1916,9 +2011,10 @@ class WorkflowSupervisor:
                                     action=approved_ticket.action.value,
                                     yes_price_dollars=approved_ticket.yes_price_dollars,
                                     count_fp=approved_ticket.count_fp,
-                                    raw=receipt.details,
+                                    raw=order_raw,
                                     kalshi_order_id=receipt.external_order_id,
                                     kalshi_env=room.kalshi_env,
+                                    strategy_code=StrategyCode.DIRECTIONAL.value,
                                 )
                             await repo.update_trade_ticket_status(ticket_record.id, receipt.status)
                         else:

@@ -367,6 +367,7 @@ class TradeAnalysisService:
                     room.market_ticker,
                     decision_ts,
                     room_id=room.id,
+                    signal_payload=signal.payload,
                     orders=related_orders,
                     fills=related_fills,
                 )
@@ -619,6 +620,7 @@ class TradeAnalysisService:
         decision_ts: datetime,
         *,
         room_id: str | None = None,
+        signal_payload: dict[str, Any] | None = None,
         orders: list[OrderRecord] | None = None,
         fills: list[FillRecord] | None = None,
     ) -> dict[str, Any] | None:
@@ -644,6 +646,11 @@ class TradeAnalysisService:
                 )
                 if artifact_snapshot is not None and artifact_observed_at is not None and artifact_observed_at <= decision_ts:
                     return artifact_snapshot
+
+        signal_snapshot = self._market_snapshot_from_signal_payload(signal_payload)
+        signal_observed_at = _as_utc(signal_snapshot.get("observed_at")) if signal_snapshot is not None else None
+        if signal_snapshot is not None and signal_observed_at is not None and signal_observed_at <= decision_ts:
+            candidates.append(signal_snapshot)
 
         history = (
             await session.execute(
@@ -760,6 +767,7 @@ class TradeAnalysisService:
 
         source_rank = {
             "room_market_snapshot": 4,
+            "signal_payload_market_snapshot": 4,
             "market_state": 3,
             "market_price_history": 2,
             "historical_market_snapshots": 1,
@@ -773,6 +781,42 @@ class TradeAnalysisService:
                 source_rank.get(str(row.get("source")), 0),
             ),
         )
+
+    @staticmethod
+    def _market_snapshot_from_signal_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        snapshot = payload.get("market_snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        market = snapshot.get("market") if isinstance(snapshot.get("market"), dict) else snapshot
+        yes_bid = _decimal_or_none(market.get("yes_bid_dollars"))
+        yes_ask = _decimal_or_none(market.get("yes_ask_dollars"))
+        no_ask = _decimal_or_none(market.get("no_ask_dollars"))
+        if yes_ask is None and no_ask is not None:
+            yes_ask = Decimal("1") - no_ask
+        if yes_bid is None and yes_ask is None:
+            return None
+        mid = (yes_bid + yes_ask) / Decimal("2") if yes_bid is not None and yes_ask is not None else None
+        provenance = dict(snapshot.get("snapshot_provenance") or {})
+        provenance.setdefault("recovered", True)
+        provenance.setdefault("source", "signal_payload_market_snapshot")
+        provenance.setdefault("source_kind", "signal_payload")
+        provenance.setdefault("source_id", provenance.get("source_id") or "signal_payload")
+        provenance.setdefault("leakage_risk", "none")
+        return {
+            "source": "signal_payload_market_snapshot",
+            "source_kind": "signal_payload",
+            "source_id": provenance.get("source_id"),
+            "snapshot_id": provenance.get("source_id") or "signal_payload",
+            "observed_at": _as_utc(snapshot.get("observed_at")),
+            "yes_bid_dollars": yes_bid,
+            "yes_ask_dollars": yes_ask,
+            "mid_dollars": mid,
+            "last_trade_dollars": _decimal_or_none(market.get("last_price_dollars")),
+            "volume": _int_or_none(market.get("volume")),
+            "snapshot_provenance": provenance,
+        }
 
     @staticmethod
     def _market_snapshot_from_artifact(artifact: Artifact) -> dict[str, Any] | None:
@@ -1048,6 +1092,10 @@ class TradeAnalysisService:
             strategy_code=strategy_code,
             yes_price_dollars=ticket_price,
             include_price_band=True,
+            forecast_delta_f=signal_payload.get("forecast_delta_f"),
+            confidence_band=signal_payload.get("confidence_band"),
+            spread_bps=_int_or_none(eligibility.get("market_spread_bps")),
+            include_context_bands=True,
         )
         snapshot_provenance = dict((market_snapshot or {}).get("snapshot_provenance") or {})
         if market_snapshot is not None and not snapshot_provenance:
@@ -1147,7 +1195,10 @@ class TradeAnalysisService:
             "lifecycle_net_pnl_dollars": _decimal_str(lifecycle_net_pnl.quantize(Decimal("0.0001"))) if lifecycle_net_pnl is not None else None,
             "model_edge_dollars": _decimal_str(model_edge.quantize(Decimal("0.0001"))) if model_edge is not None else None,
             "training_eligible": not any(reason in TRAINING_EXCLUDED_REASONS for reason in exclusion_reasons),
-            "training_exclusion_reason": next((reason for reason in exclusion_reasons if reason in TRAINING_EXCLUDED_REASONS), None),
+            "training_exclusion_reason": next(
+                (reason for reason in exclusion_reasons if reason in TRAINING_EXCLUDED_REASONS),
+                exclusion_reasons[0] if exclusion_reasons else None,
+            ),
             "exclusion_reasons": exclusion_reasons,
             "bucket_key": row_bucket_key,
             "bucket_sample_count": 0,

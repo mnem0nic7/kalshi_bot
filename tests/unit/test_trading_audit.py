@@ -9,6 +9,7 @@ from sqlalchemy import select
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import StrategyCode
 from kalshi_bot.db.models import (
+    Checkpoint,
     FillRecord,
     MarketState,
     OpsEvent,
@@ -471,6 +472,104 @@ async def test_trading_audit_downgrades_historical_suppressed_exits_without_open
     assert "risk_reducing_exit_suppressed_by_kill_switch" not in issue_codes
     assert issue["severity"] == "medium"
     assert issue["evidence"]["open_position_markets"] == []
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_stale_position_repair_dry_run_preserves_positions(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        session.add_all([
+            PositionRecord(
+                market_ticker="KXHIGHNY-26APR24-T67",
+                kalshi_env="demo",
+                subaccount=0,
+                side="yes",
+                count_fp=Decimal("3.00"),
+                average_price_dollars=Decimal("0.4500"),
+                raw={},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+            PositionRecord(
+                market_ticker="KXHIGHCHI-26APR24-T78",
+                kalshi_env="demo",
+                subaccount=0,
+                side="yes",
+                count_fp=Decimal("2.00"),
+                average_price_dollars=Decimal("0.5500"),
+                raw={},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+            Checkpoint(
+                stream_name="reconcile:demo",
+                payload={
+                    "live_tickers": ["KXHIGHCHI-26APR24-T78"],
+                    "reconciled_at": NOW.isoformat(),
+                },
+            ),
+        ])
+        await session.commit()
+
+    result = await TradingAuditService(settings, session_factory).repair_stale_positions(
+        kalshi_env="demo",
+        dry_run=True,
+        now=NOW,
+    )
+
+    async with session_factory() as session:
+        position = (
+            await session.execute(
+                select(PositionRecord).where(PositionRecord.market_ticker == "KXHIGHNY-26APR24-T67")
+            )
+        ).scalar_one()
+
+    assert result["fresh_reconcile"] is True
+    assert result["candidate_count"] == 1
+    assert result["protected_count"] == 1
+    assert result["updated_count"] == 0
+    assert position.count_fp == Decimal("3.00")
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_stale_position_repair_zeroes_absent_exchange_positions(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        session.add_all([
+            PositionRecord(
+                market_ticker="KXHIGHNY-26APR24-T67",
+                kalshi_env="demo",
+                subaccount=0,
+                side="yes",
+                count_fp=Decimal("3.00"),
+                average_price_dollars=Decimal("0.4500"),
+                raw={"source": "test"},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+            Checkpoint(
+                stream_name="reconcile:demo",
+                payload={"live_tickers": [], "reconciled_at": NOW.isoformat()},
+            ),
+        ])
+        await session.commit()
+
+    result = await TradingAuditService(settings, session_factory).repair_stale_positions(
+        kalshi_env="demo",
+        dry_run=False,
+        now=NOW,
+    )
+
+    async with session_factory() as session:
+        position = (
+            await session.execute(
+                select(PositionRecord).where(PositionRecord.market_ticker == "KXHIGHNY-26APR24-T67")
+            )
+        ).scalar_one()
+
+    assert result["updated_count"] == 1
+    assert position.count_fp == Decimal("0")
+    assert position.raw["trade_behavior_stale_position_repair"]["old_count_fp"] == "3.00"
 
 
 @pytest.mark.asyncio

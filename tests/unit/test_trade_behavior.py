@@ -7,8 +7,10 @@ import pytest
 
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import FillRecord
+from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.trade_behavior import evaluate_empirical_gate
+from kalshi_bot.services.trade_behavior_validation import build_trade_behavior_validation_report
 
 
 NOW = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
@@ -61,6 +63,7 @@ async def test_empirical_gate_blocks_under_sampled_production_live_entries(trade
             action="buy",
             strategy_code="A",
             shadow_mode=False,
+            yes_price_dollars=Decimal("0.5000"),
             now=NOW,
         )
 
@@ -82,6 +85,7 @@ async def test_empirical_gate_keeps_under_sampled_demo_shadow_report_only(trade_
             action="buy",
             strategy_code="A",
             shadow_mode=True,
+            yes_price_dollars=Decimal("0.5000"),
             now=NOW,
         )
 
@@ -109,6 +113,7 @@ async def test_empirical_gate_blocks_negative_actual_settled_evidence(trade_beha
             action="buy",
             strategy_code="A",
             shadow_mode=False,
+            yes_price_dollars=Decimal("0.5000"),
             now=NOW,
         )
 
@@ -117,3 +122,77 @@ async def test_empirical_gate_blocks_negative_actual_settled_evidence(trade_beha
     assert decision.actual_sample_count == 2
     assert decision.actual_net_pnl is not None
     assert decision.actual_net_pnl < Decimal("0")
+
+
+class FakeWatchdog:
+    async def get_status(self, repo, *, kalshi_env: str | None = None):
+        return {
+            "kalshi_env": kalshi_env,
+            "active_color": "blue",
+            "kill_switch_enabled": False,
+            "colors": {
+                "blue": {"combined_healthy": True},
+                "green": {"combined_healthy": True},
+            },
+        }
+
+
+class FakeAudit:
+    async def build_report(self, *, kalshi_env: str, days: int, focus: str = "money-safety"):
+        return {
+            "issues": [],
+            "lifecycle": {
+                "worst_buckets": [
+                    {
+                        "bucket_key": "KXHIGHNY|NY|yes|A|50-59c|delta:unknown|conf:unknown|spread:unknown",
+                        "lifecycle_net_pnl": "1.0000",
+                        "bucket_win_rate": 1.0,
+                    }
+                ]
+            },
+        }
+
+
+class FakeAnalysis:
+    async def build_report(self, *, kalshi_env: str, days: int, buckets: bool = False):
+        return {
+            "row_count": 1,
+            "training_eligible_count": 1,
+            "excluded_count": 0,
+            "data_defect_count": 0,
+            "top_exclusion_reasons": [],
+            "buckets": [],
+        }
+
+
+@pytest.mark.asyncio
+async def test_trade_behavior_validation_aggregates_runtime_audit_analysis_and_freeze(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        async with session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env="production")
+            await repo.ensure_deployment_control("blue", kalshi_env="production")
+            await session.commit()
+
+        report = await build_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=FakeWatchdog(),
+            trading_audit_service=FakeAudit(),
+            trade_analysis_service=FakeAnalysis(),
+            kalshi_env="production",
+            days=7,
+            since_hours=24,
+            now=NOW,
+        )
+    finally:
+        await engine.dispose()
+
+    assert report["status"] == "pass"
+    assert report["freeze"]["production_entry_freeze_enabled"] is True
+    assert report["empirical_gate"]["readiness"]["status"] == "freeze_active"
+    assert report["buy_entry_bypass"]["ticket_count"] == 0
+    assert report["analysis"]["training_eligible_count"] == 1

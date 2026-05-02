@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import logging
 import zoneinfo
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -11,6 +12,8 @@ from kalshi_bot.core.fixed_point import as_decimal, quantize_count, quantize_pri
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
+
+logger = logging.getLogger(__name__)
 
 _PACIFIC = zoneinfo.ZoneInfo("America/Los_Angeles")
 
@@ -59,6 +62,8 @@ class ReconcileSummary:
     fills_count: int
     settlements_count: int
     historical_cutoff_seen: bool
+    live_tickers: list[str]
+    reconciled_at: str
 
 
 class ReconciliationService:
@@ -67,7 +72,18 @@ class ReconciliationService:
         self.settings = settings or get_settings()
 
     async def reconcile(self, repo: PlatformRepository, *, subaccount: int = 0, kalshi_env: str = "") -> ReconcileSummary:
-        historical_cutoff = await self.kalshi.get_historical_cutoff()
+        reconciled_at = datetime.now(UTC)
+        historical_cutoff_seen = True
+        try:
+            historical_cutoff = await self.kalshi.get_historical_cutoff()
+        except Exception as exc:
+            historical_cutoff_seen = False
+            historical_cutoff = {
+                "unavailable": True,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            logger.warning("Kalshi historical cutoff unavailable during reconcile; continuing with live reconciliation")
         balance = await self.kalshi.get_balance()
         positions_payload = await self.kalshi.get_positions(subaccount=subaccount)
         orders_payload = await self.kalshi.get_orders()
@@ -170,6 +186,8 @@ class ReconciliationService:
                 "orders_count": len(orders),
                 "fills_count": len(fills),
                 "settlements_count": len(settlements),
+                "live_tickers": sorted(live_tickers),
+                "reconciled_at": reconciled_at.isoformat(),
             },
         )
 
@@ -198,6 +216,8 @@ class ReconciliationService:
                 "orders_count": len(orders),
                 "fills_count": len(fills),
                 "settlements_count": len(settlements),
+                "live_tickers": sorted(live_tickers),
+                "reconciled_at": reconciled_at.isoformat(),
             },
             kalshi_env=kalshi_env,
         )
@@ -208,5 +228,7 @@ class ReconciliationService:
             orders_count=len(orders),
             fills_count=len(fills),
             settlements_count=len(settlements),
-            historical_cutoff_seen=bool(historical_cutoff),
+            historical_cutoff_seen=historical_cutoff_seen,
+            live_tickers=sorted(live_tickers),
+            reconciled_at=reconciled_at.isoformat(),
         )
