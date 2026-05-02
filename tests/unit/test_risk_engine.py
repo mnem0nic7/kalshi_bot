@@ -41,6 +41,10 @@ def make_signal(edge_bps: int = 300, *, capital_bucket: str = "safe", trade_regi
     return signal
 
 
+def make_sell_signal(edge_bps: int = 300) -> StrategySignal:
+    return replace(make_signal(edge_bps), recommended_action=TradeAction.SELL)
+
+
 def make_room() -> Room:
     return Room(
         name="Test",
@@ -51,6 +55,12 @@ def make_room() -> Room:
         shadow_mode=False,
         kill_switch_enabled=False,
     )
+
+
+def make_production_room() -> Room:
+    room = make_room()
+    room.kalshi_env = "production"
+    return room
 
 
 def test_risk_engine_approves_fresh_small_trade() -> None:
@@ -114,6 +124,79 @@ def test_risk_engine_blocks_new_entries_when_source_health_pause_is_active() -> 
 
     assert verdict.status == RiskStatus.BLOCKED
     assert any("Source health pause is active" in reason for reason in verdict.reasons)
+
+
+def test_risk_engine_blocks_production_entries_during_trade_behavior_freeze() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=300,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_production_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(),
+        context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("trade_behavior_retraining_freeze" in reason for reason in verdict.reasons)
+
+
+def test_risk_engine_allows_risk_reducing_sell_during_freeze_and_kill_switch() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=300,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_production_room(),
+        control=DeploymentControl(
+            id="default",
+            active_color="blue",
+            kill_switch_enabled=True,
+            notes={
+                "source_health": {
+                    "pause_new_entries": True,
+                    "pause_reason": "source outage",
+                }
+            },
+        ),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.SELL,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("5.00"),
+        ),
+        signal=make_sell_signal(),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            current_position_count_fp=Decimal("10.00"),
+            current_position_side="yes",
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert any("risk-reducing exit is allowed" in reason for reason in verdict.reasons)
+    assert not any("trade_behavior_retraining_freeze" in reason for reason in verdict.reasons)
+    assert not any("Source health pause" in reason for reason in verdict.reasons)
 
 
 def test_risk_engine_blocks_when_position_limit_would_be_breached() -> None:

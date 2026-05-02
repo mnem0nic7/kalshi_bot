@@ -438,6 +438,77 @@ async def test_trade_analysis_keeps_excluded_rows_with_reasons(analysis_harness)
 
 
 @pytest.mark.asyncio
+async def test_trade_analysis_recovers_market_snapshot_from_order_raw(analysis_harness) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-raw-snapshot")
+        ticket = _ticket(room.id)
+        order = OrderRecord(
+            id="order-raw-snapshot",
+            trade_ticket_id=ticket.id,
+            kalshi_env="production",
+            kalshi_order_id="kord-raw-snapshot",
+            client_order_id=ticket.client_order_id,
+            market_ticker=TICKER,
+            status="filled",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("10.00"),
+            strategy_code="A",
+            raw={
+                "yes_price_dollars": "0.5000",
+                "no_price_dollars": "0.5000",
+                "created_time": (NOW - timedelta(minutes=18)).isoformat(),
+            },
+            created_at=NOW - timedelta(minutes=18),
+            updated_at=NOW - timedelta(minutes=18),
+        )
+        session.add_all([
+            room,
+            _signal(room.id),
+            ticket,
+            _risk(ticket.id, room.id),
+            order,
+            HistoricalWeatherSnapshotRecord(
+                station_id="KNYC",
+                series_ticker="KXHIGHNY",
+                local_market_day="26APR24",
+                asof_ts=NOW - timedelta(minutes=21),
+                source_kind="test",
+                source_id="weather-raw",
+                forecast_updated_ts=NOW - timedelta(minutes=21),
+                forecast_high_f=Decimal("70.00"),
+                current_temp_f=Decimal("65.00"),
+                payload={},
+            ),
+            HistoricalSettlementLabelRecord(
+                market_ticker=TICKER,
+                series_ticker="KXHIGHNY",
+                local_market_day="26APR24",
+                kalshi_result="yes",
+                settlement_value_dollars=Decimal("1.0000"),
+                settlement_ts=NOW,
+                crosscheck_status="matched",
+                payload={},
+            ),
+        ])
+        await session.commit()
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    row = dataset.rows[0]
+    assert row["market_snapshot_source"] == "order_raw_execution_touch"
+    assert row["snapshot_provenance"]["recovered"] is True
+    assert "missing_market_snapshot" not in row["exclusion_reasons"]
+    assert row["training_exclusion_reason"] is None
+
+
+@pytest.mark.asyncio
 async def test_trade_analysis_marks_signal_only_unresolved_rows_pending_not_missing_execution_fields(
     analysis_harness,
 ) -> None:

@@ -276,6 +276,7 @@ class TradeEligibilityVerdict(BaseModel):
     model_quality_reasons: list[str] = Field(default_factory=list)
     recommended_size_cap_fp: Decimal | None = None
     warn_only_blocked: bool = False
+    empirical_gate: dict[str, Any] | None = None
 
     @field_validator("remaining_payout_dollars", mode="before")
     @classmethod

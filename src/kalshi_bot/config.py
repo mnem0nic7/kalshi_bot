@@ -217,6 +217,17 @@ class Settings(BaseSettings):
     strategy_quality_edge_buffer_bps: int = 25
     sigma_lead_correction_enabled: bool = True
 
+    # Trade behavior retraining guardrails. Production entries stay frozen by
+    # default while historical evidence is being repaired and re-scored; exits
+    # and reconciliation paths do not consult these entry-only gates.
+    trade_behavior_production_entry_freeze_enabled: bool = True
+    trade_behavior_entry_freeze_reason: str = "trade_behavior_retraining_freeze"
+    trade_behavior_freeze_min_edge_bps: int = 500
+    trade_behavior_empirical_gate_enabled: bool = True
+    trade_behavior_empirical_gate_min_settled_fills: int = 20
+    trade_behavior_empirical_gate_min_net_pnl_dollars: float = 0.0
+    trade_behavior_empirical_gate_lookback_days: int = 180
+
     # Strategy C adaptive polling cadence (ThresholdProximityMonitor, §4.1.4)
     strategy_c_cadence_idle_seconds: int = 3600
     strategy_c_cadence_approach_seconds: int = 900

@@ -957,10 +957,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "trading-audit":
+            audit_days = 3650 if args.full_history else args.days
             if args.trading_audit_command == "repair":
                 result = await container.trading_audit_service.repair_attribution(
                     kalshi_env=args.kalshi_env,
-                    days=args.days,
+                    days=audit_days,
                     dry_run=args.dry_run,
                     limit=args.limit,
                 )
@@ -968,7 +969,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 return 0
             report = await container.trading_audit_service.build_report(
                 kalshi_env=args.kalshi_env,
-                days=args.days,
+                days=audit_days,
                 focus=args.focus,
             )
             if args.json:
@@ -978,10 +979,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "trade-analysis":
+            analysis_days = 3650 if args.full_history else args.days
             if args.trade_analysis_command == "dataset":
                 result = await container.trade_analysis_service.write_dataset(
                     kalshi_env=args.kalshi_env,
-                    days=args.days,
+                    days=analysis_days,
                     output=Path(args.output),
                     limit=args.limit,
                 )
@@ -995,8 +997,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 return 0
             report = await container.trade_analysis_service.build_report(
                 kalshi_env=args.kalshi_env,
-                days=args.days,
+                days=analysis_days,
                 limit=args.limit,
+                buckets=args.buckets,
             )
             if args.json:
                 print(json.dumps(report, indent=2))
@@ -1814,6 +1817,8 @@ def build_parser() -> argparse.ArgumentParser:
     trading_audit.add_argument("trading_audit_command", nargs="?", choices=["report", "repair"], default="report")
     trading_audit.add_argument("--kalshi-env", default="production")
     trading_audit.add_argument("--days", type=int, default=7)
+    trading_audit.add_argument("--full-history", action="store_true")
+    trading_audit.add_argument("--buckets", action="store_true")
     trading_audit.add_argument("--focus", choices=["money-safety"], default="money-safety")
     trading_audit.add_argument("--json", action="store_true")
     trading_audit.add_argument("--limit", type=int, default=500)
@@ -1826,6 +1831,8 @@ def build_parser() -> argparse.ArgumentParser:
     trade_analysis.add_argument("trade_analysis_command", choices=["dataset", "report", "model-eval"])
     trade_analysis.add_argument("--kalshi-env", default="production")
     trade_analysis.add_argument("--days", type=int, default=180)
+    trade_analysis.add_argument("--full-history", action="store_true")
+    trade_analysis.add_argument("--buckets", action="store_true")
     trade_analysis.add_argument("--limit", type=int, default=None)
     trade_analysis.add_argument("--json", action="store_true")
     trade_analysis.add_argument("--output", default="data/trade_analysis.jsonl")

@@ -23,6 +23,7 @@ from kalshi_bot.db.models import (
     Signal,
     TradeTicketRecord,
 )
+from kalshi_bot.services.trade_behavior import bucket_key
 
 
 def _utc_now() -> datetime:
@@ -95,6 +96,14 @@ class _Lot:
     settlement_result: str | None
 
 
+@dataclass(slots=True)
+class _LedgerLot:
+    count: Decimal
+    price: Decimal
+    settlement_result: str | None
+    bucket_key: str
+
+
 class TradingAuditService:
     """Read-only production trading behavior audit.
 
@@ -133,6 +142,7 @@ class TradingAuditService:
 
         fill_summary = self._fill_summary(fills)
         pnl = self._gross_pnl(fills)
+        lifecycle = self._lifecycle_ledger(fills)
         position_discrepancy = self._exchange_position_discrepancy(fills=fills, positions=positions)
         attribution = self._attribution_gaps(fills=fills, orders=orders)
         funnel = self._execution_funnel(
@@ -175,6 +185,7 @@ class TradingAuditService:
             "counts": {**counts, "market_price_history": price_history_count},
             "fill_summary": fill_summary,
             "pnl": pnl,
+            "lifecycle": lifecycle,
             "exchange_position_discrepancy": position_discrepancy,
             "attribution": attribution,
             "execution_funnel": funnel,
@@ -568,6 +579,123 @@ class TradingAuditService:
             "settled_lots_scored": settled_trades,
             "open_lot_count": open_lot_count,
             "unsettled_open_contracts": str(unsettled_open_contracts),
+        }
+
+    def _lifecycle_ledger(self, fills: list[FillRecord]) -> dict[str, Any]:
+        lots_by_key: dict[tuple[str, str, str], list[_LedgerLot]] = defaultdict(list)
+        rows: dict[str, dict[str, Any]] = {}
+
+        def ensure(bucket: str, fill: FillRecord) -> dict[str, Any]:
+            row = rows.setdefault(
+                bucket,
+                {
+                    "bucket_key": bucket,
+                    "strategy_code": _strategy_key(fill.strategy_code),
+                    "side": fill.side,
+                    "fills": 0,
+                    "contracts": Decimal("0"),
+                    "fees": Decimal("0"),
+                    "lifecycle_gross_pnl": Decimal("0"),
+                    "lifecycle_net_pnl": Decimal("0"),
+                    "settled_or_closed_count": 0,
+                    "win_count": 0,
+                },
+            )
+            return row
+
+        def add_fee(row: dict[str, Any], fee: Decimal) -> None:
+            row["fees"] += fee
+            row["lifecycle_net_pnl"] -= fee
+
+        for fill in fills:
+            strategy = _strategy_key(fill.strategy_code)
+            key = (fill.market_ticker, fill.side, strategy)
+            price = _side_price(fill)
+            count = Decimal(fill.count_fp)
+            fee = _decimal_or_none((fill.raw or {}).get("fee_cost")) or Decimal("0")
+            if fill.action == "buy":
+                bucket = bucket_key(
+                    market_ticker=fill.market_ticker,
+                    side=fill.side,
+                    strategy_code=fill.strategy_code,
+                    yes_price_dollars=fill.yes_price_dollars,
+                    include_price_band=True,
+                )
+                row = ensure(bucket, fill)
+                row["fills"] += 1
+                row["contracts"] += count
+                add_fee(row, fee)
+                lots_by_key[key].append(
+                    _LedgerLot(
+                        count=count,
+                        price=price,
+                        settlement_result=fill.settlement_result,
+                        bucket_key=bucket,
+                    )
+                )
+                continue
+
+            if fill.action != "sell":
+                continue
+            remaining = count
+            for lot in lots_by_key[key]:
+                if remaining <= 0:
+                    break
+                if lot.count <= 0:
+                    continue
+                matched = min(lot.count, remaining)
+                row = ensure(lot.bucket_key, fill)
+                pnl = (price - lot.price) * matched
+                fee_share = fee * (matched / count) if count > 0 else Decimal("0")
+                row["fills"] += 1
+                row["contracts"] += matched
+                row["lifecycle_gross_pnl"] += pnl
+                row["lifecycle_net_pnl"] += pnl
+                row["settled_or_closed_count"] += 1
+                if pnl > 0:
+                    row["win_count"] += 1
+                add_fee(row, fee_share)
+                lot.count -= matched
+                remaining -= matched
+
+        for lots in lots_by_key.values():
+            for lot in lots:
+                if lot.count <= 0 or lot.settlement_result not in {"win", "loss"}:
+                    continue
+                row = rows[lot.bucket_key]
+                pnl = (
+                    (Decimal("1") - lot.price) * lot.count
+                    if lot.settlement_result == "win"
+                    else -lot.price * lot.count
+                )
+                row["lifecycle_gross_pnl"] += pnl
+                row["lifecycle_net_pnl"] += pnl
+                row["settled_or_closed_count"] += 1
+                if lot.settlement_result == "win":
+                    row["win_count"] += 1
+
+        out = []
+        for row in rows.values():
+            sample_count = int(row["settled_or_closed_count"])
+            out.append({
+                "bucket_key": row["bucket_key"],
+                "strategy_code": row["strategy_code"],
+                "side": row["side"],
+                "fills": row["fills"],
+                "contracts": str(row["contracts"]),
+                "fees": _money(row["fees"]),
+                "lifecycle_gross_pnl": _money(row["lifecycle_gross_pnl"]),
+                "lifecycle_net_pnl": _money(row["lifecycle_net_pnl"]),
+                "bucket_sample_count": sample_count,
+                "bucket_win_rate": round(row["win_count"] / sample_count, 6) if sample_count else None,
+                "bucket_net_pnl": _money(row["lifecycle_net_pnl"]),
+            })
+
+        out.sort(key=lambda item: (Decimal(str(item["lifecycle_net_pnl"] or "0")), item["bucket_key"]))
+        return {
+            "bucket_count": len(out),
+            "worst_buckets": out[:20],
+            "best_buckets": list(reversed(out[-20:])),
         }
 
     def _exchange_position_discrepancy(
@@ -1194,15 +1322,26 @@ class TradingAuditService:
             exposed_clusters = [
                 cluster for cluster in suppressed_exit_clusters if cluster["market_ticker"] in open_tickers
             ]
-            issues.append({
-                "severity": "critical" if exposed_clusters else "high",
-                "code": "risk_reducing_exit_suppressed_by_kill_switch",
-                "summary": "Risk-reducing stop-loss exits were suppressed while the kill switch was enabled.",
-                "evidence": {
-                    "clusters": suppressed_exit_clusters[:10],
-                    "open_position_markets": sorted(open_tickers),
-                },
-            })
+            if exposed_clusters:
+                issues.append({
+                    "severity": "critical",
+                    "code": "risk_reducing_exit_suppressed_by_kill_switch",
+                    "summary": "Risk-reducing stop-loss exits are suppressed while open exposure remains.",
+                    "evidence": {
+                        "clusters": exposed_clusters[:10],
+                        "open_position_markets": sorted(open_tickers),
+                    },
+                })
+            else:
+                issues.append({
+                    "severity": "medium",
+                    "code": "historical_risk_reducing_exit_suppressed_by_kill_switch",
+                    "summary": "Historical stop-loss exits were suppressed by kill switch, but no matching open exposure remains.",
+                    "evidence": {
+                        "clusters": suppressed_exit_clusters[:10],
+                        "open_position_markets": sorted(open_tickers),
+                    },
+                })
         if funnel["approved_without_order_count"] or funnel["recent_failed_order_count"]:
             issues.append({
                 "severity": "high",
@@ -1271,6 +1410,7 @@ def format_trading_audit_text(report: dict[str, Any]) -> str:
     stop_loss = report["stop_loss"]
     risk = report["risk"]
     trigger = report.get("trigger_diagnostics", {})
+    lifecycle = report.get("lifecycle", {})
     issues = report["issues"]
 
     lines = [
@@ -1291,9 +1431,19 @@ def format_trading_audit_text(report: dict[str, Any]) -> str:
             f"(one-sided book: {trigger.get('one_sided_book_count', 0)}, "
             f"wide spread: {trigger.get('wide_spread_count', 0)})"
         ),
-        "",
-        "Top risk reasons:",
     ]
+    if lifecycle.get("worst_buckets"):
+        lines.extend(["", "Worst lifecycle buckets:"])
+        for row in lifecycle["worst_buckets"][:5]:
+            lines.append(
+                f"- {row['bucket_key']}: net={row['lifecycle_net_pnl']} "
+                f"fees={row['fees']} win_rate={row['bucket_win_rate']}"
+            )
+        lines.append("")
+        lines.append("Top risk reasons:")
+    else:
+        lines.append("")
+        lines.append("Top risk reasons:")
     for row in risk["top_reasons"][:5]:
         lines.append(f"- {row['count']}: {row['reason']}")
     lines.append("")

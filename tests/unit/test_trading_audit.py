@@ -423,6 +423,57 @@ async def test_trading_audit_flags_kill_switch_suppressed_stop_loss_exits(audit_
 
 
 @pytest.mark.asyncio
+async def test_trading_audit_downgrades_historical_suppressed_exits_without_open_exposure(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    room = _room("room-historical-suppressed-exit", "KXHIGHTNOLA-26APR30-T79")
+    async with session_factory() as session:
+        session.add(room)
+        for idx, minutes_ago in enumerate([20, 10]):
+            session.add(
+                OpsEvent(
+                    kalshi_env="production",
+                    severity="warning",
+                    source="stop_loss",
+                    summary="Stop-loss suppressed by kill switch [trailing_stop]: KXHIGHTNOLA-26APR30-T79 no",
+                    payload={
+                        "market_ticker": room.market_ticker,
+                        "side": "no",
+                        "trigger": "trailing_stop",
+                        "action": "stop_loss_kill_switch_suppressed",
+                        "kill_switch": {
+                            "mode": "auto",
+                            "source": "watchdog",
+                            "reason": "reconcile_stale",
+                        },
+                        "reconcile": {
+                            "stream_name": "daemon_reconcile:production:blue",
+                            "age_seconds": 420 + idx,
+                            "threshold_seconds": 300,
+                            "stale": True,
+                        },
+                    },
+                    created_at=NOW - timedelta(minutes=minutes_ago),
+                    updated_at=NOW - timedelta(minutes=minutes_ago),
+                )
+            )
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    issue_codes = {item["code"] for item in report["issues"]}
+    issue = next(
+        item for item in report["issues"] if item["code"] == "historical_risk_reducing_exit_suppressed_by_kill_switch"
+    )
+    assert "risk_reducing_exit_suppressed_by_kill_switch" not in issue_codes
+    assert issue["severity"] == "medium"
+    assert issue["evidence"]["open_position_markets"] == []
+
+
+@pytest.mark.asyncio
 async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) -> None:
     settings, session_factory = audit_harness
     async with session_factory() as session:

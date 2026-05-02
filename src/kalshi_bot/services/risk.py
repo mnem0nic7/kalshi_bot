@@ -15,6 +15,7 @@ from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.risk_policy import probability_midband_block_reason
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars, remaining_payout_dollars
 from kalshi_bot.services.strategy_cleanup import CleanupSignal
+from kalshi_bot.services.trade_behavior import entry_pause_reason
 
 
 @dataclass(slots=True)
@@ -138,18 +139,6 @@ def approved_ticket_for_verdict(ticket: TradeTicket, verdict: RiskVerdictPayload
     return ticket.model_copy(update={"count_fp": approved_count})
 
 
-def _source_health_pause_reason(control: DeploymentControl) -> str | None:
-    notes = dict(control.notes or {})
-    source_health = dict(notes.get("source_health") or {})
-    if not source_health.get("pause_new_entries"):
-        return None
-    reason = source_health.get("pause_reason") or source_health.get("reason") or "source health degraded"
-    label = source_health.get("aggregate_label")
-    if label:
-        return f"Source health pause is active ({label}): {reason}."
-    return f"Source health pause is active: {reason}."
-
-
 class DeterministicRiskEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -217,10 +206,31 @@ class DeterministicRiskEngine:
         bucket_used_dollars_after: Decimal | None = None
         resized_by_bucket = False
         resized_by_count_cap = False
+        is_buy_entry = ticket.action.value == "buy"
+        is_sell_exit = ticket.action.value == "sell"
+        risk_reducing_exit = (
+            is_sell_exit
+            and context.current_position_count_fp > 0
+            and (
+                context.current_position_side is None
+                or context.current_position_side == ticket.side.value
+            )
+        )
+        diagnostics["risk_reducing_exit"] = risk_reducing_exit
+
+        if is_sell_exit and not risk_reducing_exit:
+            block("Sell ticket does not match an existing same-side position.")
 
         if control.kill_switch_enabled:
-            block("Global kill switch is enabled.")
-        pause_reason = _source_health_pause_reason(control)
+            if risk_reducing_exit:
+                note("Global kill switch is enabled; risk-reducing exit is allowed.")
+            else:
+                block("Global kill switch is enabled.")
+        pause_reason = (
+            entry_pause_reason(settings=self.settings, control=control, kalshi_env=room.kalshi_env)
+            if is_buy_entry
+            else None
+        )
         if pause_reason is not None:
             block(pause_reason)
         if signal.recommended_action is None or signal.recommended_side is None:
@@ -329,13 +339,14 @@ class DeterministicRiskEngine:
             block("Ticket size exceeds max order count.")
 
         effective_position_count_fp = context.current_position_count_fp + context.pending_order_count_fp
-        if context.current_position_count_fp > 0 and not self.settings.risk_allow_position_add_ons:
+        if is_buy_entry and context.current_position_count_fp > 0 and not self.settings.risk_allow_position_add_ons:
             block(
                 f"Existing live position in {room.market_ticker} blocks same-ticker add-ons; "
                 "no pyramiding is enabled."
             )
         if (
-            context.current_position_count_fp > 0
+            is_buy_entry
+            and context.current_position_count_fp > 0
             and context.current_position_side is not None
             and context.current_position_side != ticket.side.value
         ):
@@ -344,12 +355,12 @@ class DeterministicRiskEngine:
                 f"blocks opposite-side {ticket.side.value} entry."
             )
         max_position_count_fp = Decimal(str(self.settings.risk_max_position_count_fp_per_ticker))
-        if effective_position_count_fp >= max_position_count_fp:
+        if is_buy_entry and effective_position_count_fp >= max_position_count_fp:
             block(
                 f"Position + in-flight orders in {room.market_ticker} at {effective_position_count_fp} contracts "
                 f"(max {self.settings.risk_max_position_count_fp_per_ticker:.0f})."
             )
-        else:
+        elif is_buy_entry:
             projected_position_count_fp = effective_position_count_fp + approved_count
             if projected_position_count_fp > max_position_count_fp:
                 fitted_count = quantize_count(
@@ -378,21 +389,21 @@ class DeterministicRiskEngine:
                     )
 
         opens_new_ticker = context.current_position_count_fp <= 0 and context.pending_order_count_fp <= 0
-        if opens_new_ticker and context.open_ticker_count >= self.settings.risk_max_concurrent_tickers:
+        if is_buy_entry and opens_new_ticker and context.open_ticker_count >= self.settings.risk_max_concurrent_tickers:
             block(
                 f"Portfolio already has {context.open_ticker_count} open tickers "
                 f"(max {self.settings.risk_max_concurrent_tickers})."
             )
 
         non_standard_regime = signal.trade_regime in ("near_threshold", "longshot_yes", "longshot_no")
-        if non_standard_regime:
+        if is_buy_entry and non_standard_regime:
             block(
                 f"Trade regime '{signal.trade_regime}' is not permitted; only standard-regime trades are allowed."
             )
 
-        if active_thresholds.risk_max_order_notional_dollars is not None and float(order_notional) > active_thresholds.risk_max_order_notional_dollars:
+        if is_buy_entry and active_thresholds.risk_max_order_notional_dollars is not None and float(order_notional) > active_thresholds.risk_max_order_notional_dollars:
             block("Ticket notional exceeds max order notional.")
-        if active_thresholds.risk_max_position_notional_dollars is not None and float(context.current_position_notional_dollars + order_notional) > active_thresholds.risk_max_position_notional_dollars:
+        if is_buy_entry and active_thresholds.risk_max_position_notional_dollars is not None and float(context.current_position_notional_dollars + order_notional) > active_thresholds.risk_max_position_notional_dollars:
             block("Projected position exceeds max position notional.")
 
         # Per-strategy daily-loss envelope: hard stop distinct from the global
@@ -400,7 +411,8 @@ class DeterministicRiskEngine:
         # have its own dollar cap so one bad strategy can't starve another of
         # capital.
         if (
-            context.strategy_code is not None
+            is_buy_entry
+            and context.strategy_code is not None
             and context.strategy_daily_realized_pnl_dollars is not None
         ):
             cap_dollars = self.settings.risk_daily_loss_dollars_by_strategy.get(
@@ -416,7 +428,7 @@ class DeterministicRiskEngine:
                     )
 
         snapshot = context.portfolio_bucket_snapshot
-        if snapshot is not None:
+        if is_buy_entry and snapshot is not None:
             bucket_limit_dollars = (
                 snapshot.risky_limit_dollars
                 if capital_bucket == "risky"

@@ -29,6 +29,7 @@ from kalshi_bot.db.models import (
     Signal,
     TradeTicketRecord,
 )
+from kalshi_bot.services.trade_behavior import bucket_key
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -366,6 +367,8 @@ class TradeAnalysisService:
                     room.market_ticker,
                     decision_ts,
                     room_id=room.id,
+                    orders=related_orders,
+                    fills=related_fills,
                 )
                 weather_snapshot = await self._weather_snapshot(session, room.market_ticker, decision_ts)
                 settlement = settlements.get(room.market_ticker)
@@ -384,6 +387,7 @@ class TradeAnalysisService:
                     now=now,
                 )
                 rows.append(row)
+            self._attach_bucket_metrics(rows)
         return TradeAnalysisDataset(rows=rows, summary=self._summary(rows, kalshi_env=kalshi_env, days=days, now=now))
 
     async def build_report(
@@ -393,6 +397,7 @@ class TradeAnalysisService:
         days: int = 180,
         now: datetime | None = None,
         limit: int | None = None,
+        buckets: bool = False,
     ) -> dict[str, Any]:
         dataset = await self.build_dataset(kalshi_env=kalshi_env, days=days, now=now, limit=limit)
         blockers = await self._promotion_blockers(kalshi_env=kalshi_env)
@@ -426,6 +431,7 @@ class TradeAnalysisService:
             "opportunity_metrics": self._opportunity_metrics(dataset.rows),
             "by_decision_status": dict(Counter(row.get("decision_status") for row in dataset.rows)),
             "by_series": dict(Counter(row.get("series_ticker") or "<unknown>" for row in dataset.rows)),
+            "buckets": self._bucket_report(dataset.rows) if buckets else [],
             "pnl": self._pnl_summary(dataset.rows),
             "read_only": True,
         }
@@ -613,6 +619,8 @@ class TradeAnalysisService:
         decision_ts: datetime,
         *,
         room_id: str | None = None,
+        orders: list[OrderRecord] | None = None,
+        fills: list[FillRecord] | None = None,
     ) -> dict[str, Any] | None:
         candidates: list[dict[str, Any]] = []
         if room_id is not None:
@@ -719,14 +727,44 @@ class TradeAnalysisService:
                 "volume": None,
             })
 
+        for order in orders or []:
+            recovered = self._market_snapshot_from_execution_raw(
+                raw=order.raw,
+                source="order_raw_execution_touch",
+                source_kind="order_raw_execution_touch",
+                source_id=order.id,
+                observed_at=_as_utc(order.created_at),
+            )
+            if recovered is not None:
+                candidates.append(recovered)
+        for fill in fills or []:
+            recovered = self._market_snapshot_from_execution_raw(
+                raw=fill.raw,
+                source="fill_raw_execution_touch",
+                source_kind="fill_raw_execution_touch",
+                source_id=fill.id,
+                observed_at=_as_utc(fill.created_at),
+            )
+            if recovered is not None:
+                candidates.append(recovered)
+
         if not candidates:
             return None
+
+        raw_sources = {"order_raw_execution_touch", "fill_raw_execution_touch"}
+        point_in_time_candidates = [
+            candidate for candidate in candidates if candidate.get("source") not in raw_sources
+        ]
+        if point_in_time_candidates:
+            candidates = point_in_time_candidates
 
         source_rank = {
             "room_market_snapshot": 4,
             "market_state": 3,
             "market_price_history": 2,
             "historical_market_snapshots": 1,
+            "order_raw_execution_touch": 0,
+            "fill_raw_execution_touch": 0,
         }
         return max(
             candidates,
@@ -763,6 +801,52 @@ class TradeAnalysisService:
             "mid_dollars": mid,
             "last_trade_dollars": _decimal_or_none(market.get("last_price_dollars")),
             "volume": _int_or_none(market.get("volume")),
+        }
+
+    @staticmethod
+    def _market_snapshot_from_execution_raw(
+        *,
+        raw: Any,
+        source: str,
+        source_kind: str,
+        source_id: str,
+        observed_at: datetime | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(raw, dict):
+            return None
+        yes_price = _decimal_or_none(raw.get("yes_price_dollars"))
+        no_price = _decimal_or_none(raw.get("no_price_dollars"))
+        if yes_price is None and no_price is None:
+            return None
+        if yes_price is None and no_price is not None:
+            yes_price = Decimal("1") - no_price
+        if no_price is None and yes_price is not None:
+            no_price = Decimal("1") - yes_price
+        if yes_price is None or no_price is None:
+            return None
+
+        yes_bid = Decimal("1") - no_price
+        yes_ask = yes_price
+        mid = (yes_bid + yes_ask) / Decimal("2")
+        raw_time = _as_utc(raw.get("created_time")) or _as_utc(raw.get("ts")) or observed_at
+        return {
+            "source": source,
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "snapshot_id": source_id,
+            "observed_at": raw_time,
+            "yes_bid_dollars": yes_bid,
+            "yes_ask_dollars": yes_ask,
+            "mid_dollars": mid,
+            "last_trade_dollars": yes_price,
+            "volume": _int_or_none(raw.get("volume")),
+            "snapshot_provenance": {
+                "recovered": True,
+                "source": source,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "leakage_risk": "execution_touch",
+            },
         }
 
     async def _weather_snapshot(
@@ -913,6 +997,12 @@ class TradeAnalysisService:
             fills=fills,
             settlement_value=settlement_value,
         )
+        fee_dollars = self._fee_dollars(fills)
+        lifecycle_net_pnl = (
+            gross_pnl - fee_dollars
+            if gross_pnl is not None and fee_dollars is not None
+            else gross_pnl
+        )
         market_observed_at = _as_utc(market_snapshot.get("observed_at")) if market_snapshot else None
         weather_observed_at = _as_utc(weather_snapshot.get("observed_at")) if weather_snapshot else None
         stale_market_seconds = (
@@ -952,6 +1042,21 @@ class TradeAnalysisService:
             decision_status=decision_status,
             now=now,
         )
+        row_bucket_key = bucket_key(
+            market_ticker=room.market_ticker,
+            side=side,
+            strategy_code=strategy_code,
+            yes_price_dollars=ticket_price,
+            include_price_band=True,
+        )
+        snapshot_provenance = dict((market_snapshot or {}).get("snapshot_provenance") or {})
+        if market_snapshot is not None and not snapshot_provenance:
+            snapshot_provenance = {
+                "recovered": False,
+                "source": market_snapshot.get("source"),
+                "source_kind": market_snapshot.get("source_kind") or market_snapshot.get("source"),
+                "source_id": market_snapshot.get("source_id") or market_snapshot.get("snapshot_id"),
+            }
         return {
             "schema_version": SCHEMA_VERSION,
             "kalshi_env": room.kalshi_env,
@@ -976,6 +1081,7 @@ class TradeAnalysisService:
             "signal_trade_regime": signal_payload.get("trade_regime"),
             "signal_candidate_outcome": (signal_payload.get("trade_selection") or {}).get("evaluation_outcome"),
             "stand_down_reason": stand_down_reason,
+            "empirical_gate": signal_payload.get("empirical_gate") or eligibility.get("empirical_gate") or candidate_trace.get("empirical_gate"),
             "forecast_delta_fallback_derived": forecast_delta_fallback.get("derived"),
             "forecast_delta_fallback_source": forecast_delta_fallback.get("source"),
             "forecast_delta_fallback_forecast_high_source": forecast_delta_fallback.get("forecast_high_source"),
@@ -1003,8 +1109,10 @@ class TradeAnalysisService:
             "order_statuses": order_statuses,
             "filled_contracts": _decimal_str(fill_count),
             "avg_fill_yes_price_dollars": _decimal_str(avg_fill_yes),
-            "fee_dollars": _decimal_str(self._fee_dollars(fills)),
+            "fee_dollars": _decimal_str(fee_dollars),
+            "fees": _decimal_str(fee_dollars),
             "slippage_dollars": _decimal_str((avg_fill_yes - ticket_price) if avg_fill_yes is not None and ticket_price is not None else None),
+            "snapshot_provenance": snapshot_provenance,
             "market_snapshot_source": (market_snapshot or {}).get("source"),
             "market_snapshot_source_kind": (market_snapshot or {}).get("source_kind") or (market_snapshot or {}).get("source"),
             "market_snapshot_source_id": (market_snapshot or {}).get("source_id"),
@@ -1035,9 +1143,16 @@ class TradeAnalysisService:
             "settlement_ts": _iso(settlement.settlement_ts) if settlement is not None else None,
             "label_win": label_win,
             "gross_pnl_dollars": _decimal_str(gross_pnl.quantize(Decimal("0.0001"))) if gross_pnl is not None else None,
+            "lifecycle_net_pnl": _decimal_str(lifecycle_net_pnl.quantize(Decimal("0.0001"))) if lifecycle_net_pnl is not None else None,
+            "lifecycle_net_pnl_dollars": _decimal_str(lifecycle_net_pnl.quantize(Decimal("0.0001"))) if lifecycle_net_pnl is not None else None,
             "model_edge_dollars": _decimal_str(model_edge.quantize(Decimal("0.0001"))) if model_edge is not None else None,
             "training_eligible": not any(reason in TRAINING_EXCLUDED_REASONS for reason in exclusion_reasons),
+            "training_exclusion_reason": next((reason for reason in exclusion_reasons if reason in TRAINING_EXCLUDED_REASONS), None),
             "exclusion_reasons": exclusion_reasons,
+            "bucket_key": row_bucket_key,
+            "bucket_sample_count": 0,
+            "bucket_win_rate": None,
+            "bucket_net_pnl": None,
             "generated_at": now.isoformat(),
         }
 
@@ -1135,6 +1250,30 @@ class TradeAnalysisService:
                 continue
         return total if found else None
 
+    def _attach_bucket_metrics(self, rows: list[dict[str, Any]]) -> None:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(str(row.get("bucket_key") or "<unknown>"), []).append(row)
+
+        for key, bucket_rows in grouped.items():
+            scored = [
+                row
+                for row in bucket_rows
+                if row.get("label_win") in {True, False}
+                and row.get("lifecycle_net_pnl") not in (None, "")
+            ]
+            sample_count = len(scored)
+            wins = sum(1 for row in scored if row.get("label_win") is True)
+            net = sum(
+                (Decimal(str(row.get("lifecycle_net_pnl"))) for row in scored),
+                Decimal("0"),
+            )
+            for row in bucket_rows:
+                row["bucket_key"] = key
+                row["bucket_sample_count"] = sample_count
+                row["bucket_win_rate"] = round(wins / sample_count, 6) if sample_count else None
+                row["bucket_net_pnl"] = str(net.quantize(Decimal("0.0001"))) if sample_count else None
+
     def _summary(self, rows: list[dict[str, Any]], *, kalshi_env: str, days: int, now: datetime) -> dict[str, Any]:
         eligible = [row for row in rows if row.get("training_eligible")]
         return {
@@ -1156,6 +1295,31 @@ class TradeAnalysisService:
             "gross_pnl_dollars": str(total.quantize(Decimal("0.0001"))),
             "avg_pnl_dollars": str((total / Decimal(len(values))).quantize(Decimal("0.0001"))) if values else None,
         }
+
+    def _bucket_report(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_bucket: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_bucket.setdefault(str(row.get("bucket_key") or "<unknown>"), []).append(row)
+        out: list[dict[str, Any]] = []
+        for key, bucket_rows in by_bucket.items():
+            scored = [row for row in bucket_rows if row.get("lifecycle_net_pnl") not in (None, "")]
+            net = sum((Decimal(str(row["lifecycle_net_pnl"])) for row in scored), Decimal("0"))
+            wins = sum(1 for row in scored if row.get("label_win") is True)
+            out.append({
+                "bucket_key": key,
+                "rows": len(bucket_rows),
+                "scored_rows": len(scored),
+                "win_rate": round(wins / len(scored), 6) if scored else None,
+                "net_pnl": str(net.quantize(Decimal("0.0001"))) if scored else None,
+                "series": Counter(row.get("series_ticker") or "<unknown>" for row in bucket_rows).most_common(3),
+            })
+        return sorted(
+            out,
+            key=lambda row: (
+                Decimal(str(row["net_pnl"])) if row.get("net_pnl") is not None else Decimal("0"),
+                row["bucket_key"],
+            ),
+        )
 
     def _stale_market_snapshot_diagnostics(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
         stale_rows = [row for row in rows if "stale_market_snapshot" in row.get("exclusion_reasons", [])]
@@ -1519,4 +1683,11 @@ def format_trade_analysis_report(report: dict[str, Any]) -> str:
         lines.extend(["", "Promotion blockers:"])
         for issue in report["promotion_blockers"][:10]:
             lines.append(f"- {str(issue.get('severity')).upper()} {issue.get('code')}: {issue.get('summary')}")
+    if report.get("buckets"):
+        lines.extend(["", "Worst buckets:"])
+        for row in report["buckets"][:10]:
+            lines.append(
+                f"- {row['bucket_key']}: rows={row['rows']} scored={row['scored_rows']} "
+                f"net={row['net_pnl']} win_rate={row['win_rate']}"
+            )
     return "\n".join(lines)

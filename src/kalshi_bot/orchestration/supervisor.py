@@ -44,6 +44,11 @@ from kalshi_bot.services.signal import (
     suggested_trade_count_fp,
 )
 from kalshi_bot.services.risk import approved_ticket_for_verdict
+from kalshi_bot.services.trade_behavior import (
+    apply_empirical_gate_to_eligibility,
+    evaluate_empirical_gate,
+    thresholds_with_production_freeze_floor,
+)
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
@@ -1075,6 +1080,7 @@ class WorkflowSupervisor:
                             raw=receipt.details,
                             kalshi_order_id=receipt.external_order_id,
                             kalshi_env=room.kalshi_env,
+                            strategy_code=StrategyCode.DIRECTIONAL.value,
                         )
                     await repo.update_trade_ticket_status(ticket_record.id, receipt.status)
                 else:
@@ -1176,6 +1182,43 @@ class WorkflowSupervisor:
         except Exception:
             logger.exception("failed to persist strategy audit", extra={"room_id": room.id})
 
+    async def _apply_empirical_gate(
+        self,
+        *,
+        session: Any,
+        room: Room,
+        signal: StrategySignal,
+    ) -> StrategySignal:
+        if (
+            signal.eligibility is None
+            or signal.recommended_action is None
+            or signal.recommended_side is None
+            or signal.target_yes_price_dollars is None
+        ):
+            return signal
+        if not hasattr(session, "execute"):
+            return signal
+
+        decision = await evaluate_empirical_gate(
+            session=session,
+            settings=self.settings,
+            kalshi_env=room.kalshi_env,
+            market_ticker=room.market_ticker,
+            side=signal.recommended_side.value,
+            action=signal.recommended_action.value,
+            strategy_code=StrategyCode.DIRECTIONAL.value,
+            shadow_mode=bool(getattr(room, "shadow_mode", self.settings.app_shadow_mode)),
+        )
+        payload = decision.to_payload()
+        signal.candidate_trace = {**dict(signal.candidate_trace or {}), "empirical_gate": payload}
+        signal.eligibility = apply_empirical_gate_to_eligibility(signal.eligibility, decision)
+        signal.stand_down_reason = signal.eligibility.stand_down_reason
+        signal.evaluation_outcome = signal.eligibility.evaluation_outcome
+        signal.candidate_trace = signal.eligibility.candidate_trace or signal.candidate_trace
+        if decision.blocks_live_entries:
+            signal.summary = f"{signal.summary} Stand down: empirical trade behavior gate blocked live entry ({decision.reason})."
+        return signal
+
     async def run_room(self, room_id: str, reason: str = "manual") -> None:
         ACTIVE_ROOMS.inc()
         try:
@@ -1206,6 +1249,11 @@ class WorkflowSupervisor:
             try:
                 pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
                 thresholds = self.agent_pack_service.runtime_thresholds(pack)
+                thresholds = thresholds_with_production_freeze_floor(
+                    settings=self.settings,
+                    kalshi_env=room.kalshi_env,
+                    thresholds=thresholds,
+                )
                 heuristic_pack = (
                     await self.historical_heuristic_service.get_active_pack(repo)
                     if self.historical_heuristic_service is not None
@@ -1283,6 +1331,11 @@ class WorkflowSupervisor:
                                 risk_safe_capital_reserve_ratio=float(d["risk_safe_capital_reserve_ratio"]),
                                 risk_risky_capital_max_ratio=float(d["risk_risky_capital_max_ratio"]),
                             )
+                            thresholds = thresholds_with_production_freeze_floor(
+                                settings=self.settings,
+                                kalshi_env=room.kalshi_env,
+                                thresholds=thresholds,
+                            )
                 delta = self.research_coordinator.build_room_delta(
                     dossier=dossier,
                     market_response=market_response,
@@ -1354,6 +1407,11 @@ class WorkflowSupervisor:
                         base_thresholds=thresholds,
                         application=heuristic_application,
                     )
+                    thresholds = thresholds_with_production_freeze_floor(
+                        settings=self.settings,
+                        kalshi_env=room.kalshi_env,
+                        thresholds=thresholds,
+                    )
                     signal.heuristic_application = heuristic_application
                     signal = apply_heuristic_application_to_signal(
                         settings=self.settings,
@@ -1396,6 +1454,11 @@ class WorkflowSupervisor:
                     room_id=room.id,
                     weather_archive_source_id=weather_archive_source_id,
                 )
+                signal = await self._apply_empirical_gate(
+                    session=session,
+                    room=room,
+                    signal=signal,
+                )
                 await repo.save_signal(
                     room_id=room.id,
                     market_ticker=room.market_ticker,
@@ -1428,6 +1491,11 @@ class WorkflowSupervisor:
                         "size_factor": str(signal.size_factor),
                         "warn_only_blocked": signal.warn_only_blocked,
                         "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
+                        "empirical_gate": (
+                            signal.eligibility.empirical_gate
+                            if signal.eligibility is not None
+                            else (signal.candidate_trace or {}).get("empirical_gate")
+                        ),
                         "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
                         "agent_pack_version": pack.version,
                         "heuristic_pack_version": (
