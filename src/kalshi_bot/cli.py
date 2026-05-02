@@ -970,6 +970,13 @@ async def _run_cli(args: argparse.Namespace) -> int:
                         limit=args.limit,
                         subaccount=container.settings.kalshi_subaccount,
                     )
+                elif args.repair_target == "market-snapshots":
+                    result = await container.trading_audit_service.repair_market_snapshots(
+                        kalshi_env=args.kalshi_env,
+                        days=audit_days,
+                        dry_run=args.dry_run,
+                        limit=args.limit,
+                    )
                 else:
                     result = await container.trading_audit_service.repair_attribution(
                         kalshi_env=args.kalshi_env,
@@ -1853,7 +1860,7 @@ def build_parser() -> argparse.ArgumentParser:
     trading_audit.add_argument("--json", action="store_true")
     trading_audit.add_argument("--limit", type=int, default=500)
     trading_audit.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
-    trading_audit.add_argument("--repair-target", choices=["attribution", "stale-positions"], default="attribution")
+    trading_audit.add_argument("--repair-target", choices=["attribution", "stale-positions", "market-snapshots"], default="attribution")
 
     trade_analysis = subparsers.add_parser(
         "trade-analysis",

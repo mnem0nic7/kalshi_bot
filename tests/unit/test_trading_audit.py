@@ -9,8 +9,12 @@ from sqlalchemy import select
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import StrategyCode
 from kalshi_bot.db.models import (
+    Artifact,
     Checkpoint,
+    DecisionTraceRecord,
     FillRecord,
+    HistoricalMarketSnapshotRecord,
+    MarketPriceHistory,
     MarketState,
     OpsEvent,
     OrderRecord,
@@ -475,6 +479,78 @@ async def test_trading_audit_downgrades_historical_suppressed_exits_without_open
 
 
 @pytest.mark.asyncio
+async def test_trading_audit_marks_one_sided_open_books_conservatively(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    yes_ticker = "KXHIGHAUS-26APR24-T71"
+    no_ticker = "KXHIGHTDAL-26APR24-T78"
+    async with session_factory() as session:
+        session.add_all([
+            _room("room-yes-one-sided", yes_ticker),
+            _room("room-no-one-sided", no_ticker),
+            PositionRecord(
+                market_ticker=yes_ticker,
+                kalshi_env="production",
+                subaccount=0,
+                side="yes",
+                count_fp=Decimal("1.00"),
+                average_price_dollars=Decimal("0.2100"),
+                raw={},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+            PositionRecord(
+                market_ticker=no_ticker,
+                kalshi_env="production",
+                subaccount=0,
+                side="no",
+                count_fp=Decimal("2.00"),
+                average_price_dollars=Decimal("0.3300"),
+                raw={},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+            MarketState(
+                kalshi_env="production",
+                market_ticker=yes_ticker,
+                yes_bid_dollars=None,
+                yes_ask_dollars=Decimal("0.0100"),
+                observed_at=NOW - timedelta(minutes=10),
+                snapshot={},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+            MarketState(
+                kalshi_env="production",
+                market_ticker=no_ticker,
+                yes_bid_dollars=Decimal("0.9900"),
+                yes_ask_dollars=None,
+                observed_at=NOW - timedelta(minutes=10),
+                snapshot={},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+        ])
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    rows = {row["market_ticker"]: row for row in report["open_positions"]["positions"]}
+    assert report["open_positions"]["stale_or_missing_mark_count"] == 0
+    assert rows[yes_ticker]["mark_price_dollars"] == "0.0000"
+    assert rows[yes_ticker]["market_state_stale"] is True
+    assert rows[yes_ticker]["mark_source"] == "one_sided_book_no_yes_bid"
+    assert rows[yes_ticker]["mark_conservative"] is True
+    assert rows[no_ticker]["mark_price_dollars"] == "0.0000"
+    assert rows[no_ticker]["mark_source"] == "one_sided_book_no_no_bid"
+    assert rows[no_ticker]["mark_conservative"] is True
+    assert "open_positions_stale_or_missing_market_state" not in {issue["code"] for issue in report["issues"]}
+
+
+@pytest.mark.asyncio
 async def test_trading_audit_stale_position_repair_dry_run_preserves_positions(audit_harness) -> None:
     settings, session_factory = audit_harness
     async with session_factory() as session:
@@ -570,6 +646,201 @@ async def test_trading_audit_stale_position_repair_zeroes_absent_exchange_positi
     assert result["updated_count"] == 1
     assert position.count_fp == Decimal("0")
     assert position.raw["trade_behavior_stale_position_repair"]["old_count_fp"] == "3.00"
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_market_snapshot_repair_recovers_artifact_and_signal_payload(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    artifact_ticker = "KXHIGHART-26APR24-T70"
+    signal_ticker = "KXHIGHSIG-26APR24-T72"
+    async with session_factory() as session:
+        artifact_room = _room("room-artifact-snapshot", artifact_ticker)
+        signal_room = _room("room-signal-snapshot", signal_ticker)
+        session.add_all([
+            artifact_room,
+            signal_room,
+            Artifact(
+                room_id=artifact_room.id,
+                artifact_type="market_snapshot",
+                source="kalshi_rest",
+                title="Market snapshot",
+                payload={
+                    "market": {
+                        "yes_bid_dollars": "0.4000",
+                        "yes_ask_dollars": "0.4400",
+                    }
+                },
+                created_at=NOW - timedelta(minutes=20),
+                updated_at=NOW - timedelta(minutes=20),
+            ),
+            Signal(
+                room_id=artifact_room.id,
+                market_ticker=artifact_ticker,
+                fair_yes_dollars=Decimal("0.6100"),
+                edge_bps=700,
+                confidence=0.80,
+                summary="artifact source",
+                payload={"evaluation_outcome": "candidate_selected"},
+                created_at=NOW - timedelta(minutes=18),
+                updated_at=NOW - timedelta(minutes=18),
+            ),
+            Signal(
+                room_id=signal_room.id,
+                market_ticker=signal_ticker,
+                fair_yes_dollars=Decimal("0.6200"),
+                edge_bps=710,
+                confidence=0.81,
+                summary="payload source",
+                payload={
+                    "evaluation_outcome": "candidate_selected",
+                    "market_snapshot": {
+                        "observed_at": (NOW - timedelta(minutes=17)).isoformat(),
+                        "yes_bid_dollars": "0.4100",
+                        "yes_ask_dollars": "0.4500",
+                    },
+                },
+                created_at=NOW - timedelta(minutes=16),
+                updated_at=NOW - timedelta(minutes=16),
+            ),
+        ])
+        await session.commit()
+
+    service = TradingAuditService(settings, session_factory)
+    dry_run = await service.repair_market_snapshots(
+        kalshi_env="production",
+        days=7,
+        dry_run=True,
+        now=NOW,
+    )
+    applied = await service.repair_market_snapshots(
+        kalshi_env="production",
+        days=7,
+        dry_run=False,
+        now=NOW,
+    )
+
+    async with session_factory() as session:
+        records = list((await session.execute(select(HistoricalMarketSnapshotRecord))).scalars())
+
+    kinds = {record.source_kind for record in records}
+    assert dry_run["candidate_count"] == 2
+    assert dry_run["updated_count"] == 0
+    assert applied["updated_count"] == 2
+    assert kinds == {"trade_analysis_backfill_room_artifact", "trade_analysis_backfill_signal_payload"}
+    assert all(record.payload["snapshot_provenance"]["recovered"] is True for record in records)
+    assert all(record.payload["snapshot_provenance"]["leakage_risk"] == "none" for record in records)
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_market_snapshot_repair_recovers_history_and_final_fallback(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    price_ticker = "KXHIGHPRC-26APR24-T70"
+    historical_ticker = "KXHIGHHST-26APR24-T72"
+    final_ticker = "KXHIGHFIN-26APR24-T74"
+    async with session_factory() as session:
+        price_room = _room("room-price-history", price_ticker)
+        historical_room = _room("room-historical-snapshot", historical_ticker)
+        final_room = _room("room-final-snapshot", final_ticker)
+        session.add_all([
+            price_room,
+            historical_room,
+            final_room,
+            Signal(
+                room_id=price_room.id,
+                market_ticker=price_ticker,
+                fair_yes_dollars=Decimal("0.6100"),
+                edge_bps=700,
+                confidence=0.80,
+                summary="price history",
+                payload={"evaluation_outcome": "candidate_selected"},
+                created_at=NOW - timedelta(minutes=16),
+                updated_at=NOW - timedelta(minutes=16),
+            ),
+            Signal(
+                room_id=historical_room.id,
+                market_ticker=historical_ticker,
+                fair_yes_dollars=Decimal("0.6200"),
+                edge_bps=710,
+                confidence=0.81,
+                summary="historical source",
+                payload={"evaluation_outcome": "candidate_selected"},
+                created_at=NOW - timedelta(minutes=15),
+                updated_at=NOW - timedelta(minutes=15),
+            ),
+            Signal(
+                room_id=final_room.id,
+                market_ticker=final_ticker,
+                fair_yes_dollars=Decimal("0.6300"),
+                edge_bps=720,
+                confidence=0.82,
+                summary="final source",
+                payload={"evaluation_outcome": "candidate_selected"},
+                created_at=NOW - timedelta(minutes=14),
+                updated_at=NOW - timedelta(minutes=14),
+            ),
+            MarketPriceHistory(
+                kalshi_env="production",
+                market_ticker=price_ticker,
+                yes_bid_dollars=Decimal("0.4200"),
+                yes_ask_dollars=Decimal("0.4600"),
+                mid_dollars=Decimal("0.4400"),
+                last_trade_dollars=Decimal("0.4500"),
+                volume=5,
+                observed_at=NOW - timedelta(minutes=17),
+                created_at=NOW - timedelta(minutes=17),
+            ),
+            HistoricalMarketSnapshotRecord(
+                market_ticker=historical_ticker,
+                series_ticker="KXHIGHHST",
+                station_id=None,
+                local_market_day="26APR24",
+                asof_ts=NOW - timedelta(minutes=16),
+                source_kind="captured_market_snapshot",
+                source_id="captured-history",
+                yes_bid_dollars=Decimal("0.4300"),
+                yes_ask_dollars=Decimal("0.4700"),
+                payload={},
+            ),
+            HistoricalMarketSnapshotRecord(
+                market_ticker=final_ticker,
+                series_ticker="KXHIGHFIN",
+                station_id=None,
+                local_market_day="26APR24",
+                asof_ts=NOW + timedelta(hours=2),
+                source_kind="kalshi_final_market",
+                source_id="final-market",
+                yes_bid_dollars=Decimal("1.0000"),
+                yes_ask_dollars=Decimal("1.0000"),
+                payload={},
+            ),
+        ])
+        await session.commit()
+
+    result = await TradingAuditService(settings, session_factory).repair_market_snapshots(
+        kalshi_env="production",
+        days=7,
+        dry_run=False,
+        now=NOW,
+    )
+
+    async with session_factory() as session:
+        records = list(
+            (
+                await session.execute(
+                    select(HistoricalMarketSnapshotRecord).where(
+                        HistoricalMarketSnapshotRecord.source_kind.like("trade_analysis_backfill_%")
+                    )
+                )
+            ).scalars()
+        )
+
+    rows = {record.market_ticker: record for record in records}
+    assert result["updated_count"] == 3
+    assert rows[price_ticker].source_kind == "trade_analysis_backfill_market_price_history"
+    assert rows[historical_ticker].source_kind == "trade_analysis_backfill_historical_snapshot"
+    assert rows[historical_ticker].payload["snapshot_provenance"]["leakage_risk"] == "point_in_time"
+    assert rows[final_ticker].source_kind == "trade_analysis_backfill_final_market"
+    assert rows[final_ticker].payload["snapshot_provenance"]["leakage_risk"] == "final_market"
 
 
 @pytest.mark.asyncio
@@ -729,6 +1000,62 @@ async def test_trading_audit_reports_selected_signal_funnel_gaps(audit_harness) 
     assert report["signal_funnel"]["recent_selected_without_ticket"][0]["room_id"] == room_selected.id
     issue_codes = {issue["code"] for issue in report["issues"]}
     assert "selected_signal_without_trade_ticket" in issue_codes
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_classifies_duplicate_suppressed_selected_signal_as_non_issue(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        room = _room("room-duplicate-suppressed", "KXHIGHNY-26APR24-T71")
+        session.add_all([
+            room,
+            Signal(
+                room_id=room.id,
+                market_ticker=room.market_ticker,
+                fair_yes_dollars=Decimal("0.7200"),
+                edge_bps=420,
+                confidence=0.82,
+                summary="Selected YES",
+                payload={
+                    "evaluation_outcome": "candidate_selected",
+                    "recommended_side": "yes",
+                    "candidate_trace": {"outcome": "candidate_selected", "selected_side": "yes"},
+                },
+                created_at=NOW - timedelta(minutes=20),
+                updated_at=NOW - timedelta(minutes=20),
+            ),
+            DecisionTraceRecord(
+                room_id=room.id,
+                ticket_id=None,
+                market_ticker=room.market_ticker,
+                kalshi_env="production",
+                decision_kind="deterministic_trade",
+                decision_time=NOW - timedelta(minutes=19),
+                path_version="deterministic-v1",
+                source_snapshot_ids={},
+                input_hash="input",
+                trace_hash="trace",
+                trace={
+                    "evaluation_outcome": "pre_risk_filtered",
+                    "final_status": "stand_down",
+                    "sizing": {"stand_down_reason": "duplicate_suppressed"},
+                },
+                created_at=NOW - timedelta(minutes=19),
+                updated_at=NOW - timedelta(minutes=19),
+            ),
+        ])
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    assert report["signal_funnel"]["selected_without_ticket_count"] == 0
+    assert report["signal_funnel"]["selected_pre_risk_filtered_without_ticket_count"] == 1
+    assert report["signal_funnel"]["selected_pre_risk_filtered_without_ticket"][0]["final_stand_down_reason"] == "duplicate_suppressed"
+    assert "selected_signal_without_trade_ticket" not in {issue["code"] for issue in report["issues"]}
 
 
 @pytest.mark.asyncio

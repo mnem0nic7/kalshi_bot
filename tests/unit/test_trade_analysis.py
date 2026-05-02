@@ -435,6 +435,8 @@ async def test_trade_analysis_keeps_excluded_rows_with_reasons(analysis_harness)
     }
     assert report["pending_settlement_count"] == 1
     assert report["data_defect_count"] == 1
+    assert report["current_data_defect_count"] == 0
+    assert report["legacy_coverage_debt_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -505,7 +507,9 @@ async def test_trade_analysis_recovers_market_snapshot_from_order_raw(analysis_h
     assert row["market_snapshot_source"] == "order_raw_execution_touch"
     assert row["snapshot_provenance"]["recovered"] is True
     assert "missing_market_snapshot" not in row["exclusion_reasons"]
-    assert row["training_exclusion_reason"] is None
+    assert row["training_exclusion_reason"] == "market_snapshot_high_leakage"
+    assert "market_snapshot_high_leakage" in row["exclusion_reasons"]
+    assert row["training_eligible"] is False
 
 
 @pytest.mark.asyncio
@@ -760,6 +764,102 @@ async def test_trade_analysis_historical_market_fallback_requires_fresh_point_in
     assert row["market_snapshot_source_kind"] == "captured_market_snapshot"
     assert row["market_snapshot_source_id"] == "fresh-captured"
     assert row["yes_bid_dollars"] == "0.4400"
+
+
+@pytest.mark.asyncio
+async def test_trade_analysis_uses_point_in_time_backfilled_market_snapshot_for_training(analysis_harness) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-backfilled-point-in-time")
+        ticket = _ticket(room.id)
+        session.add_all([
+            room,
+            _signal(room.id),
+            ticket,
+            _risk(ticket.id, room.id),
+            HistoricalMarketSnapshotRecord(
+                market_ticker=TICKER,
+                series_ticker="KXHIGHNY",
+                station_id="KNYC",
+                local_market_day="26APR24",
+                asof_ts=NOW - timedelta(minutes=21),
+                source_kind="trade_analysis_backfill_market_price_history",
+                source_id="backfilled-price-history",
+                yes_bid_dollars=Decimal("0.4300"),
+                yes_ask_dollars=Decimal("0.4700"),
+                payload={
+                    "snapshot_provenance": {
+                        "recovered": True,
+                        "source_kind": "trade_analysis_backfill_market_price_history",
+                        "source_id": "market-history-row",
+                        "leakage_risk": "point_in_time",
+                    }
+                },
+            ),
+            *[item for item in _snapshots() if not isinstance(item, MarketPriceHistory)],
+        ])
+        await session.commit()
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    row = dataset.rows[0]
+    assert row["training_eligible"] is True
+    assert "missing_market_snapshot" not in row["exclusion_reasons"]
+    assert row["market_snapshot_source_kind"] == "trade_analysis_backfill_market_price_history"
+    assert row["snapshot_provenance"]["leakage_risk"] == "point_in_time"
+
+
+@pytest.mark.asyncio
+async def test_trade_analysis_uses_final_backfilled_market_snapshot_for_diagnostics_only(analysis_harness) -> None:
+    settings, session_factory, directory = analysis_harness
+    async with session_factory() as session:
+        room = _room("room-backfilled-final")
+        ticket = _ticket(room.id)
+        session.add_all([
+            room,
+            _signal(room.id),
+            ticket,
+            _risk(ticket.id, room.id),
+            HistoricalMarketSnapshotRecord(
+                market_ticker=TICKER,
+                series_ticker="KXHIGHNY",
+                station_id="KNYC",
+                local_market_day="26APR24",
+                asof_ts=NOW + timedelta(hours=2),
+                source_kind="trade_analysis_backfill_final_market",
+                source_id="backfilled-final-market",
+                yes_bid_dollars=Decimal("0.9000"),
+                yes_ask_dollars=Decimal("0.9500"),
+                payload={
+                    "snapshot_provenance": {
+                        "recovered": True,
+                        "source_kind": "trade_analysis_backfill_final_market",
+                        "source_id": "final-market",
+                        "leakage_risk": "final_market",
+                    }
+                },
+            ),
+            *[item for item in _snapshots() if not isinstance(item, MarketPriceHistory)],
+        ])
+        await session.commit()
+
+    dataset = await TradeAnalysisService(settings, session_factory, directory).build_dataset(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    row = dataset.rows[0]
+    assert row["training_eligible"] is False
+    assert row["training_exclusion_reason"] == "market_snapshot_high_leakage"
+    assert "missing_market_snapshot" not in row["exclusion_reasons"]
+    assert "market_snapshot_high_leakage" in row["exclusion_reasons"]
+    assert row["market_snapshot_source_kind"] == "trade_analysis_backfill_final_market"
+    assert row["snapshot_provenance"]["leakage_risk"] == "final_market"
 
 
 @pytest.mark.asyncio

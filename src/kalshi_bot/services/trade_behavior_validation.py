@@ -91,6 +91,47 @@ async def _production_buy_entry_bypass(
     }
 
 
+async def _env_trading_activity_observed(
+    session,
+    *,
+    kalshi_env: str,
+    since: datetime,
+) -> bool:
+    room_rows = list(
+        (
+            await session.execute(
+                select(Room)
+                .where(Room.kalshi_env == kalshi_env, Room.created_at >= since)
+                .limit(1)
+            )
+        ).scalars()
+    )
+    if room_rows:
+        return True
+    ticket_rows = list(
+        (
+            await session.execute(
+                select(TradeTicketRecord, Room)
+                .join(Room, TradeTicketRecord.room_id == Room.id)
+                .where(Room.kalshi_env == kalshi_env, TradeTicketRecord.created_at >= since)
+                .limit(1)
+            )
+        ).all()
+    )
+    if ticket_rows:
+        return True
+    order_rows = list(
+        (
+            await session.execute(
+                select(OrderRecord)
+                .where(OrderRecord.kalshi_env == kalshi_env, OrderRecord.created_at >= since)
+                .limit(1)
+            )
+        ).scalars()
+    )
+    return bool(order_rows)
+
+
 def _active_runtime_issue(watchdog_status: dict[str, Any]) -> dict[str, Any] | None:
     active = str(watchdog_status.get("active_color") or "")
     color = dict((watchdog_status.get("colors") or {}).get(active) or {})
@@ -188,6 +229,11 @@ async def build_trade_behavior_validation_report(
             kalshi_env=kalshi_env,
             since=since,
         )
+        runtime_observed = await _env_trading_activity_observed(
+            session,
+            kalshi_env=kalshi_env,
+            since=now_utc - timedelta(days=max(1, int(days))),
+        )
 
     audit = await trading_audit_service.build_report(kalshi_env=kalshi_env, days=days)
     analysis = await trade_analysis_service.build_report(kalshi_env=kalshi_env, days=days, buckets=True)
@@ -200,7 +246,8 @@ async def build_trade_behavior_validation_report(
     )
     issues: list[dict[str, Any]] = []
     runtime_issue = _active_runtime_issue(watchdog_status)
-    if runtime_issue is not None:
+    runtime_not_observed = kalshi_env == "production" and not runtime_observed
+    if runtime_issue is not None and not runtime_not_observed:
         issues.append(runtime_issue)
     if kalshi_env == "production" and not freeze_enabled:
         issues.append(_issue("fail", "production_entry_freeze_disabled", "Production entry freeze is disabled."))
@@ -216,9 +263,19 @@ async def build_trade_behavior_validation_report(
         issues.append(_issue("warn", f"audit:{item.get('code')}", str(item.get("summary") or item.get("code"))))
 
     exclusion_counts = dict(analysis.get("top_exclusion_reasons") or [])
-    if int(exclusion_counts.get("missing_market_snapshot", 0)):
+    current_missing = int(
+        analysis.get("current_missing_market_snapshot_count")
+        if analysis.get("current_missing_market_snapshot_count") is not None
+        else exclusion_counts.get("missing_market_snapshot", 0)
+    )
+    current_defects = int(
+        analysis.get("current_data_defect_count")
+        if analysis.get("current_data_defect_count") is not None
+        else analysis.get("data_defect_count") or 0
+    )
+    if current_missing:
         issues.append(_issue("warn", "analysis:missing_market_snapshot", "Trade-analysis rows still lack recoverable market snapshots."))
-    if int(analysis.get("data_defect_count") or 0):
+    if current_defects:
         issues.append(_issue("warn", "analysis:data_defects", "Trade-analysis data defects remain."))
 
     status = "pass"
@@ -246,6 +303,8 @@ async def build_trade_behavior_validation_report(
             "readiness": gate_readiness,
         },
         "runtime_health": watchdog_status,
+        "runtime_observed": runtime_observed,
+        "runtime_not_observed": runtime_not_observed,
         "buy_entry_bypass": buy_bypass,
         "audit": {
             "issue_count": len(audit_issues),
@@ -259,6 +318,9 @@ async def build_trade_behavior_validation_report(
             "training_eligible_count": analysis.get("training_eligible_count"),
             "excluded_count": analysis.get("excluded_count"),
             "data_defect_count": analysis.get("data_defect_count"),
+            "current_missing_market_snapshot_count": analysis.get("current_missing_market_snapshot_count"),
+            "current_data_defect_count": analysis.get("current_data_defect_count"),
+            "legacy_coverage_debt_count": analysis.get("legacy_coverage_debt_count"),
             "top_exclusion_reasons": analysis.get("top_exclusion_reasons") or [],
             "worst_buckets": (analysis.get("buckets") or [])[:10],
         },

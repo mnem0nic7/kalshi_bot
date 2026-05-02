@@ -792,6 +792,7 @@ class WorkflowSupervisor:
         market_observed_at: datetime | None = None,
         research_fallback_time: datetime | None = None,
         source_snapshot_ids: dict[str, Any] | None = None,
+        signal_record: Any | None = None,
     ) -> None:
         research_observed_at = _research_ref_time(signal, research_fallback_time)
         receipt = ExecReceiptPayload(status="no_trade", details={})
@@ -1201,6 +1202,24 @@ class WorkflowSupervisor:
             trace_hash=trace_hash,
             trace=decision_trace_payload,
         )
+        if signal_record is not None:
+            payload = dict(signal_record.payload or {})
+            final_stand_down_reason = (
+                sizing_trace.get("stand_down_reason")
+                or candidate_trace.get("eligibility_stand_down_reason")
+                or payload.get("stand_down_reason")
+            )
+            payload.update(
+                {
+                    "final_outcome": evaluation_outcome,
+                    "final_status": final_status,
+                    "final_stand_down_reason": final_stand_down_reason,
+                    "decision_trace_id": decision_trace_record.id,
+                    "decision_trace_hash": trace_hash,
+                    "candidate_trace": candidate_trace,
+                }
+            )
+            signal_record.payload = payload
 
         await repo.append_message(
             room.id,
@@ -1535,7 +1554,7 @@ class WorkflowSupervisor:
                     confidence_band=signal.confidence_band,
                     spread_bps=signal.eligibility.market_spread_bps if signal.eligibility is not None else None,
                 )
-                await repo.save_signal(
+                signal_record = await repo.save_signal(
                     room_id=room.id,
                     market_ticker=room.market_ticker,
                     fair_yes_dollars=signal.fair_yes_dollars,
@@ -1661,6 +1680,7 @@ class WorkflowSupervisor:
                         thresholds=thresholds,
                         market_observed_at=market_state.observed_at,
                         research_fallback_time=dossier.freshness.refreshed_at,
+                        signal_record=signal_record,
                         source_snapshot_ids={
                             "market_state": {
                                 "kalshi_env": room.kalshi_env,

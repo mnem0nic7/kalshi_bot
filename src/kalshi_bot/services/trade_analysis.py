@@ -37,6 +37,7 @@ SCHEMA_VERSION = "trade-analysis-v1"
 MODEL_CARD_VERSION = "trade-analysis-model-card-v1"
 TRAINING_EXCLUDED_REASONS = {
     "missing_market_snapshot",
+    "market_snapshot_high_leakage",
     "missing_weather_snapshot",
     "pending_settlement",
     "missing_settlement_label",
@@ -57,6 +58,13 @@ POINT_IN_TIME_HISTORICAL_MARKET_SOURCES = {
     "checkpoint_captured_market_snapshot",
     "captured_market_snapshot",
     "reconstructed_market_checkpoint",
+    "trade_analysis_backfill_room_artifact",
+    "trade_analysis_backfill_signal_payload",
+    "trade_analysis_backfill_market_price_history",
+    "trade_analysis_backfill_historical_snapshot",
+}
+HIGH_LEAKAGE_HISTORICAL_MARKET_SOURCES = {
+    "trade_analysis_backfill_final_market",
 }
 IN_CLAUSE_BATCH_SIZE = 10_000
 
@@ -400,8 +408,33 @@ class TradeAnalysisService:
         limit: int | None = None,
         buckets: bool = False,
     ) -> dict[str, Any]:
+        now_utc = _as_utc(now) or _utc_now()
         dataset = await self.build_dataset(kalshi_env=kalshi_env, days=days, now=now, limit=limit)
         blockers = await self._promotion_blockers(kalshi_env=kalshi_env)
+        current_cutoff = now_utc - timedelta(hours=24)
+        current_rows = [
+            row
+            for row in dataset.rows
+            if (_as_utc(row.get("decision_ts")) or datetime.min.replace(tzinfo=UTC)) >= current_cutoff
+        ]
+        current_row_ids = {id(row) for row in current_rows}
+        legacy_rows = [row for row in dataset.rows if id(row) not in current_row_ids]
+        current_missing_market_snapshot_count = sum(
+            1
+            for row in current_rows
+            if "missing_market_snapshot" in row.get("exclusion_reasons", [])
+        )
+        current_data_defect_count = sum(
+            1
+            for row in current_rows
+            if not any(reason in PENDING_EXCLUSION_REASONS for reason in row.get("exclusion_reasons", []))
+            and any(reason not in PENDING_EXCLUSION_REASONS for reason in row.get("exclusion_reasons", []))
+        )
+        legacy_coverage_debt_count = sum(
+            1
+            for row in legacy_rows
+            if any(reason not in PENDING_EXCLUSION_REASONS for reason in row.get("exclusion_reasons", []))
+        )
         return {
             **dataset.summary,
             "promotion_blockers": blockers,
@@ -428,6 +461,9 @@ class TradeAnalysisService:
                 for row in dataset.rows
                 if any(reason not in PENDING_EXCLUSION_REASONS for reason in row.get("exclusion_reasons", []))
             ),
+            "current_missing_market_snapshot_count": current_missing_market_snapshot_count,
+            "current_data_defect_count": current_data_defect_count,
+            "legacy_coverage_debt_count": legacy_coverage_debt_count,
             "stale_market_snapshot_diagnostics": self._stale_market_snapshot_diagnostics(dataset.rows),
             "opportunity_metrics": self._opportunity_metrics(dataset.rows),
             "by_decision_status": dict(Counter(row.get("decision_status") for row in dataset.rows)),
@@ -721,6 +757,12 @@ class TradeAnalysisService:
             mid = None
             if historical.yes_bid_dollars is not None and historical.yes_ask_dollars is not None:
                 mid = (historical.yes_bid_dollars + historical.yes_ask_dollars) / Decimal("2")
+            historical_provenance = dict((historical.payload or {}).get("snapshot_provenance") or {})
+            historical_provenance.setdefault("recovered", historical.source_kind.startswith("trade_analysis_backfill_"))
+            historical_provenance.setdefault("source", "historical_market_snapshots")
+            historical_provenance.setdefault("source_kind", historical.source_kind)
+            historical_provenance.setdefault("source_id", historical.source_id)
+            historical_provenance.setdefault("leakage_risk", "point_in_time")
             candidates.append({
                 "source": "historical_market_snapshots",
                 "source_kind": historical.source_kind,
@@ -732,7 +774,44 @@ class TradeAnalysisService:
                 "mid_dollars": mid,
                 "last_trade_dollars": historical.last_price_dollars,
                 "volume": None,
+                "snapshot_provenance": historical_provenance,
             })
+
+        if not candidates:
+            high_leakage = (
+                await session.execute(
+                    select(HistoricalMarketSnapshotRecord)
+                    .where(
+                        HistoricalMarketSnapshotRecord.market_ticker == market_ticker,
+                        HistoricalMarketSnapshotRecord.source_kind.in_(HIGH_LEAKAGE_HISTORICAL_MARKET_SOURCES),
+                    )
+                    .order_by(HistoricalMarketSnapshotRecord.asof_ts.desc(), HistoricalMarketSnapshotRecord.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if high_leakage is not None:
+                mid = None
+                if high_leakage.yes_bid_dollars is not None and high_leakage.yes_ask_dollars is not None:
+                    mid = (high_leakage.yes_bid_dollars + high_leakage.yes_ask_dollars) / Decimal("2")
+                provenance = dict((high_leakage.payload or {}).get("snapshot_provenance") or {})
+                provenance.setdefault("recovered", True)
+                provenance.setdefault("source", "historical_market_snapshots")
+                provenance.setdefault("source_kind", high_leakage.source_kind)
+                provenance.setdefault("source_id", high_leakage.source_id)
+                provenance.setdefault("leakage_risk", "final_market")
+                candidates.append({
+                    "source": "historical_market_snapshots",
+                    "source_kind": high_leakage.source_kind,
+                    "source_id": high_leakage.source_id,
+                    "snapshot_id": high_leakage.id,
+                    "observed_at": high_leakage.asof_ts,
+                    "yes_bid_dollars": high_leakage.yes_bid_dollars,
+                    "yes_ask_dollars": high_leakage.yes_ask_dollars,
+                    "mid_dollars": mid,
+                    "last_trade_dollars": high_leakage.last_price_dollars,
+                    "volume": None,
+                    "snapshot_provenance": provenance,
+                })
 
         for order in orders or []:
             recovered = self._market_snapshot_from_execution_raw(
@@ -1248,6 +1327,12 @@ class TradeAnalysisService:
         reasons: list[str] = []
         if market_snapshot is None:
             reasons.append("missing_market_snapshot")
+        elif str((market_snapshot.get("snapshot_provenance") or {}).get("leakage_risk") or "") in {
+            "execution_touch",
+            "final_market",
+            "future_quote",
+        }:
+            reasons.append("market_snapshot_high_leakage")
         elif stale_market_seconds is not None and stale_market_seconds > self.settings.risk_stale_market_seconds:
             reasons.append("stale_market_snapshot")
         if weather_snapshot is None:

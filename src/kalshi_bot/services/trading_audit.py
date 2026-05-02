@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,8 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import StandDownReason, StrategyCode
 from kalshi_bot.db.models import (
+    Artifact,
     Checkpoint,
+    DecisionTraceRecord,
     FillRecord,
+    HistoricalMarketSnapshotRecord,
     MarketPriceHistory,
     MarketState,
     OpsEvent,
@@ -72,6 +77,20 @@ def _strategy_key(value: str | None) -> str:
     return value or "<null>"
 
 
+def _series_from_ticker(ticker: str) -> str | None:
+    prefix = str(ticker or "").split("-")[0]
+    return prefix or None
+
+
+def _market_day_from_ticker(ticker: str) -> str:
+    parts = str(ticker or "").split("-")
+    return parts[1] if len(parts) >= 2 else "unknown"
+
+
+def _hash_payload(payload: dict[str, Any]) -> str:
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
 def _side_price(fill: FillRecord) -> Decimal:
     if fill.side == "yes":
         return Decimal(fill.yes_price_dollars)
@@ -86,20 +105,62 @@ def _inferred_strategy_for_orphaned_order(order: OrderRecord) -> str | None:
     return None
 
 
-def _current_side_price(position: PositionRecord, market_state: MarketState | None) -> Decimal | None:
+def _current_side_mark(position: PositionRecord, market_state: MarketState | None) -> dict[str, Any]:
+    empty = {"price": None, "mark_source": None, "mark_conservative": False}
     if market_state is None:
-        return None
+        return empty
     if position.side == "yes":
-        return market_state.yes_bid_dollars
-    if market_state.yes_ask_dollars is None:
-        return None
-    return Decimal("1") - Decimal(market_state.yes_ask_dollars)
+        if market_state.yes_bid_dollars is not None:
+            return {"price": market_state.yes_bid_dollars, "mark_source": "yes_bid", "mark_conservative": False}
+        if market_state.yes_ask_dollars is not None:
+            return {
+                "price": Decimal("0.0000"),
+                "mark_source": "one_sided_book_no_yes_bid",
+                "mark_conservative": True,
+            }
+        return empty
+    if position.side == "no":
+        if market_state.yes_ask_dollars is not None:
+            return {
+                "price": Decimal("1") - Decimal(market_state.yes_ask_dollars),
+                "mark_source": "no_bid_from_yes_ask",
+                "mark_conservative": False,
+            }
+        if market_state.yes_bid_dollars is not None:
+            return {
+                "price": Decimal("0.0000"),
+                "mark_source": "one_sided_book_no_no_bid",
+                "mark_conservative": True,
+            }
+    return empty
+
+
+def _current_side_price(position: PositionRecord, market_state: MarketState | None) -> Decimal | None:
+    return _current_side_mark(position, market_state)["price"]
 
 
 _TERMINAL_BLOCKED_CANDIDATE_REASONS = {
     StandDownReason.RESOLVED_CONTRACT.value,
 }
 
+_PRE_RISK_STAND_DOWN_REASONS = {
+    "duplicate_suppressed",
+    "missing_total_capital",
+    "non_positive_suggested_count",
+}
+
+_POINT_IN_TIME_BACKFILL_SOURCE_KINDS = {
+    "trade_analysis_backfill_room_artifact",
+    "trade_analysis_backfill_signal_payload",
+    "trade_analysis_backfill_market_price_history",
+    "trade_analysis_backfill_historical_snapshot",
+}
+_POINT_IN_TIME_MARKET_SOURCE_KINDS = {
+    "checkpoint_captured_market_snapshot",
+    "captured_market_snapshot",
+    "reconstructed_market_checkpoint",
+    *_POINT_IN_TIME_BACKFILL_SOURCE_KINDS,
+}
 
 @dataclass(slots=True)
 class _Lot:
@@ -146,6 +207,7 @@ class TradingAuditService:
             tickets = await self._tickets(session, kalshi_env=kalshi_env, cutoff=cutoff)
             risk_verdicts = await self._risk_verdicts(session, kalshi_env=kalshi_env, cutoff=cutoff)
             signals = await self._signals(session, kalshi_env=kalshi_env, cutoff=cutoff)
+            decision_traces = await self._decision_traces(session, kalshi_env=kalshi_env, cutoff=cutoff)
             positions = await self._positions(session, kalshi_env=kalshi_env)
             market_states = await self._market_states(session, kalshi_env=kalshi_env)
             price_history_count = await self._price_history_count(session, kalshi_env=kalshi_env, cutoff=cutoff)
@@ -164,7 +226,12 @@ class TradingAuditService:
             fills=fills,
             now=now,
         )
-        signal_funnel = self._signal_funnel(signals=signals, tickets=tickets, now=now)
+        signal_funnel = self._signal_funnel(
+            signals=signals,
+            tickets=tickets,
+            decision_traces=decision_traces,
+            now=now,
+        )
         stop_loss = self._stop_loss_clusters(ops_events, now=now)
         risk = self._risk_summary(risk_verdicts)
         ops = self._ops_summary(ops_events)
@@ -469,6 +536,327 @@ class TradingAuditService:
             "status": "ready" if fresh else "stale_reconcile_checkpoint",
         }
 
+    async def repair_market_snapshots(
+        self,
+        *,
+        kalshi_env: str = "demo",
+        days: int = 30,
+        dry_run: bool = True,
+        now: datetime | None = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        now = _as_utc(now) or _utc_now()
+        cutoff = now - timedelta(days=days)
+        candidates: list[dict[str, Any]] = []
+        updated = 0
+        skipped_existing = 0
+        unrecoverable = 0
+        async with self.session_factory() as session:
+            signals = await self._signals(session, kalshi_env=kalshi_env, cutoff=cutoff)
+            for signal in signals:
+                if len(candidates) >= limit:
+                    break
+                decision_ts = _as_utc(signal.created_at) or now
+                existing = await self._existing_point_in_time_market_snapshot(
+                    session,
+                    market_ticker=signal.market_ticker,
+                    decision_ts=decision_ts,
+                )
+                if existing is not None:
+                    skipped_existing += 1
+                    continue
+
+                recovered = await self._recover_market_snapshot_for_signal(
+                    session,
+                    signal,
+                    kalshi_env=kalshi_env,
+                    decision_ts=decision_ts,
+                )
+                if recovered is None:
+                    unrecoverable += 1
+                    continue
+
+                provenance = dict(recovered["snapshot_provenance"])
+                recovered_observed_at = _as_utc(recovered.get("observed_at"))
+                if (
+                    recovered_observed_at is not None
+                    and recovered_observed_at > decision_ts
+                    and provenance.get("leakage_risk") in {"none", "point_in_time"}
+                ):
+                    provenance["leakage_risk"] = "future_quote"
+                source_kind = str(provenance["source_kind"])
+                source_id = f"trade_analysis_backfill:{signal.id}:{source_kind}"
+                duplicate = (
+                    await session.execute(
+                        select(HistoricalMarketSnapshotRecord).where(
+                            HistoricalMarketSnapshotRecord.market_ticker == signal.market_ticker,
+                            HistoricalMarketSnapshotRecord.source_kind == source_kind,
+                            HistoricalMarketSnapshotRecord.source_id == source_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if duplicate is not None:
+                    skipped_existing += 1
+                    continue
+                row_payload = {
+                    "snapshot_provenance": {
+                        **provenance,
+                        "source_id": provenance.get("source_id"),
+                        "backfill_source_id": source_id,
+                        "backfilled_at": now.isoformat(),
+                        "decision_ts": decision_ts.isoformat(),
+                    },
+                    "source_snapshot": recovered.get("payload") or {},
+                }
+                candidate = {
+                    "signal_id": signal.id,
+                    "room_id": signal.room_id,
+                    "market_ticker": signal.market_ticker,
+                    "decision_ts": decision_ts.isoformat(),
+                    "source_kind": source_kind,
+                    "source_id": source_id,
+                    "leakage_risk": provenance.get("leakage_risk"),
+                    "observed_at": _iso(recovered_observed_at),
+                    "yes_bid_dollars": _money(recovered.get("yes_bid_dollars")),
+                    "yes_ask_dollars": _money(recovered.get("yes_ask_dollars")),
+                }
+                candidates.append(candidate)
+                if dry_run:
+                    continue
+
+                record = HistoricalMarketSnapshotRecord(
+                    market_ticker=signal.market_ticker,
+                    series_ticker=_series_from_ticker(signal.market_ticker),
+                    station_id=None,
+                    local_market_day=_market_day_from_ticker(signal.market_ticker),
+                    asof_ts=recovered_observed_at or decision_ts,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    source_hash=_hash_payload(row_payload),
+                    yes_bid_dollars=recovered.get("yes_bid_dollars"),
+                    yes_ask_dollars=recovered.get("yes_ask_dollars"),
+                    no_ask_dollars=recovered.get("no_ask_dollars"),
+                    last_price_dollars=recovered.get("last_price_dollars"),
+                    payload=row_payload,
+                )
+                session.add(record)
+                updated += 1
+
+            if dry_run:
+                await session.rollback()
+            else:
+                await session.commit()
+
+        return {
+            "kalshi_env": kalshi_env,
+            "window_days": days,
+            "dry_run": dry_run,
+            "repair_target": "market-snapshots",
+            "candidate_count": len(candidates),
+            "updated_count": 0 if dry_run else updated,
+            "skipped_existing_count": skipped_existing,
+            "unrecoverable_count": unrecoverable,
+            "candidates": candidates[:50],
+        }
+
+    async def _existing_point_in_time_market_snapshot(
+        self,
+        session: AsyncSession,
+        *,
+        market_ticker: str,
+        decision_ts: datetime,
+    ) -> HistoricalMarketSnapshotRecord | None:
+        cutoff = decision_ts - timedelta(seconds=max(1, int(self.settings.risk_stale_market_seconds)))
+        return (
+            await session.execute(
+                select(HistoricalMarketSnapshotRecord)
+                .where(
+                    HistoricalMarketSnapshotRecord.market_ticker == market_ticker,
+                    HistoricalMarketSnapshotRecord.asof_ts <= decision_ts,
+                    HistoricalMarketSnapshotRecord.asof_ts >= cutoff,
+                    HistoricalMarketSnapshotRecord.source_kind.in_(sorted(_POINT_IN_TIME_BACKFILL_SOURCE_KINDS)),
+                )
+                .order_by(HistoricalMarketSnapshotRecord.asof_ts.desc(), HistoricalMarketSnapshotRecord.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    async def _recover_market_snapshot_for_signal(
+        self,
+        session: AsyncSession,
+        signal: Signal,
+        *,
+        kalshi_env: str,
+        decision_ts: datetime,
+    ) -> dict[str, Any] | None:
+        artifact = (
+            await session.execute(
+                select(Artifact)
+                .where(Artifact.room_id == signal.room_id, Artifact.artifact_type == "market_snapshot")
+                .order_by(Artifact.updated_at.desc(), Artifact.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if artifact is not None:
+            recovered = self._market_snapshot_from_payload(
+                artifact.payload,
+                observed_at=_as_utc(artifact.created_at),
+                source_kind="trade_analysis_backfill_room_artifact",
+                source_id=artifact.id,
+                leakage_risk="none",
+            )
+            if recovered is not None:
+                return recovered
+
+        signal_payload = dict(signal.payload or {})
+        signal_snapshot = signal_payload.get("market_snapshot")
+        if isinstance(signal_snapshot, dict):
+            recovered = self._market_snapshot_from_payload(
+                signal_snapshot,
+                observed_at=_parse_utc(signal_snapshot.get("observed_at")) or _as_utc(signal.created_at),
+                source_kind="trade_analysis_backfill_signal_payload",
+                source_id=signal.id,
+                leakage_risk="none",
+            )
+            if recovered is not None:
+                return recovered
+
+        history = (
+            await session.execute(
+                select(MarketPriceHistory)
+                .where(
+                    MarketPriceHistory.kalshi_env == kalshi_env,
+                    MarketPriceHistory.market_ticker == signal.market_ticker,
+                    MarketPriceHistory.observed_at <= decision_ts,
+                )
+                .order_by(MarketPriceHistory.observed_at.desc(), MarketPriceHistory.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if history is not None:
+            return {
+                "observed_at": history.observed_at,
+                "yes_bid_dollars": history.yes_bid_dollars,
+                "yes_ask_dollars": history.yes_ask_dollars,
+                "no_ask_dollars": None,
+                "last_price_dollars": history.last_trade_dollars,
+                "payload": {},
+                "snapshot_provenance": {
+                    "recovered": True,
+                    "source": "market_price_history",
+                    "source_kind": "trade_analysis_backfill_market_price_history",
+                    "source_id": history.id,
+                    "leakage_risk": "point_in_time",
+                },
+            }
+
+        historical = (
+            await session.execute(
+                select(HistoricalMarketSnapshotRecord)
+                .where(
+                    HistoricalMarketSnapshotRecord.market_ticker == signal.market_ticker,
+                    HistoricalMarketSnapshotRecord.asof_ts <= decision_ts,
+                    HistoricalMarketSnapshotRecord.source_kind.in_(sorted(_POINT_IN_TIME_MARKET_SOURCE_KINDS)),
+                )
+                .order_by(HistoricalMarketSnapshotRecord.asof_ts.desc(), HistoricalMarketSnapshotRecord.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if historical is not None:
+            return self._market_snapshot_from_historical(
+                historical,
+                source_kind="trade_analysis_backfill_historical_snapshot",
+                leakage_risk="point_in_time",
+            )
+
+        final = (
+            await session.execute(
+                select(HistoricalMarketSnapshotRecord)
+                .where(
+                    HistoricalMarketSnapshotRecord.market_ticker == signal.market_ticker,
+                    HistoricalMarketSnapshotRecord.source_kind == "kalshi_final_market",
+                )
+                .order_by(HistoricalMarketSnapshotRecord.asof_ts.desc(), HistoricalMarketSnapshotRecord.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if final is not None:
+            return self._market_snapshot_from_historical(
+                final,
+                source_kind="trade_analysis_backfill_final_market",
+                leakage_risk="final_market",
+            )
+        return None
+
+    @staticmethod
+    def _market_snapshot_from_payload(
+        payload: Any,
+        *,
+        observed_at: datetime | None,
+        source_kind: str,
+        source_id: str,
+        leakage_risk: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        market = payload.get("market") if isinstance(payload.get("market"), dict) else payload
+        meta = payload.get("_snapshot_meta") if isinstance(payload.get("_snapshot_meta"), dict) else {}
+        payload_observed_at = (
+            _parse_utc(market.get("observed_at"))
+            or _parse_utc(payload.get("observed_at"))
+            or _parse_utc(meta.get("observed_at"))
+            or observed_at
+        )
+        yes_bid = _decimal_or_none(market.get("yes_bid_dollars") or market.get("yes_bid"))
+        yes_ask = _decimal_or_none(market.get("yes_ask_dollars") or market.get("yes_ask"))
+        no_ask = _decimal_or_none(market.get("no_ask_dollars") or market.get("no_ask"))
+        if yes_ask is None and no_ask is not None:
+            yes_ask = Decimal("1") - no_ask
+        if yes_bid is None and yes_ask is None:
+            return None
+        return {
+            "observed_at": payload_observed_at,
+            "yes_bid_dollars": yes_bid,
+            "yes_ask_dollars": yes_ask,
+            "no_ask_dollars": no_ask,
+            "last_price_dollars": _decimal_or_none(
+                market.get("last_price_dollars")
+                or market.get("last_trade_dollars")
+                or market.get("last_price")
+            ),
+            "payload": payload,
+            "snapshot_provenance": {
+                "recovered": True,
+                "source": source_kind,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "leakage_risk": leakage_risk,
+            },
+        }
+
+    @staticmethod
+    def _market_snapshot_from_historical(
+        snapshot: HistoricalMarketSnapshotRecord,
+        *,
+        source_kind: str,
+        leakage_risk: str,
+    ) -> dict[str, Any]:
+        return {
+            "observed_at": snapshot.asof_ts,
+            "yes_bid_dollars": snapshot.yes_bid_dollars,
+            "yes_ask_dollars": snapshot.yes_ask_dollars,
+            "no_ask_dollars": snapshot.no_ask_dollars,
+            "last_price_dollars": snapshot.last_price_dollars,
+            "payload": snapshot.payload or {},
+            "snapshot_provenance": {
+                "recovered": True,
+                "source": snapshot.source_kind,
+                "source_kind": source_kind,
+                "source_id": snapshot.id,
+                "leakage_risk": leakage_risk,
+            },
+        }
+
     async def _fills(self, session: AsyncSession, *, kalshi_env: str, cutoff: datetime) -> list[FillRecord]:
         result = await session.execute(
             select(FillRecord)
@@ -503,6 +891,17 @@ class TradingAuditService:
             .where(Room.kalshi_env == kalshi_env)
             .where(RiskVerdictRecord.created_at >= cutoff)
             .order_by(RiskVerdictRecord.created_at.asc())
+        )
+        return list(result.scalars())
+
+    async def _decision_traces(self, session: AsyncSession, *, kalshi_env: str, cutoff: datetime) -> list[DecisionTraceRecord]:
+        result = await session.execute(
+            select(DecisionTraceRecord)
+            .where(
+                DecisionTraceRecord.kalshi_env == kalshi_env,
+                DecisionTraceRecord.decision_time >= cutoff,
+            )
+            .order_by(DecisionTraceRecord.decision_time.asc(), DecisionTraceRecord.id.asc())
         )
         return list(result.scalars())
 
@@ -931,15 +1330,26 @@ class TradingAuditService:
         *,
         signals: list[Signal],
         tickets: list[TradeTicketRecord],
+        decision_traces: list[DecisionTraceRecord],
         now: datetime,
     ) -> dict[str, Any]:
         ticketed_room_ids = {ticket.room_id for ticket in tickets}
+        traces_by_room: dict[str, DecisionTraceRecord] = {}
+        for trace in decision_traces:
+            if trace.room_id is None:
+                continue
+            prior = traces_by_room.get(trace.room_id)
+            if prior is None or (_as_utc(trace.decision_time) or datetime.min.replace(tzinfo=UTC)) >= (
+                _as_utc(prior.decision_time) or datetime.min.replace(tzinfo=UTC)
+            ):
+                traces_by_room[trace.room_id] = trace
         recent_cutoff = now - timedelta(hours=24)
         outcome_counts: Counter[str] = Counter()
         stand_down_counts: Counter[str] = Counter()
         side_counts: Counter[str] = Counter()
         top_markets: dict[str, dict[str, Any]] = {}
         selected_without_ticket: list[Signal] = []
+        pre_risk_filtered_without_ticket: list[dict[str, Any]] = []
         blocked_candidates: list[dict[str, Any]] = []
 
         for signal in signals:
@@ -980,7 +1390,31 @@ class TradingAuditService:
             if outcome == "candidate_selected":
                 market["candidate_selected"] += 1
                 if signal.room_id not in ticketed_room_ids:
-                    selected_without_ticket.append(signal)
+                    trace_record = traces_by_room.get(signal.room_id)
+                    trace = dict(trace_record.trace or {}) if trace_record is not None else {}
+                    final_stand_down_reason = self._final_stand_down_reason(payload, trace)
+                    final_outcome = str(
+                        payload.get("final_outcome")
+                        or candidate_trace.get("final_outcome")
+                        or trace.get("evaluation_outcome")
+                        or trace.get("final_outcome")
+                        or ""
+                    )
+                    if final_stand_down_reason in _PRE_RISK_STAND_DOWN_REASONS or final_outcome == "pre_risk_filtered":
+                        outcome_counts["selected_pre_risk_filtered_without_ticket"] += 1
+                        stand_down_counts[final_stand_down_reason or "pre_risk_filtered"] += 1
+                        pre_risk_filtered_without_ticket.append(
+                            self._selected_without_ticket_payload(
+                                signal,
+                                payload=payload,
+                                candidate_trace=candidate_trace,
+                                final_outcome=final_outcome or "pre_risk_filtered",
+                                final_stand_down_reason=final_stand_down_reason,
+                                decision_trace_id=trace_record.id if trace_record is not None else None,
+                            )
+                        )
+                    else:
+                        selected_without_ticket.append(signal)
             elif outcome == "pre_risk_filtered" and candidate_trace.get("outcome") == "candidate_selected":
                 selected_candidate = self._selected_candidate_trace(candidate_trace)
                 forecast_delta_f = _decimal_or_none(payload.get("forecast_delta_f"))
@@ -1050,14 +1484,7 @@ class TradingAuditService:
             payload = dict(signal.payload or {})
             candidate_trace = dict(payload.get("candidate_trace") or {})
             recent_selected_without_ticket.append(
-                {
-                    "room_id": signal.room_id,
-                    "market_ticker": signal.market_ticker,
-                    "edge_bps": signal.edge_bps,
-                    "confidence": signal.confidence,
-                    "recommended_side": payload.get("recommended_side") or candidate_trace.get("selected_side"),
-                    "created_at": _iso(signal.created_at),
-                }
+                self._selected_without_ticket_payload(signal, payload=payload, candidate_trace=candidate_trace)
             )
         return {
             "signals": len(signals),
@@ -1065,6 +1492,8 @@ class TradingAuditService:
             "selected_without_ticket_count": len(selected_without_ticket),
             "recent_selected_without_ticket_count": len(recent_selected),
             "legacy_selected_without_ticket_count": len(legacy_selected),
+            "selected_pre_risk_filtered_without_ticket_count": len(pre_risk_filtered_without_ticket),
+            "selected_pre_risk_filtered_without_ticket": pre_risk_filtered_without_ticket[:20],
             "outcome_counts": dict(outcome_counts),
             "recommended_side_counts": dict(side_counts),
             "top_stand_down_reasons": [
@@ -1080,6 +1509,48 @@ class TradingAuditService:
             "non_terminal_blocked_reason_rollups": self._blocked_candidate_reason_rollups(non_terminal_blocked_candidates),
             "recent_selected_without_ticket": recent_selected_without_ticket,
         }
+
+    @staticmethod
+    def _final_stand_down_reason(payload: dict[str, Any], trace: dict[str, Any]) -> str | None:
+        candidate_trace = dict(payload.get("candidate_trace") or {})
+        sizing = dict(trace.get("sizing") or {})
+        for value in (
+            payload.get("final_stand_down_reason"),
+            payload.get("stand_down_reason"),
+            candidate_trace.get("final_stand_down_reason"),
+            candidate_trace.get("eligibility_stand_down_reason"),
+            sizing.get("stand_down_reason"),
+            trace.get("stand_down_reason"),
+        ):
+            if value not in (None, "", "none"):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _selected_without_ticket_payload(
+        signal: Signal,
+        *,
+        payload: dict[str, Any],
+        candidate_trace: dict[str, Any],
+        final_outcome: str | None = None,
+        final_stand_down_reason: str | None = None,
+        decision_trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        row = {
+            "room_id": signal.room_id,
+            "market_ticker": signal.market_ticker,
+            "edge_bps": signal.edge_bps,
+            "confidence": signal.confidence,
+            "recommended_side": payload.get("recommended_side") or candidate_trace.get("selected_side"),
+            "created_at": _iso(signal.created_at),
+        }
+        if final_outcome:
+            row["final_outcome"] = final_outcome
+        if final_stand_down_reason:
+            row["final_stand_down_reason"] = final_stand_down_reason
+        if decision_trace_id:
+            row["decision_trace_id"] = decision_trace_id
+        return row
 
     @staticmethod
     def _selected_candidate_trace(candidate_trace: dict[str, Any]) -> dict[str, Any]:
@@ -1336,15 +1807,23 @@ class TradingAuditService:
         total_unrealized = Decimal("0")
         fresh_count = 0
         stale_or_missing_count = 0
+        mark_stale_threshold_seconds = max(
+            int(self.settings.risk_stale_market_seconds),
+            int(self.settings.daemon_reconcile_stale_kill_switch_seconds),
+        )
         for position in positions:
             market_state = market_states.get(position.market_ticker)
-            current = _current_side_price(position, market_state)
+            mark = _current_side_mark(position, market_state)
+            current = mark["price"]
             cost = Decimal(position.average_price_dollars) * Decimal(position.count_fp)
             total_cost += cost
             observed_at = _as_utc(market_state.observed_at) if market_state is not None else None
             stale_seconds = None if observed_at is None else int((now - observed_at).total_seconds())
-            is_stale = stale_seconds is None or stale_seconds > self.settings.risk_stale_market_seconds
-            if is_stale:
+            mark_missing = current is None
+            is_stale = stale_seconds is None or stale_seconds > mark_stale_threshold_seconds
+            conservative_zero_mark = bool(mark["mark_conservative"]) and current == Decimal("0.0000")
+            is_stale_or_missing = mark_missing or (is_stale and not conservative_zero_mark)
+            if is_stale_or_missing:
                 stale_or_missing_count += 1
             else:
                 fresh_count += 1
@@ -1362,7 +1841,11 @@ class TradingAuditService:
                 "unrealized_pnl_dollars": _money(unrealized),
                 "market_observed_at": _iso(observed_at),
                 "stale_seconds": stale_seconds,
-                "stale_or_missing_market_state": is_stale,
+                "mark_stale_threshold_seconds": mark_stale_threshold_seconds,
+                "market_state_stale": is_stale,
+                "mark_source": mark["mark_source"],
+                "mark_conservative": bool(mark["mark_conservative"]),
+                "stale_or_missing_market_state": is_stale_or_missing,
             })
         return {
             "position_count": len(positions),

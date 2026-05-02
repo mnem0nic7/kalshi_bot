@@ -137,6 +137,19 @@ class FakeWatchdog:
         }
 
 
+class FakeUnhealthyWatchdog:
+    async def get_status(self, repo, *, kalshi_env: str | None = None):
+        return {
+            "kalshi_env": kalshi_env,
+            "active_color": "blue",
+            "kill_switch_enabled": False,
+            "colors": {
+                "blue": {"combined_healthy": False, "reason": "no heartbeat checkpoint"},
+                "green": {"combined_healthy": False, "reason": "no heartbeat checkpoint"},
+            },
+        }
+
+
 class FakeAudit:
     async def build_report(self, *, kalshi_env: str, days: int, focus: str = "money-safety"):
         return {
@@ -161,6 +174,21 @@ class FakeAnalysis:
             "excluded_count": 0,
             "data_defect_count": 0,
             "top_exclusion_reasons": [],
+            "buckets": [],
+        }
+
+
+class FakeLegacyDebtAnalysis:
+    async def build_report(self, *, kalshi_env: str, days: int, buckets: bool = False):
+        return {
+            "row_count": 100,
+            "training_eligible_count": 10,
+            "excluded_count": 90,
+            "data_defect_count": 90,
+            "current_missing_market_snapshot_count": 0,
+            "current_data_defect_count": 0,
+            "legacy_coverage_debt_count": 90,
+            "top_exclusion_reasons": [("missing_market_snapshot", 60), ("market_snapshot_high_leakage", 30)],
             "buckets": [],
         }
 
@@ -196,3 +224,66 @@ async def test_trade_behavior_validation_aggregates_runtime_audit_analysis_and_f
     assert report["empirical_gate"]["readiness"]["status"] == "freeze_active"
     assert report["buy_entry_bypass"]["ticket_count"] == 0
     assert report["analysis"]["training_eligible_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_trade_behavior_validation_does_not_fail_unobserved_production_runtime(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation-runtime.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        async with session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env="production")
+            await repo.ensure_deployment_control("blue", kalshi_env="production")
+            await session.commit()
+
+        report = await build_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=FakeUnhealthyWatchdog(),
+            trading_audit_service=FakeAudit(),
+            trade_analysis_service=FakeAnalysis(),
+            kalshi_env="production",
+            days=7,
+            since_hours=24,
+            now=NOW,
+        )
+    finally:
+        await engine.dispose()
+
+    assert report["status"] == "pass"
+    assert report["runtime_observed"] is False
+    assert report["runtime_not_observed"] is True
+    assert "active_runtime_unhealthy" not in {issue["code"] for issue in report["issues"]}
+
+
+@pytest.mark.asyncio
+async def test_trade_behavior_validation_treats_legacy_explained_exclusions_as_coverage_debt(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation-legacy.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        async with session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env="production")
+            await repo.ensure_deployment_control("blue", kalshi_env="production")
+            await session.commit()
+
+        report = await build_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=FakeWatchdog(),
+            trading_audit_service=FakeAudit(),
+            trade_analysis_service=FakeLegacyDebtAnalysis(),
+            kalshi_env="production",
+            days=30,
+            since_hours=24,
+            now=NOW,
+        )
+    finally:
+        await engine.dispose()
+
+    assert report["status"] == "pass"
+    assert report["analysis"]["legacy_coverage_debt_count"] == 90
+    assert not [issue for issue in report["issues"] if issue["code"].startswith("analysis:")]
