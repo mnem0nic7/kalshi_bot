@@ -61,6 +61,10 @@ from kalshi_bot.services.trade_behavior_validation import (
     build_trade_behavior_validation_report,
     format_trade_behavior_validation_report,
 )
+from kalshi_bot.services.trade_behavior_quality import (
+    build_trade_behavior_quality_report,
+    format_trade_behavior_quality_report,
+)
 from kalshi_bot.services.trading_audit import format_trading_audit_text
 
 
@@ -1027,21 +1031,36 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "trade-behavior":
-            validation_days = 3650 if args.full_history else args.days
-            report = await build_trade_behavior_validation_report(
-                settings=container.settings,
-                session_factory=container.session_factory,
-                watchdog_service=container.watchdog_service,
-                trading_audit_service=container.trading_audit_service,
-                trade_analysis_service=container.trade_analysis_service,
-                kalshi_env=args.kalshi_env,
-                days=validation_days,
-                since_hours=args.since_hours,
-            )
-            if args.json:
-                print(json.dumps(report, indent=2))
+            behavior_days = 3650 if args.full_history else args.days
+            if args.trade_behavior_command == "quality":
+                report = await build_trade_behavior_quality_report(
+                    settings=container.settings,
+                    trading_audit_service=container.trading_audit_service,
+                    trade_analysis_service=container.trade_analysis_service,
+                    kalshi_env=args.kalshi_env,
+                    days=behavior_days,
+                    min_samples=args.min_samples,
+                    limit=args.limit,
+                )
+                if args.json:
+                    print(json.dumps(report, indent=2))
+                else:
+                    print(format_trade_behavior_quality_report(report))
             else:
-                print(format_trade_behavior_validation_report(report))
+                report = await build_trade_behavior_validation_report(
+                    settings=container.settings,
+                    session_factory=container.session_factory,
+                    watchdog_service=container.watchdog_service,
+                    trading_audit_service=container.trading_audit_service,
+                    trade_analysis_service=container.trade_analysis_service,
+                    kalshi_env=args.kalshi_env,
+                    days=behavior_days,
+                    since_hours=args.since_hours,
+                )
+                if args.json:
+                    print(json.dumps(report, indent=2))
+                else:
+                    print(format_trade_behavior_validation_report(report))
             return 0
 
         if args.command == "training-build":
@@ -1887,6 +1906,13 @@ def build_parser() -> argparse.ArgumentParser:
     trade_behavior_validate.add_argument("--full-history", action="store_true")
     trade_behavior_validate.add_argument("--since-hours", type=int, default=24)
     trade_behavior_validate.add_argument("--json", action="store_true")
+    trade_behavior_quality = trade_behavior_subparsers.add_parser("quality")
+    trade_behavior_quality.add_argument("--kalshi-env", default="production")
+    trade_behavior_quality.add_argument("--days", type=int, default=180)
+    trade_behavior_quality.add_argument("--full-history", action="store_true")
+    trade_behavior_quality.add_argument("--min-samples", type=int, default=None)
+    trade_behavior_quality.add_argument("--limit", type=int, default=20)
+    trade_behavior_quality.add_argument("--json", action="store_true")
 
     training_build = subparsers.add_parser("training-build")
     training_build.add_argument("training_build_scope", nargs="?", choices=["historical"])

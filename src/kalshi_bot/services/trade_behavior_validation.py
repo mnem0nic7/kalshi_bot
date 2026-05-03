@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -10,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import OrderRecord, Room, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.services.trade_behavior_quality import annotate_bucket_matrix, bucket_status_summary
 from kalshi_bot.services.trade_behavior import production_entry_freeze_enabled
 
 
@@ -146,15 +146,6 @@ def _issue(severity: str, code: str, summary: str) -> dict[str, str]:
     return {"severity": severity, "code": code, "summary": summary}
 
 
-def _decimal_or_none(value: Any) -> Decimal | None:
-    if value in (None, ""):
-        return None
-    try:
-        return Decimal(str(value))
-    except Exception:
-        return None
-
-
 def _empirical_gate_readiness(
     *,
     settings: Settings,
@@ -164,23 +155,23 @@ def _empirical_gate_readiness(
 ) -> dict[str, Any]:
     lifecycle = dict(audit.get("lifecycle") or {})
     rows_by_key: dict[str, dict[str, Any]] = {}
-    for row in list(lifecycle.get("worst_buckets") or []) + list(lifecycle.get("best_buckets") or []):
+    source_rows = list(lifecycle.get("buckets") or [])
+    if not source_rows:
+        source_rows = list(lifecycle.get("worst_buckets") or []) + list(lifecycle.get("best_buckets") or [])
+    for row in source_rows:
         if isinstance(row, dict) and row.get("bucket_key"):
             rows_by_key[str(row["bucket_key"])] = row
-    min_samples = int(settings.trade_behavior_empirical_gate_min_settled_fills)
-    min_net = Decimal(str(settings.trade_behavior_empirical_gate_min_net_pnl_dollars))
-    under_sampled = 0
-    negative = 0
-    eligible = 0
-    for row in rows_by_key.values():
-        sample_count = int(row.get("bucket_sample_count") or 0)
-        net = _decimal_or_none(row.get("bucket_net_pnl") or row.get("lifecycle_net_pnl"))
-        if sample_count < min_samples:
-            under_sampled += 1
-        if net is not None and net <= min_net:
-            negative += 1
-        if sample_count >= min_samples and net is not None and net > min_net:
-            eligible += 1
+    annotated_rows = annotate_bucket_matrix(
+        list(rows_by_key.values()),
+        settings=settings,
+        kalshi_env=kalshi_env,
+        freeze_enabled=freeze_enabled,
+    )
+    summary = bucket_status_summary(annotated_rows)
+    under_sampled = int(summary.get("under_sampled_count") or 0)
+    negative = int(summary.get("negative_actual_pnl_count") or 0)
+    eligible = int(summary.get("eligible_for_live_review_count") or 0)
+    unscored = int(summary.get("unscored_count") or 0)
 
     if not settings.trade_behavior_empirical_gate_enabled:
         status = "disabled"
@@ -203,6 +194,10 @@ def _empirical_gate_readiness(
         "eligible_reported_bucket_count": eligible,
         "negative_reported_bucket_count": negative,
         "under_sampled_reported_bucket_count": under_sampled,
+        "unscored_reported_bucket_count": unscored,
+        "evidence_status_counts": summary.get("evidence_status_counts") or {},
+        "bucket_status_counts": summary.get("bucket_status_counts") or {},
+        "bucket_matrix_sample": annotated_rows[:20],
     }
 
 
@@ -222,7 +217,6 @@ async def build_trade_behavior_validation_report(
     since = now_utc - timedelta(hours=max(1, int(since_hours)))
     async with session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=kalshi_env)
-        control = await repo.get_deployment_control(kalshi_env=kalshi_env)
         watchdog_status = await watchdog_service.get_status(repo, kalshi_env=kalshi_env)
         buy_bypass = await _production_buy_entry_bypass(
             session,
@@ -350,7 +344,8 @@ def format_trade_behavior_validation_report(report: dict[str, Any]) -> str:
             f"status={gate_readiness.get('status')} "
             f"eligible_buckets={gate_readiness.get('eligible_reported_bucket_count')} "
             f"negative_buckets={gate_readiness.get('negative_reported_bucket_count')} "
-            f"under_sampled={gate_readiness.get('under_sampled_reported_bucket_count')}"
+            f"under_sampled={gate_readiness.get('under_sampled_reported_bucket_count')} "
+            f"unscored={gate_readiness.get('unscored_reported_bucket_count')}"
         ),
         f"Audit: issues={audit.get('issue_count', 0)} critical={audit.get('critical_count', 0)} high={audit.get('high_count', 0)}",
         (

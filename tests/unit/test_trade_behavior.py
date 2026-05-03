@@ -9,7 +9,9 @@ from kalshi_bot.config import Settings
 from kalshi_bot.db.models import FillRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+from kalshi_bot.services.trade_analysis import TradeAnalysisDataset
 from kalshi_bot.services.trade_behavior import evaluate_empirical_gate
+from kalshi_bot.services.trade_behavior_quality import build_trade_behavior_quality_report
 from kalshi_bot.services.trade_behavior_validation import build_trade_behavior_validation_report
 
 
@@ -95,6 +97,28 @@ async def test_empirical_gate_keeps_under_sampled_demo_shadow_report_only(trade_
 
 
 @pytest.mark.asyncio
+async def test_empirical_gate_labels_demo_live_entries_without_blocking(trade_behavior_harness) -> None:
+    settings, session_factory = trade_behavior_harness
+    async with session_factory() as session:
+        decision = await evaluate_empirical_gate(
+            session=session,
+            settings=settings,
+            kalshi_env="demo",
+            market_ticker=TICKER,
+            side="yes",
+            action="buy",
+            strategy_code="A",
+            shadow_mode=False,
+            yes_price_dollars=Decimal("0.5000"),
+            now=NOW,
+        )
+
+    assert decision.status == "shadow_only"
+    assert decision.reason == "empirical_gate_under_sampled"
+    assert decision.blocks_live_entries is False
+
+
+@pytest.mark.asyncio
 async def test_empirical_gate_blocks_negative_actual_settled_evidence(trade_behavior_harness) -> None:
     settings, session_factory = trade_behavior_harness
     async with session_factory() as session:
@@ -166,6 +190,46 @@ class FakeAudit:
         }
 
 
+class FakeFullBucketAudit:
+    async def build_report(self, *, kalshi_env: str, days: int, focus: str = "money-safety"):
+        return {
+            "issues": [],
+            "lifecycle": {
+                "bucket_count": 4,
+                "buckets": [
+                    {
+                        "bucket_key": "KXHIGHNY|NY|yes|A|50-59c|delta:>=5f|conf:high|spread:000-099bps",
+                        "lifecycle_net_pnl": "4.0000",
+                        "bucket_net_pnl": "4.0000",
+                        "bucket_sample_count": 3,
+                        "bucket_win_rate": 1.0,
+                    },
+                    {
+                        "bucket_key": "KXHIGHNY|NY|no|A|40-49c|delta:0-2f|conf:medium|spread:250-499bps",
+                        "lifecycle_net_pnl": "-3.0000",
+                        "bucket_net_pnl": "-3.0000",
+                        "bucket_sample_count": 3,
+                        "bucket_win_rate": 0.0,
+                    },
+                    {
+                        "bucket_key": "KXHIGHTDAL|TDAL|yes|A|20-29c|delta:2-5f|conf:medium|spread:100-249bps",
+                        "lifecycle_net_pnl": "0.5000",
+                        "bucket_net_pnl": "0.5000",
+                        "bucket_sample_count": 1,
+                        "bucket_win_rate": 1.0,
+                    },
+                    {
+                        "bucket_key": "KXHIGHCHI|CHI|yes|A|30-39c|delta:unknown|conf:unknown|spread:unknown",
+                        "lifecycle_net_pnl": None,
+                        "bucket_net_pnl": None,
+                        "bucket_sample_count": 0,
+                        "bucket_win_rate": None,
+                    },
+                ],
+            },
+        }
+
+
 class FakeAnalysis:
     async def build_report(self, *, kalshi_env: str, days: int, buckets: bool = False):
         return {
@@ -176,6 +240,73 @@ class FakeAnalysis:
             "top_exclusion_reasons": [],
             "buckets": [],
         }
+
+
+class FakeQualityAnalysis(FakeAnalysis):
+    async def build_dataset(self, *, kalshi_env: str, days: int, now=None, limit=None):
+        rows = [
+            {
+                "training_eligible": True,
+                "lifecycle_net_pnl": "-2.0000",
+                "label_win": False,
+                "confidence": 0.55,
+                "forecast_delta_f": 1.0,
+                "market_spread_bps": 450,
+                "side": "yes",
+                "series_ticker": "KXHIGHNY",
+                "city": "NY",
+                "entry_price_band": "50-59c",
+                "forecast_delta_band": "0-2f",
+                "confidence_band": "medium",
+                "spread_band": "250-499bps",
+            },
+            {
+                "training_eligible": True,
+                "lifecycle_net_pnl": "-1.0000",
+                "label_win": False,
+                "confidence": 0.70,
+                "forecast_delta_f": 4.0,
+                "market_spread_bps": 300,
+                "side": "no",
+                "series_ticker": "KXHIGHNY",
+                "city": "NY",
+                "entry_price_band": "40-49c",
+                "forecast_delta_band": "2-5f",
+                "confidence_band": "medium",
+                "spread_band": "250-499bps",
+            },
+            {
+                "training_eligible": True,
+                "lifecycle_net_pnl": "3.0000",
+                "label_win": True,
+                "confidence": 0.82,
+                "forecast_delta_f": 9.0,
+                "market_spread_bps": 80,
+                "side": "yes",
+                "series_ticker": "KXHIGHCHI",
+                "city": "CHI",
+                "entry_price_band": "30-39c",
+                "forecast_delta_band": ">=5f",
+                "confidence_band": "high",
+                "spread_band": "000-099bps",
+            },
+            {
+                "training_eligible": True,
+                "lifecycle_net_pnl": "2.0000",
+                "label_win": True,
+                "confidence": 0.90,
+                "forecast_delta_f": 12.0,
+                "market_spread_bps": 50,
+                "side": "yes",
+                "series_ticker": "KXHIGHCHI",
+                "city": "CHI",
+                "entry_price_band": "20-29c",
+                "forecast_delta_band": ">=5f",
+                "confidence_band": "high",
+                "spread_band": "000-099bps",
+            },
+        ]
+        return TradeAnalysisDataset(rows=rows, summary={"row_count": len(rows)})
 
 
 class FakeLegacyDebtAnalysis:
@@ -287,3 +418,75 @@ async def test_trade_behavior_validation_treats_legacy_explained_exclusions_as_c
     assert report["status"] == "pass"
     assert report["analysis"]["legacy_coverage_debt_count"] == 90
     assert not [issue for issue in report["issues"] if issue["code"].startswith("analysis:")]
+
+
+@pytest.mark.asyncio
+async def test_trade_behavior_validation_uses_full_bucket_matrix_for_readiness(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation-buckets.db",
+        trade_behavior_production_entry_freeze_enabled=False,
+        trade_behavior_empirical_gate_min_settled_fills=2,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        report = await build_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=FakeWatchdog(),
+            trading_audit_service=FakeFullBucketAudit(),
+            trade_analysis_service=FakeAnalysis(),
+            kalshi_env="demo",
+            days=30,
+            since_hours=24,
+            now=NOW,
+        )
+    finally:
+        await engine.dispose()
+
+    readiness = report["empirical_gate"]["readiness"]
+    assert readiness["reported_bucket_rows_evaluated"] == 4
+    assert readiness["eligible_reported_bucket_count"] == 1
+    assert readiness["negative_reported_bucket_count"] == 1
+    assert readiness["under_sampled_reported_bucket_count"] == 1
+    assert readiness["unscored_reported_bucket_count"] == 1
+    assert readiness["evidence_status_counts"] == {
+        "eligible_for_live_review": 1,
+        "negative_actual_pnl": 1,
+        "under_sampled": 1,
+        "unscored": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_trade_behavior_quality_reports_demo_exploration_and_filter_sweeps() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        trade_behavior_production_entry_freeze_enabled=False,
+        trade_behavior_empirical_gate_min_settled_fills=2,
+    )
+
+    report = await build_trade_behavior_quality_report(
+        settings=settings,
+        trading_audit_service=FakeFullBucketAudit(),
+        trade_analysis_service=FakeQualityAnalysis(),
+        kalshi_env="demo",
+        days=30,
+        min_samples=2,
+        limit=20,
+    )
+
+    summary = report["bucket_matrix_summary"]
+    assert summary["eligible_for_live_review_count"] == 1
+    assert summary["negative_actual_pnl_count"] == 1
+    assert summary["under_sampled_count"] == 1
+    assert summary["unscored_count"] == 1
+    negative = next(row for row in report["worst_losing_cohorts"] if row["evidence_status"] == "negative_actual_pnl")
+    assert negative["demo_treatment"] == "exploratory_evidence_only"
+    assert report["candidate_live_review_buckets"][0]["evidence_status"] == "eligible_for_live_review"
+    confidence_sweep = next(row for row in report["threshold_sweeps"] if row["filter"] == "confidence_min_0.80")
+    assert confidence_sweep["sample_count"] == 2
+    assert confidence_sweep["net_pnl"] == "5.0000"
+    assert confidence_sweep["blocked_loss_dollars"] == "3.0000"
+    assert confidence_sweep["missed_profit_dollars"] == "0.0000"

@@ -138,6 +138,37 @@ def bucket_key(
     return "|".join(parts)
 
 
+def bucket_dimensions_from_key(value: str | None) -> dict[str, str]:
+    parts = str(value or "").split("|")
+    series = parts[0] if len(parts) > 0 and parts[0] else "unknown"
+    station = parts[1] if len(parts) > 1 and parts[1] else station_from_series(series) or "unknown"
+    side = parts[2] if len(parts) > 2 and parts[2] else "unknown"
+    strategy = parts[3] if len(parts) > 3 and parts[3] else "<unknown>"
+    entry_price_band = "unknown"
+    forecast = "unknown"
+    confidence = "unknown"
+    spread = "unknown"
+    for part in parts[4:]:
+        if part.startswith("delta:"):
+            forecast = part.split(":", 1)[1] or "unknown"
+        elif part.startswith("conf:"):
+            confidence = part.split(":", 1)[1] or "unknown"
+        elif part.startswith("spread:"):
+            spread = part.split(":", 1)[1] or "unknown"
+        elif entry_price_band == "unknown":
+            entry_price_band = part or "unknown"
+    return {
+        "series_ticker": series,
+        "station": station,
+        "side": side if side in {"yes", "no"} else "unknown",
+        "strategy_code": strategy,
+        "entry_price_band": entry_price_band,
+        "forecast_delta_band": forecast,
+        "confidence_band": confidence,
+        "spread_band": spread,
+    }
+
+
 def trade_behavior_context_payload(
     *,
     market_ticker: str | None,

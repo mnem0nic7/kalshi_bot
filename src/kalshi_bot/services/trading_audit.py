@@ -29,7 +29,7 @@ from kalshi_bot.db.models import (
     Signal,
     TradeTicketRecord,
 )
-from kalshi_bot.services.trade_behavior import bucket_key_for_fill
+from kalshi_bot.services.trade_behavior import bucket_dimensions_from_key, bucket_key_for_fill
 
 
 def _utc_now() -> datetime:
@@ -1097,12 +1097,20 @@ class TradingAuditService:
         orders_by_id = {order.id: order for order in orders or []}
 
         def ensure(bucket: str, fill: FillRecord) -> dict[str, Any]:
+            dimensions = bucket_dimensions_from_key(bucket)
             row = rows.setdefault(
                 bucket,
                 {
                     "bucket_key": bucket,
-                    "strategy_code": _strategy_key(fill.strategy_code),
-                    "side": fill.side,
+                    "kalshi_env": fill.kalshi_env,
+                    "series_ticker": dimensions["series_ticker"],
+                    "station": dimensions["station"],
+                    "strategy_code": dimensions["strategy_code"] if dimensions["strategy_code"] != "<unknown>" else _strategy_key(fill.strategy_code),
+                    "side": dimensions["side"] if dimensions["side"] != "unknown" else fill.side,
+                    "entry_price_band": dimensions["entry_price_band"],
+                    "forecast_delta_band": dimensions["forecast_delta_band"],
+                    "confidence_band": dimensions["confidence_band"],
+                    "spread_band": dimensions["spread_band"],
                     "fills": 0,
                     "contracts": Decimal("0"),
                     "fees": Decimal("0"),
@@ -1184,13 +1192,21 @@ class TradingAuditService:
             sample_count = int(row["settled_or_closed_count"])
             out.append({
                 "bucket_key": row["bucket_key"],
+                "kalshi_env": row["kalshi_env"],
+                "series_ticker": row["series_ticker"],
+                "station": row["station"],
                 "strategy_code": row["strategy_code"],
                 "side": row["side"],
+                "entry_price_band": row["entry_price_band"],
+                "forecast_delta_band": row["forecast_delta_band"],
+                "confidence_band": row["confidence_band"],
+                "spread_band": row["spread_band"],
                 "fills": row["fills"],
                 "contracts": str(row["contracts"]),
                 "fees": _money(row["fees"]),
                 "lifecycle_gross_pnl": _money(row["lifecycle_gross_pnl"]),
                 "lifecycle_net_pnl": _money(row["lifecycle_net_pnl"]),
+                "settled_or_closed_count": sample_count,
                 "bucket_sample_count": sample_count,
                 "bucket_win_rate": round(row["win_count"] / sample_count, 6) if sample_count else None,
                 "bucket_net_pnl": _money(row["lifecycle_net_pnl"]),
@@ -1199,6 +1215,7 @@ class TradingAuditService:
         out.sort(key=lambda item: (Decimal(str(item["lifecycle_net_pnl"] or "0")), item["bucket_key"]))
         return {
             "bucket_count": len(out),
+            "buckets": out,
             "worst_buckets": out[:20],
             "best_buckets": list(reversed(out[-20:])),
         }

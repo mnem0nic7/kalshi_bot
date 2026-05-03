@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import zoneinfo
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -62,8 +62,8 @@ class ReconcileSummary:
     fills_count: int
     settlements_count: int
     historical_cutoff_seen: bool
-    live_tickers: list[str]
-    reconciled_at: str
+    live_tickers: list[str] = field(default_factory=list)
+    reconciled_at: str = ""
 
 
 class ReconciliationService:

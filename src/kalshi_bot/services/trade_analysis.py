@@ -29,7 +29,7 @@ from kalshi_bot.db.models import (
     Signal,
     TradeTicketRecord,
 )
-from kalshi_bot.services.trade_behavior import bucket_key
+from kalshi_bot.services.trade_behavior import bucket_dimensions_from_key, bucket_key
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -1176,6 +1176,7 @@ class TradeAnalysisService:
             spread_bps=_int_or_none(eligibility.get("market_spread_bps")),
             include_context_bands=True,
         )
+        bucket_dimensions = bucket_dimensions_from_key(row_bucket_key)
         snapshot_provenance = dict((market_snapshot or {}).get("snapshot_provenance") or {})
         if market_snapshot is not None and not snapshot_provenance:
             snapshot_provenance = {
@@ -1190,6 +1191,8 @@ class TradeAnalysisService:
             "room_id": room.id,
             "market_ticker": room.market_ticker,
             "series_ticker": getattr(mapping, "series_ticker", None) or getattr(replay, "series_ticker", None) or _series_from_ticker(room.market_ticker),
+            "bucket_station": bucket_dimensions["station"],
+            "city": bucket_dimensions["station"],
             "station_id": getattr(mapping, "station_id", None) or (weather_snapshot or {}).get("station_id"),
             "market_day": getattr(replay, "local_market_day", None) or _market_day_from_ticker(room.market_ticker),
             "threshold_f": getattr(mapping, "threshold_f", None),
@@ -1204,6 +1207,9 @@ class TradeAnalysisService:
             "fair_yes_dollars": _decimal_str(signal.fair_yes_dollars),
             "edge_bps": signal.edge_bps,
             "confidence": signal.confidence,
+            "confidence_band": signal_payload.get("confidence_band") or bucket_dimensions["confidence_band"],
+            "forecast_delta_f": _float_or_none(signal_payload.get("forecast_delta_f")),
+            "forecast_delta_band": bucket_dimensions["forecast_delta_band"],
             "signal_summary": signal.summary,
             "signal_trade_regime": signal_payload.get("trade_regime"),
             "signal_candidate_outcome": (signal_payload.get("trade_selection") or {}).get("evaluation_outcome"),
@@ -1220,12 +1226,15 @@ class TradeAnalysisService:
             "extreme_edge_diagnostic_reason": extreme_edge_diagnostic.get("failure_reason"),
             "validated_extreme_edge": candidate_trace.get("validated_extreme_edge"),
             "eligibility_market_spread_bps": _int_or_none(eligibility.get("market_spread_bps")),
+            "market_spread_bps": _int_or_none(eligibility.get("market_spread_bps")),
+            "spread_band": bucket_dimensions["spread_band"],
             "eligibility_remaining_payout_dollars": eligibility.get("remaining_payout_dollars"),
             "ticket_id": ticket.id if ticket is not None else None,
             "action": ticket.action if ticket is not None else None,
             "side": side,
             "ticket_status": ticket.status if ticket is not None else None,
             "ticket_yes_price_dollars": _decimal_str(ticket_price),
+            "entry_price_band": bucket_dimensions["entry_price_band"],
             "ticket_count_fp": _decimal_str(ticket_count),
             "time_in_force": ticket.time_in_force if ticket is not None else None,
             "risk_status": risk.status if risk is not None else None,

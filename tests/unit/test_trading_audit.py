@@ -124,6 +124,19 @@ async def test_trading_audit_scores_settled_and_exit_pnl(audit_harness) -> None:
     assert report["pnl"]["unsettled_open_contracts"] == "2.00"
     assert report["exchange_position_discrepancy"]["discrepancy_count"] == 1
     assert report["fill_summary"]["total_fills"] == 4
+    assert report["lifecycle"]["bucket_count"] == 3
+    assert len(report["lifecycle"]["buckets"]) == 3
+    yes_bucket = next(row for row in report["lifecycle"]["buckets"] if row["series_ticker"] == "KXHIGHNY")
+    assert yes_bucket["kalshi_env"] == "production"
+    assert yes_bucket["station"] == "NY"
+    assert yes_bucket["side"] == "yes"
+    assert yes_bucket["entry_price_band"] == "40-49c"
+    assert yes_bucket["forecast_delta_band"] == "unknown"
+    assert yes_bucket["confidence_band"] == "unknown"
+    assert yes_bucket["spread_band"] == "unknown"
+    assert yes_bucket["settled_or_closed_count"] == 1
+    assert report["lifecycle"]["worst_buckets"]
+    assert report["lifecycle"]["best_buckets"]
 
 
 @pytest.mark.asyncio
