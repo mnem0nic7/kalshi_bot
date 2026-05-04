@@ -13,12 +13,15 @@ from kalshi_bot.crypto.models import CryptoMarket
 from kalshi_bot.crypto.services import (
     CryptoAssetControlService,
     CryptoAutonomyService,
+    CryptoHistoryService,
     CryptoWorkflowService,
     CryptoExecutionService,
     CryptoForecastService,
     CryptoReplayService,
+    _crypto_data_quality,
+    _crypto_decision_rows,
 )
-from kalshi_bot.db.models import OrderRecord
+from kalshi_bot.db.models import OrderRecord, RiskVerdictRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.signal import StrategySignal
@@ -69,6 +72,180 @@ def _signal() -> StrategySignal:
         summary="BTC crypto test signal.",
         eligibility=TradeEligibilityVerdict(eligible=True),
     )
+
+
+async def _seed_crypto_training_rows(session_factory, settings: Settings, *, days: int = 4) -> None:
+    base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        for idx in range(days):
+            for asset, series in (("BTC", "KXBTC15M"), ("ETH", "KXETH15M")):
+                close_time = base + timedelta(days=idx, minutes=15)
+                ticker = f"{series}-TEST-{idx}"
+                yes_bid = Decimal("0.4200") if idx % 2 == 0 else Decimal("0.5600")
+                yes_ask = yes_bid + Decimal("0.0200")
+                settlement = "yes" if idx % 2 == 0 else "no"
+                await repo.record_crypto_market_snapshot(
+                    kalshi_env=settings.kalshi_env,
+                    series_ticker=series,
+                    market_ticker=ticker,
+                    asset_symbol=asset,
+                    frequency="15m",
+                    status="settled",
+                    close_time=close_time,
+                    yes_bid_dollars=yes_bid,
+                    yes_ask_dollars=yes_ask,
+                    no_ask_dollars=Decimal("1.0000") - yes_bid,
+                    last_price_dollars=yes_bid,
+                    volume=100 + idx,
+                    open_interest=50 + idx,
+                    settlement_result=settlement,
+                    observed_at=close_time - timedelta(minutes=1),
+                    source_kind="historical",
+                    payload={"unit": True},
+                )
+                await repo.upsert_crypto_market_candlestick(
+                    kalshi_env=settings.kalshi_env,
+                    series_ticker=series,
+                    market_ticker=ticker,
+                    asset_symbol=asset,
+                    frequency="15m",
+                    period_interval=1,
+                    end_period_ts=close_time - timedelta(minutes=1),
+                    open_dollars=yes_bid,
+                    high_dollars=yes_ask,
+                    low_dollars=yes_bid - Decimal("0.0100"),
+                    close_dollars=yes_bid + Decimal("0.0100"),
+                    volume=20 + idx,
+                    payload={"unit": True},
+                )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_crypto_history_paginates_historical_markets(tmp_path) -> None:
+    settings = _settings(tmp_path)
+
+    class _FakeKalshi:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def list_historical_markets(self, **params):
+            self.calls.append(params)
+            if "cursor" not in params:
+                return {"markets": [{"ticker": "KXBTC15M-FIRST", "series_ticker": "KXBTC15M"}], "cursor": "next"}
+            return {"markets": [{"ticker": "KXBTC15M-SECOND", "series_ticker": "KXBTC15M"}]}
+
+    fake = _FakeKalshi()
+    result = await CryptoHistoryService(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        kalshi=fake,  # type: ignore[arg-type]
+        market_service=None,  # type: ignore[arg-type]
+    )._list_historical_markets("KXBTC15M")
+
+    assert result["pages_fetched"] == 2
+    assert result["rows_seen"] == 2
+    assert fake.calls[0]["series_ticker"] == "KXBTC15M"
+    assert fake.calls[1]["cursor"] == "next"
+
+
+@pytest.mark.asyncio
+async def test_crypto_history_captures_candles_with_market_local_window(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    close_time = datetime.now(UTC) - timedelta(days=30)
+    market = _market(
+        open_time=close_time - timedelta(minutes=15),
+        close_time=close_time,
+        status="settled",
+        settlement_result="yes",
+    )
+
+    class _FakeKalshi:
+        def __init__(self) -> None:
+            self.historical_calls: list[dict[str, object]] = []
+            self.live_calls: list[dict[str, object]] = []
+
+        async def get_historical_market_candlesticks(self, series_ticker: str, market_ticker: str, **params):
+            self.historical_calls.append({"series_ticker": series_ticker, "market_ticker": market_ticker, **params})
+            return {
+                "candlesticks": [
+                    {
+                        "end_period_ts": (close_time - timedelta(minutes=1)).isoformat(),
+                        "open": "0.47",
+                        "high": "0.49",
+                        "low": "0.46",
+                        "close": "0.48",
+                        "volume": 12,
+                    }
+                ]
+            }
+
+        async def get_market_candlesticks(self, series_ticker: str, market_ticker: str, **params):
+            self.live_calls.append({"series_ticker": series_ticker, "market_ticker": market_ticker, **params})
+            return {"candlesticks": []}
+
+    class _FakeRepo:
+        def __init__(self) -> None:
+            self.candles: list[dict[str, object]] = []
+
+        async def list_crypto_market_candlesticks(self, **kwargs):
+            del kwargs
+            return []
+
+        async def upsert_crypto_market_candlestick(self, **kwargs) -> None:
+            self.candles.append(kwargs)
+
+    fake_kalshi = _FakeKalshi()
+    fake_repo = _FakeRepo()
+
+    stored = await CryptoHistoryService(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        kalshi=fake_kalshi,  # type: ignore[arg-type]
+        market_service=None,  # type: ignore[arg-type]
+    )._capture_candles(fake_repo, market, cutoff=datetime.now(UTC) - timedelta(days=180))  # type: ignore[arg-type]
+
+    assert stored["status"] == "ok"
+    assert stored["stored"] == 1
+    assert fake_kalshi.live_calls == []
+    assert len(fake_kalshi.historical_calls) == 1
+    params = fake_kalshi.historical_calls[0]
+    assert int(params["end_ts"]) - int(params["start_ts"]) <= 21 * 60
+    assert int(params["start_ts"]) >= int((close_time - timedelta(minutes=16)).timestamp())
+    assert fake_repo.candles[0]["market_ticker"] == market.market_ticker
+
+
+@pytest.mark.asyncio
+async def test_crypto_history_skips_existing_historical_candles(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    close_time = datetime.now(UTC) - timedelta(days=30)
+    market = _market(open_time=close_time - timedelta(minutes=15), close_time=close_time, status="settled")
+
+    class _FakeKalshi:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_historical_market_candlesticks(self, *args, **kwargs):
+            del args, kwargs
+            self.calls += 1
+            return {"candlesticks": []}
+
+    class _FakeRepo:
+        async def list_crypto_market_candlesticks(self, **kwargs):
+            del kwargs
+            return [object()]
+
+    fake_kalshi = _FakeKalshi()
+    result = await CryptoHistoryService(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        kalshi=fake_kalshi,  # type: ignore[arg-type]
+        market_service=None,  # type: ignore[arg-type]
+    )._capture_candles(_FakeRepo(), market, cutoff=datetime.now(UTC) - timedelta(days=180))  # type: ignore[arg-type]
+
+    assert result == {"status": "skipped_existing", "stored": 0}
+    assert fake_kalshi.calls == 0
 
 
 class _FakeBaseExecution:
@@ -177,11 +354,121 @@ def test_crypto_replay_gate_requires_positive_coverage_and_calibration(tmp_path)
             "hard_cap_breaches": 0,
             "calibration_brier": 0.20,
             "market_mid_brier": 0.25,
+            "candle_count": 1,
         }
     )
 
     assert blocked["passed"] is False
     assert passed["passed"] is True
+
+
+def test_crypto_decision_rows_use_candle_proxy_when_snapshot_quotes_missing(tmp_path) -> None:
+    del tmp_path
+    close = datetime(2026, 5, 1, 12, 15, tzinfo=UTC)
+    snapshot = type(
+        "_Snapshot",
+        (),
+        {
+            "market_ticker": "KXBTC15M-TEST",
+            "series_ticker": "KXBTC15M",
+            "asset_symbol": "BTC",
+            "frequency": "15m",
+            "source_kind": "historical",
+            "settlement_result": "yes",
+            "observed_at": close - timedelta(minutes=1),
+            "close_time": close,
+            "expected_expiration_time": close,
+            "target_price_dollars": Decimal("100000.00000000"),
+            "yes_bid_dollars": None,
+            "yes_ask_dollars": None,
+            "no_ask_dollars": None,
+            "last_price_dollars": None,
+            "volume": 10,
+            "open_interest": 5,
+        },
+    )()
+    candle = type(
+        "_Candle",
+        (),
+        {
+            "market_ticker": "KXBTC15M-TEST",
+            "asset_symbol": "BTC",
+            "end_period_ts": close - timedelta(minutes=1),
+            "close_dollars": Decimal("0.6100"),
+        },
+    )()
+
+    rows = _crypto_decision_rows([snapshot], [candle])  # type: ignore[list-item]
+
+    assert len(rows) == 1
+    assert rows[0]["quote_source"] == "candlestick_close_proxy"
+    assert rows[0]["yes_ask_dollars"] == Decimal("0.6100")
+
+
+def test_crypto_data_quality_reports_per_asset_gaps(tmp_path) -> None:
+    del tmp_path
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    snapshot = type(
+        "_Snapshot",
+        (),
+        {
+            "asset_symbol": "BTC",
+            "market_ticker": "KXBTC15M-TEST",
+            "settlement_result": "yes",
+            "observed_at": now,
+            "source_kind": "historical",
+        },
+    )()
+    quality = _crypto_data_quality([snapshot], [], min_training_samples=1)  # type: ignore[list-item]
+
+    assert quality["status"] == "needs_data"
+    assert quality["assets"]["BTC"]["settled_snapshot_count"] == 1
+    assert quality["assets"]["BTC"]["markets_missing_candles"] == 1
+
+
+@pytest.mark.asyncio
+async def test_crypto_train_stores_model_with_fee_aware_metrics(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_min_training_samples=4, crypto_replay_min_resolved_markets=4)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    await _seed_crypto_training_rows(session_factory, settings, days=4)
+
+    result = await CryptoForecastService(settings=settings, session_factory=session_factory).train(frequency="15m")
+
+    assert result["status"] == "trained"
+    assert result["metrics"]["resolved_sample_count"] == 8
+    assert result["metrics"]["fees_dollars"] >= 0
+    assert "candlestick_momentum" in result["payload"]["feature_set"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_replay_run_validate_and_gate_use_backtest_metrics(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_min_training_samples=4,
+        crypto_replay_min_resolved_markets=4,
+        crypto_replay_min_trade_candidates=0,
+        crypto_replay_require_calibration_better_than_mid=False,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    await _seed_crypto_training_rows(session_factory, settings, days=5)
+    await CryptoForecastService(settings=settings, session_factory=session_factory).train(frequency="15m")
+    replay = CryptoReplayService(settings=settings, session_factory=session_factory)
+
+    run_report = await replay.run(frequency="15m", days=30, persist=True)
+    validate_report = await replay.validate(frequency="15m", days=30)
+    gate = await replay.gate(frequency="15m")
+
+    assert run_report["schema_version"] == "crypto-backtest-report-v1"
+    assert run_report["data_quality"]["candle_count"] == 10
+    assert "baseline_policy" in run_report["walk_forward"]
+    assert validate_report["status"] in {"pass", "warn", "fail"}
+    assert gate["requirements"]["requires_candles"] is True
+    await engine.dispose()
 
 
 def test_passive_prices_do_not_cross_crypto_touch(tmp_path) -> None:
@@ -476,6 +763,64 @@ async def test_crypto_workflow_non_live_asset_receipt_does_not_save_order(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_crypto_workflow_shadow_room_creates_shadow_ticket_without_order(tmp_path) -> None:
+    settings = _settings(tmp_path, app_shadow_mode=False, crypto_trading_enabled=False)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    market = _market(close_time=datetime.now(UTC) + timedelta(minutes=10))
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    execution = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=_FakeBaseExecution(),  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    workflow = CryptoWorkflowService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=_FakeWorkflowMarketService(market),  # type: ignore[arg-type]
+        forecast_service=_FakeForecastService(),  # type: ignore[arg-type]
+        risk_engine=_ApproveRiskEngine(),  # type: ignore[arg-type]
+        execution_service=execution,
+        asset_control_service=asset_control,
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC shadow workflow", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=True,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.SHADOW.value,
+        )
+        await session.commit()
+
+    await workflow.run_room(room.id, reason="test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        verdicts = list((await session.execute(select(RiskVerdictRecord))).scalars())
+        orders = list((await session.execute(select(OrderRecord))).scalars())
+        await session.commit()
+
+    assert ticket is not None
+    assert ticket.status == "shadow_skipped"
+    assert ticket.payload["asset_mode"] == "shadow"
+    assert ticket.payload["crypto_modeling"] is not None
+    assert len(verdicts) == 1
+    assert orders == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_crypto_autonomy_skips_off_assets_and_existing_rooms(tmp_path) -> None:
     settings = _settings(
         tmp_path,
@@ -558,4 +903,84 @@ async def test_crypto_autonomy_skips_off_assets_and_existing_rooms(tmp_path) -> 
     assert set(workflow_service.ran) == {"room-KXADA15M-LATER", "room-KXSOL15M-TEST"}
     assert {item["reason"] for item in result["skipped"]} == {"asset_mode_off", "room_already_exists"}
     assert "KXADA15M-SOON" not in market_service.created
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_autonomy_run_once_can_be_forced_for_operator_shadow_pass(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=True,
+        crypto_autonomy_enabled=False,
+        crypto_autonomy_min_seconds_to_close=120,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await session.commit()
+
+    class _FakeKalshi:
+        write_credentials = None
+
+    class _FakeMarketService:
+        kalshi = _FakeKalshi()
+
+        def __init__(self) -> None:
+            self.created: list[str] = []
+            self.markets = [
+                _market(
+                    market_ticker="KXBTC15M-FORCE",
+                    asset_symbol="BTC",
+                    close_time=datetime.now(UTC) + timedelta(minutes=10),
+                )
+            ]
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            return self.markets
+
+        async def create_room_for_market(self, market_ticker: str, *, reason: str) -> dict[str, object]:
+            self.created.append(market_ticker)
+            return {
+                "room_id": "room-force",
+                "market_ticker": market_ticker,
+                "asset_symbol": "BTC",
+                "asset_mode": "shadow",
+                "live_eligible": False,
+                "live_blockers": ["shadow"],
+            }
+
+    class _FakeWorkflowService:
+        async def run_room(self, room_id: str, *, reason: str) -> None:
+            self.room_id = room_id
+            self.reason = reason
+
+    market_service = _FakeMarketService()
+    workflow_service = _FakeWorkflowService()
+    disabled = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=market_service,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=workflow_service,  # type: ignore[arg-type]
+    ).run_once()
+    forced = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=market_service,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=workflow_service,  # type: ignore[arg-type]
+    ).run_once(force=True)
+
+    assert disabled["status"] == "disabled"
+    assert forced["status"] == "ok"
+    assert forced["forced"] is True
+    assert market_service.created == ["KXBTC15M-FORCE"]
     await engine.dispose()

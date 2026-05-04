@@ -973,6 +973,27 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         ).scalar_one()
         return result
 
+    async def list_crypto_market_candlesticks(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        market_ticker: str | None = None,
+        since: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[CryptoMarketCandlestickRecord]:
+        stmt = select(CryptoMarketCandlestickRecord).where(
+            CryptoMarketCandlestickRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+        )
+        if frequency is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.frequency == frequency)
+        if market_ticker is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.market_ticker == market_ticker)
+        if since is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts >= since)
+        stmt = stmt.order_by(CryptoMarketCandlestickRecord.end_period_ts.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
     async def record_crypto_model_artifact(
         self,
         *,

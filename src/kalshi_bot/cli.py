@@ -578,6 +578,11 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
         result = await container.crypto_history_service.bootstrap(days=args.days, frequency=args.frequency)
     elif args.crypto_history_command == "daily":
         result = await container.crypto_history_service.daily(frequency=args.frequency)
+    elif args.crypto_history_command == "status":
+        result = await container.crypto_history_service.status(
+            frequency=args.frequency,
+            days=args.days if args.days and args.days > 0 else None,
+        )
     else:
         raise ValueError(f"unknown crypto-history command {args.crypto_history_command}")
     print(json.dumps(result, indent=2, default=str))
@@ -593,17 +598,42 @@ async def _run_crypto_model_command(args: argparse.Namespace, container: AppCont
 
 
 async def _run_crypto_replay_command(args: argparse.Namespace, container: AppContainer) -> int:
-    if args.crypto_replay_command != "gate":
+    if args.crypto_replay_command == "gate":
+        result = await container.crypto_replay_service.gate(frequency=args.frequency)
+    elif args.crypto_replay_command == "run":
+        result = await container.crypto_replay_service.run(
+            frequency=args.frequency,
+            days=args.days,
+            limit=args.limit if args.limit and args.limit > 0 else None,
+        )
+    elif args.crypto_replay_command == "validate":
+        result = await container.crypto_replay_service.validate(
+            frequency=args.frequency,
+            days=args.days,
+            limit=args.limit if args.limit and args.limit > 0 else None,
+        )
+    else:
         raise ValueError(f"unknown crypto-replay command {args.crypto_replay_command}")
-    result = await container.crypto_replay_service.gate(frequency=args.frequency)
     print(json.dumps(result, indent=2, default=str))
-    return 0 if result.get("status") == "passed" else 1
+    if args.crypto_replay_command == "validate":
+        return 0 if result.get("status") != "fail" else 1
+    if args.crypto_replay_command == "gate":
+        return 0 if result.get("status") == "passed" else 1
+    return 0 if result.get("status") in {"pass", "warn"} else 1
 
 
 async def _run_crypto_status_command(container: AppContainer) -> int:
     result = await container.crypto_market_service.status(frequency="15m")
     print(json.dumps(result, indent=2, default=str))
     return 0
+
+
+async def _run_crypto_autonomy_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.crypto_autonomy_command != "run-once":
+        raise ValueError(f"unknown crypto-autonomy command {args.crypto_autonomy_command}")
+    result = await container.crypto_autonomy_service.run_once(frequency=args.frequency, force=True)
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("status") in {"ok", "inactive_color"} else 1
 
 
 async def _run_crypto_asset_mode_command(args: argparse.Namespace, container: AppContainer) -> int:
@@ -897,6 +927,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "crypto-status":
             return await _run_crypto_status_command(container)
+
+        if args.command == "crypto-autonomy":
+            return await _run_crypto_autonomy_command(args, container)
 
         if args.command == "crypto-asset-mode":
             return await _run_crypto_asset_mode_command(args, container)
@@ -1853,6 +1886,10 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_history_bootstrap.add_argument("--frequency", default="15m")
     crypto_history_daily = crypto_history_subparsers.add_parser("daily")
     crypto_history_daily.add_argument("--frequency", default="15m")
+    crypto_history_status = crypto_history_subparsers.add_parser("status")
+    crypto_history_status.add_argument("--frequency", default="15m")
+    crypto_history_status.add_argument("--days", type=int, default=0)
+    crypto_history_status.add_argument("--json", action="store_true")
 
     crypto_model = subparsers.add_parser("crypto-model")
     crypto_model_subparsers = crypto_model.add_subparsers(dest="crypto_model_command", required=True)
@@ -1863,8 +1900,20 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_replay_subparsers = crypto_replay.add_subparsers(dest="crypto_replay_command", required=True)
     crypto_replay_gate = crypto_replay_subparsers.add_parser("gate")
     crypto_replay_gate.add_argument("--frequency", default="15m")
+    for name in ("run", "validate"):
+        crypto_replay_command = crypto_replay_subparsers.add_parser(name)
+        crypto_replay_command.add_argument("--frequency", default="15m")
+        crypto_replay_command.add_argument("--days", type=int, default=30)
+        crypto_replay_command.add_argument("--limit", type=int, default=0)
+        crypto_replay_command.add_argument("--json", action="store_true")
 
     subparsers.add_parser("crypto-status")
+
+    crypto_autonomy = subparsers.add_parser("crypto-autonomy")
+    crypto_autonomy_subparsers = crypto_autonomy.add_subparsers(dest="crypto_autonomy_command", required=True)
+    crypto_autonomy_run_once = crypto_autonomy_subparsers.add_parser("run-once")
+    crypto_autonomy_run_once.add_argument("--frequency", default="15m")
+    crypto_autonomy_run_once.add_argument("--json", action="store_true")
 
     crypto_asset_mode = subparsers.add_parser("crypto-asset-mode")
     crypto_asset_mode_subparsers = crypto_asset_mode.add_subparsers(dest="crypto_asset_mode_command", required=True)

@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
+from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -32,11 +34,12 @@ from kalshi_bot.crypto.parsing import (
     parse_crypto_market,
     parse_crypto_series,
 )
-from kalshi_bot.db.models import CryptoMarketSnapshotRecord, Room
+from kalshi_bot.db.models import CryptoMarketCandlestickRecord, CryptoMarketSnapshotRecord, Room
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.execution import ExecutionService
+from kalshi_bot.services.fee_model import current_fee_model_version, estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext, approved_ticket_for_verdict
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
 
@@ -533,6 +536,21 @@ class CryptoMarketService:
                 artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
             )
+            backtest = await repo.get_latest_crypto_model_artifact(
+                frequency=normalize_frequency(frequency) or "15m",
+                artifact_type="backtest",
+                kalshi_env=self.settings.kalshi_env,
+            )
+            all_snapshots = await repo.list_crypto_market_snapshots(
+                frequency=normalize_frequency(frequency) or "15m",
+                kalshi_env=self.settings.kalshi_env,
+                limit=100_000,
+            )
+            candles = await repo.list_crypto_market_candlesticks(
+                frequency=normalize_frequency(frequency) or "15m",
+                kalshi_env=self.settings.kalshi_env,
+                limit=200_000,
+            )
             await session.commit()
         asset_symbols = sorted({snapshot.asset_symbol for snapshot in snapshots})
         mode_summary = self.asset_control_service.asset_mode_summary(
@@ -556,7 +574,13 @@ class CryptoMarketService:
                 frequency=frequency,
             ),
             "model": _artifact_summary(model),
+            "backtest": _artifact_summary(backtest),
             "replay_gate": _artifact_summary(gate),
+            "data_quality": _crypto_data_quality(
+                all_snapshots,
+                candles,
+                min_training_samples=self.settings.crypto_min_training_samples,
+            ),
         }
 
     async def is_crypto_room(self, room_id: str) -> bool:
@@ -594,30 +618,69 @@ class CryptoHistoryService:
         historical_markets: list[CryptoMarket] = []
         series_rows = await self.market_service.discover_series(frequency=frequency)
         errors: list[dict[str, str]] = []
+        series_stats: list[dict[str, Any]] = []
         for series in series_rows:
-            try:
-                response = await self.kalshi.list_historical_markets(series_ticker=series.series_ticker, limit=1000)
-            except httpx.HTTPError as exc:
-                errors.append({"series_ticker": series.series_ticker, "error": str(exc)})
-                continue
-            for row in _rows_from_response(response, "markets"):
+            result = await self._list_historical_markets(series.series_ticker)
+            errors.extend({"series_ticker": series.series_ticker, "error": error} for error in result["errors"])
+            markets_in_window = 0
+            for row in result["rows"]:
                 parsed = parse_crypto_market(row, series=series, frequency=frequency)
                 if parsed is None:
                     continue
                 if parsed.close_time is None or parsed.close_time >= cutoff:
+                    markets_in_window += 1
                     historical_markets.append(parsed)
+            series_stats.append(
+                {
+                    "series_ticker": series.series_ticker,
+                    "asset_symbol": series.asset_symbol,
+                    "pages_fetched": result["pages_fetched"],
+                    "rows_seen": result["rows_seen"],
+                    "markets_in_window": markets_in_window,
+                    "errors": result["errors"],
+                }
+            )
         all_markets = {market.market_ticker: market for market in [*historical_markets, *live_markets]}
-        candles_stored = 0
+        historical_tickers = {market.market_ticker for market in historical_markets}
+        candle_stats: dict[str, Any] = {
+            "stored": 0,
+            "markets_attempted": 0,
+            "markets_skipped_existing": 0,
+            "errors": [],
+        }
+        commit_batch_size = 250
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            for market in all_markets.values():
+            for index, market in enumerate(all_markets.values(), start=1):
                 await self.market_service.record_market_snapshot(
                     repo,
                     market,
-                    source_kind="historical" if market.market_ticker in {m.market_ticker for m in historical_markets} else "live",
+                    source_kind="historical" if market.market_ticker in historical_tickers else "live",
                     observed_at=market.close_time or datetime.now(UTC),
                 )
-                candles_stored += await self._capture_candles(repo, market, cutoff=cutoff)
+                capture = await self._capture_candles(repo, market, cutoff=cutoff)
+                candle_stats["stored"] += int(capture["stored"])
+                if capture["status"] == "skipped_existing":
+                    candle_stats["markets_skipped_existing"] += 1
+                else:
+                    candle_stats["markets_attempted"] += 1
+                if capture.get("error"):
+                    candle_stats["errors"].append({"market_ticker": market.market_ticker, "error": capture["error"]})
+                if index % commit_batch_size == 0:
+                    await session.commit()
+            await session.commit()
+            snapshots = await repo.list_crypto_market_snapshots(
+                frequency=normalize_frequency(frequency) or "15m",
+                kalshi_env=self.settings.kalshi_env,
+                since=cutoff,
+                limit=100_000,
+            )
+            candles = await repo.list_crypto_market_candlesticks(
+                frequency=normalize_frequency(frequency) or "15m",
+                kalshi_env=self.settings.kalshi_env,
+                since=cutoff,
+                limit=200_000,
+            )
             await session.commit()
         return {
             "status": "ok",
@@ -626,21 +689,109 @@ class CryptoHistoryService:
             "markets_stored": len(all_markets),
             "live_markets": len(live_markets),
             "historical_markets": len(historical_markets),
-            "candles_stored": candles_stored,
+            "candles_stored": candle_stats["stored"],
+            "candle_capture": {
+                **candle_stats,
+                "errors": candle_stats["errors"][:10],
+                "error_count": len(candle_stats["errors"]),
+            },
+            "series": series_stats,
+            "pages_fetched": sum(int(item["pages_fetched"]) for item in series_stats),
+            "historical_rows_seen": sum(int(item["rows_seen"]) for item in series_stats),
+            "data_quality": _crypto_data_quality(
+                snapshots,
+                candles,
+                min_training_samples=self.settings.crypto_min_training_samples,
+            ),
             "errors": errors[:10],
         }
 
     async def daily(self, *, frequency: str = "15m") -> dict[str, Any]:
         return await self.bootstrap(days=2, frequency=frequency)
 
-    async def _capture_candles(self, repo: PlatformRepository, market: CryptoMarket, *, cutoff: datetime) -> int:
+    async def status(self, *, frequency: str = "15m", days: int | None = None) -> dict[str, Any]:
+        freq = normalize_frequency(frequency) or "15m"
+        cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            snapshots = await repo.list_crypto_market_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                since=cutoff,
+                limit=200_000,
+            )
+            candles = await repo.list_crypto_market_candlesticks(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                since=cutoff,
+                limit=500_000,
+            )
+            await session.commit()
+        return {
+            "status": "ok",
+            "frequency": freq,
+            "days": days,
+            "data_quality": _crypto_data_quality(
+                snapshots,
+                candles,
+                min_training_samples=self.settings.crypto_min_training_samples,
+            ),
+        }
+
+    async def _list_historical_markets(self, series_ticker: str) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        errors: list[str] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        pages_fetched = 0
+        for _ in range(100):
+            params: dict[str, Any] = {"series_ticker": series_ticker, "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                response = await self.kalshi.list_historical_markets(**params)
+            except httpx.HTTPError as exc:
+                errors.append(str(exc))
+                break
+            page_rows = _rows_from_response(response, "markets")
+            rows.extend(page_rows)
+            pages_fetched += 1
+            cursor = response.get("cursor") or response.get("next_cursor")
+            if not cursor or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+        return {
+            "rows": rows,
+            "rows_seen": len(rows),
+            "pages_fetched": pages_fetched,
+            "errors": errors,
+        }
+
+    async def _capture_candles(self, repo: PlatformRepository, market: CryptoMarket, *, cutoff: datetime) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        if market.close_time is not None and market.close_time < now:
+            existing = await repo.list_crypto_market_candlesticks(
+                frequency=market.frequency,
+                kalshi_env=self.settings.kalshi_env,
+                market_ticker=market.market_ticker,
+                limit=1,
+            )
+            if existing:
+                return {"status": "skipped_existing", "stored": 0}
+        end_time = min(now, market.close_time or market.expected_expiration_time or now)
+        if market.close_time is not None and market.close_time < now:
+            end_time = min(now, market.close_time + timedelta(minutes=1))
+        start_time = market.open_time or (end_time - timedelta(minutes=20))
+        start_time = max(cutoff, start_time)
+        if start_time >= end_time:
+            start_time = end_time - timedelta(minutes=20)
         params = {
             "period_interval": 1,
-            "start_ts": int(cutoff.timestamp()),
-            "end_ts": int(datetime.now(UTC).timestamp()),
+            "start_ts": int(start_time.timestamp()),
+            "end_ts": int(end_time.timestamp()),
         }
         try:
-            if market.close_time is not None and market.close_time < datetime.now(UTC):
+            if market.close_time is not None and market.close_time < now:
                 response = await self.kalshi.get_historical_market_candlesticks(
                     market.series_ticker,
                     market.market_ticker,
@@ -648,9 +799,9 @@ class CryptoHistoryService:
                 )
             else:
                 response = await self.kalshi.get_market_candlesticks(market.series_ticker, market.market_ticker, **params)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             logger.info("crypto candlestick capture skipped for %s", market.market_ticker, exc_info=True)
-            return 0
+            return {"status": "error", "stored": 0, "error": str(exc)}
         count = 0
         for row in _rows_from_response(response, "candlesticks") or _rows_from_response(response, "candles"):
             candle = normalize_candlestick(row)
@@ -672,7 +823,7 @@ class CryptoHistoryService:
                 payload=candle["payload"],
             )
             count += 1
-        return count
+        return {"status": "ok", "stored": count}
 
 
 class CryptoForecastService:
@@ -685,65 +836,20 @@ class CryptoForecastService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             rows = await repo.list_crypto_market_snapshots(frequency=freq, kalshi_env=self.settings.kalshi_env, limit=100_000)
-            settled = [row for row in rows if row.settlement_result in {"yes", "no"} and _row_mid(row) is not None]
-            sample_count = len(settled)
-            payload: dict[str, Any] = {"asset_adjustments_bps": {}, "global_adjustment_bps": 0}
-            metrics = {
-                "sample_count": sample_count,
-                "resolved_sample_count": sample_count,
-                "trade_candidate_count": 0,
-                "net_simulated_pl_dollars": 0.0,
-                "hard_cap_breaches": 0,
-                "calibration_brier": None,
-                "market_mid_brier": None,
-            }
-            status = "insufficient_data"
-            if sample_count >= self.settings.crypto_min_training_samples:
-                outcome_sum = Decimal("0")
-                mid_sum = Decimal("0")
-                brier_model = Decimal("0")
-                brier_mid = Decimal("0")
-                by_asset: dict[str, list[tuple[Decimal, Decimal]]] = {}
-                for row in settled:
-                    outcome = Decimal("1") if row.settlement_result == "yes" else Decimal("0")
-                    mid = _row_mid(row) or Decimal("0.5000")
-                    outcome_sum += outcome
-                    mid_sum += mid
-                    by_asset.setdefault(row.asset_symbol, []).append((outcome, mid))
-                global_adjust = (outcome_sum / sample_count) - (mid_sum / sample_count)
-                global_adjust_bps = int((global_adjust * Decimal("10000")).to_integral_value())
-                payload["global_adjustment_bps"] = global_adjust_bps
-                for asset, items in by_asset.items():
-                    outcome_avg = sum((item[0] for item in items), Decimal("0")) / len(items)
-                    mid_avg = sum((item[1] for item in items), Decimal("0")) / len(items)
-                    payload["asset_adjustments_bps"][asset] = int(((outcome_avg - mid_avg) * Decimal("10000")).to_integral_value())
-                trade_candidates = 0
-                simulated_pl = Decimal("0")
-                for row in settled:
-                    outcome = Decimal("1") if row.settlement_result == "yes" else Decimal("0")
-                    mid = _row_mid(row) or Decimal("0.5000")
-                    adjustment = Decimal(payload["global_adjustment_bps"]) / Decimal("10000")
-                    adjustment += Decimal(payload["asset_adjustments_bps"].get(row.asset_symbol, 0)) / Decimal("20000")
-                    predicted = _clamp_price(mid + adjustment)
-                    brier_model += (predicted - outcome) ** 2
-                    brier_mid += (mid - outcome) ** 2
-                    edge = abs(predicted - mid)
-                    if edge >= Decimal(self.settings.risk_min_edge_bps) / Decimal("10000"):
-                        trade_candidates += 1
-                        simulated_pl += (outcome - mid) if predicted >= mid else (mid - outcome)
-                metrics.update(
-                    {
-                        "trade_candidate_count": trade_candidates,
-                        "net_simulated_pl_dollars": float(simulated_pl),
-                        "calibration_brier": float(brier_model / sample_count),
-                        "market_mid_brier": float(brier_mid / sample_count),
-                    }
-                )
-                status = "trained"
+            candles = await repo.list_crypto_market_candlesticks(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                limit=200_000,
+            )
+            decision_rows = _crypto_decision_rows(rows, candles)
+            sample_count = len(decision_rows)
+            payload = _fit_crypto_calibration(decision_rows)
+            metrics = _crypto_model_metrics(decision_rows, payload, settings=self.settings)
+            status = "trained" if sample_count >= self.settings.crypto_min_training_samples else "insufficient_data"
             artifact_payload = {
                 **payload,
                 "frequency": freq,
-                "trained_from": "official_kalshi_market_snapshots",
+                "trained_from": "point_in_time_crypto_snapshots_and_candles",
                 "feature_set": [
                     "asset",
                     "time_to_close",
@@ -754,7 +860,8 @@ class CryptoForecastService:
                     "mid",
                     "volume",
                     "open_interest",
-                    "recent_same_series_behavior",
+                    "candlestick_momentum",
+                    "recent_same_asset_behavior",
                 ],
             }
             artifact = await repo.record_crypto_model_artifact(
@@ -780,6 +887,16 @@ class CryptoForecastService:
             artifact = await repo.get_latest_crypto_model_artifact(
                 frequency=market.frequency,
                 artifact_type="model",
+                kalshi_env=self.settings.kalshi_env,
+            )
+            backtest = await repo.get_latest_crypto_model_artifact(
+                frequency=market.frequency,
+                artifact_type="backtest",
+                kalshi_env=self.settings.kalshi_env,
+            )
+            gate = await repo.get_latest_crypto_model_artifact(
+                frequency=market.frequency,
+                artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
             )
             await session.commit()
@@ -846,6 +963,30 @@ class CryptoForecastService:
                 "features": features,
                 "model_version": artifact.version,
                 "model_metrics": artifact.metrics,
+                "prediction_model": {
+                    "baseline_probability": _money_text(mid),
+                    "calibrated_probability": _money_text(fair),
+                    "calibration_version": artifact.version,
+                    "status": artifact.status,
+                    "reason": None,
+                },
+                "trade_selection_model": {
+                    "expected_net_pnl": _money_text(
+                        _expected_crypto_net_pnl(
+                            market,
+                            side,
+                            fair,
+                            fee_rate=Decimal(str(self.settings.kalshi_taker_fee_rate)),
+                        )
+                        if side is not None
+                        else None
+                    ),
+                    "decision": "selected" if side is not None else "stand_down",
+                    "status": "shadow_only",
+                    "reason": "crypto_live_trading_disabled" if not self.settings.crypto_trading_enabled else None,
+                    "backtest_version": backtest.version if backtest is not None else None,
+                    "replay_gate_status": gate.status if gate is not None else "missing",
+                },
             },
             capital_bucket="safe",
             confidence_band="high" if confidence >= 0.85 else "medium",
@@ -914,6 +1055,52 @@ class CryptoReplayService:
         self.settings = settings
         self.session_factory = session_factory
 
+    async def run(
+        self,
+        *,
+        frequency: str = "15m",
+        days: int | None = None,
+        limit: int | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        report = await self._build_report(
+            frequency=frequency,
+            days=days,
+            limit=limit,
+            command="run",
+        )
+        if persist:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                artifact = await repo.record_crypto_model_artifact(
+                    frequency=report["frequency"],
+                    artifact_type="backtest",
+                    version=_version("crypto-15m-backtest", report),
+                    status=report["status"],
+                    sample_count=int((report.get("dataset") or {}).get("row_count") or 0),
+                    metrics=report.get("metrics") or {},
+                    payload=report,
+                    kalshi_env=self.settings.kalshi_env,
+                    trained_at=datetime.now(UTC),
+                )
+                await session.commit()
+            report["version"] = artifact.version
+        return report
+
+    async def validate(
+        self,
+        *,
+        frequency: str = "15m",
+        days: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return await self._build_report(
+            frequency=frequency,
+            days=days,
+            limit=limit,
+            command="validate",
+        )
+
     async def gate(self, *, frequency: str = "15m") -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         async with self.session_factory() as session:
@@ -923,7 +1110,16 @@ class CryptoReplayService:
                 artifact_type="model",
                 kalshi_env=self.settings.kalshi_env,
             )
-            metrics = dict(model.metrics if model is not None else {})
+            backtest = await repo.get_latest_crypto_model_artifact(
+                frequency=freq,
+                artifact_type="backtest",
+                kalshi_env=self.settings.kalshi_env,
+            )
+            metrics = dict((backtest.metrics if backtest is not None else None) or (model.metrics if model is not None else {}) or {})
+            if model is None:
+                metrics["model_missing"] = True
+            if backtest is None:
+                metrics["backtest_missing"] = True
             gate = self.evaluate_gate(metrics)
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
@@ -956,6 +1152,16 @@ class CryptoReplayService:
         hard_cap_breaches = int(metrics.get("hard_cap_breaches") or 0)
         calibration = metrics.get("calibration_brier")
         market_mid = metrics.get("market_mid_brier")
+        candle_count = int(metrics.get("candle_count") or 0)
+        leakage_rows = int(metrics.get("leakage_row_count") or 0)
+        if metrics.get("model_missing"):
+            reasons.append("Crypto model artifact is missing.")
+        if metrics.get("backtest_missing"):
+            reasons.append("Crypto backtest artifact is missing.")
+        if candle_count <= 0:
+            reasons.append("Crypto candlestick coverage is missing.")
+        if leakage_rows > 0:
+            reasons.append(f"Replay includes {leakage_rows} non-point-in-time rows.")
         if resolved < self.settings.crypto_replay_min_resolved_markets:
             reasons.append(
                 f"Resolved sample coverage {resolved} below minimum {self.settings.crypto_replay_min_resolved_markets}."
@@ -980,7 +1186,91 @@ class CryptoReplayService:
                 "min_net_pl_dollars": self.settings.crypto_replay_min_net_pl_dollars,
                 "max_hard_cap_breaches": self.settings.crypto_replay_max_hard_cap_breaches,
                 "calibration_better_than_mid": self.settings.crypto_replay_require_calibration_better_than_mid,
+                "requires_candles": True,
+                "requires_point_in_time_rows": True,
             },
+        }
+
+    async def _build_report(
+        self,
+        *,
+        frequency: str,
+        days: int | None,
+        limit: int | None,
+        command: str,
+    ) -> dict[str, Any]:
+        freq = normalize_frequency(frequency) or "15m"
+        cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            snapshots = await repo.list_crypto_market_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                since=cutoff,
+                limit=200_000,
+            )
+            candles = await repo.list_crypto_market_candlesticks(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                since=cutoff,
+                limit=500_000,
+            )
+            model = await repo.get_latest_crypto_model_artifact(
+                frequency=freq,
+                artifact_type="model",
+                kalshi_env=self.settings.kalshi_env,
+            )
+            await session.commit()
+        rows = _crypto_decision_rows(snapshots, candles)
+        rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
+        if limit and limit > 0:
+            rows = rows[-limit:]
+        backtest = _evaluate_crypto_walk_forward(rows, settings=self.settings)
+        data_quality = _crypto_data_quality(
+            snapshots,
+            candles,
+            min_training_samples=self.settings.crypto_min_training_samples,
+        )
+        metrics = {
+            **(backtest.get("metrics") or {}),
+            "sample_count": len(rows),
+            "resolved_sample_count": len(rows),
+            "candle_count": data_quality["candle_count"],
+            "leakage_row_count": 0,
+        }
+        gate = self.evaluate_gate(metrics)
+        issues: list[dict[str, Any]] = []
+        if not self.settings.crypto_trading_enabled:
+            issues.append({"severity": "info", "code": "crypto_trading_disabled", "message": "Global crypto trading is disabled."})
+        if not self.settings.crypto_autonomy_enabled:
+            issues.append({"severity": "info", "code": "crypto_autonomy_disabled", "message": "Crypto autonomy is disabled."})
+        for reason in gate["reasons"]:
+            severity = "fail" if command == "validate" else "warn"
+            issues.append({"severity": severity, "code": _issue_code(reason), "message": reason})
+        status = "pass"
+        if any(issue["severity"] == "fail" for issue in issues):
+            status = "fail"
+        elif any(issue["severity"] == "warn" for issue in issues):
+            status = "warn"
+        return {
+            "schema_version": "crypto-backtest-report-v1",
+            "status": status,
+            "command": command,
+            "kalshi_env": self.settings.kalshi_env,
+            "frequency": freq,
+            "days": days,
+            "dataset": {
+                "row_count": len(rows),
+                "snapshot_count": len(snapshots),
+                "settled_snapshot_count": sum(1 for row in snapshots if row.settlement_result in {"yes", "no"}),
+                "assets": sorted({str(row.get("asset_symbol")) for row in rows}),
+            },
+            "data_quality": data_quality,
+            "model": _artifact_summary(model),
+            "walk_forward": backtest,
+            "metrics": metrics,
+            "promotion_gate": gate,
+            "issues": issues,
         }
 
 
@@ -1166,6 +1456,11 @@ class CryptoWorkflowService:
                     artifact_type="replay_gate",
                     kalshi_env=room.kalshi_env,
                 )
+                backtest = await repo.get_latest_crypto_model_artifact(
+                    frequency=market.frequency,
+                    artifact_type="backtest",
+                    kalshi_env=room.kalshi_env,
+                )
                 live_status = self.asset_control_service.market_live_status(
                     control=control,
                     replay_gate=gate,
@@ -1208,6 +1503,16 @@ class CryptoWorkflowService:
                         "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility else None,
                         "candidate_trace": signal.candidate_trace,
                         "market_artifact_id": market_artifact.id,
+                        "crypto_modeling": {
+                            "model_version": (signal.candidate_trace or {}).get("model_version"),
+                            "backtest_version": backtest.version if backtest is not None else None,
+                            "replay_gate_status": gate.status if gate is not None else "missing",
+                            "data_quality_status": (
+                                ((backtest.payload or {}).get("data_quality") or {}).get("status")
+                                if backtest is not None
+                                else None
+                            ),
+                        },
                     },
                 )
                 await repo.append_message(
@@ -1243,6 +1548,15 @@ class CryptoWorkflowService:
                     client_order_id,
                     strategy_code=StrategyCode.CRYPTO_15M.value,
                 )
+                ticket_record.payload = {
+                    **(ticket_record.payload or {}),
+                    "market_domain": "crypto",
+                    "frequency": market.frequency,
+                    "asset_symbol": market.asset_symbol,
+                    "asset_mode": live_status["asset_mode"],
+                    "live_eligible": live_status["live_eligible"],
+                    "crypto_modeling": (signal_record.payload or {}).get("crypto_modeling"),
+                }
                 await repo.append_message(
                     room.id,
                     RoomMessageCreate(
@@ -1250,7 +1564,7 @@ class CryptoWorkflowService:
                         kind=MessageKind.TRADE_TICKET,
                         stage=RoomStage.PROPOSING,
                         content=f"Proposed crypto {ticket.side.value.upper()} ticket for {ticket.count_fp} contracts.",
-                        payload={**ticket.model_dump(mode="json"), "strategy_code": StrategyCode.CRYPTO_15M.value},
+                        payload={**ticket_record.payload, "strategy_code": StrategyCode.CRYPTO_15M.value},
                     ),
                 )
                 await repo.update_room_stage(room.id, RoomStage.RISK)
@@ -1299,7 +1613,13 @@ class CryptoWorkflowService:
                     market=market,
                     signal=signal,
                 )
-                no_order_statuses = {"shadow_skipped", "inactive_color_skipped", "crypto_asset_live_disabled"}
+                no_order_statuses = {
+                    "shadow_skipped",
+                    "inactive_color_skipped",
+                    "crypto_asset_live_disabled",
+                    "crypto_trading_disabled",
+                    "crypto_replay_gate_blocked",
+                }
                 if receipt.external_order_id or receipt.status not in no_order_statuses:
                     await repo.save_order(
                         ticket_id=ticket_record.id,
@@ -1408,9 +1728,9 @@ class CryptoAutonomyService:
         self.asset_control_service = asset_control_service
         self.workflow_service = workflow_service
 
-    async def run_once(self, *, frequency: str = "15m") -> dict[str, Any]:
+    async def run_once(self, *, frequency: str = "15m", force: bool = False) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
-        if not self.settings.crypto_autonomy_enabled:
+        if not self.settings.crypto_autonomy_enabled and not force:
             return {"status": "disabled", "frequency": freq, "reason": "crypto_autonomy_enabled is false"}
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -1500,6 +1820,7 @@ class CryptoAutonomyService:
         return {
             "status": "ok",
             "frequency": freq,
+            "forced": force,
             "checked_markets": len(discovered),
             "eligible_markets": len(markets),
             "created": created,
@@ -1687,3 +2008,553 @@ def _signal_is_tradeable(signal: StrategySignal) -> bool:
         and signal.eligibility is not None
         and signal.eligibility.eligible
     )
+
+
+def _crypto_data_quality(
+    snapshots: list[CryptoMarketSnapshotRecord],
+    candles: list[CryptoMarketCandlestickRecord],
+    *,
+    min_training_samples: int,
+) -> dict[str, Any]:
+    assets = sorted({row.asset_symbol for row in snapshots} | {row.asset_symbol for row in candles})
+    candle_markets = {row.market_ticker for row in candles}
+    by_asset: dict[str, dict[str, Any]] = {}
+    for asset in assets:
+        asset_snapshots = [row for row in snapshots if row.asset_symbol == asset]
+        asset_candles = [row for row in candles if row.asset_symbol == asset]
+        settled = [row for row in asset_snapshots if row.settlement_result in {"yes", "no"}]
+        snapshot_markets = {row.market_ticker for row in asset_snapshots}
+        latest_observed = max((row.observed_at for row in asset_snapshots), default=None)
+        latest_candle = max((row.end_period_ts for row in asset_candles), default=None)
+        by_asset[asset] = {
+            "snapshot_count": len(asset_snapshots),
+            "settled_snapshot_count": len(settled),
+            "candle_count": len(asset_candles),
+            "market_count": len(snapshot_markets),
+            "markets_missing_candles": len(snapshot_markets - candle_markets),
+            "latest_observed_at": latest_observed.isoformat() if latest_observed else None,
+            "latest_candle_at": latest_candle.isoformat() if latest_candle else None,
+        }
+    settled_snapshot_count = sum(1 for row in snapshots if row.settlement_result in {"yes", "no"})
+    status = "ready" if settled_snapshot_count >= min_training_samples and candles else "needs_data"
+    return {
+        "status": status,
+        "snapshot_count": len(snapshots),
+        "settled_snapshot_count": settled_snapshot_count,
+        "unresolved_snapshot_count": len(snapshots) - settled_snapshot_count,
+        "candle_count": len(candles),
+        "asset_count": len(assets),
+        "assets": by_asset,
+        "source_kind_counts": dict(Counter(row.source_kind for row in snapshots)),
+    }
+
+
+def _crypto_decision_rows(
+    snapshots: list[CryptoMarketSnapshotRecord],
+    candles: list[CryptoMarketCandlestickRecord],
+) -> list[dict[str, Any]]:
+    candles_by_market: dict[str, list[CryptoMarketCandlestickRecord]] = defaultdict(list)
+    for candle in candles:
+        candles_by_market[candle.market_ticker].append(candle)
+    for market_candles in candles_by_market.values():
+        market_candles.sort(key=lambda row: row.end_period_ts)
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, datetime]] = set()
+    for snapshot in snapshots:
+        if snapshot.settlement_result not in {"yes", "no"}:
+            continue
+        decision_ts = snapshot.observed_at
+        close_time = snapshot.close_time or snapshot.expected_expiration_time
+        if close_time is not None and decision_ts > close_time:
+            continue
+        key = (snapshot.market_ticker, decision_ts)
+        if key in seen:
+            continue
+        seen.add(key)
+        candle = _nearest_candle(candles_by_market.get(snapshot.market_ticker, []), decision_ts)
+        mid = _row_mid(snapshot) or (candle.close_dollars if candle is not None else None)
+        if mid is None:
+            continue
+        yes_bid = snapshot.yes_bid_dollars
+        yes_ask = snapshot.yes_ask_dollars
+        no_ask = snapshot.no_ask_dollars
+        quote_source = "snapshot_quotes"
+        if yes_bid is None or yes_ask is None:
+            quote_source = "candlestick_close_proxy"
+            yes_bid = mid
+            yes_ask = mid
+            no_ask = Decimal("1") - mid
+        elif no_ask is None:
+            no_ask = Decimal("1") - yes_bid
+        prior_candle = _prior_candle(candles_by_market.get(snapshot.market_ticker, []), decision_ts)
+        candle_momentum = None
+        if candle is not None and prior_candle is not None and candle.close_dollars is not None and prior_candle.close_dollars is not None:
+            candle_momentum = candle.close_dollars - prior_candle.close_dollars
+        rows.append(
+            {
+                "row_id": f"{snapshot.market_ticker}:{decision_ts.isoformat()}",
+                "market_ticker": snapshot.market_ticker,
+                "series_ticker": snapshot.series_ticker,
+                "asset_symbol": snapshot.asset_symbol,
+                "frequency": snapshot.frequency,
+                "source_kind": snapshot.source_kind,
+                "quote_source": quote_source,
+                "decision_ts": decision_ts,
+                "settlement_ts": close_time,
+                "market_day": decision_ts.date().isoformat(),
+                "target_price_dollars": snapshot.target_price_dollars,
+                "mid_yes_dollars": _clamp_price(mid),
+                "yes_bid_dollars": _clamp_price(yes_bid),
+                "yes_ask_dollars": _clamp_price(yes_ask),
+                "no_ask_dollars": _clamp_price(no_ask) if no_ask is not None else None,
+                "spread_bps": int(((yes_ask - yes_bid) * Decimal("10000")).to_integral_value()) if yes_bid is not None and yes_ask is not None else None,
+                "volume": snapshot.volume,
+                "open_interest": snapshot.open_interest,
+                "time_to_close_seconds": int((close_time - decision_ts).total_seconds()) if close_time is not None else None,
+                "settlement_result": snapshot.settlement_result,
+                "label_yes": 1 if snapshot.settlement_result == "yes" else 0,
+                "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
+                "candle_momentum_dollars": candle_momentum,
+            }
+        )
+    return rows
+
+
+def _nearest_candle(
+    candles: list[CryptoMarketCandlestickRecord],
+    decision_ts: datetime,
+) -> CryptoMarketCandlestickRecord | None:
+    eligible = [row for row in candles if row.end_period_ts <= decision_ts]
+    return eligible[-1] if eligible else None
+
+
+def _prior_candle(
+    candles: list[CryptoMarketCandlestickRecord],
+    decision_ts: datetime,
+) -> CryptoMarketCandlestickRecord | None:
+    eligible = [row for row in candles if row.end_period_ts < decision_ts]
+    return eligible[-2] if len(eligible) >= 2 else None
+
+
+def _fit_crypto_calibration(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {"global_adjustment_bps": 0, "asset_adjustments_bps": {}, "feature_weights": {}}
+    outcome_avg = sum((Decimal(row["label_yes"]) for row in rows), Decimal("0")) / len(rows)
+    mid_avg = sum((_decimal(row["mid_yes_dollars"]) for row in rows), Decimal("0")) / len(rows)
+    global_adjustment = outcome_avg - mid_avg
+    by_asset: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_asset[str(row["asset_symbol"])].append(row)
+    asset_adjustments: dict[str, int] = {}
+    for asset, asset_rows in by_asset.items():
+        asset_outcome = sum((Decimal(row["label_yes"]) for row in asset_rows), Decimal("0")) / len(asset_rows)
+        asset_mid = sum((_decimal(row["mid_yes_dollars"]) for row in asset_rows), Decimal("0")) / len(asset_rows)
+        asset_adjustments[asset] = int(((asset_outcome - asset_mid - global_adjustment) * Decimal("10000")).to_integral_value())
+    return {
+        "global_adjustment_bps": int((global_adjustment * Decimal("10000")).to_integral_value()),
+        "asset_adjustments_bps": asset_adjustments,
+        "feature_weights": {
+            "candlestick_momentum": 0.25,
+            "spread_penalty_bps_per_100bps": -8,
+            "time_to_close_decay": 0.10,
+        },
+    }
+
+
+def _predict_crypto_probability(row: dict[str, Any], model: dict[str, Any] | None) -> Decimal:
+    mid = _decimal(row.get("mid_yes_dollars"))
+    if not model:
+        return _clamp_price(mid)
+    adjustment = Decimal(int(model.get("global_adjustment_bps") or 0)) / Decimal("10000")
+    adjustment += Decimal(int((model.get("asset_adjustments_bps") or {}).get(str(row.get("asset_symbol")), 0))) / Decimal("20000")
+    momentum = _decimal(row.get("candle_momentum_dollars") or Decimal("0")) * Decimal("0.25")
+    spread_bps = int(row.get("spread_bps") or 0)
+    spread_penalty = Decimal(max(0, spread_bps - 100)) / Decimal("10000") / Decimal("8")
+    return _clamp_price(mid + adjustment + momentum - spread_penalty)
+
+
+def _crypto_model_metrics(
+    rows: list[dict[str, Any]],
+    model: dict[str, Any],
+    *,
+    settings: Settings,
+) -> dict[str, Any]:
+    baseline_predictions: list[tuple[Decimal, int]] = []
+    calibrated_predictions: list[tuple[Decimal, int]] = []
+    simulated = []
+    for row in rows:
+        label = int(row["label_yes"])
+        baseline = _decimal(row["mid_yes_dollars"])
+        predicted = _predict_crypto_probability(row, model)
+        baseline_predictions.append((baseline, label))
+        calibrated_predictions.append((predicted, label))
+        simulated.append(_simulate_crypto_trade(row, predicted, settings=settings))
+    fillable = [item for item in simulated if item["status"] == "fillable"]
+    net = sum((_decimal(item["net_pnl"]) for item in fillable), Decimal("0"))
+    fees = sum((_decimal(item["fees"]) for item in fillable), Decimal("0"))
+    hard_cap_breaches = sum(1 for item in fillable if _decimal(item["net_pnl"]) < Decimal("-1.0000"))
+    baseline_metrics = _probability_metrics_decimal(baseline_predictions)
+    calibrated_metrics = _probability_metrics_decimal(calibrated_predictions)
+    return {
+        "sample_count": len(rows),
+        "resolved_sample_count": len(rows),
+        "trade_candidate_count": len(fillable),
+        "net_simulated_pl_dollars": float(net),
+        "fees_dollars": float(fees),
+        "hard_cap_breaches": hard_cap_breaches,
+        "calibration_brier": calibrated_metrics["brier"],
+        "market_mid_brier": baseline_metrics["brier"],
+        "calibration_log_loss": calibrated_metrics["log_loss"],
+        "market_mid_log_loss": baseline_metrics["log_loss"],
+        "calibration_ece": calibrated_metrics["ece"],
+        "market_mid_ece": baseline_metrics["ece"],
+        "fee_model_version": current_fee_model_version(),
+    }
+
+
+def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Settings) -> dict[str, Any]:
+    folds = _crypto_walk_forward_folds(rows, min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)))
+    if not folds:
+        empty_metrics = _crypto_model_metrics([], {}, settings=settings)
+        return {
+            "status": "insufficient_data",
+            "reason": "need_settled_point_in_time_crypto_rows_across_market_days",
+            "fold_count": 0,
+            "folds": [],
+            "baseline_policy": _crypto_policy_metrics("baseline_market_mid", [], settings=settings),
+            "candidate_policies": [
+                _crypto_policy_metrics("calibrated_prediction", [], settings=settings),
+                _crypto_policy_metrics("trade_selection_policy", [], settings=settings),
+            ],
+            "bucket_matrix": [],
+            "metrics": empty_metrics,
+        }
+    baseline_trades: list[dict[str, Any]] = []
+    calibrated_trades: list[dict[str, Any]] = []
+    selection_trades: list[dict[str, Any]] = []
+    baseline_predictions: list[tuple[Decimal, int]] = []
+    calibrated_predictions: list[tuple[Decimal, int]] = []
+    fold_summaries: list[dict[str, Any]] = []
+    for fold in folds:
+        model = _fit_crypto_calibration(fold["train_rows"])
+        eligible_buckets = _eligible_crypto_buckets(fold["train_rows"], settings=settings)
+        fold_baseline: list[dict[str, Any]] = []
+        fold_calibrated: list[dict[str, Any]] = []
+        fold_selection: list[dict[str, Any]] = []
+        for row in fold["test_rows"]:
+            baseline = _decimal(row["mid_yes_dollars"])
+            calibrated = _predict_crypto_probability(row, model)
+            baseline_predictions.append((baseline, int(row["label_yes"])))
+            calibrated_predictions.append((calibrated, int(row["label_yes"])))
+            baseline_trade = _simulate_crypto_trade(row, baseline, settings=settings)
+            calibrated_trade = _simulate_crypto_trade(row, calibrated, settings=settings)
+            if baseline_trade["status"] == "fillable":
+                fold_baseline.append({**row, "simulation": baseline_trade})
+            if calibrated_trade["status"] == "fillable":
+                fold_calibrated.append({**row, "simulation": calibrated_trade})
+                if _crypto_bucket_key(row, calibrated_trade) in eligible_buckets:
+                    fold_selection.append({**row, "simulation": calibrated_trade})
+        baseline_trades.extend(fold_baseline)
+        calibrated_trades.extend(fold_calibrated)
+        selection_trades.extend(fold_selection)
+        fold_summaries.append(
+            {
+                "fold_id": fold["fold_id"],
+                "train_rows": len(fold["train_rows"]),
+                "test_rows": len(fold["test_rows"]),
+                "baseline_selected_count": len(fold_baseline),
+                "calibrated_selected_count": len(fold_calibrated),
+                "trade_selection_selected_count": len(fold_selection),
+                "train_cutoff_market_day": fold["train_cutoff_market_day"],
+            }
+        )
+    baseline_policy = _crypto_policy_metrics("baseline_market_mid", baseline_trades, settings=settings)
+    calibrated_policy = _crypto_policy_metrics("calibrated_prediction", calibrated_trades, settings=settings)
+    selection_policy = _crypto_policy_metrics("trade_selection_policy", selection_trades, settings=settings)
+    probability = {
+        "baseline": _probability_metrics_decimal(baseline_predictions),
+        "calibrated": _probability_metrics_decimal(calibrated_predictions),
+    }
+    return {
+        "status": "ok",
+        "fold_count": len(folds),
+        "folds": fold_summaries,
+        "prediction_metrics": probability,
+        "baseline_policy": baseline_policy,
+        "candidate_policies": [calibrated_policy, selection_policy],
+        "bucket_matrix": _crypto_bucket_matrix(calibrated_trades, settings=settings),
+        "metrics": {
+            "sample_count": len(rows),
+            "resolved_sample_count": len(rows),
+            "trade_candidate_count": calibrated_policy["selected_count"],
+            "net_simulated_pl_dollars": float(_decimal(calibrated_policy["net_pnl"])),
+            "fees_dollars": float(_decimal(calibrated_policy["fees"])),
+            "hard_cap_breaches": calibrated_policy["hard_cap_breaches"],
+            "calibration_brier": probability["calibrated"]["brier"],
+            "market_mid_brier": probability["baseline"]["brier"],
+            "calibration_log_loss": probability["calibrated"]["log_loss"],
+            "market_mid_log_loss": probability["baseline"]["log_loss"],
+            "calibration_ece": probability["calibrated"]["ece"],
+            "market_mid_ece": probability["baseline"]["ece"],
+            "fee_model_version": current_fee_model_version(),
+        },
+    }
+
+
+def _crypto_walk_forward_folds(rows: list[dict[str, Any]], *, min_train_rows: int) -> list[dict[str, Any]]:
+    ordered = sorted(rows, key=lambda row: (str(row.get("market_day")), row.get("decision_ts") or datetime.max.replace(tzinfo=UTC)))
+    days = sorted({str(row["market_day"]) for row in ordered if row.get("market_day")})
+    folds: list[dict[str, Any]] = []
+    for day in days:
+        train = [row for row in ordered if str(row.get("market_day")) < day]
+        test = [row for row in ordered if str(row.get("market_day")) == day]
+        if len(train) < min_train_rows or not test:
+            continue
+        folds.append(
+            {
+                "fold_id": f"crypto-wf-{len(folds) + 1}",
+                "train_cutoff_market_day": day,
+                "train_rows": train,
+                "test_rows": test,
+            }
+        )
+    return folds
+
+
+def _simulate_crypto_trade(row: dict[str, Any], predicted_yes: Decimal, *, settings: Settings) -> dict[str, Any]:
+    label_yes = int(row["label_yes"])
+    yes_cost = _decimal(row.get("yes_ask_dollars"))
+    no_cost = _decimal(row.get("no_ask_dollars") or (Decimal("1") - _decimal(row.get("yes_bid_dollars"))))
+    yes_ev = predicted_yes - yes_cost
+    no_ev = (Decimal("1") - predicted_yes) - no_cost
+    side = "yes" if yes_ev >= no_ev else "no"
+    cost = yes_cost if side == "yes" else no_cost
+    edge = yes_ev if side == "yes" else no_ev
+    fee = estimate_kalshi_taker_fee_dollars(
+        price_dollars=cost,
+        count=Decimal("1.00"),
+        fee_rate=Decimal(str(settings.kalshi_taker_fee_rate)),
+    )
+    fee_edge = fee
+    min_edge = Decimal(settings.risk_min_edge_bps) / Decimal("10000")
+    if edge - fee_edge < min_edge:
+        return {
+            "status": "not_selected",
+            "side": side,
+            "reason": "fee_adjusted_edge_below_min",
+            "expected_net_edge": str((edge - fee_edge).quantize(Decimal("0.0001"))),
+        }
+    payoff = Decimal(label_yes) if side == "yes" else Decimal(1 - label_yes)
+    gross = payoff - cost
+    net = gross - fee
+    return {
+        "status": "fillable",
+        "side": side,
+        "execution_price_dollars": str(cost.quantize(Decimal("0.0001"))),
+        "gross_pnl": str(gross.quantize(Decimal("0.0001"))),
+        "fees": str(fee.quantize(Decimal("0.0001"))),
+        "net_pnl": str(net.quantize(Decimal("0.0001"))),
+        "expected_net_edge": str((edge - fee_edge).quantize(Decimal("0.0001"))),
+        "bucket_key": _crypto_bucket_key(row, {"side": side}),
+    }
+
+
+def _crypto_policy_metrics(policy_name: str, trade_rows: list[dict[str, Any]], *, settings: Settings) -> dict[str, Any]:
+    values = [_decimal((row.get("simulation") or {}).get("net_pnl")) for row in trade_rows]
+    gross = [_decimal((row.get("simulation") or {}).get("gross_pnl")) for row in trade_rows]
+    fees = [_decimal((row.get("simulation") or {}).get("fees")) for row in trade_rows]
+    wins = sum(1 for value in values if value > 0)
+    return {
+        "policy_name": policy_name,
+        "selected_count": len(trade_rows),
+        "fillable_count": len(trade_rows),
+        "coverage": None,
+        "gross_pnl": str(sum(gross, Decimal("0")).quantize(Decimal("0.0001"))),
+        "fees": str(sum(fees, Decimal("0")).quantize(Decimal("0.0001"))),
+        "net_pnl": str(sum(values, Decimal("0")).quantize(Decimal("0.0001"))),
+        "max_drawdown": str(_crypto_max_drawdown(values).quantize(Decimal("0.0001"))),
+        "sortino": _ratio(_crypto_sortino(values)),
+        "sharpe": _ratio(_crypto_sharpe(values)),
+        "win_rate": _ratio(wins / len(values)) if values else None,
+        "win_rate_display_only": True,
+        "cluster_count": len({(row.get("asset_symbol"), row.get("market_day")) for row in trade_rows}),
+        "hard_cap_breaches": sum(1 for value in values if value < Decimal("-1.0000")),
+        "worst_buckets": _crypto_bucket_matrix(trade_rows, settings=settings)[:10],
+    }
+
+
+def _eligible_crypto_buckets(rows: list[dict[str, Any]], *, settings: Settings) -> set[str]:
+    simulations = [{**row, "simulation": _simulate_crypto_trade(row, _decimal(row["mid_yes_dollars"]), settings=settings)} for row in rows]
+    matrix = _crypto_bucket_matrix([row for row in simulations if row["simulation"]["status"] == "fillable"], settings=settings)
+    eligible: set[str] = set()
+    for bucket in matrix:
+        if int(bucket["sample_count"]) >= settings.trade_behavior_empirical_gate_min_settled_fills and _decimal(bucket["net_pnl"]) > Decimal(str(settings.trade_behavior_empirical_gate_min_net_pnl_dollars)):
+            eligible.add(bucket["bucket_key"])
+    return eligible
+
+
+def _crypto_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Settings) -> list[dict[str, Any]]:
+    del settings
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in trade_rows:
+        key = _crypto_bucket_key(row, row.get("simulation") or {})
+        grouped[key].append(row)
+    matrix: list[dict[str, Any]] = []
+    for key, rows in grouped.items():
+        values = [_decimal((row.get("simulation") or {}).get("net_pnl")) for row in rows]
+        fees = [_decimal((row.get("simulation") or {}).get("fees")) for row in rows]
+        gross = [_decimal((row.get("simulation") or {}).get("gross_pnl")) for row in rows]
+        wins = sum(1 for value in values if value > 0)
+        first = rows[0]
+        net = sum(values, Decimal("0"))
+        matrix.append(
+            {
+                "bucket_key": key,
+                "asset_symbol": first.get("asset_symbol"),
+                "side": (first.get("simulation") or {}).get("side"),
+                "entry_price_band": _price_band(_decimal((first.get("simulation") or {}).get("execution_price_dollars") or first.get("mid_yes_dollars"))),
+                "spread_band": _spread_band(first.get("spread_bps")),
+                "sample_count": len(values),
+                "win_rate": _ratio(wins / len(values)) if values else None,
+                "gross_pnl": str(sum(gross, Decimal("0")).quantize(Decimal("0.0001"))),
+                "fees": str(sum(fees, Decimal("0")).quantize(Decimal("0.0001"))),
+                "net_pnl": str(net.quantize(Decimal("0.0001"))),
+            }
+        )
+    matrix.sort(key=lambda item: (_decimal(item["net_pnl"]), item["bucket_key"]))
+    return matrix
+
+
+def _crypto_bucket_key(row: dict[str, Any], simulation: dict[str, Any]) -> str:
+    side = simulation.get("side") or "unknown"
+    price = _decimal(simulation.get("execution_price_dollars") or row.get("mid_yes_dollars"))
+    return "|".join(
+        [
+            str(row.get("asset_symbol") or "unknown"),
+            str(side),
+            _price_band(price),
+            _spread_band(row.get("spread_bps")),
+        ]
+    )
+
+
+def _expected_crypto_net_pnl(
+    market: CryptoMarket,
+    side: ContractSide,
+    fair_yes: Decimal,
+    *,
+    fee_rate: Decimal,
+) -> Decimal | None:
+    if side == ContractSide.YES:
+        cost = market.yes_ask_dollars
+        probability = fair_yes
+    else:
+        cost = market.no_ask_dollars if market.no_ask_dollars is not None else (Decimal("1") - market.yes_bid_dollars if market.yes_bid_dollars is not None else None)
+        probability = Decimal("1") - fair_yes
+    if cost is None:
+        return None
+    fee = estimate_kalshi_taker_fee_dollars(price_dollars=cost, count=Decimal("1.00"), fee_rate=fee_rate)
+    return (probability - cost - fee).quantize(Decimal("0.0001"))
+
+
+def _probability_metrics_decimal(predictions: list[tuple[Decimal, int]]) -> dict[str, Any]:
+    if not predictions:
+        return {"sample_count": 0, "brier": None, "log_loss": None, "ece": None}
+    brier = sum((float(probability) - label) ** 2 for probability, label in predictions) / len(predictions)
+    log_loss = -sum(
+        label * math.log(max(1e-9, float(probability)))
+        + (1 - label) * math.log(max(1e-9, 1 - float(probability)))
+        for probability, label in predictions
+    ) / len(predictions)
+    buckets: dict[int, list[tuple[Decimal, int]]] = defaultdict(list)
+    for probability, label in predictions:
+        buckets[min(9, int(float(probability) * 10))].append((probability, label))
+    ece = 0.0
+    reliability = []
+    for bucket, values in sorted(buckets.items()):
+        predicted = sum(float(probability) for probability, _ in values) / len(values)
+        observed = sum(label for _, label in values) / len(values)
+        ece += (len(values) / len(predictions)) * abs(predicted - observed)
+        reliability.append(
+            {
+                "bucket": f"{bucket / 10:.1f}-{(bucket + 1) / 10:.1f}",
+                "sample_count": len(values),
+                "avg_prediction": _ratio(predicted),
+                "observed_rate": _ratio(observed),
+            }
+        )
+    return {
+        "sample_count": len(predictions),
+        "brier": _ratio(brier),
+        "log_loss": _ratio(log_loss),
+        "ece": _ratio(ece),
+        "reliability_buckets": reliability,
+    }
+
+
+def _crypto_max_drawdown(values: list[Decimal]) -> Decimal:
+    equity = Decimal("0")
+    peak = Decimal("0")
+    drawdown = Decimal("0")
+    for value in values:
+        equity += value
+        peak = max(peak, equity)
+        drawdown = max(drawdown, peak - equity)
+    return drawdown
+
+
+def _crypto_sharpe(values: list[Decimal]) -> float | None:
+    if not values:
+        return None
+    floats = [float(value) for value in values]
+    mean = sum(floats) / len(floats)
+    variance = sum((value - mean) ** 2 for value in floats) / len(floats)
+    return mean / max(math.sqrt(variance), 0.01)
+
+
+def _crypto_sortino(values: list[Decimal]) -> float | None:
+    if not values:
+        return None
+    floats = [float(value) for value in values]
+    mean = sum(floats) / len(floats)
+    downside = [value for value in floats if value < 0]
+    downside_dev = math.sqrt(sum(value * value for value in downside) / len(downside)) if downside else 0.0
+    return mean / max(downside_dev, 0.01)
+
+
+def _price_band(price: Decimal) -> str:
+    if price < Decimal("0.25"):
+        return "0.00-0.25"
+    if price < Decimal("0.50"):
+        return "0.25-0.50"
+    if price < Decimal("0.75"):
+        return "0.50-0.75"
+    return "0.75-1.00"
+
+
+def _spread_band(spread_bps: Any) -> str:
+    try:
+        value = int(spread_bps or 0)
+    except (TypeError, ValueError):
+        return "unknown"
+    if value <= 100:
+        return "tight"
+    if value <= 300:
+        return "normal"
+    return "wide"
+
+
+def _ratio(value: float | None) -> float | None:
+    return round(value, 6) if value is not None and math.isfinite(value) else None
+
+
+def _decimal(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _issue_code(reason: str) -> str:
+    lowered = "".join(ch if ch.isalnum() else "_" for ch in reason.lower()).strip("_")
+    return lowered[:80] or "crypto_replay_issue"

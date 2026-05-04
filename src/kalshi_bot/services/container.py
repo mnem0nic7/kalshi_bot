@@ -421,6 +421,7 @@ class AppContainer:
             stop_loss_service=stop_loss_service,
             momentum_calibration_service=momentum_calibration_service,
             decision_corpus_service=decision_corpus_service,
+            crypto_history_service=crypto_history_service,
             crypto_autonomy_service=crypto_autonomy_service,
         )
         container = cls(
