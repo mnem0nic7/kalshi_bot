@@ -317,7 +317,7 @@ class Settings(BaseSettings):
     training_min_trade_positive_rooms: int = 8
     training_good_research_threshold: float = 0.7
     training_campaign_enabled: bool = False
-    training_campaign_rooms_per_run: int = 3
+    training_campaign_rooms_per_run: int = 6
     training_campaign_lookback_hours: int = 24
     training_campaign_cooldown_seconds: int = 600
     training_campaign_max_recent_per_market: int = 5

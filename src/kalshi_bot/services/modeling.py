@@ -780,7 +780,9 @@ def build_shadow_modeling_payload(
             "actual_sample_count": actual_sample_count,
             "expected_net_pnl": str(expected_net) if expected_net is not None else None,
             "shadow_recommendation": (
-                "score_only" if shadow_mode or str(kalshi_env).lower() == "demo" else "blocked_by_freeze"
+                "score_only"
+                if shadow_mode or str(kalshi_env).lower() == "demo"
+                else "score_only_frozen_forward"
             ),
         },
     }

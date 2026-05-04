@@ -22,6 +22,7 @@ from kalshi_bot.core.schemas import (
 )
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.discovery import DiscoveryService
+from kalshi_bot.services.trade_behavior import production_entry_freeze_enabled
 from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
@@ -106,6 +107,8 @@ class TrainingCorpusService:
         active_failed_reason_counts, legacy_failed_reason_counts = self._partition_failed_reason_counts(failed_runs)
         pack_versions = sorted({bundle.room.get("agent_pack_version") for bundle in bundles if bundle.room.get("agent_pack_version")})
         room_origin_counts = Counter(bundle.room_origin or bundle.room.get("room_origin") or "unknown" for bundle in bundles)
+        collection_mode_counts = Counter(self._collection_mode_for_bundle(bundle) for bundle in bundles)
+        frozen_forward_collection = self._frozen_forward_collection_summary(bundles)
         recent_builds = [self._summary_from_record(record).model_dump(mode="json") for record in builds]
 
         trainable_request = request.model_copy(update={"good_research_only": True, "quality_cleaned_only": True})
@@ -191,6 +194,8 @@ class TrainingCorpusService:
             "cleaned_trainable_room_count": len(trainable_bundles),
             "evaluation_holdout_room_count": holdout_count,
             "room_origin_counts": dict(room_origin_counts),
+            "collection_mode_counts": dict(collection_mode_counts),
+            "frozen_forward_collection": frozen_forward_collection,
             "pack_versions": pack_versions,
             "recent_dataset_builds": recent_builds,
             "campaign_settings": self._campaign_settings_snapshot(),
@@ -270,6 +275,7 @@ class TrainingCorpusService:
         shadow_weather_readiness = self._shadow_weather_readiness_from_bundles(
             [bundle for bundle in dashboard_bundles if self._is_weather_shadow_bundle(bundle)]
         )
+        frozen_forward_collection = self._frozen_forward_collection_summary(dashboard_bundles)
         top_blockers = self._top_blockers(
             readiness=readiness,
             quality_debt_summary=quality_debt_summary,
@@ -290,6 +296,7 @@ class TrainingCorpusService:
             "top_blockers": top_blockers,
             "next_actions": next_actions,
             "shadow_weather_readiness": shadow_weather_readiness,
+            "frozen_forward_collection": frozen_forward_collection,
         }
 
     async def build_dataset(self, request: TrainingBuildRequest) -> dict[str, Any]:
@@ -634,6 +641,7 @@ class TrainingCorpusService:
                 limit=room_limit,
                 market_ticker=request.market_ticker,
                 origins=request.origins,
+                include_frozen_production_live=self._include_frozen_forward_rooms(request),
             )
             await session.commit()
         bundles = await self.training_export_service.export_room_bundles(
@@ -789,6 +797,63 @@ class TrainingCorpusService:
         if not ticker:
             return False
         return self.weather_directory.supports_market_ticker(ticker)
+
+    def _include_frozen_forward_rooms(self, request: TrainingBuildRequest) -> bool:
+        if request.origins is not None:
+            return False
+        return production_entry_freeze_enabled(self.settings, self.settings.kalshi_env)
+
+    def _collection_mode_for_bundle(self, bundle: TrainingRoomBundle) -> str:
+        origin = bundle.room_origin or bundle.room.get("room_origin")
+        kalshi_env = str(bundle.room.get("kalshi_env") or self.settings.kalshi_env or "").lower()
+        if (
+            kalshi_env == "production"
+            and origin == RoomOrigin.LIVE.value
+            and not bool(bundle.room.get("shadow_mode"))
+            and production_entry_freeze_enabled(self.settings, kalshi_env)
+        ):
+            return "frozen_forward"
+        if origin == RoomOrigin.SHADOW.value or bool(bundle.room.get("shadow_mode")):
+            return "explicit_shadow"
+        return str(origin or "unknown")
+
+    def _frozen_forward_collection_summary(self, bundles: list[TrainingRoomBundle]) -> dict[str, Any]:
+        frozen = [bundle for bundle in bundles if self._collection_mode_for_bundle(bundle) == "frozen_forward"]
+        latest_created = max(
+            (
+                self._parse_iso_dt(bundle.room.get("created_at"))
+                for bundle in frozen
+                if bundle.room.get("created_at")
+            ),
+            default=None,
+        )
+        enabled = production_entry_freeze_enabled(self.settings, self.settings.kalshi_env)
+        return {
+            "enabled": enabled,
+            "included_by_default": enabled,
+            "complete_rooms": len([bundle for bundle in frozen if bundle.room.get("stage") == "complete"]),
+            "signal_count": sum(1 for bundle in frozen if bundle.signal is not None),
+            "signal_payload_snapshot_count": sum(
+                1
+                for bundle in frozen
+                if isinstance(((bundle.signal or {}).get("payload")), dict)
+                and isinstance(((bundle.signal or {}).get("payload") or {}).get("market_snapshot"), dict)
+            ),
+            "decision_trace_count": sum(1 for bundle in frozen if bundle.decision_trace_id),
+            "latest_room_created_at": latest_created.isoformat() if latest_created is not None else None,
+        }
+
+    @staticmethod
+    def _parse_iso_dt(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        if value in (None, ""):
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
     def _series_ticker_for_bundle(self, bundle: TrainingRoomBundle) -> str:
         ticker = str(bundle.room.get("market_ticker") or "")

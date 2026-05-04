@@ -53,9 +53,16 @@ async def test_list_rooms_for_learning_excludes_historical_replay_by_default(tmp
             kalshi_env="demo",
             room_origin=RoomOrigin.HISTORICAL_REPLAY.value,
         )
-        await repo.update_room_stage(shadow_room.id, RoomStage.COMPLETE)
-        await repo.update_room_stage(live_room.id, RoomStage.COMPLETE)
-        await repo.update_room_stage(historical_room.id, RoomStage.COMPLETE)
+        frozen_forward_room = await repo.create_room(
+            RoomCreate(name="Production Frozen Forward Room", market_ticker="WX-PROD"),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env="production",
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        for room in (shadow_room, live_room, historical_room, frozen_forward_room):
+            await repo.update_room_stage(room.id, RoomStage.COMPLETE)
         await session.commit()
 
     async with session_factory() as session:
@@ -67,6 +74,17 @@ async def test_list_rooms_for_learning_excludes_historical_replay_by_default(tmp
         await session.commit()
 
     assert {room.id for room in rooms} == {shadow_room.id, live_room.id}
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms_for_learning(
+            since=datetime.now(UTC) - timedelta(days=1),
+            limit=10,
+            include_frozen_production_live=True,
+        )
+        await session.commit()
+
+    assert {room.id for room in rooms} == {shadow_room.id, live_room.id, frozen_forward_room.id}
     await engine.dispose()
 
 

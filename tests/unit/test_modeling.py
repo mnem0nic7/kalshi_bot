@@ -264,4 +264,4 @@ def test_shadow_modeling_payload_keeps_production_blocked_by_freeze_label() -> N
     )
 
     assert payload["trade_selection_model"]["status"] == "production_frozen"
-    assert payload["trade_selection_model"]["shadow_recommendation"] == "blocked_by_freeze"
+    assert payload["trade_selection_model"]["shadow_recommendation"] == "score_only_frozen_forward"

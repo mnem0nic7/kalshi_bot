@@ -338,6 +338,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         color: str | None = None,
         market_ticker: str | None = None,
         origins: list[str] | None = None,
+        include_frozen_production_live: bool = False,
     ) -> list[Room]:
         stmt = (
             select(Room)
@@ -350,10 +351,14 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if origins:
             stmt = stmt.where(Room.room_origin.in_(origins))
         else:
-            stmt = stmt.where(
-                Room.room_origin.in_([RoomOrigin.SHADOW.value, RoomOrigin.LIVE.value]),
-                (Room.shadow_mode.is_(True)) | (Room.kalshi_env != "production"),
-            )
+            learning_room_filter = (Room.shadow_mode.is_(True)) | (Room.kalshi_env != "production")
+            if include_frozen_production_live:
+                learning_room_filter = learning_room_filter | (
+                    (Room.kalshi_env == "production")
+                    & (Room.room_origin == RoomOrigin.LIVE.value)
+                    & (Room.shadow_mode.is_(False))
+                )
+            stmt = stmt.where(Room.room_origin.in_([RoomOrigin.SHADOW.value, RoomOrigin.LIVE.value]), learning_room_filter)
         if pack_version is not None:
             stmt = stmt.where(Room.agent_pack_version == pack_version)
         if color is not None:
