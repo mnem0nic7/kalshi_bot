@@ -269,6 +269,9 @@ async def build_trade_behavior_validation_report(
     )
     if current_missing:
         issues.append(_issue("warn", "analysis:missing_market_snapshot", "Trade-analysis rows still lack recoverable market snapshots."))
+    new_scoreability = dict(analysis.get("new_row_scoreability") or {})
+    if int(new_scoreability.get("missing_market_snapshot_count") or 0):
+        issues.append(_issue("warn", "analysis:new_rows_missing_market_snapshot", "New trade-analysis rows lack point-in-time market snapshots."))
     if current_defects:
         issues.append(_issue("warn", "analysis:data_defects", "Trade-analysis data defects remain."))
 
@@ -316,6 +319,9 @@ async def build_trade_behavior_validation_report(
             "current_data_defect_count": analysis.get("current_data_defect_count"),
             "legacy_coverage_debt_count": analysis.get("legacy_coverage_debt_count"),
             "top_exclusion_reasons": analysis.get("top_exclusion_reasons") or [],
+            "snapshot_source_counts": analysis.get("snapshot_source_counts") or {},
+            "snapshot_source_kind_counts": analysis.get("snapshot_source_kind_counts") or {},
+            "new_row_scoreability": new_scoreability,
             "worst_buckets": (analysis.get("buckets") or [])[:10],
         },
         "issues": issues,
@@ -355,6 +361,14 @@ def format_trade_behavior_validation_report(report: dict[str, Any]) -> str:
             f"defects={analysis.get('data_defect_count')}"
         ),
     ]
+    if analysis.get("new_row_scoreability"):
+        scoreability = analysis["new_row_scoreability"]
+        lines.append(
+            "New-row scoreability: "
+            f"since={scoreability.get('since')} "
+            f"rows={scoreability.get('row_count')} "
+            f"missing_snapshots={scoreability.get('missing_market_snapshot_count')}"
+        )
     if analysis.get("top_exclusion_reasons"):
         lines.extend(["", "Top exclusions:"])
         for reason, count in analysis["top_exclusion_reasons"][:5]:

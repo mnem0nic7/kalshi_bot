@@ -372,7 +372,7 @@ class AppContainer:
             settings,
             session_factory,
         )
-        trading_audit_service = TradingAuditService(settings, session_factory)
+        trading_audit_service = TradingAuditService(settings, session_factory, kalshi=kalshi)
         trade_analysis_service = TradeAnalysisService(
             settings,
             session_factory,

@@ -24,7 +24,12 @@ from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.historical_archive import append_weather_bundle_archive, weather_bundle_archive_metadata
 from kalshi_bot.services.historical_heuristics import HistoricalHeuristicService
+from kalshi_bot.services.market_snapshot_archive import (
+    DECISION_SIGNAL_MARKET_SOURCE_KIND,
+    archive_point_in_time_market_snapshot,
+)
 from kalshi_bot.services.memory import MemoryService
+from kalshi_bot.services.modeling import build_shadow_modeling_payload
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
 from kalshi_bot.services.decision_trace import (
@@ -1554,6 +1559,23 @@ class WorkflowSupervisor:
                     confidence_band=signal.confidence_band,
                     spread_bps=signal.eligibility.market_spread_bps if signal.eligibility is not None else None,
                 )
+                signal_modeling = build_shadow_modeling_payload(
+                    signal=signal,
+                    kalshi_env=room.kalshi_env,
+                    shadow_mode=bool(getattr(room, "shadow_mode", self.settings.app_shadow_mode)),
+                    bucket_key=signal_trade_behavior_context.get("bucket_key"),
+                    empirical_gate=(
+                        signal.eligibility.empirical_gate
+                        if signal.eligibility is not None
+                        else (signal.candidate_trace or {}).get("empirical_gate")
+                    ),
+                )
+                signal.candidate_trace = {
+                    **dict(signal.candidate_trace or {}),
+                    "modeling": signal_modeling,
+                    "prediction_model": signal_modeling["prediction_model"],
+                    "trade_selection_model": signal_modeling["trade_selection_model"],
+                }
                 signal_record = await repo.save_signal(
                     room_id=room.id,
                     market_ticker=room.market_ticker,
@@ -1571,6 +1593,9 @@ class WorkflowSupervisor:
                         "effective_research_freshness": dossier.freshness.model_dump(mode="json"),
                         "market_snapshot": signal_market_snapshot,
                         "trade_behavior_context": signal_trade_behavior_context,
+                        "modeling": signal_modeling,
+                        "prediction_model": signal_modeling["prediction_model"],
+                        "trade_selection_model": signal_modeling["trade_selection_model"],
                         "resolution_state": signal.resolution_state.value,
                         "strategy_mode": signal.strategy_mode.value,
                         "evaluation_outcome": signal.evaluation_outcome,
@@ -1631,6 +1656,20 @@ class WorkflowSupervisor:
                         "momentum_post_processor_outcome": momentum_outcome,
                     },
                 )
+                signal_decision_ts = getattr(signal_record, "created_at", None) or market_state.observed_at
+                decision_market_snapshot = await archive_point_in_time_market_snapshot(
+                    repo,
+                    market_response=market_response,
+                    observed_at=market_state.observed_at,
+                    kalshi_env=room.kalshi_env,
+                    market_ticker=room.market_ticker,
+                    source_kind=DECISION_SIGNAL_MARKET_SOURCE_KIND,
+                    source_id=f"signal:{signal_record.id}",
+                    recovered=False,
+                    leakage_risk="none",
+                    decision_ts=signal_decision_ts,
+                    extra_payload={"signal_id": signal_record.id, "room_id": room.id},
+                )
                 await session.commit()
                 _governance_positions = await repo.list_positions_for_ticker(
                     room.market_ticker,
@@ -1688,6 +1727,9 @@ class WorkflowSupervisor:
                                 "observed_at": market_state.observed_at,
                             },
                             "market_snapshot_artifact_id": market_snapshot_artifact.id,
+                            "decision_market_snapshot_id": (
+                                decision_market_snapshot.id if decision_market_snapshot is not None else None
+                            ),
                             "weather_archive_source_id": weather_archive_source_id,
                             "research_run_id": dossier.last_run_id,
                         },

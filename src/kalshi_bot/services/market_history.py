@@ -12,6 +12,10 @@ from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.discovery import DiscoveryService
+from kalshi_bot.services.market_snapshot_archive import (
+    DAEMON_MARKET_PRICE_SOURCE_KIND,
+    archive_point_in_time_market_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +83,7 @@ class MarketHistoryService:
                 last = _safe_decimal(market.get("last_price_dollars"))
                 raw_volume = market.get("volume")
                 volume = int(raw_volume) if raw_volume is not None else None
-                await repo.record_market_price_snapshot(
+                history = await repo.record_market_price_snapshot(
                     market_ticker=ticker,
                     kalshi_env=self.kalshi.settings.kalshi_env,
                     yes_bid_dollars=bid,
@@ -88,6 +92,18 @@ class MarketHistoryService:
                     last_trade_dollars=last,
                     volume=volume,
                     observed_at=observed_at,
+                )
+                await archive_point_in_time_market_snapshot(
+                    repo,
+                    market_response={"market": market},
+                    observed_at=observed_at,
+                    kalshi_env=self.kalshi.settings.kalshi_env,
+                    market_ticker=ticker,
+                    source_kind=DAEMON_MARKET_PRICE_SOURCE_KIND,
+                    source_id=f"market_history:{history.id}",
+                    recovered=False,
+                    leakage_risk="point_in_time",
+                    extra_payload={"market_price_history_id": history.id},
                 )
                 written += 1
             await session.commit()

@@ -29,6 +29,11 @@ from kalshi_bot.db.models import (
     Signal,
     TradeTicketRecord,
 )
+from kalshi_bot.services.market_snapshot_archive import (
+    DAEMON_MARKET_PRICE_SOURCE_KIND,
+    DECISION_SIGNAL_MARKET_SOURCE_KIND,
+    TRADE_ANALYSIS_CANDLESTICK_BACKFILL_SOURCE_KIND,
+)
 from kalshi_bot.services.trade_behavior import bucket_dimensions_from_key, bucket_key_for_fill
 
 
@@ -154,11 +159,14 @@ _POINT_IN_TIME_BACKFILL_SOURCE_KINDS = {
     "trade_analysis_backfill_signal_payload",
     "trade_analysis_backfill_market_price_history",
     "trade_analysis_backfill_historical_snapshot",
+    TRADE_ANALYSIS_CANDLESTICK_BACKFILL_SOURCE_KIND,
 }
 _POINT_IN_TIME_MARKET_SOURCE_KINDS = {
     "checkpoint_captured_market_snapshot",
     "captured_market_snapshot",
     "reconstructed_market_checkpoint",
+    DECISION_SIGNAL_MARKET_SOURCE_KIND,
+    DAEMON_MARKET_PRICE_SOURCE_KIND,
     *_POINT_IN_TIME_BACKFILL_SOURCE_KINDS,
 }
 
@@ -187,9 +195,11 @@ class TradingAuditService:
         self,
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
+        kalshi: Any | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
+        self.kalshi = kalshi
 
     async def build_report(
         self,
@@ -674,7 +684,7 @@ class TradingAuditService:
                     HistoricalMarketSnapshotRecord.market_ticker == market_ticker,
                     HistoricalMarketSnapshotRecord.asof_ts <= decision_ts,
                     HistoricalMarketSnapshotRecord.asof_ts >= cutoff,
-                    HistoricalMarketSnapshotRecord.source_kind.in_(sorted(_POINT_IN_TIME_BACKFILL_SOURCE_KINDS)),
+                    HistoricalMarketSnapshotRecord.source_kind.in_(sorted(_POINT_IN_TIME_MARKET_SOURCE_KINDS)),
                 )
                 .order_by(HistoricalMarketSnapshotRecord.asof_ts.desc(), HistoricalMarketSnapshotRecord.id.desc())
                 .limit(1)
@@ -720,6 +730,35 @@ class TradingAuditService:
             )
             if recovered is not None:
                 return recovered
+
+        stale_cutoff = decision_ts - timedelta(seconds=max(1, int(self.settings.risk_stale_market_seconds)))
+        durable_decision = await self._latest_historical_market_snapshot(
+            session,
+            market_ticker=signal.market_ticker,
+            source_kind=DECISION_SIGNAL_MARKET_SOURCE_KIND,
+            decision_ts=decision_ts,
+            cutoff=stale_cutoff,
+        )
+        if durable_decision is not None:
+            return self._market_snapshot_from_historical(
+                durable_decision,
+                source_kind=DECISION_SIGNAL_MARKET_SOURCE_KIND,
+                leakage_risk="none",
+            )
+
+        daemon_snapshot = await self._latest_historical_market_snapshot(
+            session,
+            market_ticker=signal.market_ticker,
+            source_kind=DAEMON_MARKET_PRICE_SOURCE_KIND,
+            decision_ts=decision_ts,
+            cutoff=stale_cutoff,
+        )
+        if daemon_snapshot is not None:
+            return self._market_snapshot_from_historical(
+                daemon_snapshot,
+                source_kind=DAEMON_MARKET_PRICE_SOURCE_KIND,
+                leakage_risk="point_in_time",
+            )
 
         history = (
             await session.execute(
@@ -769,6 +808,13 @@ class TradingAuditService:
                 leakage_risk="point_in_time",
             )
 
+        candlestick = await self._recover_market_snapshot_from_candlesticks(
+            signal.market_ticker,
+            decision_ts=decision_ts,
+        )
+        if candlestick is not None:
+            return candlestick
+
         final = (
             await session.execute(
                 select(HistoricalMarketSnapshotRecord)
@@ -787,6 +833,99 @@ class TradingAuditService:
                 leakage_risk="final_market",
             )
         return None
+
+    async def _latest_historical_market_snapshot(
+        self,
+        session: AsyncSession,
+        *,
+        market_ticker: str,
+        source_kind: str,
+        decision_ts: datetime,
+        cutoff: datetime,
+    ) -> HistoricalMarketSnapshotRecord | None:
+        return (
+            await session.execute(
+                select(HistoricalMarketSnapshotRecord)
+                .where(
+                    HistoricalMarketSnapshotRecord.market_ticker == market_ticker,
+                    HistoricalMarketSnapshotRecord.source_kind == source_kind,
+                    HistoricalMarketSnapshotRecord.asof_ts <= decision_ts,
+                    HistoricalMarketSnapshotRecord.asof_ts >= cutoff,
+                )
+                .order_by(HistoricalMarketSnapshotRecord.asof_ts.desc(), HistoricalMarketSnapshotRecord.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    async def _recover_market_snapshot_from_candlesticks(
+        self,
+        market_ticker: str,
+        *,
+        decision_ts: datetime,
+    ) -> dict[str, Any] | None:
+        if self.kalshi is None:
+            return None
+        series = _series_from_ticker(market_ticker)
+        if not series:
+            return None
+        lookback_hours = max(1, int(getattr(self.settings, "historical_replay_market_snapshot_lookback_hours", 36)))
+        window_start = decision_ts - timedelta(hours=lookback_hours)
+        selected: tuple[dict[str, Any], datetime] | None = None
+        for period_interval in (1, 60):
+            try:
+                response = await self.kalshi.get_market_candlesticks(
+                    series,
+                    market_ticker,
+                    period_interval=period_interval,
+                    start_ts=int(window_start.timestamp()),
+                    end_ts=int(decision_ts.timestamp()),
+                )
+            except Exception:
+                continue
+            for candlestick in response.get("candlesticks") or []:
+                end_period_ts = candlestick.get("end_period_ts")
+                if end_period_ts in (None, ""):
+                    continue
+                try:
+                    end_at = datetime.fromtimestamp(int(end_period_ts), tz=UTC)
+                except (OverflowError, OSError, ValueError):
+                    continue
+                if end_at <= decision_ts:
+                    selected = (candlestick, end_at)
+            if selected is not None:
+                break
+        if selected is None:
+            return None
+        candlestick, observed_at = selected
+        stale_seconds = (decision_ts - observed_at).total_seconds()
+        if stale_seconds < 0 or stale_seconds > float(self.settings.historical_replay_market_stale_seconds):
+            return None
+        yes_bid = _decimal_or_none((candlestick.get("yes_bid") or {}).get("close_dollars"))
+        yes_ask = _decimal_or_none((candlestick.get("yes_ask") or {}).get("close_dollars"))
+        last_price = _decimal_or_none((candlestick.get("price") or {}).get("close_dollars"))
+        no_ask = (Decimal("1.0000") - yes_bid).quantize(Decimal("0.0001")) if yes_bid is not None else None
+        if yes_bid is None and yes_ask is None:
+            return None
+        return {
+            "observed_at": observed_at,
+            "yes_bid_dollars": yes_bid,
+            "yes_ask_dollars": yes_ask,
+            "no_ask_dollars": no_ask,
+            "last_price_dollars": last_price,
+            "payload": {
+                "candlestick": candlestick,
+                "reconstructed_from": "kalshi_candlesticks",
+                "market_ticker": market_ticker,
+                "decision_ts": decision_ts.isoformat(),
+            },
+            "snapshot_provenance": {
+                "recovered": True,
+                "source": "kalshi_candlestick",
+                "source_kind": TRADE_ANALYSIS_CANDLESTICK_BACKFILL_SOURCE_KIND,
+                "source_id": f"{market_ticker}:{int(observed_at.timestamp())}",
+                "leakage_risk": "point_in_time",
+            },
+        }
 
     @staticmethod
     def _market_snapshot_from_payload(

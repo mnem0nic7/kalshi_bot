@@ -57,6 +57,12 @@ from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, re
 from kalshi_bot.services.parameter_packs import ParameterPackCanaryConfig, ParameterPackPromotionService
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
 from kalshi_bot.services.trade_analysis import format_trade_analysis_report
+from kalshi_bot.services.backtesting import (
+    build_backtesting_report,
+    format_backtesting_report,
+    write_backtesting_report,
+)
+from kalshi_bot.services.modeling import build_modeling_report, format_modeling_report
 from kalshi_bot.services.trade_behavior_validation import (
     build_trade_behavior_validation_report,
     format_trade_behavior_validation_report,
@@ -1063,6 +1069,52 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     print(format_trade_behavior_validation_report(report))
             return 0
 
+        if args.command == "modeling":
+            modeling_days = 3650 if args.full_history else args.days
+            report = await build_modeling_report(
+                settings=container.settings,
+                decision_corpus_service=container.decision_corpus_service,
+                trading_audit_service=container.trading_audit_service,
+                trade_analysis_service=container.trade_analysis_service,
+                kalshi_env=args.kalshi_env,
+                days=modeling_days,
+                command=args.modeling_command,
+                limit=args.limit,
+                row_limit=args.limit if args.limit and args.limit > 0 else None,
+            )
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(format_modeling_report(report))
+            if args.modeling_command == "validate" and report.get("status") == "fail":
+                return 1
+            return 0
+
+        if args.command == "backtesting":
+            backtesting_days = 3650 if args.full_history else args.days
+            report = await build_backtesting_report(
+                settings=container.settings,
+                session_factory=container.session_factory,
+                decision_corpus_service=container.decision_corpus_service,
+                trade_analysis_service=container.trade_analysis_service,
+                kalshi_env=args.kalshi_env,
+                days=backtesting_days,
+                full_history=bool(args.full_history),
+                command=args.backtesting_command,
+                dataset_source=args.dataset_source,
+                limit=args.limit,
+                row_limit=args.limit if args.limit and args.limit > 0 else None,
+            )
+            if args.output:
+                write_backtesting_report(report, Path(args.output))
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(format_backtesting_report(report))
+            if args.backtesting_command == "validate" and report.get("status") == "fail":
+                return 1
+            return 0
+
         if args.command == "training-build":
             if getattr(args, "training_build_scope", None) == "historical":
                 if not args.date_from or not args.date_to:
@@ -1913,6 +1965,48 @@ def build_parser() -> argparse.ArgumentParser:
     trade_behavior_quality.add_argument("--min-samples", type=int, default=None)
     trade_behavior_quality.add_argument("--limit", type=int, default=20)
     trade_behavior_quality.add_argument("--json", action="store_true")
+
+    modeling = subparsers.add_parser(
+        "modeling",
+        help="Two-stage prediction calibration and trade-selection shadow workflow.",
+    )
+    modeling_subparsers = modeling.add_subparsers(dest="modeling_command", required=True)
+    for name in ("status", "backtest", "validate", "train-shadow"):
+        modeling_command = modeling_subparsers.add_parser(name)
+        modeling_command.add_argument("--kalshi-env", default="demo")
+        modeling_command.add_argument("--days", type=int, default=180)
+        modeling_command.add_argument("--full-history", action="store_true")
+        modeling_command.add_argument(
+            "--limit",
+            type=int,
+            default=20,
+            help="Bound rows and bucket output; use 0 for an unbounded dataset pass.",
+        )
+        modeling_command.add_argument("--json", action="store_true")
+
+    backtesting = subparsers.add_parser(
+        "backtesting",
+        help="Fidelity-first walk-forward backtests and promotion readiness checks.",
+    )
+    backtesting_subparsers = backtesting.add_subparsers(dest="backtesting_command", required=True)
+    for name in ("status", "run", "validate"):
+        backtesting_command = backtesting_subparsers.add_parser(name)
+        backtesting_command.add_argument("--kalshi-env", default="demo")
+        backtesting_command.add_argument("--days", type=int, default=180)
+        backtesting_command.add_argument("--full-history", action="store_true")
+        backtesting_command.add_argument(
+            "--limit",
+            type=int,
+            default=20,
+            help="Bound dataset rows, bucket output, and diagnostics; use 0 for an unbounded dataset pass.",
+        )
+        backtesting_command.add_argument(
+            "--dataset-source",
+            choices=["auto", "trade-analysis", "decision-corpus"],
+            default="auto",
+        )
+        backtesting_command.add_argument("--json", action="store_true")
+        backtesting_command.add_argument("--output", default=None)
 
     training_build = subparsers.add_parser("training-build")
     training_build.add_argument("training_build_scope", nargs="?", choices=["historical"])

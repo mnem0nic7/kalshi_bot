@@ -86,6 +86,25 @@ def _fill(
     )
 
 
+class FakeCandlestickKalshi:
+    def __init__(self, observed_at: datetime) -> None:
+        self.observed_at = observed_at
+        self.requests: list[dict] = []
+
+    async def get_market_candlesticks(self, series_ticker: str, market_ticker: str, **params):
+        self.requests.append({"series_ticker": series_ticker, "market_ticker": market_ticker, **params})
+        return {
+            "candlesticks": [
+                {
+                    "end_period_ts": int(self.observed_at.timestamp()),
+                    "yes_bid": {"close_dollars": "0.4800"},
+                    "yes_ask": {"close_dollars": "0.5200"},
+                    "price": {"close_dollars": "0.5000"},
+                }
+            ]
+        }
+
+
 @pytest.mark.asyncio
 async def test_trading_audit_scores_settled_and_exit_pnl(audit_harness) -> None:
     settings, session_factory = audit_harness
@@ -848,12 +867,97 @@ async def test_trading_audit_market_snapshot_repair_recovers_history_and_final_f
         )
 
     rows = {record.market_ticker: record for record in records}
-    assert result["updated_count"] == 3
+    assert result["updated_count"] == 2
+    assert result["skipped_existing_count"] == 1
     assert rows[price_ticker].source_kind == "trade_analysis_backfill_market_price_history"
-    assert rows[historical_ticker].source_kind == "trade_analysis_backfill_historical_snapshot"
-    assert rows[historical_ticker].payload["snapshot_provenance"]["leakage_risk"] == "point_in_time"
+    assert historical_ticker not in rows
     assert rows[final_ticker].source_kind == "trade_analysis_backfill_final_market"
     assert rows[final_ticker].payload["snapshot_provenance"]["leakage_risk"] == "final_market"
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_market_snapshot_repair_recovers_candlestick_point_in_time(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    ticker = "KXHIGHCND-26APR24-T70"
+    async with session_factory() as session:
+        room = _room("room-candlestick", ticker)
+        session.add_all([
+            room,
+            Signal(
+                room_id=room.id,
+                market_ticker=ticker,
+                fair_yes_dollars=Decimal("0.6100"),
+                edge_bps=700,
+                confidence=0.80,
+                summary="candlestick source",
+                payload={"evaluation_outcome": "candidate_selected"},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+        ])
+        await session.commit()
+
+    kalshi = FakeCandlestickKalshi(NOW - timedelta(minutes=14))
+    result = await TradingAuditService(settings, session_factory, kalshi=kalshi).repair_market_snapshots(
+        kalshi_env="production",
+        days=7,
+        dry_run=False,
+        now=NOW,
+    )
+
+    async with session_factory() as session:
+        records = list((await session.execute(select(HistoricalMarketSnapshotRecord))).scalars())
+
+    assert result["updated_count"] == 1
+    assert kalshi.requests[0]["series_ticker"] == "KXHIGHCND"
+    assert records[0].source_kind == "trade_analysis_backfill_candlestick"
+    assert records[0].payload["snapshot_provenance"]["leakage_risk"] == "point_in_time"
+    assert records[0].yes_bid_dollars == Decimal("0.4800")
+
+
+@pytest.mark.asyncio
+async def test_trading_audit_market_snapshot_repair_skips_existing_durable_decision_snapshot(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    ticker = "KXHIGHDUR-26APR24-T70"
+    async with session_factory() as session:
+        room = _room("room-durable", ticker)
+        session.add_all([
+            room,
+            Signal(
+                room_id=room.id,
+                market_ticker=ticker,
+                fair_yes_dollars=Decimal("0.6100"),
+                edge_bps=700,
+                confidence=0.80,
+                summary="durable source",
+                payload={"evaluation_outcome": "candidate_selected"},
+                created_at=NOW - timedelta(minutes=10),
+                updated_at=NOW - timedelta(minutes=10),
+            ),
+            HistoricalMarketSnapshotRecord(
+                market_ticker=ticker,
+                series_ticker="KXHIGHDUR",
+                station_id=None,
+                local_market_day="26APR24",
+                asof_ts=NOW - timedelta(minutes=10, seconds=5),
+                source_kind="decision_signal_market_snapshot",
+                source_id="signal:existing",
+                yes_bid_dollars=Decimal("0.4500"),
+                yes_ask_dollars=Decimal("0.4900"),
+                payload={"snapshot_provenance": {"leakage_risk": "none"}},
+            ),
+        ])
+        await session.commit()
+
+    result = await TradingAuditService(settings, session_factory).repair_market_snapshots(
+        kalshi_env="production",
+        days=7,
+        dry_run=True,
+        now=NOW,
+    )
+
+    assert result["candidate_count"] == 0
+    assert result["skipped_existing_count"] == 1
 
 
 @pytest.mark.asyncio

@@ -45,6 +45,7 @@ class FakeSessionFactory:
 
 class FakePlatformRepository:
     saved_signal: dict | None = None
+    saved_snapshots: list[dict] = []
 
     def __init__(self, session: FakeSession, *, kalshi_env: str | None = None) -> None:
         self.session = session
@@ -74,6 +75,10 @@ class FakePlatformRepository:
     async def save_signal(self, **kwargs):
         type(self).saved_signal = kwargs
         return SimpleNamespace(id="signal-1", **kwargs)
+
+    async def upsert_historical_market_snapshot(self, **kwargs):
+        type(self).saved_snapshots.append(kwargs)
+        return SimpleNamespace(id=f"snapshot-{len(type(self).saved_snapshots)}", **kwargs)
 
     async def save_artifact(self, **kwargs):
         return SimpleNamespace(id="artifact-1", **kwargs)
@@ -204,6 +209,7 @@ class FakeResearchCoordinator:
 @pytest.mark.asyncio
 async def test_supervisor_persists_post_market_gate_signal_state(monkeypatch) -> None:
     FakePlatformRepository.saved_signal = None
+    FakePlatformRepository.saved_snapshots = []
     monkeypatch.setattr(supervisor_module, "PlatformRepository", FakePlatformRepository)
     settings = Settings(
         app_color="blue",
@@ -246,3 +252,5 @@ async def test_supervisor_persists_post_market_gate_signal_state(monkeypatch) ->
     assert saved_signal["payload"]["eligibility"]["eligible"] is False
     assert saved_signal["payload"]["eligibility"]["stand_down_reason"] == "market_spread_over_60pct"
     assert saved_signal["payload"]["candidate_trace"]["eligibility_stand_down_reason"] == "market_spread_over_60pct"
+    assert len(FakePlatformRepository.saved_snapshots) == 1
+    assert FakePlatformRepository.saved_snapshots[0]["source_kind"] == "decision_signal_market_snapshot"

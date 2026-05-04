@@ -227,6 +227,7 @@ class Settings(BaseSettings):
     trade_behavior_empirical_gate_min_settled_fills: int = 20
     trade_behavior_empirical_gate_min_net_pnl_dollars: float = 0.0
     trade_behavior_empirical_gate_lookback_days: int = 180
+    trade_behavior_snapshot_scoreability_since: str | None = None
 
     # Strategy C adaptive polling cadence (ThresholdProximityMonitor, §4.1.4)
     strategy_c_cadence_idle_seconds: int = 3600

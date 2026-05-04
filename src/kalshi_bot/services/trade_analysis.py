@@ -30,6 +30,11 @@ from kalshi_bot.db.models import (
     TradeTicketRecord,
 )
 from kalshi_bot.services.trade_behavior import bucket_dimensions_from_key, bucket_key
+from kalshi_bot.services.market_snapshot_archive import (
+    DAEMON_MARKET_PRICE_SOURCE_KIND,
+    DECISION_SIGNAL_MARKET_SOURCE_KIND,
+    TRADE_ANALYSIS_CANDLESTICK_BACKFILL_SOURCE_KIND,
+)
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 
@@ -58,10 +63,13 @@ POINT_IN_TIME_HISTORICAL_MARKET_SOURCES = {
     "checkpoint_captured_market_snapshot",
     "captured_market_snapshot",
     "reconstructed_market_checkpoint",
+    DECISION_SIGNAL_MARKET_SOURCE_KIND,
+    DAEMON_MARKET_PRICE_SOURCE_KIND,
     "trade_analysis_backfill_room_artifact",
     "trade_analysis_backfill_signal_payload",
     "trade_analysis_backfill_market_price_history",
     "trade_analysis_backfill_historical_snapshot",
+    TRADE_ANALYSIS_CANDLESTICK_BACKFILL_SOURCE_KIND,
 }
 HIGH_LEAKAGE_HISTORICAL_MARKET_SOURCES = {
     "trade_analysis_backfill_final_market",
@@ -419,6 +427,17 @@ class TradeAnalysisService:
         ]
         current_row_ids = {id(row) for row in current_rows}
         legacy_rows = [row for row in dataset.rows if id(row) not in current_row_ids]
+        scoreability_since = _as_utc(getattr(self.settings, "trade_behavior_snapshot_scoreability_since", None)) or current_cutoff
+        scoreability_rows = [
+            row
+            for row in dataset.rows
+            if (_as_utc(row.get("decision_ts")) or datetime.min.replace(tzinfo=UTC)) >= scoreability_since
+        ]
+        scoreability_missing_market_snapshot_count = sum(
+            1
+            for row in scoreability_rows
+            if "missing_market_snapshot" in row.get("exclusion_reasons", [])
+        )
         current_missing_market_snapshot_count = sum(
             1
             for row in current_rows
@@ -463,6 +482,11 @@ class TradeAnalysisService:
             ),
             "current_missing_market_snapshot_count": current_missing_market_snapshot_count,
             "current_data_defect_count": current_data_defect_count,
+            "new_row_scoreability": {
+                "since": scoreability_since.isoformat(),
+                "row_count": len(scoreability_rows),
+                "missing_market_snapshot_count": scoreability_missing_market_snapshot_count,
+            },
             "legacy_coverage_debt_count": legacy_coverage_debt_count,
             "stale_market_snapshot_diagnostics": self._stale_market_snapshot_diagnostics(dataset.rows),
             "opportunity_metrics": self._opportunity_metrics(dataset.rows),
@@ -1429,6 +1453,8 @@ class TradeAnalysisService:
             "row_count": len(rows),
             "training_eligible_count": len(eligible),
             "excluded_count": len(rows) - len(eligible),
+            "snapshot_source_counts": dict(Counter(row.get("market_snapshot_source") or "<missing>" for row in rows)),
+            "snapshot_source_kind_counts": dict(Counter(row.get("market_snapshot_source_kind") or "<missing>" for row in rows)),
             "read_only": True,
         }
 

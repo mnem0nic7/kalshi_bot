@@ -336,6 +336,10 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
         messages = await repo.list_messages(room.id)
         audit = await repo.get_room_strategy_audit(room.id)
         weather_snapshots = await repo.list_historical_weather_snapshots(station_id="KNYC")
+        market_snapshots = await repo.list_historical_market_snapshots(
+            market_ticker="WX-TEST",
+            source_kind="decision_signal_market_snapshot",
+        )
         await session.commit()
 
     assert stored_room is not None
@@ -343,6 +347,8 @@ async def test_supervisor_completes_room_workflow(tmp_path) -> None:
     assert any(message.role == "trader" for message in messages)
     assert any(message.kind == "ExecReceipt" for message in messages)
     assert audit is not None
+    assert len(market_snapshots) == 1
+    assert market_snapshots[0].payload["snapshot_provenance"]["leakage_risk"] == "none"
     assert audit.audit_source == "live_forward"
     assert weather_snapshots
     assert weather_snapshots[0].source_hash is not None
@@ -442,6 +448,10 @@ async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_pa
         trade_ticket = await repo.get_latest_trade_ticket_for_room(room.id)
         orders = await repo.list_orders_for_room(room.id)
         market_artifact = await repo.get_latest_artifact(room_id=room.id, artifact_type="market_snapshot")
+        market_snapshots = await repo.list_historical_market_snapshots(
+            market_ticker="WX-TRACE",
+            source_kind="decision_signal_market_snapshot",
+        )
         supervisor_messages = [
             message
             for message in await repo.list_messages(room.id)
@@ -460,7 +470,10 @@ async def test_deterministic_fast_path_persists_replayable_decision_trace(tmp_pa
     assert market_artifact is not None
     assert market_artifact.source == "kalshi_rest"
     assert market_artifact.payload["market"]["observed_at"] is not None
+    assert len(market_snapshots) == 1
+    assert market_snapshots[0].source_id.startswith("signal:")
     assert decision_trace.source_snapshot_ids["market_snapshot_artifact_id"] == market_artifact.id
+    assert decision_trace.source_snapshot_ids["decision_market_snapshot_id"] == market_snapshots[0].id
     assert replay_decision_trace(decision_trace.trace, expected_trace_hash=decision_trace.trace_hash).ok
     assert supervisor_messages[-1].payload["decision_trace_id"] == decision_trace.id
 

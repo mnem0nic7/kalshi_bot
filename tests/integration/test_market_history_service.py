@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import MarketPriceHistory
+from kalshi_bot.db.models import HistoricalMarketSnapshotRecord, MarketPriceHistory
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.market_history import MarketHistoryService
@@ -66,9 +66,13 @@ async def test_market_history_snapshots_open_position_markets_even_when_discover
 
     async with session_factory() as session:
         rows = list((await session.execute(select(MarketPriceHistory))).scalars())
+        historical_rows = list((await session.execute(select(HistoricalMarketSnapshotRecord))).scalars())
 
     assert written == 2
     assert kalshi.requests == ["WX-DISCOVERED", "WX-HELD"]
     assert {row.market_ticker for row in rows} == {"WX-DISCOVERED", "WX-HELD"}
+    assert {row.market_ticker for row in historical_rows} == {"WX-DISCOVERED", "WX-HELD"}
+    assert {row.source_kind for row in historical_rows} == {"daemon_market_price_snapshot"}
+    assert all(row.payload["snapshot_provenance"]["leakage_risk"] == "point_in_time" for row in historical_rows)
 
     await engine.dispose()
