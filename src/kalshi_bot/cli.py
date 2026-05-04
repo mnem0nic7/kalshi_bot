@@ -590,11 +590,19 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
 
 
 async def _run_crypto_model_command(args: argparse.Namespace, container: AppContainer) -> int:
-    if args.crypto_model_command != "train":
+    if args.crypto_model_command == "train":
+        result = await container.crypto_forecast_service.train(frequency=args.frequency)
+    elif args.crypto_model_command == "candidates":
+        result = await container.crypto_forecast_service.candidates(
+            frequency=args.frequency,
+            days=args.days if args.days and args.days > 0 else None,
+        )
+    else:
         raise ValueError(f"unknown crypto-model command {args.crypto_model_command}")
-    result = await container.crypto_forecast_service.train(frequency=args.frequency)
     print(json.dumps(result, indent=2, default=str))
-    return 0 if result.get("status") == "trained" else 1
+    if args.crypto_model_command == "train":
+        return 0 if result.get("status") == "trained" else 1
+    return 0 if result.get("status") in {"ok", "warn"} else 1
 
 
 async def _run_crypto_replay_command(args: argparse.Namespace, container: AppContainer) -> int:
@@ -1895,6 +1903,10 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_model_subparsers = crypto_model.add_subparsers(dest="crypto_model_command", required=True)
     crypto_model_train = crypto_model_subparsers.add_parser("train")
     crypto_model_train.add_argument("--frequency", default="15m")
+    crypto_model_candidates = crypto_model_subparsers.add_parser("candidates")
+    crypto_model_candidates.add_argument("--frequency", default="15m")
+    crypto_model_candidates.add_argument("--days", type=int, default=30)
+    crypto_model_candidates.add_argument("--json", action="store_true")
 
     crypto_replay = subparsers.add_parser("crypto-replay")
     crypto_replay_subparsers = crypto_replay.add_subparsers(dest="crypto_replay_command", required=True)

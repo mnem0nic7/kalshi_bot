@@ -11,6 +11,8 @@ from kalshi_bot.core.enums import ContractSide, RiskStatus, RoomOrigin, StandDow
 from kalshi_bot.core.schemas import ExecReceiptPayload, RiskVerdictPayload, RoomCreate, TradeEligibilityVerdict, TradeTicket
 from kalshi_bot.crypto.models import CryptoMarket
 from kalshi_bot.crypto.services import (
+    CRYPTO_EXPLORATORY_SHADOW,
+    CRYPTO_LIVE_QUALITY,
     CryptoAssetControlService,
     CryptoAutonomyService,
     CryptoHistoryService,
@@ -20,6 +22,11 @@ from kalshi_bot.crypto.services import (
     CryptoReplayService,
     _crypto_data_quality,
     _crypto_decision_rows,
+    _crypto_feature_schema,
+    _crypto_raw_feature_vector,
+    _crypto_trade_candidates,
+    _fit_crypto_calibration,
+    _predict_crypto_probability,
 )
 from kalshi_bot.db.models import OrderRecord, RiskVerdictRecord
 from kalshi_bot.db.repositories import PlatformRepository
@@ -354,6 +361,10 @@ def test_crypto_replay_gate_requires_positive_coverage_and_calibration(tmp_path)
             "hard_cap_breaches": 0,
             "calibration_brier": 0.20,
             "market_mid_brier": 0.25,
+            "calibration_log_loss": 0.55,
+            "market_mid_log_loss": 0.60,
+            "calibration_ece": 0.05,
+            "market_mid_ece": 0.08,
             "candle_count": 1,
         }
     )
@@ -403,6 +414,107 @@ def test_crypto_decision_rows_use_candle_proxy_when_snapshot_quotes_missing(tmp_
     assert len(rows) == 1
     assert rows[0]["quote_source"] == "candlestick_close_proxy"
     assert rows[0]["yes_ask_dollars"] == Decimal("0.6100")
+
+
+def test_crypto_feature_vector_is_deterministic_and_point_in_time(tmp_path) -> None:
+    del tmp_path
+    rows = [
+        {
+            "asset_symbol": "BTC",
+            "mid_yes_dollars": Decimal("0.4500"),
+            "time_to_close_seconds": 300,
+            "spread_bps": 120,
+            "volume": 100,
+            "open_interest": 25,
+            "candle_momentum_dollars": Decimal("0.0100"),
+            "target_price_dollars": Decimal("70000"),
+            "asset_recent_yes_rate": Decimal("0.6000"),
+            "asset_recent_mid_error": Decimal("0.0500"),
+            "quote_source": "snapshot_quotes",
+        },
+        {
+            "asset_symbol": "ETH",
+            "mid_yes_dollars": Decimal("0.5500"),
+            "time_to_close_seconds": 600,
+            "spread_bps": 90,
+            "volume": 200,
+            "open_interest": 50,
+            "candle_momentum_dollars": Decimal("-0.0100"),
+            "target_price_dollars": Decimal("3500"),
+            "asset_recent_yes_rate": None,
+            "asset_recent_mid_error": None,
+            "quote_source": "candlestick_close_proxy",
+        },
+    ]
+
+    schema = _crypto_feature_schema(rows)
+    first = _crypto_raw_feature_vector(rows[0], schema)
+    second = _crypto_raw_feature_vector(rows[0], schema)
+
+    assert schema["feature_schema_version"] == "crypto-logistic-v1"
+    assert schema["asset_categories"] == ["BTC", "ETH"]
+    assert first == second
+    assert len(first) == len(schema["feature_names"])
+
+
+def test_crypto_serialized_logistic_prediction_is_stable(tmp_path) -> None:
+    del tmp_path
+    base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    rows = []
+    for idx in range(8):
+        rows.append(
+            {
+                "row_id": f"row-{idx}",
+                "market_ticker": f"KXBTC15M-{idx}",
+                "asset_symbol": "BTC" if idx < 4 else "ETH",
+                "mid_yes_dollars": Decimal("0.3000") if idx % 2 == 0 else Decimal("0.7000"),
+                "yes_bid_dollars": Decimal("0.2900") if idx % 2 == 0 else Decimal("0.6900"),
+                "yes_ask_dollars": Decimal("0.3100") if idx % 2 == 0 else Decimal("0.7100"),
+                "no_ask_dollars": Decimal("0.7100") if idx % 2 == 0 else Decimal("0.3100"),
+                "time_to_close_seconds": 300,
+                "spread_bps": 200,
+                "volume": 100 + idx,
+                "open_interest": 50 + idx,
+                "candle_momentum_dollars": Decimal("0.0100") if idx % 2 == 0 else Decimal("-0.0100"),
+                "target_price_dollars": Decimal("70000"),
+                "asset_recent_yes_rate": Decimal("0.5000"),
+                "asset_recent_mid_error": Decimal("0.0000"),
+                "quote_source": "snapshot_quotes",
+                "label_yes": 1 if idx % 2 == 0 else 0,
+                "decision_ts": base + timedelta(minutes=idx),
+                "settlement_ts": base + timedelta(minutes=idx + 1),
+                "market_day": "2026-05-01",
+            }
+        )
+
+    model = _fit_crypto_calibration(rows)
+    first = _predict_crypto_probability(rows[0], model)
+    second = _predict_crypto_probability(rows[0], model)
+
+    assert model["model_type"] == "sklearn_logistic"
+    assert model["feature_schema_version"] == "crypto-logistic-v1"
+    assert first == second
+    assert Decimal("0.0100") <= first <= Decimal("0.9900")
+
+
+def test_crypto_candidate_quality_classifies_live_and_exploratory(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    row = {
+        "market_ticker": "KXBTC15M-CAND",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.4700"),
+        "yes_ask_dollars": Decimal("0.4900"),
+        "no_ask_dollars": Decimal("0.5300"),
+        "spread_bps": 200,
+    }
+
+    live = _crypto_trade_candidates(row, Decimal("0.6000"), settings=settings)
+    exploratory = _crypto_trade_candidates(row, Decimal("0.5000"), settings=settings)
+
+    assert live[0]["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert exploratory[0]["candidate_status"] == CRYPTO_EXPLORATORY_SHADOW
+    assert exploratory[0]["live_eligible"] is False
 
 
 def test_crypto_data_quality_reports_per_asset_gaps(tmp_path) -> None:
