@@ -1,0 +1,212 @@
+name: Model Quality
+
+"on":
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+    inputs:
+      kalshi_env:
+        description: Environment to evaluate
+        type: choice
+        options:
+          - demo
+          - production
+        default: demo
+      domain:
+        description: Model domain to evaluate
+        type: choice
+        options:
+          - all
+          - weather
+          - crypto
+        default: all
+      days:
+        description: Historical window in days
+        default: "180"
+      frequency:
+        description: Crypto market frequency
+        default: "15m"
+      persist:
+        description: Store the model-quality trend checkpoint
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  model-quality:
+    name: Daily Model Quality Loop
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
+      DEPLOY_SSH_ADDRESS_FAMILY: ${{ secrets.DEPLOY_SSH_ADDRESS_FAMILY || 'inet' }}
+      DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
+      INPUT_KALSHI_ENV: ${{ github.event.inputs.kalshi_env }}
+      INPUT_DOMAIN: ${{ github.event.inputs.domain }}
+      INPUT_DAYS: ${{ github.event.inputs.days }}
+      INPUT_FREQUENCY: ${{ github.event.inputs.frequency }}
+      INPUT_PERSIST: ${{ github.event.inputs.persist }}
+
+    steps:
+      - name: Skip when deploy secrets are missing
+        if: env.DEPLOY_HOST == '' || env.DEPLOY_USER == '' || env.DEPLOY_SSH_KEY == '' || env.DEPLOY_APP_DIR == ''
+        run: |
+          {
+            echo "## Model Quality"
+            echo
+            echo "Skipped remote model-quality loop because one or more required deploy secrets are missing."
+            echo "Needed: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_APP_DIR"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Prepare SSH
+        if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' && env.DEPLOY_APP_DIR != ''
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if ! [[ "${DEPLOY_SSH_PORT}" =~ ^[0-9]+$ ]] || (( DEPLOY_SSH_PORT < 1 || DEPLOY_SSH_PORT > 65535 )); then
+            echo "Invalid DEPLOY_SSH_PORT: ${DEPLOY_SSH_PORT}" >&2
+            exit 1
+          fi
+          case "${DEPLOY_SSH_ADDRESS_FAMILY}" in
+            any|inet|inet6) ;;
+            *) echo "Invalid DEPLOY_SSH_ADDRESS_FAMILY: ${DEPLOY_SSH_ADDRESS_FAMILY}" >&2; exit 1 ;;
+          esac
+          keyscan_family_flag=()
+          case "${DEPLOY_SSH_ADDRESS_FAMILY}" in
+            inet) keyscan_family_flag=(-4) ;;
+            inet6) keyscan_family_flag=(-6) ;;
+          esac
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          if ! ssh-keyscan "${keyscan_family_flag[@]}" -p "${DEPLOY_SSH_PORT}" -T 15 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>ssh-keyscan.err; then
+            cat ssh-keyscan.err >&2 || true
+            echo "::warning::ssh-keyscan failed for ${DEPLOY_HOST}:${DEPLOY_SSH_PORT}; SSH will use StrictHostKeyChecking=accept-new"
+          fi
+
+      - name: Run quality loop
+        if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' && env.DEPLOY_APP_DIR != ''
+        run: |
+          set -euo pipefail
+
+          kalshi_env="${INPUT_KALSHI_ENV:-demo}"
+          domain="${INPUT_DOMAIN:-all}"
+          days="${INPUT_DAYS:-180}"
+          frequency="${INPUT_FREQUENCY:-15m}"
+          persist="${INPUT_PERSIST:-true}"
+
+          case "${kalshi_env}" in
+            demo|production) ;;
+            *) echo "Invalid kalshi_env: ${kalshi_env}" >&2; exit 1 ;;
+          esac
+          case "${domain}" in
+            all|weather|crypto) ;;
+            *) echo "Invalid domain: ${domain}" >&2; exit 1 ;;
+          esac
+          case "${frequency}" in
+            15m) ;;
+            *) echo "Invalid frequency: ${frequency}" >&2; exit 1 ;;
+          esac
+          if ! [[ "${days}" =~ ^[0-9]+$ ]] || (( days < 1 || days > 3650 )); then
+            echo "Invalid days: ${days}" >&2
+            exit 1
+          fi
+          case "${persist}" in
+            true|false) ;;
+            *) echo "Invalid persist: ${persist}" >&2; exit 1 ;;
+          esac
+
+          if [[ "${kalshi_env}" == "demo" ]]; then
+            service="app_demo_blue"
+          else
+            service="app_production_blue"
+          fi
+          persist_flag=()
+          if [[ "${persist}" == "true" ]]; then
+            persist_flag=(--persist)
+          fi
+
+          ssh_cmd=(
+            ssh
+            -i ~/.ssh/id_ed25519
+            -p "${DEPLOY_SSH_PORT}"
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o "AddressFamily=${DEPLOY_SSH_ADDRESS_FAMILY}"
+            -o ConnectTimeout=20
+            -o ServerAliveInterval=30
+            -o ServerAliveCountMax=3
+            "${DEPLOY_USER}@${DEPLOY_HOST}"
+          )
+
+          app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
+          compose="docker compose -f infra/docker-compose.yml --env-file .env"
+          remote_cd="cd ${app_dir_quoted}"
+          run_cli="${compose} exec -T ${service} python -m kalshi_bot.cli"
+
+          run_remote_json() {
+            local label="$1"
+            shift
+            local outfile="$1"
+            shift
+            echo "::group::${label}"
+            set +e
+            "${ssh_cmd[@]}" "${remote_cd} && timeout 900 ${run_cli} $*" > "${outfile}"
+            local exit_code=$?
+            set -e
+            if jq -e 'type == "object"' "${outfile}" >/dev/null 2>&1; then
+              if (( exit_code != 0 )); then
+                echo "::warning::${label} reported non-passing status; keeping model-quality loop alive"
+              fi
+            else
+              echo "::warning::${label} failed without JSON; keeping model-quality loop alive"
+              printf '{"status":"command_failed","label":"%s"}\n' "${label}" > "${outfile}"
+            fi
+            cat "${outfile}"
+            echo "::endgroup::"
+          }
+
+          if [[ "${domain}" == "all" || "${domain}" == "crypto" ]]; then
+            run_remote_json "Crypto history status" crypto-history-status.json crypto-history status --frequency "${frequency}" --days "${days}" --json
+            run_remote_json "Crypto model train" crypto-model-train.json crypto-model train --frequency "${frequency}"
+            run_remote_json "Crypto candidate quality" crypto-model-candidates.json crypto-model candidates --frequency "${frequency}" --days "${days}" --json
+            run_remote_json "Crypto replay run" crypto-replay-run.json crypto-replay run --frequency "${frequency}" --days "${days}" --json
+            run_remote_json "Crypto replay validate" crypto-replay-validate.json crypto-replay validate --frequency "${frequency}" --days "${days}" --json
+            run_remote_json "Crypto replay gate" crypto-replay-gate.json crypto-replay gate --frequency "${frequency}"
+          fi
+
+          if [[ "${domain}" == "all" || "${domain}" == "weather" ]]; then
+            run_remote_json "Weather modeling train-shadow" weather-modeling-train-shadow.json modeling train-shadow --kalshi-env "${kalshi_env}" --days "${days}" --json
+            run_remote_json "Weather modeling validate" weather-modeling-validate.json modeling validate --kalshi-env "${kalshi_env}" --days "${days}" --json
+            run_remote_json "Weather backtesting validate" weather-backtesting-validate.json backtesting validate --kalshi-env "${kalshi_env}" --days "${days}" --limit 200 --json
+            run_remote_json "Weather trade-quality report" weather-trade-quality.json trade-behavior quality --kalshi-env "${kalshi_env}" --days "${days}" --limit 20 --json
+            run_remote_json "Weather trade-behavior validate" weather-trade-behavior-validate.json trade-behavior validate --kalshi-env "${kalshi_env}" --days 7 --json
+          fi
+
+          "${ssh_cmd[@]}" \
+            "${remote_cd} && timeout 900 ${run_cli} model-quality status --kalshi-env ${kalshi_env} --domain ${domain} --days ${days} --frequency ${frequency} ${persist_flag[*]} --json" \
+            > model-quality.json
+          jq -e 'type == "object" and .schema_version == "model-quality-report-v1"' model-quality.json >/dev/null
+
+          {
+            echo "## Model Quality"
+            echo
+            echo "- Environment: \`${kalshi_env}\`"
+            echo "- Domain: \`${domain}\`"
+            echo "- Days: \`${days}\`"
+            echo "- Frequency: \`${frequency}\`"
+            echo "- Persisted: \`$(jq -r '.persisted' model-quality.json)\`"
+            echo "- Status: \`$(jq -r '.status' model-quality.json)\`"
+            echo
+            echo "### Report"
+            echo '```json'
+            cat model-quality.json
+            echo
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

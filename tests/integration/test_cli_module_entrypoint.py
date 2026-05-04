@@ -124,12 +124,19 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
 
     history_args = parser.parse_args(["crypto-history", "status", "--frequency", "15m", "--json"])
     autonomy_args = parser.parse_args(["crypto-autonomy", "run-once", "--frequency", "15m", "--json"])
+    model_quality_args = parser.parse_args(
+        ["model-quality", "status", "--kalshi-env", "demo", "--domain", "all", "--json"]
+    )
 
     assert history_args.command == "crypto-history"
     assert history_args.crypto_history_command == "status"
     assert history_args.frequency == "15m"
     assert autonomy_args.command == "crypto-autonomy"
     assert autonomy_args.crypto_autonomy_command == "run-once"
+    assert model_quality_args.command == "model-quality"
+    assert model_quality_args.model_quality_command == "status"
+    assert model_quality_args.kalshi_env == "demo"
+    assert model_quality_args.domain == "all"
 
 
 def test_python_module_cli_exposes_parameter_pack_commands() -> None:

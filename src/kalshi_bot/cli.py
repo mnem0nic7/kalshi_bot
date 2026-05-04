@@ -62,6 +62,7 @@ from kalshi_bot.services.backtesting import (
     format_backtesting_report,
     write_backtesting_report,
 )
+from kalshi_bot.services.model_quality import build_model_quality_report, format_model_quality_report
 from kalshi_bot.services.modeling import build_modeling_report, format_modeling_report
 from kalshi_bot.services.trade_behavior_validation import (
     build_trade_behavior_validation_report,
@@ -941,6 +942,28 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "crypto-asset-mode":
             return await _run_crypto_asset_mode_command(args, container)
+
+        if args.command == "model-quality":
+            report = await build_model_quality_report(
+                settings=container.settings,
+                session_factory=container.session_factory,
+                decision_corpus_service=container.decision_corpus_service,
+                trading_audit_service=container.trading_audit_service,
+                trade_analysis_service=container.trade_analysis_service,
+                crypto_market_service=container.crypto_market_service,
+                crypto_forecast_service=container.crypto_forecast_service,
+                crypto_replay_service=container.crypto_replay_service,
+                kalshi_env=args.kalshi_env,
+                domain=args.domain,
+                days=args.days,
+                frequency=args.frequency,
+                persist=args.persist,
+            )
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(format_model_quality_report(report))
+            return 0
 
         if args.command == "research-refresh":
             dossier = await container.research_coordinator.refresh_market_dossier(
@@ -1934,6 +1957,16 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_asset_mode_set = crypto_asset_mode_subparsers.add_parser("set")
     crypto_asset_mode_set.add_argument("symbol")
     crypto_asset_mode_set.add_argument("mode", choices=["off", "shadow", "live"])
+
+    model_quality = subparsers.add_parser("model-quality")
+    model_quality_subparsers = model_quality.add_subparsers(dest="model_quality_command", required=True)
+    model_quality_status = model_quality_subparsers.add_parser("status")
+    model_quality_status.add_argument("--kalshi-env", choices=["demo", "production"], default="demo")
+    model_quality_status.add_argument("--domain", choices=["weather", "crypto", "all"], default="all")
+    model_quality_status.add_argument("--days", type=int, default=180)
+    model_quality_status.add_argument("--frequency", default="15m")
+    model_quality_status.add_argument("--persist", action="store_true")
+    model_quality_status.add_argument("--json", action="store_true")
 
     create_room = subparsers.add_parser("create-room")
     create_room.add_argument("--name", required=True)
