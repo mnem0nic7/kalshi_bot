@@ -224,7 +224,7 @@ async def test_crypto_history_captures_candles_with_market_local_window(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_crypto_history_skips_existing_historical_candles(tmp_path) -> None:
+async def test_crypto_history_refetches_existing_historical_candles_to_fill_gaps(tmp_path) -> None:
     settings = _settings(tmp_path)
     close_time = datetime.now(UTC) - timedelta(days=30)
     market = _market(open_time=close_time - timedelta(minutes=15), close_time=close_time, status="settled")
@@ -251,8 +251,8 @@ async def test_crypto_history_skips_existing_historical_candles(tmp_path) -> Non
         market_service=None,  # type: ignore[arg-type]
     )._capture_candles(_FakeRepo(), market, cutoff=datetime.now(UTC) - timedelta(days=180))  # type: ignore[arg-type]
 
-    assert result == {"status": "skipped_existing", "stored": 0}
-    assert fake_kalshi.calls == 0
+    assert result == {"status": "ok", "stored": 0}
+    assert fake_kalshi.calls == 1
 
 
 class _FakeBaseExecution:
@@ -366,6 +366,8 @@ def test_crypto_replay_gate_requires_positive_coverage_and_calibration(tmp_path)
             "calibration_ece": 0.05,
             "market_mid_ece": 0.08,
             "candle_count": 1,
+            "spot_feature_coverage_pct": 1.0,
+            "strict_trade_eligible_count": 1,
         }
     )
 
@@ -413,7 +415,56 @@ def test_crypto_decision_rows_use_candle_proxy_when_snapshot_quotes_missing(tmp_
 
     assert len(rows) == 1
     assert rows[0]["quote_source"] == "candlestick_close_proxy"
+    assert rows[0]["strict_trade_eligible"] is False
+    assert rows[0]["execution_model_status"] == "proxy_quote_prediction_only"
     assert rows[0]["yes_ask_dollars"] == Decimal("0.6100")
+
+
+def test_crypto_decision_rows_generate_prediction_only_preclose_candle_proxy(tmp_path) -> None:
+    del tmp_path
+    close = datetime(2026, 5, 1, 12, 15, tzinfo=UTC)
+    snapshot = type(
+        "_Snapshot",
+        (),
+        {
+            "market_ticker": "KXBTC15M-PRECLOSE",
+            "series_ticker": "KXBTC15M",
+            "asset_symbol": "BTC",
+            "frequency": "15m",
+            "source_kind": "final_market",
+            "settlement_result": "no",
+            "observed_at": close,
+            "close_time": close,
+            "expected_expiration_time": close,
+            "target_price_dollars": Decimal("100000.00000000"),
+            "yes_bid_dollars": None,
+            "yes_ask_dollars": None,
+            "no_ask_dollars": None,
+            "last_price_dollars": None,
+            "volume": 10,
+            "open_interest": 5,
+        },
+    )()
+    candle = type(
+        "_Candle",
+        (),
+        {
+            "market_ticker": "KXBTC15M-PRECLOSE",
+            "asset_symbol": "BTC",
+            "end_period_ts": close - timedelta(minutes=1),
+            "close_dollars": Decimal("0.3900"),
+            "volume": 7,
+        },
+    )()
+
+    rows = _crypto_decision_rows([snapshot], [candle])  # type: ignore[list-item]
+    proxy_rows = [row for row in rows if row["row_id"].startswith("candle_proxy:")]
+
+    assert len(proxy_rows) == 1
+    assert proxy_rows[0]["source_kind"] == "kalshi_candlestick_replay_proxy"
+    assert proxy_rows[0]["prediction_eligible"] is True
+    assert proxy_rows[0]["strict_trade_eligible"] is False
+    assert proxy_rows[0]["execution_model_status"] == "proxy_quote_prediction_only"
 
 
 def test_crypto_feature_vector_is_deterministic_and_point_in_time(tmp_path) -> None:
@@ -451,7 +502,7 @@ def test_crypto_feature_vector_is_deterministic_and_point_in_time(tmp_path) -> N
     first = _crypto_raw_feature_vector(rows[0], schema)
     second = _crypto_raw_feature_vector(rows[0], schema)
 
-    assert schema["feature_schema_version"] == "crypto-logistic-v1"
+    assert schema["feature_schema_version"] == "crypto-logistic-v2"
     assert schema["asset_categories"] == ["BTC", "ETH"]
     assert first == second
     assert len(first) == len(schema["feature_names"])
@@ -492,7 +543,7 @@ def test_crypto_serialized_logistic_prediction_is_stable(tmp_path) -> None:
     second = _predict_crypto_probability(rows[0], model)
 
     assert model["model_type"] == "sklearn_logistic"
-    assert model["feature_schema_version"] == "crypto-logistic-v1"
+    assert model["feature_schema_version"] == "crypto-logistic-v2"
     assert first == second
     assert Decimal("0.0100") <= first <= Decimal("0.9900")
 
@@ -515,6 +566,26 @@ def test_crypto_candidate_quality_classifies_live_and_exploratory(tmp_path) -> N
     assert live[0]["candidate_status"] == CRYPTO_LIVE_QUALITY
     assert exploratory[0]["candidate_status"] == CRYPTO_EXPLORATORY_SHADOW
     assert exploratory[0]["live_eligible"] is False
+
+
+def test_crypto_proxy_quote_rows_are_prediction_only(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=50)
+    row = {
+        "market_ticker": "KXBTC15M-PROXY",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 0,
+        "strict_trade_eligible": False,
+        "execution_model_status": "proxy_quote_prediction_only",
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.9000"), settings=settings)
+
+    assert {candidate["candidate_status"] for candidate in candidates} == {"prediction_only_proxy_quote"}
+    assert all(candidate["live_eligible"] is False for candidate in candidates)
 
 
 def test_crypto_data_quality_reports_per_asset_gaps(tmp_path) -> None:

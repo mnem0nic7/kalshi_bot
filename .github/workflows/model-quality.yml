@@ -173,12 +173,17 @@ jobs:
           }
 
           if [[ "${domain}" == "all" || "${domain}" == "crypto" ]]; then
+            run_remote_json "Crypto spot status" crypto-spot-status.json crypto-spot status --frequency "${frequency}" --days "${days}" --json
+            run_remote_json "Crypto spot backfill" crypto-spot-backfill.json crypto-spot backfill --frequency "${frequency}" --days "${days}" --json
             run_remote_json "Crypto history status" crypto-history-status.json crypto-history status --frequency "${frequency}" --days "${days}" --json
             run_remote_json "Crypto model train" crypto-model-train.json crypto-model train --frequency "${frequency}"
             run_remote_json "Crypto candidate quality" crypto-model-candidates.json crypto-model candidates --frequency "${frequency}" --days "${days}" --json
             run_remote_json "Crypto replay run" crypto-replay-run.json crypto-replay run --frequency "${frequency}" --days "${days}" --json
             run_remote_json "Crypto replay validate" crypto-replay-validate.json crypto-replay validate --frequency "${frequency}" --days "${days}" --json
             run_remote_json "Crypto replay gate" crypto-replay-gate.json crypto-replay gate --frequency "${frequency}"
+            if [[ "${kalshi_env}" == "demo" ]]; then
+              run_remote_json "Crypto demo shadow run-once" crypto-autonomy-run-once.json crypto-autonomy run-once --frequency "${frequency}" --json
+            fi
           fi
 
           if [[ "${domain}" == "all" || "${domain}" == "weather" ]]; then

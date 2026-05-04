@@ -123,6 +123,7 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     parser = cli_module.build_parser()
 
     history_args = parser.parse_args(["crypto-history", "status", "--frequency", "15m", "--json"])
+    spot_args = parser.parse_args(["crypto-spot", "status", "--frequency", "15m", "--assets", "BTC", "--json"])
     autonomy_args = parser.parse_args(["crypto-autonomy", "run-once", "--frequency", "15m", "--json"])
     model_quality_args = parser.parse_args(
         ["model-quality", "status", "--kalshi-env", "demo", "--domain", "all", "--json"]
@@ -131,6 +132,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert history_args.command == "crypto-history"
     assert history_args.crypto_history_command == "status"
     assert history_args.frequency == "15m"
+    assert spot_args.command == "crypto-spot"
+    assert spot_args.crypto_spot_command == "status"
+    assert spot_args.assets == ["BTC"]
     assert autonomy_args.command == "crypto-autonomy"
     assert autonomy_args.crypto_autonomy_command == "run-once"
     assert model_quality_args.command == "model-quality"

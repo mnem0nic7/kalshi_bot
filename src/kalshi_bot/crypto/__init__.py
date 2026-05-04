@@ -7,6 +7,7 @@ from kalshi_bot.crypto.services import (
     CryptoHistoryService,
     CryptoMarketService,
     CryptoReplayService,
+    CryptoSpotService,
     CryptoWorkflowService,
 )
 
@@ -18,5 +19,6 @@ __all__ = [
     "CryptoMarketService",
     "CryptoReplayService",
     "CryptoSeries",
+    "CryptoSpotService",
     "CryptoWorkflowService",
 ]

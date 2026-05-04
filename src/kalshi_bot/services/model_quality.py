@@ -220,6 +220,9 @@ def _crypto_quality_summary(
         "model_quality": "promotion_ready" if promotion_ready else "shadow_research",
         "baseline": "crypto_market_mid",
         "data_quality": status_report.get("data_quality") or {},
+        "spot_quality": status_report.get("spot_quality") or {},
+        "shadow_evidence": status_report.get("shadow_evidence") or {},
+        "readiness_score": status_report.get("readiness_score") or {},
         "global_live_blockers": status_report.get("global_live_blockers") or [],
         "prediction": prediction,
         "trade_selection": {
@@ -328,10 +331,12 @@ def format_model_quality_report(report: dict[str, Any]) -> str:
             f"prediction_rows={prediction.get('eligible_rows')}"
         )
         if domain == "crypto":
+            readiness = summary.get("readiness_score") or {}
             lines.append(
                 f"  strict_candidates={selection.get('strict_candidate_count')} "
                 f"shadow_candidates={selection.get('shadow_candidate_count')} "
-                f"net={selection.get('net_pnl_after_fees')}"
+                f"net={selection.get('net_pnl_after_fees')} "
+                f"readiness={readiness.get('score')}/10"
             )
         else:
             lines.append(

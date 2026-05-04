@@ -35,6 +35,7 @@ from kalshi_bot.db.models import (
     CryptoMarketCandlestickRecord,
     CryptoMarketSnapshotRecord,
     CryptoModelArtifactRecord,
+    CryptoSpotOHLCRecord,
     DecisionTraceRecord,
     FillRecord,
     ForecastSnapshotRecord,
@@ -992,6 +993,117 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if since is not None:
             stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts >= since)
         stmt = stmt.order_by(CryptoMarketCandlestickRecord.end_period_ts.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def upsert_crypto_spot_ohlc(
+        self,
+        *,
+        provider: str,
+        asset_symbol: str,
+        end_ts: datetime,
+        frequency: str = "15m",
+        kalshi_env: str | None = None,
+        quote_currency: str = "USD",
+        interval_seconds: int = 900,
+        start_ts: datetime | None = None,
+        open_dollars: Decimal | None = None,
+        high_dollars: Decimal | None = None,
+        low_dollars: Decimal | None = None,
+        close_dollars: Decimal | None = None,
+        volume: Decimal | None = None,
+        observed_at: datetime | None = None,
+        source_kind: str = "spot_ohlc",
+        source_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> CryptoSpotOHLCRecord:
+        now = datetime.now(UTC)
+        env = self._resolved_kalshi_env(kalshi_env)
+        insert_values = {
+            "id": str(uuid4()),
+            "kalshi_env": env,
+            "provider": provider,
+            "asset_symbol": asset_symbol,
+            "quote_currency": quote_currency,
+            "frequency": frequency,
+            "interval_seconds": interval_seconds,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "open_dollars": open_dollars,
+            "high_dollars": high_dollars,
+            "low_dollars": low_dollars,
+            "close_dollars": close_dollars,
+            "volume": volume,
+            "observed_at": observed_at or now,
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "payload": payload or {},
+            "created_at": now,
+            "updated_at": now,
+        }
+        update_values = {key: value for key, value in insert_values.items() if key not in {"id", "created_at"}}
+        dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
+        if dialect_name == "postgresql":
+            stmt = pg_insert(CryptoSpotOHLCRecord).values(**insert_values)
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(CryptoSpotOHLCRecord).values(**insert_values)
+        else:
+            record = CryptoSpotOHLCRecord(**insert_values)
+            self.session.add(record)
+            await self.session.flush()
+            return record
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoSpotOHLCRecord.kalshi_env,
+                    CryptoSpotOHLCRecord.provider,
+                    CryptoSpotOHLCRecord.asset_symbol,
+                    CryptoSpotOHLCRecord.quote_currency,
+                    CryptoSpotOHLCRecord.interval_seconds,
+                    CryptoSpotOHLCRecord.end_ts,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+        result = (
+            await self.session.execute(
+                select(CryptoSpotOHLCRecord).where(
+                    CryptoSpotOHLCRecord.kalshi_env == env,
+                    CryptoSpotOHLCRecord.provider == provider,
+                    CryptoSpotOHLCRecord.asset_symbol == asset_symbol,
+                    CryptoSpotOHLCRecord.quote_currency == quote_currency,
+                    CryptoSpotOHLCRecord.interval_seconds == interval_seconds,
+                    CryptoSpotOHLCRecord.end_ts == end_ts,
+                )
+            )
+        ).scalar_one()
+        return result
+
+    async def list_crypto_spot_ohlc(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        provider: str | None = None,
+        asset_symbol: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[CryptoSpotOHLCRecord]:
+        stmt = select(CryptoSpotOHLCRecord).where(
+            CryptoSpotOHLCRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+        )
+        if frequency is not None:
+            stmt = stmt.where(CryptoSpotOHLCRecord.frequency == frequency)
+        if provider is not None:
+            stmt = stmt.where(CryptoSpotOHLCRecord.provider == provider)
+        if asset_symbol is not None:
+            stmt = stmt.where(CryptoSpotOHLCRecord.asset_symbol == asset_symbol)
+        if since is not None:
+            stmt = stmt.where(CryptoSpotOHLCRecord.end_ts >= since)
+        if until is not None:
+            stmt = stmt.where(CryptoSpotOHLCRecord.end_ts <= until)
+        stmt = stmt.order_by(CryptoSpotOHLCRecord.end_ts.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
     async def record_crypto_model_artifact(

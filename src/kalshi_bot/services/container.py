@@ -18,6 +18,7 @@ from kalshi_bot.crypto.services import (
     CryptoHistoryService,
     CryptoMarketService,
     CryptoReplayService,
+    CryptoSpotService,
     CryptoWorkflowService,
 )
 from kalshi_bot.db.repositories import PlatformRepository
@@ -120,6 +121,7 @@ class AppContainer:
     crypto_autonomy_service: CryptoAutonomyService
     crypto_market_service: CryptoMarketService
     crypto_history_service: CryptoHistoryService
+    crypto_spot_service: CryptoSpotService
     crypto_forecast_service: CryptoForecastService
     crypto_replay_service: CryptoReplayService
     crypto_execution_service: CryptoExecutionService
@@ -188,6 +190,10 @@ class AppContainer:
             asset_control_service=crypto_asset_control_service,
         )
         crypto_forecast_service = CryptoForecastService(
+            settings=settings,
+            session_factory=session_factory,
+        )
+        crypto_spot_service = CryptoSpotService(
             settings=settings,
             session_factory=session_factory,
         )
@@ -422,6 +428,7 @@ class AppContainer:
             momentum_calibration_service=momentum_calibration_service,
             decision_corpus_service=decision_corpus_service,
             crypto_history_service=crypto_history_service,
+            crypto_spot_service=crypto_spot_service,
             crypto_autonomy_service=crypto_autonomy_service,
         )
         container = cls(
@@ -474,6 +481,7 @@ class AppContainer:
             crypto_autonomy_service=crypto_autonomy_service,
             crypto_market_service=crypto_market_service,
             crypto_history_service=crypto_history_service,
+            crypto_spot_service=crypto_spot_service,
             crypto_forecast_service=crypto_forecast_service,
             crypto_replay_service=crypto_replay_service,
             crypto_execution_service=crypto_execution_service,

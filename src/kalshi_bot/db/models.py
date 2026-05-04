@@ -173,6 +173,41 @@ class CryptoMarketCandlestickRecord(Base, IdMixin, TimestampMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class CryptoSpotOHLCRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "crypto_spot_ohlc"
+    __table_args__ = (
+        UniqueConstraint(
+            "kalshi_env",
+            "provider",
+            "asset_symbol",
+            "quote_currency",
+            "interval_seconds",
+            "end_ts",
+            name="uq_crypto_spot_ohlc_period",
+        ),
+        Index("ix_crypto_spot_ohlc_asset_period", "asset_symbol", "end_ts"),
+        Index("ix_crypto_spot_ohlc_provider_asset", "provider", "asset_symbol"),
+    )
+
+    kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False, default="demo", index=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    asset_symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    quote_currency: Mapped[str] = mapped_column(String(8), nullable=False, default="USD", index=True)
+    frequency: Mapped[str] = mapped_column(String(32), nullable=False, default="15m", index=True)
+    interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=900)
+    start_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    open_dollars: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    high_dollars: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    low_dollars: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    close_dollars: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    volume: Mapped[Decimal | None] = mapped_column(Numeric(24, 8), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    source_kind: Mapped[str] = mapped_column(String(64), nullable=False, default="spot_ohlc")
+    source_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class CryptoModelArtifactRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "crypto_model_artifacts"
     __table_args__ = (

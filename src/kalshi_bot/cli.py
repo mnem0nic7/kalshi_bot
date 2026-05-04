@@ -590,6 +590,26 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
     return 0
 
 
+async def _run_crypto_spot_command(args: argparse.Namespace, container: AppContainer) -> int:
+    asset_symbols = args.assets if getattr(args, "assets", None) else None
+    if args.crypto_spot_command == "backfill":
+        result = await container.crypto_spot_service.backfill(
+            days=args.days,
+            frequency=args.frequency,
+            asset_symbols=asset_symbols,
+        )
+    elif args.crypto_spot_command == "status":
+        result = await container.crypto_spot_service.status(
+            frequency=args.frequency,
+            days=args.days if args.days and args.days > 0 else None,
+            asset_symbols=asset_symbols,
+        )
+    else:
+        raise ValueError(f"unknown crypto-spot command {args.crypto_spot_command}")
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("status") in {"ok", "warn"} else 1
+
+
 async def _run_crypto_model_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.crypto_model_command == "train":
         result = await container.crypto_forecast_service.train(frequency=args.frequency)
@@ -927,6 +947,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "crypto-history":
             return await _run_crypto_history_command(args, container)
+
+        if args.command == "crypto-spot":
+            return await _run_crypto_spot_command(args, container)
 
         if args.command == "crypto-model":
             return await _run_crypto_model_command(args, container)
@@ -1921,6 +1944,19 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_history_status.add_argument("--frequency", default="15m")
     crypto_history_status.add_argument("--days", type=int, default=0)
     crypto_history_status.add_argument("--json", action="store_true")
+
+    crypto_spot = subparsers.add_parser("crypto-spot")
+    crypto_spot_subparsers = crypto_spot.add_subparsers(dest="crypto_spot_command", required=True)
+    crypto_spot_backfill = crypto_spot_subparsers.add_parser("backfill")
+    crypto_spot_backfill.add_argument("--days", type=int, default=180)
+    crypto_spot_backfill.add_argument("--frequency", default="15m")
+    crypto_spot_backfill.add_argument("--assets", nargs="*", default=None)
+    crypto_spot_backfill.add_argument("--json", action="store_true")
+    crypto_spot_status = crypto_spot_subparsers.add_parser("status")
+    crypto_spot_status.add_argument("--frequency", default="15m")
+    crypto_spot_status.add_argument("--days", type=int, default=0)
+    crypto_spot_status.add_argument("--assets", nargs="*", default=None)
+    crypto_spot_status.add_argument("--json", action="store_true")
 
     crypto_model = subparsers.add_parser("crypto-model")
     crypto_model_subparsers = crypto_model.add_subparsers(dest="crypto_model_command", required=True)

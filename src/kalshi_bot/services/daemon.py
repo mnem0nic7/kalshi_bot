@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import HistoricalIntelligenceRunRequest, ShadowCampaignRequest
-from kalshi_bot.crypto.services import CryptoAutonomyService, CryptoHistoryService
+from kalshi_bot.crypto.services import CryptoAutonomyService, CryptoHistoryService, CryptoSpotService
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.services.discovery import DiscoveryService
@@ -71,6 +71,7 @@ class DaemonService:
         momentum_calibration_service: MomentumCalibrationService | None = None,
         decision_corpus_service: DecisionCorpusService | None = None,
         crypto_history_service: CryptoHistoryService | None = None,
+        crypto_spot_service: CryptoSpotService | None = None,
         crypto_autonomy_service: CryptoAutonomyService | None = None,
     ) -> None:
         self.settings = settings
@@ -99,6 +100,7 @@ class DaemonService:
         self.momentum_calibration_service = momentum_calibration_service
         self.decision_corpus_service = decision_corpus_service
         self.crypto_history_service = crypto_history_service
+        self.crypto_spot_service = crypto_spot_service
         self.crypto_autonomy_service = crypto_autonomy_service
         self.stop_loss_service = stop_loss_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
@@ -161,6 +163,7 @@ class DaemonService:
             "auto_rooms_enabled": self.settings.trigger_enable_auto_rooms,
             "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
             "crypto_history_auto_enabled": self.settings.crypto_history_auto_enabled,
+            "crypto_spot_history_auto_enabled": self.settings.crypto_spot_history_auto_enabled,
             "heartbeat_at": self._now_iso(),
         }
         async with self.session_factory() as session:
@@ -240,6 +243,7 @@ class DaemonService:
             "strategy_c": asyncio.create_task(self._periodic_strategy_c_loop()),
             "monotonicity_arb": asyncio.create_task(self._periodic_monotonicity_arb_loop()),
             "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
+            "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
             "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
         }
         if run_seconds is not None:
@@ -376,6 +380,9 @@ class DaemonService:
             await asyncio.sleep(self.settings.crypto_autonomy_interval_seconds)
             if self.crypto_autonomy_service is None or not self.settings.crypto_autonomy_enabled:
                 continue
+            if self.settings.kalshi_env != "demo":
+                logger.info("crypto autonomy enabled but skipped outside demo env")
+                continue
             if not await self._is_active_color():
                 continue
             try:
@@ -397,6 +404,21 @@ class DaemonService:
                 )
             except Exception:
                 logger.warning("crypto history loop error", exc_info=True)
+
+    async def _periodic_crypto_spot_history_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.crypto_history_auto_interval_seconds)
+            if self.crypto_spot_service is None or not self.settings.crypto_spot_history_auto_enabled:
+                continue
+            if not await self._is_active_color():
+                continue
+            try:
+                await self.crypto_spot_service.backfill(
+                    days=self.settings.crypto_spot_history_auto_lookback_days,
+                    frequency="15m",
+                )
+            except Exception:
+                logger.warning("crypto spot history loop error", exc_info=True)
 
     async def _run_heartbeat_follow_up(self, payload: dict[str, Any]) -> None:
         if (
