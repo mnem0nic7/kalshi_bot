@@ -1962,6 +1962,30 @@ class CryptoWorkflowService:
                 )
                 if verdict.status != RiskStatus.APPROVED:
                     await repo.update_trade_ticket_status(ticket_record.id, "blocked")
+                    if self.settings.app_shadow_mode or room.shadow_mode or live_status["asset_mode"] == CRYPTO_ASSET_MODE_SHADOW:
+                        receipt = ExecReceiptPayload(
+                            status="shadow_skipped",
+                            client_order_id=client_order_id,
+                            details={
+                                "reason": "risk_blocked_before_execution",
+                                "asset_symbol": market.asset_symbol,
+                                "asset_mode": live_status["asset_mode"],
+                                "live_eligible": live_status["live_eligible"],
+                                "risk_status": verdict.status.value,
+                                "risk_reasons": verdict.reasons,
+                                "no_order_submitted": True,
+                            },
+                        )
+                        await repo.append_message(
+                            room.id,
+                            RoomMessageCreate(
+                                role=AgentRole.EXECUTION_CLERK,
+                                kind=MessageKind.EXEC_RECEIPT,
+                                stage=RoomStage.EXECUTING,
+                                content=f"Crypto execution status: {receipt.status}.",
+                                payload=receipt.model_dump(mode="json"),
+                            ),
+                        )
                     await repo.update_room_stage(room.id, RoomStage.COMPLETE)
                     await session.commit()
                     return

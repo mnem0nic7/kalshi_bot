@@ -28,7 +28,7 @@ from kalshi_bot.crypto.services import (
     _fit_crypto_calibration,
     _predict_crypto_probability,
 )
-from kalshi_bot.db.models import OrderRecord, RiskVerdictRecord
+from kalshi_bot.db.models import OrderRecord, RiskVerdictRecord, RoomMessage
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.signal import StrategySignal
@@ -292,6 +292,15 @@ class _ApproveRiskEngine:
             status=RiskStatus.APPROVED,
             approved_count_fp=ticket.count_fp,
             approved_notional_dollars=ticket.yes_price_dollars * ticket.count_fp,
+        )
+
+
+class _BlockRiskEngine:
+    def evaluate(self, **kwargs) -> RiskVerdictPayload:
+        del kwargs
+        return RiskVerdictPayload(
+            status=RiskStatus.BLOCKED,
+            reasons=["unit risk block"],
         )
 
 
@@ -999,6 +1008,69 @@ async def test_crypto_workflow_shadow_room_creates_shadow_ticket_without_order(t
     assert ticket.payload["asset_mode"] == "shadow"
     assert ticket.payload["crypto_modeling"] is not None
     assert len(verdicts) == 1
+    assert orders == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_workflow_shadow_risk_block_records_shadow_skipped_receipt(tmp_path) -> None:
+    settings = _settings(tmp_path, app_shadow_mode=False, crypto_trading_enabled=False)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    market = _market(close_time=datetime.now(UTC) + timedelta(minutes=10), yes_bid_dollars=Decimal("0.0100"))
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    execution = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=_FakeBaseExecution(),  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    workflow = CryptoWorkflowService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=_FakeWorkflowMarketService(market),  # type: ignore[arg-type]
+        forecast_service=_FakeForecastService(),  # type: ignore[arg-type]
+        risk_engine=_BlockRiskEngine(),  # type: ignore[arg-type]
+        execution_service=execution,
+        asset_control_service=asset_control,
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC shadow risk block", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=True,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.SHADOW.value,
+        )
+        await session.commit()
+
+    await workflow.run_room(room.id, reason="test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        messages = list((await session.execute(select(RoomMessage))).scalars())
+        orders = list((await session.execute(select(OrderRecord))).scalars())
+        await session.commit()
+
+    receipts = [message for message in messages if message.kind == "ExecReceipt"]
+    assert ticket is not None
+    assert ticket.status == "blocked"
+    assert verdict is not None
+    assert verdict.status == RiskStatus.BLOCKED.value
+    assert len(receipts) == 1
+    assert "shadow_skipped" in receipts[0].content
+    assert receipts[0].payload["details"]["reason"] == "risk_blocked_before_execution"
+    assert receipts[0].payload["details"]["no_order_submitted"] is True
     assert orders == []
     await engine.dispose()
 
