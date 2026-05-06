@@ -2,16 +2,17 @@
 set -euo pipefail
 
 compose_file="infra/docker-compose.yml"
+compose_env_file="--env-file .env"
 
 build_migrate_image() {
   local env_name="$1"
-  docker compose -f "${compose_file}" build "migrate_${env_name}" >/dev/null
+  docker compose -f "${compose_file}" ${compose_env_file} build "migrate_${env_name}" >/dev/null
 }
 
 container_status() {
   local service="$1"
   local container_id
-  container_id="$(docker compose -f "${compose_file}" ps -q "${service}" 2>/dev/null || true)"
+  container_id="$(docker compose -f "${compose_file}" ${compose_env_file} ps -q "${service}" 2>/dev/null || true)"
   if [[ -z "${container_id}" ]]; then
     printf '%s\n' "missing"
     return
@@ -25,16 +26,16 @@ run_control() {
   local -a cmd=("$@")
   local primary_service="app_${env_name}_blue"
   local secondary_service="app_${env_name}_green"
-  if [[ -n "$(docker compose -f "${compose_file}" ps --status running -q "${primary_service}" 2>/dev/null || true)" ]]; then
-    docker compose -f "${compose_file}" exec -T "${primary_service}" "${cmd[@]}"
+  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q "${primary_service}" 2>/dev/null || true)" ]]; then
+    docker compose -f "${compose_file}" ${compose_env_file} exec -T "${primary_service}" "${cmd[@]}"
     return
   fi
-  if [[ -n "$(docker compose -f "${compose_file}" ps --status running -q "${secondary_service}" 2>/dev/null || true)" ]]; then
-    docker compose -f "${compose_file}" exec -T "${secondary_service}" "${cmd[@]}"
+  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q "${secondary_service}" 2>/dev/null || true)" ]]; then
+    docker compose -f "${compose_file}" ${compose_env_file} exec -T "${secondary_service}" "${cmd[@]}"
     return
   fi
   build_migrate_image "${env_name}"
-  docker compose -f "${compose_file}" run --rm --no-deps "migrate_${env_name}" "${cmd[@]}"
+  docker compose -f "${compose_file}" ${compose_env_file} run --rm --no-deps "migrate_${env_name}" "${cmd[@]}"
 }
 
 record_action() {
@@ -72,7 +73,7 @@ execute_plan() {
       return 0
       ;;
     restart_color)
-      if docker compose -f "${compose_file}" restart "app_${env_name}_${target}" "daemon_${env_name}_${target}"; then
+      if docker compose -f "${compose_file}" ${compose_env_file} restart "app_${env_name}_${target}" "daemon_${env_name}_${target}"; then
         record_action "${env_name}" "restart_color" "succeeded" "${reason}" "${target}" "${failed}"
       else
         record_action "${env_name}" "restart_color" "failed" "${reason}" "${target}" "${failed}"
@@ -94,7 +95,7 @@ execute_plan() {
       fi
       ;;
     failover)
-      if docker compose -f "${compose_file}" restart "app_${env_name}_${failed}" "daemon_${env_name}_${failed}"; then
+      if docker compose -f "${compose_file}" ${compose_env_file} restart "app_${env_name}_${failed}" "daemon_${env_name}_${failed}"; then
         record_action "${env_name}" "failover" "succeeded" "${reason}" "${target}" "${failed}"
       else
         record_action "${env_name}" "failover" "failed" "${reason}" "${target}" "${failed}"
