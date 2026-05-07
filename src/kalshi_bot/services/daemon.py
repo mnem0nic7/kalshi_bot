@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -105,6 +106,8 @@ class DaemonService:
         self.stop_loss_service = stop_loss_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
+        self._active_color_cache: tuple[float, bool] | None = None
+        self._last_market_update_dispatched_at: dict[str, float] = {}
 
     async def _recover_orphaned_rooms(self) -> None:
         async with self.session_factory() as session:
@@ -301,6 +304,8 @@ class DaemonService:
         return selected_markets
 
     async def _handle_market_update(self, market_ticker: str) -> None:
+        if not self._market_update_dispatch_due(market_ticker):
+            return
         if not await self._is_active_color():
             return
         await self.research_coordinator.handle_market_update(market_ticker)
@@ -308,11 +313,32 @@ class DaemonService:
             await self.auto_trigger_service.handle_market_update(market_ticker)
 
     async def _is_active_color(self) -> bool:
+        cache_ttl = max(0.0, float(self.settings.daemon_active_color_cache_seconds))
+        now = time.monotonic()
+        if cache_ttl > 0.0 and self._active_color_cache is not None:
+            expires_at, cached_result = self._active_color_cache
+            if now < expires_at:
+                return cached_result
+
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             await session.commit()
-        return control.active_color == self.settings.app_color
+        is_active = control.active_color == self.settings.app_color
+        if cache_ttl > 0.0:
+            self._active_color_cache = (now + cache_ttl, is_active)
+        return is_active
+
+    def _market_update_dispatch_due(self, market_ticker: str) -> bool:
+        interval = max(0.0, float(self.settings.daemon_market_update_throttle_seconds))
+        if interval <= 0.0:
+            return True
+        now = time.monotonic()
+        last_dispatched_at = self._last_market_update_dispatched_at.get(market_ticker)
+        if last_dispatched_at is not None and now - last_dispatched_at < interval:
+            return False
+        self._last_market_update_dispatched_at[market_ticker] = now
+        return True
 
     async def _periodic_reconcile_loop(self) -> None:
         while True:

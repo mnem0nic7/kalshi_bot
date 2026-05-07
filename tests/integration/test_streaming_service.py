@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import Checkpoint, FillRecord, MarketState, OpsEvent, OrderRecord
+from kalshi_bot.db.models import Checkpoint, FillRecord, MarketState, OpsEvent, OrderRecord, RawExchangeEvent
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.streaming import MarketStreamService
@@ -322,6 +322,89 @@ async def test_streaming_service_handles_interleaved_market_sequences_by_sid(tmp
     assert str(alpha.yes_bid_dollars) == "0.4400"
     assert str(beta.yes_bid_dollars) == "0.3300"
     assert checkpoint.cursor == "3"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_service_throttles_orderbook_delta_persistence(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/stream-throttle.db",
+        stream_orderbook_persist_interval_seconds=60.0,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = MarketStreamService(settings, session_factory, DummyWebSocketClient())  # type: ignore[arg-type]
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await service.process_message(
+            repo,
+            {
+                "type": "orderbook_snapshot",
+                "sid": 4,
+                "seq": 1,
+                "msg": {
+                    "market_ticker": "WX-TEST",
+                    "yes_dollars_fp": [["0.4300", "4.00"]],
+                    "no_dollars_fp": [["0.5200", "6.00"]],
+                },
+            },
+        )
+        await service.process_message(
+            repo,
+            {
+                "type": "orderbook_delta",
+                "sid": 4,
+                "seq": 2,
+                "msg": {
+                    "market_ticker": "WX-TEST",
+                    "side": "yes",
+                    "price_dollars": "0.4400",
+                    "delta_fp": "3.00",
+                },
+            },
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        market_state = (await session.execute(select(MarketState).where(MarketState.market_ticker == "WX-TEST"))).scalar_one()
+        checkpoint = (await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws:demo:blue:4"))).scalar_one()
+        raw_events = list((await session.execute(select(RawExchangeEvent))).scalars())
+
+    assert str(service.orderbooks["WX-TEST"].best_yes_bid) == "0.4400"
+    assert str(market_state.yes_bid_dollars) == "0.4300"
+    assert checkpoint.cursor == "1"
+    assert [event.event_type for event in raw_events] == ["orderbook_snapshot"]
+
+    service._last_orderbook_persisted_at["WX-TEST"] -= 61.0
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await service.process_message(
+            repo,
+            {
+                "type": "orderbook_delta",
+                "sid": 4,
+                "seq": 3,
+                "msg": {
+                    "market_ticker": "WX-TEST",
+                    "side": "yes",
+                    "price_dollars": "0.4500",
+                    "delta_fp": "1.00",
+                },
+            },
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        market_state = (await session.execute(select(MarketState).where(MarketState.market_ticker == "WX-TEST"))).scalar_one()
+        checkpoint = (await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws:demo:blue:4"))).scalar_one()
+        raw_events = list((await session.execute(select(RawExchangeEvent).order_by(RawExchangeEvent.id))).scalars())
+
+    assert str(market_state.yes_bid_dollars) == "0.4500"
+    assert checkpoint.cursor == "3"
+    assert [event.event_type for event in raw_events] == ["orderbook_snapshot", "orderbook_delta"]
 
     await engine.dispose()
 

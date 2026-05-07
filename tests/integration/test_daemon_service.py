@@ -445,6 +445,47 @@ async def test_inactive_daemon_color_does_not_run_market_update_side_effects(tmp
 
 
 @pytest.mark.asyncio
+async def test_daemon_throttles_repeated_market_update_side_effects(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-update-throttle.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        daemon_market_update_throttle_seconds=60.0,
+        trigger_enable_auto_rooms=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    stream_service = FakeStreamService(updates=["WX-TEST", "WX-TEST"])
+    research = FakeResearchCoordinator()
+    auto_trigger = FakeAutoTriggerService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        stream_service,  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        research,  # type: ignore[arg-type]
+        auto_trigger,  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+    )
+
+    result = await daemon.run(max_messages=1)
+
+    assert result["completed"] == "stream"
+    assert research.market_updates == ["WX-TEST"]
+    assert auto_trigger.market_updates == ["WX-TEST"]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_daemon_streams_open_position_markets_even_when_discovery_rolls_forward(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-open-position-stream.db",

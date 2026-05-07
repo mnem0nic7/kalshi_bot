@@ -292,6 +292,10 @@ class Settings(BaseSettings):
     research_web_max_results: int = 5
     research_web_max_queries: int = 2
     stream_error_log_cooldown_seconds: int = 900
+    # Hot websocket books can emit many orderbook deltas per second. Keep the
+    # in-memory book current on every message, but optionally coalesce database
+    # writes and downstream daemon callbacks to this cadence.
+    stream_orderbook_persist_interval_seconds: float = 0.0
     trigger_enable_auto_rooms: bool = False
     trigger_cooldown_seconds: int = 300
     trigger_price_move_bypass_bps: int = 1500
@@ -304,6 +308,8 @@ class Settings(BaseSettings):
     daemon_reconcile_interval_seconds: int = 60
     daemon_reconcile_stale_kill_switch_seconds: int = 300
     daemon_heartbeat_interval_seconds: int = 60
+    daemon_active_color_cache_seconds: float = 0.0
+    daemon_market_update_throttle_seconds: float = 0.0
     daemon_market_history_interval_seconds: int = 60
     daemon_market_history_retention_hours: int = 24
     daemon_memory_note_retention_days: int = 90

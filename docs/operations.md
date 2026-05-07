@@ -101,6 +101,11 @@ The behavior is controlled by:
 - `DAEMON_RECONCILE_INTERVAL_SECONDS`
 - `DAEMON_HEARTBEAT_INTERVAL_SECONDS`
 - `DAEMON_START_WITH_RECONCILE`
+- `STREAM_ORDERBOOK_PERSIST_INTERVAL_SECONDS` throttles websocket orderbook-delta database writes while keeping the in-memory book current on every message. `0` preserves the old write-every-delta behavior.
+- `DAEMON_MARKET_UPDATE_THROTTLE_SECONDS` coalesces downstream research and auto-trigger callbacks per market.
+- `DAEMON_ACTIVE_COLOR_CACHE_SECONDS` caches the blue/green active-color lookup used on hot market updates.
+
+The Compose stack defaults those throttle values to `1.0`, `2.0`, and `5.0` seconds respectively.
 
 The daemon also monitors staged agent-pack canaries and live-monitor windows. When a candidate pack is staged on the inactive color, the rollout is recorded first as `pending_pack_promotion:<env>:<color>`, then that color's daemon applies the new pack on startup before producing canary shadow rooms during heartbeats. If the canary sits longer than `SELF_IMPROVE_CANARY_MAX_SECONDS`, `self-improve status` and the control room mark it `stalled` instead of pretending rollout is still in progress.
 

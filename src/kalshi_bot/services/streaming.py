@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -100,6 +101,7 @@ class MarketStreamService:
         self.orderbooks: dict[str, OrderBookState] = {}
         self.channel_names: dict[int, str] = {}
         self.sid_sequences: dict[int, int] = {}
+        self._last_orderbook_persisted_at: dict[str, float] = {}
 
     async def stream(
         self,
@@ -170,32 +172,46 @@ class MarketStreamService:
         message_type = message.get("type", "unknown")
         sid = int(message.get("sid", 0) or 0)
         seq = message.get("seq")
+        market_ticker = self._market_ticker_for_message(message)
         if message_type == "subscribed" and sid and message.get("msg", {}).get("channel"):
             self.channel_names[sid] = message["msg"]["channel"]
-        await repo.log_exchange_event("ws", message_type, message, market_ticker=self._market_ticker_for_message(message))
         if sid and seq is not None:
             self._validate_sid_sequence(
                 sid=sid,
                 seq=int(seq),
                 message_type=message_type,
-                market_ticker=self._market_ticker_for_message(message),
+                market_ticker=market_ticker,
             )
+
+        should_persist_event = True
+        if message_type == "orderbook_delta":
+            should_persist_event = self._should_persist_orderbook_delta(market_ticker)
+
+        if should_persist_event:
+            await repo.log_exchange_event("ws", message_type, message, market_ticker=market_ticker)
         if sid:
-            await repo.set_checkpoint(
-                self._checkpoint_name(sid),
-                str(seq) if seq is not None else None,
-                {"message_type": message_type, "message": message},
-            )
+            if should_persist_event:
+                await repo.set_checkpoint(
+                    self._checkpoint_name(sid),
+                    str(seq) if seq is not None else None,
+                    {"message_type": message_type, "message": message},
+                )
 
         if message_type == "orderbook_snapshot":
             await self._handle_orderbook_snapshot(repo, message, sid=sid, seq=seq)
-            return self._market_ticker_for_message(message)
+            return market_ticker
         elif message_type == "orderbook_delta":
-            await self._handle_orderbook_delta(repo, message, sid=sid, seq=seq)
-            return self._market_ticker_for_message(message)
+            persisted = await self._handle_orderbook_delta(
+                repo,
+                message,
+                sid=sid,
+                seq=seq,
+                persist=should_persist_event,
+            )
+            return market_ticker if persisted else None
         elif message_type == "market_lifecycle_v2":
             await self._handle_market_lifecycle(repo, message)
-            return self._market_ticker_for_message(message)
+            return market_ticker
         elif message_type == "user_order":
             await self._handle_user_order(repo, message)
         elif message_type == "fill":
@@ -253,8 +269,17 @@ class MarketStreamService:
         self.orderbooks[market_ticker] = OrderBookState.from_snapshot(msg, seq=seq)
         FEED_FRESHNESS_SECONDS.labels(feed="kalshi_ws").set(0)
         await self._persist_market_state(repo, market_ticker)
+        self._last_orderbook_persisted_at[market_ticker] = time.monotonic()
 
-    async def _handle_orderbook_delta(self, repo: PlatformRepository, message: dict[str, Any], *, sid: int, seq: int | None) -> None:
+    async def _handle_orderbook_delta(
+        self,
+        repo: PlatformRepository,
+        message: dict[str, Any],
+        *,
+        sid: int,
+        seq: int | None,
+        persist: bool,
+    ) -> bool:
         msg = message["msg"]
         market_ticker = msg["market_ticker"]
         state = self.orderbooks.get(market_ticker)
@@ -266,10 +291,14 @@ class MarketStreamService:
                 source="stream",
                 payload={"market_ticker": market_ticker, "sid": sid, "seq": seq, "message": msg},
             )
-            return
+            return False
         state.apply_delta(msg, seq=seq)
         FEED_FRESHNESS_SECONDS.labels(feed="kalshi_ws").set(0)
+        if not persist:
+            return False
         await self._persist_market_state(repo, market_ticker)
+        self._last_orderbook_persisted_at[market_ticker] = time.monotonic()
+        return True
 
     async def _handle_market_lifecycle(self, repo: PlatformRepository, message: dict[str, Any]) -> None:
         msg = message["msg"]
@@ -372,6 +401,16 @@ class MarketStreamService:
         self.orderbooks.clear()
         self.channel_names.clear()
         self.sid_sequences.clear()
+        self._last_orderbook_persisted_at.clear()
+
+    def _should_persist_orderbook_delta(self, market_ticker: str | None) -> bool:
+        interval = max(0.0, float(self.settings.stream_orderbook_persist_interval_seconds))
+        if interval <= 0.0 or market_ticker is None:
+            return True
+        last_persisted_at = self._last_orderbook_persisted_at.get(market_ticker)
+        if last_persisted_at is None:
+            return True
+        return time.monotonic() - last_persisted_at >= interval
 
     def _validate_sid_sequence(
         self,

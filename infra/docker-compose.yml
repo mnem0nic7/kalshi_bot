@@ -3,10 +3,16 @@ x-build: &build
     context: ..
     dockerfile: infra/docker/Dockerfile
 
+x-cpu-limits: &cpu-limits
+  cpuset: "1-7"
+
 x-common-env-base: &common-env-base
   APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
   APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
   APP_SHADOW_MODE: ${APP_SHADOW_MODE:-true}
+  STREAM_ORDERBOOK_PERSIST_INTERVAL_SECONDS: ${STREAM_ORDERBOOK_PERSIST_INTERVAL_SECONDS:-1.0}
+  DAEMON_MARKET_UPDATE_THROTTLE_SECONDS: ${DAEMON_MARKET_UPDATE_THROTTLE_SECONDS:-2.0}
+  DAEMON_ACTIVE_COLOR_CACHE_SECONDS: ${DAEMON_ACTIVE_COLOR_CACHE_SECONDS:-5.0}
   CRYPTO_AUTONOMY_ENABLED: ${CRYPTO_AUTONOMY_ENABLED:-false}
   CRYPTO_AUTONOMY_INTERVAL_SECONDS: ${CRYPTO_AUTONOMY_INTERVAL_SECONDS:-60}
   CRYPTO_AUTONOMY_MIN_SECONDS_TO_CLOSE: ${CRYPTO_AUTONOMY_MIN_SECONDS_TO_CLOSE:-120}
@@ -56,7 +62,7 @@ x-codex-volumes: &codex-volumes
   - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
 
 x-app-common: &app-common
-  <<: *build
+  <<: [*build, *cpu-limits]
   env_file: [../.env]
   expose: ["8000"]
   volumes: *codex-volumes
@@ -91,7 +97,7 @@ x-production-app-base: &production-app-base
       condition: service_completed_successfully
 
 x-daemon-common: &daemon-common
-  <<: *build
+  <<: [*build, *cpu-limits]
   command: ["python", "-m", "kalshi_bot.cli", "daemon"]
   env_file: [../.env]
   volumes: *codex-volumes
@@ -121,6 +127,7 @@ x-production-daemon-base: &production-daemon-base
 
 services:
   postgres_demo:
+    <<: *cpu-limits
     image: pgvector/pgvector:pg16
     env_file: [../.env]
     environment:
@@ -137,6 +144,7 @@ services:
       - postgres_demo_data:/var/lib/postgresql/data
 
   postgres_production:
+    <<: *cpu-limits
     image: pgvector/pgvector:pg16
     env_file: [../.env]
     environment:
@@ -289,6 +297,7 @@ services:
         condition: service_healthy
 
   caddy:
+    <<: *cpu-limits
     image: caddy:2.9-alpine
     env_file: [../.env]
     environment:
