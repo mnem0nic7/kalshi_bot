@@ -81,6 +81,17 @@ class FakeDiscoveryService:
         return ["WX-DISCOVERED"]
 
 
+class BlockingDiscoveryService:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def list_stream_markets(self) -> list[str]:
+        self.started.set()
+        await self.release.wait()
+        return ["WX-DISCOVERED"]
+
+
 class FakeShadowTrainingService:
     async def run_shadow_sweep(self, *, limit=None, reason="shadow_sweep", markets=None):
         return []
@@ -271,6 +282,8 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
         daemon_start_with_reconcile=True,
         daemon_reconcile_interval_seconds=60,
         daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -309,7 +322,7 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
 
     async with session_factory() as session:
         heartbeat = (
-            await session.execute(select(OpsEvent).where(OpsEvent.source == "daemon").order_by(OpsEvent.updated_at.desc()))
+            await session.execute(select(OpsEvent).where(OpsEvent.source == "daemon").order_by(OpsEvent.updated_at.desc()).limit(1))
         ).scalar_one()
         heartbeat_checkpoint = (
             await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:demo:blue"))
@@ -331,6 +344,121 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_daemon_run_writes_heartbeat_before_startup_warmup(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-startup-warmup.db",
+        daemon_start_with_reconcile=True,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=60,
+        daemon_startup_jitter_seconds=0,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    stream_service = FakeStreamService()
+    reconciliation_service = FakeReconciliationService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        stream_service,  # type: ignore[arg-type]
+        reconciliation_service,  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+    )
+
+    async def wait_for_heartbeat_checkpoint() -> Checkpoint:
+        while True:
+            async with session_factory() as session:
+                checkpoint = (
+                    await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:demo:blue"))
+                ).scalar_one_or_none()
+            if checkpoint is not None:
+                return checkpoint
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(daemon.run(max_messages=1))
+    try:
+        checkpoint = await asyncio.wait_for(wait_for_heartbeat_checkpoint(), timeout=10)
+        assert checkpoint.payload["app_color"] == "blue"
+        assert "heartbeat_at" in checkpoint.payload
+        assert reconciliation_service.calls == []
+        assert stream_service.calls == []
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_stays_fresh_during_startup_discovery(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-startup-discovery.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=1,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    discovery_service = BlockingDiscoveryService()
+    stream_service = FakeStreamService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        discovery_service,  # type: ignore[arg-type]
+        stream_service,  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+    )
+
+    async def wait_for_heartbeat_count(expected_count: int) -> list[OpsEvent]:
+        while True:
+            async with session_factory() as session:
+                events = (
+                    await session.execute(
+                        select(OpsEvent)
+                        .where(OpsEvent.source == "daemon", OpsEvent.summary == "Daemon heartbeat")
+                        .order_by(OpsEvent.created_at.asc())
+                    )
+                ).scalars().all()
+            if len(events) >= expected_count:
+                return list(events)
+            await asyncio.sleep(0.05)
+
+    task = asyncio.create_task(daemon.run(max_messages=1))
+    try:
+        await asyncio.wait_for(discovery_service.started.wait(), timeout=2)
+        events = await asyncio.wait_for(wait_for_heartbeat_count(2), timeout=3)
+        assert len(events) >= 2
+        assert stream_service.calls == []
+        discovery_service.release.set()
+        result = await asyncio.wait_for(task, timeout=2)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await engine.dispose()
+
+    assert result["completed"] == "stream"
+    assert stream_service.calls == [["WX-DISCOVERED"]]
+
+
+@pytest.mark.asyncio
 async def test_daemon_heartbeat_uses_settings_kalshi_env_for_control_state(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-prod-control.db",
@@ -339,6 +467,8 @@ async def test_daemon_heartbeat_uses_settings_kalshi_env_for_control_state(tmp_p
         daemon_start_with_reconcile=False,
         daemon_reconcile_interval_seconds=60,
         daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -401,6 +531,8 @@ async def test_inactive_daemon_color_does_not_run_market_update_side_effects(tmp
         daemon_start_with_reconcile=False,
         daemon_reconcile_interval_seconds=60,
         daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
         trigger_enable_auto_rooms=True,
     )
     engine = create_engine(settings)
@@ -451,6 +583,8 @@ async def test_daemon_throttles_repeated_market_update_side_effects(tmp_path) ->
         daemon_start_with_reconcile=False,
         daemon_reconcile_interval_seconds=60,
         daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
         daemon_market_update_throttle_seconds=60.0,
         trigger_enable_auto_rooms=True,
     )
@@ -492,6 +626,8 @@ async def test_daemon_streams_open_position_markets_even_when_discovery_rolls_fo
         daemon_start_with_reconcile=False,
         daemon_reconcile_interval_seconds=60,
         daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -540,6 +676,8 @@ async def test_daemon_heartbeat_runs_checkpoint_capture_without_rooms(tmp_path) 
         daemon_start_with_reconcile=False,
         daemon_reconcile_interval_seconds=60,
         daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -577,6 +715,8 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
         daemon_start_with_reconcile=False,
         daemon_reconcile_interval_seconds=60,
         daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)

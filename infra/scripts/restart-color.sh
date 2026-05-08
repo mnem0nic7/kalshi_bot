@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+refresh_caddy=false
+if [[ "${1:-}" == "--refresh-caddy" ]]; then
+  refresh_caddy=true
+  shift
+fi
+
 if [[ $# -eq 1 ]]; then
   target_env="all"
-  color="${1:?usage: restart-color.sh [demo|production] <blue|green>}"
+  color="${1:?usage: restart-color.sh [--refresh-caddy] [demo|production|all] <blue|green>}"
 elif [[ $# -eq 2 ]]; then
-  target_env="${1:?usage: restart-color.sh [demo|production] <blue|green>}"
-  color="${2:?usage: restart-color.sh [demo|production] <blue|green>}"
+  target_env="${1:?usage: restart-color.sh [--refresh-caddy] [demo|production|all] <blue|green>}"
+  color="${2:?usage: restart-color.sh [--refresh-caddy] [demo|production|all] <blue|green>}"
 else
-  echo "usage: restart-color.sh [demo|production] <blue|green>" >&2
+  echo "usage: restart-color.sh [--refresh-caddy] [demo|production|all] <blue|green>" >&2
   exit 1
 fi
 compose_file="infra/docker-compose.yml"
@@ -22,9 +28,15 @@ if [[ "${color}" != "blue" && "${color}" != "green" ]]; then
   exit 1
 fi
 if [[ "${target_env}" != "all" && "${target_env}" != "demo" && "${target_env}" != "production" ]]; then
-  echo "env must be demo or production" >&2
+  echo "env must be demo, production, or all" >&2
   exit 1
 fi
+
+docker compose -f "${compose_file}" ${compose_env_file} config >/dev/null
+
+build_app_image() {
+  docker compose -f "${compose_file}" ${compose_env_file} build migrate_demo >/dev/null
+}
 
 service_health() {
   local service="$1"
@@ -55,31 +67,63 @@ wait_for_service_health() {
   return 1
 }
 
+wait_for_services_health() {
+  local timeout_seconds="$1"
+  shift
+  local service
+  local -a pids=()
+  local status=0
+  for service in "$@"; do
+    wait_for_service_health "${service}" "${timeout_seconds}" &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      status=1
+    fi
+  done
+  return "${status}"
+}
+
 envs=("demo" "production")
 if [[ "${target_env}" != "all" ]]; then
   envs=("${target_env}")
 fi
+
+build_app_image
 
 for env_name in "${envs[@]}"; do
   app_service="app_${env_name}_${color}"
   daemon_service="daemon_${env_name}_${color}"
   docker compose -f "${compose_file}" ${compose_env_file} stop "${app_service}" "${daemon_service}" 2>/dev/null || true
   docker compose -f "${compose_file}" ${compose_env_file} rm -f "${app_service}" "${daemon_service}" 2>/dev/null || true
-  docker compose -f "${compose_file}" ${compose_env_file} up -d --build --no-deps \
+  docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps \
     "${app_service}" "${daemon_service}"
   wait_for_service_health "${app_service}" 180
 done
 
-docker compose -f "${compose_file}" ${compose_env_file} up -d --build --no-deps \
-  web_demo web_production web_strategies
-wait_for_service_health web_demo 180
-wait_for_service_health web_production 180
-wait_for_service_health web_strategies 180
+web_services=("web_strategies")
+if [[ "${target_env}" == "all" || "${target_env}" == "demo" ]]; then
+  web_services+=("web_demo")
+fi
+if [[ "${target_env}" == "all" || "${target_env}" == "production" ]]; then
+  web_services+=("web_production")
+fi
 
-# Stop and remove caddy explicitly before recreating to avoid removal-in-progress errors
-docker compose -f "${compose_file}" ${compose_env_file} stop caddy 2>/dev/null || true
-docker compose -f "${compose_file}" ${compose_env_file} rm -f caddy 2>/dev/null || true
-docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps --force-recreate caddy
-wait_for_service_health caddy 90
+docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps --force-recreate \
+  "${web_services[@]}"
+wait_for_services_health 180 "${web_services[@]}"
 
-echo "Recreated ${target_env}/${color} runtime services and refreshed caddy plus site containers"
+if [[ "${refresh_caddy}" == "true" ]]; then
+  # Stop and remove caddy explicitly before recreating to avoid removal-in-progress errors.
+  docker compose -f "${compose_file}" ${compose_env_file} stop caddy 2>/dev/null || true
+  docker compose -f "${compose_file}" ${compose_env_file} rm -f caddy 2>/dev/null || true
+  docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps --force-recreate caddy
+  wait_for_service_health caddy 90
+fi
+
+if [[ "${refresh_caddy}" == "true" ]]; then
+  echo "Recreated ${target_env}/${color} runtime services, targeted site containers, and caddy"
+else
+  echo "Recreated ${target_env}/${color} runtime services and targeted site containers"
+fi

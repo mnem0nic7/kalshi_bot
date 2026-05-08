@@ -1,4 +1,5 @@
 x-build: &build
+  image: ${KALSHI_BOT_IMAGE:-kalshi-bot:local}
   build:
     context: ..
     dockerfile: infra/docker/Dockerfile
@@ -13,6 +14,8 @@ x-common-env-base: &common-env-base
   STREAM_ORDERBOOK_PERSIST_INTERVAL_SECONDS: ${STREAM_ORDERBOOK_PERSIST_INTERVAL_SECONDS:-1.0}
   DAEMON_MARKET_UPDATE_THROTTLE_SECONDS: ${DAEMON_MARKET_UPDATE_THROTTLE_SECONDS:-2.0}
   DAEMON_ACTIVE_COLOR_CACHE_SECONDS: ${DAEMON_ACTIVE_COLOR_CACHE_SECONDS:-5.0}
+  DAEMON_STARTUP_GRACE_SECONDS: ${DAEMON_STARTUP_GRACE_SECONDS:-30}
+  DAEMON_STARTUP_JITTER_SECONDS: ${DAEMON_STARTUP_JITTER_SECONDS:-45}
   CRYPTO_AUTONOMY_ENABLED: ${CRYPTO_AUTONOMY_ENABLED:-false}
   CRYPTO_AUTONOMY_INTERVAL_SECONDS: ${CRYPTO_AUTONOMY_INTERVAL_SECONDS:-60}
   CRYPTO_AUTONOMY_MIN_SECONDS_TO_CLOSE: ${CRYPTO_AUTONOMY_MIN_SECONDS_TO_CLOSE:-120}
@@ -67,9 +70,9 @@ x-app-common: &app-common
   expose: ["8000"]
   volumes: *codex-volumes
   healthcheck:
-    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=15).read()"]
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=30).read()"]
     interval: 60s
-    timeout: 20s
+    timeout: 60s
     retries: 3
     start_period: 90s
   restart: unless-stopped
@@ -223,7 +226,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "-m", "kalshi_bot.docker_healthcheck", "daemon"]
       interval: 60s
-      timeout: 30s
+      timeout: 60s
       retries: 3
       start_period: 120s
 
@@ -236,7 +239,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "-m", "kalshi_bot.docker_healthcheck", "daemon"]
       interval: 60s
-      timeout: 30s
+      timeout: 60s
       retries: 3
       start_period: 120s
 
@@ -249,7 +252,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "-m", "kalshi_bot.docker_healthcheck", "daemon"]
       interval: 60s
-      timeout: 30s
+      timeout: 60s
       retries: 3
       start_period: 120s
 
@@ -262,7 +265,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "-m", "kalshi_bot.docker_healthcheck", "daemon"]
       interval: 60s
-      timeout: 30s
+      timeout: 60s
       retries: 3
       start_period: 120s
 

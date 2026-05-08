@@ -5,9 +5,8 @@ reason="${1:-systemd_boot}"
 compose_file="infra/docker-compose.yml"
 compose_env_file="--env-file .env"
 
-build_migrate_image() {
-  local env_name="$1"
-  docker compose -f "${compose_file}" ${compose_env_file} build "migrate_${env_name}" >/dev/null
+build_app_image() {
+  docker compose -f "${compose_file}" ${compose_env_file} build migrate_demo >/dev/null
 }
 
 service_health() {
@@ -39,10 +38,27 @@ wait_for_service_health() {
   return 1
 }
 
+wait_for_services_health() {
+  local timeout_seconds="$1"
+  shift
+  local service
+  local -a pids=()
+  local status=0
+  for service in "$@"; do
+    wait_for_service_health "${service}" "${timeout_seconds}" &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      status=1
+    fi
+  done
+  return "${status}"
+}
+
 run_migrate() {
   local env_name="$1"
   shift
-  build_migrate_image "${env_name}"
   docker compose -f "${compose_file}" ${compose_env_file} run --rm --no-deps "migrate_${env_name}" "$@"
 }
 
@@ -64,22 +80,30 @@ run_control() {
 }
 
 docker compose -f "${compose_file}" ${compose_env_file} config >/dev/null
+build_app_image
 docker compose -f "${compose_file}" ${compose_env_file} up -d postgres_demo postgres_production
-wait_for_service_health postgres_demo 60
-wait_for_service_health postgres_production 60
-run_migrate demo
-run_migrate production
-docker compose -f "${compose_file}" ${compose_env_file} up -d --build \
+wait_for_services_health 60 postgres_demo postgres_production
+run_migrate demo &
+demo_migrate_pid="$!"
+run_migrate production &
+production_migrate_pid="$!"
+migrate_status=0
+if ! wait "${demo_migrate_pid}"; then
+  migrate_status=1
+fi
+if ! wait "${production_migrate_pid}"; then
+  migrate_status=1
+fi
+if [[ "${migrate_status}" -ne 0 ]]; then
+  exit "${migrate_status}"
+fi
+docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build \
   app_demo_blue app_demo_green daemon_demo_blue daemon_demo_green \
   app_production_blue app_production_green daemon_production_blue daemon_production_green \
   web_demo web_production web_strategies
-wait_for_service_health app_demo_blue 180
-wait_for_service_health app_demo_green 180
-wait_for_service_health app_production_blue 180
-wait_for_service_health app_production_green 180
-wait_for_service_health web_demo 180
-wait_for_service_health web_production 180
-wait_for_service_health web_strategies 180
+wait_for_services_health 180 \
+  app_demo_blue app_demo_green app_production_blue app_production_green \
+  web_demo web_production web_strategies
 docker compose -f "${compose_file}" ${compose_env_file} up -d --force-recreate caddy
 wait_for_service_health caddy 90
 

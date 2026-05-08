@@ -57,6 +57,7 @@ async def _daemon_health() -> int:
         password=os.getenv("POSTGRES_PASSWORD"),
         database=os.getenv("POSTGRES_DB", "kalshi_bot"),
         timeout=5,
+        command_timeout=5,
     )
     try:
         payload = await conn.fetchval(
@@ -64,7 +65,10 @@ async def _daemon_health() -> int:
             stream_name,
         )
     finally:
-        await conn.close()
+        try:
+            await asyncio.wait_for(conn.close(), timeout=1)
+        except Exception:
+            conn.terminate()
 
     now = datetime.now(UTC)
     heartbeat_at = parse_heartbeat_at(payload)

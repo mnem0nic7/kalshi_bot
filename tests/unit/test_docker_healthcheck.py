@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from kalshi_bot.docker_healthcheck import parse_heartbeat_at
+from kalshi_bot.docker_healthcheck import _env_int, parse_heartbeat_at
 
 
 def test_parse_heartbeat_at_accepts_json_string() -> None:
@@ -12,3 +12,14 @@ def test_parse_heartbeat_at_accepts_json_string() -> None:
 def test_parse_heartbeat_at_rejects_missing_or_invalid_payload() -> None:
     assert parse_heartbeat_at({}) is None
     assert parse_heartbeat_at("{not json") is None
+
+
+def test_env_int_uses_default_for_missing_or_invalid_values(monkeypatch) -> None:
+    monkeypatch.delenv("DAEMON_HEARTBEAT_INTERVAL_SECONDS", raising=False)
+    assert _env_int("DAEMON_HEARTBEAT_INTERVAL_SECONDS", 60) == 60
+
+    monkeypatch.setenv("DAEMON_HEARTBEAT_INTERVAL_SECONDS", "not-an-int")
+    assert _env_int("DAEMON_HEARTBEAT_INTERVAL_SECONDS", 60) == 60
+
+    monkeypatch.setenv("DAEMON_HEARTBEAT_INTERVAL_SECONDS", "15")
+    assert _env_int("DAEMON_HEARTBEAT_INTERVAL_SECONDS", 60) == 15

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import asdict
@@ -220,39 +221,54 @@ class DaemonService:
         max_messages: int | None = None,
         run_seconds: float | None = None,
     ) -> dict[str, Any]:
-        selected_markets = await self._select_stream_markets(markets)
         should_auto_trigger = self.settings.trigger_enable_auto_rooms if auto_trigger is None else auto_trigger
         self._auto_trigger_enabled_for_run = should_auto_trigger
 
-        await self.self_improve_service.apply_pending_pack_promotion(app_color=self.settings.app_color)
-        await self._recover_orphaned_rooms()
-        if self.settings.daemon_start_with_reconcile:
-            await self.reconcile_once()
-        self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
-
-        tasks: dict[str, asyncio.Task] = {
-            "stream": asyncio.create_task(
-                self.stream_service.stream(
-                    market_tickers=selected_markets,
-                    include_private=not public_only,
-                    max_messages=max_messages,
-                    on_market_update=self._handle_market_update,
-                )
-            ),
-            "reconcile": asyncio.create_task(self._periodic_reconcile_loop()),
-            "heartbeat": asyncio.create_task(self._periodic_heartbeat_loop()),
-            "market_history": asyncio.create_task(self._periodic_market_history_loop()),
-            "stop_loss": asyncio.create_task(self._periodic_stop_loss_loop()),
-            "strategy_c": asyncio.create_task(self._periodic_strategy_c_loop()),
-            "monotonicity_arb": asyncio.create_task(self._periodic_monotonicity_arb_loop()),
-            "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
-            "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
-            "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
-        }
-        if run_seconds is not None:
-            tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
-
+        tasks: dict[str, asyncio.Task] = {}
         try:
+            await self.heartbeat_once(run_follow_up=False)
+            tasks["heartbeat"] = asyncio.create_task(self._periodic_heartbeat_loop())
+
+            startup_delay = self._startup_delay_seconds()
+            if startup_delay > 0:
+                logger.info(
+                    "Daemon startup warmup delaying heavy work for %.1f seconds env=%s color=%s",
+                    startup_delay,
+                    self.settings.kalshi_env,
+                    self.settings.app_color,
+                )
+                await asyncio.sleep(startup_delay)
+
+            await self.self_improve_service.apply_pending_pack_promotion(app_color=self.settings.app_color)
+            await self._recover_orphaned_rooms()
+            if self.settings.daemon_start_with_reconcile:
+                await self.reconcile_once()
+            self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
+            selected_markets = await self._select_stream_markets(markets)
+
+            tasks.update(
+                {
+                    "stream": asyncio.create_task(
+                        self.stream_service.stream(
+                            market_tickers=selected_markets,
+                            include_private=not public_only,
+                            max_messages=max_messages,
+                            on_market_update=self._handle_market_update,
+                        )
+                    ),
+                    "reconcile": asyncio.create_task(self._periodic_reconcile_loop()),
+                    "market_history": asyncio.create_task(self._periodic_market_history_loop()),
+                    "stop_loss": asyncio.create_task(self._periodic_stop_loss_loop()),
+                    "strategy_c": asyncio.create_task(self._periodic_strategy_c_loop()),
+                    "monotonicity_arb": asyncio.create_task(self._periodic_monotonicity_arb_loop()),
+                    "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
+                    "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
+                    "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
+                }
+            )
+            if run_seconds is not None:
+                tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
+
             done, pending = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
             completed_name = next(name for name, task in tasks.items() if task in done)
 
@@ -973,6 +989,15 @@ class DaemonService:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=UTC)
         return parsed.astimezone(UTC)
+
+    def _startup_delay_seconds(self) -> float:
+        grace = max(0, float(self.settings.daemon_startup_grace_seconds))
+        jitter_window = max(0, int(self.settings.daemon_startup_jitter_seconds))
+        if jitter_window <= 0:
+            return grace
+        key = f"{self.settings.kalshi_env}:{self.settings.app_color}".encode("utf-8")
+        jitter = int.from_bytes(hashlib.sha256(key).digest()[:4], "big") % (jitter_window + 1)
+        return grace + float(jitter)
 
     @staticmethod
     def _now_iso() -> str:

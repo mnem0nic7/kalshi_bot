@@ -38,6 +38,13 @@ alembic upgrade head
 All `app_*` and `daemon_*` containers gate on `migrate_<env>: service_completed_successfully`, so a direct `docker compose up -d` is safe — containers won't start until their env's schema is current.
 
 Always migrate before live promotion.
+
+## Fast deploys
+
+Use `infra/scripts/restart-color.sh <demo|production> <blue|green>` for the normal app deploy path. It builds the shared Python image once, recreates only the requested env/color app and daemon, refreshes the matching web surface plus `web_strategies`, and leaves Caddy alone.
+
+Use `infra/scripts/restart-color.sh --refresh-caddy <demo|production|all> <blue|green>` only when Caddy routing/config also changed. Use `infra/scripts/start-stack.sh` for full host recovery; it still brings up both environments and runs both migration services.
+
 Always migrate before enabling the watchdog timer on an already-running deployment, because the runtime now depends on the newer agent-pack tables and checkpoints.
 
 Deploy finding from April 12, 2026:

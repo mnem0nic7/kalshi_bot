@@ -314,6 +314,8 @@ class Settings(BaseSettings):
     daemon_market_history_retention_hours: int = 24
     daemon_memory_note_retention_days: int = 90
     daemon_start_with_reconcile: bool = True
+    daemon_startup_grace_seconds: int = 30
+    daemon_startup_jitter_seconds: int = 45
     source_health_pause_new_entries_enabled: bool = True
     source_health_broken_pause_consecutive_cycles: int = 3
     source_health_expected_cadence_seconds: int = 21600

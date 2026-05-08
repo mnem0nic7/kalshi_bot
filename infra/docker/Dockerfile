@@ -19,7 +19,8 @@ COPY alembic.ini ./
 COPY docs ./docs
 COPY infra/config ./infra/config
 
-# Re-register editable install with real source (no dep download)
-RUN pip install --no-cache-dir -e .
+# The cached editable install points at /app/src; PYTHONPATH keeps source-only
+# rebuilds from paying another package installation step.
+ENV PYTHONPATH=/app/src
 
 CMD ["python", "-m", "kalshi_bot.main"]
