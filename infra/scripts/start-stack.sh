@@ -104,6 +104,10 @@ docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build \
 wait_for_services_health 180 \
   app_demo_blue app_demo_green app_production_blue app_production_green \
   web_demo web_production web_strategies
+# Stop and remove caddy explicitly before recreating to avoid Docker compose
+# removal-in-progress races during full machine recovery.
+docker compose -f "${compose_file}" ${compose_env_file} stop caddy 2>/dev/null || true
+docker compose -f "${compose_file}" ${compose_env_file} rm -f caddy 2>/dev/null || true
 docker compose -f "${compose_file}" ${compose_env_file} up -d --force-recreate caddy
 wait_for_service_health caddy 90
 
