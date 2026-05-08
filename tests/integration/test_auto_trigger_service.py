@@ -149,8 +149,21 @@ async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> 
     await engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("yes_bid", "yes_ask", "expected_tradeable_sides", "expected_missing_quotes"),
+    [
+        (Decimal("0.7300"), None, ["no"], ["no_bid", "yes_ask"]),
+        (None, Decimal("0.2700"), ["yes"], ["no_ask", "yes_bid"]),
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_trigger_launches_room_for_one_sided_book_with_tradeable_no_side(tmp_path) -> None:
+async def test_auto_trigger_waitlists_one_sided_book_without_launching(
+    tmp_path,
+    yes_bid: Decimal | None,
+    yes_ask: Decimal | None,
+    expected_tradeable_sides: list[str],
+    expected_missing_quotes: list[str],
+) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_one_sided.db",
         trigger_enable_auto_rooms=True,
@@ -172,12 +185,12 @@ async def test_auto_trigger_launches_room_for_one_sided_book_with_tradeable_no_s
             snapshot={
                 "market_ticker": "WX-TEST",
                 "market": {
-                    "yes_bid_dollars": "0.7300",
-                    "yes_ask_dollars": None,
+                    "yes_bid_dollars": str(yes_bid) if yes_bid is not None else None,
+                    "yes_ask_dollars": str(yes_ask) if yes_ask is not None else None,
                 },
             },
-            yes_bid_dollars=Decimal("0.7300"),
-            yes_ask_dollars=None,
+            yes_bid_dollars=yes_bid,
+            yes_ask_dollars=yes_ask,
             last_trade_dollars=None,
         )
         await session.commit()
@@ -186,23 +199,29 @@ async def test_auto_trigger_launches_room_for_one_sided_book_with_tradeable_no_s
     await service.handle_market_update("WX-TEST")
     await service.wait_for_tasks()
 
-    await service.wait_for_tasks()
-
     async with session_factory() as session:
         repo = PlatformRepository(session)
         rooms = await repo.list_rooms(limit=10)
         ops_events = await repo.list_ops_events(limit=10, kalshi_env=settings.kalshi_env)
-        checkpoint = await repo.get_checkpoint("auto_trigger:demo:WX-TEST")
+        checkpoint = await repo.get_checkpoint("auto_trigger_block:demo:WX-TEST:one_sided_book")
+        waitlist = await repo.get_checkpoint("auto_trigger_waitlist:demo:WX-TEST")
+        launch_checkpoint = await repo.get_checkpoint("auto_trigger:demo:WX-TEST")
         await session.commit()
 
-    matching = [event for event in ops_events if "launched room" in event.summary]
-    assert len(rooms) == 1
-    assert len(supervisor.calls) == 1
+    matching = [event for event in ops_events if "one-sided order book" in event.summary]
+    assert rooms == []
+    assert supervisor.calls == []
     assert len(matching) == 1
     assert checkpoint is not None
-    assert checkpoint.payload["one_sided_tradeable_probe"]["one_sided"] is True
-    assert checkpoint.payload["one_sided_tradeable_probe"]["tradeable_sides"] == ["no"]
-    assert checkpoint.payload["one_sided_tradeable_probe"]["actionability"] == "one_sided_book_side_aware_probe"
+    assert checkpoint.payload["reason"] == "one_sided_book"
+    assert checkpoint.payload["actionability"] == "missed_due_to_one_sided_book"
+    assert checkpoint.payload["one_sided"] is True
+    assert checkpoint.payload["tradeable_sides"] == expected_tradeable_sides
+    assert checkpoint.payload["missing_quotes"] == expected_missing_quotes
+    assert waitlist is not None
+    assert waitlist.payload["last_reason"] == "one_sided_book"
+    assert waitlist.payload["last_actionability"] == "missed_due_to_one_sided_book"
+    assert launch_checkpoint is None
 
     await engine.dispose()
 
@@ -261,8 +280,20 @@ async def test_auto_trigger_waitlists_book_with_no_taker_quote(tmp_path) -> None
     await engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("initial_yes_bid", "initial_yes_ask", "expected_initial_reason"),
+    [
+        (None, None, "no_taker_quote"),
+        (Decimal("0.7300"), None, "one_sided_book"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_trigger_rechecks_waitlisted_book_with_rest_quote(tmp_path) -> None:
+async def test_auto_trigger_rechecks_waitlisted_book_with_rest_quote(
+    tmp_path,
+    initial_yes_bid: Decimal | None,
+    initial_yes_ask: Decimal | None,
+    expected_initial_reason: str,
+) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_waitlist_recheck.db",
         trigger_enable_auto_rooms=True,
@@ -294,12 +325,12 @@ async def test_auto_trigger_rechecks_waitlisted_book_with_rest_quote(tmp_path) -
             snapshot={
                 "market_ticker": "WX-TEST",
                 "market": {
-                    "yes_bid_dollars": None,
-                    "yes_ask_dollars": None,
+                    "yes_bid_dollars": str(initial_yes_bid) if initial_yes_bid is not None else None,
+                    "yes_ask_dollars": str(initial_yes_ask) if initial_yes_ask is not None else None,
                 },
             },
-            yes_bid_dollars=None,
-            yes_ask_dollars=None,
+            yes_bid_dollars=initial_yes_bid,
+            yes_ask_dollars=initial_yes_ask,
             last_trade_dollars=None,
         )
         await session.commit()
@@ -332,6 +363,7 @@ async def test_auto_trigger_rechecks_waitlisted_book_with_rest_quote(tmp_path) -
     assert len(rooms) == 1
     assert len(supervisor.calls) == 1
     assert waitlist is not None
+    assert waitlist.payload["last_reason"] == expected_initial_reason
     assert waitlist.payload["status"] == "resolved"
     assert waitlist.payload["resolution_reason"] == "actionable"
     assert state is not None

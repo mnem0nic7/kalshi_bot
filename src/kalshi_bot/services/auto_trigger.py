@@ -675,7 +675,12 @@ class AutoTriggerService:
                 "market_observed_at": self._iso_or_none(market_state.observed_at),
             }
         if missing_quotes:
-            return None
+            one_sided_probe = self._one_sided_tradeable_probe(market_state)
+            return {
+                **one_sided_probe,
+                "reason": "one_sided_book",
+                "actionability": "missed_due_to_one_sided_book",
+            }
 
         spread_bps = self._spread_bps(market_state)
         if spread_bps is None:
