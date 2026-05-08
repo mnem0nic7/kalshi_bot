@@ -772,7 +772,13 @@ def _collapse_trading_activity_rows(rows: list[dict[str, Any]], *, limit: int) -
     return visible
 
 
-async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit: int = RECENT_TRADE_PROPOSAL_LIMIT) -> list[dict[str, Any]]:
+async def _recent_trading_activity_views(
+    session: Any,
+    *,
+    kalshi_env: str,
+    limit: int = RECENT_TRADE_PROPOSAL_LIMIT,
+    market_prefix: str | None = None,
+) -> list[dict[str, Any]]:
     latest_signal = (
         select(
             Signal.room_id.label("room_id"),
@@ -935,6 +941,8 @@ async def _recent_trading_activity_views(session: Any, *, kalshi_env: str, limit
         )
         for row in fill_result.all()
     )
+    if market_prefix:
+        rows = [row for row in rows if str(row.get("market_ticker") or "").startswith(market_prefix)]
     return _collapse_trading_activity_rows(rows, limit=limit)
 
 
@@ -2159,7 +2167,11 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         win_rate_data = await repo.get_fill_win_rate_30d(kalshi_env=kalshi_env)
         session_fill_pnl = await repo.get_session_fill_pnl_summary(kalshi_env=kalshi_env)
         broken_book_data = await repo.get_broken_book_rate_30d(kalshi_env=kalshi_env)
-        recent_trading_activity = await _recent_trading_activity_views(session, kalshi_env=kalshi_env)
+        recent_trading_activity = await _recent_trading_activity_views(
+            session,
+            kalshi_env=kalshi_env,
+            market_prefix="KXHIGH",
+        )
         fallback_capital = thresholds.risk_max_position_notional_dollars
         if fallback_capital is None:
             fallback_capital = 0

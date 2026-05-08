@@ -578,6 +578,30 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
     assert views[2]["note"] == "Book effectively broken."
     assert views[3]["status"] == "proposed"
     assert views[4]["market_ticker"] == "KXHIGHNY-26APR27-T69"
+
+    crypto_ticket = SimpleNamespace(
+        trade_ticket_id="ticket-crypto",
+        market_ticker="KXSOL15M-26MAY061345-45",
+        action="buy",
+        side="yes",
+        yes_price_dollars=Decimal("0.0100"),
+        count_fp=Decimal("1.00"),
+        status="blocked",
+        risk_status="blocked",
+        risk_reasons=["Room is in shadow mode."],
+        approved_notional_dollars=None,
+        signal_payload=None,
+        created_at=now + timedelta(minutes=2),
+        updated_at=now + timedelta(minutes=2),
+    )
+    weather_views = await control_room_module._recent_trading_activity_views(
+        _SequenceSession([[crypto_ticket, *ticket_rows], order_rows, fill_rows]),
+        kalshi_env="demo",
+        market_prefix="KXHIGH",
+    )
+
+    assert all(item["market_ticker"].startswith("KXHIGH") for item in weather_views)
+    assert "KXSOL15M-26MAY061345-45" not in [item["market_ticker"] for item in weather_views]
     assert views[4]["activity_label"] == "Sold NO"
     assert views[4]["updated_at"] == (now - timedelta(days=4)).isoformat()
     assert views[5]["market_ticker"] == "KXHIGHNY-26APR24-T67"
