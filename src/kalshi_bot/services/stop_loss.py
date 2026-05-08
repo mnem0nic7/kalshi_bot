@@ -10,9 +10,9 @@ import numpy as np
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import FillRecord, MarketPriceHistory, MarketState, PositionRecord
-from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.core.enums import StrategyCode
+from kalshi_bot.db.models import MarketPriceHistory, MarketState, PositionRecord
+from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED,
@@ -50,9 +50,8 @@ def _sell_price(market_state: MarketState, side: str) -> Decimal | None:
     if side == "yes":
         price = market_state.yes_bid_dollars
     else:
-        # For NO sell: yes_price_dollars = yes_ask.
-        # SELL NO at P means min acceptable NO price = 1-P; fills when NO bid >= 1-P.
-        # yes_ask = 1 - no_bid, so P = yes_ask -> 1-P = no_bid -> fills at the NO bid.
+        # Kalshi's order API prices every order with yes_price_dollars. For a
+        # NO sell at the current NO bid, the corresponding YES price is yes_ask.
         price = market_state.yes_ask_dollars
     if price is None or price <= Decimal("0") or price >= Decimal("1"):
         return None
@@ -63,64 +62,14 @@ def _side_price(mid_yes: Decimal, side: str) -> Decimal:
     return mid_yes if side == "yes" else Decimal("1") - mid_yes
 
 
-def _price_history_since(
-    prices: list[MarketPriceHistory],
-    opened_at: datetime | None,
-) -> list[MarketPriceHistory]:
-    opened_at = _as_utc(opened_at)
-    if opened_at is None:
-        return prices
-    return [
-        row
-        for row in prices
-        if (_as_utc(row.observed_at) or datetime.min.replace(tzinfo=UTC)) >= opened_at
-    ]
-
-
-def _peak_price_from_history(
-    prices: list[MarketPriceHistory],
-    side: str,
-    *,
-    opened_at: datetime | None = None,
-) -> Decimal | None:
-    """Return the highest side-appropriate mid price while this position was held."""
+def _peak_price_from_history(prices: list[MarketPriceHistory], side: str) -> Decimal | None:
+    """Return the day's highest side-appropriate mid price from price history."""
     candidates = [
         _side_price(row.mid_dollars, side)
-        for row in _price_history_since(prices, opened_at)
+        for row in prices
         if row.mid_dollars is not None
     ]
     return max(candidates) if candidates else None
-
-
-def _position_opened_at_from_fills(position: PositionRecord, fills: list[FillRecord]) -> datetime | None:
-    """Infer when the current open lot began by replaying same-side fills."""
-    running = Decimal("0")
-    opened_at: datetime | None = None
-    for fill in sorted(fills, key=lambda item: _as_utc(item.created_at) or datetime.min.replace(tzinfo=UTC)):
-        if fill.market_ticker != position.market_ticker or str(fill.side) != str(position.side):
-            continue
-        delta = Decimal(str(fill.count_fp or "0"))
-        if str(fill.action).lower() == "sell":
-            delta = -delta
-        if running <= 0 and delta > 0:
-            opened_at = _as_utc(fill.created_at)
-        running += delta
-        if running <= 0:
-            opened_at = None
-    return opened_at
-
-
-def _position_opened_at(position: PositionRecord, fills: list[FillRecord]) -> datetime | None:
-    return _position_opened_at_from_fills(position, fills) or _as_utc(position.created_at)
-
-
-def _parse_iso_datetime(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
-    except ValueError:
-        return None
 
 
 def _trailing_loss_ratio(peak: Decimal, current: Decimal) -> float:
@@ -171,7 +120,7 @@ class StopLossService:
 
         # Load positions and market states in one read session
         async with self.session_factory() as session:
-            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            repo = PlatformRepository(session)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             if control.active_color != self.settings.app_color:
                 await session.commit()
@@ -190,10 +139,10 @@ class StopLossService:
             }
 
         now = datetime.now(UTC)
-        # Fetch the retained price and fill history for each held ticker.
+        # Fetch a full trading day of price history for each held ticker.
         today_window = timedelta(hours=24)
         async with self.session_factory() as session:
-            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            repo = PlatformRepository(session)
             price_histories = {}
             for ticker in tickers:
                 price_histories[ticker] = await repo.fetch_recent_prices(
@@ -201,9 +150,6 @@ class StopLossService:
                     kalshi_env=self.settings.kalshi_env,
                     window=today_window,
                 )
-            fills_by_ticker: dict[str, list[FillRecord]] = {ticker: [] for ticker in tickers}
-            for fill in await repo.list_fills_for_markets(tickers, kalshi_env=self.settings.kalshi_env):
-                fills_by_ticker.setdefault(fill.market_ticker, []).append(fill)
 
         stale_cutoff = timedelta(seconds=self.settings.risk_stale_market_seconds)
         for position in positions:
@@ -225,8 +171,7 @@ class StopLossService:
                 continue
 
             prices = price_histories.get(position.market_ticker, [])
-            opened_at = _position_opened_at(position, fills_by_ticker.get(position.market_ticker, []))
-            result = await self._evaluate_and_submit(position, ms, mid, prices, now, opened_at)
+            result = await self._evaluate_and_submit(position, ms, mid, prices, now)
             if result is not None:
                 triggered.append(result)
 
@@ -239,15 +184,13 @@ class StopLossService:
         mid: Decimal,
         prices: list[MarketPriceHistory],
         now: datetime,
-        opened_at: datetime | None,
     ) -> dict[str, Any] | None:
         """Evaluate one position in its own committed transaction to make the cooldown checkpoint immediately visible."""
         async with self.session_factory() as session:
-            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
-
+            repo = PlatformRepository(session)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
-            kill_switch_enabled: bool = bool(control.kill_switch_enabled)
-            active_color: str = control.active_color
+            kill_switch_enabled = bool(control.kill_switch_enabled)
+            active_color = control.active_color
 
             # shared submit cooldown — read with committed isolation
             submit_key = f"stop_loss_submit:{self.settings.kalshi_env}:{position.market_ticker}"
@@ -267,10 +210,9 @@ class StopLossService:
                         if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
                             return None
 
-            held_prices = _price_history_since(prices, opened_at)
-
-            # Trigger 1: trailing stop — 10% drop from the peak seen while held.
-            peak = _peak_price_from_history(held_prices, position.side)
+            # Trigger 1: trailing stop — 10% drop from today's peak price.
+            # Uses day's price history so the stop trails upward as price rises.
+            peak = _peak_price_from_history(prices, position.side)
             trailing_ratio: float | None = None
             if peak is not None:
                 trailing_ratio = _trailing_loss_ratio(peak, mid)
@@ -281,20 +223,21 @@ class StopLossService:
                             repo, position, sell_px, mid, trailing_ratio, now,
                             kill_switch_enabled=kill_switch_enabled,
                             active_color=active_color,
-                            control=control,
-                            trigger="trailing_stop", peak=peak, opened_at=opened_at,
+                            trigger="trailing_stop", peak=peak,
                         )
                         await session.commit()
                         return result
 
             # Trigger 2: adverse momentum (no P&L requirement — catches slow bleeds
             # that haven't yet hit the trailing stop threshold).
-            hold_start = opened_at or _as_utc(position.created_at) or now
-            hold_minutes = (now - hold_start).total_seconds() / 60
+            created_at = position.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            hold_minutes = (now - created_at).total_seconds() / 60
             if hold_minutes < self.settings.stop_loss_momentum_min_hold_minutes:
                 return None
 
-            slope = _momentum_slope(held_prices)
+            slope = _momentum_slope(prices)
             if slope is None:
                 return None
 
@@ -312,66 +255,10 @@ class StopLossService:
                 repo, position, sell_px, mid, trailing_ratio, now,
                 kill_switch_enabled=kill_switch_enabled,
                 active_color=active_color,
-                control=control,
-                trigger=trigger, slope=slope, peak=peak, opened_at=opened_at,
+                trigger=trigger, slope=slope, peak=peak,
             )
             await session.commit()
             return result
-
-    async def _kill_switch_suppression_context(
-        self,
-        repo: PlatformRepository,
-        control: Any,
-        now: datetime,
-    ) -> dict[str, Any]:
-        notes = dict(control.notes or {})
-        kill_switch_notes = dict(notes.get("kill_switch") or {})
-        active_color = str(getattr(control, "active_color", None) or self.settings.app_color)
-        threshold_seconds = self.settings.daemon_reconcile_stale_kill_switch_seconds
-        stream_name = f"daemon_reconcile:{self.settings.kalshi_env}:{active_color}"
-        checkpoint = await repo.get_checkpoint(stream_name)
-        reconciled_at: datetime | None = None
-        if checkpoint is not None and isinstance(checkpoint.payload, dict):
-            reconciled_at = _parse_iso_datetime(checkpoint.payload.get("reconciled_at"))
-        if reconciled_at is None:
-            fallback = await repo.get_checkpoint(f"reconcile:{self.settings.kalshi_env}")
-            if fallback is not None and isinstance(fallback.payload, dict):
-                reconciled_at = _parse_iso_datetime(fallback.payload.get("reconciled_at"))
-                stream_name = fallback.stream_name
-
-        reconcile_age_seconds = None
-        if reconciled_at is not None:
-            reconcile_age_seconds = max(0.0, (now - reconciled_at).total_seconds())
-        else:
-            watchdog = dict(notes.get("watchdog") or {})
-            colors = watchdog.get("colors") if isinstance(watchdog.get("colors"), dict) else {}
-            active = colors.get(active_color) if isinstance(colors, dict) else {}
-            daemon = active.get("daemon") if isinstance(active, dict) else {}
-            raw_age = daemon.get("last_reconcile_age_seconds") if isinstance(daemon, dict) else None
-            try:
-                reconcile_age_seconds = float(raw_age) if raw_age is not None else None
-            except (TypeError, ValueError):
-                reconcile_age_seconds = None
-
-        return {
-            "active_color": active_color,
-            "kill_switch": {
-                key: kill_switch_notes.get(key)
-                for key in ("mode", "source", "reason", "enabled_at", "payload")
-                if key in kill_switch_notes
-            },
-            "reconcile": {
-                "stream_name": stream_name,
-                "reconciled_at": reconciled_at.isoformat() if reconciled_at is not None else None,
-                "age_seconds": round(reconcile_age_seconds, 3) if reconcile_age_seconds is not None else None,
-                "threshold_seconds": threshold_seconds,
-                "stale": (
-                    reconcile_age_seconds is not None
-                    and threshold_seconds > 0
-                    and reconcile_age_seconds > threshold_seconds
-                ),
-            },
-        }
 
     async def _submit(
         self,
@@ -384,19 +271,19 @@ class StopLossService:
         *,
         kill_switch_enabled: bool,
         active_color: str,
-        control: Any,
         trigger: str = "trailing_stop",
         slope: float | None = None,
         peak: Decimal | None = None,
-        opened_at: datetime | None = None,
     ) -> dict[str, Any]:
         market_ticker = position.market_ticker
         peak_display = str(peak) if peak is not None else "n/a"
         mark_display = str(mid)
         sell_display = str(sell_price)
 
-        hold_start = opened_at or _as_utc(position.created_at) or now
-        hold_minutes = (now - hold_start).total_seconds() / 60
+        created_at = position.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        hold_minutes = (now - created_at).total_seconds() / 60
         possible_model_error = (
             loss_ratio is not None
             and loss_ratio > 0.30
@@ -411,92 +298,45 @@ class StopLossService:
             before=now,
         )
         if strategy_code is None:
-            # Buy fill has no attribution (pre-fix data or missing chain).
-            # All live positions are Strategy A; default prevents null propagation.
             strategy_code = StrategyCode.DIRECTIONAL
-            logger.debug(
-                "stop_loss: no attributed buy fill found for %s %s; defaulting strategy_code=%s",
-                market_ticker,
-                position.side,
-                strategy_code,
-            )
-        receipt = await self.execution_service.close_position(
-            market_ticker=market_ticker,
-            side=position.side,
-            count_fp=position.count_fp,
-            yes_price_dollars=sell_price,
-            client_order_id=client_order_id,
-            kill_switch_enabled=kill_switch_enabled,
-            active_color=active_color,
-            subaccount=self.settings.kalshi_subaccount or None,
-            allow_risk_reducing_exit=True,
-        )
 
-        # Kill switch: clean noop — no submit/reentry checkpoints, rate-limited warning.
-        if receipt.status == "kill_switch_blocked":
-            suppression_context = await self._kill_switch_suppression_context(repo, control, now)
-            ks_cp_key = f"stop_loss_kill_switch_suppressed:{self.settings.kalshi_env}:{market_ticker}"
-            ks_cp = await repo.get_checkpoint(ks_cp_key)
-            rate_limited = (
-                ks_cp is not None
-                and ks_cp.payload.get("suppressed_at") is not None
-                and now - datetime.fromisoformat(ks_cp.payload["suppressed_at"]) < timedelta(minutes=10)
+        receipt = None
+        submit_failed = False
+        submit_error: str | None = None
+        try:
+            receipt = await self.execution_service.close_position(
+                market_ticker=market_ticker,
+                side=position.side,
+                count_fp=position.count_fp,
+                yes_price_dollars=sell_price,
+                client_order_id=client_order_id,
+                kill_switch_enabled=kill_switch_enabled,
+                active_color=active_color,
+                subaccount=self.settings.kalshi_subaccount or None,
+                allow_risk_reducing_exit=True,
             )
-            if not rate_limited:
-                await repo.log_ops_event(
-                    severity="warning",
-                    summary=(
-                        f"Stop-loss suppressed by kill switch [{trigger}]: "
-                        f"{market_ticker} {position.side}"
-                        + (f" loss={loss_ratio:.0%}" if loss_ratio is not None else "")
-                    ),
-                    source="stop_loss",
-                    payload={
-                        "market_ticker": market_ticker,
-                        "side": position.side,
-                        "trigger": trigger,
-                        "mid_mark": str(mid),
-                        "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
-                        "peak_price": str(peak) if peak is not None else None,
-                        "action": "stop_loss_kill_switch_suppressed",
-                        **suppression_context,
-                    },
-                )
-                await repo.set_checkpoint(
-                    ks_cp_key,
-                    cursor=None,
-                    payload={
-                        "suppressed_at": now.isoformat(),
-                        "trigger": trigger,
-                        "market_ticker": market_ticker,
-                        "side": position.side,
-                        **suppression_context,
-                    },
-                )
-            logger.warning(
-                "Stop-loss suppressed by kill switch [%s]: %s %s loss=%s",
-                trigger,
-                market_ticker,
-                position.side,
-                f"{loss_ratio:.0%}" if loss_ratio is not None else "n/a",
-            )
-            return {
-                "market_ticker": market_ticker,
-                "side": position.side,
-                "action": "stop_loss_kill_switch_suppressed",
-                "trigger": trigger,
-                "kill_switch_blocked": True,
-                "rate_limited_event": rate_limited,
-                **suppression_context,
-            }
+        except Exception as exc:
+            logger.warning("stop_loss order submit failed for %s: %s", market_ticker, exc)
+            submit_failed = True
+            submit_error = str(exc)
 
-        shadow = receipt.status == "shadow_skipped"
-        order_data = dict((receipt.details or {}).get("order") or {})
-        order_status = str(order_data.get("status") or receipt.status)
+        receipt_status = receipt.status if receipt is not None else "submit_exception"
+        receipt_details = receipt.details if receipt is not None else {"error": submit_error}
+        shadow = receipt_status == "shadow_skipped"
+        order_data = dict((receipt_details or {}).get("order") or {})
+        order_status = str(order_data.get("status") or receipt_status)
         normalized_order_status = order_status.strip().lower()
         terminal_filled = normalized_order_status in {"filled", "executed"}
         terminal_unfilled = normalized_order_status in {"cancelled", "canceled", "expired"}
-        submit_failed = not shadow and receipt.external_order_id is None and not terminal_filled and not terminal_unfilled
+        if receipt is not None:
+            submit_failed = (
+                not shadow
+                and receipt.external_order_id is None
+                and not terminal_filled
+                and not terminal_unfilled
+            )
+            if submit_failed:
+                submit_error = str(receipt_details)
         action = f"stop_loss_{trigger}_shadow" if shadow else f"stop_loss_{trigger}"
 
         event_payload: dict[str, Any] = {
@@ -513,9 +353,8 @@ class StopLossService:
             "action": action,
             "trigger": trigger,
             "possible_model_error": possible_model_error,
-            "exec_status": receipt.status,
+            "exec_status": receipt_status,
             "strategy_code": strategy_code,
-            "position_opened_at": hold_start.isoformat(),
         }
         if slope is not None:
             event_payload["momentum_slope_cents_per_min"] = round(slope, 4)
@@ -527,18 +366,17 @@ class StopLossService:
             "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
             "peak_price": str(peak) if peak is not None else None,
             "trigger": trigger,
-            "position_opened_at": hold_start.isoformat(),
         }
 
         if shadow:
-            submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_FILLED_EXIT
             submit_payload["client_order_id"] = client_order_id
+            submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_FILLED_EXIT
         elif not submit_failed:
             submit_payload.update(
                 {
                     "client_order_id": client_order_id,
                     "order_status": order_status,
-                    "kalshi_order_id": receipt.external_order_id,
+                    "kalshi_order_id": receipt.external_order_id if receipt is not None else None,
                     "outcome_status": (
                         STOP_LOSS_OUTCOME_FILLED_EXIT
                         if terminal_filled
@@ -552,16 +390,15 @@ class StopLossService:
             )
             if terminal_unfilled:
                 submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
-            event_payload["order_response"] = receipt.details
+            event_payload["order_response"] = receipt_details
         else:
-            logger.warning("stop_loss order submit failed for %s: %s", market_ticker, receipt.details)
-            event_payload["submit_error"] = str(receipt.details)
-            submit_payload["submit_error"] = str(receipt.details)
+            event_payload["submit_error"] = submit_error
+            submit_payload["submit_error"] = submit_error
             submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_SUBMIT_FAILED
             # Back off on outright submit errors to avoid spamming an illiquid book.
             submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
 
-        if not shadow and receipt.status != "inactive_color_skipped":
+        if not shadow and receipt_status != "inactive_color_skipped":
             await repo.save_order(
                 ticket_id=None,
                 client_order_id=client_order_id,
@@ -571,8 +408,8 @@ class StopLossService:
                 action="sell",
                 yes_price_dollars=sell_price,
                 count_fp=position.count_fp,
-                raw=receipt.details or {},
-                kalshi_order_id=receipt.external_order_id,
+                raw=receipt_details or {},
+                kalshi_order_id=receipt.external_order_id if receipt is not None else None,
                 kalshi_env=self.settings.kalshi_env,
                 strategy_code=strategy_code,
             )
@@ -608,7 +445,6 @@ class StopLossService:
                     "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
                     "peak_price": str(peak) if peak is not None else None,
                     "trigger": trigger,
-                    "position_opened_at": hold_start.isoformat(),
                     "outcome_status": submit_payload.get("outcome_status"),
                     "reverse_evaluated": False,
                 },

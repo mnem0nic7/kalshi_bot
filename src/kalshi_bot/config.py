@@ -87,7 +87,8 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("LLM_HOSTED_API_KEY", "OPENAI_API_KEY"),
     )
-    llm_hosted_model: str = "gpt-5.4"
+    llm_hosted_model: str = "gpt-4o"
+    codex_model: str = "gpt-4o"
     llm_local_base_url: str = "http://localhost:11434/v1"
     llm_local_api_key: str = "dummy"
     llm_local_model: str = "llama3.1:8b"
@@ -121,13 +122,10 @@ class Settings(BaseSettings):
     risk_max_position_notional_dollars: float | None = None
     risk_daily_loss_limit_dollars: float | None = None
     # P2-2: edge-scaled (fractional-Kelly) sizing. Off by default until
-    # calibration (see /api/strategies/calibration) confirms the fair-value
-    # signal is well-calibrated. When on, the Kelly notional is capped by the
-    # existing flat-percentage limits so this can only ever reduce risk.
+    # calibration confirms the fair-value signal is well-calibrated. When on,
+    # the Kelly notional is still capped by the existing flat-percentage limits.
     risk_edge_scaled_sizing_enabled: bool = False
-    risk_edge_scaled_kelly_multiplier: float = 0.25  # quarter-Kelly
-    # Per-strategy dollar-denominated hard-loss cap. Empty = no per-strategy cap.
-    # Example env var value: '{"A": 500, "C": 100}' (JSON-parsed by pydantic-settings).
+    risk_edge_scaled_kelly_multiplier: float = 0.25
     risk_daily_loss_dollars_by_strategy: dict[str, float] = Field(default_factory=dict)
 
     crypto_enabled: bool = True
@@ -170,34 +168,23 @@ class Settings(BaseSettings):
     stop_loss_momentum_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_reentry_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_min_hold_minutes: int = 30
-    # Step 3 momentum weight config keys (placeholder defaults; calibrated values written to DB checkpoint).
-    # momentum_weight_scale_cents_per_min: the denominator in w = max(floor, 1 - slope_against/scale).
-    # momentum_slope_veto_cents_per_min: hard veto gate; None = disabled until first calibration ships.
-    # momentum_weight_floor: minimum weight applied to edge_effective_bps.
-    # momentum_veto_staleness_gate: staleness_factor must exceed this before veto can fire.
-    # momentum_weight_shadow_mode: when True, post-processor stamps analytics fields but does not
-    #   enforce edge_effective_bps in eligibility decisions — enforcement falls back to raw edge.
     momentum_weight_scale_cents_per_min: float = 1.0
     momentum_slope_veto_cents_per_min: float | None = None
     momentum_weight_floor: float = 0.3
     momentum_veto_staleness_gate: float = 0.5
     momentum_weight_shadow_mode: bool = True
-    # Phase 2 — nightly automation
     momentum_calibration_auto_enabled: bool = False
     momentum_calibration_nightly_hour_local: int = 2
     momentum_calibration_nightly_timezone: str = "America/Los_Angeles"
     momentum_calibration_nightly_lookback_days: int = 90
-    # Phase 2 — tier thresholds
     momentum_calibration_tier1_max_delta_fraction: float = 0.10
     momentum_calibration_tier2_max_delta_fraction: float = 0.20
     momentum_calibration_tier1_max_ci_width_fraction: float = 0.30
     momentum_calibration_sanity_max_ci_width_fraction: float = 0.50
     momentum_calibration_tier1_auto_promote_enabled: bool = False
-    # Phase 2 — coverage gate
     momentum_calibration_min_slope_coverage: float = 0.80
     momentum_calibration_recent_coverage_days: int = 7
     momentum_calibration_min_observations: int = 1000
-    # Phase 2 — skip escalation
     momentum_calibration_skip_critical_threshold: int = 4
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
@@ -209,30 +196,15 @@ class Settings(BaseSettings):
     risk_min_edge_bps: int = 500
     risk_fee_aware_edge_enabled: bool = True
     risk_max_credible_edge_bps: int = 5000
-    # PENDING_CALIBRATION: raised from 0.60 to 0.80 based on N=3 winning trades
-    # (AUS-T86/CHI-T78/SFO-T70) all having confidence ≥ 0.80 at entry. Unblocking
-    # experiment: collect ≥ 30 settled trades across confidence deciles and verify
-    # the win-rate cliff is at 0.80 and not lower.
     risk_min_confidence: float = 0.80
     risk_min_contract_price_dollars: float = 0.25
-    # Probability distance from 50%: inside this band, require extra edge that ramps
-    # linearly to risk_probability_midband_max_extra_edge_bps at fair_yes=0.50.
-    # Set risk_min_probability_extremity_pct to 0.0 to disable.
     risk_min_probability_extremity_pct: float = 25.0
     risk_probability_midband_max_extra_edge_bps: int = 500
-    # PENDING_CALIBRATION: 8.0°F boundary derived from N=3 winners (delta_f=10–13°F).
-    # Unblocking experiment: collect ≥ 30 settled trades with |delta_f| 4–12°F and
-    # verify loss rate drops materially above 8°F versus below.
     strategy_min_abs_delta_f: float = 8.0
-    # Symmetric with risk_min_contract_price_dollars: avoid buying a side
-    # priced so high that the remaining upside is too small for the tail risk.
     strategy_min_remaining_payout_bps: int = 2500
     strategy_quality_edge_buffer_bps: int = 25
     sigma_lead_correction_enabled: bool = True
 
-    # Trade behavior retraining guardrails. Production entries stay frozen by
-    # default while historical evidence is being repaired and re-scored; exits
-    # and reconciliation paths do not consult these entry-only gates.
     trade_behavior_production_entry_freeze_enabled: bool = True
     trade_behavior_entry_freeze_reason: str = "trade_behavior_retraining_freeze"
     trade_behavior_freeze_min_edge_bps: int = 500
@@ -242,15 +214,12 @@ class Settings(BaseSettings):
     trade_behavior_empirical_gate_lookback_days: int = 180
     trade_behavior_snapshot_scoreability_since: str | None = None
 
-    # Strategy C adaptive polling cadence (ThresholdProximityMonitor, §4.1.4)
     strategy_c_cadence_idle_seconds: int = 3600
     strategy_c_cadence_approach_seconds: int = 900
     strategy_c_cadence_near_threshold_seconds: int = 150
     strategy_c_cadence_post_peak_seconds: int = 900
     strategy_c_near_threshold_margin_f: float = 2.0
     strategy_c_approach_margin_f: float = 5.0
-
-    # Strategy C lock-confirmation gates (§4.1.4)
     strategy_c_required_consecutive_confirmations: int = 2
     strategy_c_max_observation_age_minutes: int = 30
     strategy_c_max_forecast_residual_f: float = 8.0
@@ -267,16 +236,8 @@ class Settings(BaseSettings):
     strategy_c_enabled: bool = False
     strategy_c_shadow_only: bool = True
 
-    # Addition 3: Monotonicity Arb Scanner (§4.3)
     monotonicity_arb_enabled: bool = False
     monotonicity_arb_shadow_only: bool = True
-    # Live execution of the two-leg arb requires an atomic executor that can
-    # place leg 1, place leg 2, and unwind leg 1 if leg 2 fails. That executor
-    # is NOT built yet — see services/monotonicity_scanner.py docstring.
-    # This flag is an explicit acknowledgement that the atomic path exists
-    # before the risk gate will allow a non-shadow outcome. Flipping shadow_only
-    # to False without this flag is rejected with 'risk_blocked', not silently
-    # downgraded to shadow.
     monotonicity_arb_atomic_execution_ready: bool = False
     monotonicity_arb_min_net_edge_cents: int = 2
     monotonicity_arb_max_notional_dollars: float = 25.0
@@ -292,9 +253,6 @@ class Settings(BaseSettings):
     research_web_max_results: int = 5
     research_web_max_queries: int = 2
     stream_error_log_cooldown_seconds: int = 900
-    # Hot websocket books can emit many orderbook deltas per second. Keep the
-    # in-memory book current on every message, but optionally coalesce database
-    # writes and downstream daemon callbacks to this cadence.
     stream_orderbook_persist_interval_seconds: float = 0.0
     trigger_enable_auto_rooms: bool = False
     trigger_cooldown_seconds: int = 300
@@ -338,7 +296,7 @@ class Settings(BaseSettings):
     training_min_trade_positive_rooms: int = 8
     training_good_research_threshold: float = 0.7
     training_campaign_enabled: bool = False
-    training_campaign_rooms_per_run: int = 6
+    training_campaign_rooms_per_run: int = 3
     training_campaign_lookback_hours: int = 24
     training_campaign_cooldown_seconds: int = 600
     training_campaign_max_recent_per_market: int = 5
