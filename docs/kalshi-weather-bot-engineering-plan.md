@@ -738,8 +738,10 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | Variable | Default | Notes |
 |---|---|---|
 | `KALSHI_ENV` | `demo` | `demo` or `production` |
-| `APP_SHADOW_MODE` | `true` | `false` to enable live orders |
-| `APP_ENABLE_KILL_SWITCH` | `true` | `false` to permit execution |
+| `APP_SHADOW_MODE` | `true` | Legacy/global shadow switch; compose overrides it with env-scoped values below |
+| `DEMO_APP_SHADOW_MODE` | `true` | `false` enables demo live order submission when active color and kill switch also permit it |
+| `PRODUCTION_APP_SHADOW_MODE` | `true` | Production stays shadowed unless explicitly overridden |
+| `APP_ENABLE_KILL_SWITCH` | `true` | Enables kill-switch control; the deployment-control row must have kill switch off to permit execution |
 | `APP_COLOR` | `blue` | Blue/green identity |
 | `LLM_TRADING_ENABLED` | `false` | Not used in production; deterministic fast path only |
 | `GEMINI_API_KEY` | — | Primary LLM provider |
@@ -830,6 +832,10 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 |---|---|---|
 | `STRATEGY_C_ENABLED` | `false` | Master switch; must also clear kill switch before live orders |
 | `STRATEGY_C_SHADOW_ONLY` | `true` | Shadow-only mode; flip to `false` after operator sign-off |
+| `DEMO_STRATEGY_C_ENABLED` | `false` | Compose override for demo Strategy C |
+| `DEMO_STRATEGY_C_SHADOW_ONLY` | `true` | Compose override for demo Strategy C live/shadow mode |
+| `PRODUCTION_STRATEGY_C_ENABLED` | `false` | Compose override for production Strategy C |
+| `PRODUCTION_STRATEGY_C_SHADOW_ONLY` | `true` | Compose override for production Strategy C live/shadow mode |
 | `STRATEGY_C_CADENCE_IDLE_SECONDS` | `3600` | Sweep interval far from threshold |
 | `STRATEGY_C_CADENCE_APPROACH_SECONDS` | `900` | Sweep interval when within `approach_margin_f` (5°F) |
 | `STRATEGY_C_CADENCE_NEAR_THRESHOLD_SECONDS` | `150` | Sweep interval when within `near_threshold_margin_f` (2°F) |
@@ -862,7 +868,9 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `TRIGGER_ENABLE_AUTO_ROOMS` | `true` | Master switch for autonomous room creation from orderbook events |
+| `TRIGGER_ENABLE_AUTO_ROOMS` | `false` | Legacy/global master switch; compose overrides it with env-scoped values below |
+| `DEMO_TRIGGER_ENABLE_AUTO_ROOMS` | `false` | Compose override for demo auto room creation |
+| `PRODUCTION_TRIGGER_ENABLE_AUTO_ROOMS` | `false` | Compose override for production auto room creation |
 | `TRIGGER_COOLDOWN_SECONDS` | 300 | Per-ticker cooldown between trigger evaluations (30s after broken-book events) |
 | `TRIGGER_MAX_SPREAD_BPS` | 1200 | Reject trigger if bid/ask spread exceeds this |
 | `TRIGGER_MAX_CONCURRENT_ROOMS` | 12 | Hard cap on simultaneously running rooms |

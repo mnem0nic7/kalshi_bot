@@ -102,6 +102,8 @@ This mode:
 The behavior is controlled by:
 
 - `TRIGGER_ENABLE_AUTO_ROOMS`
+- `DEMO_TRIGGER_ENABLE_AUTO_ROOMS`
+- `PRODUCTION_TRIGGER_ENABLE_AUTO_ROOMS`
 - `TRIGGER_COOLDOWN_SECONDS`
 - `TRIGGER_MAX_SPREAD_BPS`
 - `TRIGGER_MAX_CONCURRENT_ROOMS`
@@ -352,6 +354,9 @@ Additional compose env vars added in the April 2026 architecture refactor:
 - `POSTGRES_DEMO_PORT` (default `5432`) — host port for the demo Postgres instance
 - `POSTGRES_PRODUCTION_PORT` (default `5433`) — host port for the production Postgres instance
 - `WEB_APP_COLOR` (default `blue`) — `APP_COLOR` seen by the three Caddy-facing web containers; update this when promoting to green so the dashboard header badge reflects the active color
+- `DEMO_APP_SHADOW_MODE` / `PRODUCTION_APP_SHADOW_MODE` — environment-scoped shadow switches used by Compose so demo can be live without making production live on its next restart
+- `DEMO_STRATEGY_C_ENABLED` / `PRODUCTION_STRATEGY_C_ENABLED` — environment-scoped Strategy C master switches
+- `DEMO_STRATEGY_C_SHADOW_ONLY` / `PRODUCTION_STRATEGY_C_SHADOW_ONLY` — environment-scoped Strategy C live/shadow switches
 
 The `infra/docker-compose.yml` file uses YAML anchors to define shared service templates. Add new per-env settings to `x-demo-env` / `x-production-env` and shared settings to `x-common-env-base`. The Dockerfile uses a two-stage pip install so dependency layers are cached independently of source changes.
 
