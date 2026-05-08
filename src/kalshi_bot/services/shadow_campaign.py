@@ -47,6 +47,8 @@ class ShadowCampaignService:
         self.shadow_training_service = shadow_training_service
 
     async def run(self, request: ShadowCampaignRequest) -> list[ShadowRunResult]:
+        if request.domain != "weather":
+            raise ValueError("shadow campaigns currently support domain=weather only")
         discoveries = await self.discovery_service.discover_configured_markets()
         now = datetime.now(UTC)
         lookback_cutoff = now - timedelta(hours=self.settings.training_campaign_lookback_hours)

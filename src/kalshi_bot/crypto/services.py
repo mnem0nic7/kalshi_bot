@@ -34,6 +34,7 @@ from kalshi_bot.crypto.parsing import (
     normalize_frequency,
     parse_crypto_market,
     parse_crypto_series,
+    parse_price,
 )
 from kalshi_bot.db.models import (
     CryptoMarketCandlestickRecord,
@@ -2384,9 +2385,47 @@ def _cap_crypto_autonomy_markets(
 
 
 def _row_mid(row: CryptoMarketSnapshotRecord) -> Decimal | None:
-    if row.yes_bid_dollars is not None and row.yes_ask_dollars is not None:
-        return (row.yes_bid_dollars + row.yes_ask_dollars) / Decimal("2")
-    return row.last_price_dollars
+    yes_bid = _snapshot_price(row, attr="yes_bid_dollars", dollar_keys=("yes_bid_dollars",), cent_keys=("yes_bid",))
+    yes_ask = _snapshot_price(row, attr="yes_ask_dollars", dollar_keys=("yes_ask_dollars",), cent_keys=("yes_ask",))
+    if yes_bid is not None and yes_ask is not None:
+        return (yes_bid + yes_ask) / Decimal("2")
+    return _snapshot_price(
+        row,
+        attr="last_price_dollars",
+        dollar_keys=("last_price_dollars", "last_trade_price_dollars"),
+        cent_keys=("last_price", "last_trade_price"),
+    )
+
+
+def _snapshot_payload_sources(row: CryptoMarketSnapshotRecord) -> list[dict[str, Any]]:
+    payload = row.payload if isinstance(getattr(row, "payload", None), dict) else {}
+    sources: list[dict[str, Any]] = []
+    for source in (
+        payload,
+        payload.get("market"),
+        payload.get("raw"),
+        (payload.get("raw") or {}).get("market") if isinstance(payload.get("raw"), dict) else None,
+    ):
+        if isinstance(source, dict):
+            sources.append(source)
+    return sources
+
+
+def _snapshot_price(
+    row: CryptoMarketSnapshotRecord,
+    *,
+    attr: str,
+    dollar_keys: tuple[str, ...],
+    cent_keys: tuple[str, ...],
+) -> Decimal | None:
+    value = getattr(row, attr, None)
+    if value is not None:
+        return value
+    for source in _snapshot_payload_sources(row):
+        parsed = parse_price(source, dollar_keys=dollar_keys, cent_keys=cent_keys)
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _crypto_live_market_row(
@@ -2762,9 +2801,9 @@ def _crypto_decision_rows(
         mid = _row_mid(snapshot) or (candle.close_dollars if candle is not None else None)
         if mid is None:
             continue
-        yes_bid = snapshot.yes_bid_dollars
-        yes_ask = snapshot.yes_ask_dollars
-        no_ask = snapshot.no_ask_dollars
+        yes_bid = _snapshot_price(snapshot, attr="yes_bid_dollars", dollar_keys=("yes_bid_dollars",), cent_keys=("yes_bid",))
+        yes_ask = _snapshot_price(snapshot, attr="yes_ask_dollars", dollar_keys=("yes_ask_dollars",), cent_keys=("yes_ask",))
+        no_ask = _snapshot_price(snapshot, attr="no_ask_dollars", dollar_keys=("no_ask_dollars",), cent_keys=("no_ask",))
         quote_source = "snapshot_quotes"
         if yes_bid is None or yes_ask is None:
             quote_source = "candlestick_close_proxy"

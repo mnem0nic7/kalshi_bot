@@ -510,6 +510,24 @@ async def test_training_build_origins_shadow_and_shadow_weather_readiness_exclud
         )
         for room in (traced_shadow, untraced_shadow, crypto_shadow, live_room):
             await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+        for room in (traced_shadow, untraced_shadow):
+            await repo.upsert_room_research_health(
+                room_id=room.id,
+                market_ticker=room.market_ticker,
+                dossier_status="ready",
+                gate_passed=True,
+                valid_dossier=True,
+                good_for_training=True,
+                quality_score=0.9,
+                citation_coverage_score=0.9,
+                settlement_clarity_score=0.9,
+                freshness_score=0.9,
+                contradiction_count=0,
+                structured_completeness_score=0.9,
+                fair_value_score=0.9,
+                dossier_artifact_id=None,
+                payload={"test": "weather readiness health"},
+            )
         ticket = await repo.save_trade_ticket(
             traced_shadow.id,
             TradeTicket(
@@ -569,6 +587,9 @@ async def test_training_build_origins_shadow_and_shadow_weather_readiness_exclud
     assert shadow_readiness["deterministic_trace_count"] == 1
     assert shadow_readiness["trade_ticket_count"] == 1
     assert shadow_readiness["risk_verdict_count"] == 1
+    assert shadow_readiness["research_health_present_count"] == 2
+    assert shadow_readiness["good_research_room_count"] == 2
+    assert "research_health_missing" not in shadow_readiness["top_blockers"]
     assert "missing_decision_traces" in shadow_readiness["top_blockers"]
     assert "not_enough_shadow_rooms" in shadow_readiness["top_blockers"]
 

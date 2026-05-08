@@ -749,6 +749,15 @@ class HistoricalProvenance(BaseModel):
 class ShadowCampaignRequest(BaseModel):
     limit: int = 3
     reason: str = "shadow_campaign"
+    domain: str = "weather"
+
+    @field_validator("domain", mode="before")
+    @classmethod
+    def validate_domain(cls, value: Any) -> str:
+        domain = str(value or "weather").strip().lower()
+        if domain != "weather":
+            raise ValueError("shadow campaigns currently support domain=weather only")
+        return domain
 
 
 class RoomMessageCreate(BaseModel):

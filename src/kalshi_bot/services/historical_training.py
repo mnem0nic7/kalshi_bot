@@ -10,9 +10,12 @@ from decimal import Decimal
 import hashlib
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.agents.room_agents import AgentSuite
@@ -23,7 +26,7 @@ from kalshi_bot.core.schemas import (
     RoomCreate,
     RoomMessageCreate,
 )
-from kalshi_bot.db.models import DeploymentControl
+from kalshi_bot.db.models import DeploymentControl, HistoricalWeatherSnapshotRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.memory import MemoryService
@@ -452,6 +455,7 @@ class HistoricalTrainingService:
         date_from: date,
         date_to: date,
         series: list[str] | None = None,
+        archive_raw_events: bool = True,
     ) -> dict[str, Any]:
         templates = self._selected_templates(series)
         station_ids = {template.station_id for template in templates}
@@ -461,33 +465,45 @@ class HistoricalTrainingService:
         imported = 0
         samples: list[dict[str, Any]] = []
 
-        async with self.session_factory() as session:
-            repo = PlatformRepository(session)
-            events = await repo.list_weather_events(created_after=after, created_before=before, limit=50000)
-            await session.commit()
-
-        for event in events:
-            if event.station_id not in station_ids:
-                continue
-            payload = event.payload if isinstance(event.payload, dict) else {}
-            archive_record = append_weather_bundle_archive(
-                self.settings,
-                payload,
-                source_id=f"weather-event:{event.id}",
-                archive_source="raw_weather_backfill",
-                captured_at=_as_utc(event.created_at),
-            )
-            if archive_record is None:
-                continue
-            archived += 1
-            if len(samples) < 10:
-                samples.append(
-                    {
-                        "station_id": archive_record["station_id"],
-                        "local_market_day": archive_record["local_market_day"],
-                        "archive_path": archive_record["archive_path"],
-                    }
-                )
+        if archive_raw_events:
+            for station_id in sorted(station_ids):
+                page_before = before
+                while True:
+                    async with self.session_factory() as session:
+                        repo = PlatformRepository(session)
+                        events = await repo.list_weather_events(
+                            station_id=station_id,
+                            created_after=after,
+                            created_before=page_before,
+                            limit=1000,
+                        )
+                        await session.commit()
+                    if not events:
+                        break
+                    for event in events:
+                        payload = event.payload if isinstance(event.payload, dict) else {}
+                        archive_record = append_weather_bundle_archive(
+                            self.settings,
+                            payload,
+                            source_id=f"weather-event:{event.id}",
+                            archive_source="raw_weather_backfill",
+                            captured_at=_as_utc(event.created_at),
+                        )
+                        if archive_record is None:
+                            continue
+                        archived += 1
+                        if len(samples) < 10:
+                            samples.append(
+                                {
+                                    "station_id": archive_record["station_id"],
+                                    "local_market_day": archive_record["local_market_day"],
+                                    "archive_path": archive_record["archive_path"],
+                                }
+                            )
+                    if len(events) < 1000:
+                        break
+                    oldest = min(_as_utc(event.created_at) for event in events if event.created_at is not None)
+                    page_before = oldest - timedelta(microseconds=1)
         imported = await self._import_file_weather_archives(date_from=date_from, date_to=date_to, templates=templates)
         checkpoint_promotions = await self._promote_checkpoint_archives_from_existing_weather(
             date_from=date_from,
@@ -499,6 +515,7 @@ class HistoricalTrainingService:
             "date_from": date_from.isoformat(),
             "date_to": date_to.isoformat(),
             "series": [template.series_ticker for template in templates],
+            "raw_archive_skipped": not archive_raw_events,
             "archived_event_count": archived,
             "imported_snapshot_count": imported,
             "checkpoint_archive_promotion_count": checkpoint_promotions["checkpoint_archive_promotion_count"],
@@ -2847,10 +2864,22 @@ class HistoricalTrainingService:
         if not archive_dir.exists():
             return 0
         templates_by_station = {template.station_id: template for template in templates}
+        requested_days = [
+            (date_from + timedelta(days=offset)).isoformat()
+            for offset in range((date_to - date_from).days + 1)
+        ]
+        archive_paths = [
+            path
+            for station_id in sorted(templates_by_station)
+            for day in requested_days
+            for path in [archive_dir / station_id / f"{day}.jsonl"]
+            if path.exists()
+        ]
         created = 0
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            for path in sorted(archive_dir.rglob("*.jsonl")):
+            dialect_name = session.bind.dialect.name if session.bind is not None else ""
+            for path in archive_paths:
                 with path.open("r", encoding="utf-8") as handle:
                     for line_number, line in enumerate(handle, start=1):
                         line = line.strip()
@@ -2890,21 +2919,63 @@ class HistoricalTrainingService:
                         asof_ts = archive_meta["asof_ts"] if archive_meta is not None else max(item for item in [observation_ts, forecast_updated_ts, datetime.now(UTC)] if item is not None)
                         source_id = str(((payload.get("_archive") or {}).get("source_id")) or f"{path.relative_to(archive_dir)}:{line_number}")
                         source_kind = str(((payload.get("_archive") or {}).get("archive_source")) or self.ARCHIVED_WEATHER_SOURCE)
-                        await repo.upsert_historical_weather_snapshot(
-                            station_id=template.station_id,
-                            series_ticker=template.series_ticker,
-                            local_market_day=local_day,
-                            asof_ts=asof_ts,
-                            source_kind=self.ARCHIVED_WEATHER_SOURCE if source_kind != self.CAPTURED_WEATHER_SOURCE else source_kind,
-                            source_id=source_id,
-                            source_hash=_hash_payload(payload),
-                            observation_ts=observation_ts,
-                            forecast_updated_ts=forecast_updated_ts,
-                            forecast_high_f=self._quantize_two(extract_forecast_high_f((payload.get("forecast") or {}))),
-                            current_temp_f=self._quantize_two(extract_current_temp_f((payload.get("observation") or {}))),
-                            payload=payload,
-                        )
+                        normalized_source_kind = self.ARCHIVED_WEATHER_SOURCE if source_kind != self.CAPTURED_WEATHER_SOURCE else source_kind
+                        values = {
+                            "id": str(uuid4()),
+                            "station_id": template.station_id,
+                            "series_ticker": template.series_ticker,
+                            "local_market_day": local_day,
+                            "asof_ts": asof_ts,
+                            "source_kind": normalized_source_kind,
+                            "source_id": source_id,
+                            "source_hash": _hash_payload(payload),
+                            "observation_ts": observation_ts,
+                            "forecast_updated_ts": forecast_updated_ts,
+                            "forecast_high_f": self._quantize_two(extract_forecast_high_f((payload.get("forecast") or {}))),
+                            "current_temp_f": self._quantize_two(extract_current_temp_f((payload.get("observation") or {}))),
+                            "payload": payload,
+                            "created_at": datetime.now(UTC),
+                            "updated_at": datetime.now(UTC),
+                        }
+                        if dialect_name in {"postgresql", "sqlite"}:
+                            insert_stmt = (
+                                pg_insert(HistoricalWeatherSnapshotRecord)
+                                if dialect_name == "postgresql"
+                                else sqlite_insert(HistoricalWeatherSnapshotRecord)
+                            ).values(**values)
+                            update_values = {
+                                key: value
+                                for key, value in values.items()
+                                if key not in {"id", "created_at", "station_id", "source_kind", "source_id"}
+                            }
+                            await session.execute(
+                                insert_stmt.on_conflict_do_update(
+                                    index_elements=[
+                                        HistoricalWeatherSnapshotRecord.station_id,
+                                        HistoricalWeatherSnapshotRecord.source_kind,
+                                        HistoricalWeatherSnapshotRecord.source_id,
+                                    ],
+                                    set_=update_values,
+                                )
+                            )
+                        else:
+                            await repo.upsert_historical_weather_snapshot(
+                                station_id=template.station_id,
+                                series_ticker=template.series_ticker,
+                                local_market_day=local_day,
+                                asof_ts=asof_ts,
+                                source_kind=normalized_source_kind,
+                                source_id=source_id,
+                                source_hash=values["source_hash"],
+                                observation_ts=observation_ts,
+                                forecast_updated_ts=forecast_updated_ts,
+                                forecast_high_f=values["forecast_high_f"],
+                                current_temp_f=values["current_temp_f"],
+                                payload=payload,
+                            )
                         created += 1
+                        if created % 1000 == 0:
+                            await session.commit()
             await session.commit()
         return created
 

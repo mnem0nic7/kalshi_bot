@@ -40,6 +40,7 @@ from kalshi_bot.services.decision_corpus import DecisionCorpusService
 from kalshi_bot.services.decision_corpus_calibration import DecisionCorpusCalibrationReportService
 from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.reconcile import ReconciliationService
+from kalshi_bot.services.research_health_backfill import ResearchHealthBackfillService
 from kalshi_bot.services.research import ResearchCoordinator
 from kalshi_bot.services.risk import DeterministicRiskEngine
 from kalshi_bot.services.shadow import ShadowTrainingService
@@ -92,6 +93,7 @@ class AppContainer:
     execution_service: ExecutionService
     memory_service: MemoryService
     research_coordinator: ResearchCoordinator
+    research_health_backfill_service: ResearchHealthBackfillService
     auto_trigger_service: AutoTriggerService
     daemon_service: DaemonService
     decision_corpus_service: DecisionCorpusService
@@ -238,6 +240,10 @@ class AppContainer:
             providers,
             signal_engine,
             agent_pack_service,
+        )
+        research_health_backfill_service = ResearchHealthBackfillService(
+            session_factory=session_factory,
+            research_coordinator=research_coordinator,
         )
         agents = AgentSuite(settings, providers)
         historical_training_service = HistoricalTrainingService(
@@ -452,6 +458,7 @@ class AppContainer:
             execution_service=execution_service,
             memory_service=memory_service,
             research_coordinator=research_coordinator,
+            research_health_backfill_service=research_health_backfill_service,
             auto_trigger_service=auto_trigger_service,
             daemon_service=daemon_service,
             decision_corpus_service=decision_corpus_service,

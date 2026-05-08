@@ -657,6 +657,21 @@ async def _run_crypto_status_command(container: AppContainer) -> int:
     return 0
 
 
+async def _run_training_backfill_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.training_backfill_command != "research-health":
+        raise ValueError(f"unknown training-backfill command {args.training_backfill_command}")
+    result = await container.research_health_backfill_service.backfill_research_health(
+        origins=args.origins,
+        days=args.days,
+        market_prefixes=args.market_prefix,
+        limit=args.limit,
+        overwrite=args.overwrite,
+        include_non_complete=args.include_non_complete,
+    )
+    print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
 async def _run_crypto_autonomy_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.crypto_autonomy_command != "run-once":
         raise ValueError(f"unknown crypto-autonomy command {args.crypto_autonomy_command}")
@@ -1240,6 +1255,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(await container.training_corpus_service.build_dataset(request), indent=2))
             return 0
 
+        if args.command == "training-backfill":
+            return await _run_training_backfill_command(args, container)
+
         if args.command == "historical-status":
             print(json.dumps(await container.historical_training_service.get_status(verbose=args.verbose), indent=2))
             return 0
@@ -1385,6 +1403,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 date_from=date.fromisoformat(args.date_from),
                 date_to=date.fromisoformat(args.date_to),
                 series=args.series or None,
+                archive_raw_events=not args.import_only,
             )
             print(json.dumps(result, indent=2))
             return 0
@@ -1814,7 +1833,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "shadow-campaign" and args.shadow_campaign_command == "run":
-            request = ShadowCampaignRequest(limit=args.limit, reason=args.reason)
+            request = ShadowCampaignRequest(limit=args.limit, reason=args.reason, domain=args.domain)
             results = await container.shadow_campaign_service.run(request)
             payload = [_shadow_run_payload(item) for item in results]
             missing_traces = [item for item in payload if item.get("decision_trace_id") is None]
@@ -2172,6 +2191,16 @@ def build_parser() -> argparse.ArgumentParser:
     training_build_list = subparsers.add_parser("training-build-list")
     training_build_list.add_argument("--limit", type=int, default=20)
 
+    training_backfill = subparsers.add_parser("training-backfill")
+    training_backfill_subparsers = training_backfill.add_subparsers(dest="training_backfill_command", required=True)
+    training_backfill_research = training_backfill_subparsers.add_parser("research-health")
+    training_backfill_research.add_argument("--origins", nargs="+", default=[RoomOrigin.SHADOW.value])
+    training_backfill_research.add_argument("--days", type=int, default=30)
+    training_backfill_research.add_argument("--market-prefix", action="append", default=[])
+    training_backfill_research.add_argument("--limit", type=int, default=2000)
+    training_backfill_research.add_argument("--overwrite", action="store_true")
+    training_backfill_research.add_argument("--include-non-complete", action="store_true")
+
     baseline_model_card = subparsers.add_parser(
         "baseline-model-card",
         help="Write a read-only historical plus shadow baseline model card.",
@@ -2284,6 +2313,7 @@ def build_parser() -> argparse.ArgumentParser:
     historical_backfill_weather.add_argument("--date-from", required=True)
     historical_backfill_weather.add_argument("--date-to", required=True)
     historical_backfill_weather.add_argument("--series", nargs="*", default=None)
+    historical_backfill_weather.add_argument("--import-only", action="store_true")
     historical_backfill_forecast = historical_backfill_subparsers.add_parser("forecast-archive")
     historical_backfill_forecast.add_argument("--date-from", required=True)
     historical_backfill_forecast.add_argument("--date-to", required=True)
@@ -2588,6 +2618,7 @@ def build_parser() -> argparse.ArgumentParser:
     shadow_campaign_run = shadow_campaign_subparsers.add_parser("run")
     shadow_campaign_run.add_argument("--limit", type=int, default=3)
     shadow_campaign_run.add_argument("--reason", default="cli_shadow_campaign")
+    shadow_campaign_run.add_argument("--domain", choices=["weather"], default="weather")
 
     run_room = subparsers.add_parser("run-room")
     run_room.add_argument("room_id")

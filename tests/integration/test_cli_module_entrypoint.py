@@ -975,6 +975,37 @@ async def test_shadow_campaign_cli_reports_trace_ids_and_fails_when_any_are_miss
     assert "missing deterministic decision traces" in payload["error"]
 
 
+def test_shadow_campaign_cli_accepts_weather_domain() -> None:
+    args = cli_module.build_parser().parse_args(["shadow-campaign", "run", "--domain", "weather", "--limit", "25"])
+
+    assert args.command == "shadow-campaign"
+    assert args.shadow_campaign_command == "run"
+    assert args.domain == "weather"
+    assert args.limit == 25
+
+
+def test_training_backfill_research_health_cli_arguments() -> None:
+    args = cli_module.build_parser().parse_args(
+        [
+            "training-backfill",
+            "research-health",
+            "--origins",
+            "shadow",
+            "--days",
+            "30",
+            "--market-prefix",
+            "KXHIGH",
+            "--limit",
+            "2000",
+        ]
+    )
+
+    assert args.command == "training-backfill"
+    assert args.training_backfill_command == "research-health"
+    assert args.origins == ["shadow"]
+    assert args.market_prefix == ["KXHIGH"]
+
+
 def test_python_module_cli_entrypoint_reports_operator_errors_cleanly(tmp_path) -> None:
     env = os.environ.copy()
     env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/cli.db"
