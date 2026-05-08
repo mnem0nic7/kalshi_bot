@@ -108,7 +108,7 @@ wait_for_services_health 180 \
 # removal-in-progress races during full machine recovery.
 docker compose -f "${compose_file}" ${compose_env_file} stop caddy 2>/dev/null || true
 docker compose -f "${compose_file}" ${compose_env_file} rm -f caddy 2>/dev/null || true
-docker compose -f "${compose_file}" ${compose_env_file} up -d --force-recreate caddy
+docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps --force-recreate caddy
 wait_for_service_health caddy 90
 
 run_control demo python -m kalshi_bot.cli watchdog mark-boot --status success --reason "${reason}"
