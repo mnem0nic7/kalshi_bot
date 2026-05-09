@@ -386,6 +386,123 @@ async def test_trading_audit_flags_money_safety_issues(audit_harness) -> None:
 
 
 @pytest.mark.asyncio
+async def test_trading_audit_ignores_benign_ops_noise_for_money_safety(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        for idx in range(12):
+            session.add(
+                OpsEvent(
+                    kalshi_env="production",
+                    severity="error",
+                    source="research",
+                    summary=f"Research refresh failed for KXHIGHTOKC-26MAY10-T{idx}",
+                    payload={
+                        "market_ticker": f"KXHIGHTOKC-26MAY10-T{idx}",
+                        "trigger_reason": "market_event",
+                        "error": "Client error '404 Not Found' for url 'https://example.test/market'",
+                        "error_type": "HTTPStatusError",
+                    },
+                    created_at=NOW - timedelta(minutes=idx),
+                    updated_at=NOW - timedelta(minutes=idx),
+                )
+            )
+            session.add(
+                OpsEvent(
+                    kalshi_env="production",
+                    severity="warning",
+                    source="auto_trigger",
+                    summary=f"Auto-trigger skipped for KXHIGHNY-26APR24-T{idx}: max concurrent rooms reached",
+                    payload={"market_ticker": f"KXHIGHNY-26APR24-T{idx}", "reason": "max_concurrent_rooms"},
+                    created_at=NOW - timedelta(minutes=idx),
+                    updated_at=NOW - timedelta(minutes=idx),
+                )
+            )
+        session.add_all(
+            [
+                OpsEvent(
+                    kalshi_env="production",
+                    severity="error",
+                    source="stream",
+                    summary="Kalshi websocket stream error repeated 852 times",
+                    payload={
+                        "error_type": "ConnectionClosedError",
+                        "message": "sent 1011 (internal error) keepalive ping timeout; no close frame received",
+                    },
+                    created_at=NOW - timedelta(minutes=20),
+                    updated_at=NOW - timedelta(minutes=20),
+                ),
+                OpsEvent(
+                    kalshi_env="production",
+                    severity="warning",
+                    source="watchdog",
+                    summary="Watchdog requested recovery action",
+                    payload={
+                        "action": "restart_color",
+                        "reason": "active color unhealthy",
+                        "colors": {"blue": {"daemon": {"reason": "heartbeat stale"}}},
+                    },
+                    created_at=NOW - timedelta(minutes=21),
+                    updated_at=NOW - timedelta(minutes=21),
+                ),
+                OpsEvent(
+                    kalshi_env="production",
+                    severity="error",
+                    source="research",
+                    summary="Research refresh failed for KXHIGHTMIN-26MAY10-T57",
+                    payload={
+                        "trigger_reason": "room_start",
+                        "error_type": "HTTPStatusError",
+                        "status_code": 502,
+                    },
+                    created_at=NOW - timedelta(minutes=22),
+                    updated_at=NOW - timedelta(minutes=22),
+                ),
+                OpsEvent(
+                    kalshi_env="production",
+                    severity="warning",
+                    source="strategy_auto_evolve",
+                    summary="Strategy Auto-Evolve completed: no strategy activated",
+                    payload={
+                        "event_kind": "auto_evolve",
+                        "trading_audit": {
+                            "issues": [
+                                {
+                                    "severity": "medium",
+                                    "code": "stale_data_blocks_or_events",
+                                    "summary": "Stale market or research data is affecting trading decisions.",
+                                }
+                            ]
+                        },
+                    },
+                    created_at=NOW - timedelta(minutes=23),
+                    updated_at=NOW - timedelta(minutes=23),
+                ),
+            ]
+        )
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=1,
+        now=NOW,
+    )
+
+    issue_codes = {issue["code"] for issue in report["issues"]}
+    assert "stale_data_blocks_or_events" not in issue_codes
+    assert "ops_warning_error_noise" not in issue_codes
+    assert report["ops"]["ignored_benign_event_counts"] == {
+        "research_market_event_404": 12,
+        "auto_trigger_capacity_skip": 12,
+        "stream_transient_reconnect": 1,
+        "watchdog_self_recovery": 1,
+        "strategy_auto_evolve_stale_diagnostic": 1,
+    }
+    assert report["ops"]["actionable_top_sources"] == [
+        {"severity": "error", "source": "research", "count": 1}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_trading_audit_flags_kill_switch_suppressed_stop_loss_exits(audit_harness) -> None:
     settings, session_factory = audit_harness
     room = _room("room-suppressed-exit", "KXHIGHTNOLA-26APR30-T79")

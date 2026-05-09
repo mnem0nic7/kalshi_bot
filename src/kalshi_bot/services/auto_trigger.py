@@ -134,9 +134,9 @@ class AutoTriggerService:
                         "max_concurrent_rooms"
                     ),
                     cooldown_seconds=thresholds.trigger_cooldown_seconds,
-                    severity="warning",
+                    severity="info",
                     summary=f"Auto-trigger skipped for {market_ticker}: max concurrent rooms reached",
-                    payload={"market_ticker": market_ticker},
+                    payload={"market_ticker": market_ticker, "reason": "max_concurrent_rooms"},
                     kalshi_env=self.settings.kalshi_env,
                 )
                 await session.commit()

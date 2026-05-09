@@ -65,6 +65,77 @@ def _iso(value: datetime | None) -> str | None:
     return normalized.isoformat() if normalized is not None else None
 
 
+def _ops_payload(event: OpsEvent) -> dict[str, Any]:
+    return event.payload if isinstance(event.payload, dict) else {}
+
+
+def _ops_text(event: OpsEvent) -> str:
+    return f"{event.summary or ''} {_ops_payload(event)}".lower()
+
+
+def _is_background_research_market_not_found(event: OpsEvent) -> bool:
+    payload = _ops_payload(event)
+    if str(event.source or "").lower() != "research":
+        return False
+    if str(payload.get("trigger_reason") or "").lower() != "market_event":
+        return False
+    text = _ops_text(event)
+    status_code = payload.get("status_code")
+    return status_code in (404, "404") or ("404" in text and "not found" in text)
+
+
+def _is_transient_stream_reconnect(event: OpsEvent) -> bool:
+    payload = _ops_payload(event)
+    if str(event.source or "").lower() != "stream":
+        return False
+    if payload.get("classification") == "transient_reconnect" or payload.get("transient") is True:
+        return True
+    if str(payload.get("error_type") or "") != "ConnectionClosedError":
+        return False
+    text = f"{event.summary or ''} {payload.get('message') or ''}".lower()
+    return "keepalive ping timeout" in text and ("no close frame" in text or "1011" in text)
+
+
+def _is_watchdog_self_recovery(event: OpsEvent) -> bool:
+    payload = _ops_payload(event)
+    if str(event.source or "").lower() != "watchdog":
+        return False
+    if "watchdog requested recovery action" not in str(event.summary or "").lower():
+        return False
+    return str(payload.get("action") or "").lower() in {"restart_color", "failover"}
+
+
+def _is_auto_trigger_capacity_skip(event: OpsEvent) -> bool:
+    if str(event.source or "").lower() != "auto_trigger":
+        return False
+    return "max concurrent rooms reached" in _ops_text(event)
+
+
+def _is_strategy_auto_evolve_stale_diagnostic(event: OpsEvent) -> bool:
+    payload = _ops_payload(event)
+    if str(event.source or "").lower() != "strategy_auto_evolve":
+        return False
+    if str(payload.get("event_kind") or "").lower() != "auto_evolve":
+        return False
+    return "stale" in _ops_text(event)
+
+
+def _ignored_money_safety_ops_category(event: OpsEvent) -> str | None:
+    if str(event.severity or "").lower() == "critical":
+        return None
+    if _is_background_research_market_not_found(event):
+        return "research_market_event_404"
+    if _is_transient_stream_reconnect(event):
+        return "stream_transient_reconnect"
+    if _is_watchdog_self_recovery(event):
+        return "watchdog_self_recovery"
+    if _is_auto_trigger_capacity_skip(event):
+        return "auto_trigger_capacity_skip"
+    if _is_strategy_auto_evolve_stale_diagnostic(event):
+        return "strategy_auto_evolve_stale_diagnostic"
+    return None
+
+
 def _money(value: Decimal | None) -> str | None:
     return str(value.quantize(Decimal("0.0001"))) if value is not None else None
 
@@ -1860,19 +1931,36 @@ class TradingAuditService:
         }
 
     def _ops_summary(self, ops_events: list[OpsEvent]) -> dict[str, Any]:
+        ignored_categories = Counter(
+            category
+            for event in ops_events
+            if (category := _ignored_money_safety_ops_category(event)) is not None
+        )
+        actionable_events = [
+            event
+            for event in ops_events
+            if _ignored_money_safety_ops_category(event) is None
+        ]
         counts = Counter((event.severity, event.source) for event in ops_events)
+        actionable_counts = Counter((event.severity, event.source) for event in actionable_events)
         stale_count = sum(
             1
-            for event in ops_events
-            if "stale" in (event.summary or "").lower()
-            or "stale" in str(event.payload or {}).lower()
+            for event in actionable_events
+            if "stale" in _ops_text(event)
         )
         return {
             "event_count": len(ops_events),
+            "actionable_event_count": len(actionable_events),
+            "ignored_benign_event_count": sum(ignored_categories.values()),
+            "ignored_benign_event_counts": dict(ignored_categories),
             "stale_event_count": stale_count,
             "top_sources": [
                 {"severity": severity, "source": source, "count": count}
                 for (severity, source), count in counts.most_common(20)
+            ],
+            "actionable_top_sources": [
+                {"severity": severity, "source": source, "count": count}
+                for (severity, source), count in actionable_counts.most_common(20)
             ],
         }
 
@@ -2134,7 +2222,11 @@ class TradingAuditService:
                     "ops_stale_event_count": ops["stale_event_count"],
                 },
             })
-        noisy_sources = [row for row in ops["top_sources"] if row["severity"] in {"warning", "error", "critical"} and row["count"] >= 10]
+        noisy_sources = [
+            row
+            for row in ops.get("actionable_top_sources", ops["top_sources"])
+            if row["severity"] in {"warning", "error", "critical"} and row["count"] >= 10
+        ]
         if noisy_sources:
             issues.append({
                 "severity": "medium",
