@@ -484,6 +484,67 @@ def test_crypto_decision_rows_recover_real_quotes_from_snapshot_payload(tmp_path
     assert rows[0]["no_ask_dollars"] == Decimal("0.5300")
 
 
+def test_crypto_decision_rows_join_settlement_labels_to_live_quote_snapshots(tmp_path) -> None:
+    del tmp_path
+    close = datetime(2026, 5, 1, 12, 15, tzinfo=UTC)
+    quote_snapshot = type(
+        "_Snapshot",
+        (),
+        {
+            "market_ticker": "KXBTC15M-JOINED",
+            "series_ticker": "KXBTC15M",
+            "asset_symbol": "BTC",
+            "frequency": "15m",
+            "source_kind": "live",
+            "settlement_result": None,
+            "observed_at": close - timedelta(minutes=3),
+            "open_time": close - timedelta(minutes=15),
+            "close_time": close,
+            "expected_expiration_time": close,
+            "target_price_dollars": Decimal("100000.00000000"),
+            "yes_bid_dollars": Decimal("0.4700"),
+            "yes_ask_dollars": Decimal("0.4900"),
+            "no_ask_dollars": Decimal("0.5300"),
+            "last_price_dollars": Decimal("0.4800"),
+            "volume": 10,
+            "open_interest": 5,
+        },
+    )()
+    settled_snapshot = type(
+        "_Snapshot",
+        (),
+        {
+            "market_ticker": "KXBTC15M-JOINED",
+            "series_ticker": "KXBTC15M",
+            "asset_symbol": "BTC",
+            "frequency": "15m",
+            "source_kind": "historical",
+            "settlement_result": "yes",
+            "observed_at": close,
+            "open_time": close - timedelta(minutes=15),
+            "close_time": close,
+            "expected_expiration_time": close,
+            "target_price_dollars": Decimal("100000.00000000"),
+            "yes_bid_dollars": None,
+            "yes_ask_dollars": None,
+            "no_ask_dollars": None,
+            "last_price_dollars": None,
+            "volume": 10,
+            "open_interest": 5,
+        },
+    )()
+
+    rows = _crypto_decision_rows([quote_snapshot, settled_snapshot], [])  # type: ignore[list-item]
+
+    assert len(rows) == 1
+    assert rows[0]["quote_source"] == "snapshot_quotes"
+    assert rows[0]["strict_trade_eligible"] is True
+    assert rows[0]["settlement_result"] == "yes"
+    assert rows[0]["settlement_label_source"] == "joined_settled_snapshot"
+    assert rows[0]["yes_bid_dollars"] == Decimal("0.4700")
+    assert rows[0]["yes_ask_dollars"] == Decimal("0.4900")
+
+
 def test_crypto_decision_rows_generate_prediction_only_preclose_candle_proxy(tmp_path) -> None:
     del tmp_path
     close = datetime(2026, 5, 1, 12, 15, tzinfo=UTC)
