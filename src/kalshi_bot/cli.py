@@ -1248,6 +1248,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     kalshi_env=args.kalshi_env,
                     days=behavior_days,
                     since_hours=args.since_hours,
+                    mode=args.mode,
                 )
                 if args.json:
                     print(json.dumps(report, indent=2))
@@ -2228,6 +2229,7 @@ def build_parser() -> argparse.ArgumentParser:
     trade_behavior_validate.add_argument("--days", type=int, default=7)
     trade_behavior_validate.add_argument("--full-history", action="store_true")
     trade_behavior_validate.add_argument("--since-hours", type=int, default=24)
+    trade_behavior_validate.add_argument("--mode", choices=["fast", "detailed"], default="detailed")
     trade_behavior_validate.add_argument("--json", action="store_true")
     trade_behavior_quality = trade_behavior_subparsers.add_parser("quality")
     trade_behavior_quality.add_argument("--kalshi-env", default="production")

@@ -1450,6 +1450,56 @@ def test_overnight_readiness_cli_report_json_smoke(tmp_path) -> None:
     assert "Traceback" not in result.stderr
 
 
+def test_trade_behavior_validate_cli_modes_json_smoke(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+
+    fast = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "trade-behavior",
+            "validate",
+            "--mode",
+            "fast",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert fast.returncode == 0
+    assert '"mode": "fast"' in fast.stdout
+    assert '"fast_gate"' in fast.stdout
+    assert "Traceback" not in fast.stderr
+
+    detailed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "trade-behavior",
+            "validate",
+            "--mode",
+            "detailed",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert detailed.returncode == 0
+    assert '"mode": "detailed"' in detailed.stdout
+    assert '"analysis"' in detailed.stdout
+    assert "Traceback" not in detailed.stderr
+
+
 @pytest.mark.asyncio
 async def test_ignore_strategy_promotion_secondary_status_cli_updates_resolution_audit(tmp_path) -> None:
     database_url = f"sqlite+aiosqlite:///{tmp_path}/promotion-ignore-cli.db"

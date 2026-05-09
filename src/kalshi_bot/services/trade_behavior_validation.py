@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -7,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import OrderRecord, Room, TradeTicketRecord
+from kalshi_bot.db.models import Checkpoint, FillRecord, OpsEvent, OrderRecord, RiskVerdictRecord, Room, Signal, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.trade_behavior_quality import annotate_bucket_matrix, bucket_status_summary
 from kalshi_bot.services.trade_behavior import production_entry_freeze_enabled
@@ -15,6 +16,12 @@ from kalshi_bot.services.trade_behavior import production_entry_freeze_enabled
 
 LIVE_BUY_TICKET_STATUSES = {"approved", "submitted", "resting", "filled", "executed"}
 LIVE_BUY_ORDER_STATUSES = {"accepted", "open", "submitted", "resting", "filled", "executed"}
+FAILED_ORDER_STATUSES = {"failed", "rejected", "order_id_missing", "lock_denied", "write_credentials_missing"}
+NOISY_OPS_SEVERITIES = {"warning", "error", "critical"}
+
+
+def _batches(values: list[str], size: int = 500) -> list[list[str]]:
+    return [values[i : i + size] for i in range(0, len(values), size)]
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -146,6 +153,115 @@ def _issue(severity: str, code: str, summary: str) -> dict[str, str]:
     return {"severity": severity, "code": code, "summary": summary}
 
 
+def _report_status(issues: list[dict[str, Any]]) -> str:
+    if any(issue.get("severity") == "fail" for issue in issues):
+        return "fail"
+    if issues:
+        return "warn"
+    return "pass"
+
+
+def _order_failed(order: OrderRecord) -> bool:
+    status = str(order.status or "").lower()
+    return status in FAILED_ORDER_STATUSES or status.startswith("rejected_")
+
+
+def _parse_checkpoint_time(checkpoint: Checkpoint | None) -> datetime | None:
+    if checkpoint is None:
+        return None
+    payload = checkpoint.payload if isinstance(checkpoint.payload, dict) else {}
+    raw = payload.get("reconciled_at") or payload.get("ran_at") or payload.get("updated_at")
+    if not raw:
+        return _as_utc(checkpoint.updated_at)
+    try:
+        return _as_utc(datetime.fromisoformat(str(raw)))
+    except ValueError:
+        return None
+
+
+def _reconcile_evidence(checkpoint: Checkpoint | None, *, now: datetime) -> dict[str, Any]:
+    reconciled_at = _parse_checkpoint_time(checkpoint)
+    age_seconds = None
+    if reconciled_at is not None:
+        age_seconds = max(0, int((now - reconciled_at).total_seconds()))
+    return {
+        "stream_name": checkpoint.stream_name if checkpoint is not None else None,
+        "present": checkpoint is not None,
+        "reconciled_at": reconciled_at.isoformat() if reconciled_at is not None else None,
+        "age_seconds": age_seconds,
+    }
+
+
+def _ops_summary(ops_events: list[OpsEvent]) -> dict[str, Any]:
+    source_counts = Counter((str(event.severity), str(event.source)) for event in ops_events)
+    stale_count = sum(
+        1
+        for event in ops_events
+        if "stale" in str(event.summary or "").lower()
+        or "stale" in str(event.payload or {}).lower()
+    )
+    critical_events = [event for event in ops_events if str(event.severity).lower() == "critical"]
+    noisy_sources = [
+        {"severity": severity, "source": source, "count": count}
+        for (severity, source), count in source_counts.most_common(20)
+        if severity in NOISY_OPS_SEVERITIES and count >= 10
+    ]
+    return {
+        "event_count": len(ops_events),
+        "stale_event_count": stale_count,
+        "critical_event_count": len(critical_events),
+        "top_sources": [
+            {"severity": severity, "source": source, "count": count}
+            for (severity, source), count in source_counts.most_common(20)
+        ],
+        "noisy_sources": noisy_sources,
+        "critical_events": [
+            {
+                "id": event.id,
+                "source": event.source,
+                "summary": event.summary,
+                "created_at": _as_utc(event.created_at).isoformat() if event.created_at else None,
+            }
+            for event in critical_events[:20]
+        ],
+    }
+
+
+def _position_discrepancy_evidence(ops_events: list[OpsEvent]) -> dict[str, Any]:
+    evidence: list[dict[str, Any]] = []
+    for event in ops_events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        text = f"{event.summary or ''} {payload}".lower()
+        count = payload.get("discrepancy_count") or payload.get("position_discrepancy_count")
+        flagged = "exchange_position_discrepancy" in text or "position discrepancy" in text
+        if not flagged and count in (None, 0, "0"):
+            continue
+        evidence.append(
+            {
+                "id": event.id,
+                "severity": event.severity,
+                "source": event.source,
+                "summary": event.summary,
+                "discrepancy_count": count,
+                "created_at": _as_utc(event.created_at).isoformat() if event.created_at else None,
+            }
+        )
+    return {"discrepancy_count": len(evidence), "events": evidence[:20]}
+
+
+def _fast_order_payload(order: OrderRecord) -> dict[str, Any]:
+    return {
+        "order_id": order.id,
+        "client_order_id": order.client_order_id,
+        "market_ticker": order.market_ticker,
+        "status": order.status,
+        "side": order.side,
+        "action": order.action,
+        "strategy_code": order.strategy_code,
+        "created_at": _as_utc(order.created_at).isoformat() if order.created_at else None,
+    }
+
+
 def _empirical_gate_readiness(
     *,
     settings: Settings,
@@ -201,6 +317,193 @@ def _empirical_gate_readiness(
     }
 
 
+async def _build_fast_trade_behavior_validation_report(
+    *,
+    settings: Settings,
+    session_factory: async_sessionmaker,
+    watchdog_service: Any,
+    kalshi_env: str,
+    days: int,
+    since_hours: int,
+    now: datetime,
+) -> dict[str, Any]:
+    since = now - timedelta(hours=max(1, int(since_hours)))
+    activity_cutoff = now - timedelta(days=max(1, int(days)))
+    freeze_enabled = production_entry_freeze_enabled(settings, kalshi_env)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=kalshi_env)
+        watchdog_status = await watchdog_service.get_status(repo, kalshi_env=kalshi_env)
+        control = await repo.get_deployment_control(kalshi_env=kalshi_env)
+        active_color = str(getattr(control, "active_color", "") or settings.app_color)
+        reconcile_checkpoint = await repo.get_checkpoint(f"daemon_reconcile:{kalshi_env}:{active_color}")
+        buy_bypass = await _production_buy_entry_bypass(session, kalshi_env=kalshi_env, since=since)
+        runtime_observed = await _env_trading_activity_observed(
+            session,
+            kalshi_env=kalshi_env,
+            since=activity_cutoff,
+        )
+
+        rooms = list(
+            (
+                await session.execute(
+                    select(Room)
+                    .where(Room.kalshi_env == kalshi_env, Room.created_at >= since)
+                    .order_by(Room.created_at.desc(), Room.id.desc())
+                )
+            ).scalars()
+        )
+        room_ids = [room.id for room in rooms]
+
+        signals: list[Signal] = []
+        tickets: list[TradeTicketRecord] = []
+        risk_verdicts: list[RiskVerdictRecord] = []
+        if room_ids:
+            for batch in _batches(room_ids):
+                signals.extend(
+                    list((await session.execute(select(Signal).where(Signal.room_id.in_(batch)))).scalars())
+                )
+                tickets.extend(
+                    list((await session.execute(select(TradeTicketRecord).where(TradeTicketRecord.room_id.in_(batch)))).scalars())
+                )
+                risk_verdicts.extend(
+                    list((await session.execute(select(RiskVerdictRecord).where(RiskVerdictRecord.room_id.in_(batch)))).scalars())
+                )
+
+        orders = list(
+            (
+                await session.execute(
+                    select(OrderRecord)
+                    .where(OrderRecord.kalshi_env == kalshi_env, OrderRecord.created_at >= since)
+                    .order_by(OrderRecord.created_at.desc(), OrderRecord.id.desc())
+                )
+            ).scalars()
+        )
+        fills = list(
+            (
+                await session.execute(
+                    select(FillRecord)
+                    .where(FillRecord.kalshi_env == kalshi_env, FillRecord.created_at >= since)
+                    .order_by(FillRecord.created_at.desc(), FillRecord.id.desc())
+                )
+            ).scalars()
+        )
+        ops_events = list(
+            (
+                await session.execute(
+                    select(OpsEvent)
+                    .where(OpsEvent.kalshi_env == kalshi_env, OpsEvent.created_at >= since)
+                    .order_by(OpsEvent.created_at.desc(), OpsEvent.id.desc())
+                )
+            ).scalars()
+        )
+
+    runtime_issue = _active_runtime_issue(watchdog_status)
+    runtime_not_observed = kalshi_env == "production" and not runtime_observed
+    failed_orders = [order for order in orders if _order_failed(order)]
+    live_activity_blocked_by_safety = kalshi_env == "production" and (settings.app_shadow_mode or freeze_enabled)
+    reconcile = _reconcile_evidence(reconcile_checkpoint, now=now)
+    reconcile_age = reconcile.get("age_seconds")
+    ops = _ops_summary(ops_events)
+    discrepancy = _position_discrepancy_evidence(ops_events)
+
+    issues: list[dict[str, Any]] = []
+    if runtime_issue is not None and not runtime_not_observed:
+        issues.append(runtime_issue)
+    if kalshi_env == "production" and not freeze_enabled:
+        issues.append(_issue("fail", "production_entry_freeze_disabled", "Production entry freeze is disabled."))
+    if kalshi_env == "production" and (buy_bypass["ticket_count"] or buy_bypass["order_count"]):
+        issues.append(_issue("fail", "production_buy_entry_bypass", "Production buy entries were observed after the validation cutoff."))
+    if failed_orders:
+        issues.append(_issue("fail", "fast_gate_failed_orders", "Failed or rejected orders were observed inside the fast validation window."))
+    if live_activity_blocked_by_safety and (orders or fills):
+        issues.append(_issue("fail", "fast_gate_unexpected_live_activity", "Live orders or fills were observed while production safety blockers are active."))
+    if ops["critical_event_count"]:
+        issues.append(_issue("fail", "fast_gate_critical_ops_events", "Critical ops events were observed inside the fast validation window."))
+    if discrepancy["discrepancy_count"]:
+        issues.append(_issue("fail", "exchange_position_discrepancy_evidence", "Exchange/local position discrepancy evidence was observed."))
+    if not reconcile["present"]:
+        issues.append(_issue("fail", "daemon_reconcile_missing", "No daemon reconcile checkpoint exists for the active production color."))
+    elif reconcile_age is None:
+        issues.append(_issue("fail", "daemon_reconcile_invalid", "Daemon reconcile checkpoint does not contain a usable timestamp."))
+    elif reconcile_age > max(1, int(settings.daemon_reconcile_stale_kill_switch_seconds)):
+        issues.append(_issue("fail", "daemon_reconcile_stale", "Daemon reconcile checkpoint is stale."))
+
+    if ops["stale_event_count"]:
+        issues.append(_issue("warn", "fast_gate_stale_data_noise", "Recent ops events include stale-data noise."))
+    if ops["noisy_sources"]:
+        issues.append(_issue("warn", "fast_gate_ops_warning_error_noise", "Recent warning/error event volume is elevated."))
+
+    fast_gate = {
+        "mode": "fast",
+        "since": since.isoformat(),
+        "counts": {
+            "rooms": len(rooms),
+            "signals": len(signals),
+            "trade_tickets": len(tickets),
+            "risk_verdicts": len(risk_verdicts),
+            "orders": len(orders),
+            "fills": len(fills),
+            "ops_events": len(ops_events),
+        },
+        "room_stage_counts": dict(Counter(str(room.stage or "<unknown>") for room in rooms)),
+        "room_origin_counts": dict(Counter(str(room.room_origin or "<unknown>") for room in rooms)),
+        "shadow_mode_counts": dict(Counter("shadow" if room.shadow_mode else "live" for room in rooms)),
+        "ticket_status_counts": dict(Counter(str(ticket.status or "<unknown>") for ticket in tickets)),
+        "risk_status_counts": dict(Counter(str(verdict.status or "<unknown>") for verdict in risk_verdicts)),
+        "order_status_counts": dict(Counter(str(order.status or "<unknown>") for order in orders)),
+        "failed_orders": [_fast_order_payload(order) for order in failed_orders[:20]],
+        "reconcile": reconcile,
+        "ops": ops,
+        "exchange_position_discrepancy": discrepancy,
+    }
+
+    return {
+        "status": _report_status(issues),
+        "mode": "fast",
+        "kalshi_env": kalshi_env,
+        "window_days": days,
+        "since_hours": since_hours,
+        "generated_at": now.isoformat(),
+        "freeze": {
+            "production_entry_freeze_enabled": freeze_enabled,
+            "reason": settings.trade_behavior_entry_freeze_reason,
+            "min_edge_floor_bps": settings.trade_behavior_freeze_min_edge_bps,
+        },
+        "empirical_gate": {
+            "enabled": settings.trade_behavior_empirical_gate_enabled,
+            "readiness": {
+                "status": "not_evaluated_fast_mode",
+                "reason": "fast_mode_uses_indexed_runtime_evidence_only",
+            },
+        },
+        "runtime_health": watchdog_status,
+        "runtime_observed": runtime_observed,
+        "runtime_not_observed": runtime_not_observed,
+        "buy_entry_bypass": buy_bypass,
+        "audit": {
+            "mode": "fast",
+            "issue_count": None,
+            "critical_count": None,
+            "high_count": None,
+            "issues": [],
+            "worst_lifecycle_buckets": [],
+        },
+        "analysis": {
+            "mode": "fast",
+            "rows": None,
+            "training_eligible_count": None,
+            "excluded_count": None,
+            "data_defect_count": None,
+            "top_exclusion_reasons": [],
+            "new_row_scoreability": {},
+            "worst_buckets": [],
+        },
+        "fast_gate": fast_gate,
+        "issues": issues,
+    }
+
+
 async def build_trade_behavior_validation_report(
     *,
     settings: Settings,
@@ -211,9 +514,23 @@ async def build_trade_behavior_validation_report(
     kalshi_env: str = "production",
     days: int = 7,
     since_hours: int = 24,
+    mode: str = "detailed",
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    if mode not in {"fast", "detailed"}:
+        raise ValueError("mode must be fast or detailed")
     now_utc = _as_utc(now) or datetime.now(UTC)
+    if mode == "fast":
+        return await _build_fast_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=watchdog_service,
+            kalshi_env=kalshi_env,
+            days=days,
+            since_hours=since_hours,
+            now=now_utc,
+        )
+
     since = now_utc - timedelta(hours=max(1, int(since_hours)))
     async with session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=kalshi_env)
@@ -283,6 +600,7 @@ async def build_trade_behavior_validation_report(
 
     return {
         "status": status,
+        "mode": "detailed",
         "kalshi_env": kalshi_env,
         "window_days": days,
         "since_hours": since_hours,
@@ -335,9 +653,14 @@ def format_trade_behavior_validation_report(report: dict[str, Any]) -> str:
     audit = report.get("audit") or {}
     analysis = report.get("analysis") or {}
     bypass = report.get("buy_entry_bypass") or {}
+    fast_gate = report.get("fast_gate") or {}
+    fast_counts = fast_gate.get("counts") or {}
     lines = [
         "Trade Behavior Validation",
-        f"env={report.get('kalshi_env')} status={str(report.get('status')).upper()} window={report.get('window_days')}d since={report.get('since_hours')}h",
+        (
+            f"env={report.get('kalshi_env')} status={str(report.get('status')).upper()} "
+            f"mode={report.get('mode', 'detailed')} window={report.get('window_days')}d since={report.get('since_hours')}h"
+        ),
         "",
         (
             "Freeze: "
@@ -345,22 +668,54 @@ def format_trade_behavior_validation_report(report: dict[str, Any]) -> str:
             f"reason={freeze.get('reason')} floor={freeze.get('min_edge_floor_bps')}bps"
         ),
         f"Buy-entry bypass: tickets={bypass.get('ticket_count', 0)} orders={bypass.get('order_count', 0)}",
-        (
-            "Empirical gate: "
-            f"status={gate_readiness.get('status')} "
-            f"eligible_buckets={gate_readiness.get('eligible_reported_bucket_count')} "
-            f"negative_buckets={gate_readiness.get('negative_reported_bucket_count')} "
-            f"under_sampled={gate_readiness.get('under_sampled_reported_bucket_count')} "
-            f"unscored={gate_readiness.get('unscored_reported_bucket_count')}"
-        ),
-        f"Audit: issues={audit.get('issue_count', 0)} critical={audit.get('critical_count', 0)} high={audit.get('high_count', 0)}",
-        (
-            "Analysis: "
-            f"eligible={analysis.get('training_eligible_count')} "
-            f"excluded={analysis.get('excluded_count')} "
-            f"defects={analysis.get('data_defect_count')}"
-        ),
     ]
+    if report.get("mode") == "fast":
+        reconcile = fast_gate.get("reconcile") or {}
+        ops = fast_gate.get("ops") or {}
+        lines.extend(
+            [
+                (
+                    "Fast gate: "
+                    f"rooms={fast_counts.get('rooms', 0)} "
+                    f"signals={fast_counts.get('signals', 0)} "
+                    f"tickets={fast_counts.get('trade_tickets', 0)} "
+                    f"orders={fast_counts.get('orders', 0)} "
+                    f"fills={fast_counts.get('fills', 0)}"
+                ),
+                (
+                    "Reconcile: "
+                    f"present={reconcile.get('present')} "
+                    f"age_seconds={reconcile.get('age_seconds')} "
+                    f"stream={reconcile.get('stream_name')}"
+                ),
+                (
+                    "Ops: "
+                    f"events={ops.get('event_count', 0)} "
+                    f"critical={ops.get('critical_event_count', 0)} "
+                    f"stale={ops.get('stale_event_count', 0)}"
+                ),
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                (
+                    "Empirical gate: "
+                    f"status={gate_readiness.get('status')} "
+                    f"eligible_buckets={gate_readiness.get('eligible_reported_bucket_count')} "
+                    f"negative_buckets={gate_readiness.get('negative_reported_bucket_count')} "
+                    f"under_sampled={gate_readiness.get('under_sampled_reported_bucket_count')} "
+                    f"unscored={gate_readiness.get('unscored_reported_bucket_count')}"
+                ),
+                f"Audit: issues={audit.get('issue_count', 0)} critical={audit.get('critical_count', 0)} high={audit.get('high_count', 0)}",
+                (
+                    "Analysis: "
+                    f"eligible={analysis.get('training_eligible_count')} "
+                    f"excluded={analysis.get('excluded_count')} "
+                    f"defects={analysis.get('data_defect_count')}"
+                ),
+            ]
+        )
     if analysis.get("new_row_scoreability"):
         scoreability = analysis["new_row_scoreability"]
         lines.append(

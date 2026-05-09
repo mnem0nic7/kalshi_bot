@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import FillRecord
+from kalshi_bot.db.models import FillRecord, OpsEvent, OrderRecord, Room, Signal, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.trade_analysis import TradeAnalysisDataset
@@ -322,6 +322,243 @@ class FakeLegacyDebtAnalysis:
             "top_exclusion_reasons": [("missing_market_snapshot", 60), ("market_snapshot_high_leakage", 30)],
             "buckets": [],
         }
+
+
+class ExplodingAudit:
+    async def build_report(self, **kwargs):
+        raise AssertionError("fast validation must not call trading_audit_service")
+
+
+class ExplodingAnalysis:
+    async def build_report(self, **kwargs):
+        raise AssertionError("fast validation must not call trade_analysis_service")
+
+
+async def _seed_fast_reconcile(session_factory, *, reconciled_at: datetime = NOW) -> None:
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        await repo.ensure_deployment_control("blue", kalshi_env="production")
+        await repo.set_checkpoint("daemon_reconcile:production:blue", None, {"reconciled_at": reconciled_at.isoformat()})
+        await session.commit()
+
+
+def _fast_room(*, room_id: str = "fast-room", shadow_mode: bool = True) -> Room:
+    return Room(
+        id=room_id,
+        name="Fast Gate Room",
+        market_ticker=TICKER,
+        kalshi_env="production",
+        shadow_mode=shadow_mode,
+        room_origin="auto",
+        stage="complete",
+        created_at=NOW - timedelta(hours=1),
+        updated_at=NOW - timedelta(hours=1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_trade_behavior_fast_validation_uses_indexed_rows_without_slow_services(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        await _seed_fast_reconcile(session_factory)
+        async with session_factory() as session:
+            room = _fast_room()
+            session.add(room)
+            session.add(
+                Signal(
+                    id="fast-signal",
+                    room_id=room.id,
+                    market_ticker=TICKER,
+                    fair_yes_dollars=Decimal("0.6000"),
+                    edge_bps=1000,
+                    confidence=0.9,
+                    summary="fast gate signal",
+                    created_at=NOW - timedelta(hours=1),
+                    updated_at=NOW - timedelta(hours=1),
+                )
+            )
+            await session.commit()
+
+        report = await build_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=FakeWatchdog(),
+            trading_audit_service=ExplodingAudit(),
+            trade_analysis_service=ExplodingAnalysis(),
+            kalshi_env="production",
+            days=7,
+            since_hours=24,
+            mode="fast",
+            now=NOW,
+        )
+    finally:
+        await engine.dispose()
+
+    assert report["status"] == "pass"
+    assert report["mode"] == "fast"
+    assert report["freeze"]["production_entry_freeze_enabled"] is True
+    assert report["fast_gate"]["counts"]["rooms"] == 1
+    assert report["fast_gate"]["counts"]["signals"] == 1
+    assert report["buy_entry_bypass"]["ticket_count"] == 0
+    assert report["audit"]["mode"] == "fast"
+    assert report["analysis"]["mode"] == "fast"
+
+
+@pytest.mark.asyncio
+async def test_trade_behavior_fast_validation_fails_live_buy_bypass_during_freeze(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-bypass.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        await _seed_fast_reconcile(session_factory)
+        async with session_factory() as session:
+            room = _fast_room(shadow_mode=False)
+            session.add(room)
+            session.add(
+                TradeTicketRecord(
+                    id="fast-ticket",
+                    room_id=room.id,
+                    market_ticker=TICKER,
+                    action="buy",
+                    side="yes",
+                    yes_price_dollars=Decimal("0.5000"),
+                    count_fp=Decimal("1.00"),
+                    time_in_force="immediate_or_cancel",
+                    client_order_id="fast-ticket-client",
+                    status="approved",
+                    created_at=NOW - timedelta(hours=1),
+                    updated_at=NOW - timedelta(hours=1),
+                )
+            )
+            await session.commit()
+
+        report = await build_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=FakeWatchdog(),
+            trading_audit_service=ExplodingAudit(),
+            trade_analysis_service=ExplodingAnalysis(),
+            kalshi_env="production",
+            since_hours=24,
+            mode="fast",
+            now=NOW,
+        )
+    finally:
+        await engine.dispose()
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert report["status"] == "fail"
+    assert "production_buy_entry_bypass" in codes
+    assert report["buy_entry_bypass"]["ticket_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_trade_behavior_fast_validation_fails_failed_orders_critical_ops_and_stale_reconcile(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-failures.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        await _seed_fast_reconcile(session_factory, reconciled_at=NOW - timedelta(minutes=10))
+        async with session_factory() as session:
+            session.add(
+                OrderRecord(
+                    id="fast-order",
+                    kalshi_env="production",
+                    client_order_id="fast-order-client",
+                    market_ticker=TICKER,
+                    status="rejected_400",
+                    side="yes",
+                    action="buy",
+                    yes_price_dollars=Decimal("0.5000"),
+                    count_fp=Decimal("1.00"),
+                    created_at=NOW - timedelta(hours=1),
+                    updated_at=NOW - timedelta(hours=1),
+                )
+            )
+            session.add(
+                OpsEvent(
+                    id="fast-critical",
+                    kalshi_env="production",
+                    severity="critical",
+                    source="watchdog",
+                    summary="critical reconcile fault",
+                    payload={},
+                    created_at=NOW - timedelta(hours=1),
+                    updated_at=NOW - timedelta(hours=1),
+                )
+            )
+            await session.commit()
+
+        report = await build_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=FakeWatchdog(),
+            trading_audit_service=ExplodingAudit(),
+            trade_analysis_service=ExplodingAnalysis(),
+            kalshi_env="production",
+            since_hours=24,
+            mode="fast",
+            now=NOW,
+        )
+    finally:
+        await engine.dispose()
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert report["status"] == "fail"
+    assert "fast_gate_failed_orders" in codes
+    assert "fast_gate_critical_ops_events" in codes
+    assert "fast_gate_unexpected_live_activity" in codes
+    assert "daemon_reconcile_stale" in codes
+
+
+@pytest.mark.asyncio
+async def test_trade_behavior_fast_validation_warns_on_stale_ops_noise(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-warn.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        await _seed_fast_reconcile(session_factory)
+        async with session_factory() as session:
+            for idx in range(10):
+                session.add(
+                    OpsEvent(
+                        id=f"fast-warning-{idx}",
+                        kalshi_env="production",
+                        severity="warning",
+                        source="daemon",
+                        summary="stale market data warning",
+                        payload={},
+                        created_at=NOW - timedelta(minutes=idx),
+                        updated_at=NOW - timedelta(minutes=idx),
+                    )
+                )
+            await session.commit()
+
+        report = await build_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=FakeWatchdog(),
+            trading_audit_service=ExplodingAudit(),
+            trade_analysis_service=ExplodingAnalysis(),
+            kalshi_env="production",
+            since_hours=24,
+            mode="fast",
+            now=NOW,
+        )
+    finally:
+        await engine.dispose()
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert report["status"] == "warn"
+    assert "fast_gate_stale_data_noise" in codes
+    assert "fast_gate_ops_warning_error_noise" in codes
+    assert not [issue for issue in report["issues"] if issue["severity"] == "fail"]
 
 
 @pytest.mark.asyncio
