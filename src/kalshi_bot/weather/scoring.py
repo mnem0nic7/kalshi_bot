@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from kalshi_bot.core.enums import StandDownReason, WeatherResolutionState
 from kalshi_bot.core.fixed_point import quantize_price
+from kalshi_bot.core.schemas import ResolvedSigma
+from kalshi_bot.forecast.ensemble_fuser import EnsembleMember, SourceEnsemble, fuse_ensembles
 from kalshi_bot.weather.models import WeatherMarketMapping
 
 NEAR_THRESHOLD_DELTA_F = 2.0
@@ -110,6 +112,12 @@ class WeatherSignalSnapshot:
     forecast_updated_time: datetime | None
     summary: str
     stand_down_reason: StandDownReason | None = None
+    observed_high_so_far_f: float | None = None
+    source_disagreement_f: float | None = None
+    sigma_f: float | None = None
+    sigma_layer: str | None = None
+    residual_adjustment_f: float | None = None
+    prediction_provenance: dict[str, Any] | None = None
 
 
 def gaussian_probability(delta_f: float, sigma_f: float = 3.5) -> float:
@@ -135,6 +143,11 @@ def nws_forecast_sigma_f(month: int) -> float:
     return _MONTHLY_SIGMA_F.get(month, 3.5)
 
 
+# Minimum sample counts for DB-fit to win over each fallback layer (§4.2.3).
+_DB_BEATS_GLOBAL_MIN_N = 100
+_DB_BEATS_YAML_MIN_N = 200
+
+
 @dataclass(slots=True)
 class SigmaContext:
     """Pre-loaded DB-fit parameters for σ resolution. All fields optional — None → skip that layer."""
@@ -144,12 +157,10 @@ class SigmaContext:
     sigma_params: dict | None = None   # keyed by (station, season_bucket)
     lead_factors: dict | None = None   # keyed by lead_bucket
     lead_correction_enabled: bool = True
-
-
-# Minimum sample counts for DB-fit to win over each fallback layer (§4.2.3).
-_DB_BEATS_GLOBAL_MIN_N = 100
-_DB_BEATS_YAML_MIN_N = 200
-
+    sigma_calibration_enabled: bool = True
+    min_samples_beats_global: int = _DB_BEATS_GLOBAL_MIN_N
+    min_samples_beats_yaml: int = _DB_BEATS_YAML_MIN_N
+    min_crps_improvement: float = 0.0
 
 def sigma_f_for_mapping(
     mapping: Any,
@@ -157,6 +168,15 @@ def sigma_f_for_mapping(
     *,
     ctx: "SigmaContext | None" = None,
 ) -> float:
+    return resolve_sigma_for_mapping(mapping, month, ctx=ctx).sigma_f
+
+
+def resolve_sigma_for_mapping(
+    mapping: Any,
+    month: int,
+    *,
+    ctx: "SigmaContext | None" = None,
+) -> ResolvedSigma:
     """Return the calibrated σ for a market mapping, three-layer resolver.
 
     Layer priority:
@@ -167,24 +187,57 @@ def sigma_f_for_mapping(
     """
     overrides = getattr(mapping, "sigma_f_by_month", None)
     yaml_sigma = float(overrides[month]) if (overrides and month in overrides) else None
+    season_bucket = ctx.season_bucket if ctx is not None else None
+    lead_bucket: str | None = None
 
-    if ctx is not None and ctx.sigma_params is not None and ctx.station and ctx.season_bucket:
+    if (
+        ctx is not None
+        and ctx.sigma_calibration_enabled
+        and ctx.sigma_params is not None
+        and ctx.station
+        and ctx.season_bucket
+    ):
         params = ctx.sigma_params.get((ctx.station, ctx.season_bucket))
         if params is not None:
             n = params.get("sample_count", 0)
-            crps_ok = (params.get("crps_improvement_vs_global") or 0.0) > 0.0
-            min_n = _DB_BEATS_YAML_MIN_N if yaml_sigma is not None else _DB_BEATS_GLOBAL_MIN_N
+            crps_improvement = params.get("crps_improvement_vs_global")
+            crps_ok = (crps_improvement or 0.0) > ctx.min_crps_improvement
+            min_n = ctx.min_samples_beats_yaml if yaml_sigma is not None else ctx.min_samples_beats_global
             if n >= min_n and crps_ok:
                 sigma = float(params["sigma_base_f"])
+                lead_factor = 1.0
                 if ctx.lead_correction_enabled and ctx.lead_factors and ctx.lead_hours is not None:
                     from kalshi_bot.weather.sigma_calibration import lead_bucket_for_hours
                     bucket = lead_bucket_for_hours(ctx.lead_hours)
-                    sigma *= ctx.lead_factors.get(bucket, 1.0)
-                return max(sigma, 0.5)
+                    lead_bucket = bucket
+                    lead_factor = float(ctx.lead_factors.get(bucket, 1.0))
+                    sigma *= lead_factor
+                return ResolvedSigma(
+                    sigma_f=max(sigma, 0.5),
+                    mean_bias_f=float(params.get("mean_bias_f") or 0.0),
+                    lead_factor=lead_factor,
+                    source_layer="db_fit",
+                    sample_count=int(n or 0),
+                    crps_improvement_vs_global=(
+                        float(crps_improvement) if crps_improvement is not None else None
+                    ),
+                    season_bucket=ctx.season_bucket,
+                    lead_bucket=lead_bucket,
+                )
 
     if yaml_sigma is not None:
-        return yaml_sigma
-    return nws_forecast_sigma_f(month)
+        return ResolvedSigma(
+            sigma_f=max(yaml_sigma, 0.5),
+            source_layer="yaml",
+            season_bucket=season_bucket,
+            lead_bucket=lead_bucket,
+        )
+    return ResolvedSigma(
+        sigma_f=nws_forecast_sigma_f(month),
+        source_layer="global",
+        season_bucket=season_bucket,
+        lead_bucket=lead_bucket,
+    )
 
 
 def extract_gridpoint_max_temp_f(
@@ -266,6 +319,164 @@ def _observation_matches_settlement_date(
     return obs_ts.astimezone(timezone).date() == settlement_date
 
 
+def _forecast_run_time(forecast_payload: dict[str, Any], fallback: datetime) -> datetime:
+    return parse_iso_datetime(forecast_payload.get("properties", {}).get("updated")) or fallback
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _build_forecast_ensemble(
+    *,
+    mapping: WeatherMarketMapping,
+    target_date: date | None,
+    forecast_payload: dict[str, Any],
+    forecast_grid_payload: dict[str, Any] | None,
+    external_forecast_members: list[dict[str, Any]] | None,
+    fallback_time: datetime,
+) -> tuple[float | None, dict[str, Any]]:
+    members: list[EnsembleMember] = []
+    run_time = _forecast_run_time(forecast_payload, fallback_time)
+    station_id = mapping.station_id or mapping.series_ticker or mapping.market_ticker
+
+    daily_high = extract_forecast_high_f(forecast_payload, target_date=target_date)
+    if daily_high is not None:
+        members.append(
+            EnsembleMember(
+                source="nws_daily_period",
+                run_id=run_time.isoformat(),
+                station_id=station_id,
+                valid_time=run_time,
+                high_temp_f=float(daily_high),
+                weight=1.0,
+            )
+        )
+
+    gridpoint_high = (
+        extract_gridpoint_max_temp_f(forecast_grid_payload, target_date=target_date)
+        if forecast_grid_payload
+        else None
+    )
+    if gridpoint_high is not None:
+        members.append(
+            EnsembleMember(
+                source="nws_gridpoint",
+                run_id=run_time.isoformat(),
+                station_id=station_id,
+                valid_time=run_time,
+                high_temp_f=float(gridpoint_high),
+                weight=1.2,
+            )
+        )
+
+    for index, raw in enumerate(external_forecast_members or []):
+        high = _finite_float(raw.get("high_temp_f") or raw.get("forecast_high_f"))
+        if high is None:
+            continue
+        valid_time = parse_iso_datetime(str(raw.get("valid_time") or raw.get("run_ts") or "")) or run_time
+        source = str(raw.get("source") or raw.get("provider") or "external_forecast")
+        members.append(
+            EnsembleMember(
+                source=source,
+                run_id=str(raw.get("run_id") or raw.get("source_id") or f"{source}:{index}"),
+                station_id=station_id,
+                valid_time=valid_time,
+                high_temp_f=high,
+                weight=max(float(raw.get("weight") or 1.0), 0.01),
+            )
+        )
+
+    if not members:
+        return None, {
+            "enabled": True,
+            "status": "missing_members",
+            "source_set": [],
+            "source_disagreement_f": None,
+        }
+
+    source_groups = [
+        SourceEnsemble(source=source, members=source_members)
+        for source, source_members in _group_members_by_source(members).items()
+    ]
+    fused = fuse_ensembles(source_groups)
+    member_values = [member.high_temp_f for member in fused.members]
+    disagreement = max(member_values) - min(member_values) if len(member_values) > 1 else 0.0
+    return fused.mean_f, {
+        "enabled": True,
+        "status": "ok",
+        "mean_f": fused.mean_f,
+        "ensemble_sigma_f": fused.sigma_f,
+        "member_count": fused.member_count,
+        "source_set": fused.source_set_used,
+        "source_member_counts": fused.source_member_counts,
+        "source_disagreement_f": disagreement,
+        "rejected_members": fused.rejected_members,
+    }
+
+
+def _group_members_by_source(members: list[EnsembleMember]) -> dict[str, list[EnsembleMember]]:
+    grouped: dict[str, list[EnsembleMember]] = {}
+    for member in members:
+        grouped.setdefault(member.source, []).append(member)
+    return grouped
+
+
+def _residual_model_adjustment(
+    residual_model: dict[str, Any] | None,
+    *,
+    station_id: str | None,
+    season_bucket: str | None,
+    lead_hours: float | None,
+    source_disagreement_f: float | None,
+    forecast_revision_age_hours: float | None,
+    current_temp_f: float | None,
+    observed_high_so_far_f: float | None,
+    forecast_high_f: float | None,
+) -> tuple[float, dict[str, Any]]:
+    if not residual_model or not residual_model.get("active"):
+        return 0.0, {"status": "inactive"}
+    feature_names = list(residual_model.get("feature_names") or [])
+    coefficients = list(residual_model.get("coefficients") or [])
+    if len(feature_names) != len(coefficients):
+        return 0.0, {"status": "invalid_artifact"}
+    values: dict[str, float] = {
+        "intercept": 1.0,
+        "lead_hours": float(lead_hours or 0.0),
+        "source_disagreement_f": float(source_disagreement_f or 0.0),
+        "forecast_revision_age_hours": float(forecast_revision_age_hours or 0.0),
+        "current_minus_forecast_f": (
+            float(current_temp_f - forecast_high_f)
+            if current_temp_f is not None and forecast_high_f is not None
+            else 0.0
+        ),
+        "observed_high_minus_forecast_f": (
+            float(observed_high_so_far_f - forecast_high_f)
+            if observed_high_so_far_f is not None and forecast_high_f is not None
+            else 0.0
+        ),
+    }
+    if station_id:
+        values[f"station:{station_id}"] = 1.0
+    if season_bucket:
+        values[f"season:{season_bucket}"] = 1.0
+    adjustment = float(residual_model.get("intercept") or 0.0)
+    for name, coefficient in zip(feature_names, coefficients, strict=True):
+        adjustment += values.get(str(name), 0.0) * float(coefficient)
+    max_abs = float(residual_model.get("max_abs_adjustment_f") or 5.0)
+    adjustment = max(-max_abs, min(max_abs, adjustment))
+    return adjustment, {
+        "status": "applied",
+        "version": residual_model.get("version"),
+        "adjustment_f": adjustment,
+        "metrics": residual_model.get("metrics") or {},
+    }
+
+
 def confidence_band_for(confidence: float) -> str:
     if confidence >= 0.85:
         return "high"
@@ -311,6 +522,15 @@ def score_weather_market(
     forecast_grid_payload: dict[str, Any] | None = None,
     *,
     sigma_ctx: "SigmaContext | None" = None,
+    prediction_enabled: bool = False,
+    source_ensemble_enabled: bool = True,
+    source_disagreement_widen_f: float = 3.0,
+    source_disagreement_stand_down_f: float = 8.0,
+    source_disagreement_sigma_multiplier_max: float = 2.0,
+    nowcast_high_so_far_enabled: bool = True,
+    residual_model: dict[str, Any] | None = None,
+    external_forecast_members: list[dict[str, Any]] | None = None,
+    observed_high_so_far_f: float | None = None,
 ) -> WeatherSignalSnapshot:
     if not mapping.supports_structured_weather or mapping.threshold_f is None:
         raise RuntimeError(f"{mapping.market_ticker} is missing structured weather configuration")
@@ -328,15 +548,38 @@ def score_weather_market(
     if ticker_settlement_date is not None:
         settlement_date = ticker_settlement_date
 
-    # Layer 2: precise gridpoint max temp (unrounded Celsius→F) via forecastGridData.
-    # Falls back to Layer 1 (rounded daily period) when unavailable.
+    now_utc = datetime.now(UTC)
+    forecast_updated_ts = parse_iso_datetime(forecast_payload.get("properties", {}).get("updated"))
+    candidates = [t for t in (obs_ts, forecast_updated_ts) if t is not None]
+    asof_ts = max(candidates) if candidates else now_utc
+
+    # Baseline: precise gridpoint max temp (unrounded Celsius→F), falling back
+    # to rounded NWS daily-period high. Improved mode fuses all available sources.
     gridpoint_max_f = (
         extract_gridpoint_max_temp_f(forecast_grid_payload, target_date=settlement_date)
         if forecast_grid_payload
         else None
     )
-    forecast_high_f = gridpoint_max_f if gridpoint_max_f is not None else extract_forecast_high_f(forecast_payload, target_date=settlement_date)
+    daily_period_high_f = extract_forecast_high_f(forecast_payload, target_date=settlement_date)
+    forecast_high_f = gridpoint_max_f if gridpoint_max_f is not None else daily_period_high_f
     using_gridpoint = gridpoint_max_f is not None
+    ensemble_provenance: dict[str, Any] = {
+        "enabled": bool(prediction_enabled and source_ensemble_enabled),
+        "status": "disabled",
+        "source_disagreement_f": None,
+    }
+    if prediction_enabled and source_ensemble_enabled:
+        ensemble_high, ensemble_provenance = _build_forecast_ensemble(
+            mapping=mapping,
+            target_date=settlement_date,
+            forecast_payload=forecast_payload,
+            forecast_grid_payload=forecast_grid_payload,
+            external_forecast_members=external_forecast_members,
+            fallback_time=asof_ts,
+        )
+        if ensemble_high is not None:
+            forecast_high_f = ensemble_high
+            using_gridpoint = "nws_gridpoint" in set(ensemble_provenance.get("source_set") or [])
 
     current_temp_f = extract_current_temp_f(observation_payload)
     current_observation_applies = _observation_matches_settlement_date(
@@ -344,6 +587,18 @@ def score_weather_market(
         settlement_date=ticker_settlement_date,
         timezone_name=mapping.timezone_name,
     )
+    effective_observed_high_so_far_f = observed_high_so_far_f
+    if effective_observed_high_so_far_f is None and current_observation_applies:
+        effective_observed_high_so_far_f = current_temp_f
+    high_so_far_applies = observed_high_so_far_f is not None or current_observation_applies
+    if (
+        prediction_enabled
+        and nowcast_high_so_far_enabled
+        and forecast_high_f is not None
+        and effective_observed_high_so_far_f is not None
+        and high_so_far_applies
+    ):
+        forecast_high_f = max(forecast_high_f, effective_observed_high_so_far_f)
     resolution_state = WeatherResolutionState.UNRESOLVED
     if current_temp_f is not None and current_observation_applies:
         if mapping.operator == ">" and current_temp_f > mapping.threshold_f:
@@ -356,6 +611,12 @@ def score_weather_market(
             resolution_state = WeatherResolutionState.LOCKED_NO
 
     snapshot_stand_down_reason: StandDownReason | None = None
+    source_disagreement_f = ensemble_provenance.get("source_disagreement_f")
+    if source_disagreement_f is not None:
+        source_disagreement_f = float(source_disagreement_f)
+    resolved_sigma: ResolvedSigma | None = None
+    residual_adjustment_f: float | None = None
+    residual_provenance: dict[str, Any] = {"status": "inactive"}
     if resolution_state == WeatherResolutionState.LOCKED_YES:
         fair = Decimal("1.0000")
         confidence = 1.0
@@ -376,49 +637,83 @@ def score_weather_market(
         confidence = 0.0
         summary = "Forecast high was unavailable; standing down."
         snapshot_stand_down_reason = StandDownReason.FORECAST_UNAVAILABLE
+    elif (
+        prediction_enabled
+        and source_disagreement_f is not None
+        and source_disagreement_f > source_disagreement_stand_down_f
+    ):
+        fair = Decimal("0.5000")
+        confidence = 0.0
+        summary = (
+            f"Forecast sources disagree by {source_disagreement_f:.1f}F, above the "
+            f"{source_disagreement_stand_down_f:.1f}F stand-down threshold."
+        )
+        snapshot_stand_down_reason = StandDownReason.FORECAST_SOURCE_DISAGREEMENT
     else:
+        month = (settlement_date or now_utc.date()).month
+        from kalshi_bot.weather.sigma_calibration import season_for_month
+        base_ctx = sigma_ctx or SigmaContext()
+        resolved_ctx = SigmaContext(
+            station=base_ctx.station or getattr(mapping, "station_id", None),
+            season_bucket=base_ctx.season_bucket or season_for_month(month),
+            lead_hours=base_ctx.lead_hours,
+            sigma_params=base_ctx.sigma_params,
+            lead_factors=base_ctx.lead_factors,
+            lead_correction_enabled=base_ctx.lead_correction_enabled,
+            sigma_calibration_enabled=base_ctx.sigma_calibration_enabled,
+            min_samples_beats_global=base_ctx.min_samples_beats_global,
+            min_samples_beats_yaml=base_ctx.min_samples_beats_yaml,
+            min_crps_improvement=base_ctx.min_crps_improvement,
+        )
+        if resolved_ctx.lead_hours is None and settlement_date is not None:
+            settlement_noon = datetime(
+                settlement_date.year, settlement_date.month, settlement_date.day, 12, 0, 0, tzinfo=UTC
+            )
+            lead_h = (settlement_noon - asof_ts).total_seconds() / 3600
+            resolved_ctx = SigmaContext(
+                station=resolved_ctx.station,
+                season_bucket=resolved_ctx.season_bucket,
+                lead_hours=lead_h,
+                sigma_params=resolved_ctx.sigma_params,
+                lead_factors=resolved_ctx.lead_factors,
+                lead_correction_enabled=resolved_ctx.lead_correction_enabled,
+                sigma_calibration_enabled=resolved_ctx.sigma_calibration_enabled,
+                min_samples_beats_global=resolved_ctx.min_samples_beats_global,
+                min_samples_beats_yaml=resolved_ctx.min_samples_beats_yaml,
+                min_crps_improvement=resolved_ctx.min_crps_improvement,
+            )
+        forecast_revision_age_hours = (
+            (asof_ts - forecast_updated_ts).total_seconds() / 3600
+            if forecast_updated_ts is not None
+            else None
+        )
+        residual_delta, residual_provenance = _residual_model_adjustment(
+            residual_model,
+            station_id=getattr(mapping, "station_id", None),
+            season_bucket=resolved_ctx.season_bucket,
+            lead_hours=resolved_ctx.lead_hours,
+            source_disagreement_f=source_disagreement_f,
+            forecast_revision_age_hours=forecast_revision_age_hours,
+            current_temp_f=current_temp_f,
+            observed_high_so_far_f=effective_observed_high_so_far_f,
+            forecast_high_f=forecast_high_f,
+        )
+        if residual_delta:
+            residual_adjustment_f = residual_delta
+            forecast_high_f += residual_delta
         delta_f = forecast_high_f - mapping.threshold_f
         if mapping.operator in ("<", "<="):
             delta_f = -delta_f
         if using_gridpoint:
             # Layer 2: Gaussian CDF with calibrated monthly σ.
             # asof_ts = max(obs_ts, forecast_updated_ts) — matches the training definition.
-            now_utc = datetime.now(UTC)
-            month = (settlement_date or now_utc.date()).month
-            forecast_updated_ts = parse_iso_datetime(forecast_payload.get("properties", {}).get("updated"))
-            candidates = [t for t in (obs_ts, forecast_updated_ts) if t is not None]
-            asof_ts = max(candidates) if candidates else now_utc
-            resolved_ctx = sigma_ctx
-            if resolved_ctx is None:
-                from kalshi_bot.weather.sigma_calibration import season_for_month
-                resolved_ctx = SigmaContext(
-                    station=getattr(mapping, "station_id", None),
-                    season_bucket=season_for_month(month),
-                )
-            elif resolved_ctx.season_bucket is None and resolved_ctx.station is None:
-                from kalshi_bot.weather.sigma_calibration import season_for_month
-                resolved_ctx = SigmaContext(
-                    station=getattr(mapping, "station_id", None),
-                    season_bucket=season_for_month(month),
-                    lead_hours=resolved_ctx.lead_hours,
-                    sigma_params=resolved_ctx.sigma_params,
-                    lead_factors=resolved_ctx.lead_factors,
-                    lead_correction_enabled=resolved_ctx.lead_correction_enabled,
-                )
-            if resolved_ctx.lead_hours is None and settlement_date is not None:
-                settlement_noon = datetime(
-                    settlement_date.year, settlement_date.month, settlement_date.day, 12, 0, 0, tzinfo=UTC
-                )
-                lead_h = (settlement_noon - asof_ts).total_seconds() / 3600
-                resolved_ctx = SigmaContext(
-                    station=resolved_ctx.station,
-                    season_bucket=resolved_ctx.season_bucket,
-                    lead_hours=lead_h,
-                    sigma_params=resolved_ctx.sigma_params,
-                    lead_factors=resolved_ctx.lead_factors,
-                    lead_correction_enabled=resolved_ctx.lead_correction_enabled,
-                )
-            sigma = sigma_f_for_mapping(mapping, month, ctx=resolved_ctx)
+            resolved_sigma = resolve_sigma_for_mapping(mapping, month, ctx=resolved_ctx)
+            sigma = resolved_sigma.sigma_f
+            if prediction_enabled and source_disagreement_f is not None and source_disagreement_widen_f > 0:
+                multiplier = 1.0 + max(0.0, source_disagreement_f / source_disagreement_widen_f)
+                sigma *= min(source_disagreement_sigma_multiplier_max, multiplier)
+            if resolved_sigma.source_layer == "db_fit" and resolved_sigma.mean_bias_f:
+                delta_f -= resolved_sigma.mean_bias_f
             probability = gaussian_probability(delta_f, sigma_f=sigma)
         else:
             # Layer 1 fallback: logistic with adaptive spread.
@@ -448,13 +743,30 @@ def score_weather_market(
     if resolution_state in {WeatherResolutionState.LOCKED_YES, WeatherResolutionState.LOCKED_NO}:
         trade_regime = "standard"
     elif forecast_high_f is not None:
-        layer_tag = "gridpoint" if using_gridpoint else "daily-period"
+        if prediction_enabled and source_ensemble_enabled and ensemble_provenance.get("status") == "ok":
+            layer_tag = "ensemble"
+        else:
+            layer_tag = "gridpoint" if using_gridpoint else "daily-period"
         contract_phrase = "below-threshold" if mapping.operator in ("<", "<=") else "above-threshold"
         summary = (
             f"Forecast high {forecast_high_f:.1f}F [{layer_tag}] versus {contract_phrase} "
             f"{mapping.threshold_f:.1f}F contract "
             f"implies fair yes near {fair} with confidence {confidence:.2f}."
         )
+    prediction_provenance = {
+        "prediction_enabled": prediction_enabled,
+        "forecast_high_f": forecast_high_f,
+        "daily_period_high_f": daily_period_high_f,
+        "gridpoint_high_f": gridpoint_max_f,
+        "observed_high_so_far_f": effective_observed_high_so_far_f,
+        "source_disagreement_f": source_disagreement_f,
+        "ensemble": ensemble_provenance,
+        "sigma": resolved_sigma.model_dump(mode="json") if resolved_sigma is not None else None,
+        "residual_model": residual_provenance,
+        "residual_adjustment_f": residual_adjustment_f,
+        "asof_ts": asof_ts.isoformat(),
+        "settlement_date": settlement_date.isoformat() if settlement_date is not None else None,
+    }
     return WeatherSignalSnapshot(
         fair_yes_dollars=fair,
         confidence=confidence,
@@ -465,7 +777,13 @@ def score_weather_market(
         trade_regime=trade_regime,
         resolution_state=resolution_state,
         observation_time=obs_ts,
-        forecast_updated_time=parse_iso_datetime(forecast_payload.get("properties", {}).get("updated")),
+        forecast_updated_time=forecast_updated_ts,
         summary=summary,
         stand_down_reason=snapshot_stand_down_reason,
+        observed_high_so_far_f=effective_observed_high_so_far_f,
+        source_disagreement_f=source_disagreement_f,
+        sigma_f=resolved_sigma.sigma_f if resolved_sigma is not None else None,
+        sigma_layer=resolved_sigma.source_layer if resolved_sigma is not None else None,
+        residual_adjustment_f=residual_adjustment_f,
+        prediction_provenance=prediction_provenance,
     )

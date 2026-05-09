@@ -51,6 +51,7 @@ class StrategySignal:
     momentum_slope_cents_per_min: float | None = None
     momentum_weight: float | None = None
     edge_effective_bps: float | None = None
+    prediction_provenance: dict[str, Any] = field(default_factory=dict)
 
     def edge_for_eligibility(self) -> float:
         return self.edge_effective_bps if self.edge_effective_bps is not None else float(self.edge_bps)
@@ -951,8 +952,25 @@ def evaluate_trade_eligibility(
 
 
 class WeatherSignalEngine:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        residual_model_artifact: dict[str, Any] | None = None,
+        sigma_params: dict | None = None,
+        lead_factors: dict | None = None,
+    ) -> None:
         self.settings = settings
+        self.residual_model_artifact = residual_model_artifact
+        self.sigma_params = sigma_params
+        self.lead_factors = lead_factors
+
+    def set_residual_model_artifact(self, artifact: dict[str, Any] | None) -> None:
+        self.residual_model_artifact = artifact
+
+    def set_sigma_calibration(self, *, sigma_params: dict | None, lead_factors: dict | None) -> None:
+        self.sigma_params = sigma_params
+        self.lead_factors = lead_factors
 
     def _market_price(self, market_snapshot: dict[str, Any], key: str) -> Decimal | None:
         market = market_snapshot.get("market", market_snapshot)
@@ -970,16 +988,22 @@ class WeatherSignalEngine:
         lead_factors: dict | None = None,
     ) -> StrategySignal:
         sigma_ctx: SigmaContext | None = None
-        if sigma_params is not None or lead_factors is not None:
+        effective_sigma_params = sigma_params if sigma_params is not None else self.sigma_params
+        effective_lead_factors = lead_factors if lead_factors is not None else self.lead_factors
+        if effective_sigma_params is not None or effective_lead_factors is not None or self.settings.sigma_calibration_enabled:
             from kalshi_bot.weather.sigma_calibration import season_for_month
             from datetime import UTC, datetime
             month = datetime.now(UTC).month
             sigma_ctx = SigmaContext(
                 station=getattr(mapping, "station_id", None),
                 season_bucket=season_for_month(month),
-                sigma_params=sigma_params,
-                lead_factors=lead_factors,
+                sigma_params=effective_sigma_params,
+                lead_factors=effective_lead_factors,
                 lead_correction_enabled=self.settings.sigma_lead_correction_enabled,
+                sigma_calibration_enabled=self.settings.sigma_calibration_enabled,
+                min_samples_beats_global=self.settings.sigma_min_samples_beats_global,
+                min_samples_beats_yaml=self.settings.sigma_min_samples_beats_yaml,
+                min_crps_improvement=self.settings.sigma_min_crps_improvement,
             )
         weather = score_weather_market(
             mapping,
@@ -987,6 +1011,19 @@ class WeatherSignalEngine:
             weather_bundle.get("observation", {}),
             forecast_grid_payload=weather_bundle.get("forecast_grid") or None,
             sigma_ctx=sigma_ctx,
+            prediction_enabled=self.settings.weather_prediction_enabled,
+            source_ensemble_enabled=self.settings.weather_source_ensemble_enabled,
+            source_disagreement_widen_f=self.settings.weather_source_disagreement_widen_f,
+            source_disagreement_stand_down_f=self.settings.weather_source_disagreement_stand_down_f,
+            source_disagreement_sigma_multiplier_max=self.settings.weather_source_disagreement_sigma_multiplier_max,
+            nowcast_high_so_far_enabled=self.settings.weather_nowcast_high_so_far_enabled,
+            residual_model=(
+                self.residual_model_artifact
+                if self.settings.weather_residual_model_enabled
+                else None
+            ),
+            external_forecast_members=self._external_forecast_members(weather_bundle),
+            observed_high_so_far_f=self._observed_high_so_far(weather_bundle),
         )
         effective_min_edge_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
         recommendation_action, recommendation_side, target_yes, edge_bps, candidate_trace = _trade_recommendation_with_trace(
@@ -1028,12 +1065,44 @@ class WeatherSignalEngine:
             capital_bucket=capital_bucket_for_trade_regime(weather.trade_regime),
             forecast_delta_f=weather.forecast_delta_f,
             confidence_band=weather.confidence_band,
+            prediction_provenance=dict(weather.prediction_provenance or {}),
         )
         return annotate_signal_quality(
             settings=self.settings,
             signal=signal,
             market_snapshot=market_snapshot,
         )
+
+    def _external_forecast_members(self, weather_bundle: dict[str, Any]) -> list[dict[str, Any]]:
+        members: list[dict[str, Any]] = []
+        for key in ("external_forecasts", "forecast_archive_members", "ensemble_members"):
+            raw = weather_bundle.get(key)
+            if isinstance(raw, list):
+                members.extend(item for item in raw if isinstance(item, dict))
+        archive = weather_bundle.get("forecast_archive") or weather_bundle.get("external_forecast")
+        if isinstance(archive, dict):
+            high = archive.get("forecast_high_f")
+            if high is not None:
+                members.append(
+                    {
+                        "source": archive.get("provider") or "open_meteo_forecast_archive",
+                        "run_id": archive.get("source_id") or archive.get("run_ts"),
+                        "valid_time": archive.get("run_ts") or archive.get("checkpoint_ts"),
+                        "forecast_high_f": high,
+                        "weight": archive.get("weight") or 1.0,
+                    }
+                )
+        return members
+
+    def _observed_high_so_far(self, weather_bundle: dict[str, Any]) -> float | None:
+        for key in ("observed_high_so_far_f", "current_day_high_f", "max_observed_temp_f"):
+            raw = weather_bundle.get(key)
+            if raw not in (None, ""):
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return None
+        return None
 
 
 def estimate_notional_dollars(side: ContractSide, yes_price_dollars: Decimal, count_fp: Decimal) -> Decimal:

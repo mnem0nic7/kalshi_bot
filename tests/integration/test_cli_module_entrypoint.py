@@ -143,6 +143,27 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert model_quality_args.domain == "all"
 
 
+def test_python_module_cli_exposes_weather_prediction_commands() -> None:
+    parser = cli_module.build_parser()
+
+    prediction_args = parser.parse_args(["weather-prediction", "evaluate", "--series", "KXHIGHNY"])
+    diagnostics_args = parser.parse_args(["weather-prediction", "station-diagnostics", "--min-days", "10"])
+    sigma_args = parser.parse_args(["weather-sigma", "refit", "--dry-run"])
+    residual_args = parser.parse_args(["weather-residual", "train", "--kalshi-env", "demo", "--dry-run"])
+
+    assert prediction_args.command == "weather-prediction"
+    assert prediction_args.weather_prediction_command == "evaluate"
+    assert prediction_args.series == ["KXHIGHNY"]
+    assert diagnostics_args.weather_prediction_command == "station-diagnostics"
+    assert diagnostics_args.min_days == 10
+    assert sigma_args.command == "weather-sigma"
+    assert sigma_args.weather_sigma_command == "refit"
+    assert sigma_args.dry_run is True
+    assert residual_args.command == "weather-residual"
+    assert residual_args.weather_residual_command == "train"
+    assert residual_args.kalshi_env == "demo"
+
+
 def test_python_module_cli_exposes_parameter_pack_commands() -> None:
     top_level = subprocess.run(
         [sys.executable, "-m", "kalshi_bot.cli", "--help"],

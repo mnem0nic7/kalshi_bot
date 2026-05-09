@@ -733,6 +733,12 @@ class ResearchCoordinator:
                     "forecast_delta_f": weather_snapshot.forecast_delta_f,
                     "threshold_f": mapping.threshold_f if mapping is not None else None,
                     "resolution_state": weather_snapshot.resolution_state.value,
+                    "observed_high_so_far_f": weather_snapshot.observed_high_so_far_f,
+                    "source_disagreement_f": weather_snapshot.source_disagreement_f,
+                    "sigma_f": weather_snapshot.sigma_f,
+                    "sigma_layer": weather_snapshot.sigma_layer,
+                    "residual_adjustment_f": weather_snapshot.residual_adjustment_f,
+                    "prediction_provenance": weather_snapshot.prediction_provenance,
                 }
             )
         elif web_payload is not None:

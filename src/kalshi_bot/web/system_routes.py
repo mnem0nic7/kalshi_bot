@@ -68,6 +68,18 @@ def create_system_router(
                 "training": training_status_payload,
                 "heuristics": heuristic_status_payload,
                 "runtime_health": runtime_health,
+                "settings": {
+                    "app_shadow_mode": app_container.settings.app_shadow_mode,
+                    "trigger_enable_auto_rooms": app_container.settings.trigger_enable_auto_rooms,
+                    "strategy_c_enabled": app_container.settings.strategy_c_enabled,
+                    "strategy_c_shadow_only": app_container.settings.strategy_c_shadow_only,
+                    "weather_prediction_enabled": app_container.settings.weather_prediction_enabled,
+                    "weather_source_ensemble_enabled": app_container.settings.weather_source_ensemble_enabled,
+                    "weather_residual_model_enabled": app_container.settings.weather_residual_model_enabled,
+                    "crypto_trading_enabled": app_container.settings.crypto_trading_enabled,
+                    "crypto_autonomy_enabled": app_container.settings.crypto_autonomy_enabled,
+                    "monotonicity_arb_enabled": app_container.settings.monotonicity_arb_enabled,
+                },
                 "rooms": dossiers,
                 "positions": [
                     {

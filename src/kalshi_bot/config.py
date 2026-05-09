@@ -203,6 +203,20 @@ class Settings(BaseSettings):
     strategy_min_abs_delta_f: float = 8.0
     strategy_min_remaining_payout_bps: int = 2500
     strategy_quality_edge_buffer_bps: int = 25
+    weather_prediction_enabled: bool = False
+    weather_source_ensemble_enabled: bool = True
+    weather_source_disagreement_widen_f: float = 3.0
+    weather_source_disagreement_stand_down_f: float = 8.0
+    weather_source_disagreement_sigma_multiplier_max: float = 2.0
+    weather_nowcast_high_so_far_enabled: bool = True
+    weather_residual_model_enabled: bool = False
+    weather_residual_min_mae_improvement_pct: float = 0.02
+    weather_residual_min_brier_improvement_pct: float = 0.0
+    weather_residual_model_max_age_hours: int = 168
+    sigma_calibration_enabled: bool = True
+    sigma_min_samples_beats_global: int = 100
+    sigma_min_samples_beats_yaml: int = 200
+    sigma_min_crps_improvement: float = 0.0
     sigma_lead_correction_enabled: bool = True
 
     trade_behavior_production_entry_freeze_enabled: bool = True

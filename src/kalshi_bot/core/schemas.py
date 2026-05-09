@@ -257,6 +257,17 @@ class ResearchGateVerdict(BaseModel):
     stale_tolerance_active: bool = False  # passed via grace window; supervisor applies reduced notional cap
 
 
+class ResolvedSigma(BaseModel):
+    sigma_f: float
+    mean_bias_f: float = 0.0
+    lead_factor: float = 1.0
+    source_layer: str = "global"
+    sample_count: int = 0
+    crps_improvement_vs_global: float | None = None
+    season_bucket: str | None = None
+    lead_bucket: str | None = None
+
+
 class TradeEligibilityVerdict(BaseModel):
     eligible: bool
     strategy_mode: StrategyMode = StrategyMode.DIRECTIONAL_UNRESOLVED

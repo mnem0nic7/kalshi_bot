@@ -46,6 +46,7 @@ from kalshi_bot.services.risk import DeterministicRiskEngine
 from kalshi_bot.services.shadow import ShadowTrainingService
 from kalshi_bot.services.signal import WeatherSignalEngine
 from kalshi_bot.services.signal_calibration import SignalCalibrationService
+from kalshi_bot.services.sigma_resolver import SigmaResolver
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.stop_loss import StopLossService
@@ -61,6 +62,7 @@ from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.services.market_history import MarketHistoryService
 from kalshi_bot.services.watchdog import WatchdogService
+from kalshi_bot.services.weather_prediction import WeatherPredictionService
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.strategy_cleanup_service import StrategyCleanupService
 from kalshi_bot.services.momentum_calibration import MomentumCalibrationService
@@ -88,6 +90,8 @@ class AppContainer:
     weather_directory: WeatherMarketDirectory
     agent_pack_service: AgentPackService
     signal_engine: WeatherSignalEngine
+    sigma_resolver: SigmaResolver
+    weather_prediction_service: WeatherPredictionService
     signal_calibration_service: SignalCalibrationService
     risk_engine: DeterministicRiskEngine
     execution_service: ExecutionService
@@ -176,7 +180,19 @@ class AppContainer:
         for warning in weather_directory.validate():
             logger.warning("Market map validation: %s", warning)
         agent_pack_service = AgentPackService(settings)
+        sigma_resolver = SigmaResolver(settings, session_factory)
+        weather_prediction_service = WeatherPredictionService(settings, session_factory)
         signal_engine = WeatherSignalEngine(settings)
+        try:
+            sigma_snapshot = await sigma_resolver.snapshot()
+            signal_engine.set_sigma_calibration(
+                sigma_params=sigma_snapshot.sigma_params,
+                lead_factors=sigma_snapshot.lead_factors,
+            )
+            residual_model = await weather_prediction_service.load_active_residual_model()
+            signal_engine.set_residual_model_artifact(residual_model)
+        except Exception as exc:
+            logger.warning("Weather prediction artifacts unavailable at startup: %s", exc)
         signal_calibration_service = SignalCalibrationService(session_factory)
         risk_engine = DeterministicRiskEngine(settings)
         execution_service = ExecutionService(settings, kalshi)
@@ -453,6 +469,8 @@ class AppContainer:
             weather_directory=weather_directory,
             agent_pack_service=agent_pack_service,
             signal_engine=signal_engine,
+            sigma_resolver=sigma_resolver,
+            weather_prediction_service=weather_prediction_service,
             signal_calibration_service=signal_calibration_service,
             risk_engine=risk_engine,
             execution_service=execution_service,

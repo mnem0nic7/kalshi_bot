@@ -87,6 +87,7 @@ class StandDownReason(StrEnum):
     STRATEGY_C_CLI_VARIANCE = "strategy_c_cli_variance"
     # Signal-level stand-downs (before risk engine)
     FORECAST_UNAVAILABLE = "forecast_unavailable"
+    FORECAST_SOURCE_DISAGREEMENT = "forecast_source_disagreement"
     INSUFFICIENT_FORECAST_SEPARATION = "insufficient_forecast_separation"
     CONFIDENCE_TOO_LOW = "confidence_too_low"
     DOSSIER_STALE = "dossier_stale"

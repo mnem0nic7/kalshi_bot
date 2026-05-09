@@ -1003,6 +1003,61 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 print(format_model_quality_report(report))
             return 0
 
+        if args.command == "weather-prediction":
+            if args.weather_prediction_command == "evaluate":
+                result = await container.weather_prediction_service.evaluate(series=args.series or None)
+            elif args.weather_prediction_command == "station-diagnostics":
+                result = await container.weather_prediction_service.station_diagnostics(min_days=args.min_days)
+            else:  # pragma: no cover - argparse enforces choices
+                raise ValueError(f"unknown weather-prediction command {args.weather_prediction_command}")
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.command == "weather-sigma":
+            if args.weather_sigma_command == "refit":
+                result = await container.weather_prediction_service.refit_sigma(
+                    version=args.version,
+                    dry_run=args.dry_run,
+                )
+            elif args.weather_sigma_command == "status":
+                snapshot = await container.sigma_resolver.snapshot(force=True)
+                result = {
+                    "sigma_calibration_enabled": container.settings.sigma_calibration_enabled,
+                    "station_sigma_row_count": len(snapshot.sigma_params),
+                    "lead_factor_count": len(snapshot.lead_factors),
+                    "loaded_at": snapshot.loaded_at.isoformat(),
+                    "lead_factors": snapshot.lead_factors,
+                    "qualifying_station_sigma_row_count": sum(
+                        1
+                        for params in snapshot.sigma_params.values()
+                        if params.get("sample_count", 0) >= container.settings.sigma_min_samples_beats_global
+                        and (params.get("crps_improvement_vs_global") or 0.0)
+                        > container.settings.sigma_min_crps_improvement
+                    ),
+                }
+            else:  # pragma: no cover - argparse enforces choices
+                raise ValueError(f"unknown weather-sigma command {args.weather_sigma_command}")
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.command == "weather-residual":
+            if args.weather_residual_command == "train":
+                result = await container.weather_prediction_service.train_residual_model(
+                    kalshi_env=args.kalshi_env,
+                    dry_run=args.dry_run,
+                )
+            elif args.weather_residual_command == "evaluate":
+                result = await container.weather_prediction_service.train_residual_model(
+                    kalshi_env=args.kalshi_env,
+                    dry_run=True,
+                )
+            elif args.weather_residual_command == "status":
+                result = await container.weather_prediction_service.status(kalshi_env=args.kalshi_env)
+            else:  # pragma: no cover - argparse enforces choices
+                raise ValueError(f"unknown weather-residual command {args.weather_residual_command}")
+            print(json.dumps(result, indent=2))
+            return 0
+
         if args.command == "research-refresh":
             dossier = await container.research_coordinator.refresh_market_dossier(
                 args.market_ticker,
@@ -2022,6 +2077,28 @@ def build_parser() -> argparse.ArgumentParser:
     model_quality_status.add_argument("--frequency", default="15m")
     model_quality_status.add_argument("--persist", action="store_true")
     model_quality_status.add_argument("--json", action="store_true")
+
+    weather_prediction = subparsers.add_parser("weather-prediction")
+    weather_prediction_subparsers = weather_prediction.add_subparsers(dest="weather_prediction_command", required=True)
+    weather_prediction_evaluate = weather_prediction_subparsers.add_parser("evaluate")
+    weather_prediction_evaluate.add_argument("--series", nargs="*", default=None)
+    weather_prediction_subparsers.add_parser("station-diagnostics").add_argument("--min-days", type=int, default=5)
+
+    weather_sigma = subparsers.add_parser("weather-sigma")
+    weather_sigma_subparsers = weather_sigma.add_subparsers(dest="weather_sigma_command", required=True)
+    weather_sigma_refit = weather_sigma_subparsers.add_parser("refit")
+    weather_sigma_refit.add_argument("--version", default=None)
+    weather_sigma_refit.add_argument("--dry-run", action="store_true")
+    weather_sigma_subparsers.add_parser("status")
+
+    weather_residual = subparsers.add_parser("weather-residual")
+    weather_residual_subparsers = weather_residual.add_subparsers(dest="weather_residual_command", required=True)
+    for name in ("train", "evaluate"):
+        weather_residual_command = weather_residual_subparsers.add_parser(name)
+        weather_residual_command.add_argument("--kalshi-env", default="demo")
+        weather_residual_command.add_argument("--dry-run", action="store_true")
+    weather_residual_status = weather_residual_subparsers.add_parser("status")
+    weather_residual_status.add_argument("--kalshi-env", default="demo")
 
     create_room = subparsers.add_parser("create-room")
     create_room.add_argument("--name", required=True)

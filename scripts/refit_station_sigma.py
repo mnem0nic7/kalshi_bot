@@ -33,18 +33,19 @@ from kalshi_bot.weather.sigma_calibration import (
     persist_sigma_params,
     season_for_month,
 )
+from kalshi_bot.services.weather_prediction import PREFERRED_WEATHER_SOURCE_KINDS
 
-_PREFERRED_SOURCE_KINDS = (
-    "checkpoint_archived_weather_bundle",
-    "coverage_repair_checkpoint_promotion",
-    "external_forecast_archive_weather_bundle",
-    "archived_weather_bundle",
-    "daemon_checkpoint_capture",
-)
+_PREFERRED_SOURCE_KINDS = PREFERRED_WEATHER_SOURCE_KINDS
 
 # Global fallback σ used for CRPS baseline comparison.
 _GLOBAL_SIGMA = 3.5
 _GLOBAL_BIAS = 0.0
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 async def run(dry_run: bool, version: str) -> int:
@@ -66,27 +67,58 @@ async def run(dry_run: bool, version: str) -> int:
         labels = (await session.execute(labels_stmt)).scalars().all()
         print(f"[refit] {len(labels)} settled labels with crosscheck_high_f")
 
-        matched = 0
+        label_days: dict[tuple[str, str], dict] = {}
+        label_highs: dict[tuple[str, str], set[float]] = defaultdict(set)
         for label in labels:
-            series_ticker = label.series_ticker
-            actual_high = float(label.crosscheck_high_f)
+            series_ticker = str(label.series_ticker or "")
+            if not series_ticker:
+                continue
+            key = (series_ticker, str(label.local_market_day))
+            label_highs[key].add(float(label.crosscheck_high_f))
+            slot = label_days.setdefault(
+                key,
+                {
+                    "series_ticker": series_ticker,
+                    "local_market_day": str(label.local_market_day),
+                    "actual_high": float(label.crosscheck_high_f),
+                    "settlement_ts": label.settlement_ts,
+                },
+            )
+            if label.settlement_ts is not None and (
+                slot.get("settlement_ts") is None or label.settlement_ts > slot["settlement_ts"]
+            ):
+                slot["settlement_ts"] = label.settlement_ts
+        label_days = {key: slot for key, slot in label_days.items() if len(label_highs[key]) == 1}
+        print(f"[refit] {len(label_days)} unique unambiguous series-days")
 
-            snap = None
-            for source_kind in _PREFERRED_SOURCE_KINDS:
-                snap_stmt = (
-                    select(HistoricalWeatherSnapshotRecord)
-                    .where(
-                        and_(
-                            HistoricalWeatherSnapshotRecord.series_ticker == series_ticker,
-                            HistoricalWeatherSnapshotRecord.local_market_day == label.local_market_day,
-                            HistoricalWeatherSnapshotRecord.source_kind == source_kind,
-                        )
-                    )
-                    .limit(1)
+        matched = 0
+        source_rank = {source: index for index, source in enumerate(_PREFERRED_SOURCE_KINDS)}
+        for (_series_day, slot) in label_days.items():
+            series_ticker = slot["series_ticker"]
+            actual_high = slot["actual_high"]
+
+            snap_stmt = select(HistoricalWeatherSnapshotRecord).where(
+                and_(
+                    HistoricalWeatherSnapshotRecord.series_ticker == series_ticker,
+                    HistoricalWeatherSnapshotRecord.local_market_day == slot["local_market_day"],
+                    HistoricalWeatherSnapshotRecord.forecast_high_f.is_not(None),
+                    HistoricalWeatherSnapshotRecord.source_kind.in_(_PREFERRED_SOURCE_KINDS),
                 )
-                snap = (await session.execute(snap_stmt)).scalar_one_or_none()
-                if snap is not None:
-                    break
+            )
+            candidates = list((await session.execute(snap_stmt)).scalars())
+            settlement_ts = _as_utc(slot.get("settlement_ts"))
+            if settlement_ts is not None:
+                candidates = [snap for snap in candidates if _as_utc(snap.asof_ts) <= settlement_ts]
+            if not candidates:
+                continue
+            snap = sorted(
+                candidates,
+                key=lambda item: (
+                    source_rank.get(item.source_kind, 999),
+                    -(_as_utc(item.asof_ts) or datetime.min.replace(tzinfo=UTC)).timestamp(),
+                    -int(getattr(item, "id", 0) or 0),
+                ),
+            )[0]
 
             if snap is None or snap.forecast_high_f is None:
                 continue
@@ -95,7 +127,7 @@ async def run(dry_run: bool, version: str) -> int:
             residual = actual_high - forecast_high
 
             # Derive season from settlement month
-            settlement_date = label.local_market_day  # YYYY-MM-DD string
+            settlement_date = slot["local_market_day"]  # YYYY-MM-DD string
             try:
                 month = int(settlement_date[5:7])
             except (ValueError, TypeError, IndexError):
@@ -110,10 +142,12 @@ async def run(dry_run: bool, version: str) -> int:
             by_station_season[(station, season)].append(residual)
 
             # Lead time from asof_ts vs settlement_ts
-            if snap.asof_ts and label.settlement_ts:
+            if snap.asof_ts and settlement_ts:
                 try:
-                    asof = snap.asof_ts if snap.asof_ts.tzinfo else snap.asof_ts.replace(tzinfo=UTC)
-                    settle = label.settlement_ts if label.settlement_ts.tzinfo else label.settlement_ts.replace(tzinfo=UTC)
+                    asof = _as_utc(snap.asof_ts)
+                    settle = _as_utc(settlement_ts)
+                    if asof is None or settle is None:
+                        continue
                     lead_hours = (settle - asof).total_seconds() / 3600
                     bucket = lead_bucket_for_hours(lead_hours)
                     by_lead[bucket].append(residual)

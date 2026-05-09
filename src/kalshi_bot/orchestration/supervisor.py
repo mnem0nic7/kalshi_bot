@@ -1605,6 +1605,7 @@ class WorkflowSupervisor:
                         "recommended_side": signal.recommended_side.value if signal.recommended_side is not None else None,
                         "forecast_delta_f": signal.forecast_delta_f,
                         "confidence_band": signal.confidence_band,
+                        "prediction_provenance": signal.prediction_provenance,
                         "model_quality_status": signal.model_quality_status,
                         "model_quality_reasons": signal.model_quality_reasons,
                         "recommended_size_cap_fp": (
