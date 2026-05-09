@@ -33,6 +33,18 @@ class FakeKalshi:
         }
 
 
+class NotFoundKalshi:
+    async def get_market(self, ticker: str) -> dict:
+        request = httpx.Request("GET", f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}")
+        response = httpx.Response(404, request=request, json={"error": "market_not_found"})
+        raise httpx.HTTPStatusError(
+            "Client error '404 Not Found' for url "
+            f"'https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}'",
+            request=request,
+            response=response,
+        )
+
+
 class FakeWeather:
     async def build_market_snapshot(self, mapping: WeatherMarketMapping) -> dict:
         return {
@@ -341,6 +353,105 @@ async def test_background_research_failure_is_recorded_without_escaping_task(tmp
     assert events[0].payload["error"]
     assert events[0].payload["error_type"] == "ConnectTimeout"
     assert failed_checkpoint is not None
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_background_market_event_404_is_skipped_without_error_noise(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/research_background_404.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    directory = WeatherMarketDirectory(
+        {
+            "WX-TEST": WeatherMarketMapping(
+                market_ticker="WX-TEST",
+                market_type="weather",
+                station_id="KNYC",
+                location_name="NYC",
+                latitude=40.0,
+                longitude=-73.0,
+                threshold_f=80,
+                settlement_source="NWS station observation",
+            )
+        }
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot={"ticker": "WX-TEST"},
+            yes_bid_dollars=Decimal("0.4200"),
+            yes_ask_dollars=Decimal("0.4400"),
+            last_trade_dollars=Decimal("0.4300"),
+        )
+        await session.commit()
+
+    coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        NotFoundKalshi(),  # type: ignore[arg-type]
+        FakeWeather(),  # type: ignore[arg-type]
+        directory,
+        FakeProviders(),  # type: ignore[arg-type]
+        WeatherSignalEngine(settings),
+        AgentPackService(settings),
+    )
+
+    await coordinator.handle_market_update("WX-TEST")
+    await coordinator.wait_for_tasks()
+    await coordinator.handle_market_update("WX-TEST")
+    await coordinator.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        runs = await repo.list_research_runs(market_ticker="WX-TEST", limit=10)
+        events = await repo.list_ops_events(sources=["research"], limit=10)
+        failed_checkpoint = await repo.get_checkpoint("research_refresh_failed:demo:WX-TEST")
+        await session.commit()
+
+    assert [run.status for run in runs] == ["skipped"]
+    assert runs[0].error_text is None
+    assert runs[0].payload["reason"] == "background_market_not_found"
+    assert [event.severity for event in events] == ["info"]
+    assert events[0].payload["non_actionable"] is True
+    assert failed_checkpoint is not None
+    assert failed_checkpoint.payload["reason"] == "background_market_not_found"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_manual_research_refresh_404_still_fails(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/research_manual_404.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        NotFoundKalshi(),  # type: ignore[arg-type]
+        FakeWeather(),  # type: ignore[arg-type]
+        _miami_directory(),
+        FakeProviders(),  # type: ignore[arg-type]
+        WeatherSignalEngine(settings),
+        AgentPackService(settings),
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await coordinator.refresh_market_dossier("WX-MIA", trigger_reason="manual")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        runs = await repo.list_research_runs(market_ticker="WX-MIA", limit=10)
+        events = await repo.list_ops_events(sources=["research"], limit=10)
+        await session.commit()
+
+    assert [run.status for run in runs] == ["failed"]
+    assert runs[0].error_text
+    assert "404" in runs[0].error_text
+    assert [event.severity for event in events] == ["error"]
 
     await engine.dispose()
 

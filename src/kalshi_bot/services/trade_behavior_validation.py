@@ -20,6 +20,56 @@ FAILED_ORDER_STATUSES = {"failed", "rejected", "order_id_missing", "lock_denied"
 NOISY_OPS_SEVERITIES = {"warning", "error", "critical"}
 
 
+def _event_payload(event: OpsEvent) -> dict[str, Any]:
+    return event.payload if isinstance(event.payload, dict) else {}
+
+
+def _event_text(event: OpsEvent) -> str:
+    return f"{event.summary or ''} {_event_payload(event)}".lower()
+
+
+def _is_background_research_market_not_found(event: OpsEvent) -> bool:
+    payload = _event_payload(event)
+    if str(event.source or "").lower() != "research":
+        return False
+    if str(payload.get("trigger_reason") or "").lower() != "market_event":
+        return False
+    text = _event_text(event)
+    status_code = payload.get("status_code")
+    return status_code in (404, "404") or ("404" in text and "not found" in text)
+
+
+def _is_watchdog_heartbeat_stale_recovery(event: OpsEvent) -> bool:
+    if str(event.source or "").lower() != "watchdog":
+        return False
+    text = _event_text(event)
+    return "watchdog requested recovery action" in text and "heartbeat stale" in text
+
+
+def _is_transient_stream_reconnect(event: OpsEvent) -> bool:
+    payload = _event_payload(event)
+    if str(event.source or "").lower() != "stream":
+        return False
+    if payload.get("classification") == "transient_reconnect" or payload.get("transient") is True:
+        return True
+    error_type = str(payload.get("error_type") or "")
+    if error_type != "ConnectionClosedError":
+        return False
+    message = str(payload.get("message") or "")
+    text = f"{event.summary or ''} {message}".lower()
+    return "keepalive ping timeout" in text and ("no close frame" in text or "1011" in text)
+
+
+def _ignored_fast_gate_ops_category(event: OpsEvent) -> str | None:
+    if _is_background_research_market_not_found(event):
+        return "research_market_event_404"
+    if _is_watchdog_heartbeat_stale_recovery(event):
+        return "watchdog_heartbeat_stale_recovery"
+    if _is_transient_stream_reconnect(event):
+        return "stream_transient_reconnect"
+    return None
+
+
 def _batches(values: list[str], size: int = 500) -> list[list[str]]:
     return [values[i : i + size] for i in range(0, len(values), size)]
 
@@ -193,26 +243,43 @@ def _reconcile_evidence(checkpoint: Checkpoint | None, *, now: datetime) -> dict
 
 
 def _ops_summary(ops_events: list[OpsEvent]) -> dict[str, Any]:
+    ignored_categories = Counter(
+        category
+        for event in ops_events
+        if (category := _ignored_fast_gate_ops_category(event)) is not None
+    )
+    actionable_events = [
+        event
+        for event in ops_events
+        if _ignored_fast_gate_ops_category(event) is None
+    ]
     source_counts = Counter((str(event.severity), str(event.source)) for event in ops_events)
+    actionable_source_counts = Counter((str(event.severity), str(event.source)) for event in actionable_events)
     stale_count = sum(
         1
-        for event in ops_events
-        if "stale" in str(event.summary or "").lower()
-        or "stale" in str(event.payload or {}).lower()
+        for event in actionable_events
+        if "stale" in _event_text(event)
     )
     critical_events = [event for event in ops_events if str(event.severity).lower() == "critical"]
     noisy_sources = [
         {"severity": severity, "source": source, "count": count}
-        for (severity, source), count in source_counts.most_common(20)
+        for (severity, source), count in actionable_source_counts.most_common(20)
         if severity in NOISY_OPS_SEVERITIES and count >= 10
     ]
     return {
         "event_count": len(ops_events),
+        "actionable_event_count": len(actionable_events),
+        "ignored_benign_event_count": sum(ignored_categories.values()),
+        "ignored_benign_event_counts": dict(ignored_categories),
         "stale_event_count": stale_count,
         "critical_event_count": len(critical_events),
         "top_sources": [
             {"severity": severity, "source": source, "count": count}
             for (severity, source), count in source_counts.most_common(20)
+        ],
+        "actionable_top_sources": [
+            {"severity": severity, "source": source, "count": count}
+            for (severity, source), count in actionable_source_counts.most_common(20)
         ],
         "noisy_sources": noisy_sources,
         "critical_events": [

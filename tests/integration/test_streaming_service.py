@@ -440,3 +440,40 @@ async def test_streaming_service_rate_limits_repeated_stream_errors(tmp_path) ->
     assert checkpoint.payload["last_seen_at"] is not None
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_service_classifies_keepalive_timeout_as_transient_reconnect(tmp_path) -> None:
+    class ConnectionClosedError(Exception):
+        pass
+
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/stream-keepalive.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = MarketStreamService(settings, session_factory, DummyWebSocketClient())  # type: ignore[arg-type]
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await service._record_stream_error(
+            repo,
+            ConnectionClosedError("sent 1011 (internal error) keepalive ping timeout; no close frame received"),
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        event = (await session.execute(select(OpsEvent))).scalar_one()
+        checkpoint = (
+            await session.execute(
+                select(Checkpoint).where(Checkpoint.stream_name == "kalshi_ws_error:demo:blue:ConnectionClosedError")
+            )
+        ).scalar_one()
+
+    assert event.severity == "info"
+    assert event.summary == "Kalshi websocket transient reconnect"
+    assert event.payload["classification"] == "transient_reconnect"
+    assert event.payload["transient"] is True
+    assert checkpoint.payload["classification"] == "transient_reconnect"
+    assert checkpoint.payload["occurrence_count"] == 1
+
+    await engine.dispose()

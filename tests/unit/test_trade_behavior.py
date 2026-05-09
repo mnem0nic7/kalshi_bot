@@ -562,6 +562,98 @@ async def test_trade_behavior_fast_validation_warns_on_stale_ops_noise(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_trade_behavior_fast_validation_ignores_known_benign_ops_noise(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-benign.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        await _seed_fast_reconcile(session_factory)
+        async with session_factory() as session:
+            for idx in range(12):
+                session.add(
+                    OpsEvent(
+                        id=f"research-404-{idx}",
+                        kalshi_env="production",
+                        severity="error",
+                        source="research",
+                        summary=f"Research refresh failed for {TICKER}",
+                        payload={
+                            "market_ticker": TICKER,
+                            "trigger_reason": "market_event",
+                            "error_type": "HTTPStatusError",
+                            "error": "Client error '404 Not Found' for url https://example.test/markets",
+                        },
+                        created_at=NOW - timedelta(minutes=idx),
+                        updated_at=NOW - timedelta(minutes=idx),
+                    )
+                )
+                session.add(
+                    OpsEvent(
+                        id=f"stream-keepalive-{idx}",
+                        kalshi_env="production",
+                        severity="error",
+                        source="stream",
+                        summary=f"Kalshi websocket stream error repeated {idx + 1} times",
+                        payload={
+                            "error_type": "ConnectionClosedError",
+                            "message": "sent 1011 (internal error) keepalive ping timeout; no close frame received",
+                        },
+                        created_at=NOW - timedelta(minutes=idx),
+                        updated_at=NOW - timedelta(minutes=idx),
+                    )
+                )
+            session.add(
+                OpsEvent(
+                    id="watchdog-heartbeat-stale",
+                    kalshi_env="production",
+                    severity="warning",
+                    source="watchdog",
+                    summary="Watchdog requested recovery action",
+                    payload={
+                        "reason": "active color unhealthy",
+                        "colors": {
+                            "blue": {
+                                "daemon": {
+                                    "healthy": False,
+                                    "reason": "heartbeat stale",
+                                }
+                            }
+                        },
+                    },
+                    created_at=NOW - timedelta(minutes=1),
+                    updated_at=NOW - timedelta(minutes=1),
+                )
+            )
+            await session.commit()
+
+        report = await build_trade_behavior_validation_report(
+            settings=settings,
+            session_factory=session_factory,
+            watchdog_service=FakeWatchdog(),
+            trading_audit_service=ExplodingAudit(),
+            trade_analysis_service=ExplodingAnalysis(),
+            kalshi_env="production",
+            since_hours=24,
+            mode="fast",
+            now=NOW,
+        )
+    finally:
+        await engine.dispose()
+
+    assert report["status"] == "pass"
+    assert report["issues"] == []
+    ops = report["fast_gate"]["ops"]
+    assert ops["stale_event_count"] == 0
+    assert ops["noisy_sources"] == []
+    assert ops["ignored_benign_event_counts"] == {
+        "research_market_event_404": 12,
+        "stream_transient_reconnect": 12,
+        "watchdog_heartbeat_stale_recovery": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_trade_behavior_validation_aggregates_runtime_audit_analysis_and_freeze(tmp_path) -> None:
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation.db")
     engine = create_engine(settings)

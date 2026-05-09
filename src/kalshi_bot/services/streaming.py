@@ -29,6 +29,13 @@ def _first_positive_count(*values: Any) -> str | None:
     return None
 
 
+def _is_transient_websocket_keepalive_disconnect(error_type: str, message: str) -> bool:
+    if error_type != "ConnectionClosedError":
+        return False
+    text = message.lower()
+    return "keepalive ping timeout" in text and ("no close frame" in text or "1011" in text)
+
+
 class SequenceGapError(RuntimeError):
     pass
 
@@ -237,22 +244,34 @@ class MarketStreamService:
         last_logged_at = self._parse_datetime(existing.get("last_logged_at"))
         cooldown = timedelta(seconds=max(0, int(self.settings.stream_error_log_cooldown_seconds)))
         should_log = last_logged_at is None or now - last_logged_at >= cooldown
+        transient_reconnect = _is_transient_websocket_keepalive_disconnect(error_type, message)
         payload = {
             "error_type": error_type,
             "message": message,
+            "classification": "transient_reconnect" if transient_reconnect else "stream_error",
+            "transient": transient_reconnect,
             "first_seen_at": first_seen_at,
             "last_seen_at": now.isoformat(),
             "occurrence_count": occurrence_count,
             "last_logged_at": now.isoformat() if should_log else existing.get("last_logged_at"),
         }
         if should_log:
-            await repo.log_ops_event(
-                severity="error",
-                summary=(
+            severity = "info" if transient_reconnect else "error"
+            if transient_reconnect:
+                summary = (
+                    "Kalshi websocket transient reconnect"
+                    if occurrence_count == 1
+                    else f"Kalshi websocket transient reconnect repeated {occurrence_count} times"
+                )
+            else:
+                summary = (
                     "Kalshi websocket stream error"
                     if occurrence_count == 1
                     else f"Kalshi websocket stream error repeated {occurrence_count} times"
-                ),
+                )
+            await repo.log_ops_event(
+                severity=severity,
+                summary=summary,
                 source="stream",
                 payload=payload,
                 kalshi_env=self.settings.kalshi_env,

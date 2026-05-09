@@ -125,8 +125,14 @@ def _to_iso(value: datetime | None) -> str | None:
 
 def _exception_payload(exc: Exception, *, market_ticker: str, trigger_reason: str) -> dict[str, Any]:
     error_type = str(getattr(exc, "error_type", "") or type(exc).__name__)
+    response = getattr(exc, "response", None)
+    request = getattr(exc, "request", None) or getattr(response, "request", None)
     endpoint = getattr(exc, "endpoint", None)
+    if endpoint is None and request is not None:
+        endpoint = getattr(request, "url", None)
     status_code = getattr(exc, "status_code", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
     message = str(exc).strip()
     if not message:
         message = f"{error_type} while refreshing {market_ticker}"
@@ -145,6 +151,16 @@ def _exception_payload(exc: Exception, *, market_ticker: str, trigger_reason: st
     return payload
 
 
+def _is_market_not_found_payload(payload: dict[str, Any]) -> bool:
+    text = f"{payload.get('error') or ''} {payload.get('endpoint') or ''}".lower()
+    status_code = payload.get("status_code")
+    return status_code in (404, "404") or ("404" in text and "not found" in text)
+
+
+def _is_background_market_event_not_found(trigger_reason: str, payload: dict[str, Any]) -> bool:
+    return str(trigger_reason).lower() == "market_event" and _is_market_not_found_payload(payload)
+
+
 def _checkpoint_age_seconds(checkpoint_payload: dict[str, Any], key: str, *, now: datetime) -> float | None:
     raw_value = checkpoint_payload.get(key)
     if not raw_value:
@@ -156,6 +172,10 @@ def _checkpoint_age_seconds(checkpoint_payload: dict[str, Any], key: str, *, now
     if recorded_at.tzinfo is None:
         recorded_at = recorded_at.replace(tzinfo=UTC)
     return (now - recorded_at.astimezone(UTC)).total_seconds()
+
+
+class _NonActionableResearchRefresh(RuntimeError):
+    pass
 
 
 class WebSynthesisPayload(BaseModel):
@@ -371,6 +391,40 @@ class ResearchCoordinator:
                     market_ticker=market_ticker,
                     trigger_reason=trigger_reason,
                 )
+                if _is_background_market_event_not_found(trigger_reason, error_payload):
+                    skipped_at = datetime.now(UTC)
+                    skipped_payload = {
+                        "status": "skipped",
+                        "reason": "background_market_not_found",
+                        "non_actionable": True,
+                        "market_ticker": market_ticker,
+                        "trigger_reason": trigger_reason,
+                        "error": error_payload,
+                    }
+                    await repo.complete_research_run(
+                        run.id,
+                        status="skipped",
+                        payload=skipped_payload,
+                    )
+                    await repo.log_ops_event(
+                        severity="info",
+                        summary=f"Research refresh skipped for unavailable market {market_ticker}",
+                        source="research",
+                        payload=skipped_payload,
+                    )
+                    await repo.set_checkpoint(
+                        f"research_refresh_failed:{self.settings.kalshi_env}:{market_ticker}",
+                        cursor=None,
+                        payload={
+                            "failed_at": skipped_at.isoformat(),
+                            "skipped_at": skipped_at.isoformat(),
+                            "reason": "background_market_not_found",
+                            "non_actionable": True,
+                            **error_payload,
+                        },
+                    )
+                    await session.commit()
+                    raise _NonActionableResearchRefresh(f"Market {market_ticker} is unavailable for background refresh") from exc
                 await repo.complete_research_run(
                     run.id,
                     status="failed",
@@ -453,6 +507,8 @@ class ResearchCoordinator:
             await self.refresh_market_dossier(market_ticker, trigger_reason="market_event")
         except asyncio.CancelledError:
             raise
+        except _NonActionableResearchRefresh:
+            logger.info("Background research refresh skipped for unavailable market %s", market_ticker)
         except Exception:
             logger.info("Background research refresh failed for %s; failure was recorded", market_ticker)
         finally:
