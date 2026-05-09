@@ -1647,6 +1647,11 @@ class WorkflowSupervisor:
                             "current_temp_f": signal.weather.current_temp_f,
                             "observed_high_so_far_f": signal.weather.observed_high_so_far_f,
                             "threshold_f": getattr(mapping, "threshold_f", None) if mapping is not None else None,
+                            "source_disagreement_f": signal.weather.source_disagreement_f,
+                            "sigma_f": signal.weather.sigma_f,
+                            "sigma_layer": signal.weather.sigma_layer,
+                            "residual_adjustment_f": signal.weather.residual_adjustment_f,
+                            "prediction_provenance": dict(signal.prediction_provenance or {}),
                         }
                     )
                     trader_context_payload.update(
