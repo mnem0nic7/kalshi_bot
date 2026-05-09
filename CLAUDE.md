@@ -19,6 +19,10 @@ pytest tests/integration/test_supervisor_workflow.py
 # Run a single test by name
 pytest -k "test_risk_blocks_oversized_order"
 
+# Browser regression tests (requires Playwright)
+python -m playwright install chromium
+pytest tests/browser/
+
 # Run migrations
 alembic upgrade head
 
@@ -29,7 +33,10 @@ python3 -m kalshi_bot.main
 kalshi-bot-cli <subcommand>   # see README for the full list
 ```
 
-No linter/formatter is configured in `pyproject.toml`. Tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
+No linter/formatter is configured in `pyproject.toml`. Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. The global `conftest.py` sets `WEB_AUTH_ENABLED=false` as an autouse fixture, so integration tests skip HTTP basic-auth without extra setup.
+
+### Docker workflow
+The compose file lives at `infra/docker-compose.yml`. Copy `.env.example` to `.env` before first run. Postgres runs as two separate services (`postgres_demo` / `postgres_production`); migrations are separate `migrate_demo` / `migrate_production` services. App and daemon containers follow the pattern `{app|daemon}_{demo|production}_{blue|green}`.
 
 ## Architecture
 
@@ -37,6 +44,14 @@ The platform is one async Python service (`src/kalshi_bot/`) with the following 
 
 ### Dependency injection via `AppContainer`
 `services/container.py` constructs and wires every service at startup. Almost every service receives a `Settings` object, `async_sessionmaker`, and collaborating services through this container. When adding a new service, register it here.
+
+### Core primitives (`core/`)
+Shared types used across every layer:
+- `enums.py` — `AgentRole`, `RoomStage`, `RiskStatus`, `StrategyCode`, etc.
+- `schemas.py` — Pydantic models for inter-service payloads (`TradeTicket`, `RiskVerdictPayload`, `RoomMessageCreate`, …)
+- `fixed_point.py` — Kalshi price/count quantization helpers (`quantize_price`, `quantize_count`, `make_client_order_id`)
+- `metrics.py` — Prometheus counters (`ACTIVE_ROOMS`, `ORDERS_TOTAL`, `ROOM_RUNS_TOTAL`)
+- `signal_payload.py` — capital-bucket derivation from signal payloads
 
 ### Agent room (`agents/`)
 `room_agents.py` defines `AgentSuite` — eight roles that run in sequence inside each trading room:
@@ -59,13 +74,37 @@ Each role calls `providers.rewrite_with_metadata()` which routes to Gemini (prim
 - `risk.py` — `DeterministicRiskEngine`: enforces order size, position, and daily-loss limits; result is authoritative regardless of LLM opinion
 - `execution.py` — `ExecutionService`: the only path that hits Kalshi write endpoints; requires active deployment color + cleared kill switch
 
+### Risk sub-package (`risk/`)
+Structured sub-models used by `DeterministicRiskEngine`:
+- `hard_caps.py`, `parameter_pack.py` — position and daily-loss cap definitions
+- `exit_score.py`, `survival.py`, `sizing.py`, `uncertainty.py` — probabilistic position-management helpers
+
+### Forecast sub-package (`forecast/`)
+Ensemble probability engine for signal generation:
+- `probability_engine.py` / `ensemble_fuser.py` — combine multiple model outputs into a calibrated probability
+- `online_calibrator.py` — recalibrates forecasts against recent settlements
+- `learned_head.py` — XGBoost/LightGBM learned residual head
+- `source_health.py` — tracks per-source reliability for fuser weighting
+
+### Crypto subsystem (`crypto/`)
+A self-contained parallel trading stack for crypto prediction markets, mirroring the weather pipeline:
+- `services.py` — `CryptoWorkflowService`, `CryptoExecutionService`, `CryptoForecastService`, `CryptoHistoryService`, `CryptoReplayService`, `CryptoSpotService`, `CryptoAssetControlService`, `CryptoAutonomyService`, `CryptoMarketService`
+- `models.py` / `parsing.py` — `CryptoMarket`, `CryptoSeries`, candlestick normalization
+All crypto services are wired through `AppContainer` alongside weather services.
+
+### Persistence (`db/`)
+Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In tests, SQLite is used via a JSON-compatible type wrapper (no pgvector). Alembic migrations live in `alembic/`.
+
+`PlatformRepository` (in `db/repositories.py`) is the single repository surface passed to services. It is assembled from four mixin classes — `DeploymentControlRepositoryMixin`, `LearningRepositoryMixin`, `StrategyRepositoryMixin`, `WebAuthRepositoryMixin` — each in their own file under `db/`. Add new query methods to the appropriate mixin, not directly to `PlatformRepository`.
+
 ### Integrations (`integrations/`)
 - `kalshi.py` — REST (RSA-signed) + WebSocket client
 - `weather.py` — NWS/NOAA ingestion
 - `forecast_archive.py` — Open-Meteo historical weather recovery
+- `crypto_spot.py` — Coinbase + CoinGecko OHLC spot feeds
 
-### Persistence
-Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In tests, SQLite is used via a JSON-compatible type wrapper (no pgvector). Alembic migrations live in `alembic/`.
+### Learning sub-package (`learning/`)
+Drift watcher and parameter-search utilities used by the self-improve and strategy-evolution pipelines.
 
 ### Control room (`web/`)
 FastAPI app with server-rendered Jinja2 templates, SSE transcript stream, and REST endpoints. The top-level summary strip (`/api/control-room/summary`) is designed to be fast — it avoids live market discovery and uses lightweight room snapshots. The `Research` view also exposes an 180d-only assignment review queue (`ready_for_approval`, `drifted_assignment`, `evidence_weakened`, `aligned`, `waiting_for_evidence`), and city detail includes the latest approval note plus next-action copy. The operator win-rate card uses `PlatformRepository.get_fill_win_rate_30d()` and treats wins as realized-P&L-positive exits first, falling back to settlement results only when no sell fill exists for that ticker and side.
@@ -80,7 +119,7 @@ A DB-backed single-writer lock enforces that only the active color (`app_color` 
 4. `replay_corpus` — materialized `historical_replay` rooms
 
 ## Key configuration
-`config.py` (`Settings`) reads from `.env`. Key env vars:
+`config.py` (`Settings`) reads from `.env` (copy from `.env.example`). Key env vars:
 - `KALSHI_ENV` — `demo` or `live`
 - `LIVE_KALSHI_API_KEY` / `DEMO_KALSHI_API_KEY` — API key IDs
 - `LIVE_KALSHI_READ_PRIVATE_KEY_PATH` / `DEMO_*` — RSA PEM paths
@@ -88,7 +127,7 @@ A DB-backed single-writer lock enforces that only the active color (`app_color` 
 - `APP_SHADOW_MODE=true` — prevents live order submission (default on)
 - `APP_COLOR` — `blue` or `green` for blue/green deployment
 - `SELF_IMPROVE_CANARY_MAX_SECONDS` — max staged-canary lifetime before status becomes `stalled`
-- `WEATHER_MARKET_MAP_PATH` — path to market config YAML (default: `docs/examples/weather_markets.example.yaml`)
+- `WEATHER_MARKET_MAP_PATH` — path to market config YAML (default: `docs/examples/weather_markets.example.yaml`); the YAML uses `series_templates` so the app auto-discovers current daily temperature contracts per configured city
 
 ## Safety rules
 - The app starts in shadow mode (`APP_SHADOW_MODE=true`) and with the kill switch enabled by default. Do not disable either until mappings, reconciliation, and restart recovery are validated.

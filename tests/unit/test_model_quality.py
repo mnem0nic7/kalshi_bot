@@ -38,7 +38,7 @@ class FakeCryptoForecastService:
 
     async def candidates(self, *, frequency: str = "15m", days: int | None = None) -> dict[str, Any]:
         return {
-            "schema_version": "crypto-model-candidates-v1",
+            "schema_version": "crypto-model-candidates-v2",
             "status": "ok",
             "frequency": frequency,
             "days": days,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import logging
 import math
@@ -75,6 +77,9 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v3"
+CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
+CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
 CRYPTO_EXPLORATORY_SHADOW = "exploratory_shadow"
 CRYPTO_LIVE_QUALITY = "live_quality"
 
@@ -1088,7 +1093,7 @@ class CryptoForecastService:
             )
             decision_rows = _crypto_decision_rows(rows, candles, spot_rows)
             sample_count = len(decision_rows)
-            payload = _fit_crypto_calibration(decision_rows)
+            payload = _fit_crypto_calibration(decision_rows, settings=self.settings)
             metrics = _crypto_model_metrics(decision_rows, payload, settings=self.settings)
             status = "trained" if sample_count >= self.settings.crypto_min_training_samples else "insufficient_data"
             artifact_payload = {
@@ -1098,22 +1103,29 @@ class CryptoForecastService:
                 "feature_set": [
                     "market_mid_logit",
                     "asset",
-                    "side_candidate",
                     "time_to_close",
+                    "time_to_close_bucket",
+                    "market_age",
                     "target_price",
                     "execution_price",
                     "spread",
+                    "quote_source",
+                    "proxy_quote_flag",
                     "mid",
                     "volume",
                     "open_interest",
                     "candlestick_momentum",
                     "spot_moneyness",
                     "spot_momentum",
+                    "spot_return_windows",
                     "spot_realized_volatility",
+                    "spot_target_distance_volatility",
                     "kalshi_mid_spot_gap",
                     "recent_same_asset_behavior",
                 ],
-                "metrics_scope": "in_sample",
+                "metrics_scope": metrics.get("validation_scope") or "walk_forward_time_ordered",
+                "candidate_registry_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
+                "dependency_versions": _crypto_dependency_versions(),
             }
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
@@ -1165,13 +1177,17 @@ class CryptoForecastService:
             await session.commit()
         decision_rows = _crypto_decision_rows(rows, candles, spot_rows)
         model_payload = artifact.payload if artifact is not None else None
+        candidate_report = _crypto_model_candidate_report(decision_rows, settings=self.settings)
         return {
-            "schema_version": "crypto-model-candidates-v1",
+            "schema_version": "crypto-model-candidates-v2",
             "status": "ok" if model_payload else "missing_model",
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "days": days,
             "model": _artifact_summary(artifact),
+            "primary_metric": "brier",
+            "candidate_report": candidate_report,
+            "ranked_candidates": candidate_report.get("candidates") or [],
             **_crypto_candidate_quality_report(decision_rows, model_payload, settings=self.settings),
         }
 
@@ -1272,6 +1288,10 @@ class CryptoForecastService:
                     "calibration_version": artifact.version,
                     "model_version": artifact.version,
                     "feature_schema_version": payload.get("feature_schema_version"),
+                    "model_type": payload.get("model_type"),
+                    "candidate_registry_version": payload.get("candidate_registry_version"),
+                    "candidate_champion": (payload.get("candidate_report") or {}).get("champion_name") if isinstance(payload.get("candidate_report"), dict) else None,
+                    "ensemble_weights": payload.get("ensemble_weights"),
                     "status": artifact.status,
                     "metric_deltas": _crypto_metric_deltas(artifact.metrics or {}),
                     "reason": None,
@@ -2440,6 +2460,7 @@ def _crypto_live_market_row(
     if no_ask is None and market.yes_bid_dollars is not None:
         no_ask = Decimal("1.0000") - market.yes_bid_dollars
     strict_trade_eligible = market.yes_bid_dollars is not None and market.yes_ask_dollars is not None
+    market_age_seconds = _crypto_market_age_seconds(now, market.open_time)
     row = {
         "row_id": f"live:{market.market_ticker}:{now.isoformat()}",
         "market_ticker": market.market_ticker,
@@ -2464,6 +2485,7 @@ def _crypto_live_market_row(
         "volume": market.volume,
         "open_interest": market.open_interest,
         "time_to_close_seconds": int((close_time - now).total_seconds()) if close_time is not None else None,
+        "market_age_seconds": market_age_seconds,
         "candle_momentum_dollars": Decimal("0"),
         "spot_feature_status": "missing",
         "asset_recent_yes_rate": None,
@@ -2823,6 +2845,7 @@ def _crypto_decision_rows(
             mid_yes=_clamp_price(mid),
         )
         strict_trade_eligible = quote_source == "snapshot_quotes"
+        market_age_seconds = _crypto_market_age_seconds(decision_ts, getattr(snapshot, "open_time", None))
         rows.append(
             {
                 "row_id": f"{snapshot.market_ticker}:{decision_ts.isoformat()}",
@@ -2848,6 +2871,7 @@ def _crypto_decision_rows(
                 "volume": snapshot.volume,
                 "open_interest": snapshot.open_interest,
                 "time_to_close_seconds": int((close_time - decision_ts).total_seconds()) if close_time is not None else None,
+                "market_age_seconds": market_age_seconds,
                 "settlement_result": snapshot.settlement_result,
                 "label_yes": 1 if snapshot.settlement_result == "yes" else 0,
                 "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
@@ -2906,6 +2930,7 @@ def _crypto_decision_rows(
                     "volume": candle.volume if candle.volume is not None else snapshot.volume,
                     "open_interest": snapshot.open_interest,
                     "time_to_close_seconds": int((close_time - decision_ts).total_seconds()),
+                    "market_age_seconds": _crypto_market_age_seconds(decision_ts, getattr(snapshot, "open_time", None)),
                     "settlement_result": snapshot.settlement_result,
                     "label_yes": 1 if snapshot.settlement_result == "yes" else 0,
                     "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
@@ -2940,7 +2965,11 @@ def _spot_context_for_decision(
             "spot_moneyness_dollars": None,
             "spot_moneyness_pct": None,
             "spot_momentum_pct": None,
+            "spot_return_1_pct": None,
+            "spot_return_3_pct": None,
+            "spot_return_6_pct": None,
             "spot_realized_volatility": None,
+            "spot_target_distance_volatility": None,
             "kalshi_mid_spot_gap": None,
         }
     current = eligible[-1]
@@ -2950,6 +2979,9 @@ def _spot_context_for_decision(
     momentum_pct = None
     if prior_close is not None and prior_close > 0:
         momentum_pct = (close - prior_close) / prior_close
+    spot_return_1_pct = momentum_pct
+    spot_return_3_pct = _spot_return_pct(eligible, periods=3)
+    spot_return_6_pct = _spot_return_pct(eligible, periods=6)
     returns: list[Decimal] = []
     window = eligible[-9:]
     for before, after in zip(window, window[1:], strict=False):
@@ -2969,6 +3001,9 @@ def _spot_context_for_decision(
         moneyness = close - target_price
         moneyness_pct = moneyness / target_price
         spot_probability_proxy = Decimal("0.5000") + max(Decimal("-0.5000"), min(Decimal("0.5000"), moneyness_pct * Decimal("20")))
+    target_distance_volatility = None
+    if moneyness_pct is not None and volatility is not None and volatility > 0:
+        target_distance_volatility = moneyness_pct / volatility
     kalshi_gap = mid_yes - spot_probability_proxy if spot_probability_proxy is not None else None
     return {
         "spot_feature_status": "available",
@@ -2980,9 +3015,23 @@ def _spot_context_for_decision(
         "spot_moneyness_dollars": moneyness,
         "spot_moneyness_pct": moneyness_pct,
         "spot_momentum_pct": momentum_pct,
+        "spot_return_1_pct": spot_return_1_pct,
+        "spot_return_3_pct": spot_return_3_pct,
+        "spot_return_6_pct": spot_return_6_pct,
         "spot_realized_volatility": volatility,
+        "spot_target_distance_volatility": target_distance_volatility,
         "kalshi_mid_spot_gap": kalshi_gap,
     }
+
+
+def _spot_return_pct(spot_rows: list[CryptoSpotOHLCRecord], *, periods: int) -> Decimal | None:
+    if len(spot_rows) <= periods:
+        return None
+    current_close = _decimal(spot_rows[-1].close_dollars)
+    prior_close = _decimal(spot_rows[-1 - periods].close_dollars)
+    if prior_close <= 0:
+        return None
+    return (current_close - prior_close) / prior_close
 
 
 def _crypto_add_recent_asset_features(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3030,7 +3079,11 @@ def _json_ready_spot_features(row: dict[str, Any]) -> dict[str, Any]:
         "spot_moneyness_dollars",
         "spot_moneyness_pct",
         "spot_momentum_pct",
+        "spot_return_1_pct",
+        "spot_return_3_pct",
+        "spot_return_6_pct",
         "spot_realized_volatility",
+        "spot_target_distance_volatility",
         "kalshi_mid_spot_gap",
     ]
     result: dict[str, Any] = {}
@@ -3075,17 +3128,27 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "spot_available",
         "spot_moneyness_pct",
         "spot_momentum_pct",
+        "spot_return_1_pct",
+        "spot_return_3_pct",
+        "spot_return_6_pct",
         "spot_realized_volatility",
+        "spot_target_distance_volatility",
         "kalshi_mid_spot_gap",
         "spot_stale_ratio",
         "asset_recent_yes_rate_delta",
         "asset_recent_mid_error",
         "quote_source_candlestick_proxy",
+        "quote_source_snapshot_quotes",
         "strict_trade_eligible",
+        "time_to_close_bucket_0_5m",
+        "time_to_close_bucket_5_10m",
+        "time_to_close_bucket_10_15m",
+        "time_to_close_bucket_15m_plus",
+        "market_age_ratio",
     ]
     feature_names = [*numeric, *[f"asset={asset}" for asset in assets]]
     return {
-        "feature_schema_version": CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION,
+        "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
         "feature_names": feature_names,
         "numeric_feature_names": numeric,
         "asset_categories": assets,
@@ -3137,12 +3200,18 @@ def _crypto_raw_feature_vector(
     candle_momentum = float(_decimal(row.get("candle_momentum_dollars") or Decimal("0")))
     spot_moneyness = float(_decimal(row.get("spot_moneyness_pct") or Decimal("0")))
     spot_momentum = float(_decimal(row.get("spot_momentum_pct") or Decimal("0")))
+    spot_return_1 = float(_decimal(row.get("spot_return_1_pct") or Decimal("0")))
+    spot_return_3 = float(_decimal(row.get("spot_return_3_pct") or Decimal("0")))
+    spot_return_6 = float(_decimal(row.get("spot_return_6_pct") or Decimal("0")))
     spot_volatility = float(_decimal(row.get("spot_realized_volatility") or Decimal("0")))
+    spot_target_distance_volatility = float(_decimal(row.get("spot_target_distance_volatility") or Decimal("0")))
     kalshi_mid_spot_gap = float(_decimal(row.get("kalshi_mid_spot_gap") or Decimal("0")))
     spot_stale_seconds = max(0.0, float(row.get("spot_stale_seconds") or 0))
+    market_age_seconds = max(0.0, float(row.get("market_age_seconds") or 0))
     default_values = _crypto_default_values_for_asset(asset, defaults or {})
     recent_yes = row.get("asset_recent_yes_rate")
     recent_error = row.get("asset_recent_mid_error")
+    time_to_close_bucket = _crypto_time_to_close_bucket(time_to_close)
     numeric_values = {
         "market_mid_logit": math.log(max(1e-6, mid) / max(1e-6, 1.0 - mid)),
         "mid_yes": mid,
@@ -3155,17 +3224,43 @@ def _crypto_raw_feature_vector(
         "spot_available": 1.0 if row.get("spot_feature_status") == "available" else 0.0,
         "spot_moneyness_pct": max(-0.25, min(0.25, spot_moneyness)) * 4.0,
         "spot_momentum_pct": max(-0.05, min(0.05, spot_momentum)) * 20.0,
+        "spot_return_1_pct": max(-0.05, min(0.05, spot_return_1)) * 20.0,
+        "spot_return_3_pct": max(-0.10, min(0.10, spot_return_3)) * 10.0,
+        "spot_return_6_pct": max(-0.15, min(0.15, spot_return_6)) * (20.0 / 3.0),
         "spot_realized_volatility": max(0.0, min(0.10, spot_volatility)) * 10.0,
+        "spot_target_distance_volatility": max(-8.0, min(8.0, spot_target_distance_volatility)) / 8.0,
         "kalshi_mid_spot_gap": max(-0.50, min(0.50, kalshi_mid_spot_gap)) * 2.0,
         "spot_stale_ratio": min(spot_stale_seconds / 3600.0, 6.0) / 6.0,
         "asset_recent_yes_rate_delta": float(_decimal(recent_yes)) - 0.5 if recent_yes is not None else default_values["asset_recent_yes_rate"] - 0.5,
         "asset_recent_mid_error": float(_decimal(recent_error)) if recent_error is not None else default_values["asset_recent_mid_error"],
         "quote_source_candlestick_proxy": 1.0 if row.get("quote_source") == "candlestick_close_proxy" else 0.0,
+        "quote_source_snapshot_quotes": 1.0 if row.get("quote_source") in {"snapshot_quotes", "live_market_snapshot"} else 0.0,
         "strict_trade_eligible": 1.0 if row.get("strict_trade_eligible") else 0.0,
+        "time_to_close_bucket_0_5m": 1.0 if time_to_close_bucket == "0_5m" else 0.0,
+        "time_to_close_bucket_5_10m": 1.0 if time_to_close_bucket == "5_10m" else 0.0,
+        "time_to_close_bucket_10_15m": 1.0 if time_to_close_bucket == "10_15m" else 0.0,
+        "time_to_close_bucket_15m_plus": 1.0 if time_to_close_bucket == "15m_plus" else 0.0,
+        "market_age_ratio": min(market_age_seconds / 900.0, 8.0) / 8.0,
     }
     values: list[float] = [numeric_values[name] for name in schema.get("numeric_feature_names") or []]
     values.extend(1.0 if asset == category else 0.0 for category in schema.get("asset_categories") or [])
     return values
+
+
+def _crypto_time_to_close_bucket(seconds: float) -> str:
+    if seconds <= 300:
+        return "0_5m"
+    if seconds <= 600:
+        return "5_10m"
+    if seconds <= 900:
+        return "10_15m"
+    return "15m_plus"
+
+
+def _crypto_market_age_seconds(decision_ts: datetime, open_time: datetime | None) -> int | None:
+    if open_time is None:
+        return None
+    return max(0, int((_as_utc_datetime(decision_ts) - _as_utc_datetime(open_time)).total_seconds()))
 
 
 def _crypto_default_values_for_asset(asset: str, defaults: dict[str, Any]) -> dict[str, float]:
@@ -3219,64 +3314,370 @@ def _fit_crypto_heuristic_calibration(rows: list[dict[str, Any]]) -> dict[str, A
     }
 
 
-def _fit_crypto_calibration(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _package_version(package: str) -> str | None:
+    try:
+        return importlib_metadata.version(package)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _fit_crypto_calibration(
+    rows: list[dict[str, Any]],
+    *,
+    settings: Settings | None = None,
+    include_candidate_report: bool = True,
+) -> dict[str, Any]:
     fallback = _fit_crypto_heuristic_calibration(rows)
     if not rows:
         return fallback
     labels = [int(row["label_yes"]) for row in rows]
     if len(set(labels)) < 2:
         return {**fallback, "fallback_reason": "single_class_training_rows"}
-    try:
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.preprocessing import StandardScaler
-        import sklearn
-    except Exception as exc:  # pragma: no cover - dependency failures are surfaced in artifact payload.
-        return {**fallback, "fallback_reason": f"sklearn_unavailable:{exc}"}
 
     schema = _crypto_feature_schema(rows)
-    raw_matrix = [_crypto_raw_feature_vector(row, schema) for row in rows]
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(raw_matrix)
-    classifier = LogisticRegression(
-        C=0.75,
-        class_weight="balanced",
-        max_iter=1000,
-        random_state=17,
-        solver="lbfgs",
-    )
-    classifier.fit(scaled, labels)
     defaults = _crypto_feature_defaults(rows)
+    candidates = _fit_crypto_model_candidates(rows, schema=schema, defaults=defaults, fallback=fallback)
+    candidate_report = (
+        _crypto_model_candidate_report(rows, settings=settings, full_candidate_status=candidates)
+        if include_candidate_report
+        else _crypto_in_sample_candidate_report(rows, candidates)
+    )
+    champion_name = str(candidate_report.get("champion_name") or "sklearn_logistic")
+    if champion_name == "calibrated_weighted_ensemble":
+        member_models = {
+            name: dict(candidates[name]["model"])
+            for name in (candidate_report.get("ensemble_weights") or {})
+            if candidates.get(name, {}).get("status") == "available" and candidates[name].get("model") is not None
+        }
+        if member_models:
+            return {
+                "model_type": "calibrated_weighted_ensemble",
+                "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+                "feature_names": schema["feature_names"],
+                "numeric_feature_names": schema["numeric_feature_names"],
+                "asset_categories": schema["asset_categories"],
+                "positive_label": "yes",
+                "ensemble_weights": dict(candidate_report.get("ensemble_weights") or {}),
+                "member_models": member_models,
+                "fallback_model": fallback,
+                "feature_defaults": defaults,
+                "candidate_report": candidate_report,
+                "training_cutoff": _crypto_training_cutoff(rows),
+            }
+    if candidates.get(champion_name, {}).get("status") == "available" and candidates[champion_name].get("model") is not None:
+        model = dict(candidates[champion_name]["model"])
+        model["candidate_report"] = candidate_report
+        return model
+    for fallback_name in ("sklearn_logistic", "market_mid_baseline"):
+        if candidates.get(fallback_name, {}).get("status") == "available" and candidates[fallback_name].get("model") is not None:
+            model = dict(candidates[fallback_name]["model"])
+            model["candidate_report"] = {
+                **candidate_report,
+                "champion_fallback_reason": f"selected_champion_unavailable:{champion_name}",
+            }
+            return model
+    return {**fallback, "fallback_reason": "no_candidate_model_available", "candidate_report": candidate_report}
+
+
+def _fit_crypto_model_candidates(
+    rows: list[dict[str, Any]],
+    *,
+    schema: dict[str, Any] | None = None,
+    defaults: dict[str, Any] | None = None,
+    fallback: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    schema = schema or _crypto_feature_schema(rows)
+    defaults = defaults or _crypto_feature_defaults(rows)
+    fallback = fallback or _fit_crypto_heuristic_calibration(rows)
+    labels = [int(row["label_yes"]) for row in rows]
+    raw_matrix = [_crypto_raw_feature_vector(row, schema, defaults=defaults) for row in rows]
+    result: dict[str, dict[str, Any]] = {
+        "market_mid_baseline": {
+            "name": "market_mid_baseline",
+            "status": "available",
+            "model": _market_mid_crypto_model(schema=schema, defaults=defaults, fallback=fallback, rows=rows),
+            "dependency_version": None,
+        }
+    }
+    if not rows or len(set(labels)) < 2:
+        reason = "need_two_outcome_classes"
+        for name in ("sklearn_logistic", "xgboost_classifier", "lightgbm_classifier"):
+            result[name] = {"name": name, "status": "unavailable", "reason": reason, "dependency_version": None}
+        return result
+    result["sklearn_logistic"] = _fit_crypto_logistic_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback)
+    result["xgboost_classifier"] = _fit_crypto_xgboost_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback)
+    result["lightgbm_classifier"] = _fit_crypto_lightgbm_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback)
+    return result
+
+
+def _market_mid_crypto_model(
+    *,
+    schema: dict[str, Any],
+    defaults: dict[str, Any],
+    fallback: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
-        "model_type": "sklearn_logistic",
-        "feature_schema_version": CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION,
+        "model_type": "market_mid_baseline",
+        "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
         "feature_names": schema["feature_names"],
         "numeric_feature_names": schema["numeric_feature_names"],
         "asset_categories": schema["asset_categories"],
-        "scaler": {
-            "mean": [float(value) for value in scaler.mean_],
-            "scale": [float(value) if float(value) != 0.0 else 1.0 for value in scaler.scale_],
-        },
-        "coefficients": [float(value) for value in classifier.coef_[0]],
-        "intercept": float(classifier.intercept_[0]),
         "positive_label": "yes",
-        "sklearn": {
-            "version": sklearn.__version__,
-            "estimator": "LogisticRegression",
-            "solver": "lbfgs",
-            "class_weight": "balanced",
-            "random_state": 17,
-        },
         "feature_defaults": defaults,
         "fallback_model": fallback,
         "training_cutoff": _crypto_training_cutoff(rows),
     }
 
 
-def _predict_crypto_probability(row: dict[str, Any], model: dict[str, Any] | None) -> Decimal:
+def _fit_crypto_logistic_model(
+    rows: list[dict[str, Any]],
+    raw_matrix: list[list[float]],
+    labels: list[int],
+    *,
+    schema: dict[str, Any],
+    defaults: dict[str, Any],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        import sklearn
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+    except Exception as exc:  # pragma: no cover - dependency failures are surfaced in artifact payload.
+        return {"name": "sklearn_logistic", "status": "unavailable", "reason": f"sklearn_unavailable:{exc}", "dependency_version": None}
+    try:
+        scaler = StandardScaler()
+        scaled = scaler.fit_transform(raw_matrix)
+        classifier = LogisticRegression(
+            C=0.75,
+            class_weight="balanced",
+            max_iter=1000,
+            random_state=17,
+            solver="lbfgs",
+        )
+        classifier.fit(scaled, labels)
+        model = {
+            "model_type": "sklearn_logistic",
+            "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+            "feature_names": schema["feature_names"],
+            "numeric_feature_names": schema["numeric_feature_names"],
+            "asset_categories": schema["asset_categories"],
+            "scaler": {
+                "mean": [float(value) for value in scaler.mean_],
+                "scale": [float(value) if float(value) != 0.0 else 1.0 for value in scaler.scale_],
+            },
+            "coefficients": [float(value) for value in classifier.coef_[0]],
+            "intercept": float(classifier.intercept_[0]),
+            "positive_label": "yes",
+            "sklearn": {
+                "version": sklearn.__version__,
+                "estimator": "LogisticRegression",
+                "solver": "lbfgs",
+                "class_weight": "balanced",
+                "random_state": 17,
+            },
+            "feature_defaults": defaults,
+            "fallback_model": fallback,
+            "training_cutoff": _crypto_training_cutoff(rows),
+        }
+        model["probability_calibration"] = _fit_probability_calibration(
+            [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
+            labels,
+        )
+        return {"name": "sklearn_logistic", "status": "available", "model": model, "dependency_version": sklearn.__version__}
+    except Exception as exc:
+        return {"name": "sklearn_logistic", "status": "unavailable", "reason": f"sklearn_fit_failed:{exc}", "dependency_version": _package_version("scikit-learn")}
+
+
+def _fit_crypto_xgboost_model(
+    rows: list[dict[str, Any]],
+    raw_matrix: list[list[float]],
+    labels: list[int],
+    *,
+    schema: dict[str, Any],
+    defaults: dict[str, Any],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        import xgboost as xgb
+    except Exception as exc:
+        return {"name": "xgboost_classifier", "status": "unavailable", "reason": f"xgboost_unavailable:{exc}", "dependency_version": None}
+    try:
+        classifier = xgb.XGBClassifier(
+            n_estimators=80,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            eval_metric="logloss",
+            random_state=17,
+            n_jobs=1,
+            tree_method="hist",
+        )
+        classifier.fit(raw_matrix, labels)
+        booster = classifier.get_booster()
+        try:
+            raw_booster = booster.save_raw(raw_format="json")
+        except TypeError:
+            raw_booster = booster.save_raw()
+        raw_bytes = raw_booster if isinstance(raw_booster, bytes) else str(raw_booster).encode("utf-8")
+        model = {
+            "model_type": "xgboost_classifier",
+            "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+            "feature_names": schema["feature_names"],
+            "numeric_feature_names": schema["numeric_feature_names"],
+            "asset_categories": schema["asset_categories"],
+            "booster_raw_base64": base64.b64encode(raw_bytes).decode("ascii"),
+            "positive_label": "yes",
+            "xgboost": {
+                "version": getattr(xgb, "__version__", None),
+                "estimator": "XGBClassifier",
+                "random_state": 17,
+                "tree_method": "hist",
+            },
+            "feature_defaults": defaults,
+            "fallback_model": fallback,
+            "training_cutoff": _crypto_training_cutoff(rows),
+        }
+        model["probability_calibration"] = _fit_probability_calibration(
+            [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
+            labels,
+        )
+        return {"name": "xgboost_classifier", "status": "available", "model": model, "dependency_version": getattr(xgb, "__version__", None)}
+    except Exception as exc:
+        return {"name": "xgboost_classifier", "status": "unavailable", "reason": f"xgboost_fit_failed:{exc}", "dependency_version": _package_version("xgboost") or _package_version("xgboost-cpu")}
+
+
+def _fit_crypto_lightgbm_model(
+    rows: list[dict[str, Any]],
+    raw_matrix: list[list[float]],
+    labels: list[int],
+    *,
+    schema: dict[str, Any],
+    defaults: dict[str, Any],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        import lightgbm as lgb
+    except Exception as exc:
+        return {"name": "lightgbm_classifier", "status": "unavailable", "reason": f"lightgbm_unavailable:{exc}", "dependency_version": None}
+    try:
+        classifier = lgb.LGBMClassifier(
+            n_estimators=80,
+            max_depth=3,
+            learning_rate=0.05,
+            num_leaves=15,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            min_child_samples=1,
+            random_state=17,
+            n_jobs=1,
+            verbosity=-1,
+        )
+        classifier.fit(raw_matrix, labels)
+        booster = classifier.booster_
+        model = {
+            "model_type": "lightgbm_classifier",
+            "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+            "feature_names": schema["feature_names"],
+            "numeric_feature_names": schema["numeric_feature_names"],
+            "asset_categories": schema["asset_categories"],
+            "booster_model_string": booster.model_to_string(),
+            "positive_label": "yes",
+            "lightgbm": {
+                "version": getattr(lgb, "__version__", None),
+                "estimator": "LGBMClassifier",
+                "random_state": 17,
+            },
+            "feature_defaults": defaults,
+            "fallback_model": fallback,
+            "training_cutoff": _crypto_training_cutoff(rows),
+        }
+        model["probability_calibration"] = _fit_probability_calibration(
+            [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
+            labels,
+        )
+        return {"name": "lightgbm_classifier", "status": "available", "model": model, "dependency_version": getattr(lgb, "__version__", None)}
+    except Exception as exc:
+        return {"name": "lightgbm_classifier", "status": "unavailable", "reason": f"lightgbm_fit_failed:{exc}", "dependency_version": _package_version("lightgbm")}
+
+
+def _fit_probability_calibration(predictions: list[Decimal], labels: list[int]) -> dict[str, Any] | None:
+    if len(predictions) < 12 or len(set(labels)) < 2 or len({str(value) for value in predictions}) < 3:
+        return None
+    try:
+        from sklearn.isotonic import IsotonicRegression
+    except Exception:
+        return None
+    try:
+        x_values = [float(value) for value in predictions]
+        calibrator = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(x_values, labels)
+        return {
+            "method": "isotonic",
+            "sample_count": len(predictions),
+            "thresholds_x": [float(value) for value in calibrator.X_thresholds_],
+            "thresholds_y": [float(value) for value in calibrator.y_thresholds_],
+        }
+    except Exception:
+        return None
+
+
+def _apply_probability_calibration(probability: Decimal, calibration: dict[str, Any] | None) -> Decimal:
+    if not calibration or calibration.get("method") != "isotonic":
+        return _clamp_price(probability)
+    xs = [float(value) for value in calibration.get("thresholds_x") or []]
+    ys = [float(value) for value in calibration.get("thresholds_y") or []]
+    if len(xs) != len(ys) or not xs:
+        return _clamp_price(probability)
+    value = float(probability)
+    if value <= xs[0]:
+        return _clamp_price(Decimal(str(ys[0])))
+    if value >= xs[-1]:
+        return _clamp_price(Decimal(str(ys[-1])))
+    for idx in range(1, len(xs)):
+        if value <= xs[idx]:
+            left_x = xs[idx - 1]
+            right_x = xs[idx]
+            left_y = ys[idx - 1]
+            right_y = ys[idx]
+            if right_x == left_x:
+                return _clamp_price(Decimal(str(right_y)))
+            ratio = (value - left_x) / (right_x - left_x)
+            return _clamp_price(Decimal(str(left_y + (right_y - left_y) * ratio)))
+    return _clamp_price(probability)
+
+
+def _predict_crypto_probability(
+    row: dict[str, Any],
+    model: dict[str, Any] | None,
+    *,
+    apply_calibration: bool = True,
+) -> Decimal:
     mid = _decimal(row.get("mid_yes_dollars"))
     if not model:
         return _clamp_price(mid)
-    if model.get("model_type") == "sklearn_logistic":
+    model_type = model.get("model_type")
+    if model_type == "market_mid_baseline":
+        return _clamp_price(mid)
+    if model_type == "calibrated_weighted_ensemble":
+        try:
+            weights = {str(name): float(weight) for name, weight in (model.get("ensemble_weights") or {}).items()}
+            members = model.get("member_models") or {}
+            total_weight = sum(weight for name, weight in weights.items() if name in members)
+            if total_weight <= 0:
+                return _predict_crypto_probability(row, model.get("fallback_model"))
+            probability = Decimal("0")
+            for name, weight in weights.items():
+                if name not in members:
+                    continue
+                probability += _predict_crypto_probability(row, members[name]) * Decimal(str(weight / total_weight))
+            return _clamp_price(probability)
+        except Exception:
+            return _predict_crypto_probability(row, model.get("fallback_model"))
+    if model_type == "sklearn_logistic":
         try:
             schema = {
                 "feature_names": list(model.get("feature_names") or []),
@@ -3293,8 +3694,39 @@ def _predict_crypto_probability(row: dict[str, Any], model: dict[str, Any] | Non
             logit = float(model.get("intercept") or 0.0)
             for value, mean, scale, coefficient in zip(raw, means, scales, coefficients, strict=True):
                 logit += ((value - mean) / scale) * coefficient
-            probability = 1.0 / (1.0 + math.exp(-max(-40.0, min(40.0, logit))))
-            return _clamp_price(Decimal(str(probability)))
+            probability = _clamp_price(Decimal(str(1.0 / (1.0 + math.exp(-max(-40.0, min(40.0, logit)))))))
+            return _apply_probability_calibration(probability, model.get("probability_calibration")) if apply_calibration else probability
+        except Exception:
+            return _predict_crypto_probability(row, model.get("fallback_model"))
+    if model_type == "xgboost_classifier":
+        try:
+            import xgboost as xgb
+
+            schema = {
+                "feature_names": list(model.get("feature_names") or []),
+                "numeric_feature_names": list(model.get("numeric_feature_names") or []),
+                "asset_categories": list(model.get("asset_categories") or []),
+            }
+            raw = _crypto_raw_feature_vector(row, schema, defaults=model.get("feature_defaults") or {})
+            booster = xgb.Booster()
+            booster.load_model(bytearray(base64.b64decode(str(model.get("booster_raw_base64") or ""))))
+            probability = _clamp_price(Decimal(str(float(booster.predict(xgb.DMatrix([raw]))[0]))))
+            return _apply_probability_calibration(probability, model.get("probability_calibration")) if apply_calibration else probability
+        except Exception:
+            return _predict_crypto_probability(row, model.get("fallback_model"))
+    if model_type == "lightgbm_classifier":
+        try:
+            import lightgbm as lgb
+
+            schema = {
+                "feature_names": list(model.get("feature_names") or []),
+                "numeric_feature_names": list(model.get("numeric_feature_names") or []),
+                "asset_categories": list(model.get("asset_categories") or []),
+            }
+            raw = _crypto_raw_feature_vector(row, schema, defaults=model.get("feature_defaults") or {})
+            booster = lgb.Booster(model_str=str(model.get("booster_model_string") or ""))
+            probability = _clamp_price(Decimal(str(float(booster.predict([raw])[0]))))
+            return _apply_probability_calibration(probability, model.get("probability_calibration")) if apply_calibration else probability
         except Exception:
             return _predict_crypto_probability(row, model.get("fallback_model"))
     adjustment = Decimal(int(model.get("global_adjustment_bps") or 0)) / Decimal("10000")
@@ -3303,6 +3735,366 @@ def _predict_crypto_probability(row: dict[str, Any], model: dict[str, Any] | Non
     spread_bps = int(row.get("spread_bps") or 0)
     spread_penalty = Decimal(max(0, spread_bps - 100)) / Decimal("10000") / Decimal("8")
     return _clamp_price(mid + adjustment + momentum - spread_penalty)
+
+
+def _crypto_predictions_for_model(rows: list[dict[str, Any]], model: dict[str, Any] | None) -> list[tuple[Decimal, int]]:
+    return [(_predict_crypto_probability(row, model), int(row["label_yes"])) for row in rows]
+
+
+def _crypto_candidate_metric_entry(
+    *,
+    name: str,
+    status: str,
+    metrics: dict[str, Any] | None = None,
+    reason: str | None = None,
+    dependency_version: str | None = None,
+    fold_count: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": status,
+        "metrics": metrics,
+        "reason": reason,
+        "dependency_version": dependency_version,
+        "fold_count": fold_count,
+    }
+
+
+def _metric_regression_limit(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value + max(0.001, abs(value) * CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE)
+
+
+def _crypto_candidate_guardrail_failures(
+    metrics: dict[str, Any],
+    *,
+    market_mid_metrics: dict[str, Any] | None,
+    logistic_metrics: dict[str, Any] | None,
+    candidate_name: str,
+) -> list[str]:
+    if candidate_name == "market_mid_baseline":
+        return []
+    failures: list[str] = []
+    references = [("market_mid", market_mid_metrics)]
+    if candidate_name != "sklearn_logistic":
+        references.append(("sklearn_logistic", logistic_metrics))
+    for reference_name, reference in references:
+        if not reference:
+            continue
+        for key in ("log_loss", "ece"):
+            candidate_value = metrics.get(key)
+            reference_value = reference.get(key)
+            if candidate_value is None or reference_value is None:
+                continue
+            limit = _metric_regression_limit(float(reference_value))
+            if limit is not None and float(candidate_value) > limit:
+                failures.append(f"{key}_regressed_vs_{reference_name}")
+    return failures
+
+
+def _crypto_select_champion(candidates: list[dict[str, Any]]) -> str:
+    eligible = [
+        candidate
+        for candidate in candidates
+        if candidate.get("status") == "available"
+        and isinstance(candidate.get("metrics"), dict)
+        and (candidate.get("metrics") or {}).get("brier") is not None
+    ]
+    if not eligible:
+        return "sklearn_logistic"
+    eligible.sort(key=lambda item: (float((item.get("metrics") or {})["brier"]), str(item.get("name"))))
+    return str(eligible[0]["name"])
+
+
+def _crypto_ensemble_weights_from_metrics(candidates: list[dict[str, Any]]) -> dict[str, float]:
+    eligible = [
+        candidate
+        for candidate in candidates
+        if candidate.get("name") not in {"market_mid_baseline", "calibrated_weighted_ensemble"}
+        and candidate.get("status") == "available"
+        and isinstance(candidate.get("metrics"), dict)
+        and (candidate.get("metrics") or {}).get("brier") is not None
+    ]
+    if len(eligible) < 2:
+        return {}
+    best_brier = min(float((candidate.get("metrics") or {})["brier"]) for candidate in eligible)
+    selected = [
+        candidate
+        for candidate in eligible
+        if float((candidate.get("metrics") or {})["brier"]) <= best_brier * 1.05 + 1e-12
+    ]
+    if len(selected) < 2:
+        return {}
+    inverse = {
+        str(candidate["name"]): 1.0 / max(1e-9, float((candidate.get("metrics") or {})["brier"]))
+        for candidate in selected
+    }
+    total = sum(inverse.values())
+    return {name: round(weight / total, 6) for name, weight in sorted(inverse.items())}
+
+
+def _crypto_predict_ensemble_from_models(
+    row: dict[str, Any],
+    models: dict[str, dict[str, Any]],
+    weights: dict[str, float],
+) -> Decimal:
+    total_weight = sum(weight for name, weight in weights.items() if name in models)
+    if total_weight <= 0:
+        return _clamp_price(_decimal(row.get("mid_yes_dollars")))
+    probability = Decimal("0")
+    for name, weight in weights.items():
+        if name not in models:
+            continue
+        probability += _predict_crypto_probability(row, models[name]) * Decimal(str(weight / total_weight))
+    return _clamp_price(probability)
+
+
+def _crypto_in_sample_candidate_report(
+    rows: list[dict[str, Any]],
+    candidate_status: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    market_metrics: dict[str, Any] | None = None
+    logistic_metrics: dict[str, Any] | None = None
+    for name in ("market_mid_baseline", "sklearn_logistic", "xgboost_classifier", "lightgbm_classifier"):
+        status = candidate_status.get(name) or {"name": name, "status": "unavailable", "reason": "not_registered"}
+        if status.get("status") == "available" and status.get("model") is not None:
+            metrics = _probability_metrics_decimal(_crypto_predictions_for_model(rows, status["model"]))
+            if name == "market_mid_baseline":
+                market_metrics = metrics
+            if name == "sklearn_logistic":
+                logistic_metrics = metrics
+            entries.append(
+                _crypto_candidate_metric_entry(
+                    name=name,
+                    status="available",
+                    metrics=metrics,
+                    dependency_version=status.get("dependency_version"),
+                )
+            )
+        else:
+            entries.append(
+                _crypto_candidate_metric_entry(
+                    name=name,
+                    status="unavailable",
+                    reason=status.get("reason"),
+                    dependency_version=status.get("dependency_version"),
+                )
+            )
+    guarded_entries = _crypto_apply_candidate_guardrails(entries, market_metrics=market_metrics, logistic_metrics=logistic_metrics)
+    model_map = {
+        name: status["model"]
+        for name, status in candidate_status.items()
+        if status.get("status") == "available" and status.get("model") is not None
+    }
+    guarded_entries, ensemble_weights = _crypto_add_ensemble_candidate(rows, guarded_entries, model_map)
+    champion = _crypto_select_champion(guarded_entries)
+    return {
+        "schema_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
+        "status": "ok",
+        "selection_scope": "in_sample_training_fallback",
+        "primary_metric": "brier",
+        "guardrails": {
+            "log_loss_ece_max_regression_pct": CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE,
+            "references": ["market_mid_baseline", "sklearn_logistic"],
+        },
+        "fold_count": 0,
+        "candidates": sorted(guarded_entries, key=_crypto_candidate_sort_key),
+        "champion_name": champion,
+        "champion_validation_metrics": _metrics_for_candidate(guarded_entries, champion),
+        "ensemble_weights": ensemble_weights,
+        "dependency_versions": _crypto_dependency_versions(),
+    }
+
+
+def _crypto_model_candidate_report(
+    rows: list[dict[str, Any]],
+    *,
+    settings: Settings | None,
+    full_candidate_status: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    min_train_rows = max(2, min(settings.crypto_min_training_samples, 20)) if settings is not None else max(2, min(len(rows) // 2, 20))
+    folds = _crypto_walk_forward_folds(rows, min_train_rows=min_train_rows)
+    if not folds:
+        report = _crypto_in_sample_candidate_report(rows, full_candidate_status or _fit_crypto_model_candidates(rows))
+        report["status"] = "insufficient_walk_forward_data"
+        report["reason"] = "need_settled_point_in_time_crypto_rows_across_market_days"
+        return report
+
+    predictions_by_candidate: dict[str, list[tuple[Decimal, int]]] = defaultdict(list)
+    unavailable_reasons: dict[str, str] = {}
+    dependency_versions: dict[str, str | None] = {}
+    fold_summaries: list[dict[str, Any]] = []
+    for fold in folds:
+        train_rows = fold["train_rows"]
+        test_rows = fold["test_rows"]
+        schema = _crypto_feature_schema(train_rows)
+        defaults = _crypto_feature_defaults(train_rows)
+        fallback = _fit_crypto_heuristic_calibration(train_rows)
+        candidate_status = _fit_crypto_model_candidates(train_rows, schema=schema, defaults=defaults, fallback=fallback)
+        available_models = {
+            name: status["model"]
+            for name, status in candidate_status.items()
+            if status.get("status") == "available" and status.get("model") is not None
+        }
+        train_report = _crypto_in_sample_candidate_report(train_rows, candidate_status)
+        weights = dict(train_report.get("ensemble_weights") or {})
+        if len(weights) >= 2:
+            for row in test_rows:
+                predictions_by_candidate["calibrated_weighted_ensemble"].append(
+                    (_crypto_predict_ensemble_from_models(row, available_models, weights), int(row["label_yes"]))
+                )
+        else:
+            unavailable_reasons.setdefault("calibrated_weighted_ensemble", "need_at_least_two_guardrail_clean_members")
+        for name in ("market_mid_baseline", "sklearn_logistic", "xgboost_classifier", "lightgbm_classifier"):
+            status = candidate_status.get(name) or {"status": "unavailable", "reason": "not_registered"}
+            dependency_versions[name] = status.get("dependency_version")
+            if status.get("status") != "available" or status.get("model") is None:
+                unavailable_reasons.setdefault(name, str(status.get("reason") or "unavailable"))
+                continue
+            for row in test_rows:
+                predictions_by_candidate[name].append((_predict_crypto_probability(row, status["model"]), int(row["label_yes"])))
+        fold_summaries.append(
+            {
+                "fold_id": fold["fold_id"],
+                "train_rows": len(train_rows),
+                "test_rows": len(test_rows),
+                "train_cutoff_market_day": fold["train_cutoff_market_day"],
+                "ensemble_weights": weights,
+                "available_candidates": sorted(available_models),
+            }
+        )
+
+    market_metrics = _probability_metrics_decimal(predictions_by_candidate.get("market_mid_baseline", []))
+    logistic_metrics = _probability_metrics_decimal(predictions_by_candidate.get("sklearn_logistic", []))
+    entries: list[dict[str, Any]] = []
+    for name in ("market_mid_baseline", "sklearn_logistic", "xgboost_classifier", "lightgbm_classifier", "calibrated_weighted_ensemble"):
+        predictions = predictions_by_candidate.get(name, [])
+        if predictions:
+            entries.append(
+                _crypto_candidate_metric_entry(
+                    name=name,
+                    status="available",
+                    metrics=_probability_metrics_decimal(predictions),
+                    reason=None,
+                    dependency_version=dependency_versions.get(name),
+                    fold_count=len(folds),
+                )
+            )
+        else:
+            entries.append(
+                _crypto_candidate_metric_entry(
+                    name=name,
+                    status="unavailable",
+                    metrics=None,
+                    reason=unavailable_reasons.get(name) or "no_walk_forward_predictions",
+                    dependency_version=dependency_versions.get(name),
+                    fold_count=len(folds),
+                )
+            )
+    entries = _crypto_apply_candidate_guardrails(entries, market_metrics=market_metrics, logistic_metrics=logistic_metrics)
+    ensemble_entry = next((entry for entry in entries if entry["name"] == "calibrated_weighted_ensemble"), None)
+    champion = _crypto_select_champion(entries)
+    return {
+        "schema_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
+        "status": "ok",
+        "selection_scope": "walk_forward_time_ordered",
+        "primary_metric": "brier",
+        "guardrails": {
+            "log_loss_ece_max_regression_pct": CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE,
+            "references": ["market_mid_baseline", "sklearn_logistic"],
+        },
+        "fold_count": len(folds),
+        "folds": fold_summaries,
+        "candidates": sorted(entries, key=_crypto_candidate_sort_key),
+        "champion_name": champion,
+        "champion_validation_metrics": _metrics_for_candidate(entries, champion),
+        "ensemble_weights": _crypto_ensemble_weights_from_metrics(entries) if ensemble_entry and ensemble_entry.get("status") == "available" else {},
+        "dependency_versions": _crypto_dependency_versions(),
+    }
+
+
+def _crypto_add_ensemble_candidate(
+    rows: list[dict[str, Any]],
+    entries: list[dict[str, Any]],
+    model_map: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    weights = _crypto_ensemble_weights_from_metrics(entries)
+    if len(weights) < 2:
+        entries.append(
+            _crypto_candidate_metric_entry(
+                name="calibrated_weighted_ensemble",
+                status="unavailable",
+                reason="need_at_least_two_guardrail_clean_members",
+            )
+        )
+        return entries, {}
+    predictions = [(_crypto_predict_ensemble_from_models(row, model_map, weights), int(row["label_yes"])) for row in rows]
+    ensemble_metrics = _probability_metrics_decimal(predictions)
+    market_metrics = _metrics_for_candidate(entries, "market_mid_baseline")
+    logistic_metrics = _metrics_for_candidate(entries, "sklearn_logistic")
+    failures = _crypto_candidate_guardrail_failures(
+        ensemble_metrics,
+        market_mid_metrics=market_metrics,
+        logistic_metrics=logistic_metrics,
+        candidate_name="calibrated_weighted_ensemble",
+    )
+    entries.append(
+        _crypto_candidate_metric_entry(
+            name="calibrated_weighted_ensemble",
+            status="guardrail_failed" if failures else "available",
+            metrics=ensemble_metrics,
+            reason=",".join(failures) if failures else None,
+        )
+    )
+    return entries, weights
+
+
+def _crypto_apply_candidate_guardrails(
+    entries: list[dict[str, Any]],
+    *,
+    market_metrics: dict[str, Any] | None,
+    logistic_metrics: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    guarded: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.get("status") != "available" or not isinstance(entry.get("metrics"), dict):
+            guarded.append(entry)
+            continue
+        failures = _crypto_candidate_guardrail_failures(
+            entry["metrics"],
+            market_mid_metrics=market_metrics,
+            logistic_metrics=logistic_metrics,
+            candidate_name=str(entry["name"]),
+        )
+        if failures:
+            guarded.append({**entry, "status": "guardrail_failed", "reason": ",".join(failures)})
+        else:
+            guarded.append(entry)
+    return guarded
+
+
+def _crypto_candidate_sort_key(entry: dict[str, Any]) -> tuple[int, float, str]:
+    metrics = entry.get("metrics") if isinstance(entry.get("metrics"), dict) else {}
+    brier = metrics.get("brier") if isinstance(metrics, dict) else None
+    status_rank = 0 if entry.get("status") == "available" else 1
+    return (status_rank, float(brier) if brier is not None else 999.0, str(entry.get("name")))
+
+
+def _metrics_for_candidate(entries: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    for entry in entries:
+        if entry.get("name") == name and isinstance(entry.get("metrics"), dict):
+            return entry["metrics"]
+    return None
+
+
+def _crypto_dependency_versions() -> dict[str, str | None]:
+    return {
+        "scikit_learn": _package_version("scikit-learn"),
+        "xgboost": _package_version("xgboost") or _package_version("xgboost-cpu"),
+        "lightgbm": _package_version("lightgbm"),
+    }
 
 
 def _crypto_model_metrics(
@@ -3332,7 +4124,7 @@ def _crypto_model_metrics(
     hard_cap_breaches = sum(1 for item in fillable if _decimal(item["net_pnl"]) < Decimal("-1.0000"))
     baseline_metrics = _probability_metrics_decimal(baseline_predictions)
     calibrated_metrics = _probability_metrics_decimal(calibrated_predictions)
-    return {
+    metrics = {
         "sample_count": len(rows),
         "resolved_sample_count": len(rows),
         "prediction_eligible_count": sum(1 for row in rows if row.get("prediction_eligible", True)),
@@ -3355,6 +4147,20 @@ def _crypto_model_metrics(
         "fee_model_version": current_fee_model_version(),
         "metrics_scope": "in_sample",
     }
+    candidate_report = model.get("candidate_report") if isinstance(model, dict) else None
+    if isinstance(candidate_report, dict):
+        champion_metrics = candidate_report.get("champion_validation_metrics") or {}
+        metrics.update(
+            {
+                "champion_model": candidate_report.get("champion_name") or model.get("model_type"),
+                "validation_brier": champion_metrics.get("brier"),
+                "validation_log_loss": champion_metrics.get("log_loss"),
+                "validation_ece": champion_metrics.get("ece"),
+                "validation_fold_count": candidate_report.get("fold_count"),
+                "validation_scope": candidate_report.get("selection_scope"),
+            }
+        )
+    return metrics
 
 
 def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Settings) -> dict[str, Any]:
@@ -3388,8 +4194,8 @@ def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Setti
     calibrated_predictions: list[tuple[Decimal, int]] = []
     fold_summaries: list[dict[str, Any]] = []
     for fold in folds:
-        model = _fit_crypto_calibration(fold["train_rows"])
-        heuristic_model = model.get("fallback_model") if model.get("model_type") == "sklearn_logistic" else _fit_crypto_heuristic_calibration(fold["train_rows"])
+        model = _fit_crypto_calibration(fold["train_rows"], settings=settings, include_candidate_report=False)
+        heuristic_model = model.get("fallback_model") if isinstance(model.get("fallback_model"), dict) else _fit_crypto_heuristic_calibration(fold["train_rows"])
         eligible_buckets = _eligible_crypto_buckets(fold["train_rows"], settings=settings)
         fold_baseline: list[dict[str, Any]] = []
         fold_heuristic: list[dict[str, Any]] = []
@@ -3457,7 +4263,7 @@ def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Setti
         "baseline_policy": baseline_policy,
         "candidate_policies": [heuristic_policy, calibrated_policy, selection_policy, live_review_policy, exploratory_policy],
         "bucket_matrix": _crypto_bucket_matrix(calibrated_trades, settings=settings),
-        "candidate_quality": _crypto_candidate_quality_report(rows, _fit_crypto_calibration(rows), settings=settings),
+        "candidate_quality": _crypto_candidate_quality_report(rows, _fit_crypto_calibration(rows, settings=settings), settings=settings),
         "metrics": {
             "sample_count": len(rows),
             "resolved_sample_count": len(rows),
