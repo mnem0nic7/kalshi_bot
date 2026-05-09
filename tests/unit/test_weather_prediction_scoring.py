@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -150,6 +150,120 @@ def test_active_residual_model_adjusts_forecast() -> None:
     assert signal.residual_adjustment_f == pytest.approx(2.0)
     assert signal.forecast_high_f == pytest.approx(82.0)
     assert signal.prediction_provenance["residual_model"]["status"] == "applied"
+
+
+def test_intraday_model_lowers_late_day_yes_fair_when_high_so_far_lags() -> None:
+    artifact = {
+        "active": True,
+        "model_type": "weather_intraday_logistic_v1",
+        "version": "test",
+        "created_at": datetime.now(UTC).isoformat(),
+        "feature_names": ["forecast_delta_f", "observed_high_delta_f", "after_peak_hours"],
+        "feature_means": {"forecast_delta_f": 0.0, "observed_high_delta_f": 0.0, "after_peak_hours": 0.0},
+        "feature_scales": {"forecast_delta_f": 1.0, "observed_high_delta_f": 1.0, "after_peak_hours": 1.0},
+        "coefficients": [0.25, 0.9, -0.2],
+        "intercept": 0.0,
+    }
+
+    signal = score_weather_market(
+        _mapping(threshold=90),
+        _forecast(high_f=92),
+        _observation(temp_c=28.9),
+        forecast_grid_payload={},
+        intraday_model=artifact,
+        intraday_model_enabled=True,
+        observed_high_so_far_f=84.0,
+    )
+
+    intraday = signal.prediction_provenance["intraday_model"]
+    assert intraday["status"] == "used"
+    assert Decimal(intraday["intraday_fair_yes"]) < Decimal(intraday["baseline_fair_yes"])
+    assert signal.fair_yes_dollars < Decimal("0.5000")
+
+
+def test_intraday_model_handles_below_threshold_operator_direction() -> None:
+    artifact = {
+        "active": True,
+        "model_type": "weather_intraday_logistic_v1",
+        "version": "test",
+        "created_at": datetime.now(UTC).isoformat(),
+        "feature_names": ["forecast_delta_f"],
+        "feature_means": {"forecast_delta_f": 0.0},
+        "feature_scales": {"forecast_delta_f": 1.0},
+        "coefficients": [1.0],
+        "intercept": 0.0,
+    }
+
+    signal = score_weather_market(
+        _mapping(threshold=76).model_copy(update={"operator": "<"}),
+        _forecast(high_f=82),
+        _observation(temp_c=22.0),
+        forecast_grid_payload={},
+        intraday_model=artifact,
+        intraday_model_enabled=True,
+        observed_high_so_far_f=72.0,
+    )
+
+    assert signal.prediction_provenance["intraday_model"]["status"] == "used"
+    assert signal.fair_yes_dollars < Decimal("0.1000")
+
+
+def test_stale_intraday_model_falls_back_to_baseline() -> None:
+    artifact = {
+        "active": True,
+        "model_type": "weather_intraday_logistic_v1",
+        "version": "test",
+        "created_at": (datetime.now(UTC) - timedelta(days=30)).isoformat(),
+        "feature_names": ["forecast_delta_f"],
+        "feature_means": {"forecast_delta_f": 0.0},
+        "feature_scales": {"forecast_delta_f": 1.0},
+        "coefficients": [-10.0],
+        "intercept": 0.0,
+    }
+
+    signal = score_weather_market(
+        _mapping(threshold=80),
+        _forecast(high_f=86),
+        _observation(),
+        forecast_grid_payload={},
+        intraday_model=artifact,
+        intraday_model_enabled=True,
+        intraday_model_max_age_hours=1,
+    )
+
+    intraday = signal.prediction_provenance["intraday_model"]
+    assert intraday["status"] == "fallback"
+    assert intraday["fallback_reason"] == "stale_artifact"
+    assert signal.fair_yes_dollars == Decimal(intraday["baseline_fair_yes"])
+
+
+def test_intraday_series_fallback_uses_baseline_for_regressed_series() -> None:
+    artifact = {
+        "active": True,
+        "model_type": "weather_intraday_logistic_v1",
+        "version": "test",
+        "created_at": datetime.now(UTC).isoformat(),
+        "series_fallbacks": ["KXHIGHNY"],
+        "feature_names": ["forecast_delta_f"],
+        "feature_means": {"forecast_delta_f": 0.0},
+        "feature_scales": {"forecast_delta_f": 1.0},
+        "coefficients": [-10.0],
+        "intercept": 0.0,
+    }
+
+    signal = score_weather_market(
+        _mapping(threshold=80),
+        _forecast(high_f=86),
+        _observation(),
+        forecast_grid_payload={},
+        intraday_model=artifact,
+        intraday_model_enabled=True,
+    )
+
+    intraday = signal.prediction_provenance["intraday_model"]
+    assert intraday["status"] == "fallback"
+    assert intraday["fallback_reason"] == "series_regression_fallback"
+    assert signal.fair_yes_dollars == Decimal(intraday["baseline_fair_yes"])
 
 
 def test_signal_engine_carries_prediction_provenance() -> None:

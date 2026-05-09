@@ -525,6 +525,28 @@ def _weather_decision_sentence(numeric_facts: dict[str, Any]) -> str | None:
     return None
 
 
+def _intraday_model_sentence(payload: dict[str, Any], numeric_facts: dict[str, Any]) -> str | None:
+    provenance = payload.get("prediction_provenance") if isinstance(payload, dict) else None
+    intraday = provenance.get("intraday_model") if isinstance(provenance, dict) else None
+    if not isinstance(intraday, dict):
+        return None
+    if intraday.get("status") == "used":
+        baseline = _compact_price(intraday.get("baseline_fair_yes"))
+        intraday_fair = _compact_price(intraday.get("intraday_fair_yes"))
+        threshold = _compact_fahrenheit(numeric_facts.get("threshold_f"))
+        observed_high = _compact_fahrenheit(numeric_facts.get("observed_high_so_far_f"))
+        if baseline and intraday_fair:
+            context = ""
+            if observed_high and threshold:
+                context = f" with high so far at {observed_high} against {threshold}"
+            return f"The intraday model adjusted fair YES from {baseline} to {intraday_fair}{context}."
+        return "The intraday model supplied the fair value for this room."
+    if intraday.get("status") == "fallback":
+        reason = _clean_reason_label(intraday.get("fallback_reason"))
+        return f"Intraday model was unavailable ({reason.lower()}), so baseline fair value was used."
+    return None
+
+
 def _minimum_forecast_separation_from_eligibility(eligibility: dict[str, Any]) -> str | None:
     for reason in eligibility.get("reasons") or []:
         text = str(reason)
@@ -621,7 +643,14 @@ def _room_decision_description(
     selected_side: str | None,
     risk_reasons: list[str],
 ) -> str:
-    sentences = [item for item in [_weather_decision_sentence(numeric_facts)] if item]
+    sentences = [
+        item
+        for item in [
+            _weather_decision_sentence(numeric_facts),
+            _intraday_model_sentence(payload, numeric_facts),
+        ]
+        if item
+    ]
     selected_sentence = _selected_trade_sentence(selected_side, trace)
     empirical_sentence = _empirical_gate_sentence(payload, trace, eligibility)
     if status in {"filled", "ordered"}:

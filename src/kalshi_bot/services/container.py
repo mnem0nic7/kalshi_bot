@@ -191,6 +191,8 @@ class AppContainer:
             )
             residual_model = await weather_prediction_service.load_active_residual_model()
             signal_engine.set_residual_model_artifact(residual_model)
+            intraday_model = await weather_prediction_service.load_active_intraday_model()
+            signal_engine.set_intraday_model_artifact(intraday_model)
         except Exception as exc:
             logger.warning("Weather prediction artifacts unavailable at startup: %s", exc)
         signal_calibration_service = SignalCalibrationService(session_factory)

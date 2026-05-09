@@ -8,6 +8,8 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import numpy as np
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sqlalchemy import bindparam, select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -19,6 +21,15 @@ from kalshi_bot.weather.scoring import (
     extract_forecast_high_f,
     extract_gridpoint_max_temp_f,
     gaussian_probability,
+)
+from kalshi_bot.weather.intraday import (
+    IntradayFeatureInput,
+    NUMERIC_INTRADAY_FEATURES,
+    intraday_artifact_fallback_reason,
+    intraday_feature_values,
+    normalize_weather_operator,
+    oriented_weather_delta,
+    threshold_bucket,
 )
 from kalshi_bot.weather.sigma_calibration import season_for_month
 from kalshi_bot.weather.sigma_calibration import (
@@ -41,6 +52,7 @@ PREFERRED_WEATHER_SOURCE_KINDS = (
 )
 
 RESIDUAL_CHECKPOINT_PREFIX = "weather_residual_model"
+INTRADAY_CHECKPOINT_PREFIX = "weather_intraday_model"
 
 
 @dataclass(slots=True)
@@ -59,6 +71,27 @@ class PredictionRow:
     @property
     def residual_f(self) -> float:
         return self.actual_high_f - self.forecast_high_f
+
+
+@dataclass(slots=True)
+class IntradayTrainingRow:
+    market_ticker: str
+    series_ticker: str
+    station_id: str
+    local_market_day: str
+    asof_ts: datetime
+    settlement_ts: datetime | None
+    forecast_updated_ts: datetime | None
+    source_kind: str
+    threshold_f: float
+    operator: str
+    outcome_yes: int
+    forecast_high_f: float
+    current_temp_f: float | None
+    observed_high_so_far_f: float | None
+    source_disagreement_f: float | None
+    timezone_name: str | None
+    payload: dict[str, Any]
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -139,6 +172,84 @@ def _weather_features(row: PredictionRow) -> dict[str, float]:
     }
 
 
+def _source_disagreement_from_payload(payload: dict[str, Any], local_market_day: str) -> float:
+    try:
+        target_date = date.fromisoformat(local_market_day)
+    except ValueError:
+        target_date = None
+    forecast_payload = payload.get("forecast") or {}
+    grid_payload = payload.get("forecast_grid") or {}
+    grid_high = extract_gridpoint_max_temp_f(grid_payload, target_date=target_date) if grid_payload else None
+    daily_high = extract_forecast_high_f(forecast_payload, target_date=target_date) if forecast_payload else None
+    source_values = [value for value in (grid_high, daily_high) if value is not None]
+    return float(max(source_values) - min(source_values)) if len(source_values) > 1 else 0.0
+
+
+def _timezone_from_payload(payload: dict[str, Any]) -> str | None:
+    mapping = payload.get("mapping") if isinstance(payload.get("mapping"), dict) else {}
+    value = mapping.get("timezone_name")
+    return str(value) if value else None
+
+
+def _intraday_feature_input(row: IntradayTrainingRow) -> IntradayFeatureInput:
+    return IntradayFeatureInput(
+        market_ticker=row.market_ticker,
+        series_ticker=row.series_ticker,
+        station_id=row.station_id,
+        timezone_name=row.timezone_name,
+        local_market_day=row.local_market_day,
+        threshold_f=row.threshold_f,
+        operator=row.operator,
+        asof_ts=row.asof_ts,
+        forecast_updated_ts=row.forecast_updated_ts,
+        settlement_ts=row.settlement_ts,
+        forecast_high_f=row.forecast_high_f,
+        current_temp_f=row.current_temp_f,
+        observed_high_so_far_f=row.observed_high_so_far_f,
+        source_disagreement_f=row.source_disagreement_f,
+    )
+
+
+def _baseline_probability_for_intraday_row(row: IntradayTrainingRow) -> float:
+    delta = oriented_weather_delta(row.forecast_high_f, row.threshold_f, row.operator)
+    return gaussian_probability(delta, sigma_f=3.5)
+
+
+def _brier_score(probabilities: list[float], outcomes: list[int]) -> float | None:
+    if not probabilities:
+        return None
+    arr = np.asarray(probabilities, dtype=float)
+    y = np.asarray(outcomes, dtype=float)
+    return float(np.mean((arr - y) ** 2))
+
+
+def _calibration_buckets(probabilities: list[float], outcomes: list[int]) -> list[dict[str, Any]]:
+    buckets: list[dict[str, Any]] = []
+    for index in range(5):
+        lo = index / 5
+        hi = (index + 1) / 5
+        selected = [
+            (probability, outcome)
+            for probability, outcome in zip(probabilities, outcomes, strict=True)
+            if lo <= probability < hi or (index == 4 and probability == 1.0)
+        ]
+        if not selected:
+            buckets.append({"bucket": f"{lo:.1f}-{hi:.1f}", "count": 0})
+            continue
+        avg_probability = float(np.mean([item[0] for item in selected]))
+        observed_rate = float(np.mean([item[1] for item in selected]))
+        buckets.append(
+            {
+                "bucket": f"{lo:.1f}-{hi:.1f}",
+                "count": len(selected),
+                "avg_probability": avg_probability,
+                "observed_rate": observed_rate,
+                "abs_error": abs(avg_probability - observed_rate),
+            }
+        )
+    return buckets
+
+
 class WeatherPredictionService:
     def __init__(self, settings: Settings, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self.settings = settings
@@ -147,6 +258,10 @@ class WeatherPredictionService:
     @staticmethod
     def residual_checkpoint_name(kalshi_env: str) -> str:
         return f"{RESIDUAL_CHECKPOINT_PREFIX}:{kalshi_env}:active"
+
+    @staticmethod
+    def intraday_checkpoint_name(kalshi_env: str) -> str:
+        return f"{INTRADAY_CHECKPOINT_PREFIX}:{kalshi_env}:active"
 
     async def load_active_residual_model(self, *, kalshi_env: str | None = None) -> dict[str, Any] | None:
         env = kalshi_env or self.settings.kalshi_env
@@ -164,14 +279,40 @@ class WeatherPredictionService:
                 return None
             return payload
 
+    async def load_active_intraday_model(self, *, kalshi_env: str | None = None) -> dict[str, Any] | None:
+        env = kalshi_env or self.settings.kalshi_env
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=env)
+            checkpoint = await repo.get_checkpoint(self.intraday_checkpoint_name(env))
+            if checkpoint is None:
+                return None
+            payload = dict(checkpoint.payload or {})
+            reason = intraday_artifact_fallback_reason(
+                payload,
+                max_age_hours=self.settings.weather_intraday_model_max_age_hours,
+            )
+            return None if reason is not None else payload
+
     async def status(self, *, kalshi_env: str | None = None) -> dict[str, Any]:
         env = kalshi_env or self.settings.kalshi_env
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=env)
-            checkpoint = await repo.get_checkpoint(self.residual_checkpoint_name(env))
+            residual_checkpoint = await repo.get_checkpoint(self.residual_checkpoint_name(env))
+            intraday_checkpoint = await repo.get_checkpoint(self.intraday_checkpoint_name(env))
+            intraday_payload = dict(intraday_checkpoint.payload or {}) if intraday_checkpoint is not None else None
             return {
                 "kalshi_env": env,
-                "residual_model": dict(checkpoint.payload or {}) if checkpoint is not None else None,
+                "residual_model": dict(residual_checkpoint.payload or {}) if residual_checkpoint is not None else None,
+                "intraday_model": intraday_payload,
+                "intraday_model_usable": (
+                    intraday_artifact_fallback_reason(
+                        intraday_payload,
+                        max_age_hours=self.settings.weather_intraday_model_max_age_hours,
+                    )
+                    is None
+                    if intraday_payload is not None
+                    else False
+                ),
             }
 
     async def evaluate(self, *, series: list[str] | None = None) -> dict[str, Any]:
@@ -217,6 +358,270 @@ class WeatherPredictionService:
                 },
             )
         return result
+
+    async def evaluate_intraday_model(self, *, series: list[str] | None = None) -> dict[str, Any]:
+        return await self.train_intraday_model(kalshi_env=self.settings.kalshi_env, dry_run=True, series=series)
+
+    async def train_intraday_model(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        dry_run: bool = False,
+        series: list[str] | None = None,
+    ) -> dict[str, Any]:
+        env = kalshi_env or self.settings.kalshi_env
+        rows = await self._load_intraday_rows(series=series)
+        version = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        artifact = self._fit_intraday_artifact(rows, version=version)
+        artifact["kalshi_env"] = env
+        artifact["dry_run"] = dry_run
+        if artifact.get("active") and not dry_run:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=env)
+                await repo.set_checkpoint(self.intraday_checkpoint_name(env), artifact.get("version"), artifact)
+                await session.commit()
+        return artifact
+
+    def _fit_intraday_artifact(self, rows: list[IntradayTrainingRow], *, version: str) -> dict[str, Any]:
+        created_at = datetime.now(UTC).isoformat()
+        row_count = len(rows)
+        unique_markets = len({row.market_ticker for row in rows})
+        unique_series_days = len({(row.series_ticker, row.local_market_day) for row in rows})
+        base_artifact: dict[str, Any] = {
+            "active": False,
+            "model_type": "weather_intraday_logistic_v1",
+            "version": version,
+            "created_at": created_at,
+            "row_count": row_count,
+            "unique_market_count": unique_markets,
+            "unique_series_day_count": unique_series_days,
+            "feature_names": [],
+            "feature_means": {},
+            "feature_scales": {},
+            "coefficients": [],
+            "intercept": 0.0,
+            "metrics": {},
+            "gates": {},
+        }
+        days = sorted({row.local_market_day for row in rows})
+        if row_count < self.settings.weather_intraday_min_train_rows or len(days) < 5:
+            return {
+                **base_artifact,
+                "reason": "insufficient_rows",
+                "gates": {
+                    "min_train_rows": self.settings.weather_intraday_min_train_rows,
+                    "observed_rows": row_count,
+                    "observed_days": len(days),
+                },
+            }
+        holdout_start = days[max(1, int(len(days) * 0.8))]
+        train_rows = [row for row in rows if row.local_market_day < holdout_start]
+        holdout_rows = [row for row in rows if row.local_market_day >= holdout_start]
+        if len(holdout_rows) < self.settings.weather_intraday_min_holdout_rows:
+            return {
+                **base_artifact,
+                "reason": "insufficient_holdout_rows",
+                "gates": {
+                    "min_holdout_rows": self.settings.weather_intraday_min_holdout_rows,
+                    "observed_holdout_rows": len(holdout_rows),
+                    "holdout_start": holdout_start,
+                },
+            }
+        train_days = sorted({row.local_market_day for row in train_rows})
+        calibration_start = train_days[max(1, int(len(train_days) * 0.8))] if len(train_days) >= 5 else holdout_start
+        fit_rows = [row for row in train_rows if row.local_market_day < calibration_start]
+        calibration_rows = [row for row in train_rows if row.local_market_day >= calibration_start]
+        if len(fit_rows) < self.settings.weather_intraday_min_holdout_rows or len(set(row.outcome_yes for row in fit_rows)) < 2:
+            fit_rows = train_rows
+            calibration_rows = train_rows
+
+        y_train = np.asarray([row.outcome_yes for row in fit_rows], dtype=int)
+        if len(set(y_train.tolist())) < 2:
+            return {**base_artifact, "reason": "single_class_train_rows"}
+
+        feature_names = self._intraday_feature_names(rows)
+        x_train = self._intraday_matrix(fit_rows, feature_names)
+        x_calibration = self._intraday_matrix(calibration_rows, feature_names)
+        x_holdout = self._intraday_matrix(holdout_rows, feature_names)
+        means = np.mean(x_train, axis=0)
+        scales = np.std(x_train, axis=0)
+        scales = np.where(scales == 0.0, 1.0, scales)
+        x_train_scaled = (x_train - means) / scales
+        x_calibration_scaled = (x_calibration - means) / scales if len(calibration_rows) else x_train_scaled
+        x_holdout_scaled = (x_holdout - means) / scales
+
+        model = LogisticRegression(max_iter=500, solver="lbfgs")
+        model.fit(x_train_scaled, y_train)
+        raw_calibration_probabilities = [float(value) for value in model.predict_proba(x_calibration_scaled)[:, 1]]
+        calibration_outcomes = [row.outcome_yes for row in calibration_rows] or [row.outcome_yes for row in fit_rows]
+        calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        calibrator.fit(raw_calibration_probabilities, calibration_outcomes)
+        calibration_artifact = {
+            "method": "isotonic",
+            "x_thresholds": [float(value) for value in calibrator.X_thresholds_],
+            "y_thresholds": [float(value) for value in calibrator.y_thresholds_],
+            "row_count": len(calibration_outcomes),
+        }
+        raw_holdout_probabilities = [float(value) for value in model.predict_proba(x_holdout_scaled)[:, 1]]
+        model_probabilities = [float(value) for value in calibrator.transform(raw_holdout_probabilities)]
+        baseline_probabilities = [_baseline_probability_for_intraday_row(row) for row in holdout_rows]
+        outcomes = [row.outcome_yes for row in holdout_rows]
+        initial_series_regressions = self._intraday_series_regressions(
+            holdout_rows,
+            model_probabilities,
+            baseline_probabilities,
+        )
+        series_fallbacks = sorted(
+            {
+                str(row.get("series_ticker"))
+                for row in initial_series_regressions
+                if float(row.get("brier_delta") or 0.0) > self.settings.weather_intraday_max_series_brier_regression
+            }
+        )
+        if series_fallbacks:
+            fallback_set = set(series_fallbacks)
+            model_probabilities = [
+                baseline_probability if row.series_ticker in fallback_set else model_probability
+                for row, model_probability, baseline_probability in zip(
+                    holdout_rows,
+                    model_probabilities,
+                    baseline_probabilities,
+                    strict=True,
+                )
+            ]
+        model_brier = _brier_score(model_probabilities, outcomes)
+        baseline_brier = _brier_score(baseline_probabilities, outcomes)
+        improvement_pct = (
+            (baseline_brier - model_brier) / baseline_brier
+            if baseline_brier and model_brier is not None
+            else 0.0
+        )
+        calibration = _calibration_buckets(model_probabilities, outcomes)
+        checked_buckets = [
+            bucket
+            for bucket in calibration
+            if int(bucket.get("count") or 0) >= self.settings.weather_intraday_min_calibration_bucket_rows
+        ]
+        max_bucket_error = max((float(bucket.get("abs_error") or 0.0) for bucket in checked_buckets), default=0.0)
+        series_regressions = self._intraday_series_regressions(
+            holdout_rows,
+            model_probabilities,
+            baseline_probabilities,
+        )
+        severe_series_regressions = [
+            row
+            for row in series_regressions
+            if float(row.get("brier_delta") or 0.0) > self.settings.weather_intraday_max_series_brier_regression
+        ]
+        gates = {
+            "min_train_rows": {
+                "passed": row_count >= self.settings.weather_intraday_min_train_rows,
+                "observed": row_count,
+                "required": self.settings.weather_intraday_min_train_rows,
+            },
+            "min_holdout_rows": {
+                "passed": len(holdout_rows) >= self.settings.weather_intraday_min_holdout_rows,
+                "observed": len(holdout_rows),
+                "required": self.settings.weather_intraday_min_holdout_rows,
+            },
+            "brier_improvement": {
+                "passed": improvement_pct >= self.settings.weather_intraday_min_brier_improvement_pct,
+                "observed": improvement_pct,
+                "required": self.settings.weather_intraday_min_brier_improvement_pct,
+            },
+            "calibration": {
+                "passed": max_bucket_error <= self.settings.weather_intraday_max_calibration_error,
+                "observed_max_bucket_error": max_bucket_error,
+                "required_max_bucket_error": self.settings.weather_intraday_max_calibration_error,
+                "checked_bucket_count": len(checked_buckets),
+            },
+            "series_regression": {
+                "passed": len(severe_series_regressions) == 0,
+                "severe_regression_count": len(severe_series_regressions),
+                "max_allowed_brier_delta": self.settings.weather_intraday_max_series_brier_regression,
+            },
+        }
+        active = all(bool(gate.get("passed")) for gate in gates.values())
+        return {
+            **base_artifact,
+            "active": active,
+            "reason": "gates_passed" if active else "gates_not_passed",
+            "feature_names": feature_names,
+            "feature_means": {name: float(value) for name, value in zip(feature_names, means, strict=True)},
+            "feature_scales": {name: float(value) for name, value in zip(feature_names, scales, strict=True)},
+            "coefficients": [float(value) for value in model.coef_[0]],
+            "intercept": float(model.intercept_[0]),
+            "calibration": calibration_artifact,
+            "series_fallbacks": series_fallbacks,
+            "metrics": {
+                "train_rows": len(train_rows),
+                "fit_rows": len(fit_rows),
+                "calibration_rows": len(calibration_rows),
+                "holdout_rows": len(holdout_rows),
+                "holdout_start": holdout_start,
+                "calibration_start": calibration_start,
+                "baseline_brier": baseline_brier,
+                "model_brier": model_brier,
+                "brier_improvement_pct": improvement_pct,
+                "calibration_buckets": calibration,
+                "initial_series_regressions": initial_series_regressions[:20],
+                "series_regressions": series_regressions[:20],
+            },
+            "gates": gates,
+        }
+
+    def _intraday_feature_names(self, rows: list[IntradayTrainingRow]) -> list[str]:
+        names: set[str] = set(NUMERIC_INTRADAY_FEATURES)
+        for row in rows:
+            names.update(intraday_feature_values(_intraday_feature_input(row)).keys())
+        categorical = sorted(name for name in names if name not in NUMERIC_INTRADAY_FEATURES)
+        return [name for name in NUMERIC_INTRADAY_FEATURES if name in names] + categorical
+
+    def _intraday_matrix(self, rows: list[IntradayTrainingRow], feature_names: list[str]) -> np.ndarray:
+        matrix = np.zeros((len(rows), len(feature_names)), dtype=float)
+        for row_idx, row in enumerate(rows):
+            values = intraday_feature_values(_intraday_feature_input(row))
+            for col_idx, name in enumerate(feature_names):
+                matrix[row_idx, col_idx] = float(values.get(name, 0.0))
+        return matrix
+
+    def _intraday_series_regressions(
+        self,
+        rows: list[IntradayTrainingRow],
+        model_probabilities: list[float],
+        baseline_probabilities: list[float],
+    ) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, list[Any]]] = defaultdict(lambda: {"model": [], "baseline": [], "outcomes": []})
+        for row, model_probability, baseline_probability in zip(
+            rows,
+            model_probabilities,
+            baseline_probabilities,
+            strict=True,
+        ):
+            bucket = grouped[row.series_ticker]
+            bucket["model"].append(model_probability)
+            bucket["baseline"].append(baseline_probability)
+            bucket["outcomes"].append(row.outcome_yes)
+        regressions: list[dict[str, Any]] = []
+        for series_ticker, values in grouped.items():
+            count = len(values["outcomes"])
+            if count < self.settings.weather_intraday_min_series_holdout_rows:
+                continue
+            model_brier = _brier_score(values["model"], values["outcomes"])
+            baseline_brier = _brier_score(values["baseline"], values["outcomes"])
+            if model_brier is None or baseline_brier is None:
+                continue
+            regressions.append(
+                {
+                    "series_ticker": series_ticker,
+                    "count": count,
+                    "baseline_brier": baseline_brier,
+                    "model_brier": model_brier,
+                    "brier_delta": model_brier - baseline_brier,
+                }
+            )
+        regressions.sort(key=lambda row: float(row.get("brier_delta") or 0.0), reverse=True)
+        return regressions
 
     async def refit_sigma(self, *, version: str | None = None, dry_run: bool = False) -> dict[str, Any]:
         rows, _labels = await self._load_rows(series=None)
@@ -583,6 +988,225 @@ class WeatherPredictionService:
                 )
             )
         return rows, labels
+
+    async def _load_intraday_rows(self, *, series: list[str] | None) -> list[IntradayTrainingRow]:
+        async with self.session_factory() as session:
+            if session.get_bind().dialect.name == "postgresql":
+                return await self._load_intraday_rows_postgres(session, series=series)
+
+            label_stmt = select(HistoricalSettlementLabelRecord).where(
+                HistoricalSettlementLabelRecord.crosscheck_high_f.is_not(None),
+                HistoricalSettlementLabelRecord.series_ticker.is_not(None),
+            )
+            if series:
+                label_stmt = label_stmt.where(HistoricalSettlementLabelRecord.series_ticker.in_(series))
+            labels = list((await session.execute(label_stmt)).scalars())
+            weather_stmt = select(HistoricalWeatherSnapshotRecord).where(
+                HistoricalWeatherSnapshotRecord.forecast_high_f.is_not(None),
+                HistoricalWeatherSnapshotRecord.series_ticker.is_not(None),
+                HistoricalWeatherSnapshotRecord.source_kind.in_(PREFERRED_WEATHER_SOURCE_KINDS),
+            )
+            if series:
+                weather_stmt = weather_stmt.where(HistoricalWeatherSnapshotRecord.series_ticker.in_(series))
+            snapshots = list((await session.execute(weather_stmt)).scalars())
+
+        snapshots_by_key: dict[tuple[str, str], list[HistoricalWeatherSnapshotRecord]] = defaultdict(list)
+        for snapshot in snapshots:
+            snapshots_by_key[(str(snapshot.series_ticker), str(snapshot.local_market_day))].append(snapshot)
+        rows: list[IntradayTrainingRow] = []
+        for key, items in snapshots_by_key.items():
+            running_high: float | None = None
+            ranked_by_hour: dict[datetime, tuple[HistoricalWeatherSnapshotRecord, float | None]] = {}
+            for snapshot in sorted(items, key=lambda item: (_as_utc(item.asof_ts) or item.asof_ts, int(item.id or 0))):
+                current = float(snapshot.current_temp_f) if snapshot.current_temp_f is not None else None
+                if current is not None:
+                    running_high = current if running_high is None else max(running_high, current)
+                hour_key = (_as_utc(snapshot.asof_ts) or snapshot.asof_ts).replace(minute=0, second=0, microsecond=0)
+                ranked_by_hour[hour_key] = (snapshot, running_high)
+            labels_for_key = [
+                label
+                for label in labels
+                if (str(label.series_ticker), str(label.local_market_day)) == key
+            ]
+            for label in labels_for_key:
+                rows.extend(
+                    self._intraday_rows_from_label_and_snapshots(
+                        label=label,
+                        snapshots=list(ranked_by_hour.values()),
+                    )
+                )
+        rows.sort(key=lambda row: (row.local_market_day, row.market_ticker, row.asof_ts))
+        return rows
+
+    async def _load_intraday_rows_postgres(
+        self,
+        session: AsyncSession,
+        *,
+        series: list[str] | None,
+    ) -> list[IntradayTrainingRow]:
+        label_filter = "AND series_ticker IN :series" if series else ""
+        ranked_filter = "AND l.series_ticker IN :series" if series else ""
+        source_case = "\n".join(
+            f"                    WHEN '{source}' THEN {index}"
+            for index, source in enumerate(PREFERRED_WEATHER_SOURCE_KINDS)
+        )
+        stmt = text(
+            f"""
+            WITH labels AS (
+                SELECT
+                    market_ticker,
+                    series_ticker,
+                    local_market_day,
+                    settlement_ts,
+                    crosscheck_result,
+                    kalshi_result,
+                    payload
+                FROM historical_settlement_labels
+                WHERE crosscheck_high_f IS NOT NULL
+                  AND series_ticker IS NOT NULL
+                  {label_filter}
+            ),
+            snapshots AS (
+                SELECT
+                    h.*,
+                    max(h.current_temp_f::float) OVER (
+                        PARTITION BY h.station_id, h.local_market_day
+                        ORDER BY h.asof_ts ASC, h.id ASC
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS observed_high_so_far_f
+                FROM historical_weather_snapshots h
+                WHERE h.forecast_high_f IS NOT NULL
+                  AND h.series_ticker IS NOT NULL
+                  AND h.source_kind IN :sources
+            ),
+            ranked AS (
+                SELECT
+                    l.market_ticker,
+                    l.crosscheck_result,
+                    l.kalshi_result,
+                    l.payload AS label_payload,
+                    h.series_ticker,
+                    h.station_id,
+                    h.local_market_day,
+                    h.asof_ts,
+                    l.settlement_ts,
+                    h.forecast_updated_ts,
+                    h.source_kind,
+                    h.forecast_high_f,
+                    h.current_temp_f,
+                    h.observed_high_so_far_f,
+                    h.payload AS weather_payload,
+                    row_number() OVER (
+                        PARTITION BY l.market_ticker, date_trunc('hour', h.asof_ts)
+                        ORDER BY
+                            CASE h.source_kind
+{source_case}
+                                ELSE 999
+                            END ASC,
+                            h.asof_ts DESC,
+                            h.id DESC
+                    ) AS rank
+                FROM labels l
+                JOIN snapshots h
+                  ON l.series_ticker = h.series_ticker
+                 AND l.local_market_day = h.local_market_day
+                WHERE (l.settlement_ts IS NULL OR h.asof_ts <= l.settlement_ts)
+                  {ranked_filter}
+            )
+            SELECT *
+            FROM ranked
+            WHERE rank = 1
+            ORDER BY local_market_day ASC, market_ticker ASC, asof_ts ASC
+            """
+        ).bindparams(bindparam("sources", expanding=True))
+        params: dict[str, Any] = {"sources": list(PREFERRED_WEATHER_SOURCE_KINDS)}
+        if series:
+            stmt = stmt.bindparams(bindparam("series", expanding=True))
+            params["series"] = series
+        result = await session.execute(stmt, params)
+        rows: list[IntradayTrainingRow] = []
+        for mapping in result.mappings():
+            row = self._intraday_row_from_mapping(mapping)
+            if row is not None:
+                rows.append(row)
+        return rows
+
+    def _intraday_row_from_mapping(self, mapping: Any) -> IntradayTrainingRow | None:
+        threshold = _threshold_from_ticker(str(mapping["market_ticker"]))
+        outcome = _result_to_binary(
+            HistoricalSettlementLabelRecord(
+                market_ticker=str(mapping["market_ticker"]),
+                local_market_day=str(mapping["local_market_day"]),
+                source_kind="training_row",
+                crosscheck_result=mapping.get("crosscheck_result"),
+                kalshi_result=mapping.get("kalshi_result"),
+            )
+        )
+        if threshold is None or outcome is None:
+            return None
+        label_payload = dict(mapping.get("label_payload") or {})
+        weather_payload = dict(mapping.get("weather_payload") or {})
+        operator = normalize_weather_operator(None, market_payload=label_payload)
+        return IntradayTrainingRow(
+            market_ticker=str(mapping["market_ticker"]),
+            series_ticker=str(mapping["series_ticker"]),
+            station_id=str(mapping["station_id"]),
+            local_market_day=str(mapping["local_market_day"]),
+            asof_ts=_as_utc(mapping["asof_ts"]) or mapping["asof_ts"],
+            settlement_ts=_as_utc(mapping["settlement_ts"]),
+            forecast_updated_ts=_as_utc(mapping["forecast_updated_ts"]),
+            source_kind=str(mapping["source_kind"]),
+            threshold_f=float(threshold),
+            operator=operator,
+            outcome_yes=int(outcome),
+            forecast_high_f=float(mapping["forecast_high_f"]),
+            current_temp_f=float(mapping["current_temp_f"]) if mapping["current_temp_f"] is not None else None,
+            observed_high_so_far_f=(
+                float(mapping["observed_high_so_far_f"]) if mapping["observed_high_so_far_f"] is not None else None
+            ),
+            source_disagreement_f=_source_disagreement_from_payload(weather_payload, str(mapping["local_market_day"])),
+            timezone_name=_timezone_from_payload(weather_payload),
+            payload=weather_payload,
+        )
+
+    def _intraday_rows_from_label_and_snapshots(
+        self,
+        *,
+        label: HistoricalSettlementLabelRecord,
+        snapshots: list[tuple[HistoricalWeatherSnapshotRecord, float | None]],
+    ) -> list[IntradayTrainingRow]:
+        threshold = _threshold_from_ticker(label.market_ticker)
+        outcome = _result_to_binary(label)
+        if threshold is None or outcome is None:
+            return []
+        operator = normalize_weather_operator(None, market_payload=dict(label.payload or {}))
+        rows: list[IntradayTrainingRow] = []
+        for snapshot, high_so_far in snapshots:
+            if label.settlement_ts is not None and _as_utc(snapshot.asof_ts) and _as_utc(snapshot.asof_ts) > _as_utc(label.settlement_ts):  # type: ignore[operator]
+                continue
+            payload = dict(snapshot.payload or {})
+            rows.append(
+                IntradayTrainingRow(
+                    market_ticker=label.market_ticker,
+                    series_ticker=str(label.series_ticker),
+                    station_id=snapshot.station_id,
+                    local_market_day=label.local_market_day,
+                    asof_ts=_as_utc(snapshot.asof_ts) or snapshot.asof_ts,
+                    settlement_ts=_as_utc(label.settlement_ts),
+                    forecast_updated_ts=_as_utc(snapshot.forecast_updated_ts),
+                    source_kind=snapshot.source_kind,
+                    threshold_f=float(threshold),
+                    operator=operator,
+                    outcome_yes=int(outcome),
+                    forecast_high_f=float(snapshot.forecast_high_f),
+                    current_temp_f=float(snapshot.current_temp_f) if snapshot.current_temp_f is not None else None,
+                    observed_high_so_far_f=high_so_far,
+                    source_disagreement_f=_source_disagreement_from_payload(payload, label.local_market_day),
+                    timezone_name=_timezone_from_payload(payload),
+                    payload=payload,
+                )
+            )
+        return rows
 
     async def _load_rows_postgres(
         self,

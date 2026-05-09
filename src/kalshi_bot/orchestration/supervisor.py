@@ -641,6 +641,13 @@ class WorkflowSupervisor:
                         continue
                     if current_snapshot.source_hash and snapshot.source_hash == current_snapshot.source_hash:
                         continue
+                    if (
+                        snapshot.observation_ts == current_snapshot.observation_ts
+                        and snapshot.forecast_updated_ts == current_snapshot.forecast_updated_ts
+                        and snapshot.forecast_high_f == current_snapshot.forecast_high_f
+                        and snapshot.current_temp_f == current_snapshot.current_temp_f
+                    ):
+                        continue
                     comparison_snapshot = snapshot
                     break
 
@@ -743,6 +750,39 @@ class WorkflowSupervisor:
             "forecast_high_f": str(snapshot.forecast_high_f) if snapshot.forecast_high_f is not None else None,
             "current_temp_f": str(snapshot.current_temp_f) if snapshot.current_temp_f is not None else None,
         }
+
+    async def _observed_high_so_far_for_bundle(
+        self,
+        repo: PlatformRepository,
+        *,
+        mapping: Any,
+        weather_bundle: dict[str, Any],
+    ) -> float | None:
+        archive_meta = weather_bundle_archive_metadata(weather_bundle)
+        if archive_meta is None:
+            return None
+        station_id = archive_meta.get("station_id") or getattr(mapping, "station_id", None)
+        target_local_market_day = _ticker_local_market_day(getattr(mapping, "market_ticker", "") or "")
+        local_market_day = target_local_market_day or archive_meta.get("local_market_day")
+        asof_ts = archive_meta.get("asof_ts")
+        if station_id is None or local_market_day is None or asof_ts is None:
+            return _float_or_none(archive_meta.get("current_temp_f"))
+        current_applies = archive_meta.get("local_market_day") == local_market_day
+        snapshots = await repo.list_historical_weather_snapshots(
+            station_id=str(station_id),
+            local_market_day=str(local_market_day),
+            before_asof=asof_ts,
+            limit=5000,
+        )
+        highs = [
+            value
+            for snapshot in snapshots
+            if (value := _float_or_none(getattr(snapshot, "current_temp_f", None))) is not None
+        ]
+        current = _float_or_none(archive_meta.get("current_temp_f"))
+        if current is not None and current_applies:
+            highs.append(current)
+        return max(highs) if highs else None
 
     async def _recent_duplicate_risk_block_trace_id(
         self,
@@ -1399,6 +1439,14 @@ class WorkflowSupervisor:
                     if mapping is not None and mapping.supports_structured_weather
                     else None
                 )
+                if mapping is not None and mapping.supports_structured_weather and weather_bundle is not None:
+                    observed_high_so_far = await self._observed_high_so_far_for_bundle(
+                        repo,
+                        mapping=mapping,
+                        weather_bundle=weather_bundle,
+                    )
+                    if observed_high_so_far is not None:
+                        weather_bundle = {**weather_bundle, "observed_high_so_far_f": observed_high_so_far}
                 if mapping is not None and mapping.series_ticker:
                     city_assignment = await repo.get_city_strategy_assignment(mapping.series_ticker)
                     if city_assignment is not None:
@@ -1469,11 +1517,24 @@ class WorkflowSupervisor:
                     last_trade_dollars=as_decimal(market["last_price_dollars"]) if market.get("last_price_dollars") is not None else None,
                 )
                 market_snapshot_artifact = None
-                signal = self.research_coordinator.build_signal_from_dossier(
-                    dossier,
-                    market_response,
-                    min_edge_bps=thresholds.risk_min_edge_bps,
-                )
+                if mapping is not None and mapping.supports_structured_weather and weather_bundle is not None:
+                    signal = self.signal_engine.evaluate(
+                        mapping,
+                        market_response,
+                        weather_bundle,
+                        min_edge_bps=thresholds.risk_min_edge_bps,
+                    )
+                    signal.candidate_trace = {
+                        **dict(signal.candidate_trace or {}),
+                        "fresh_weather_signal": True,
+                        "research_last_run_id": dossier.last_run_id,
+                    }
+                else:
+                    signal = self.research_coordinator.build_signal_from_dossier(
+                        dossier,
+                        market_response,
+                        min_edge_bps=thresholds.risk_min_edge_bps,
+                    )
                 if mapping is not None and mapping.supports_structured_weather and self.historical_heuristic_service is not None:
                     heuristic_application = self.historical_heuristic_service.apply_to_signal(
                         pack=heuristic_pack,
@@ -1576,6 +1637,30 @@ class WorkflowSupervisor:
                     "prediction_model": signal_modeling["prediction_model"],
                     "trade_selection_model": signal_modeling["trade_selection_model"],
                 }
+                trader_context_payload = dossier.trader_context.model_dump(mode="json")
+                if signal.weather is not None:
+                    numeric_facts = dict(trader_context_payload.get("numeric_facts") or {})
+                    numeric_facts.update(
+                        {
+                            "forecast_high_f": signal.weather.forecast_high_f,
+                            "forecast_delta_f": signal.weather.forecast_delta_f,
+                            "current_temp_f": signal.weather.current_temp_f,
+                            "observed_high_so_far_f": signal.weather.observed_high_so_far_f,
+                            "threshold_f": getattr(mapping, "threshold_f", None) if mapping is not None else None,
+                        }
+                    )
+                    trader_context_payload.update(
+                        {
+                            "fair_yes_dollars": str(signal.fair_yes_dollars),
+                            "confidence": signal.confidence,
+                            "forecast_delta_f": signal.forecast_delta_f,
+                            "confidence_band": signal.confidence_band,
+                            "trade_regime": signal.trade_regime,
+                            "strategy_mode": signal.strategy_mode.value,
+                            "resolution_state": signal.resolution_state.value,
+                            "numeric_facts": numeric_facts,
+                        }
+                    )
                 signal_record = await repo.save_signal(
                     room_id=room.id,
                     market_ticker=room.market_ticker,
@@ -1588,7 +1673,7 @@ class WorkflowSupervisor:
                         "research_gate_passed": dossier.gate.passed,
                         "research_last_run_id": dossier.last_run_id,
                         "research_delta": delta.model_dump(mode="json"),
-                        "trader_context": dossier.trader_context.model_dump(mode="json"),
+                        "trader_context": trader_context_payload,
                         "research_freshness": dossier.freshness.model_dump(mode="json"),
                         "effective_research_freshness": dossier.freshness.model_dump(mode="json"),
                         "market_snapshot": signal_market_snapshot,

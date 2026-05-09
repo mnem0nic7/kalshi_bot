@@ -11,6 +11,12 @@ from kalshi_bot.core.enums import StandDownReason, WeatherResolutionState
 from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.core.schemas import ResolvedSigma
 from kalshi_bot.forecast.ensemble_fuser import EnsembleMember, SourceEnsemble, fuse_ensembles
+from kalshi_bot.weather.intraday import (
+    IntradayFeatureInput,
+    intraday_artifact_fallback_reason,
+    intraday_feature_values,
+    intraday_probability_from_artifact,
+)
 from kalshi_bot.weather.models import WeatherMarketMapping
 
 NEAR_THRESHOLD_DELTA_F = 2.0
@@ -529,6 +535,9 @@ def score_weather_market(
     source_disagreement_sigma_multiplier_max: float = 2.0,
     nowcast_high_so_far_enabled: bool = True,
     residual_model: dict[str, Any] | None = None,
+    intraday_model: dict[str, Any] | None = None,
+    intraday_model_enabled: bool = False,
+    intraday_model_max_age_hours: int = 168,
     external_forecast_members: list[dict[str, Any]] | None = None,
     observed_high_so_far_f: float | None = None,
 ) -> WeatherSignalSnapshot:
@@ -617,6 +626,11 @@ def score_weather_market(
     resolved_sigma: ResolvedSigma | None = None
     residual_adjustment_f: float | None = None
     residual_provenance: dict[str, Any] = {"status": "inactive"}
+    baseline_fair_yes: Decimal | None = None
+    intraday_provenance: dict[str, Any] = {
+        "enabled": bool(intraday_model_enabled),
+        "status": "disabled" if not intraday_model_enabled else "not_evaluated",
+    }
     if resolution_state == WeatherResolutionState.LOCKED_YES:
         fair = Decimal("1.0000")
         confidence = 1.0
@@ -718,10 +732,73 @@ def score_weather_market(
         else:
             # Layer 1 fallback: logistic with adaptive spread.
             probability = logistic_probability(delta_f, spread_f=_adaptive_spread_f(delta_f))
-        fair = quantize_price(probability)
+        baseline_fair_yes = quantize_price(probability)
+        fair = baseline_fair_yes
+        if intraday_model_enabled:
+            fallback_reason = intraday_artifact_fallback_reason(
+                intraday_model,
+                max_age_hours=intraday_model_max_age_hours,
+                now=asof_ts,
+            )
+            if fallback_reason is None and intraday_model is not None:
+                series_fallbacks = {str(item) for item in (intraday_model.get("series_fallbacks") or [])}
+                if mapping.series_ticker in series_fallbacks:
+                    fallback_reason = "series_regression_fallback"
+                else:
+                    fallback_reason = None
+            if fallback_reason is None and intraday_model is not None:
+                feature_input = IntradayFeatureInput(
+                    market_ticker=mapping.market_ticker,
+                    series_ticker=mapping.series_ticker,
+                    station_id=mapping.station_id,
+                    timezone_name=mapping.timezone_name,
+                    local_market_day=settlement_date.isoformat() if settlement_date is not None else None,
+                    threshold_f=float(mapping.threshold_f),
+                    operator=mapping.operator,
+                    asof_ts=asof_ts,
+                    forecast_updated_ts=forecast_updated_ts,
+                    settlement_ts=None,
+                    forecast_high_f=forecast_high_f,
+                    current_temp_f=current_temp_f if current_observation_applies else None,
+                    observed_high_so_far_f=effective_observed_high_so_far_f,
+                    source_disagreement_f=source_disagreement_f,
+                )
+                intraday_features = intraday_feature_values(feature_input)
+                intraday_probability = intraday_probability_from_artifact(intraday_model, intraday_features)
+                if intraday_probability is None:
+                    intraday_provenance = {
+                        "enabled": True,
+                        "status": "fallback",
+                        "fallback_reason": "scoring_failed",
+                        "baseline_fair_yes": str(baseline_fair_yes),
+                    }
+                else:
+                    fair = quantize_price(intraday_probability)
+                    intraday_provenance = {
+                        "enabled": True,
+                        "status": "used",
+                        "model_version": intraday_model.get("version"),
+                        "baseline_fair_yes": str(baseline_fair_yes),
+                        "intraday_fair_yes": str(fair),
+                        "local_hour": intraday_features.get("local_hour"),
+                        "heating_hours_remaining": intraday_features.get("heating_hours_remaining"),
+                        "observed_high_delta_f": intraday_features.get("observed_high_delta_f"),
+                    }
+            else:
+                intraday_provenance = {
+                    "enabled": True,
+                    "status": "fallback",
+                    "fallback_reason": fallback_reason,
+                    "baseline_fair_yes": str(baseline_fair_yes),
+                }
         confidence = min(
             0.95,
-            0.45 + min(abs(delta_f) / 12, 0.35) + (0.15 if current_temp_f is not None and current_observation_applies else 0.0),
+            max(
+                min(abs(delta_f) / 12, 0.35),
+                min(abs(float(fair) - 0.5) * 0.9, 0.40),
+            )
+            + 0.45
+            + (0.15 if current_temp_f is not None and current_observation_applies else 0.0),
         )
 
     forecast_delta_f = None
@@ -743,7 +820,9 @@ def score_weather_market(
     if resolution_state in {WeatherResolutionState.LOCKED_YES, WeatherResolutionState.LOCKED_NO}:
         trade_regime = "standard"
     elif forecast_high_f is not None:
-        if prediction_enabled and source_ensemble_enabled and ensemble_provenance.get("status") == "ok":
+        if intraday_provenance.get("status") == "used":
+            layer_tag = "intraday"
+        elif prediction_enabled and source_ensemble_enabled and ensemble_provenance.get("status") == "ok":
             layer_tag = "ensemble"
         else:
             layer_tag = "gridpoint" if using_gridpoint else "daily-period"
@@ -753,6 +832,11 @@ def score_weather_market(
             f"{mapping.threshold_f:.1f}F contract "
             f"implies fair yes near {fair} with confidence {confidence:.2f}."
         )
+        if intraday_provenance.get("status") == "used":
+            summary = (
+                f"{summary} Intraday model moved fair yes from "
+                f"{intraday_provenance.get('baseline_fair_yes')} to {intraday_provenance.get('intraday_fair_yes')}."
+            )
     prediction_provenance = {
         "prediction_enabled": prediction_enabled,
         "forecast_high_f": forecast_high_f,
@@ -764,6 +848,8 @@ def score_weather_market(
         "sigma": resolved_sigma.model_dump(mode="json") if resolved_sigma is not None else None,
         "residual_model": residual_provenance,
         "residual_adjustment_f": residual_adjustment_f,
+        "baseline_fair_yes": str(baseline_fair_yes) if baseline_fair_yes is not None else None,
+        "intraday_model": intraday_provenance,
         "asof_ts": asof_ts.isoformat(),
         "settlement_date": settlement_date.isoformat() if settlement_date is not None else None,
     }

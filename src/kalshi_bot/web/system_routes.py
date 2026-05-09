@@ -76,6 +76,7 @@ def create_system_router(
                     "weather_prediction_enabled": app_container.settings.weather_prediction_enabled,
                     "weather_source_ensemble_enabled": app_container.settings.weather_source_ensemble_enabled,
                     "weather_residual_model_enabled": app_container.settings.weather_residual_model_enabled,
+                    "weather_intraday_model_enabled": app_container.settings.weather_intraday_model_enabled,
                     "crypto_trading_enabled": app_container.settings.crypto_trading_enabled,
                     "crypto_autonomy_enabled": app_container.settings.crypto_autonomy_enabled,
                     "monotonicity_arb_enabled": app_container.settings.monotonicity_arb_enabled,

@@ -150,6 +150,11 @@ def test_python_module_cli_exposes_weather_prediction_commands() -> None:
     diagnostics_args = parser.parse_args(["weather-prediction", "station-diagnostics", "--min-days", "10"])
     sigma_args = parser.parse_args(["weather-sigma", "refit", "--dry-run"])
     residual_args = parser.parse_args(["weather-residual", "train", "--kalshi-env", "demo", "--dry-run"])
+    intraday_eval_args = parser.parse_args(
+        ["weather-intraday", "evaluate", "--kalshi-env", "production", "--series", "KXHIGHNY", "--json"]
+    )
+    intraday_train_args = parser.parse_args(["weather-intraday", "train", "--kalshi-env", "production", "--json"])
+    intraday_status_args = parser.parse_args(["weather-intraday", "status", "--kalshi-env", "production", "--json"])
 
     assert prediction_args.command == "weather-prediction"
     assert prediction_args.weather_prediction_command == "evaluate"
@@ -162,6 +167,89 @@ def test_python_module_cli_exposes_weather_prediction_commands() -> None:
     assert residual_args.command == "weather-residual"
     assert residual_args.weather_residual_command == "train"
     assert residual_args.kalshi_env == "demo"
+    assert intraday_eval_args.command == "weather-intraday"
+    assert intraday_eval_args.weather_intraday_command == "evaluate"
+    assert intraday_eval_args.kalshi_env == "production"
+    assert intraday_eval_args.series == ["KXHIGHNY"]
+    assert intraday_train_args.weather_intraday_command == "train"
+    assert intraday_status_args.weather_intraday_command == "status"
+
+
+@pytest.mark.asyncio
+async def test_weather_intraday_cli_commands_emit_stable_json(monkeypatch, capsys) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeWeatherPredictionService:
+        async def train_intraday_model(self, **kwargs):
+            calls.append(("train_intraday_model", kwargs))
+            return {
+                "active": not kwargs["dry_run"],
+                "kalshi_env": kwargs["kalshi_env"],
+                "dry_run": kwargs["dry_run"],
+                "gates": {"min_train_rows": {"passed": True}},
+            }
+
+        async def status(self, **kwargs):
+            calls.append(("status", kwargs))
+            return {
+                "kalshi_env": kwargs["kalshi_env"],
+                "intraday_model": {"active": True},
+                "intraday_model_usable": True,
+            }
+
+    class FakeContainer:
+        weather_prediction_service = FakeWeatherPredictionService()
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_build(*, bootstrap_db: bool):
+        assert bootstrap_db is True
+        return FakeContainer()
+
+    monkeypatch.setattr(cli_module.AppContainer, "build", fake_build)
+    parser = cli_module.build_parser()
+
+    evaluate_exit = await cli_module._run_cli(
+        parser.parse_args(
+            ["weather-intraday", "evaluate", "--kalshi-env", "production", "--series", "KXHIGHNY", "--json"]
+        )
+    )
+    evaluate_payload = json.loads(capsys.readouterr().out)
+
+    train_exit = await cli_module._run_cli(
+        parser.parse_args(["weather-intraday", "train", "--kalshi-env", "production", "--json"])
+    )
+    train_payload = json.loads(capsys.readouterr().out)
+
+    status_exit = await cli_module._run_cli(
+        parser.parse_args(["weather-intraday", "status", "--kalshi-env", "production", "--json"])
+    )
+    status_payload = json.loads(capsys.readouterr().out)
+
+    assert evaluate_exit == 0
+    assert train_exit == 0
+    assert status_exit == 0
+    assert evaluate_payload == {
+        "active": False,
+        "kalshi_env": "production",
+        "dry_run": True,
+        "gates": {"min_train_rows": {"passed": True}},
+    }
+    assert train_payload["active"] is True
+    assert train_payload["dry_run"] is False
+    assert status_payload["intraday_model_usable"] is True
+    assert calls == [
+        (
+            "train_intraday_model",
+            {"kalshi_env": "production", "dry_run": True, "series": ["KXHIGHNY"]},
+        ),
+        (
+            "train_intraday_model",
+            {"kalshi_env": "production", "dry_run": False, "series": None},
+        ),
+        ("status", {"kalshi_env": "production"}),
+    ]
 
 
 def test_python_module_cli_exposes_parameter_pack_commands() -> None:

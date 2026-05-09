@@ -430,6 +430,23 @@ def _stand_down_detail(raw_reason: str | None, trace: dict) -> str | None:
     return None
 
 
+def _intraday_detail(signal_payload: dict) -> str | None:
+    provenance = signal_payload.get("prediction_provenance") if isinstance(signal_payload, dict) else None
+    intraday = provenance.get("intraday_model") if isinstance(provenance, dict) else None
+    if not isinstance(intraday, dict):
+        return None
+    if intraday.get("status") == "used":
+        baseline = _price_label(intraday.get("baseline_fair_yes"))
+        fair = _price_label(intraday.get("intraday_fair_yes"))
+        if baseline and fair:
+            return f"Intraday model adjusted fair YES from {baseline} to {fair} using current time and observed high-so-far."
+        return "Intraday model supplied this room's fair value."
+    if intraday.get("status") == "fallback":
+        reason = _reason_label(intraday.get("fallback_reason"))
+        return f"Intraday model unavailable ({reason.lower()}); baseline fair value was used."
+    return None
+
+
 def _weather_summary(research_dossier: dict | None, weather_bundle: dict | None) -> dict:
     numeric_facts = ((research_dossier or {}).get("summary") or {}).get("current_numeric_facts") or {}
     mapping = (weather_bundle or {}).get("mapping") or {}
@@ -552,6 +569,7 @@ def _decision_summary(
         "stand_down_reason": raw_stand_down_reason,
         "stand_down_display": _display_stand_down_reason(raw_stand_down_reason, trace),
         "stand_down_detail": _stand_down_detail(raw_stand_down_reason, trace),
+        "intraday_detail": _intraday_detail(signal_payload),
         "blocked_by": blocked_by,
         "risk_status": (risk_verdict or {}).get("status"),
         "execution_status": execution_status,

@@ -1087,6 +1087,26 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2))
             return 0
 
+        if args.command == "weather-intraday":
+            if args.weather_intraday_command == "evaluate":
+                result = await container.weather_prediction_service.train_intraday_model(
+                    kalshi_env=args.kalshi_env,
+                    dry_run=True,
+                    series=args.series or None,
+                )
+            elif args.weather_intraday_command == "train":
+                result = await container.weather_prediction_service.train_intraday_model(
+                    kalshi_env=args.kalshi_env,
+                    dry_run=False,
+                    series=args.series or None,
+                )
+            elif args.weather_intraday_command == "status":
+                result = await container.weather_prediction_service.status(kalshi_env=args.kalshi_env)
+            else:  # pragma: no cover - argparse enforces choices
+                raise ValueError(f"unknown weather-intraday command {args.weather_intraday_command}")
+            print(json.dumps(result, indent=2))
+            return 0
+
         if args.command == "research-refresh":
             dossier = await container.research_coordinator.refresh_market_dossier(
                 args.market_ticker,
@@ -2145,6 +2165,17 @@ def build_parser() -> argparse.ArgumentParser:
         weather_residual_command.add_argument("--dry-run", action="store_true")
     weather_residual_status = weather_residual_subparsers.add_parser("status")
     weather_residual_status.add_argument("--kalshi-env", default="demo")
+
+    weather_intraday = subparsers.add_parser("weather-intraday")
+    weather_intraday_subparsers = weather_intraday.add_subparsers(dest="weather_intraday_command", required=True)
+    for name in ("evaluate", "train"):
+        weather_intraday_command = weather_intraday_subparsers.add_parser(name)
+        weather_intraday_command.add_argument("--kalshi-env", default="demo")
+        weather_intraday_command.add_argument("--series", nargs="*", default=None)
+        weather_intraday_command.add_argument("--json", action="store_true")
+    weather_intraday_status = weather_intraday_subparsers.add_parser("status")
+    weather_intraday_status.add_argument("--kalshi-env", default="demo")
+    weather_intraday_status.add_argument("--json", action="store_true")
 
     create_room = subparsers.add_parser("create-room")
     create_room.add_argument("--name", required=True)

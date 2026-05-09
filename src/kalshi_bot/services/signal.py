@@ -797,6 +797,7 @@ def apply_heuristic_application_to_signal(
         capital_bucket=signal.capital_bucket,
         forecast_delta_f=signal.forecast_delta_f,
         confidence_band=signal.confidence_band,
+        prediction_provenance=dict(signal.prediction_provenance or {}),
     )
     return annotate_signal_quality(
         settings=settings,
@@ -1031,16 +1032,21 @@ class WeatherSignalEngine:
         settings: Settings,
         *,
         residual_model_artifact: dict[str, Any] | None = None,
+        intraday_model_artifact: dict[str, Any] | None = None,
         sigma_params: dict | None = None,
         lead_factors: dict | None = None,
     ) -> None:
         self.settings = settings
         self.residual_model_artifact = residual_model_artifact
+        self.intraday_model_artifact = intraday_model_artifact
         self.sigma_params = sigma_params
         self.lead_factors = lead_factors
 
     def set_residual_model_artifact(self, artifact: dict[str, Any] | None) -> None:
         self.residual_model_artifact = artifact
+
+    def set_intraday_model_artifact(self, artifact: dict[str, Any] | None) -> None:
+        self.intraday_model_artifact = artifact
 
     def set_sigma_calibration(self, *, sigma_params: dict | None, lead_factors: dict | None) -> None:
         self.sigma_params = sigma_params
@@ -1096,6 +1102,13 @@ class WeatherSignalEngine:
                 if self.settings.weather_residual_model_enabled
                 else None
             ),
+            intraday_model=(
+                self.intraday_model_artifact
+                if self.settings.weather_intraday_model_enabled
+                else None
+            ),
+            intraday_model_enabled=self.settings.weather_intraday_model_enabled,
+            intraday_model_max_age_hours=self.settings.weather_intraday_model_max_age_hours,
             external_forecast_members=self._external_forecast_members(weather_bundle),
             observed_high_so_far_f=self._observed_high_so_far(weather_bundle),
         )

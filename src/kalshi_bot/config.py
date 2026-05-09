@@ -215,6 +215,15 @@ class Settings(BaseSettings):
     weather_residual_min_crps_improvement_pct: float = 0.0
     weather_residual_min_brier_improvement_pct: float = 0.0
     weather_residual_model_max_age_hours: int = 168
+    weather_intraday_model_enabled: bool = False
+    weather_intraday_model_max_age_hours: int = 168
+    weather_intraday_min_train_rows: int = 500
+    weather_intraday_min_holdout_rows: int = 100
+    weather_intraday_min_brier_improvement_pct: float = 0.01
+    weather_intraday_max_calibration_error: float = 0.20
+    weather_intraday_min_calibration_bucket_rows: int = 50
+    weather_intraday_min_series_holdout_rows: int = 30
+    weather_intraday_max_series_brier_regression: float = 0.05
     sigma_calibration_enabled: bool = True
     sigma_min_samples_beats_global: int = 100
     sigma_min_samples_beats_yaml: int = 200

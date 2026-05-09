@@ -75,20 +75,26 @@ class ExecutedKalshi(FakeKalshi):
 
 class FakeWeather:
     async def build_market_snapshot(self, mapping: WeatherMarketMapping) -> dict:
+        now = datetime.now(UTC)
         return {
             "mapping": mapping.model_dump(mode="json"),
             "forecast": {
                 "properties": {
-                    "updated": "2026-04-10T00:00:00+00:00",
+                    "updated": now.isoformat(),
                     "periods": [
-                        {"isDaytime": True, "temperature": 88, "temperatureUnit": "F"},
+                        {
+                            "isDaytime": True,
+                            "temperature": 88,
+                            "temperatureUnit": "F",
+                            "startTime": now.isoformat(),
+                        },
                     ],
                 }
             },
             "observation": {
                 "properties": {
                     "temperature": {"value": 25.0},
-                    "timestamp": "2026-04-10T01:00:00+00:00",
+                    "timestamp": now.isoformat(),
                 }
             },
             "points": {},

@@ -316,6 +316,17 @@
     } else if (detailNode) {
       detailNode.remove();
     }
+    let intradayNode = document.getElementById("decision-intraday-detail");
+    if (decision.intraday_detail) {
+      if (!intradayNode) {
+        intradayNode = element("p", "subtle-callout");
+        intradayNode.id = "decision-intraday-detail";
+        panel.append(intradayNode);
+      }
+      intradayNode.textContent = decision.intraday_detail;
+    } else if (intradayNode) {
+      intradayNode.remove();
+    }
     let summaryNode = document.getElementById("latest-ops-summary");
     if (decision.latest_ops_summary) {
       if (!summaryNode) {
