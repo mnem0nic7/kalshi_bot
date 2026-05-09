@@ -23,6 +23,7 @@ from kalshi_bot.crypto.services import (
     _crypto_data_quality,
     _crypto_decision_rows,
     _crypto_feature_schema,
+    _crypto_model_candidate_report,
     _crypto_raw_feature_vector,
     _crypto_trade_candidates,
     _fit_crypto_calibration,
@@ -565,10 +566,19 @@ def test_crypto_feature_vector_is_deterministic_and_point_in_time(tmp_path) -> N
     first = _crypto_raw_feature_vector(rows[0], schema)
     second = _crypto_raw_feature_vector(rows[0], schema)
 
-    assert schema["feature_schema_version"] == "crypto-logistic-v2"
+    assert schema["feature_schema_version"] == "crypto-rich-v3"
     assert schema["asset_categories"] == ["BTC", "ETH"]
+    assert "spot_return_3_pct" in schema["feature_names"]
+    assert "time_to_close_bucket_0_5m" in schema["feature_names"]
+    assert "quote_source_snapshot_quotes" in schema["feature_names"]
     assert first == second
     assert len(first) == len(schema["feature_names"])
+    proxy = _crypto_raw_feature_vector(rows[1], schema)
+    quote_real_idx = schema["feature_names"].index("quote_source_snapshot_quotes")
+    quote_proxy_idx = schema["feature_names"].index("quote_source_candlestick_proxy")
+    assert first[quote_real_idx] == 1.0
+    assert proxy[quote_real_idx] == 0.0
+    assert proxy[quote_proxy_idx] == 1.0
 
 
 def test_crypto_serialized_logistic_prediction_is_stable(tmp_path) -> None:
@@ -605,8 +615,106 @@ def test_crypto_serialized_logistic_prediction_is_stable(tmp_path) -> None:
     first = _predict_crypto_probability(rows[0], model)
     second = _predict_crypto_probability(rows[0], model)
 
-    assert model["model_type"] == "sklearn_logistic"
-    assert model["feature_schema_version"] == "crypto-logistic-v2"
+    assert model["model_type"] in {
+        "sklearn_logistic",
+        "xgboost_classifier",
+        "lightgbm_classifier",
+        "calibrated_weighted_ensemble",
+        "market_mid_baseline",
+    }
+    assert model["feature_schema_version"] == "crypto-rich-v3"
+    assert model["candidate_report"]["primary_metric"] == "brier"
+    assert first == second
+    assert Decimal("0.0100") <= first <= Decimal("0.9900")
+
+
+def test_crypto_candidate_registry_reports_optional_rich_models(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_min_training_samples=4)
+    base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    rows = []
+    for day in range(4):
+        for idx, asset in enumerate(("BTC", "ETH")):
+            label = 1 if (day + idx) % 2 == 0 else 0
+            mid = Decimal("0.3500") if label else Decimal("0.6500")
+            rows.append(
+                {
+                    "row_id": f"row-{day}-{asset}",
+                    "market_ticker": f"KX{asset}15M-{day}",
+                    "asset_symbol": asset,
+                    "mid_yes_dollars": mid,
+                    "yes_bid_dollars": mid - Decimal("0.0100"),
+                    "yes_ask_dollars": mid + Decimal("0.0100"),
+                    "no_ask_dollars": Decimal("1.0000") - mid,
+                    "time_to_close_seconds": 300 + (idx * 300),
+                    "market_age_seconds": 600,
+                    "spread_bps": 200,
+                    "volume": 100 + day,
+                    "open_interest": 50 + day,
+                    "candle_momentum_dollars": Decimal("0.0100") if label else Decimal("-0.0100"),
+                    "target_price_dollars": Decimal("70000"),
+                    "asset_recent_yes_rate": Decimal("0.5000"),
+                    "asset_recent_mid_error": Decimal("0.0000"),
+                    "quote_source": "snapshot_quotes",
+                    "strict_trade_eligible": True,
+                    "label_yes": label,
+                    "decision_ts": base + timedelta(days=day, minutes=idx),
+                    "settlement_ts": base + timedelta(days=day, minutes=idx + 15),
+                    "market_day": (base + timedelta(days=day)).date().isoformat(),
+                }
+            )
+
+    report = _crypto_model_candidate_report(rows, settings=settings)
+    names = {candidate["name"]: candidate for candidate in report["candidates"]}
+
+    assert report["primary_metric"] == "brier"
+    assert report["selection_scope"] == "walk_forward_time_ordered"
+    assert report["champion_name"] in names
+    assert names["market_mid_baseline"]["metrics"]["brier"] is not None
+    assert names["sklearn_logistic"]["status"] in {"available", "guardrail_failed"}
+    assert names["xgboost_classifier"]["status"] in {"available", "unavailable", "guardrail_failed"}
+    assert names["lightgbm_classifier"]["status"] in {"available", "unavailable", "guardrail_failed"}
+
+
+def test_crypto_ensemble_prediction_is_deterministic(tmp_path) -> None:
+    del tmp_path
+    row = {
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.4500"),
+        "time_to_close_seconds": 300,
+        "spread_bps": 120,
+        "volume": 100,
+        "open_interest": 25,
+        "candle_momentum_dollars": Decimal("0.0100"),
+        "target_price_dollars": Decimal("70000"),
+        "asset_recent_yes_rate": Decimal("0.6000"),
+        "asset_recent_mid_error": Decimal("0.0500"),
+        "quote_source": "snapshot_quotes",
+        "strict_trade_eligible": True,
+    }
+    schema = _crypto_feature_schema([row])
+    market_model = {
+        "model_type": "market_mid_baseline",
+        "feature_names": schema["feature_names"],
+        "numeric_feature_names": schema["numeric_feature_names"],
+        "asset_categories": schema["asset_categories"],
+    }
+    heuristic_model = {
+        "model_type": "heuristic_adjustment",
+        "global_adjustment_bps": 100,
+        "asset_adjustments_bps": {"BTC": 50},
+    }
+    ensemble = {
+        "model_type": "calibrated_weighted_ensemble",
+        "ensemble_weights": {"market_mid_baseline": 0.25, "heuristic_adjustment": 0.75},
+        "member_models": {
+            "market_mid_baseline": market_model,
+            "heuristic_adjustment": heuristic_model,
+        },
+    }
+
+    first = _predict_crypto_probability(row, ensemble)
+    second = _predict_crypto_probability(row, ensemble)
+
     assert first == second
     assert Decimal("0.0100") <= first <= Decimal("0.9900")
 
@@ -680,12 +788,27 @@ async def test_crypto_train_stores_model_with_fee_aware_metrics(tmp_path) -> Non
     await init_models(engine)
     await _seed_crypto_training_rows(session_factory, settings, days=4)
 
-    result = await CryptoForecastService(settings=settings, session_factory=session_factory).train(frequency="15m")
+    service = CryptoForecastService(settings=settings, session_factory=session_factory)
+    result = await service.train(frequency="15m")
+    candidates = await service.candidates(frequency="15m", days=30)
 
     assert result["status"] == "trained"
     assert result["metrics"]["resolved_sample_count"] == 8
     assert result["metrics"]["fees_dollars"] >= 0
+    assert result["metrics"]["champion_model"] in {
+        "market_mid_baseline",
+        "sklearn_logistic",
+        "xgboost_classifier",
+        "lightgbm_classifier",
+        "calibrated_weighted_ensemble",
+    }
+    assert result["payload"]["candidate_report"]["primary_metric"] == "brier"
+    assert result["payload"]["candidate_registry_version"] == "crypto-candidate-registry-v1"
     assert "candlestick_momentum" in result["payload"]["feature_set"]
+    assert candidates["schema_version"] == "crypto-model-candidates-v2"
+    assert candidates["primary_metric"] == "brier"
+    assert candidates["ranked_candidates"]
+    assert candidates["candidate_report"]["champion_name"]
     await engine.dispose()
 
 
