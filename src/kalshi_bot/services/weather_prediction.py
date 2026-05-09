@@ -22,6 +22,7 @@ from kalshi_bot.weather.scoring import (
 )
 from kalshi_bot.weather.sigma_calibration import season_for_month
 from kalshi_bot.weather.sigma_calibration import (
+    _crps_normal,
     fit_lead_factors,
     fit_sigma_base,
     lead_bucket_for_hours,
@@ -346,10 +347,17 @@ class WeatherPredictionService:
         ]
         raw_metrics = _metrics(raw_holdout)
         adjusted_metrics = _metrics(adjusted_holdout)
+        raw_crps = _crps_normal(3.5, 0.0, raw_holdout)
+        adjusted_crps = _crps_normal(3.5, 0.0, adjusted_holdout)
         brier = self._brier_metrics(labels, rows, feature_names, coef, holdout_only=True)
         raw_mae = float(raw_metrics.get("mae_f") or math.inf)
         adjusted_mae = float(adjusted_metrics.get("mae_f") or math.inf)
         mae_improvement_pct = (raw_mae - adjusted_mae) / raw_mae if raw_mae and math.isfinite(raw_mae) else 0.0
+        crps_improvement_pct = (
+            (raw_crps - adjusted_crps) / raw_crps
+            if raw_crps and math.isfinite(raw_crps) and math.isfinite(adjusted_crps)
+            else 0.0
+        )
         raw_brier = brier.get("raw_brier")
         adjusted_brier = brier.get("adjusted_brier")
         brier_improvement_pct = (
@@ -359,6 +367,7 @@ class WeatherPredictionService:
         )
         active = (
             mae_improvement_pct >= self.settings.weather_residual_min_mae_improvement_pct
+            and crps_improvement_pct >= self.settings.weather_residual_min_crps_improvement_pct
             and brier_improvement_pct >= self.settings.weather_residual_min_brier_improvement_pct
         )
         artifact = {
@@ -375,6 +384,11 @@ class WeatherPredictionService:
                 "raw": raw_metrics,
                 "adjusted": adjusted_metrics,
                 "mae_improvement_pct": mae_improvement_pct,
+                "crps": {
+                    "raw_crps": raw_crps,
+                    "adjusted_crps": adjusted_crps,
+                },
+                "crps_improvement_pct": crps_improvement_pct,
                 "brier": brier,
                 "brier_improvement_pct": brier_improvement_pct,
             },

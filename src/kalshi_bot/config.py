@@ -211,6 +211,7 @@ class Settings(BaseSettings):
     weather_nowcast_high_so_far_enabled: bool = True
     weather_residual_model_enabled: bool = False
     weather_residual_min_mae_improvement_pct: float = 0.02
+    weather_residual_min_crps_improvement_pct: float = 0.0
     weather_residual_min_brier_improvement_pct: float = 0.0
     weather_residual_model_max_age_hours: int = 168
     sigma_calibration_enabled: bool = True
