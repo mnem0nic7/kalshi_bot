@@ -632,7 +632,7 @@ async def test_recent_room_decision_views_reports_stand_downs_and_blocks() -> No
                 "selected_edge_bps": 4443,
                 "no": {"quality_adjusted_edge_bps": 4418},
             },
-            "trader_context": {"numeric_facts": {"forecast_delta_f": -1.6, "threshold_f": 67.0}},
+            "trader_context": {"numeric_facts": {"forecast_high_f": 65.4, "forecast_delta_f": -1.6, "threshold_f": 67.0}},
         },
         trade_ticket_id=None,
         ticket_action=None,
@@ -673,9 +673,60 @@ async def test_recent_room_decision_views_reports_stand_downs_and_blocks() -> No
         order_count=0,
         fill_count=0,
     )
+    no_action = SimpleNamespace(
+        room_id="room-no-action",
+        name="Boston high temperature",
+        market_ticker="KXHIGHTBOS-26MAY09-T75",
+        room_origin="live",
+        stage="complete",
+        shadow_mode=False,
+        created_at=now - timedelta(minutes=7),
+        updated_at=now - timedelta(minutes=6),
+        signal_id="signal-no-action",
+        fair_yes_dollars=Decimal("0.1957"),
+        edge_bps=1357,
+        confidence=0.70,
+        signal_summary="No taker trade clears the configured edge threshold.",
+        signal_payload={
+            "final_stand_down_reason": "no_actionable_edge",
+            "candidate_trace": {
+                "selected_side": None,
+                "selected_edge_bps": None,
+                "min_edge_bps": 500,
+                "min_contract_price_dollars": "0.2500",
+                "yes": {
+                    "side": "yes",
+                    "status": "skipped",
+                    "reason": "below_min_contract_price",
+                    "traded_price_dollars": "0.0600",
+                    "edge_bps": 1357,
+                    "quality_adjusted_edge_bps": 1332,
+                },
+                "no": {
+                    "side": "no",
+                    "status": "skipped",
+                    "reason": "below_min_edge",
+                    "traded_price_dollars": "0.9400",
+                    "edge_bps": -1457,
+                    "quality_adjusted_edge_bps": -1482,
+                },
+            },
+            "trader_context": {"numeric_facts": {"forecast_high_f": 72.0, "forecast_delta_f": -3.0, "threshold_f": 75.0}},
+        },
+        trade_ticket_id=None,
+        ticket_action=None,
+        ticket_side=None,
+        ticket_yes_price_dollars=None,
+        ticket_count_fp=None,
+        ticket_status=None,
+        risk_status=None,
+        risk_reasons=None,
+        order_count=0,
+        fill_count=0,
+    )
 
     views = await control_room_module._recent_room_decision_views(
-        _SequenceSession([[stand_down, risk_block]]),
+        _SequenceSession([[stand_down, risk_block, no_action]]),
         kalshi_env="production",
         market_prefix="KXHIGH",
     )
@@ -687,17 +738,29 @@ async def test_recent_room_decision_views_reports_stand_downs_and_blocks() -> No
     assert views[0]["quality_adjusted_edge_display"] == "4418bps"
     assert views[0]["fair_yes_display"] == "$0.1957"
     assert views[0]["confidence_display"] == "71%"
-    assert views[0]["reason"] == "Insufficient forecast separation"
+    assert views[0]["reason"] == "Forecast too close to threshold"
     assert views[0]["weather_display"] == "delta -1.6F · threshold 67F"
+    assert "Forecast high" in views[0]["description"]
+    assert "Model preferred NO" in views[0]["description"]
+    assert "forecast was too close" in views[0]["description"]
     assert views[1]["status"] == "blocked"
     assert views[1]["status_label"] == "Risk blocked"
     assert views[1]["reason"] == "Existing live position blocks same-ticker add-ons."
+    assert "Risk blocked the order" in views[1]["description"]
     assert views[1]["ticket"] == {
         "action": "buy",
         "side": "yes",
         "yes_price_dollars": "0.7700",
         "count_fp": "2.29",
     }
+    assert views[2]["status"] == "no_trade"
+    assert views[2]["selected_side"] == "—"
+    assert views[2]["selected_edge_display"] == "best 1357bps"
+    assert views[2]["quality_adjusted_edge_display"] == "1332bps"
+    assert views[2]["reason"] == "No safe entry at current quotes"
+    assert "neither side cleared every entry rule" in views[2]["description"]
+    assert "YES was priced at $0.0600" in views[2]["description"]
+    assert "NO only had -1482bps" in views[2]["description"]
 
 
 @pytest.mark.asyncio

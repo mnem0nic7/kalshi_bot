@@ -699,11 +699,8 @@
 
       const reasonTd = el("td", "room-decision-reason");
       reasonTd.appendChild(el("strong", null, decision.reason || "—"));
-      if (decision.weather_display && decision.weather_display !== "—") {
-        reasonTd.appendChild(el("span", "muted-label", decision.weather_display));
-      }
-      if (decision.summary) {
-        reasonTd.appendChild(el("span", "muted-label room-decision-summary", decision.summary));
+      if (decision.description) {
+        reasonTd.appendChild(el("span", "muted-label room-decision-summary", decision.description));
       }
 
       const updatedTd = el("td", "muted-label");

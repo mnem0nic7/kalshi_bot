@@ -161,7 +161,12 @@ def _build_recent_room_decisions() -> list[dict[str, object]]:
             "fair_yes_display": "$0.1957",
             "confidence_display": "71%",
             "weather_display": "delta -1.6F · threshold 67F",
-            "reason": "Insufficient forecast separation",
+            "reason": "Forecast too close to threshold",
+            "description": (
+                "Forecast high is 65.4F against a 67F threshold (1.6F away). "
+                "Model preferred NO at $0.8043 versus fair $0.8043 with 4418bps after buffer. "
+                "It stood down because the forecast was too close to the contract threshold."
+            ),
             "summary": "NO has edge but forecast separation is too narrow.",
             "updated_at": "2026-05-09T18:30:00+00:00",
         },
@@ -181,6 +186,7 @@ def _build_recent_room_decisions() -> list[dict[str, object]]:
             "confidence_display": "83%",
             "weather_display": "—",
             "reason": "Existing live position blocks same-ticker add-ons.",
+            "description": "Model preferred YES at $0.7700. Risk blocked the order: Existing live position blocks same-ticker add-ons.",
             "summary": "YES clears model edge.",
             "updated_at": "2026-05-09T18:25:00+00:00",
         },
@@ -1094,7 +1100,9 @@ def test_recent_room_decisions_render_above_trading_activity(
                 assert "KXHIGHTHOU-26MAY09-T70" in decisions_text
                 assert "4443bps" in decisions_text
                 assert "qa 4418bps" in decisions_text
-                assert "Insufficient forecast separation" in decisions_text
+                assert "Forecast too close to threshold" in decisions_text
+                assert "Forecast high is 65.4F against a 67F threshold" in decisions_text
+                assert "It stood down because the forecast was too close" in decisions_text
                 assert "Existing live position blocks same-ticker add-ons." in decisions_text
                 timestamp = decisions.locator('[data-timestamp="2026-05-09T18:30:00+00:00"]').first
                 assert timestamp.count() == 1

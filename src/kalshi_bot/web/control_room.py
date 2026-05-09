@@ -407,15 +407,20 @@ def _clean_reason_label(reason: Any) -> str:
     if not normalized:
         return "—"
     labels = {
-        "empirical_gate_block": "Empirical gate block",
-        "empirical_gate_under_sampled": "Empirical gate under-sampled",
-        "insufficient_forecast_separation": "Insufficient forecast separation",
-        "no_actionable_edge": "No actionable edge",
-        "forecast_delta_missing": "Forecast delta missing",
+        "empirical_gate_block": "Trade-behavior gate blocked entry",
+        "empirical_gate_under_sampled": "Trade-behavior history is too thin",
+        "insufficient_forecast_separation": "Forecast too close to threshold",
+        "no_actionable_edge": "No safe entry at current quotes",
+        "forecast_delta_missing": "Missing forecast separation",
         "resolved_contract": "Resolved contract",
-        "market_stale": "Market stale",
+        "market_stale": "Market data is stale",
         "spread_too_wide": "Spread too wide",
-        "entry_freeze": "Entry freeze",
+        "entry_freeze": "Entry freeze is on",
+        "book_effectively_broken": "Order book is not usable",
+        "below_min_contract_price": "Price below minimum entry",
+        "below_min_edge": "Edge below minimum",
+        "below_min_remaining_payout": "Remaining payout too small",
+        "selected_side_unmarketable": "Selected side is not marketable",
     }
     return labels.get(normalized, normalized.replace("_", " ").title())
 
@@ -442,6 +447,208 @@ def _int_or_none(value: Any) -> int | None:
     return int(numeric) if numeric is not None else None
 
 
+def _normalized_trade_side(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"yes", "no"} else None
+
+
+def _compact_fahrenheit(value: Any) -> str | None:
+    numeric = _float_or_none(value)
+    if numeric is None:
+        return None
+    return f"{numeric:.0f}F" if numeric.is_integer() else f"{numeric:.1f}F"
+
+
+def _compact_price(value: Any) -> str | None:
+    price = _decimal_or_none(value)
+    return _price_display(price) if price is not None else None
+
+
+def _compact_bps(value: Any) -> str | None:
+    numeric = _int_or_none(value)
+    return f"{numeric}bps" if numeric is not None else None
+
+
+def _candidate_for_side(trace: dict[str, Any], side: str | None) -> dict[str, Any]:
+    if side and isinstance(trace.get(side), dict):
+        return trace[side]
+    for candidate in trace.get("candidates") or []:
+        if isinstance(candidate, dict) and _normalized_trade_side(candidate.get("side")) == side:
+            return candidate
+    return {}
+
+
+def _best_visible_candidate(trace: dict[str, Any]) -> dict[str, Any]:
+    candidates = [item for item in (trace.get("candidates") or []) if isinstance(item, dict)]
+    if not candidates:
+        candidates = [trace.get("yes"), trace.get("no")]
+    candidates = [item for item in candidates if isinstance(item, dict)]
+    if not candidates:
+        return {}
+    return max(
+        candidates,
+        key=lambda item: (
+            edge if (edge := _int_or_none(item.get("quality_adjusted_edge_bps"))) is not None else -1_000_000
+        ),
+    )
+
+
+def _weather_decision_sentence(numeric_facts: dict[str, Any]) -> str | None:
+    forecast_high = _compact_fahrenheit(numeric_facts.get("forecast_high_f"))
+    threshold = _compact_fahrenheit(numeric_facts.get("threshold_f"))
+    delta = _float_or_none(numeric_facts.get("forecast_delta_f"))
+    observed_high = _compact_fahrenheit(numeric_facts.get("observed_high_so_far_f"))
+    if forecast_high and threshold:
+        if delta is None:
+            sentence = f"Forecast high is {forecast_high} against a {threshold} threshold."
+        else:
+            sentence = f"Forecast high is {forecast_high} against a {threshold} threshold ({abs(delta):.1f}F away)."
+        if observed_high:
+            sentence += f" High so far is {observed_high}."
+        return sentence
+    return None
+
+
+def _minimum_forecast_separation_from_eligibility(eligibility: dict[str, Any]) -> str | None:
+    for reason in eligibility.get("reasons") or []:
+        text = str(reason)
+        marker = "minimum "
+        if marker not in text:
+            continue
+        tail = text.split(marker, 1)[1].strip()
+        value = tail.split("F", 1)[0].replace("°", "").strip()
+        if value:
+            return value if value.endswith("F") else f"{value}F"
+    return None
+
+
+def _candidate_block_sentence(candidate: dict[str, Any], trace: dict[str, Any]) -> str | None:
+    side = _normalized_trade_side(candidate.get("side"))
+    if side is None:
+        return None
+    side_label = side.upper()
+    reason = str(candidate.get("reason") or "").strip()
+    edge = _compact_bps(candidate.get("quality_adjusted_edge_bps") or candidate.get("edge_bps"))
+    required_edge = _compact_bps(trace.get("min_edge_bps"))
+    traded_price = _compact_price(candidate.get("traded_price_dollars"))
+    min_price = _compact_price(trace.get("min_contract_price_dollars"))
+    remaining = _compact_price(candidate.get("remaining_payout_dollars"))
+    min_remaining_bps = _int_or_none(trace.get("minimum_remaining_payout_bps"))
+    min_remaining = _compact_price(
+        Decimal(min_remaining_bps) / Decimal("10000") if min_remaining_bps is not None else None
+    )
+    if reason == "below_min_contract_price" and traded_price and min_price:
+        return f"{side_label} was priced at {traded_price}, below the {min_price} minimum entry price."
+    if reason == "below_min_edge" and edge and required_edge:
+        return f"{side_label} only had {edge} after buffer, below the {required_edge} minimum edge."
+    if reason == "below_min_remaining_payout" and remaining and min_remaining:
+        return f"{side_label} left {remaining} of payout, below the {min_remaining} minimum remaining payout."
+    if reason == "spread_too_wide":
+        spread = _compact_bps(candidate.get("spread_bps") or trace.get("spread_bps"))
+        limit = _compact_bps(trace.get("spread_limit_bps"))
+        return f"{side_label} was skipped because the spread was {spread or 'too wide'}; limit is {limit or 'configured lower'}."
+    if reason:
+        return f"{side_label} was skipped: {_clean_reason_label(reason).lower()}."
+    return None
+
+
+def _empirical_gate_sentence(payload: dict[str, Any], trace: dict[str, Any], eligibility: dict[str, Any]) -> str | None:
+    gate = trace.get("empirical_gate")
+    if not isinstance(gate, dict):
+        gate = eligibility.get("empirical_gate")
+    if not isinstance(gate, dict):
+        gate = payload.get("empirical_gate")
+    if not isinstance(gate, dict):
+        gate = payload.get("trade_selection_model")
+    if not isinstance(gate, dict):
+        return None
+    reason = str(gate.get("reason") or "").strip()
+    status = str(gate.get("status") or "").strip()
+    sample_count = _int_or_none(gate.get("actual_sample_count"))
+    if reason == "empirical_gate_under_sampled" or status == "under_sampled":
+        if sample_count is not None:
+            return f"Trade-behavior history has only {sample_count} matching samples for this bucket, so live entry stays blocked."
+        return "Trade-behavior history is still too thin for this bucket, so live entry stays blocked."
+    if reason == "empirical_gate_unavailable" or status == "production_frozen":
+        return "The trade-behavior gate has no usable production history for this bucket yet."
+    if status == "blocked" or reason:
+        return f"Trade-behavior gate blocked live entry ({_clean_reason_label(reason or status).lower()})."
+    return None
+
+
+def _selected_trade_sentence(side: str | None, trace: dict[str, Any]) -> str | None:
+    candidate = _candidate_for_side(trace, side)
+    if not side or not candidate:
+        return None
+    side_label = side.upper()
+    price = _compact_price(candidate.get("traded_price_dollars"))
+    fair = _compact_price(candidate.get("fair_side_dollars"))
+    edge = _compact_bps(candidate.get("quality_adjusted_edge_bps") or candidate.get("edge_bps"))
+    pieces = [f"Model preferred {side_label}"]
+    if price:
+        pieces.append(f"at {price}")
+    if fair:
+        pieces.append(f"versus fair {fair}")
+    if edge:
+        pieces.append(f"with {edge} after buffer")
+    return " ".join(pieces) + "."
+
+
+def _room_decision_description(
+    *,
+    status: str,
+    reason: str,
+    payload: dict[str, Any],
+    trace: dict[str, Any],
+    eligibility: dict[str, Any],
+    numeric_facts: dict[str, Any],
+    selected_side: str | None,
+    risk_reasons: list[str],
+) -> str:
+    sentences = [item for item in [_weather_decision_sentence(numeric_facts)] if item]
+    selected_sentence = _selected_trade_sentence(selected_side, trace)
+    empirical_sentence = _empirical_gate_sentence(payload, trace, eligibility)
+    if status in {"filled", "ordered"}:
+        if selected_sentence:
+            sentences.append(selected_sentence)
+        sentences.append("Execution evidence is present for this room.")
+    elif status == "blocked":
+        if selected_sentence:
+            sentences.append(selected_sentence)
+        if risk_reasons:
+            sentences.append("Risk blocked the order: " + " ".join(risk_reasons))
+        else:
+            sentences.append("Risk blocked the order before it reached the exchange.")
+    elif reason == "Forecast too close to threshold":
+        minimum = _minimum_forecast_separation_from_eligibility(eligibility)
+        if selected_sentence:
+            sentences.append(selected_sentence)
+        if minimum:
+            sentences.append(f"It stood down because the forecast was inside the {minimum} minimum separation rule.")
+        else:
+            sentences.append("It stood down because the forecast was too close to the contract threshold.")
+        if empirical_sentence:
+            sentences.append(empirical_sentence)
+    elif reason == "No safe entry at current quotes":
+        sentences.append("No order was sent because neither side cleared every entry rule at the current quotes.")
+        candidate_sentences = [
+            sentence
+            for candidate in (_candidate_for_side(trace, "yes"), _candidate_for_side(trace, "no"))
+            if (sentence := _candidate_block_sentence(candidate, trace))
+        ]
+        sentences.extend(candidate_sentences[:2])
+        if empirical_sentence and not candidate_sentences:
+            sentences.append(empirical_sentence)
+    else:
+        if selected_sentence:
+            sentences.append(selected_sentence)
+        if empirical_sentence:
+            sentences.append(empirical_sentence)
+        if not sentences:
+            sentences.append("No order was sent for this room.")
+    return " ".join(sentences)
+
+
 def _room_decision_from_row(row: Any) -> dict[str, Any]:
     payload = row.signal_payload if isinstance(getattr(row, "signal_payload", None), dict) else {}
     trace = _candidate_trace(payload)
@@ -449,20 +656,28 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
     trade_behavior_context = (
         payload.get("trade_behavior_context") if isinstance(payload.get("trade_behavior_context"), dict) else {}
     )
-    selected_side = (
+    selected_side_raw = (
         trace.get("selected_side")
         or payload.get("recommended_side")
         or trade_behavior_context.get("side")
         or getattr(row, "ticket_side", None)
     )
+    selected_side = _normalized_trade_side(selected_side_raw)
     selected_edge_bps = (
         trace.get("selected_edge_bps")
         or payload.get("edge_effective_bps")
         or getattr(row, "edge_bps", None)
     )
     quality_adjusted_edge_bps = eligibility.get("edge_after_quality_buffer_bps")
-    if quality_adjusted_edge_bps is None and selected_side and isinstance(trace.get(str(selected_side)), dict):
-        quality_adjusted_edge_bps = trace[str(selected_side)].get("quality_adjusted_edge_bps")
+    selected_candidate = _candidate_for_side(trace, selected_side)
+    if quality_adjusted_edge_bps is None and selected_candidate:
+        quality_adjusted_edge_bps = selected_candidate.get("quality_adjusted_edge_bps")
+    if selected_side is None:
+        best_candidate = _best_visible_candidate(trace)
+        if best_candidate.get("edge_bps") is not None:
+            selected_edge_bps = best_candidate.get("edge_bps")
+        if best_candidate.get("quality_adjusted_edge_bps") is not None:
+            quality_adjusted_edge_bps = best_candidate.get("quality_adjusted_edge_bps")
     stand_down_reason = (
         payload.get("final_stand_down_reason")
         or payload.get("stand_down_reason")
@@ -479,6 +694,8 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
     risk_status = str(getattr(row, "risk_status", None) or "").lower()
     room_stage = str(getattr(row, "stage", "") or "")
 
+    risk_reasons = [str(reason) for reason in (getattr(row, "risk_reasons", None) or []) if str(reason or "").strip()]
+
     if fills_observed:
         status = "filled"
         status_label = "Filled"
@@ -493,8 +710,7 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
         status = "blocked"
         status_label = "Risk blocked"
         status_tone = "bad"
-        reasons = getattr(row, "risk_reasons", None) or []
-        reason = "; ".join(str(item) for item in reasons) or _clean_reason_label(risk_status)
+        reason = "; ".join(risk_reasons) or _clean_reason_label(risk_status)
     elif ticket_id:
         status = ticket_status or "ticket"
         status_label = _clean_reason_label(ticket_status or "ticket generated")
@@ -526,7 +742,8 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
     confidence_display = f"{confidence:.0%}" if confidence is not None else "—"
     selected_edge_bps_int = _int_or_none(selected_edge_bps)
     quality_adjusted_edge_bps_int = _int_or_none(quality_adjusted_edge_bps)
-    edge_display = f"{selected_edge_bps_int}bps" if selected_edge_bps_int is not None else "—"
+    edge_prefix = "" if selected_side else "best "
+    edge_display = f"{edge_prefix}{selected_edge_bps_int}bps" if selected_edge_bps_int is not None else "—"
     quality_edge_display = f"{quality_adjusted_edge_bps_int}bps" if quality_adjusted_edge_bps_int is not None else None
     forecast_delta = _float_or_none(numeric_facts.get("forecast_delta_f"))
     threshold = _float_or_none(numeric_facts.get("threshold_f"))
@@ -535,6 +752,16 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
         weather_bits.append(f"delta {forecast_delta:+.1f}F")
     if threshold is not None:
         weather_bits.append(f"threshold {threshold:.0f}F")
+    description = _room_decision_description(
+        status=status,
+        reason=reason,
+        payload=payload,
+        trace=trace,
+        eligibility=eligibility,
+        numeric_facts=numeric_facts,
+        selected_side=selected_side,
+        risk_reasons=risk_reasons,
+    )
     return {
         "room_id": getattr(row, "room_id", None),
         "url": f"/rooms/{getattr(row, 'room_id', '')}",
@@ -548,7 +775,7 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
         "status": status,
         "status_label": status_label,
         "status_tone": status_tone,
-        "selected_side": str(selected_side).upper() if selected_side else "—",
+        "selected_side": selected_side.upper() if selected_side else "—",
         "selected_edge_bps": selected_edge_bps_int,
         "selected_edge_display": edge_display,
         "quality_adjusted_edge_bps": quality_adjusted_edge_bps_int,
@@ -563,7 +790,8 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
         "reason": reason,
         "stand_down_reason": stand_down_reason,
         "risk_status": risk_status or None,
-        "risk_reasons": list(getattr(row, "risk_reasons", None) or []),
+        "risk_reasons": risk_reasons,
+        "description": description,
         "summary": getattr(row, "signal_summary", None) or "",
         "ticket": _compact_ticket(
             {

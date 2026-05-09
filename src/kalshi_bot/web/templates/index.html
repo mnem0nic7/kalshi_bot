@@ -308,8 +308,7 @@
               </td>
               <td class="room-decision-reason">
                 <strong>{{ item.reason }}</strong>
-                {% if item.weather_display != "—" %}<span class="muted-label">{{ item.weather_display }}</span>{% endif %}
-                {% if item.summary %}<span class="muted-label room-decision-summary">{{ item.summary }}</span>{% endif %}
+                {% if item.description %}<span class="muted-label room-decision-summary">{{ item.description }}</span>{% endif %}
               </td>
               <td class="muted-label">
                 {% if item.updated_at %}<span data-timestamp="{{ item.updated_at }}" title="{{ item.updated_at }}">{{ item.updated_at }}</span>{% else %}—{% endif %}
