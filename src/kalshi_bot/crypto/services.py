@@ -6,6 +6,7 @@ import importlib.metadata as importlib_metadata
 import json
 import logging
 import math
+from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -2803,16 +2804,30 @@ def _crypto_decision_rows(
         spot_by_asset[row.asset_symbol].append(row)
     for asset_rows in spot_by_asset.values():
         asset_rows.sort(key=lambda row: row.end_ts)
+    spot_end_times_by_asset = {
+        asset: [_as_utc_datetime(row.end_ts) for row in asset_rows]
+        for asset, asset_rows in spot_by_asset.items()
+    }
 
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, datetime]] = set()
-    settled_snapshots_by_market: dict[str, CryptoMarketSnapshotRecord] = {}
+    settled_snapshots_by_market = _crypto_settlement_snapshots_by_market(snapshots)
     for snapshot in snapshots:
-        if snapshot.settlement_result not in {"yes", "no"}:
+        settlement_snapshot = settled_snapshots_by_market.get(snapshot.market_ticker)
+        settlement_result = getattr(snapshot, "settlement_result", None)
+        if settlement_result not in {"yes", "no"}:
+            if settlement_snapshot is None:
+                continue
+            settlement_result = settlement_snapshot.settlement_result
+        if settlement_result not in {"yes", "no"}:
             continue
-        settled_snapshots_by_market.setdefault(snapshot.market_ticker, snapshot)
         decision_ts = snapshot.observed_at
-        close_time = snapshot.close_time or snapshot.expected_expiration_time
+        close_time = (
+            getattr(settlement_snapshot, "close_time", None)
+            or getattr(settlement_snapshot, "expected_expiration_time", None)
+            if settlement_snapshot is not None
+            else None
+        ) or snapshot.close_time or snapshot.expected_expiration_time
         if close_time is not None and decision_ts >= close_time:
             continue
         key = (snapshot.market_ticker, decision_ts)
@@ -2840,12 +2855,15 @@ def _crypto_decision_rows(
             candle_momentum = candle.close_dollars - prior_candle.close_dollars
         spot_context = _spot_context_for_decision(
             spot_by_asset.get(snapshot.asset_symbol, []),
+            spot_end_times=spot_end_times_by_asset.get(snapshot.asset_symbol),
             decision_ts=decision_ts,
-            target_price=snapshot.target_price_dollars,
+            target_price=snapshot.target_price_dollars or (settlement_snapshot.target_price_dollars if settlement_snapshot is not None else None),
             mid_yes=_clamp_price(mid),
         )
         strict_trade_eligible = quote_source == "snapshot_quotes"
         market_age_seconds = _crypto_market_age_seconds(decision_ts, getattr(snapshot, "open_time", None))
+        target_price = snapshot.target_price_dollars or (settlement_snapshot.target_price_dollars if settlement_snapshot is not None else None)
+        settlement_joined = settlement_snapshot is not None and settlement_snapshot is not snapshot
         rows.append(
             {
                 "row_id": f"{snapshot.market_ticker}:{decision_ts.isoformat()}",
@@ -2862,7 +2880,7 @@ def _crypto_decision_rows(
                 "decision_ts": decision_ts,
                 "settlement_ts": close_time,
                 "market_day": decision_ts.date().isoformat(),
-                "target_price_dollars": snapshot.target_price_dollars,
+                "target_price_dollars": target_price,
                 "mid_yes_dollars": _clamp_price(mid),
                 "yes_bid_dollars": _clamp_price(yes_bid),
                 "yes_ask_dollars": _clamp_price(yes_ask),
@@ -2872,8 +2890,9 @@ def _crypto_decision_rows(
                 "open_interest": snapshot.open_interest,
                 "time_to_close_seconds": int((close_time - decision_ts).total_seconds()) if close_time is not None else None,
                 "market_age_seconds": market_age_seconds,
-                "settlement_result": snapshot.settlement_result,
-                "label_yes": 1 if snapshot.settlement_result == "yes" else 0,
+                "settlement_result": settlement_result,
+                "settlement_label_source": "joined_settled_snapshot" if settlement_joined else "snapshot",
+                "label_yes": 1 if settlement_result == "yes" else 0,
                 "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
                 "candle_momentum_dollars": candle_momentum,
                 **spot_context,
@@ -2901,6 +2920,7 @@ def _crypto_decision_rows(
                 candle_momentum = candle.close_dollars - prior_candle.close_dollars
             spot_context = _spot_context_for_decision(
                 spot_by_asset.get(snapshot.asset_symbol, []),
+                spot_end_times=spot_end_times_by_asset.get(snapshot.asset_symbol),
                 decision_ts=decision_ts,
                 target_price=snapshot.target_price_dollars,
                 mid_yes=mid,
@@ -2941,19 +2961,49 @@ def _crypto_decision_rows(
     return _crypto_add_recent_asset_features(rows)
 
 
+def _crypto_settlement_snapshots_by_market(
+    snapshots: list[CryptoMarketSnapshotRecord],
+) -> dict[str, CryptoMarketSnapshotRecord]:
+    settled = [
+        snapshot
+        for snapshot in snapshots
+        if getattr(snapshot, "settlement_result", None) in {"yes", "no"}
+    ]
+    settled.sort(
+        key=lambda snapshot: (
+            str(getattr(snapshot, "market_ticker", "")),
+            _crypto_sort_datetime(
+                getattr(snapshot, "close_time", None)
+                or getattr(snapshot, "expected_expiration_time", None)
+                or getattr(snapshot, "observed_at", None)
+            ),
+            _crypto_sort_datetime(getattr(snapshot, "observed_at", None)),
+        )
+    )
+    return {snapshot.market_ticker: snapshot for snapshot in settled}
+
+
+def _crypto_sort_datetime(value: datetime | None) -> datetime:
+    return _as_utc_datetime(value) if value is not None else datetime.min.replace(tzinfo=UTC)
+
+
 def _spot_context_for_decision(
     spot_rows: list[CryptoSpotOHLCRecord],
     *,
+    spot_end_times: list[datetime] | None = None,
     decision_ts: datetime,
     target_price: Decimal | None,
     mid_yes: Decimal,
 ) -> dict[str, Any]:
     decision_utc = _as_utc_datetime(decision_ts)
-    eligible = [
-        row
-        for row in spot_rows
-        if _as_utc_datetime(row.end_ts) <= decision_utc and row.close_dollars is not None
-    ]
+    if spot_end_times is not None:
+        eligible = [row for row in spot_rows[:bisect_right(spot_end_times, decision_utc)] if row.close_dollars is not None]
+    else:
+        eligible = [
+            row
+            for row in spot_rows
+            if _as_utc_datetime(row.end_ts) <= decision_utc and row.close_dollars is not None
+        ]
     if not eligible:
         return {
             "spot_feature_status": "missing",
