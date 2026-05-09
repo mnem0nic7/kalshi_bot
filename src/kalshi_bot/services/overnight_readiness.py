@@ -21,7 +21,7 @@ from kalshi_bot.crypto.services import (
     _crypto_decision_rows,
     _crypto_spot_quality,
 )
-from kalshi_bot.db.models import Checkpoint, DeploymentControl
+from kalshi_bot.db.models import Checkpoint, DeploymentControl, FillRecord, OrderRecord, RiskVerdictRecord, Room, Signal, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.crypto_spot import COINGECKO_IDS, COINBASE_PRODUCT_IDS
 
@@ -126,6 +126,7 @@ class OvernightReadinessService:
         end_hour: int = DEFAULT_END_HOUR,
         days: int = 180,
         frequency: str = "15m",
+        weather_analysis_mode: str = "fast",
         now: datetime | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
@@ -146,6 +147,7 @@ class OvernightReadinessService:
                 now=now_utc,
                 window=window,
                 limit=limit,
+                analysis_mode=weather_analysis_mode,
             )
         if "crypto" in domain_set:
             domain_reports["crypto"] = await self._crypto_readiness(
@@ -281,20 +283,30 @@ class OvernightReadinessService:
         now: datetime,
         window: OvernightWindow,
         limit: int | None,
+        analysis_mode: str,
     ) -> dict[str, Any]:
-        dataset = await self.trade_analysis_service.build_dataset(
-            kalshi_env=kalshi_env,
-            days=days,
-            now=now,
-            limit=limit,
-        )
-        rows = [
-            {**row, "overnight": window.local_fields(row.get("decision_ts"))}
-            for row in getattr(dataset, "rows", [])
-            if window.contains(row.get("decision_ts"))
-        ]
+        if analysis_mode not in {"fast", "detailed"}:
+            raise ValueError("weather_analysis_mode must be fast or detailed")
+
+        rows: list[dict[str, Any]] = []
+        if analysis_mode == "detailed":
+            dataset = await self.trade_analysis_service.build_dataset(
+                kalshi_env=kalshi_env,
+                days=days,
+                now=now,
+                limit=limit,
+            )
+            rows = [
+                {**row, "overnight": window.local_fields(row.get("decision_ts"))}
+                for row in getattr(dataset, "rows", [])
+                if window.contains(row.get("decision_ts"))
+            ]
+            evidence = _weather_detailed_evidence(rows, days=days)
+        else:
+            evidence = await self._weather_fast_evidence(kalshi_env=kalshi_env, days=days, now=now, window=window)
+            rows = [{}] * int(evidence["row_count"])
         audit = None
-        if self.trading_audit_service is not None:
+        if analysis_mode == "detailed" and self.trading_audit_service is not None:
             audit = await self.trading_audit_service.build_report(kalshi_env=kalshi_env, days=days, focus="money-safety", now=now)
 
         hard_blockers: list[dict[str, Any]] = []
@@ -321,26 +333,20 @@ class OvernightReadinessService:
         if not self.settings.trigger_enable_auto_rooms:
             hard_blockers.append(_issue("weather", "weather_auto_rooms_disabled", "Weather auto-room triggering is disabled."))
 
-        pnl = _pnl_summary(rows)
-        if rows and pnl["scored_count"] == 0:
+        pnl = evidence.get("pnl") or {"scored_count": 0, "net_pnl_dollars": None, "avg_pnl_dollars": None}
+        if rows and analysis_mode == "detailed" and pnl["scored_count"] == 0:
             warnings.append(_issue("weather", "weather_missing_settlement_pnl_coverage", "No overnight weather rows have scored P&L.", severity="warn"))
+        if rows and analysis_mode == "fast":
+            warnings.append(
+                _issue(
+                    "weather",
+                    "weather_fast_summary_without_pnl",
+                    "Fast weather readiness used indexed room/ticket/fill counts; run detailed mode for P&L/exclusion diagnostics.",
+                    severity="warn",
+                )
+            )
 
-        evidence = {
-            "window_days": days,
-            "row_count": len(rows),
-            "training_eligible_count": sum(1 for row in rows if row.get("training_eligible")),
-            "excluded_count": sum(1 for row in rows if not row.get("training_eligible")),
-            "by_decision_status": dict(Counter(str(row.get("decision_status") or "<unknown>") for row in rows)),
-            "by_series": dict(Counter(str(row.get("series_ticker") or "<unknown>") for row in rows).most_common(20)),
-            "top_exclusion_reasons": Counter(
-                reason
-                for row in rows
-                for reason in row.get("exclusion_reasons", [])
-            ).most_common(20),
-            "pnl": pnl,
-            "snapshot_source_kind_counts": dict(Counter(str(row.get("market_snapshot_source_kind") or "<missing>") for row in rows)),
-            "audit": _weather_audit_summary(audit),
-        }
+        evidence = {**evidence, "audit": _weather_audit_summary(audit)}
         hard_blockers = _unique_issues(hard_blockers)
         warnings = _unique_issues(warnings)
         return {
@@ -349,6 +355,137 @@ class OvernightReadinessService:
             "hard_blockers": hard_blockers,
             "warnings": warnings,
             "evidence": evidence,
+        }
+
+    async def _weather_fast_evidence(
+        self,
+        *,
+        kalshi_env: str,
+        days: int,
+        now: datetime,
+        window: OvernightWindow,
+    ) -> dict[str, Any]:
+        cutoff = now - timedelta(days=days)
+        async with self.session_factory() as session:
+            room_rows = list(
+                (
+                    await session.execute(
+                        select(
+                            Room.id,
+                            Room.market_ticker,
+                            Room.created_at,
+                            Room.shadow_mode,
+                            Room.room_origin,
+                            Room.stage,
+                        )
+                        .where(Room.kalshi_env == kalshi_env, Room.created_at >= cutoff)
+                        .order_by(Room.created_at.desc(), Room.id.desc())
+                    )
+                ).all()
+            )
+
+            room_rows = [
+                row
+                for row in room_rows
+                if _weather_ticker(row.market_ticker) and window.contains(row.created_at)
+            ]
+            room_ids = [row.id for row in room_rows]
+            signals_by_room: dict[str, Signal] = {}
+            tickets_by_room: dict[str, TradeTicketRecord] = {}
+            risks_by_ticket: dict[str, RiskVerdictRecord] = {}
+            orders_by_ticket: dict[str, list[OrderRecord]] = {}
+            fills_by_order: dict[str, list[FillRecord]] = {}
+
+            for batch in _batches(room_ids):
+                signals = list(
+                    (
+                        await session.execute(
+                            select(Signal).where(Signal.room_id.in_(batch)).order_by(Signal.created_at.asc(), Signal.id.asc())
+                        )
+                    ).scalars()
+                )
+                for signal in signals:
+                    signals_by_room[signal.room_id] = signal
+                tickets = list(
+                    (
+                        await session.execute(
+                            select(TradeTicketRecord)
+                            .where(TradeTicketRecord.room_id.in_(batch))
+                            .order_by(TradeTicketRecord.created_at.asc(), TradeTicketRecord.id.asc())
+                        )
+                    ).scalars()
+                )
+                for ticket in tickets:
+                    tickets_by_room[ticket.room_id] = ticket
+
+            ticket_ids = [ticket.id for ticket in tickets_by_room.values()]
+            for batch in _batches(ticket_ids):
+                risks = list(
+                    (
+                        await session.execute(
+                            select(RiskVerdictRecord)
+                            .where(RiskVerdictRecord.ticket_id.in_(batch))
+                            .order_by(RiskVerdictRecord.created_at.asc(), RiskVerdictRecord.id.asc())
+                        )
+                    ).scalars()
+                )
+                for risk in risks:
+                    risks_by_ticket[risk.ticket_id] = risk
+                orders = list(
+                    (
+                        await session.execute(
+                            select(OrderRecord)
+                            .where(OrderRecord.trade_ticket_id.in_(batch))
+                            .order_by(OrderRecord.created_at.asc(), OrderRecord.id.asc())
+                        )
+                    ).scalars()
+                )
+                for order in orders:
+                    if order.trade_ticket_id:
+                        orders_by_ticket.setdefault(str(order.trade_ticket_id), []).append(order)
+
+            order_ids = [order.id for orders in orders_by_ticket.values() for order in orders]
+            for batch in _batches(order_ids):
+                fills = list((await session.execute(select(FillRecord).where(FillRecord.order_id.in_(batch)))).scalars())
+                for fill in fills:
+                    if fill.order_id:
+                        fills_by_order.setdefault(str(fill.order_id), []).append(fill)
+
+        decision_counts: Counter[str] = Counter()
+        risk_counts: Counter[str] = Counter()
+        order_counts: Counter[str] = Counter()
+        by_series: Counter[str] = Counter()
+        for row in room_rows:
+            ticket = tickets_by_room.get(row.id)
+            risk = risks_by_ticket.get(ticket.id) if ticket is not None else None
+            orders = orders_by_ticket.get(ticket.id, []) if ticket is not None else []
+            fills = [fill for order in orders for fill in fills_by_order.get(order.id, [])]
+            decision_counts[_weather_fast_decision_status(ticket=ticket, risk=risk, orders=orders, fills=fills, has_signal=row.id in signals_by_room)] += 1
+            if risk is not None:
+                risk_counts[str(risk.status or "<unknown>")] += 1
+            for order in orders:
+                order_counts[str(order.status or "<unknown>")] += 1
+            by_series[_series_from_ticker(row.market_ticker)] += 1
+
+        return {
+            "analysis_mode": "fast",
+            "window_days": days,
+            "row_count": len(room_rows),
+            "training_eligible_count": None,
+            "excluded_count": None,
+            "by_decision_status": dict(decision_counts),
+            "by_series": dict(by_series.most_common(20)),
+            "by_room_origin": dict(Counter(str(row.room_origin or "<unknown>") for row in room_rows)),
+            "by_stage": dict(Counter(str(row.stage or "<unknown>") for row in room_rows)),
+            "shadow_mode_counts": dict(Counter("shadow" if row.shadow_mode else "live" for row in room_rows)),
+            "signal_count": len(signals_by_room),
+            "ticket_count": len(tickets_by_room),
+            "risk_status_counts": dict(risk_counts),
+            "order_status_counts": dict(order_counts),
+            "fill_count": sum(len(fills) for fills in fills_by_order.values()),
+            "top_exclusion_reasons": [],
+            "pnl": {"scored_count": 0, "net_pnl_dollars": None, "avg_pnl_dollars": None},
+            "snapshot_source_kind_counts": {},
         }
 
     async def _crypto_readiness(
@@ -464,12 +601,12 @@ class OvernightReadinessService:
                     severity="warn",
                 )
             )
-        if _normalize_env(kalshi_env) == "production":
+        if _normalize_env(kalshi_env) == "production" and not self.settings.crypto_production_autonomy_enabled:
             hard_blockers.append(
                 _issue(
                     "crypto",
                     "crypto_production_autonomy_not_supported",
-                    "CryptoAutonomyService is currently demo-only for autonomous overnight trading.",
+                    "Crypto production autonomy requires CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true.",
                 )
             )
         if model is None:
@@ -515,6 +652,7 @@ class OvernightReadinessService:
                 "asset_symbols": asset_symbols,
                 "asset_modes": mode_summary["modes"],
                 "asset_mode_counts": mode_summary["counts"],
+                "crypto_production_autonomy_enabled": self.settings.crypto_production_autonomy_enabled,
                 "global_live_blockers": global_live_blockers,
                 "stored_snapshot_count": len(snapshots),
                 "stored_candle_count": len(candles),
@@ -667,6 +805,68 @@ def _weather_audit_summary(audit: dict[str, Any] | None) -> dict[str, Any]:
         "risk": audit.get("risk") or {},
         "issues": (audit.get("issues") or [])[:20],
     }
+
+
+def _weather_detailed_evidence(rows: list[dict[str, Any]], *, days: int) -> dict[str, Any]:
+    return {
+        "analysis_mode": "detailed",
+        "window_days": days,
+        "row_count": len(rows),
+        "training_eligible_count": sum(1 for row in rows if row.get("training_eligible")),
+        "excluded_count": sum(1 for row in rows if not row.get("training_eligible")),
+        "by_decision_status": dict(Counter(str(row.get("decision_status") or "<unknown>") for row in rows)),
+        "by_series": dict(Counter(str(row.get("series_ticker") or "<unknown>") for row in rows).most_common(20)),
+        "top_exclusion_reasons": Counter(
+            reason
+            for row in rows
+            for reason in row.get("exclusion_reasons", [])
+        ).most_common(20),
+        "pnl": _pnl_summary(rows),
+        "snapshot_source_kind_counts": dict(Counter(str(row.get("market_snapshot_source_kind") or "<missing>") for row in rows)),
+    }
+
+
+def _weather_fast_decision_status(
+    *,
+    ticket: TradeTicketRecord | None,
+    risk: RiskVerdictRecord | None,
+    orders: list[OrderRecord],
+    fills: list[FillRecord],
+    has_signal: bool,
+) -> str:
+    if fills:
+        return "filled"
+    if orders:
+        failed = {"failed", "rejected", "rejected_503", "order_id_missing", "lock_denied", "write_credentials_missing"}
+        if any(str(order.status).lower() in failed for order in orders):
+            return "order_failed"
+        return "ordered_unfilled"
+    if risk is not None and risk.status == "approved":
+        return "approved_no_order"
+    if risk is not None:
+        return f"risk_{risk.status}"
+    if ticket is not None:
+        return f"ticket_{ticket.status}"
+    if has_signal:
+        return "signal_only"
+    return "room_only"
+
+
+def _weather_ticker(market_ticker: str | None) -> bool:
+    ticker = str(market_ticker or "").upper()
+    return not any(
+        ticker.startswith(prefix)
+        for prefix in ("KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M", "KXDOGE15M", "KXBNB15M", "KXHYPE15M")
+    )
+
+
+def _series_from_ticker(market_ticker: str | None) -> str:
+    ticker = str(market_ticker or "").upper()
+    return ticker.split("-", 1)[0] if ticker else "<unknown>"
+
+
+def _batches(values: list[str], size: int = 5000) -> list[list[str]]:
+    return [values[idx:idx + size] for idx in range(0, len(values), size)]
 
 
 def _artifact_summary(artifact: Any | None) -> dict[str, Any]:

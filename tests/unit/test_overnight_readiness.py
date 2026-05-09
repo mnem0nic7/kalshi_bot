@@ -5,8 +5,10 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.crypto.services import CryptoAssetControlService
 from kalshi_bot.db.models import (
     Checkpoint,
@@ -14,6 +16,7 @@ from kalshi_bot.db.models import (
     CryptoMarketSnapshotRecord,
     CryptoSpotOHLCRecord,
     DeploymentControl,
+    Room,
 )
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -140,7 +143,12 @@ async def test_weather_readiness_filters_overnight_rows_and_blocks_freeze(tmp_pa
         has_write_credentials=True,
     )
 
-    report = await service.build_report(kalshi_env="production", domains="weather", now=NOW)
+    report = await service.build_report(
+        kalshi_env="production",
+        domains="weather",
+        weather_analysis_mode="detailed",
+        now=NOW,
+    )
 
     assert report["domains"]["weather"]["evidence"]["row_count"] == 2
     assert report["domains"]["weather"]["evidence"]["training_eligible_count"] == 1
@@ -148,6 +156,60 @@ async def test_weather_readiness_filters_overnight_rows_and_blocks_freeze(tmp_pa
     codes = {issue["code"] for issue in report["hard_blockers"]}
     assert "trade_behavior_production_entry_freeze_enabled" in codes
     assert "weather_auto_rooms_disabled" not in codes
+
+
+@pytest.mark.asyncio
+async def test_weather_fast_readiness_summarizes_overnight_rooms_without_trade_analysis(tmp_path) -> None:
+    settings, factory = await _settings_and_factory(tmp_path)
+    await _seed_control(factory)
+    async with factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        await repo.create_room(
+            room=RoomCreate(
+                name="overnight weather",
+                market_ticker="KXHIGHAUS-26MAY10-T70",
+            ),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env="production",
+            room_origin="live",
+        )
+        room = await repo.create_room(
+            room=RoomCreate(
+                name="day weather",
+                market_ticker="KXHIGHAUS-26MAY10-T71",
+            ),
+            active_color="blue",
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env="production",
+            room_origin="live",
+        )
+        room.created_at = datetime(2026, 5, 10, 19, 0, tzinfo=UTC)
+        first = (
+            await session.execute(
+                select(Room).where(Room.market_ticker == "KXHIGHAUS-26MAY10-T70")
+            )
+        ).scalar_one()
+        first.created_at = datetime(2026, 5, 10, 6, 30, tzinfo=UTC)
+        await session.commit()
+
+    service = OvernightReadinessService(
+        settings=settings,
+        session_factory=factory,
+        trade_analysis_service=FakeTradeAnalysisService([]),
+        trading_audit_service=FakeTradingAuditService(),
+        crypto_asset_control_service=CryptoAssetControlService(settings=settings, session_factory=factory),
+        has_write_credentials=True,
+    )
+
+    report = await service.build_report(kalshi_env="production", domains="weather", now=NOW)
+
+    evidence = report["domains"]["weather"]["evidence"]
+    assert evidence["analysis_mode"] == "fast"
+    assert evidence["row_count"] == 1
+    assert evidence["by_series"] == {"KXHIGHAUS": 1}
 
 
 @pytest.mark.asyncio

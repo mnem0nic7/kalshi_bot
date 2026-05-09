@@ -1023,6 +1023,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 end_hour=args.end_hour,
                 days=args.days,
                 frequency=args.frequency,
+                weather_analysis_mode=args.weather_analysis_mode,
                 limit=args.limit,
             )
             if args.json:
@@ -2118,6 +2119,7 @@ def build_parser() -> argparse.ArgumentParser:
     overnight_readiness.add_argument("--end-hour", type=int, default=6)
     overnight_readiness.add_argument("--days", type=int, default=180)
     overnight_readiness.add_argument("--frequency", default="15m")
+    overnight_readiness.add_argument("--weather-analysis-mode", choices=["fast", "detailed"], default="fast")
     overnight_readiness.add_argument("--limit", type=int, default=None)
     overnight_readiness.add_argument("--json", action="store_true")
 

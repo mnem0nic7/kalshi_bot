@@ -1477,3 +1477,94 @@ async def test_crypto_autonomy_run_once_can_be_forced_for_operator_shadow_pass(t
     assert forced["forced"] is True
     assert market_service.created == ["KXBTC15M-FORCE"]
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_autonomy_requires_explicit_production_fuse(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        kalshi_env="production",
+        app_shadow_mode=False,
+        crypto_autonomy_enabled=True,
+        crypto_production_autonomy_enabled=False,
+    )
+    engine = create_engine(settings)
+    result = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=create_session_factory(engine),
+        market_service=object(),  # type: ignore[arg-type]
+        asset_control_service=object(),  # type: ignore[arg-type]
+        workflow_service=object(),  # type: ignore[arg-type]
+    ).run_once()
+
+    assert result["status"] == "production_blocked"
+    assert "CRYPTO_PRODUCTION_AUTONOMY_ENABLED" in result["reason"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_autonomy_production_fuse_skips_non_live_eligible_markets(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        kalshi_env="production",
+        app_shadow_mode=False,
+        crypto_autonomy_enabled=True,
+        crypto_production_autonomy_enabled=True,
+        crypto_trading_enabled=True,
+        crypto_autonomy_min_seconds_to_close=120,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            kalshi_env=settings.kalshi_env,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await session.commit()
+
+    class _FakeKalshi:
+        write_credentials = None
+
+    class _FakeMarketService:
+        kalshi = _FakeKalshi()
+
+        def __init__(self) -> None:
+            self.created: list[str] = []
+            self.markets = [
+                _market(
+                    market_ticker="KXBTC15M-PROD",
+                    asset_symbol="BTC",
+                    close_time=datetime.now(UTC) + timedelta(minutes=10),
+                )
+            ]
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            return self.markets
+
+        async def create_room_for_market(self, market_ticker: str, *, reason: str) -> dict[str, object]:
+            self.created.append(market_ticker)
+            return {"room_id": "should-not-create"}
+
+    class _FakeWorkflowService:
+        async def run_room(self, room_id: str, *, reason: str) -> None:
+            self.room_id = room_id
+
+    market_service = _FakeMarketService()
+    result = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=market_service,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=_FakeWorkflowService(),  # type: ignore[arg-type]
+    ).run_once()
+
+    assert result["status"] == "ok"
+    assert market_service.created == []
+    assert result["skipped"][0]["reason"] == "not_live_eligible"
+    assert "Asset BTC mode is shadow; set it to live to allow live orders." in result["skipped"][0]["live_blockers"]
+    await engine.dispose()

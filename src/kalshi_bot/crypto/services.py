@@ -2144,11 +2144,12 @@ class CryptoAutonomyService:
         freq = normalize_frequency(frequency) or "15m"
         if not self.settings.crypto_autonomy_enabled and not force:
             return {"status": "disabled", "frequency": freq, "reason": "crypto_autonomy_enabled is false"}
-        if self.settings.kalshi_env != "demo":
+        production_mode = str(self.settings.kalshi_env or "").strip().lower() != "demo"
+        if production_mode and not self.settings.crypto_production_autonomy_enabled:
             return {
                 "status": "production_blocked",
                 "frequency": freq,
-                "reason": "crypto shadow autonomy is demo-only",
+                "reason": "crypto production autonomy requires CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true",
                 "kalshi_env": self.settings.kalshi_env,
             }
         async with self.session_factory() as session:
@@ -2190,6 +2191,17 @@ class CryptoAutonomyService:
                     market=market,
                     has_write_credentials=self.market_service.kalshi.write_credentials is not None,
                 )
+                if production_mode and not live_status["live_eligible"]:
+                    skipped.append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "reason": "not_live_eligible",
+                            "asset_mode": live_status["asset_mode"],
+                            "live_blockers": live_status["live_blockers"],
+                        }
+                    )
+                    continue
                 if live_status["asset_mode"] == CRYPTO_ASSET_MODE_OFF:
                     skipped.append(
                         {

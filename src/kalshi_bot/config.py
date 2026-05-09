@@ -150,6 +150,7 @@ class Settings(BaseSettings):
     crypto_spot_history_auto_lookback_days: int = 2
     crypto_replay_min_spot_coverage_pct: float = 0.80
     crypto_autonomy_enabled: bool = False
+    crypto_production_autonomy_enabled: bool = False
     crypto_autonomy_interval_seconds: int = 60
     crypto_autonomy_min_seconds_to_close: int = 120
     crypto_autonomy_max_rooms_per_run: int = 7
