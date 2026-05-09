@@ -60,13 +60,26 @@ def _is_transient_stream_reconnect(event: OpsEvent) -> bool:
     return "keepalive ping timeout" in text and ("no close frame" in text or "1011" in text)
 
 
+def _is_strategy_auto_evolve_stale_diagnostic(event: OpsEvent) -> bool:
+    payload = _event_payload(event)
+    if str(event.source or "").lower() != "strategy_auto_evolve":
+        return False
+    if str(payload.get("event_kind") or "").lower() != "auto_evolve":
+        return False
+    return "stale" in _event_text(event)
+
+
 def _ignored_fast_gate_ops_category(event: OpsEvent) -> str | None:
+    if str(event.severity or "").lower() == "critical":
+        return None
     if _is_background_research_market_not_found(event):
         return "research_market_event_404"
     if _is_watchdog_heartbeat_stale_recovery(event):
         return "watchdog_heartbeat_stale_recovery"
     if _is_transient_stream_reconnect(event):
         return "stream_transient_reconnect"
+    if _is_strategy_auto_evolve_stale_diagnostic(event):
+        return "strategy_auto_evolve_stale_diagnostic"
     return None
 
 

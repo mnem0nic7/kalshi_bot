@@ -625,6 +625,29 @@ async def test_trade_behavior_fast_validation_ignores_known_benign_ops_noise(tmp
                     updated_at=NOW - timedelta(minutes=1),
                 )
             )
+            session.add(
+                OpsEvent(
+                    id="strategy-auto-evolve-stale-diagnostic",
+                    kalshi_env="production",
+                    severity="warning",
+                    source="strategy_auto_evolve",
+                    summary="Strategy Auto-Evolve completed: no strategy activated",
+                    payload={
+                        "event_kind": "auto_evolve",
+                        "trading_audit": {
+                            "issues": [
+                                {
+                                    "severity": "medium",
+                                    "code": "stale_data_blocks_or_events",
+                                    "summary": "Stale market or research data is affecting trading decisions.",
+                                }
+                            ]
+                        },
+                    },
+                    created_at=NOW - timedelta(minutes=1),
+                    updated_at=NOW - timedelta(minutes=1),
+                )
+            )
             await session.commit()
 
         report = await build_trade_behavior_validation_report(
@@ -650,6 +673,7 @@ async def test_trade_behavior_fast_validation_ignores_known_benign_ops_noise(tmp
         "research_market_event_404": 12,
         "stream_transient_reconnect": 12,
         "watchdog_heartbeat_stale_recovery": 1,
+        "strategy_auto_evolve_stale_diagnostic": 1,
     }
 
 
