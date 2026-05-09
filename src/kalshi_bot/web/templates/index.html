@@ -270,6 +270,60 @@
 
     </div>
 
+    {% set recent_room_decisions = env_data.recent_room_decisions or [] %}
+    <article class="dash-card dash-card-room-decisions" data-testid="recent-room-decisions">
+      <div class="dash-card-header">
+        <div class="dash-card-title-block">
+          <h2>Recent Room Decisions</h2>
+          <span class="muted-label">Latest room outcomes, including no-trade stand-downs</span>
+        </div>
+        <span class="muted-label room-decisions-count-label">{{ recent_room_decisions | length }} room{{ "s" if recent_room_decisions | length != 1 }}</span>
+      </div>
+      {% if recent_room_decisions %}
+      <div class="table-wrap room-decisions-wrap">
+        <table class="positions-table room-decisions-table">
+          <thead>
+            <tr><th>Market</th><th>Decision</th><th>Side</th><th>Edge</th><th>Fair</th><th>Reason</th><th>Updated</th></tr>
+          </thead>
+          <tbody>
+            {% for item in recent_room_decisions %}
+            <tr>
+              <td class="mono">
+                <div class="room-decision-market-cell">
+                  <a href="{{ item.url }}">{{ item.market_ticker }}</a>
+                  <span class="muted-label">{{ item.room_origin }} · {{ item.stage }}</span>
+                </div>
+              </td>
+              <td>
+                <span class="status-pill {% if item.status_tone == 'good' %}status-good{% elif item.status_tone == 'warning' %}status-warning{% elif item.status_tone == 'bad' %}status-bad{% else %}status-neutral{% endif %}">{{ item.status_label }}</span>
+              </td>
+              <td class="mono">{{ item.selected_side }}</td>
+              <td class="mono">
+                {{ item.selected_edge_display }}
+                {% if item.quality_adjusted_edge_display %}<span class="muted-label room-decision-subvalue">qa {{ item.quality_adjusted_edge_display }}</span>{% endif %}
+              </td>
+              <td class="mono">
+                {{ item.fair_yes_display }}
+                <span class="muted-label room-decision-subvalue">{{ item.confidence_display }}</span>
+              </td>
+              <td class="room-decision-reason">
+                <strong>{{ item.reason }}</strong>
+                {% if item.weather_display != "—" %}<span class="muted-label">{{ item.weather_display }}</span>{% endif %}
+                {% if item.summary %}<span class="muted-label room-decision-summary">{{ item.summary }}</span>{% endif %}
+              </td>
+              <td class="muted-label">
+                {% if item.updated_at %}<span data-timestamp="{{ item.updated_at }}" title="{{ item.updated_at }}">{{ item.updated_at }}</span>{% else %}—{% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="empty-state">No recent room decisions.</p>
+      {% endif %}
+    </article>
+
     {% set recent_trade_proposals = env_data.recent_trading_activity or env_data.recent_trade_proposals or [] %}
     <article class="dash-card dash-card-proposals" data-testid="recent-trade-proposals">
       <div class="dash-card-header">

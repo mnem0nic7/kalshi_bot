@@ -609,6 +609,98 @@ async def test_recent_trading_activity_views_merges_tickets_orders_and_fills() -
 
 
 @pytest.mark.asyncio
+async def test_recent_room_decision_views_reports_stand_downs_and_blocks() -> None:
+    now = datetime(2026, 5, 9, 18, 30, tzinfo=UTC)
+    stand_down = SimpleNamespace(
+        room_id="room-stand-down",
+        name="Seattle high temperature",
+        market_ticker="KXHIGHSEA-26MAY09-T67",
+        room_origin="live",
+        stage="complete",
+        shadow_mode=False,
+        created_at=now - timedelta(minutes=2),
+        updated_at=now - timedelta(minutes=1),
+        signal_id="signal-stand-down",
+        fair_yes_dollars=Decimal("0.1957"),
+        edge_bps=4443,
+        confidence=0.71,
+        signal_summary="NO has edge but forecast separation is too narrow.",
+        signal_payload={
+            "final_stand_down_reason": "insufficient_forecast_separation",
+            "candidate_trace": {
+                "selected_side": "no",
+                "selected_edge_bps": 4443,
+                "no": {"quality_adjusted_edge_bps": 4418},
+            },
+            "trader_context": {"numeric_facts": {"forecast_delta_f": -1.6, "threshold_f": 67.0}},
+        },
+        trade_ticket_id=None,
+        ticket_action=None,
+        ticket_side=None,
+        ticket_yes_price_dollars=None,
+        ticket_count_fp=None,
+        ticket_status=None,
+        risk_status=None,
+        risk_reasons=None,
+        order_count=0,
+        fill_count=0,
+    )
+    risk_block = SimpleNamespace(
+        room_id="room-risk-block",
+        name="Houston high temperature",
+        market_ticker="KXHIGHTHOU-26MAY09-T70",
+        room_origin="live",
+        stage="complete",
+        shadow_mode=False,
+        created_at=now - timedelta(minutes=5),
+        updated_at=now - timedelta(minutes=4),
+        signal_id="signal-risk-block",
+        fair_yes_dollars=Decimal("0.7700"),
+        edge_bps=2186,
+        confidence=0.83,
+        signal_summary="YES clears model edge.",
+        signal_payload={
+            "candidate_trace": {"selected_side": "yes", "selected_edge_bps": 2186},
+        },
+        trade_ticket_id="ticket-risk-block",
+        ticket_action="buy",
+        ticket_side="yes",
+        ticket_yes_price_dollars=Decimal("0.7700"),
+        ticket_count_fp=Decimal("2.29"),
+        ticket_status="blocked",
+        risk_status="blocked",
+        risk_reasons=["Existing live position blocks same-ticker add-ons."],
+        order_count=0,
+        fill_count=0,
+    )
+
+    views = await control_room_module._recent_room_decision_views(
+        _SequenceSession([[stand_down, risk_block]]),
+        kalshi_env="production",
+        market_prefix="KXHIGH",
+    )
+
+    assert views[0]["status"] == "no_trade"
+    assert views[0]["status_label"] == "No trade"
+    assert views[0]["selected_side"] == "NO"
+    assert views[0]["selected_edge_display"] == "4443bps"
+    assert views[0]["quality_adjusted_edge_display"] == "4418bps"
+    assert views[0]["fair_yes_display"] == "$0.1957"
+    assert views[0]["confidence_display"] == "71%"
+    assert views[0]["reason"] == "Insufficient forecast separation"
+    assert views[0]["weather_display"] == "delta -1.6F · threshold 67F"
+    assert views[1]["status"] == "blocked"
+    assert views[1]["status_label"] == "Risk blocked"
+    assert views[1]["reason"] == "Existing live position blocks same-ticker add-ons."
+    assert views[1]["ticket"] == {
+        "action": "buy",
+        "side": "yes",
+        "yes_price_dollars": "0.7700",
+        "count_fp": "2.29",
+    }
+
+
+@pytest.mark.asyncio
 async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 4, 17, 17, 50, tzinfo=UTC)
     positions = [
@@ -909,6 +1001,21 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
             ]
         ),
     )
+    monkeypatch.setattr(
+        control_room_module,
+        "_recent_room_decision_views",
+        AsyncMock(
+            return_value=[
+                {
+                    "room_id": "room-1",
+                    "market_ticker": "KXHIGHCHI-26APR17-T79",
+                    "status": "no_trade",
+                    "status_label": "No trade",
+                    "reason": "Insufficient forecast separation",
+                }
+            ]
+        ),
+    )
 
     payload = await control_room_module.build_env_dashboard(container, "demo")
 
@@ -940,6 +1047,8 @@ async def test_build_env_dashboard_includes_balance_and_position_pnl(monkeypatch
     assert payload["positions"][1]["entry_lot_count"] == 2
     assert payload["positions_summary"]["capital_buckets"]["risky_limit_display"] == "$75.00"
     assert payload["recent_trading_activity"][0]["event_type"] == "ticket"
+    assert payload["recent_room_decisions"][0]["status_label"] == "No trade"
+    assert payload["recent_room_decisions"][0]["market_ticker"] == "KXHIGHCHI-26APR17-T79"
     assert payload["recent_trade_proposals"][0]["market_ticker"] == "KXHIGHCHI-26APR17-T79"
     assert payload["recent_trade_proposals"] == payload["recent_trading_activity"]
     assert payload["recent_trade_proposals"][0]["risk_status"] == "blocked"

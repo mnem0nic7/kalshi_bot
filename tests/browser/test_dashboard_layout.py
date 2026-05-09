@@ -144,6 +144,49 @@ def _build_recent_trade_proposals() -> list[dict[str, object]]:
     ]
 
 
+def _build_recent_room_decisions() -> list[dict[str, object]]:
+    return [
+        {
+            "room_id": "room-sea",
+            "url": "/rooms/room-sea",
+            "market_ticker": "KXHIGHSEA-26MAY09-T67",
+            "room_origin": "live",
+            "stage": "complete",
+            "status": "no_trade",
+            "status_label": "No trade",
+            "status_tone": "warning",
+            "selected_side": "NO",
+            "selected_edge_display": "4443bps",
+            "quality_adjusted_edge_display": "4418bps",
+            "fair_yes_display": "$0.1957",
+            "confidence_display": "71%",
+            "weather_display": "delta -1.6F · threshold 67F",
+            "reason": "Insufficient forecast separation",
+            "summary": "NO has edge but forecast separation is too narrow.",
+            "updated_at": "2026-05-09T18:30:00+00:00",
+        },
+        {
+            "room_id": "room-hou",
+            "url": "/rooms/room-hou",
+            "market_ticker": "KXHIGHTHOU-26MAY09-T70",
+            "room_origin": "live",
+            "stage": "complete",
+            "status": "blocked",
+            "status_label": "Risk blocked",
+            "status_tone": "bad",
+            "selected_side": "YES",
+            "selected_edge_display": "2186bps",
+            "quality_adjusted_edge_display": None,
+            "fair_yes_display": "$0.7700",
+            "confidence_display": "83%",
+            "weather_display": "—",
+            "reason": "Existing live position blocks same-ticker add-ons.",
+            "summary": "YES clears model edge.",
+            "updated_at": "2026-05-09T18:25:00+00:00",
+        },
+    ]
+
+
 def _build_env_payload(
     cash_display: str,
     positions_count: int,
@@ -160,6 +203,7 @@ def _build_env_payload(
     total_unrealized_pnl_tone: str = "good",
     has_pnl_summary: bool = True,
     session_pnl: dict[str, object] | None = None,
+    recent_room_decisions: list[dict[str, object]] | None = None,
     recent_trading_activity: list[dict[str, object]] | None = None,
     recent_trade_proposals: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
@@ -193,6 +237,7 @@ def _build_env_payload(
         "alerts": [],
         "active_rooms": [],
         "positions": _build_positions(positions_count),
+        "recent_room_decisions": recent_room_decisions or [],
         "recent_trading_activity": activity,
         "recent_trade_proposals": activity,
         "positions_summary": {
@@ -1013,6 +1058,46 @@ def test_recent_trading_activity_renders_at_bottom_of_demo_and_production(
                 assert "Spread too wide for entry." in production_text
                 production_timestamp = page.locator('#panel-production [data-testid="recent-trade-proposals"] [data-timestamp="2026-04-22T21:03:00+00:00"]').first
                 assert production_timestamp.count() == 1
+            finally:
+                browser.close()
+
+
+def test_recent_room_decisions_render_above_trading_activity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payloads = {
+        "demo": _build_env_payload(
+            "$1,250.00",
+            positions_count=1,
+            recent_room_decisions=_build_recent_room_decisions(),
+            recent_trade_proposals=_build_recent_trade_proposals(),
+        ),
+        "production": _build_env_payload("$2,500.00", positions_count=1),
+    }
+    with _serve_dashboard(monkeypatch, tmp_path, payloads=payloads) as base_url:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            try:
+                page.goto(base_url, wait_until="load", timeout=15_000)
+                page.wait_for_selector('#panel-demo [data-testid="recent-room-decisions"]', timeout=15_000)
+                decisions = page.locator('#panel-demo [data-testid="recent-room-decisions"]')
+                activity = page.locator('#panel-demo [data-testid="recent-trade-proposals"]')
+                decisions_text = decisions.text_content(timeout=15_000) or ""
+
+                assert decisions.bounding_box()["y"] < activity.bounding_box()["y"]
+                assert "Recent Room Decisions" in decisions_text
+                assert "2 rooms" in decisions_text
+                assert "No trade" in decisions_text
+                assert "Risk blocked" in decisions_text
+                assert "KXHIGHSEA-26MAY09-T67" in decisions_text
+                assert "KXHIGHTHOU-26MAY09-T70" in decisions_text
+                assert "4443bps" in decisions_text
+                assert "qa 4418bps" in decisions_text
+                assert "Insufficient forecast separation" in decisions_text
+                assert "Existing live position blocks same-ticker add-ons." in decisions_text
+                timestamp = decisions.locator('[data-timestamp="2026-05-09T18:30:00+00:00"]').first
+                assert timestamp.count() == 1
             finally:
                 browser.close()
 

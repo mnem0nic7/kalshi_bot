@@ -637,6 +637,100 @@
     tableWrap.replaceChildren(table);
   }
 
+  function renderRecentRoomDecisions(card, decisions) {
+    if (!card) return;
+    const countLabel = card.querySelector(".room-decisions-count-label");
+    if (countLabel) countLabel.textContent = `${decisions.length} room${decisions.length !== 1 ? "s" : ""}`;
+
+    const empty = card.querySelector("p.empty-state");
+    if (!decisions.length) {
+      const wrap = card.querySelector(".room-decisions-wrap");
+      if (wrap) wrap.remove();
+      if (!empty) card.appendChild(el("p", "empty-state", "No recent room decisions."));
+      return;
+    }
+    if (empty) empty.remove();
+
+    let tableWrap = card.querySelector(".room-decisions-wrap");
+    if (!tableWrap) {
+      tableWrap = el("div", "table-wrap room-decisions-wrap");
+      card.appendChild(tableWrap);
+    }
+
+    const table = el("table", "positions-table room-decisions-table");
+    const thead = el("thead");
+    const headerRow = el("tr");
+    ["Market", "Decision", "Side", "Edge", "Fair", "Reason", "Updated"].forEach((h) => {
+      headerRow.appendChild(el("th", null, h));
+    });
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+
+    const tbody = el("tbody");
+    decisions.forEach((decision) => {
+      const tr = el("tr");
+
+      const marketTd = el("td", "mono");
+      const marketWrap = el("div", "room-decision-market-cell");
+      if (decision.url) {
+        const link = el("a", null, decision.market_ticker || "—");
+        link.href = decision.url;
+        marketWrap.appendChild(link);
+      } else {
+        marketWrap.appendChild(el("span", null, decision.market_ticker || "—"));
+      }
+      marketWrap.appendChild(
+        el("span", "muted-label", `${decision.room_origin || "room"} · ${decision.stage || "unknown"}`),
+      );
+      marketTd.appendChild(marketWrap);
+
+      const decisionTd = el("td");
+      decisionTd.appendChild(
+        el("span", `status-pill ${statusPillClass(decision.status_tone || "neutral")}`, decision.status_label || "—"),
+      );
+
+      const edgeTd = el("td", "mono", decision.selected_edge_display || "—");
+      if (decision.quality_adjusted_edge_display) {
+        edgeTd.appendChild(el("span", "muted-label room-decision-subvalue", `qa ${decision.quality_adjusted_edge_display}`));
+      }
+
+      const fairTd = el("td", "mono", decision.fair_yes_display || "—");
+      fairTd.appendChild(el("span", "muted-label room-decision-subvalue", decision.confidence_display || "—"));
+
+      const reasonTd = el("td", "room-decision-reason");
+      reasonTd.appendChild(el("strong", null, decision.reason || "—"));
+      if (decision.weather_display && decision.weather_display !== "—") {
+        reasonTd.appendChild(el("span", "muted-label", decision.weather_display));
+      }
+      if (decision.summary) {
+        reasonTd.appendChild(el("span", "muted-label room-decision-summary", decision.summary));
+      }
+
+      const updatedTd = el("td", "muted-label");
+      if (decision.updated_at) {
+        const timeNode = el("span", null, formatAge(decision.updated_at));
+        timeNode.dataset.timestamp = decision.updated_at;
+        timeNode.title = decision.updated_at;
+        updatedTd.appendChild(timeNode);
+      } else {
+        updatedTd.textContent = "—";
+      }
+
+      tr.append(
+        marketTd,
+        decisionTd,
+        el("td", "mono", decision.selected_side || "—"),
+        edgeTd,
+        fairTd,
+        reasonTd,
+        updatedTd,
+      );
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    tableWrap.replaceChildren(table);
+  }
+
   function renderCapitalBuckets(card, summary) {
     if (!card) return;
     const line = card.querySelector(".bucket-usage-line");
@@ -667,6 +761,7 @@
       renderAlerts(panel.querySelector(".dash-card-alerts"), data.alerts || []);
       renderCapitalBuckets(panel.querySelector(".dash-card-positions"), data.positions_summary || {});
       renderPositions(panel.querySelector(".dash-card-positions"), data.positions || [], data.positions_summary || {});
+      renderRecentRoomDecisions(panel.querySelector(".dash-card-room-decisions"), data.recent_room_decisions || []);
       renderRecentTradeProposals(
         panel.querySelector(".dash-card-proposals"),
         data.recent_trading_activity || data.recent_trade_proposals || [],

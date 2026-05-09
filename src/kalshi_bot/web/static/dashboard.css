@@ -385,6 +385,43 @@
   word-break: break-word;
 }
 
+.room-decisions-wrap {
+  max-height: 34rem;
+  overflow: auto;
+}
+
+.room-decisions-table {
+  min-width: 980px;
+}
+
+.room-decision-market-cell,
+.room-decision-reason {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.room-decision-market-cell a {
+  color: #dce8f7;
+  text-decoration: none;
+}
+
+.room-decision-market-cell a:hover {
+  color: #f4d27b;
+}
+
+.room-decision-subvalue,
+.room-decision-summary {
+  display: block;
+  font-size: 0.82rem;
+}
+
+.room-decision-summary {
+  max-width: 720px;
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .position-flag {
   display: inline-flex;
   align-items: center;

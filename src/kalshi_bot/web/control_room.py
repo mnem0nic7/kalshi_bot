@@ -89,6 +89,7 @@ ROOM_TAB_LIMIT = 40
 POSITION_LIMIT = 100
 OPS_EVENT_LIMIT = 40
 RECENT_TRADE_PROPOSAL_LIMIT = 10
+RECENT_ROOM_DECISION_LIMIT = 500
 RESEARCH_ACTIVE_STATUSES = {"active", "open"}
 STRATEGY_WINDOW_OPTIONS = (30, 90, DEFAULT_STRATEGY_WINDOW_DAYS)
 STRATEGY_EVENT_LIMIT = 80
@@ -399,6 +400,184 @@ def _room_reason(bundle: Any) -> str | None:
         or outcome.final_status
         or outcome.room_stage
     )
+
+
+def _clean_reason_label(reason: Any) -> str:
+    normalized = str(reason or "").strip()
+    if not normalized:
+        return "—"
+    labels = {
+        "empirical_gate_block": "Empirical gate block",
+        "empirical_gate_under_sampled": "Empirical gate under-sampled",
+        "insufficient_forecast_separation": "Insufficient forecast separation",
+        "no_actionable_edge": "No actionable edge",
+        "forecast_delta_missing": "Forecast delta missing",
+        "resolved_contract": "Resolved contract",
+        "market_stale": "Market stale",
+        "spread_too_wide": "Spread too wide",
+        "entry_freeze": "Entry freeze",
+    }
+    return labels.get(normalized, normalized.replace("_", " ").title())
+
+
+def _nested_dict_value(payload: dict[str, Any], *path: str) -> Any:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _candidate_trace(payload: dict[str, Any]) -> dict[str, Any]:
+    direct = payload.get("candidate_trace")
+    if isinstance(direct, dict):
+        return direct
+    nested = _nested_dict_value(payload, "eligibility", "candidate_trace")
+    return nested if isinstance(nested, dict) else {}
+
+
+def _int_or_none(value: Any) -> int | None:
+    numeric = _float_or_none(value)
+    return int(numeric) if numeric is not None else None
+
+
+def _room_decision_from_row(row: Any) -> dict[str, Any]:
+    payload = row.signal_payload if isinstance(getattr(row, "signal_payload", None), dict) else {}
+    trace = _candidate_trace(payload)
+    eligibility = payload.get("eligibility") if isinstance(payload.get("eligibility"), dict) else {}
+    trade_behavior_context = (
+        payload.get("trade_behavior_context") if isinstance(payload.get("trade_behavior_context"), dict) else {}
+    )
+    selected_side = (
+        trace.get("selected_side")
+        or payload.get("recommended_side")
+        or trade_behavior_context.get("side")
+        or getattr(row, "ticket_side", None)
+    )
+    selected_edge_bps = (
+        trace.get("selected_edge_bps")
+        or payload.get("edge_effective_bps")
+        or getattr(row, "edge_bps", None)
+    )
+    quality_adjusted_edge_bps = eligibility.get("edge_after_quality_buffer_bps")
+    if quality_adjusted_edge_bps is None and selected_side and isinstance(trace.get(str(selected_side)), dict):
+        quality_adjusted_edge_bps = trace[str(selected_side)].get("quality_adjusted_edge_bps")
+    stand_down_reason = (
+        payload.get("final_stand_down_reason")
+        or payload.get("stand_down_reason")
+        or eligibility.get("stand_down_reason")
+        or trace.get("eligibility_stand_down_reason")
+    )
+    numeric_facts = _nested_dict_value(payload, "trader_context", "numeric_facts")
+    if not isinstance(numeric_facts, dict):
+        numeric_facts = {}
+    orders_submitted = int(getattr(row, "order_count", None) or 0)
+    fills_observed = int(getattr(row, "fill_count", None) or 0)
+    ticket_id = getattr(row, "trade_ticket_id", None)
+    ticket_status = str(getattr(row, "ticket_status", None) or "").lower()
+    risk_status = str(getattr(row, "risk_status", None) or "").lower()
+    room_stage = str(getattr(row, "stage", "") or "")
+
+    if fills_observed:
+        status = "filled"
+        status_label = "Filled"
+        status_tone = "good"
+        reason = "Fill observed"
+    elif orders_submitted:
+        status = "ordered"
+        status_label = "Order submitted"
+        status_tone = "good"
+        reason = "Order submitted"
+    elif ticket_id and risk_status == "blocked":
+        status = "blocked"
+        status_label = "Risk blocked"
+        status_tone = "bad"
+        reasons = getattr(row, "risk_reasons", None) or []
+        reason = "; ".join(str(item) for item in reasons) or _clean_reason_label(risk_status)
+    elif ticket_id:
+        status = ticket_status or "ticket"
+        status_label = _clean_reason_label(ticket_status or "ticket generated")
+        status_tone = "good" if ticket_status in {"approved", "submitted", "executed", "filled"} else "warning"
+        reason = "Trade ticket generated"
+    elif stand_down_reason:
+        status = "no_trade"
+        status_label = "No trade"
+        status_tone = "warning" if stand_down_reason not in {"no_actionable_edge"} else "neutral"
+        reason = _clean_reason_label(stand_down_reason)
+    elif getattr(row, "signal_id", None):
+        status = "signal_only"
+        status_label = "Signal only"
+        status_tone = "neutral"
+        reason = "No trade ticket generated"
+    elif room_stage not in {"complete", "failed"}:
+        status = "running"
+        status_label = "Running"
+        status_tone = "neutral"
+        reason = _clean_reason_label(room_stage)
+    else:
+        status = "no_signal"
+        status_label = "No signal"
+        status_tone = "warning"
+        reason = _clean_reason_label(room_stage)
+
+    fair_yes = _decimal_or_none(getattr(row, "fair_yes_dollars", None))
+    confidence = _float_or_none(getattr(row, "confidence", None))
+    confidence_display = f"{confidence:.0%}" if confidence is not None else "—"
+    selected_edge_bps_int = _int_or_none(selected_edge_bps)
+    quality_adjusted_edge_bps_int = _int_or_none(quality_adjusted_edge_bps)
+    edge_display = f"{selected_edge_bps_int}bps" if selected_edge_bps_int is not None else "—"
+    quality_edge_display = f"{quality_adjusted_edge_bps_int}bps" if quality_adjusted_edge_bps_int is not None else None
+    forecast_delta = _float_or_none(numeric_facts.get("forecast_delta_f"))
+    threshold = _float_or_none(numeric_facts.get("threshold_f"))
+    weather_bits = []
+    if forecast_delta is not None:
+        weather_bits.append(f"delta {forecast_delta:+.1f}F")
+    if threshold is not None:
+        weather_bits.append(f"threshold {threshold:.0f}F")
+    return {
+        "room_id": getattr(row, "room_id", None),
+        "url": f"/rooms/{getattr(row, 'room_id', '')}",
+        "market_ticker": getattr(row, "market_ticker", None),
+        "name": getattr(row, "name", None),
+        "room_origin": getattr(row, "room_origin", None),
+        "stage": room_stage,
+        "shadow_mode": bool(getattr(row, "shadow_mode", False)),
+        "created_at": _iso_or_none(getattr(row, "created_at", None)),
+        "updated_at": _iso_or_none(getattr(row, "updated_at", None)),
+        "status": status,
+        "status_label": status_label,
+        "status_tone": status_tone,
+        "selected_side": str(selected_side).upper() if selected_side else "—",
+        "selected_edge_bps": selected_edge_bps_int,
+        "selected_edge_display": edge_display,
+        "quality_adjusted_edge_bps": quality_adjusted_edge_bps_int,
+        "quality_adjusted_edge_display": quality_edge_display,
+        "fair_yes_dollars": str(fair_yes) if fair_yes is not None else None,
+        "fair_yes_display": _price_display(fair_yes),
+        "confidence": confidence,
+        "confidence_display": confidence_display,
+        "forecast_delta_f": forecast_delta,
+        "threshold_f": threshold,
+        "weather_display": " · ".join(weather_bits) if weather_bits else "—",
+        "reason": reason,
+        "stand_down_reason": stand_down_reason,
+        "risk_status": risk_status or None,
+        "risk_reasons": list(getattr(row, "risk_reasons", None) or []),
+        "summary": getattr(row, "signal_summary", None) or "",
+        "ticket": _compact_ticket(
+            {
+                "action": getattr(row, "ticket_action", None),
+                "side": getattr(row, "ticket_side", None),
+                "yes_price_dollars": getattr(row, "ticket_yes_price_dollars", None),
+                "count_fp": getattr(row, "ticket_count_fp", None),
+            }
+            if ticket_id
+            else None
+        ),
+        "orders_submitted": orders_submitted,
+        "fills_observed": fills_observed,
+    }
 
 
 def _compact_ticket(ticket: Any) -> dict[str, Any] | None:
@@ -948,6 +1127,131 @@ async def _recent_trading_activity_views(
 
 async def _recent_trade_proposal_views(session: Any, *, kalshi_env: str, limit: int = RECENT_TRADE_PROPOSAL_LIMIT) -> list[dict[str, Any]]:
     return await _recent_trading_activity_views(session, kalshi_env=kalshi_env, limit=limit)
+
+
+async def _recent_room_decision_views(
+    session: Any,
+    *,
+    kalshi_env: str,
+    limit: int = RECENT_ROOM_DECISION_LIMIT,
+    market_prefix: str | None = None,
+) -> list[dict[str, Any]]:
+    conditions = [
+        Room.kalshi_env == kalshi_env,
+        Room.room_origin.in_([RoomOrigin.LIVE.value, RoomOrigin.SHADOW.value]),
+    ]
+    if market_prefix:
+        conditions.append(Room.market_ticker.startswith(market_prefix))
+    recent_rooms = (
+        select(
+            Room.id.label("room_id"),
+            Room.name.label("name"),
+            Room.market_ticker.label("market_ticker"),
+            Room.room_origin.label("room_origin"),
+            Room.stage.label("stage"),
+            Room.shadow_mode.label("shadow_mode"),
+            Room.created_at.label("created_at"),
+            Room.updated_at.label("updated_at"),
+        )
+        .where(*conditions)
+        .order_by(Room.created_at.desc(), Room.updated_at.desc())
+        .limit(limit)
+        .cte("recent_room_decisions")
+    )
+    recent_room_ids = select(recent_rooms.c.room_id)
+    latest_signal = (
+        select(
+            Signal.room_id.label("room_id"),
+            Signal.id.label("signal_id"),
+            Signal.fair_yes_dollars.label("fair_yes_dollars"),
+            Signal.edge_bps.label("edge_bps"),
+            Signal.confidence.label("confidence"),
+            Signal.summary.label("signal_summary"),
+            Signal.payload.label("signal_payload"),
+            func.row_number().over(partition_by=Signal.room_id, order_by=Signal.updated_at.desc()).label("rn"),
+        )
+        .where(Signal.room_id.in_(recent_room_ids))
+        .subquery()
+    )
+    latest_ticket = (
+        select(
+            TradeTicketRecord.room_id.label("room_id"),
+            TradeTicketRecord.id.label("trade_ticket_id"),
+            TradeTicketRecord.action.label("ticket_action"),
+            TradeTicketRecord.side.label("ticket_side"),
+            TradeTicketRecord.yes_price_dollars.label("ticket_yes_price_dollars"),
+            TradeTicketRecord.count_fp.label("ticket_count_fp"),
+            TradeTicketRecord.status.label("ticket_status"),
+            func.row_number()
+            .over(partition_by=TradeTicketRecord.room_id, order_by=TradeTicketRecord.updated_at.desc())
+            .label("rn"),
+        )
+        .where(TradeTicketRecord.room_id.in_(recent_room_ids))
+        .subquery()
+    )
+    latest_ticket_ids = select(latest_ticket.c.trade_ticket_id).where(latest_ticket.c.rn == 1)
+    latest_risk = (
+        select(
+            RiskVerdictRecord.ticket_id.label("ticket_id"),
+            RiskVerdictRecord.status.label("risk_status"),
+            RiskVerdictRecord.reasons.label("risk_reasons"),
+            func.row_number()
+            .over(partition_by=RiskVerdictRecord.ticket_id, order_by=RiskVerdictRecord.updated_at.desc())
+            .label("rn"),
+        )
+        .where(RiskVerdictRecord.ticket_id.in_(latest_ticket_ids))
+        .subquery()
+    )
+    order_counts = (
+        select(OrderRecord.trade_ticket_id.label("trade_ticket_id"), func.count(OrderRecord.id).label("order_count"))
+        .where(OrderRecord.trade_ticket_id.in_(latest_ticket_ids))
+        .group_by(OrderRecord.trade_ticket_id)
+        .subquery()
+    )
+    fill_counts = (
+        select(OrderRecord.trade_ticket_id.label("trade_ticket_id"), func.count(FillRecord.id).label("fill_count"))
+        .select_from(FillRecord)
+        .join(OrderRecord, FillRecord.order_id == OrderRecord.id)
+        .where(OrderRecord.trade_ticket_id.in_(latest_ticket_ids))
+        .group_by(OrderRecord.trade_ticket_id)
+        .subquery()
+    )
+    result = await session.execute(
+        select(
+            recent_rooms.c.room_id,
+            recent_rooms.c.name,
+            recent_rooms.c.market_ticker,
+            recent_rooms.c.room_origin,
+            recent_rooms.c.stage,
+            recent_rooms.c.shadow_mode,
+            recent_rooms.c.created_at,
+            recent_rooms.c.updated_at,
+            latest_signal.c.signal_id,
+            latest_signal.c.fair_yes_dollars,
+            latest_signal.c.edge_bps,
+            latest_signal.c.confidence,
+            latest_signal.c.signal_summary,
+            latest_signal.c.signal_payload,
+            latest_ticket.c.trade_ticket_id,
+            latest_ticket.c.ticket_action,
+            latest_ticket.c.ticket_side,
+            latest_ticket.c.ticket_yes_price_dollars,
+            latest_ticket.c.ticket_count_fp,
+            latest_ticket.c.ticket_status,
+            latest_risk.c.risk_status,
+            latest_risk.c.risk_reasons,
+            order_counts.c.order_count,
+            fill_counts.c.fill_count,
+        )
+        .select_from(recent_rooms)
+        .outerjoin(latest_signal, (latest_signal.c.room_id == recent_rooms.c.room_id) & (latest_signal.c.rn == 1))
+        .outerjoin(latest_ticket, (latest_ticket.c.room_id == recent_rooms.c.room_id) & (latest_ticket.c.rn == 1))
+        .outerjoin(latest_risk, (latest_risk.c.ticket_id == latest_ticket.c.trade_ticket_id) & (latest_risk.c.rn == 1))
+        .outerjoin(order_counts, order_counts.c.trade_ticket_id == latest_ticket.c.trade_ticket_id)
+        .outerjoin(fill_counts, fill_counts.c.trade_ticket_id == latest_ticket.c.trade_ticket_id)
+        .order_by(recent_rooms.c.created_at.desc(), recent_rooms.c.updated_at.desc())
+    )
+    return [_room_decision_from_row(row) for row in result.all()]
 
 
 def _series_from_market_ticker(market_ticker: str | None) -> str:
@@ -2172,6 +2476,11 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
             kalshi_env=kalshi_env,
             market_prefix="KXHIGH",
         )
+        recent_room_decisions = await _recent_room_decision_views(
+            session,
+            kalshi_env=kalshi_env,
+            market_prefix="KXHIGH",
+        )
         fallback_capital = thresholds.risk_max_position_notional_dollars
         if fallback_capital is None:
             fallback_capital = 0
@@ -2256,6 +2565,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         "broken_book_counts": f"{broken_book_data.get('broken_count', 0)} / {broken_book_data.get('total_count', 0)} rooms (30d)",
         "positions_summary": positions_summary,
         "positions": position_views,
+        "recent_room_decisions": recent_room_decisions,
         "recent_trading_activity": recent_trading_activity,
         "recent_trade_proposals": recent_trading_activity,
         "alerts": [_ops_event_view(e) for e in alerts],
