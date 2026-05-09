@@ -70,6 +70,7 @@ class FakeRoomSnapshotRepo:
             decision_time=now,
             created_at=now,
         )
+        self.signal = None
 
     async def get_room(self, room_id: str):
         return self.room if room_id == "room-1" else None
@@ -78,7 +79,7 @@ class FakeRoomSnapshotRepo:
         return self.messages
 
     async def get_latest_signal_for_room(self, room_id: str):
-        return None
+        return self.signal
 
     async def get_latest_trade_ticket_for_room(self, room_id: str):
         return None
@@ -135,6 +136,53 @@ async def test_load_room_snapshot_builds_payload_and_controls_message_inclusion(
     assert without_messages["decision_trace"]["id"] == "trace-1"
     assert "messages" not in without_messages
     assert with_messages["messages"][0]["role"] == AgentRole.RESEARCHER.value
+
+
+@pytest.mark.asyncio
+async def test_room_snapshot_displays_price_floor_stand_down(monkeypatch) -> None:
+    fake_repo = FakeRoomSnapshotRepo()
+    now = datetime(2026, 5, 9, 19, 35, tzinfo=UTC)
+    fake_repo.signal = SimpleNamespace(
+        id="signal-1",
+        room_id="room-1",
+        market_ticker="KXHIGHTSATX-26MAY09-T90",
+        fair_yes_dollars="0.4375",
+        edge_bps=4025,
+        confidence=0.68,
+        summary="No taker trade clears the configured edge threshold.",
+        payload={
+            "stand_down_reason": "no_actionable_edge",
+            "candidate_trace": {
+                "outcome": "pre_risk_filtered",
+                "min_contract_price_dollars": "0.2500",
+                "yes": {
+                    "side": "yes",
+                    "status": "skipped",
+                    "reason": "below_min_edge",
+                    "traded_price_dollars": "0.8700",
+                    "quality_adjusted_edge_bps": -4350,
+                },
+                "no": {
+                    "side": "no",
+                    "status": "skipped",
+                    "reason": "below_min_contract_price",
+                    "traded_price_dollars": "0.1600",
+                    "quality_adjusted_edge_bps": 4000,
+                },
+            },
+        },
+        created_at=now,
+    )
+    monkeypatch.setattr(room_snapshot, "PlatformRepository", lambda _session: fake_repo)
+
+    payload = await room_snapshot.load_room_snapshot(FakeAppContainer(), "room-1")
+
+    decision = payload["analytics"]["decision"]
+    assert decision["stand_down_reason"] == "no_actionable_edge"
+    assert decision["stand_down_display"] == "Price below minimum entry"
+    assert "NO had edge (4000bps after buffer)" in decision["stand_down_detail"]
+    assert "$0.1600" in decision["stand_down_detail"]
+    assert "$0.2500" in decision["stand_down_detail"]
 
 
 @pytest.mark.asyncio

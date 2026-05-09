@@ -674,6 +674,75 @@ def _trade_recommendation(
     return recommendation_action, recommendation_side, target_yes, edge_bps
 
 
+def _best_filtered_candidate(candidate_trace: dict[str, Any]) -> dict[str, Any] | None:
+    candidates = [candidate for candidate in candidate_trace.get("candidates") or [] if isinstance(candidate, dict)]
+    if not candidates:
+        candidates = [
+            candidate
+            for candidate in (candidate_trace.get("yes"), candidate_trace.get("no"))
+            if isinstance(candidate, dict)
+        ]
+    candidates = [candidate for candidate in candidates if candidate.get("status") == "skipped"]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda candidate: (
+            int(candidate["quality_adjusted_edge_bps"])
+            if candidate.get("quality_adjusted_edge_bps") is not None
+            else -1_000_000,
+            int(candidate["edge_bps"]) if candidate.get("edge_bps") is not None else -1_000_000,
+        ),
+    )
+
+
+def _filtered_candidate_stand_down(candidate_trace: dict[str, Any]) -> tuple[StandDownReason, str] | None:
+    if candidate_trace.get("outcome") != "pre_risk_filtered":
+        return None
+    candidate = _best_filtered_candidate(candidate_trace)
+    if not candidate:
+        return None
+    reason = str(candidate.get("reason") or "")
+    side = str(candidate.get("side") or "trade").upper()
+    traded_price = candidate.get("traded_price_dollars") or "n/a"
+    min_contract_price = candidate_trace.get("min_contract_price_dollars") or "n/a"
+    edge = candidate.get("quality_adjusted_edge_bps")
+    min_edge = candidate_trace.get("min_edge_bps")
+    remaining = candidate.get("remaining_payout_dollars") or "n/a"
+    minimum_remaining_payout_bps = candidate_trace.get("minimum_remaining_payout_bps")
+    minimum_remaining = (
+        f"{Decimal(str(minimum_remaining_payout_bps)) / Decimal('10000'):.4f}"
+        if minimum_remaining_payout_bps not in (None, "")
+        else "n/a"
+    )
+    if reason == "below_min_contract_price":
+        return (
+            StandDownReason.CONTRACT_PRICE_TOO_LOW,
+            f"Best {side} candidate had edge, but its entry price {traded_price} is below "
+            f"the configured minimum contract price {min_contract_price}.",
+        )
+    if reason == "insufficient_remaining_payout":
+        return (
+            StandDownReason.INSUFFICIENT_REMAINING_PAYOUT,
+            f"Best {side} candidate had edge, but remaining payout {remaining} is below "
+            f"the configured minimum {minimum_remaining}.",
+        )
+    if reason == "spread_too_wide":
+        spread_bps = candidate.get("spread_bps") or candidate_trace.get("spread_bps") or "n/a"
+        spread_limit = candidate_trace.get("spread_limit_bps") or "n/a"
+        return (
+            StandDownReason.SPREAD_TOO_WIDE,
+            f"Best {side} candidate had edge, but market spread {spread_bps}bps exceeds "
+            f"the configured maximum {spread_limit}bps.",
+        )
+    if reason in {"below_min_edge", "below_quality_adjusted_edge"} and edge is not None and min_edge is not None:
+        return (
+            StandDownReason.NO_ACTIONABLE_EDGE,
+            f"Best {side} candidate only had {edge}bps after quality checks versus required {min_edge}bps.",
+        )
+    return None
+
+
 def apply_heuristic_application_to_signal(
     *,
     settings: Settings,
@@ -864,8 +933,13 @@ def evaluate_trade_eligibility(
         reasons.append(f"Longshot bet blocked: trade regime is {signal.trade_regime}.")
         stand_down_reason = StandDownReason.LONGSHOT_BET
     elif signal.recommended_action is None or signal.recommended_side is None or signal.target_yes_price_dollars is None:
-        reasons.append(no_trade_text)
-        stand_down_reason = no_trade_reason
+        filtered_candidate_reason = _filtered_candidate_stand_down(candidate_trace)
+        if filtered_candidate_reason is not None:
+            stand_down_reason, filtered_candidate_text = filtered_candidate_reason
+            reasons.append(filtered_candidate_text)
+        else:
+            reasons.append(no_trade_text)
+            stand_down_reason = no_trade_reason
     else:
         remaining_payout = remaining_payout_dollars(signal.recommended_side, signal.target_yes_price_dollars)
         if remaining_payout <= (Decimal(minimum_remaining_payout_bps) / Decimal("10000")):

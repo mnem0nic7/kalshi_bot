@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 
 from kalshi_bot.core.enums import AgentRole
@@ -318,6 +319,117 @@ def _pricing_summary(signal: dict | None, market_snapshot: dict | None, trade_ti
     }
 
 
+def _reason_label(reason: str | None) -> str:
+    normalized = str(reason or "").strip()
+    labels = {
+        "no_actionable_edge": "No safe entry at current quotes",
+        "contract_price_too_low": "Price below minimum entry",
+        "below_min_contract_price": "Price below minimum entry",
+        "insufficient_remaining_payout": "Remaining payout too small",
+        "below_min_remaining_payout": "Remaining payout too small",
+        "insufficient_forecast_separation": "Forecast too close to threshold",
+        "forecast_delta_missing": "Missing forecast separation",
+        "spread_too_wide": "Spread too wide",
+        "book_effectively_broken": "Order book is not usable",
+        "selected_side_unmarketable": "Selected side is not marketable",
+        "market_stale": "Market data is stale",
+        "research_stale": "Research is stale",
+        "resolved_contract": "Resolved contract",
+        "empirical_gate_block": "Trade-behavior gate blocked entry",
+        "empirical_gate_under_sampled": "Trade-behavior history is too thin",
+    }
+    if not normalized:
+        return "n/a"
+    return labels.get(normalized, normalized.replace("_", " ").title())
+
+
+def _price_label(value) -> str | None:
+    if value in (None, ""):
+        return None
+    try:
+        return f"${Decimal(str(value)):.4f}"
+    except Exception:
+        return str(value)
+
+
+def _bps_label(value) -> str | None:
+    if value in (None, ""):
+        return None
+    try:
+        return f"{int(float(value))}bps"
+    except Exception:
+        return str(value)
+
+
+def _candidate_trace(signal_payload: dict) -> dict:
+    trace = signal_payload.get("candidate_trace")
+    if isinstance(trace, dict):
+        return trace
+    eligibility = signal_payload.get("eligibility")
+    if isinstance(eligibility, dict) and isinstance(eligibility.get("candidate_trace"), dict):
+        return eligibility["candidate_trace"]
+    return {}
+
+
+def _best_visible_candidate(trace: dict) -> dict:
+    candidates = [candidate for candidate in trace.get("candidates") or [] if isinstance(candidate, dict)]
+    if not candidates:
+        candidates = [candidate for candidate in (trace.get("yes"), trace.get("no")) if isinstance(candidate, dict)]
+    if not candidates:
+        return {}
+    return max(
+        candidates,
+        key=lambda candidate: (
+            int(float(candidate["quality_adjusted_edge_bps"]))
+            if candidate.get("quality_adjusted_edge_bps") is not None
+            else -1_000_000,
+            int(float(candidate["edge_bps"])) if candidate.get("edge_bps") is not None else -1_000_000,
+        ),
+    )
+
+
+def _display_stand_down_reason(raw_reason: str | None, trace: dict) -> str:
+    if raw_reason == "no_actionable_edge" and trace.get("outcome") == "pre_risk_filtered":
+        candidate_reason = str((_best_visible_candidate(trace) or {}).get("reason") or "")
+        if candidate_reason:
+            return _reason_label(candidate_reason)
+    return _reason_label(raw_reason)
+
+
+def _stand_down_detail(raw_reason: str | None, trace: dict) -> str | None:
+    candidate = _best_visible_candidate(trace)
+    candidate_reason = str(candidate.get("reason") or "")
+    side = str(candidate.get("side") or "").upper()
+    edge = _bps_label(candidate.get("quality_adjusted_edge_bps") or candidate.get("edge_bps"))
+    price = _price_label(candidate.get("traded_price_dollars"))
+    min_price = _price_label(trace.get("min_contract_price_dollars"))
+    if raw_reason in {"contract_price_too_low", "no_actionable_edge"} and candidate_reason == "below_min_contract_price":
+        parts = [side or "The best candidate", "had edge"]
+        if edge:
+            parts.append(f"({edge} after buffer)")
+        if price and min_price:
+            parts.append(f"but its entry price {price} was below the {min_price} minimum contract price")
+        else:
+            parts.append("but it was below the minimum contract price")
+        return " ".join(parts) + ". No order was sent."
+    if raw_reason == "no_actionable_edge" and candidate_reason in {"below_min_edge", "below_quality_adjusted_edge"}:
+        min_edge = _bps_label(trace.get("min_edge_bps"))
+        if edge and min_edge:
+            return f"Best candidate had {edge} after quality checks, below the {min_edge} minimum edge. No order was sent."
+    if raw_reason in {"insufficient_remaining_payout", "no_actionable_edge"} and candidate_reason in {
+        "insufficient_remaining_payout",
+        "below_min_remaining_payout",
+    }:
+        remaining = _price_label(candidate.get("remaining_payout_dollars"))
+        min_remaining_bps = trace.get("minimum_remaining_payout_bps")
+        min_remaining = (
+            _price_label(Decimal(str(min_remaining_bps)) / Decimal("10000")) if min_remaining_bps not in (None, "") else None
+        )
+        if remaining and min_remaining:
+            return f"Best candidate left only {remaining} of payout, below the {min_remaining} minimum. No order was sent."
+    return None
+
+
 def _weather_summary(research_dossier: dict | None, weather_bundle: dict | None) -> dict:
     numeric_facts = ((research_dossier or {}).get("summary") or {}).get("current_numeric_facts") or {}
     mapping = (weather_bundle or {}).get("mapping") or {}
@@ -414,6 +526,8 @@ def _decision_summary(
         execution_status = "stand_down"
 
     signal_payload = (signal or {}).get("payload") or {}
+    trace = _candidate_trace(signal_payload) if isinstance(signal_payload, dict) else {}
+    raw_stand_down_reason = signal_payload.get("stand_down_reason") if isinstance(signal_payload, dict) else None
     eligibility = signal_payload.get("eligibility") if isinstance(signal_payload, dict) else None
     blocked_by = None
     if ((research_dossier or {}).get("gate") or {}).get("passed") is False:
@@ -435,7 +549,9 @@ def _decision_summary(
         "candidate_pack_id": signal_payload.get("candidate_pack_id") if isinstance(signal_payload, dict) else None,
         "rule_trace": signal_payload.get("rule_trace") if isinstance(signal_payload, dict) else [],
         "eligibility": eligibility,
-        "stand_down_reason": signal_payload.get("stand_down_reason") if isinstance(signal_payload, dict) else None,
+        "stand_down_reason": raw_stand_down_reason,
+        "stand_down_display": _display_stand_down_reason(raw_stand_down_reason, trace),
+        "stand_down_detail": _stand_down_detail(raw_stand_down_reason, trace),
         "blocked_by": blocked_by,
         "risk_status": (risk_verdict or {}).get("status"),
         "execution_status": execution_status,

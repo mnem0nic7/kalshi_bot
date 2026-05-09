@@ -420,7 +420,9 @@ def _clean_reason_label(reason: Any) -> str:
         "below_min_contract_price": "Price below minimum entry",
         "below_min_edge": "Edge below minimum",
         "below_min_remaining_payout": "Remaining payout too small",
+        "insufficient_remaining_payout": "Remaining payout too small",
         "selected_side_unmarketable": "Selected side is not marketable",
+        "contract_price_too_low": "Price below minimum entry",
     }
     return labels.get(normalized, normalized.replace("_", " ").title())
 
@@ -491,6 +493,20 @@ def _best_visible_candidate(trace: dict[str, Any]) -> dict[str, Any]:
             edge if (edge := _int_or_none(item.get("quality_adjusted_edge_bps"))) is not None else -1_000_000
         ),
     )
+
+
+def _display_stand_down_reason(stand_down_reason: Any, trace: dict[str, Any]) -> str:
+    normalized = str(stand_down_reason or "").strip()
+    if normalized == "no_actionable_edge" and trace.get("outcome") == "pre_risk_filtered":
+        best_candidate = _best_visible_candidate(trace)
+        candidate_reason = str(best_candidate.get("reason") or "").strip()
+        if candidate_reason in {"below_min_contract_price"}:
+            return _clean_reason_label("contract_price_too_low")
+        if candidate_reason in {"insufficient_remaining_payout", "below_min_remaining_payout"}:
+            return _clean_reason_label("insufficient_remaining_payout")
+        if candidate_reason == "spread_too_wide":
+            return _clean_reason_label("spread_too_wide")
+    return _clean_reason_label(normalized)
 
 
 def _weather_decision_sentence(numeric_facts: dict[str, Any]) -> str | None:
@@ -629,7 +645,12 @@ def _room_decision_description(
             sentences.append("It stood down because the forecast was too close to the contract threshold.")
         if empirical_sentence:
             sentences.append(empirical_sentence)
-    elif reason == "No safe entry at current quotes":
+    elif reason in {
+        "No safe entry at current quotes",
+        "Price below minimum entry",
+        "Remaining payout too small",
+        "Spread too wide",
+    }:
         sentences.append("No order was sent because neither side cleared every entry rule at the current quotes.")
         candidate_sentences = [
             sentence
@@ -719,8 +740,8 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
     elif stand_down_reason:
         status = "no_trade"
         status_label = "No trade"
-        status_tone = "warning" if stand_down_reason not in {"no_actionable_edge"} else "neutral"
-        reason = _clean_reason_label(stand_down_reason)
+        reason = _display_stand_down_reason(stand_down_reason, trace)
+        status_tone = "neutral" if reason == "No safe entry at current quotes" else "warning"
     elif getattr(row, "signal_id", None):
         status = "signal_only"
         status_label = "Signal only"

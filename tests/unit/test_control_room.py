@@ -690,6 +690,7 @@ async def test_recent_room_decision_views_reports_stand_downs_and_blocks() -> No
         signal_payload={
             "final_stand_down_reason": "no_actionable_edge",
             "candidate_trace": {
+                "outcome": "pre_risk_filtered",
                 "selected_side": None,
                 "selected_edge_bps": None,
                 "min_edge_bps": 500,
@@ -757,7 +758,7 @@ async def test_recent_room_decision_views_reports_stand_downs_and_blocks() -> No
     assert views[2]["selected_side"] == "—"
     assert views[2]["selected_edge_display"] == "best 1357bps"
     assert views[2]["quality_adjusted_edge_display"] == "1332bps"
-    assert views[2]["reason"] == "No safe entry at current quotes"
+    assert views[2]["reason"] == "Price below minimum entry"
     assert "neither side cleared every entry rule" in views[2]["description"]
     assert "YES was priced at $0.0600" in views[2]["description"]
     assert "NO only had -1482bps" in views[2]["description"]

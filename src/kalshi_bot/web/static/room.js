@@ -292,7 +292,7 @@
     const cards = [
       buildMetricCard("Trade Proposed", decision.trade_proposed ? "Yes" : "No"),
       buildMetricCard("Blocked By", formatStage(decision.blocked_by || "n/a")),
-      buildMetricCard("Stand Down", formatStage(decision.stand_down_reason || "n/a")),
+      buildMetricCard("Stand Down", decision.stand_down_display || formatStage(decision.stand_down_reason || "n/a")),
       buildMetricCard("Orders", formatInteger(decision.order_count || 0)),
       buildMetricCard("Fills", formatInteger(decision.fill_count || 0)),
       buildMetricCard("Latest Order", formatStage(decision.latest_order_status || "n/a")),
@@ -304,6 +304,17 @@
     const panel = decisionGrid.parentElement;
     if (!panel) {
       return;
+    }
+    let detailNode = document.getElementById("decision-stand-down-detail");
+    if (decision.stand_down_detail) {
+      if (!detailNode) {
+        detailNode = element("p", "subtle-callout");
+        detailNode.id = "decision-stand-down-detail";
+        panel.append(detailNode);
+      }
+      detailNode.textContent = decision.stand_down_detail;
+    } else if (detailNode) {
+      detailNode.remove();
     }
     let summaryNode = document.getElementById("latest-ops-summary");
     if (decision.latest_ops_summary) {

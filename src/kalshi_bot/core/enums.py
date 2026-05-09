@@ -94,6 +94,7 @@ class StandDownReason(StrEnum):
     FORECAST_DELTA_MISSING = "forecast_delta_missing"
     EXTREME_EDGE_DIAGNOSTIC_FAILED = "extreme_edge_diagnostic_failed"
     SELECTED_SIDE_UNMARKETABLE = "selected_side_unmarketable"
+    CONTRACT_PRICE_TOO_LOW = "contract_price_too_low"
     ENTRY_FREEZE = "entry_freeze"
     EMPIRICAL_GATE_BLOCK = "empirical_gate_block"
     CRYPTO_DISABLED = "crypto_disabled"

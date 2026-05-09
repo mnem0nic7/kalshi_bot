@@ -376,6 +376,57 @@ def test_trade_eligibility_labels_no_actionable_edge_when_book_is_normal_but_edg
     assert verdict.evaluation_outcome == "no_candidate"
 
 
+def test_trade_eligibility_preserves_price_floor_filter_reason() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_contract_price_dollars=0.25)
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.4375"),
+        confidence=0.68,
+        edge_bps=4025,
+        recommended_action=None,
+        recommended_side=None,
+        target_yes_price_dollars=None,
+        summary="no candidate",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+        candidate_trace={
+            "outcome": "pre_risk_filtered",
+            "min_contract_price_dollars": "0.2500",
+            "candidates": [
+                {
+                    "side": "yes",
+                    "status": "skipped",
+                    "reason": "below_min_edge",
+                    "edge_bps": -4325,
+                    "quality_adjusted_edge_bps": -4350,
+                    "traded_price_dollars": "0.8700",
+                },
+                {
+                    "side": "no",
+                    "status": "skipped",
+                    "reason": "below_min_contract_price",
+                    "edge_bps": 4025,
+                    "quality_adjusted_edge_bps": 4000,
+                    "traded_price_dollars": "0.1600",
+                },
+            ],
+        },
+    )
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.8400", "yes_ask_dollars": "0.8700", "no_ask_dollars": "0.1600"}},
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.eligible is False
+    assert verdict.stand_down_reason == StandDownReason.CONTRACT_PRICE_TOO_LOW
+    assert verdict.evaluation_outcome == "pre_risk_filtered"
+    assert "entry price 0.1600 is below" in verdict.reasons[0]
+
+
 def test_base_strategy_summary_strips_old_trade_suffixes() -> None:
     summary = (
         "Forecast high 86.0F versus threshold 84.0F implies fair yes near 0.6391 with confidence 0.77. "
