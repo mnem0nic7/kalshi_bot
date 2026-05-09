@@ -1422,6 +1422,34 @@ def test_trade_analysis_cli_report_json_smoke(tmp_path) -> None:
     assert "Traceback" not in result.stderr
 
 
+def test_overnight_readiness_cli_report_json_smoke(tmp_path) -> None:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path}/overnight-readiness-cli.db"
+    env["APP_AUTO_INIT_DB"] = "true"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kalshi_bot.cli",
+            "overnight-readiness",
+            "report",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = result.stdout
+    assert '"schema_version": "overnight-readiness-v1"' in payload
+    assert '"ready_for_live"' in payload
+    assert '"read_only": true' in payload
+    assert "Traceback" not in result.stderr
+
+
 @pytest.mark.asyncio
 async def test_ignore_strategy_promotion_secondary_status_cli_updates_resolution_audit(tmp_path) -> None:
     database_url = f"sqlite+aiosqlite:///{tmp_path}/promotion-ignore-cli.db"

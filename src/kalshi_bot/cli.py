@@ -64,6 +64,10 @@ from kalshi_bot.services.backtesting import (
 )
 from kalshi_bot.services.model_quality import build_model_quality_report, format_model_quality_report
 from kalshi_bot.services.modeling import build_modeling_report, format_modeling_report
+from kalshi_bot.services.overnight_readiness import (
+    OvernightReadinessService,
+    format_overnight_readiness_report,
+)
 from kalshi_bot.services.trade_behavior_validation import (
     build_trade_behavior_validation_report,
     format_trade_behavior_validation_report,
@@ -899,7 +903,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
         return 0
 
-    container = await AppContainer.build(bootstrap_db=args.command not in {"init-db", "trading-audit", "trade-analysis"})
+    container = await AppContainer.build(bootstrap_db=args.command not in {"init-db", "trading-audit", "trade-analysis", "overnight-readiness"})
     try:
         if args.command == "init-db":
             await init_models(container.engine)
@@ -1001,6 +1005,30 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 print(json.dumps(report, indent=2))
             else:
                 print(format_model_quality_report(report))
+            return 0
+
+        if args.command == "overnight-readiness":
+            report = await OvernightReadinessService(
+                settings=container.settings,
+                session_factory=container.session_factory,
+                trade_analysis_service=container.trade_analysis_service,
+                trading_audit_service=container.trading_audit_service,
+                crypto_asset_control_service=container.crypto_asset_control_service,
+                has_write_credentials=container.kalshi.write_credentials is not None,
+            ).build_report(
+                kalshi_env=args.kalshi_env,
+                domains=args.domains,
+                timezone_name=args.timezone,
+                start_hour=args.start_hour,
+                end_hour=args.end_hour,
+                days=args.days,
+                frequency=args.frequency,
+                limit=args.limit,
+            )
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(format_overnight_readiness_report(report))
             return 0
 
         if args.command == "weather-prediction":
@@ -2077,6 +2105,21 @@ def build_parser() -> argparse.ArgumentParser:
     model_quality_status.add_argument("--frequency", default="15m")
     model_quality_status.add_argument("--persist", action="store_true")
     model_quality_status.add_argument("--json", action="store_true")
+
+    overnight_readiness = subparsers.add_parser(
+        "overnight-readiness",
+        help="Read-only live readiness evaluation for Pacific overnight trading.",
+    )
+    overnight_readiness.add_argument("overnight_readiness_command", nargs="?", choices=["report"], default="report")
+    overnight_readiness.add_argument("--kalshi-env", choices=["demo", "production"], default="production")
+    overnight_readiness.add_argument("--domains", choices=["weather", "crypto", "all"], default="all")
+    overnight_readiness.add_argument("--timezone", default="America/Los_Angeles")
+    overnight_readiness.add_argument("--start-hour", type=int, default=22)
+    overnight_readiness.add_argument("--end-hour", type=int, default=6)
+    overnight_readiness.add_argument("--days", type=int, default=180)
+    overnight_readiness.add_argument("--frequency", default="15m")
+    overnight_readiness.add_argument("--limit", type=int, default=None)
+    overnight_readiness.add_argument("--json", action="store_true")
 
     weather_prediction = subparsers.add_parser("weather-prediction")
     weather_prediction_subparsers = weather_prediction.add_subparsers(dest="weather_prediction_command", required=True)
