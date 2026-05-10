@@ -116,6 +116,8 @@ kalshi-bot-cli self-improve critique --days 14 --limit 200
 kalshi-bot-cli self-improve eval --candidate-version <VERSION> --days 14 --limit 200
 kalshi-bot-cli self-improve promote --evaluation-run-id <EVALUATION_RUN_ID>
 kalshi-bot-cli self-improve rollback --reason manual_rollback
+kalshi-bot-cli autonomous-gates status --kalshi-env production --domain all --format json
+kalshi-bot-cli autonomous-gates run --kalshi-env production --domain all --source combined --days 3650 --dry-run --format json
 kalshi-bot-cli health-check app --color blue
 kalshi-bot-cli health-check daemon --color blue
 kalshi-bot-cli watchdog status
@@ -175,7 +177,7 @@ Each workflow writes the PEM to a temporary file at runtime, runs REST plus WebS
 - Add required reviewers before the workflow can run
 - Move `LIVE_KALSHI_API_KEY` and `LIVE_KALSHI_PRIVATE_KEY_PEM` into that environment if you want the live credentials isolated from repo-wide secrets
 
-`Self Improve` runs a local offline guard test slice, then critiques and evaluates the last 14 days of shadow or demo rooms on the VPS. It can adjust prompts and non-gate safety caps, but tunable gate thresholds are reserved for the deterministic `autonomous-gates` pipeline. Canary runs now carry a max window via `SELF_IMPROVE_CANARY_MAX_SECONDS`, and `self-improve status` marks them `stalled` if they sit too long without promotion or rollback. `Rollback Agent Pack` is manual-only and is designed to live behind the GitHub Actions `live` environment.
+`Self Improve` runs a local offline guard test slice, then critiques and evaluates the last 14 days of shadow or demo rooms on the VPS. It can adjust prompts and non-gate safety caps, but tunable weather thresholds and crypto runtime policy are reserved for the deterministic `autonomous-gates` pipeline. Canary runs now carry a max window via `SELF_IMPROVE_CANARY_MAX_SECONDS`, and `self-improve status` marks them `stalled` if they sit too long without promotion or rollback. `Rollback Agent Pack` is manual-only and is designed to live behind the GitHub Actions `live` environment.
 
 LLM calls are disabled by default with `LLM_CALLS_ENABLED=false`. `Sync Gemini Runtime` is only for an explicit LLM-enabled experiment; it syncs `GEMINI_KEY` (or `GEMINI_API_KEY`) into the remote `.env`, recreates both app and daemon colors so Docker picks the new env up, and confirms the runtime can see the Gemini key.
 
@@ -195,7 +197,7 @@ LLM calls are disabled by default with `LLM_CALLS_ENABLED=false`. `Sync Gemini R
 - Training-first corpus engine with research-health scoring, reproducible dataset builds, and readiness gates
 - Optional structured-weather shadow campaigns via `kalshi-bot-cli shadow-campaign run`
 - Deterministic `builtin-deterministic-v1` agent pack with provider `none` roles by default
-- Versioned agent packs, GitHub Actions self-improvement loop, and deterministic autonomous gate tuning
+- Versioned agent packs, GitHub Actions self-improvement loop, and deterministic autonomous gate tuning for weather plus per-asset crypto policy
 - Host-native watchdog recovery with compose healthchecks and color failover
 
 ## Important safety note

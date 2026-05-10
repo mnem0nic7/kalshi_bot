@@ -270,3 +270,66 @@ async def test_autonomous_gate_tuning_validation_ignores_production_entry_freeze
     assert result["validation"]["failures"] == []
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_crypto_gate_tuning_stages_per_asset_policy(tmp_path, monkeypatch) -> None:
+    _settings, engine, session_factory, _agent_pack_service, service = await _service(tmp_path)
+
+    async def fake_crypto_recommendation(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": "crypto-autonomous-gate-recommendations-v1",
+            "kalshi_env": "demo",
+            "domain": "crypto",
+            "window_days": 3650,
+            "min_support": 1,
+            "row_counts": {
+                "snapshot_rows": 20,
+                "decision_rows": 20,
+                "labeled_rows": 20,
+                "assets": ["BTC", "ETH"],
+            },
+            "current_policy": {},
+            "asset_diagnostics": [],
+            "promoted_assets": {
+                "BTC": {
+                    "promotion_status": "promoted",
+                    "candidate_policy": "crypto.BTC.min_fee_adjusted_edge_bps=1000",
+                    "entry": {
+                        "min_fee_adjusted_edge_bps": 1000,
+                        "max_spread_bps": 250,
+                        "min_confidence": 0.75,
+                        "min_contract_price_dollars": 0.05,
+                        "min_remaining_payout_bps": 1000,
+                        "max_credible_edge_bps": 7500,
+                    },
+                    "current_score": {"selected_count": 1, "net_pnl": "0.1000", "drawdown_proxy": "0.0000"},
+                    "candidate_score": {"selected_count": 2, "net_pnl": "1.0000", "drawdown_proxy": "0.0000"},
+                    "promotion_reason": "walk_forward_pnl_improved_without_worse_drawdown",
+                }
+            },
+        }
+
+    monkeypatch.setattr(service, "_build_crypto_recommendation", fake_crypto_recommendation)
+
+    result = await service.run(domain="crypto", dry_run=False, min_support=1, now=datetime(2026, 5, 10, tzinfo=UTC))
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        candidate = await repo.get_agent_pack(result["candidate_version"])
+        checkpoint = await repo.get_checkpoint("autonomous_gate_tuning:crypto:demo")
+        await session.commit()
+
+    assert result["status"] == "staged"
+    assert result["domain"] == "crypto"
+    assert candidate is not None
+    crypto_policy = candidate.payload["crypto_policy"]
+    assert crypto_policy["live"]["trading_enabled"] is True
+    assert crypto_policy["live"]["production_autonomy_enabled"] is True
+    assert crypto_policy["live"]["asset_modes"] == {"BTC": "live"}
+    assert "ETH" not in crypto_policy["asset_entry_overrides"]
+    assert crypto_policy["asset_entry_overrides"]["BTC"]["min_fee_adjusted_edge_bps"] == 1000
+    assert checkpoint is not None
+    assert checkpoint.payload["changes"]["BTC"]["live_mode"] == "live"
+
+    await engine.dispose()

@@ -50,10 +50,18 @@ Always migrate before enabling the watchdog timer on an already-running deployme
 After gate-tuning changes, run a dry autonomous validation before restarting live services:
 
 ```bash
-kalshi-bot-cli autonomous-gates run --kalshi-env production --source combined --days 3650 --dry-run --format json
+kalshi-bot-cli autonomous-gates run --kalshi-env production --domain all --source combined --days 3650 --dry-run --format json
 ```
 
-The command should either return `dry_run` with a passing validation payload, or an explicit safety failure such as production entry freeze being disabled. Do not hand-edit `.env` to apply learned gate thresholds; promoted thresholds live in agent packs and are applied by the settlement-triggered autonomous canary flow.
+The command should either return `dry_run` with a passing validation payload, `no_candidate` when a domain has no promoted evidence-backed change, or an explicit safety failure. Do not hand-edit `.env` to apply learned gate thresholds; promoted weather thresholds and crypto policies live in agent packs and are applied by the settlement-triggered autonomous canary flow.
+
+Crypto autonomous gating now follows the same runtime source of truth as weather, with crypto-specific policy inside the active agent pack. The normal operator status check is:
+
+```bash
+kalshi-bot-cli autonomous-gates status --kalshi-env production --domain all --format json
+```
+
+Crypto policy is separate from weather thresholds and promotes per asset. A BTC candidate can stage, canary, and promote without changing ETH. Deployment-note asset mode `off`, inactive color, app shadow mode, missing write credentials, kill switch, disabled `crypto_enabled`/`crypto_15m_enabled`, replay-gate failure, stale data, position caps, and risk caps remain hard blockers.
 
 Deploy finding from April 12, 2026:
 
@@ -322,7 +330,7 @@ Recovery actions are recorded in ops events and surfaced in `/api/status` plus t
 
 ## Self-improvement loop
 
-The deterministic runtime and versioned agent-pack system are documented in [self_improve.md](self_improve.md). LLM-backed Strategy Codex and Strategy Auto-Evolve are disabled unless `LLM_CALLS_ENABLED=true`; autonomous gate tuning is deterministic and stages/promotes threshold changes through agent packs.
+The deterministic runtime and versioned agent-pack system are documented in [self_improve.md](self_improve.md). LLM-backed Strategy Codex and Strategy Auto-Evolve are disabled unless `LLM_CALLS_ENABLED=true`; autonomous gate tuning is deterministic and stages/promotes weather thresholds plus crypto runtime policy through agent packs.
 
 Typical operator flow:
 
@@ -331,8 +339,8 @@ kalshi-bot-cli self-improve status
 kalshi-bot-cli self-improve critique --days 14 --limit 200
 kalshi-bot-cli self-improve eval --candidate-version <VERSION> --days 14 --limit 200
 kalshi-bot-cli self-improve promote --evaluation-run-id <EVALUATION_RUN_ID>
-kalshi-bot-cli autonomous-gates status --kalshi-env production --format json
-kalshi-bot-cli autonomous-gates run --kalshi-env production --source combined --days 3650 --dry-run --format json
+kalshi-bot-cli autonomous-gates status --kalshi-env production --domain all --format json
+kalshi-bot-cli autonomous-gates run --kalshi-env production --domain all --source combined --days 3650 --dry-run --format json
 ```
 
 For Docker blue or green deployments, the helper scripts mirror the same flow:

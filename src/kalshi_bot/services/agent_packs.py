@@ -8,6 +8,10 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole, DeploymentColor
 from kalshi_bot.core.schemas import (
     AgentPack,
+    AgentPackCryptoEntryPolicy,
+    AgentPackCryptoLivePolicy,
+    AgentPackCryptoPolicy,
+    AgentPackCryptoReplayPolicy,
     AgentPackMemoryConfig,
     AgentPackResearchConfig,
     AgentPackRoleConfig,
@@ -36,6 +40,39 @@ class RuntimeThresholds:
     risk_min_confidence: float = 0.80
     risk_min_contract_price_dollars: float = 0.25
     strategy_min_abs_delta_f: float = 8.0
+
+
+@dataclass(slots=True)
+class RuntimeCryptoPolicy:
+    min_fee_adjusted_edge_bps: int
+    max_spread_bps: int
+    min_confidence: float
+    min_contract_price_dollars: float
+    min_remaining_payout_bps: int
+    max_credible_edge_bps: int
+    replay_min_resolved_markets: int
+    replay_min_trade_candidates: int
+    replay_min_net_pl_dollars: float
+    replay_max_hard_cap_breaches: int
+    replay_min_spot_coverage_pct: float
+    replay_require_calibration_better_than_mid: bool
+    trading_enabled: bool
+    production_autonomy_enabled: bool
+    asset_modes: dict[str, str]
+    asset_entry_overrides: dict[str, dict[str, Any]]
+
+    def entry_for_asset(self, asset_symbol: str | None) -> dict[str, Any]:
+        symbol = _normalize_crypto_asset_symbol(asset_symbol or "")
+        base = {
+            "min_fee_adjusted_edge_bps": self.min_fee_adjusted_edge_bps,
+            "max_spread_bps": self.max_spread_bps,
+            "min_confidence": self.min_confidence,
+            "min_contract_price_dollars": self.min_contract_price_dollars,
+            "min_remaining_payout_bps": self.min_remaining_payout_bps,
+            "max_credible_edge_bps": self.max_credible_edge_bps,
+        }
+        override = self.asset_entry_overrides.get(symbol) or {}
+        return {**base, **{key: value for key, value in override.items() if value is not None}}
 
 
 class AgentPackService:
@@ -116,6 +153,28 @@ class AgentPackService:
                 trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
                 strategy_min_abs_delta_f=self.settings.strategy_min_abs_delta_f,
                 strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
+            ),
+            crypto_policy=AgentPackCryptoPolicy(
+                entry=AgentPackCryptoEntryPolicy(
+                    min_fee_adjusted_edge_bps=self.settings.risk_min_edge_bps,
+                    max_spread_bps=self.settings.trigger_max_spread_bps,
+                    min_confidence=self.settings.risk_min_confidence,
+                    min_contract_price_dollars=self.settings.risk_min_contract_price_dollars,
+                    min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
+                    max_credible_edge_bps=self.settings.risk_max_credible_edge_bps,
+                ),
+                replay=AgentPackCryptoReplayPolicy(
+                    min_resolved_markets=self.settings.crypto_replay_min_resolved_markets,
+                    min_trade_candidates=self.settings.crypto_replay_min_trade_candidates,
+                    min_net_pl_dollars=self.settings.crypto_replay_min_net_pl_dollars,
+                    max_hard_cap_breaches=self.settings.crypto_replay_max_hard_cap_breaches,
+                    min_spot_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
+                    require_calibration_better_than_mid=self.settings.crypto_replay_require_calibration_better_than_mid,
+                ),
+                live=AgentPackCryptoLivePolicy(
+                    trading_enabled=self.settings.crypto_trading_enabled,
+                    production_autonomy_enabled=self.settings.crypto_production_autonomy_enabled,
+                ),
             ),
         )
 
@@ -312,8 +371,92 @@ class AgentPackService:
             ),
         )
 
+    def runtime_crypto_policy(self, pack: AgentPack | None = None) -> RuntimeCryptoPolicy:
+        policy = (pack.crypto_policy if pack is not None else AgentPackCryptoPolicy()) or AgentPackCryptoPolicy()
+        entry = policy.entry or AgentPackCryptoEntryPolicy()
+        replay = policy.replay or AgentPackCryptoReplayPolicy()
+        live = policy.live or AgentPackCryptoLivePolicy()
+
+        def value_or_settings(value: Any, fallback: Any) -> Any:
+            return fallback if value is None else value
+
+        overrides: dict[str, dict[str, Any]] = {}
+        for raw_symbol, raw_entry in (policy.asset_entry_overrides or {}).items():
+            overrides[_normalize_crypto_asset_symbol(raw_symbol)] = {
+                "min_fee_adjusted_edge_bps": raw_entry.min_fee_adjusted_edge_bps,
+                "max_spread_bps": raw_entry.max_spread_bps,
+                "min_confidence": raw_entry.min_confidence,
+                "min_contract_price_dollars": raw_entry.min_contract_price_dollars,
+                "min_remaining_payout_bps": raw_entry.min_remaining_payout_bps,
+                "max_credible_edge_bps": raw_entry.max_credible_edge_bps,
+            }
+
+        return RuntimeCryptoPolicy(
+            min_fee_adjusted_edge_bps=int(value_or_settings(entry.min_fee_adjusted_edge_bps, self.settings.risk_min_edge_bps)),
+            max_spread_bps=int(value_or_settings(entry.max_spread_bps, self.settings.trigger_max_spread_bps)),
+            min_confidence=float(value_or_settings(entry.min_confidence, self.settings.risk_min_confidence)),
+            min_contract_price_dollars=float(
+                value_or_settings(entry.min_contract_price_dollars, self.settings.risk_min_contract_price_dollars)
+            ),
+            min_remaining_payout_bps=int(
+                value_or_settings(entry.min_remaining_payout_bps, self.settings.strategy_min_remaining_payout_bps)
+            ),
+            max_credible_edge_bps=int(
+                value_or_settings(entry.max_credible_edge_bps, self.settings.risk_max_credible_edge_bps)
+            ),
+            replay_min_resolved_markets=int(
+                value_or_settings(replay.min_resolved_markets, self.settings.crypto_replay_min_resolved_markets)
+            ),
+            replay_min_trade_candidates=int(
+                value_or_settings(replay.min_trade_candidates, self.settings.crypto_replay_min_trade_candidates)
+            ),
+            replay_min_net_pl_dollars=float(
+                value_or_settings(replay.min_net_pl_dollars, self.settings.crypto_replay_min_net_pl_dollars)
+            ),
+            replay_max_hard_cap_breaches=int(
+                value_or_settings(replay.max_hard_cap_breaches, self.settings.crypto_replay_max_hard_cap_breaches)
+            ),
+            replay_min_spot_coverage_pct=float(
+                value_or_settings(replay.min_spot_coverage_pct, self.settings.crypto_replay_min_spot_coverage_pct)
+            ),
+            replay_require_calibration_better_than_mid=bool(
+                value_or_settings(
+                    replay.require_calibration_better_than_mid,
+                    self.settings.crypto_replay_require_calibration_better_than_mid,
+                )
+            ),
+            trading_enabled=bool(value_or_settings(live.trading_enabled, self.settings.crypto_trading_enabled)),
+            production_autonomy_enabled=bool(
+                value_or_settings(live.production_autonomy_enabled, self.settings.crypto_production_autonomy_enabled)
+            ),
+            asset_modes={
+                _normalize_crypto_asset_symbol(symbol): _normalize_crypto_asset_mode(mode)
+                for symbol, mode in (live.asset_modes or {}).items()
+            },
+            asset_entry_overrides=overrides,
+        )
+
+    def runtime_crypto_thresholds(self, policy: RuntimeCryptoPolicy, *, asset_symbol: str | None = None) -> RuntimeThresholds:
+        entry = policy.entry_for_asset(asset_symbol)
+        return RuntimeThresholds(
+            risk_min_edge_bps=int(entry["min_fee_adjusted_edge_bps"]),
+            risk_max_credible_edge_bps=int(entry["max_credible_edge_bps"]),
+            risk_min_confidence=float(entry["min_confidence"]),
+            risk_min_contract_price_dollars=float(entry["min_contract_price_dollars"]),
+            risk_max_order_notional_dollars=self.settings.risk_max_order_notional_dollars,
+            risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
+            risk_safe_capital_reserve_ratio=self.settings.risk_safe_capital_reserve_ratio,
+            risk_risky_capital_max_ratio=self.settings.risk_risky_capital_max_ratio,
+            trigger_max_spread_bps=int(entry["max_spread_bps"]),
+            trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
+            strategy_quality_edge_buffer_bps=self.settings.strategy_quality_edge_buffer_bps,
+            strategy_min_abs_delta_f=self.settings.strategy_min_abs_delta_f,
+            strategy_min_remaining_payout_bps=int(entry["min_remaining_payout_bps"]),
+        )
+
     def sanitize_candidate_pack(self, candidate: AgentPack, *, parent_version: str) -> AgentPack:
         thresholds = candidate.thresholds.model_copy(deep=True)
+        crypto_policy = candidate.crypto_policy.model_copy(deep=True)
         thresholds.risk_min_edge_bps = self._clamp_int(thresholds.risk_min_edge_bps, 250, 5000)
         thresholds.risk_max_credible_edge_bps = self._clamp_int(thresholds.risk_max_credible_edge_bps, 2500, 10000)
         thresholds.risk_min_confidence = self._clamp_float(thresholds.risk_min_confidence, 0.60, 0.90)
@@ -340,6 +483,27 @@ class AgentPackService:
         thresholds.risk_risky_capital_max_ratio = self._clamp_float(
             thresholds.risk_risky_capital_max_ratio, 0.0, 1.0
         )
+        crypto_policy.entry = self._sanitize_crypto_entry(crypto_policy.entry)
+        crypto_policy.replay = AgentPackCryptoReplayPolicy(
+            min_resolved_markets=self._clamp_int(crypto_policy.replay.min_resolved_markets, 10, 5000),
+            min_trade_candidates=self._clamp_int(crypto_policy.replay.min_trade_candidates, 1, 1000),
+            min_net_pl_dollars=self._clamp_float(crypto_policy.replay.min_net_pl_dollars, 0.0, 1000.0),
+            max_hard_cap_breaches=self._clamp_int(crypto_policy.replay.max_hard_cap_breaches, 0, 100),
+            min_spot_coverage_pct=self._clamp_float(crypto_policy.replay.min_spot_coverage_pct, 0.50, 1.0),
+            require_calibration_better_than_mid=crypto_policy.replay.require_calibration_better_than_mid,
+        )
+        crypto_policy.live = AgentPackCryptoLivePolicy(
+            trading_enabled=crypto_policy.live.trading_enabled,
+            production_autonomy_enabled=crypto_policy.live.production_autonomy_enabled,
+            asset_modes={
+                _normalize_crypto_asset_symbol(symbol): _normalize_crypto_asset_mode(mode)
+                for symbol, mode in (crypto_policy.live.asset_modes or {}).items()
+            },
+        )
+        crypto_policy.asset_entry_overrides = {
+            _normalize_crypto_asset_symbol(symbol): self._sanitize_crypto_entry(entry)
+            for symbol, entry in (crypto_policy.asset_entry_overrides or {}).items()
+        }
         sanitized_roles = {
             role_name: role.model_copy(update={"temperature": max(0.0, min(1.0, role.temperature))})
             for role_name, role in candidate.roles.items()
@@ -348,6 +512,7 @@ class AgentPackService:
             update={
                 "parent_version": parent_version,
                 "thresholds": thresholds,
+                "crypto_policy": crypto_policy,
                 "roles": sanitized_roles,
             }
         )
@@ -371,6 +536,16 @@ class AgentPackService:
             return None
         return max(low, min(high, float(value)))
 
+    def _sanitize_crypto_entry(self, entry: AgentPackCryptoEntryPolicy) -> AgentPackCryptoEntryPolicy:
+        return AgentPackCryptoEntryPolicy(
+            min_fee_adjusted_edge_bps=self._clamp_int(entry.min_fee_adjusted_edge_bps, 250, 5000),
+            max_spread_bps=self._clamp_int(entry.max_spread_bps, 50, 2500),
+            min_confidence=self._clamp_float(entry.min_confidence, 0.50, 0.99),
+            min_contract_price_dollars=self._clamp_float(entry.min_contract_price_dollars, 0.01, 0.99),
+            min_remaining_payout_bps=self._clamp_int(entry.min_remaining_payout_bps, 100, 9900),
+            max_credible_edge_bps=self._clamp_int(entry.max_credible_edge_bps, 2500, 10000),
+        )
+
     @staticmethod
     def _notes(control: DeploymentControl) -> dict[str, Any]:
         existing = dict(control.notes or {})
@@ -383,3 +558,13 @@ class AgentPackService:
         updated = dict(notes or {})
         updated["agent_packs"] = agent_pack_notes
         return updated
+
+
+def _normalize_crypto_asset_symbol(asset_symbol: str) -> str:
+    normalized = "".join(ch for ch in str(asset_symbol or "").strip().upper() if ch.isalnum())
+    return normalized or "UNKNOWN"
+
+
+def _normalize_crypto_asset_mode(mode: Any) -> str:
+    normalized = str(mode or "shadow").strip().lower()
+    return normalized if normalized in {"off", "shadow", "live"} else "shadow"

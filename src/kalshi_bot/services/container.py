@@ -214,6 +214,7 @@ class AppContainer:
         crypto_forecast_service = CryptoForecastService(
             settings=settings,
             session_factory=session_factory,
+            agent_pack_service=agent_pack_service,
         )
         crypto_spot_service = CryptoSpotService(
             settings=settings,
@@ -222,6 +223,7 @@ class AppContainer:
         crypto_replay_service = CryptoReplayService(
             settings=settings,
             session_factory=session_factory,
+            agent_pack_service=agent_pack_service,
         )
         crypto_execution_service = CryptoExecutionService(
             settings=settings,
@@ -335,6 +337,7 @@ class AppContainer:
             risk_engine=risk_engine,
             execution_service=crypto_execution_service,
             asset_control_service=crypto_asset_control_service,
+            agent_pack_service=agent_pack_service,
         )
         crypto_autonomy_service = CryptoAutonomyService(
             settings=settings,
@@ -342,6 +345,7 @@ class AppContainer:
             market_service=crypto_market_service,
             asset_control_service=crypto_asset_control_service,
             workflow_service=crypto_workflow_service,
+            agent_pack_service=agent_pack_service,
         )
         shadow_training_service = ShadowTrainingService(
             settings,

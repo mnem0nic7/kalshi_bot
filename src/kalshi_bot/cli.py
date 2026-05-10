@@ -1271,7 +1271,10 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "autonomous-gates":
             if args.autonomous_gates_command == "status":
-                payload = await container.autonomous_gate_tuning_service.status(kalshi_env=args.kalshi_env)
+                payload = await container.autonomous_gate_tuning_service.status(
+                    kalshi_env=args.kalshi_env,
+                    domain=args.domain,
+                )
             elif args.autonomous_gates_command == "run":
                 payload = await container.autonomous_gate_tuning_service.run(
                     kalshi_env=args.kalshi_env,
@@ -1280,6 +1283,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     min_support=args.min_support,
                     dry_run=args.dry_run,
                     triggered_by="cli",
+                    domain=args.domain,
                 )
             else:
                 raise ValueError(f"unknown autonomous-gates command {args.autonomous_gates_command}")
@@ -2256,9 +2260,11 @@ def build_parser() -> argparse.ArgumentParser:
     autonomous_gate_run.add_argument("--days", type=int, default=None)
     autonomous_gate_run.add_argument("--min-support", type=int, default=None)
     autonomous_gate_run.add_argument("--dry-run", action="store_true")
+    autonomous_gate_run.add_argument("--domain", choices=["weather", "crypto", "all"], default="all")
     autonomous_gate_run.add_argument("--format", choices=["json"], default="json")
     autonomous_gate_status = autonomous_gate_subparsers.add_parser("status")
     autonomous_gate_status.add_argument("--kalshi-env", default="production")
+    autonomous_gate_status.add_argument("--domain", choices=["weather", "crypto", "all"], default="all")
     autonomous_gate_status.add_argument("--format", choices=["json"], default="json")
 
     stream = subparsers.add_parser("stream")

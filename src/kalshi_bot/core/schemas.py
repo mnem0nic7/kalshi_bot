@@ -397,6 +397,37 @@ class AgentPackThresholds(BaseModel):
     strategy_min_remaining_payout_bps: int | None = None
 
 
+class AgentPackCryptoEntryPolicy(BaseModel):
+    min_fee_adjusted_edge_bps: int | None = None
+    max_spread_bps: int | None = None
+    min_confidence: float | None = None
+    min_contract_price_dollars: float | None = None
+    min_remaining_payout_bps: int | None = None
+    max_credible_edge_bps: int | None = None
+
+
+class AgentPackCryptoReplayPolicy(BaseModel):
+    min_resolved_markets: int | None = None
+    min_trade_candidates: int | None = None
+    min_net_pl_dollars: float | None = None
+    max_hard_cap_breaches: int | None = None
+    min_spot_coverage_pct: float | None = None
+    require_calibration_better_than_mid: bool | None = None
+
+
+class AgentPackCryptoLivePolicy(BaseModel):
+    trading_enabled: bool | None = None
+    production_autonomy_enabled: bool | None = None
+    asset_modes: dict[str, str] = Field(default_factory=dict)
+
+
+class AgentPackCryptoPolicy(BaseModel):
+    entry: AgentPackCryptoEntryPolicy = Field(default_factory=AgentPackCryptoEntryPolicy)
+    replay: AgentPackCryptoReplayPolicy = Field(default_factory=AgentPackCryptoReplayPolicy)
+    live: AgentPackCryptoLivePolicy = Field(default_factory=AgentPackCryptoLivePolicy)
+    asset_entry_overrides: dict[str, AgentPackCryptoEntryPolicy] = Field(default_factory=dict)
+
+
 class AgentPack(BaseModel):
     version: str
     status: str = "builtin"
@@ -407,6 +438,7 @@ class AgentPack(BaseModel):
     research: AgentPackResearchConfig
     memory: AgentPackMemoryConfig
     thresholds: AgentPackThresholds = Field(default_factory=AgentPackThresholds)
+    crypto_policy: AgentPackCryptoPolicy = Field(default_factory=AgentPackCryptoPolicy)
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

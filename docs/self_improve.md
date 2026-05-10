@@ -27,10 +27,19 @@ An agent pack is the mutable runtime unit for self-improvement. Each version sto
 - memory summarization settings
 - bounded mutable thresholds:
   - `risk_min_edge_bps`
+  - `risk_max_credible_edge_bps`
+  - `risk_min_confidence`
+  - `risk_min_contract_price_dollars`
   - `risk_max_order_notional_dollars`
   - `risk_max_position_notional_dollars`
   - `trigger_max_spread_bps`
   - `trigger_cooldown_seconds`
+  - `strategy_min_abs_delta_f`
+  - `strategy_min_remaining_payout_bps`
+- crypto policy:
+  - entry gates: fee-adjusted minimum edge, maximum spread, minimum confidence, minimum contract price, minimum remaining payout, and maximum credible edge
+  - replay gates: resolved-market support, trade-candidate support, minimum simulated P/L, hard-cap breach ceiling, spot coverage, and calibration-better-than-mid requirement
+  - live policy: runtime trading flag, runtime production-autonomy flag, per-asset modes, and per-asset entry-threshold overrides
 
 The following safety controls are never auto-modified:
 
@@ -95,13 +104,21 @@ kalshi-bot-cli parameter-pack stage --candidate-pack candidate-pack.json --candi
 kalshi-bot-cli parameter-pack canary --report canary-report.json
 kalshi-bot-cli parameter-pack promote-staged --reason manual_parameter_pack_promote
 kalshi-bot-cli parameter-pack rollback-staged --reason manual_parameter_pack_rollback
-kalshi-bot-cli autonomous-gates run --kalshi-env production --source combined --days 3650 --dry-run --format json
-kalshi-bot-cli autonomous-gates status --kalshi-env production --format json
+kalshi-bot-cli autonomous-gates run --kalshi-env production --domain all --source combined --days 3650 --dry-run --format json
+kalshi-bot-cli autonomous-gates status --kalshi-env production --domain all --format json
 ```
 
 `parameter-pack status` shows the current staged rollout notes, champion pack, recent parameter packs, recent parameter-pack promotion events, and the current `promotion_starvation` checkpoint state. It also marks stale staged or canary-pending candidates `stalled` after `SELF_IMPROVE_CANARY_MAX_SECONDS` so abandoned rollouts are visible. `parameter-pack drift` evaluates calibration drift from a JSON window and reports whether new entries should pause and a pack search should trigger; it does not mutate runtime state. `parameter-pack grid` emits deterministic bounded candidates for offline replay without evaluating or staging them. `parameter-pack select` reads offline replay search candidates, stamps deterministic pack hashes into holdout reports when absent, applies the same sealed hard-cap promotion gates, prints the first passing candidate artifact, and reports `promotion_starvation` after K failed candidates; it does not mutate runtime state. `parameter-pack record-starvation` turns that read-only `promotion_starvation` result into an ops event and checkpoint, retaining the current pack and escalating from warning to error after repeated starvations. `parameter-pack learned-gate` keeps optional learned-head blend weight at zero unless learned holdout Brier, ECE, and Sharpe beat closed-form. `parameter-pack nws-parser-gate` keeps optional parser feature weight at zero unless shadow availability and schema-validity windows pass. `parameter-pack stage` is intentionally not an activator. It stores a sanitized candidate pack, records a `promotion_events` row with holdout-gate evidence and sealed hard-cap hash, writes `deployment_control.notes.parameter_packs` for operator visibility, and clears any existing starvation streak. `parameter-pack canary` evaluates shadow-canary evidence: Brier must stay within 20% of holdout Brier, and risk-engine bypasses, data-source kill events, and hard-cap touches must be zero. `parameter-pack promote-staged` is operator-only and marks a canary-passed pack as the champion metadata record. `parameter-pack rollback-staged` marks that staged candidate rolled back and rejected. None of these commands change active color, live execution, hard caps, or runtime thresholds.
 
-`autonomous-gates run` is the deterministic threshold authority for baseline gates. It builds a gate-learning recommendation from historical and forward-shadow bundles, validates the candidate through bundle-backed backtesting and modeling, stages threshold changes inside an agent pack, and waits for newly labeled live decision-corpus canary rows before assigning the pack to the active color. The daemon runs it after settlement reconciliation and on an active-color periodic heartbeat, so accepted recommendations do not wait indefinitely for another settlement event. `--dry-run` prints the candidate, validation report, and evidence fingerprint without mutating runtime state. `autonomous-gates status` reads the checkpoint, active color, active pack, active thresholds, fallback settings thresholds, threshold drift, and last canary/promotion result. This loop never rewrites `.env` or `config.py`; those remain fallback defaults, while promoted agent-pack thresholds are the live source of truth.
+`autonomous-gates run` is the deterministic threshold authority for baseline gates. For weather, it builds a gate-learning recommendation from historical and forward-shadow bundles, validates the candidate through bundle-backed backtesting and modeling, stages threshold changes inside an agent pack, and waits for newly labeled live decision-corpus canary rows before assigning the pack to the active color. For crypto, the same command reads crypto snapshots, candles, spot OHLC, replay/backtest artifacts, and labeled crypto outcomes, then stages per-asset crypto-policy changes only for assets with enough support and better walk-forward P/L without worse drawdown. The daemon runs `--domain all` after settlement reconciliation and on an active-color periodic heartbeat, so accepted weather or crypto recommendations do not wait indefinitely for another settlement event. `--dry-run` prints the candidate, validation report, and evidence fingerprint without mutating runtime state. `autonomous-gates status --domain all` reads the checkpoint, active color, active pack, active weather thresholds, active crypto policy, fallback settings thresholds, threshold drift, and last canary/promotion result. This loop never rewrites `.env` or `config.py`; those remain fallback defaults, while promoted agent-pack thresholds and crypto policy are the live source of truth.
+
+Crypto parity memory:
+
+- Weather and crypto thresholds are separate in the active agent pack.
+- Crypto promotion is per asset; a BTC policy promotion must not change ETH.
+- Manual deployment-note asset mode `off` is a hard override and wins over any agent-pack live mode.
+- Runtime crypto live flags may satisfy crypto trading and production-autonomy checks, but they do not override `crypto_enabled`, `crypto_15m_enabled`, inactive color, app shadow mode, missing write credentials, stale data, kill switch, replay failure, or risk caps.
+- Crypto candidate selection, replay gate evaluation, deterministic risk checks, execution requotes, and passive/taker fallback must read the active runtime crypto policy instead of raw `Settings` when a pack field exists.
 
 The helper scripts wrap the same flow for Docker blue or green deployments:
 

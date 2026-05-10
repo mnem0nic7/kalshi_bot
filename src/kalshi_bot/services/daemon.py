@@ -165,6 +165,7 @@ class DaemonService:
                         days=self.settings.autonomous_gate_tuning_days,
                         min_support=self.settings.autonomous_gate_tuning_min_support,
                         triggered_by="settlement_reconcile",
+                        domain="all",
                     )
                 else:
                     result["autonomous_gate_tuning"] = {"status": "skipped", "reason": "inactive_color"}
@@ -434,9 +435,6 @@ class DaemonService:
         while True:
             await asyncio.sleep(self.settings.crypto_autonomy_interval_seconds)
             if self.crypto_autonomy_service is None or not self.settings.crypto_autonomy_enabled:
-                continue
-            if self.settings.kalshi_env != "demo":
-                logger.info("crypto autonomy enabled but skipped outside demo env")
                 continue
             if not await self._is_active_color():
                 continue
@@ -765,6 +763,7 @@ class DaemonService:
                 days=self.settings.autonomous_gate_tuning_days,
                 min_support=self.settings.autonomous_gate_tuning_min_support,
                 triggered_by="active_periodic",
+                domain="all",
             )
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)

@@ -4,7 +4,7 @@ import pytest
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
-from kalshi_bot.core.schemas import AgentPack, AgentPackThresholds
+from kalshi_bot.core.schemas import AgentPack, AgentPackCryptoEntryPolicy, AgentPackCryptoPolicy, AgentPackThresholds
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.agent_packs import AgentPackService
@@ -23,6 +23,9 @@ def test_agent_pack_service_builds_deterministic_default_pack() -> None:
     assert pack.thresholds.risk_min_confidence == settings.risk_min_confidence
     assert pack.thresholds.strategy_min_abs_delta_f == settings.strategy_min_abs_delta_f
     assert pack.thresholds.risk_max_credible_edge_bps == settings.risk_max_credible_edge_bps
+    assert pack.crypto_policy.entry.min_fee_adjusted_edge_bps == settings.risk_min_edge_bps
+    assert pack.crypto_policy.replay.min_resolved_markets == settings.crypto_replay_min_resolved_markets
+    assert pack.crypto_policy.live.trading_enabled == settings.crypto_trading_enabled
 
 
 def test_agent_pack_runtime_thresholds_override_all_tunable_gates() -> None:
@@ -53,6 +56,41 @@ def test_agent_pack_runtime_thresholds_override_all_tunable_gates() -> None:
     assert thresholds.strategy_min_remaining_payout_bps == 1000
 
 
+def test_agent_pack_runtime_crypto_policy_overrides_per_asset() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    service = AgentPackService(settings)
+    pack = service.default_pack().model_copy(
+        update={
+            "crypto_policy": AgentPackCryptoPolicy(
+                entry=AgentPackCryptoEntryPolicy(
+                    min_fee_adjusted_edge_bps=1000,
+                    max_spread_bps=800,
+                    min_confidence=0.75,
+                    min_contract_price_dollars=0.08,
+                    min_remaining_payout_bps=1500,
+                    max_credible_edge_bps=7500,
+                ),
+                asset_entry_overrides={
+                    "btc": AgentPackCryptoEntryPolicy(
+                        min_fee_adjusted_edge_bps=1500,
+                        max_spread_bps=250,
+                    )
+                },
+            )
+        }
+    )
+
+    policy = service.runtime_crypto_policy(pack)
+    thresholds = service.runtime_crypto_thresholds(policy, asset_symbol="BTC")
+
+    assert policy.entry_for_asset("eth")["min_fee_adjusted_edge_bps"] == 1000
+    assert policy.entry_for_asset("BTC")["min_fee_adjusted_edge_bps"] == 1500
+    assert policy.entry_for_asset("BTC")["max_spread_bps"] == 250
+    assert thresholds.risk_min_edge_bps == 1500
+    assert thresholds.trigger_max_spread_bps == 250
+    assert thresholds.strategy_min_remaining_payout_bps == 1500
+
+
 def test_agent_pack_service_sanitizes_mutable_threshold_bounds() -> None:
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
     service = AgentPackService(settings)
@@ -74,6 +112,36 @@ def test_agent_pack_service_sanitizes_mutable_threshold_bounds() -> None:
     assert sanitized.thresholds.risk_max_position_notional_dollars == 25.0
     assert sanitized.thresholds.trigger_max_spread_bps == 50
     assert sanitized.thresholds.trigger_cooldown_seconds == 3600
+
+
+def test_agent_pack_service_sanitizes_crypto_policy_bounds() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    service = AgentPackService(settings)
+    payload = service.default_pack().model_dump(mode="json")
+    payload["version"] = "candidate-crypto-test"
+    payload["crypto_policy"]["entry"] = {
+        "min_fee_adjusted_edge_bps": 9999,
+        "max_spread_bps": 1,
+        "min_confidence": 0.01,
+        "min_contract_price_dollars": 0.001,
+        "min_remaining_payout_bps": 1,
+        "max_credible_edge_bps": 99999,
+    }
+    payload["crypto_policy"]["live"]["asset_modes"] = {"btc": "live", "eth": "nonsense"}
+    payload["crypto_policy"]["asset_entry_overrides"] = {
+        "btc": {"min_fee_adjusted_edge_bps": 9999, "max_spread_bps": 9999}
+    }
+
+    sanitized = service.sanitize_candidate_pack(AgentPack(**payload), parent_version="builtin")
+
+    assert sanitized.crypto_policy.entry.min_fee_adjusted_edge_bps == 5000
+    assert sanitized.crypto_policy.entry.max_spread_bps == 50
+    assert sanitized.crypto_policy.entry.min_confidence == 0.50
+    assert sanitized.crypto_policy.entry.min_contract_price_dollars == 0.01
+    assert sanitized.crypto_policy.entry.min_remaining_payout_bps == 100
+    assert sanitized.crypto_policy.entry.max_credible_edge_bps == 10000
+    assert sanitized.crypto_policy.live.asset_modes == {"BTC": "live", "ETH": "shadow"}
+    assert sanitized.crypto_policy.asset_entry_overrides["BTC"].max_spread_bps == 2500
 
 
 def test_agent_pack_service_clamps_role_temperature() -> None:

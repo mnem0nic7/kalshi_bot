@@ -10,6 +10,7 @@ The platform is one async Python service with four main layers:
    - NOAA/NWS weather ingestion
 2. Deterministic engines
    - Weather fair-value estimation
+   - Crypto 15-minute signal selection and replay-gated calibration
    - Shadow-first Gumbel/KDE/climatology probability primitives
    - Adapter-first ensemble fusion primitives
    - Shadow-first uncertainty, fee-aware Kelly, survival, and exit-risk primitives
@@ -74,7 +75,8 @@ Postgres stores:
 - forecast snapshots and climatology priors for future replay-gated probability promotion
 - source health logs for per-provider success, freshness, completeness, consistency, and aggregate pause audits
 - agent packs, including live-overridable gate thresholds for edge, price, payout, spread, confidence, forecast separation, and max credible edge
-- autonomous gate-tuning checkpoints and promotion evidence from bundle-backed backtests/modeling
+- agent-pack crypto policy, including crypto entry gates, replay gates, runtime live flags, per-asset modes, and per-asset entry overrides
+- autonomous gate-tuning checkpoints and promotion evidence from bundle-backed weather backtests/modeling plus crypto snapshot/candle/spot/outcome scoring
 - deterministic parameter packs and holdout reports for future replay-gated promotion
 - staged parameter-pack promotion evidence in `promotion_events` and `deployment_control.notes.parameter_packs`
 - shadow-canary parameter-pack evidence before any operator promotion
@@ -106,3 +108,14 @@ When auto-triggering is enabled:
 3. It enforces cooldown and single-active-room rules per market
 4. It creates a new room and launches the existing supervisor workflow
 5. Trigger metadata is stored in checkpoints under `auto_trigger:<market>`
+
+## Autonomous Gate Tuning
+
+The deterministic `autonomous-gates` loop is the only runtime authority for changing live tunable gates. It never rewrites `.env` or `config.py`; those remain fallback defaults. Promoted values live in the active agent pack.
+
+Weather and crypto have separate policy surfaces:
+
+- Weather uses `AgentPackThresholds` for edge, price, payout, spread, confidence, forecast separation, max credible edge, and risk sizing inputs.
+- Crypto uses `AgentPackCryptoPolicy` for fee-adjusted edge, spread, confidence, contract price, remaining payout, max credible edge, replay support gates, runtime live flags, and per-asset overrides.
+
+Crypto promotions are per asset. The daemon runs `autonomous-gates --domain all` after settlement reconciliation and from the active-color heartbeat. A staged crypto candidate can promote BTC without changing ETH, and manual asset mode `off` remains a hard override over any promoted live mode.

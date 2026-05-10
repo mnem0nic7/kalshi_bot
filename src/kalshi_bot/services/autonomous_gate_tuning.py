@@ -9,9 +9,17 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.schemas import AgentPack
+from kalshi_bot.core.schemas import AgentPack, AgentPackCryptoEntryPolicy, AgentPackCryptoPolicy
+from kalshi_bot.crypto.services import (
+    _crypto_decision_rows,
+    _crypto_walk_forward_folds,
+    _fit_crypto_calibration,
+    _predict_crypto_probability,
+    _simulate_crypto_trade,
+    normalize_asset_symbol,
+)
 from kalshi_bot.db.repositories import PlatformRepository
-from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
+from kalshi_bot.services.agent_packs import AgentPackService, RuntimeCryptoPolicy, RuntimeThresholds
 from kalshi_bot.services.backtesting import build_backtesting_report
 from kalshi_bot.services.gate_learning import (
     GateLearningRow,
@@ -62,26 +70,31 @@ class AutonomousGateTuningService:
         self.modeling_builder = modeling_builder
         self.gate_learning_service_factory = gate_learning_service_factory or GateLearningService
 
-    async def status(self, *, kalshi_env: str | None = None) -> dict[str, Any]:
+    async def status(self, *, kalshi_env: str | None = None, domain: str = "all") -> dict[str, Any]:
+        normalized_domain = _normalize_domain(domain)
         env = kalshi_env or self.settings.kalshi_env
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=env)
             await self.agent_pack_service.ensure_initialized(repo)
             checkpoint = await repo.get_checkpoint(_checkpoint_name(env))
+            crypto_checkpoint = await repo.get_checkpoint(_checkpoint_name(env, domain="crypto"))
             control = await repo.get_deployment_control()
             active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
             active_thresholds = _threshold_values(self.agent_pack_service.runtime_thresholds(active_pack))
+            active_crypto_policy = _crypto_policy_values(self.agent_pack_service.runtime_crypto_policy(active_pack))
             await session.commit()
         settings_thresholds = _settings_threshold_values(self.settings)
         checkpoint_payload = checkpoint.payload if checkpoint is not None else None
-        return {
+        payload = {
             "status": ((checkpoint_payload or {}).get("status") if checkpoint_payload is not None else "not_started"),
             "kalshi_env": env,
+            "domain": normalized_domain,
             "llm_calls_enabled": bool(self.settings.llm_calls_enabled),
             "deterministic_runtime": not bool(self.settings.llm_calls_enabled),
             "active_color": control.active_color,
             "active_pack_version": active_pack.version,
             "active_thresholds": active_thresholds,
+            "active_crypto_policy": active_crypto_policy,
             "settings_thresholds": settings_thresholds,
             "threshold_drift": _threshold_drift(active_thresholds, settings_thresholds),
             "checkpoint": checkpoint_payload,
@@ -92,6 +105,22 @@ class AutonomousGateTuningService:
             "last_canary": (checkpoint_payload or {}).get("canary") if checkpoint_payload else None,
             "last_promotion": _promotion_summary(checkpoint_payload),
         }
+        if normalized_domain in {"crypto", "all"}:
+            crypto_payload = crypto_checkpoint.payload if crypto_checkpoint is not None else None
+            payload["crypto"] = {
+                "status": (crypto_payload or {}).get("status") if crypto_payload is not None else "not_started",
+                "checkpoint": crypto_payload,
+                "last_stage": _stage_summary(crypto_payload),
+                "last_canary": (crypto_payload or {}).get("canary") if crypto_payload else None,
+                "last_promotion": _promotion_summary(crypto_payload),
+            }
+            if normalized_domain == "crypto":
+                payload["status"] = payload["crypto"]["status"]
+                payload["checkpoint"] = crypto_payload
+                payload["last_stage"] = payload["crypto"]["last_stage"]
+                payload["last_canary"] = payload["crypto"]["last_canary"]
+                payload["last_promotion"] = payload["crypto"]["last_promotion"]
+        return payload
 
     async def run(
         self,
@@ -103,7 +132,44 @@ class AutonomousGateTuningService:
         dry_run: bool = False,
         triggered_by: str = "manual",
         now: datetime | None = None,
+        domain: str = "weather",
     ) -> dict[str, Any]:
+        normalized_domain = _normalize_domain(domain)
+        if normalized_domain == "crypto":
+            return await self._run_crypto(
+                kalshi_env=kalshi_env,
+                days=days,
+                min_support=min_support,
+                dry_run=dry_run,
+                triggered_by=triggered_by,
+                now=now,
+            )
+        if normalized_domain == "all":
+            weather = await self.run(
+                kalshi_env=kalshi_env,
+                source=source,
+                days=days,
+                min_support=min_support,
+                dry_run=dry_run,
+                triggered_by=triggered_by,
+                now=now,
+                domain="weather",
+            )
+            crypto = await self._run_crypto(
+                kalshi_env=kalshi_env,
+                days=days,
+                min_support=min_support,
+                dry_run=dry_run,
+                triggered_by=triggered_by,
+                now=now,
+            )
+            return {
+                "status": _combined_status(weather, crypto),
+                "kalshi_env": kalshi_env or self.settings.kalshi_env,
+                "domain": "all",
+                "weather": weather,
+                "crypto": crypto,
+            }
         env = kalshi_env or self.settings.kalshi_env
         run_source = source or self.settings.autonomous_gate_tuning_source
         run_days = int(days if days is not None else self.settings.autonomous_gate_tuning_days)
@@ -199,6 +265,456 @@ class AutonomousGateTuningService:
             )
             await session.commit()
         return staged
+
+    async def _run_crypto(
+        self,
+        *,
+        kalshi_env: str | None,
+        days: int | None,
+        min_support: int | None,
+        dry_run: bool,
+        triggered_by: str,
+        now: datetime | None,
+    ) -> dict[str, Any]:
+        env = kalshi_env or self.settings.kalshi_env
+        run_days = int(days if days is not None else self.settings.autonomous_gate_tuning_days)
+        support = int(min_support if min_support is not None else self.settings.autonomous_gate_tuning_min_support)
+        now_utc = _as_utc(now) or datetime.now(UTC)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=env)
+            checkpoint = await repo.get_checkpoint(_checkpoint_name(env, domain="crypto"))
+            payload = dict(checkpoint.payload if checkpoint is not None else {})
+            if payload.get("status") == "staged":
+                result = await self._evaluate_crypto_canary(
+                    repo,
+                    checkpoint_payload=payload,
+                    kalshi_env=env,
+                    dry_run=dry_run,
+                    now=now_utc,
+                )
+                await session.commit()
+                return result
+            pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(pack)
+            recommendation = await self._build_crypto_recommendation(
+                repo,
+                crypto_policy=crypto_policy,
+                kalshi_env=env,
+                days=run_days,
+                min_support=support,
+                now=now_utc,
+            )
+            candidate = _candidate_crypto_policy_values(recommendation, pack)
+            if not candidate["changes"]:
+                await session.commit()
+                return {
+                    "status": "no_candidate",
+                    "kalshi_env": env,
+                    "domain": "crypto",
+                    "reason": "no_crypto_asset_gate_changes_promoted",
+                    "recommendation": recommendation,
+                }
+            evidence_fingerprint = _crypto_evidence_fingerprint(
+                recommendation=recommendation,
+                current_policy=candidate["current_crypto_policy"],
+                candidate_policy=candidate["candidate_crypto_policy"],
+            )
+            if evidence_fingerprint in set(payload.get("evidence_fingerprint_history") or []):
+                await session.commit()
+                return {
+                    "status": "duplicate_evidence",
+                    "kalshi_env": env,
+                    "domain": "crypto",
+                    "evidence_fingerprint": evidence_fingerprint,
+                    "changes": candidate["changes"],
+                }
+            validation = {
+                "passed": recommendation["row_counts"]["labeled_rows"] > 0,
+                "failures": [] if recommendation["row_counts"]["labeled_rows"] > 0 else ["crypto_zero_rows"],
+                "row_counts": recommendation["row_counts"],
+            }
+            if dry_run or not validation["passed"]:
+                await session.commit()
+                return {
+                    "status": "dry_run" if dry_run else "validation_failed",
+                    "kalshi_env": env,
+                    "domain": "crypto",
+                    "dry_run": dry_run,
+                    "changes": candidate["changes"],
+                    "candidate_crypto_policy": candidate["candidate_crypto_policy"],
+                    "evidence_fingerprint": evidence_fingerprint,
+                    "recommendation": recommendation,
+                    "validation": validation,
+                }
+            staged = await self._stage_crypto_candidate(
+                repo,
+                current_pack=pack,
+                current_crypto_policy=candidate["current_crypto_policy"],
+                candidate_crypto_policy=candidate["candidate_crypto_policy"],
+                changes=candidate["changes"],
+                recommendation=recommendation,
+                validation=validation,
+                evidence_fingerprint=evidence_fingerprint,
+                kalshi_env=env,
+                days=run_days,
+                min_support=support,
+                triggered_by=triggered_by,
+                now=now_utc,
+                history=list(payload.get("evidence_fingerprint_history") or []),
+            )
+            await session.commit()
+            return staged
+
+    async def _build_crypto_recommendation(
+        self,
+        repo: PlatformRepository,
+        *,
+        crypto_policy: Any,
+        kalshi_env: str,
+        days: int,
+        min_support: int,
+        now: datetime,
+    ) -> dict[str, Any]:
+        cutoff = now - timedelta(days=days)
+        snapshots = await repo.list_crypto_market_snapshots(
+            frequency="15m",
+            kalshi_env=kalshi_env,
+            since=cutoff,
+            limit=100_000,
+        )
+        candles = await repo.list_crypto_market_candlesticks(
+            frequency="15m",
+            kalshi_env=kalshi_env,
+            since=cutoff,
+            limit=200_000,
+        )
+        spot_rows = await repo.list_crypto_spot_ohlc(
+            frequency="15m",
+            kalshi_env=kalshi_env,
+            since=cutoff,
+            limit=500_000,
+        )
+        rows = _crypto_decision_rows(snapshots, candles, spot_rows)
+        labeled = [row for row in rows if row.get("label_yes") in {0, 1}]
+        assets = sorted({normalize_asset_symbol(str(row.get("asset_symbol") or "")) for row in labeled})
+        current_scores: dict[str, Any] = {}
+        promoted: dict[str, Any] = {}
+        diagnostics: list[dict[str, Any]] = []
+        for asset in assets:
+            asset_rows = [row for row in labeled if normalize_asset_symbol(str(row.get("asset_symbol") or "")) == asset]
+            current_score = _score_crypto_policy_rows(
+                asset_rows,
+                settings=self.settings,
+                crypto_policy=crypto_policy,
+                asset_symbol=asset,
+            )
+            current_scores[asset] = current_score
+            best = _best_crypto_asset_candidate(
+                asset_rows,
+                settings=self.settings,
+                crypto_policy=crypto_policy,
+                asset_symbol=asset,
+                min_support=min_support,
+                current_score=current_score,
+            )
+            diagnostics.append(
+                {
+                    "asset_symbol": asset,
+                    "row_count": len(asset_rows),
+                    "current": _json_crypto_score(current_score),
+                    "best_candidate": best,
+                }
+            )
+            if best is not None and best["promotion_status"] == "promoted":
+                promoted[asset] = best
+        return {
+            "schema_version": "crypto-autonomous-gate-recommendations-v1",
+            "kalshi_env": kalshi_env,
+            "domain": "crypto",
+            "window_days": days,
+            "min_support": min_support,
+            "row_counts": {
+                "snapshot_rows": len(snapshots),
+                "decision_rows": len(rows),
+                "labeled_rows": len(labeled),
+                "assets": assets,
+            },
+            "current_policy": _crypto_policy_values(crypto_policy),
+            "asset_diagnostics": diagnostics,
+            "promoted_assets": promoted,
+        }
+
+    async def _stage_crypto_candidate(
+        self,
+        repo: PlatformRepository,
+        *,
+        current_pack: AgentPack,
+        current_crypto_policy: dict[str, Any],
+        candidate_crypto_policy: dict[str, Any],
+        changes: dict[str, Any],
+        recommendation: dict[str, Any],
+        validation: dict[str, Any],
+        evidence_fingerprint: str,
+        kalshi_env: str,
+        days: int,
+        min_support: int,
+        triggered_by: str,
+        now: datetime,
+        history: list[str],
+    ) -> dict[str, Any]:
+        version = f"crypto-gate-tuning-{now.strftime('%Y%m%dT%H%M%SZ')}"
+        candidate_pack = current_pack.model_copy(
+            update={
+                "version": version,
+                "status": "staged",
+                "parent_version": current_pack.version,
+                "source": OPS_SOURCE,
+                "description": "Autonomous crypto gate tuning candidate from deterministic point-in-time replay evidence.",
+                "crypto_policy": AgentPackCryptoPolicy.model_validate(candidate_crypto_policy),
+                "metadata": {
+                    **dict(current_pack.metadata or {}),
+                    "autonomous_crypto_gate_tuning": {
+                        "staged_at": now.isoformat(),
+                        "triggered_by": triggered_by,
+                        "kalshi_env": kalshi_env,
+                        "days": days,
+                        "min_support": min_support,
+                        "evidence_fingerprint": evidence_fingerprint,
+                        "changes": changes,
+                    },
+                },
+            }
+        )
+        candidate_pack = self.agent_pack_service.sanitize_candidate_pack(candidate_pack, parent_version=current_pack.version)
+        await repo.update_agent_pack(candidate_pack)
+        promotion = await repo.create_promotion_event(
+            candidate_version=version,
+            previous_version=current_pack.version,
+            target_color=self.settings.app_color,
+            evaluation_run_id=None,
+            payload={
+                "kind": "autonomous_crypto_gate_tuning",
+                "evidence_fingerprint": evidence_fingerprint,
+                "current_crypto_policy": current_crypto_policy,
+                "candidate_crypto_policy": candidate_crypto_policy,
+                "changes": changes,
+                "recommendation_summary": {
+                    "row_counts": recommendation.get("row_counts"),
+                    "promoted_assets": sorted(changes),
+                },
+                "validation": validation,
+            },
+            status="staged",
+        )
+        control = await repo.get_deployment_control()
+        notes = self.agent_pack_service._notes(control)
+        notes["autonomous_crypto_gate_tuning"] = {
+            "status": "staged",
+            "candidate_version": version,
+            "previous_version": current_pack.version,
+            "promotion_event_id": promotion.id,
+            "evidence_fingerprint": evidence_fingerprint,
+            "staged_at": now.isoformat(),
+            "changes": changes,
+        }
+        await repo.update_deployment_notes(self.agent_pack_service._replace_notes(control.notes, notes))
+        history = list(dict.fromkeys([*history, evidence_fingerprint]))
+        checkpoint_payload = {
+            "status": "staged",
+            "kalshi_env": kalshi_env,
+            "domain": "crypto",
+            "candidate_version": version,
+            "previous_version": current_pack.version,
+            "promotion_event_id": promotion.id,
+            "staged_at": now.isoformat(),
+            "days": days,
+            "min_support": min_support,
+            "evidence_fingerprint": evidence_fingerprint,
+            "evidence_fingerprint_history": history[-20:],
+            "current_crypto_policy": current_crypto_policy,
+            "candidate_crypto_policy": candidate_crypto_policy,
+            "changes": changes,
+            "recommendation_summary": {
+                "row_counts": recommendation.get("row_counts"),
+                "promoted_assets": sorted(changes),
+            },
+        }
+        await repo.set_checkpoint(_checkpoint_name(kalshi_env, domain="crypto"), cursor=None, payload=checkpoint_payload)
+        await repo.log_ops_event(
+            severity="info",
+            summary=f"Autonomous crypto gate tuning staged {version} for {len(changes)} asset(s)",
+            source=OPS_SOURCE,
+            payload=checkpoint_payload,
+            kalshi_env=kalshi_env,
+        )
+        return {
+            "status": "staged",
+            "kalshi_env": kalshi_env,
+            "domain": "crypto",
+            "candidate_version": version,
+            "previous_version": current_pack.version,
+            "promotion_event_id": promotion.id,
+            "changes": changes,
+            "evidence_fingerprint": evidence_fingerprint,
+            "validation": validation,
+        }
+
+    async def _evaluate_crypto_canary(
+        self,
+        repo: PlatformRepository,
+        *,
+        checkpoint_payload: dict[str, Any],
+        kalshi_env: str,
+        dry_run: bool,
+        now: datetime,
+    ) -> dict[str, Any]:
+        staged_at = _as_utc(checkpoint_payload.get("staged_at")) or now
+        snapshots = await repo.list_crypto_market_snapshots(
+            frequency="15m",
+            kalshi_env=kalshi_env,
+            since=staged_at,
+            limit=100_000,
+        )
+        candles = await repo.list_crypto_market_candlesticks(
+            frequency="15m",
+            kalshi_env=kalshi_env,
+            since=staged_at - timedelta(hours=6),
+            limit=200_000,
+        )
+        spot_rows = await repo.list_crypto_spot_ohlc(
+            frequency="15m",
+            kalshi_env=kalshi_env,
+            since=staged_at - timedelta(hours=6),
+            limit=500_000,
+        )
+        rows = [
+            row
+            for row in _crypto_decision_rows(snapshots, candles, spot_rows)
+            if _as_utc(row.get("settlement_ts")) is not None and (_as_utc(row.get("settlement_ts")) or now) > staged_at
+        ]
+        changed_assets = set((checkpoint_payload.get("changes") or {}).keys())
+        if changed_assets:
+            rows = [
+                row
+                for row in rows
+                if normalize_asset_symbol(str(row.get("asset_symbol") or "")) in changed_assets
+            ]
+        current_policy = _runtime_crypto_policy_from_payload(
+            checkpoint_payload.get("current_crypto_policy") or {},
+            service=self.agent_pack_service,
+        )
+        candidate_policy = _runtime_crypto_policy_from_payload(
+            checkpoint_payload.get("candidate_crypto_policy") or {},
+            service=self.agent_pack_service,
+        )
+        current_score = _score_crypto_policy_rows(rows, settings=self.settings, crypto_policy=current_policy)
+        candidate_score = _score_crypto_policy_rows(rows, settings=self.settings, crypto_policy=candidate_policy)
+        canary = {
+            "settled_rows": len(rows),
+            "evidence_source": "crypto_live_market_snapshots",
+            "candidate_selected_rows": candidate_score["selected_count"],
+            "current_selected_rows": current_score["selected_count"],
+            "candidate_net_pnl": _money(candidate_score["net_pnl"]),
+            "current_net_pnl": _money(current_score["net_pnl"]),
+            "candidate_drawdown_proxy": _money(candidate_score["drawdown_proxy"]),
+            "current_drawdown_proxy": _money(current_score["drawdown_proxy"]),
+            "staged_at": staged_at.isoformat(),
+            "evaluated_at": now.isoformat(),
+            "assets": sorted(changed_assets),
+        }
+        min_rows = int(self.settings.autonomous_gate_tuning_canary_min_settled_rows)
+        expired = now - staged_at > timedelta(hours=int(self.settings.autonomous_gate_tuning_canary_max_wait_hours))
+        if candidate_score["selected_count"] < min_rows:
+            if dry_run or not expired:
+                return {
+                    "status": "canary_pending",
+                    "kalshi_env": kalshi_env,
+                    "domain": "crypto",
+                    "candidate_version": checkpoint_payload.get("candidate_version"),
+                    "reason": "insufficient_canary_support",
+                    "required_candidate_rows": min_rows,
+                    "expired": expired,
+                    "canary": canary,
+                }
+            return await self._reject_crypto_candidate(
+                repo,
+                checkpoint_payload=checkpoint_payload,
+                kalshi_env=kalshi_env,
+                reason="canary_support_timeout",
+                canary=canary,
+                now=now,
+            )
+        passed = (
+            candidate_score["net_pnl"] > current_score["net_pnl"]
+            and candidate_score["drawdown_proxy"] <= current_score["drawdown_proxy"]
+        )
+        if dry_run:
+            return {
+                "status": "canary_passed" if passed else "canary_failed",
+                "kalshi_env": kalshi_env,
+                "domain": "crypto",
+                "dry_run": True,
+                "candidate_version": checkpoint_payload.get("candidate_version"),
+                "canary": canary,
+            }
+        if not passed:
+            return await self._reject_crypto_candidate(
+                repo,
+                checkpoint_payload=checkpoint_payload,
+                kalshi_env=kalshi_env,
+                reason="canary_pnl_or_drawdown_regression",
+                canary=canary,
+                now=now,
+            )
+        return await self._promote_crypto_candidate(
+            repo,
+            checkpoint_payload=checkpoint_payload,
+            kalshi_env=kalshi_env,
+            canary=canary,
+            now=now,
+        )
+
+    async def _promote_crypto_candidate(
+        self,
+        repo: PlatformRepository,
+        *,
+        checkpoint_payload: dict[str, Any],
+        kalshi_env: str,
+        canary: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        result = await self._promote_candidate(
+            repo,
+            checkpoint_payload=checkpoint_payload,
+            kalshi_env=kalshi_env,
+            canary=canary,
+            now=now,
+            checkpoint_domain="crypto",
+        )
+        result["domain"] = "crypto"
+        return result
+
+    async def _reject_crypto_candidate(
+        self,
+        repo: PlatformRepository,
+        *,
+        checkpoint_payload: dict[str, Any],
+        kalshi_env: str,
+        reason: str,
+        canary: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        result = await self._reject_candidate(
+            repo,
+            checkpoint_payload=checkpoint_payload,
+            kalshi_env=kalshi_env,
+            reason=reason,
+            canary=canary,
+            now=now,
+            checkpoint_domain="crypto",
+        )
+        result["domain"] = "crypto"
+        return result
 
     async def _validate_candidate(
         self,
@@ -477,6 +993,7 @@ class AutonomousGateTuningService:
         kalshi_env: str,
         canary: dict[str, Any],
         now: datetime,
+        checkpoint_domain: str = "weather",
     ) -> dict[str, Any]:
         candidate_version = str(checkpoint_payload["candidate_version"])
         previous_version = checkpoint_payload.get("previous_version")
@@ -532,7 +1049,7 @@ class AutonomousGateTuningService:
             payload["promoted_at"] = now.isoformat()
             await repo.update_promotion_event(str(promotion_id), status="stable", payload=payload)
         payload = {**checkpoint_payload, "status": "champion", "promoted_at": now.isoformat(), "canary": canary}
-        await repo.set_checkpoint(_checkpoint_name(kalshi_env), cursor=None, payload=payload)
+        await repo.set_checkpoint(_checkpoint_name(kalshi_env, domain=checkpoint_domain), cursor=None, payload=payload)
         await repo.log_ops_event(
             severity="info",
             summary=f"Autonomous gate tuning promoted {candidate_version}",
@@ -557,6 +1074,7 @@ class AutonomousGateTuningService:
         reason: str,
         canary: dict[str, Any],
         now: datetime,
+        checkpoint_domain: str = "weather",
     ) -> dict[str, Any]:
         candidate_version = str(checkpoint_payload.get("candidate_version") or "")
         if candidate_version:
@@ -585,7 +1103,7 @@ class AutonomousGateTuningService:
             payload["rejected_at"] = now.isoformat()
             await repo.update_promotion_event(str(promotion_id), status="rolled_back", payload=payload, rollback_reason=reason)
         payload = {**checkpoint_payload, "status": "rejected", "rejected_at": now.isoformat(), "rejection_reason": reason, "canary": canary}
-        await repo.set_checkpoint(_checkpoint_name(kalshi_env), cursor=None, payload=payload)
+        await repo.set_checkpoint(_checkpoint_name(kalshi_env, domain=checkpoint_domain), cursor=None, payload=payload)
         await repo.log_ops_event(
             severity="warning",
             summary=f"Autonomous gate tuning rejected {candidate_version or 'candidate'}: {reason}",
@@ -602,8 +1120,30 @@ class AutonomousGateTuningService:
         }
 
 
-def _checkpoint_name(kalshi_env: str) -> str:
+def _checkpoint_name(kalshi_env: str, *, domain: str = "weather") -> str:
+    if domain == "crypto":
+        return f"{CHECKPOINT_PREFIX}:crypto:{kalshi_env}"
     return f"{CHECKPOINT_PREFIX}:{kalshi_env}"
+
+
+def _normalize_domain(domain: str | None) -> str:
+    normalized = str(domain or "weather").strip().lower()
+    if normalized not in {"weather", "crypto", "all"}:
+        raise ValueError("domain must be one of: weather, crypto, all")
+    return normalized
+
+
+def _combined_status(weather: dict[str, Any], crypto: dict[str, Any]) -> str:
+    statuses = {str(weather.get("status")), str(crypto.get("status"))}
+    if "staged" in statuses:
+        return "staged"
+    if "promoted" in statuses:
+        return "promoted"
+    if "validation_failed" in statuses or "rejected" in statuses:
+        return "attention"
+    if statuses <= {"no_candidate", "duplicate_evidence", "canary_pending"}:
+        return "no_candidate"
+    return "ok"
 
 
 def _as_utc(value: Any) -> datetime | None:
@@ -628,6 +1168,43 @@ def _threshold_values(thresholds: RuntimeThresholds) -> dict[str, Any]:
 
 def _settings_threshold_values(settings: Settings) -> dict[str, Any]:
     return {field: getattr(settings, field) for field in TUNABLE_GATE_FIELDS}
+
+
+def _crypto_policy_values(policy: RuntimeCryptoPolicy) -> dict[str, Any]:
+    return {
+        "entry": {
+            "min_fee_adjusted_edge_bps": policy.min_fee_adjusted_edge_bps,
+            "max_spread_bps": policy.max_spread_bps,
+            "min_confidence": policy.min_confidence,
+            "min_contract_price_dollars": policy.min_contract_price_dollars,
+            "min_remaining_payout_bps": policy.min_remaining_payout_bps,
+            "max_credible_edge_bps": policy.max_credible_edge_bps,
+        },
+        "replay": {
+            "min_resolved_markets": policy.replay_min_resolved_markets,
+            "min_trade_candidates": policy.replay_min_trade_candidates,
+            "min_net_pl_dollars": policy.replay_min_net_pl_dollars,
+            "max_hard_cap_breaches": policy.replay_max_hard_cap_breaches,
+            "min_spot_coverage_pct": policy.replay_min_spot_coverage_pct,
+            "require_calibration_better_than_mid": policy.replay_require_calibration_better_than_mid,
+        },
+        "live": {
+            "trading_enabled": policy.trading_enabled,
+            "production_autonomy_enabled": policy.production_autonomy_enabled,
+            "asset_modes": dict(policy.asset_modes),
+        },
+        "asset_entry_overrides": {
+            symbol: {key: value for key, value in values.items() if value is not None}
+            for symbol, values in policy.asset_entry_overrides.items()
+        },
+    }
+
+
+def _runtime_crypto_policy_from_payload(payload: dict[str, Any], *, service: AgentPackService) -> RuntimeCryptoPolicy:
+    pack = service.default_pack().model_copy(
+        update={"crypto_policy": AgentPackCryptoPolicy.model_validate(payload)}
+    )
+    return service.runtime_crypto_policy(pack)
 
 
 def _threshold_drift(active_thresholds: dict[str, Any], settings_thresholds: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -690,6 +1267,40 @@ def _candidate_threshold_values(
     }
 
 
+def _candidate_crypto_policy_values(recommendation: dict[str, Any], current_pack: AgentPack) -> dict[str, Any]:
+    current_policy = AgentPackCryptoPolicy.model_validate(current_pack.crypto_policy.model_dump(mode="json"))
+    candidate_policy = AgentPackCryptoPolicy.model_validate(current_pack.crypto_policy.model_dump(mode="json"))
+    changes: dict[str, Any] = {}
+    live_modes = dict(candidate_policy.live.asset_modes or {})
+    overrides = dict(candidate_policy.asset_entry_overrides or {})
+    for asset, details in dict(recommendation.get("promoted_assets") or {}).items():
+        symbol = normalize_asset_symbol(asset)
+        entry = AgentPackCryptoEntryPolicy.model_validate(details["entry"])
+        overrides[symbol] = entry
+        live_modes[symbol] = "live"
+        changes[symbol] = {
+            "entry": entry.model_dump(mode="json"),
+            "current_score": details.get("current_score"),
+            "candidate_score": details.get("candidate_score"),
+            "candidate_policy": details.get("candidate_policy"),
+            "reason": details.get("promotion_reason"),
+            "live_mode": "live",
+        }
+    candidate_policy.asset_entry_overrides = overrides
+    candidate_policy.live = candidate_policy.live.model_copy(
+        update={
+            "trading_enabled": True,
+            "production_autonomy_enabled": True,
+            "asset_modes": live_modes,
+        }
+    )
+    return {
+        "current_crypto_policy": current_policy.model_dump(mode="json"),
+        "candidate_crypto_policy": candidate_policy.model_dump(mode="json"),
+        "changes": changes,
+    }
+
+
 def _evidence_fingerprint(
     *,
     recommendation: dict[str, Any],
@@ -704,6 +1315,23 @@ def _evidence_fingerprint(
         "current_thresholds": current_thresholds,
         "candidate_thresholds": candidate_thresholds,
         "recommended_settings": recommendation.get("recommended_settings"),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _crypto_evidence_fingerprint(
+    *,
+    recommendation: dict[str, Any],
+    current_policy: dict[str, Any],
+    candidate_policy: dict[str, Any],
+) -> str:
+    payload = {
+        "schema_version": recommendation.get("schema_version"),
+        "row_counts": recommendation.get("row_counts"),
+        "current_crypto_policy": current_policy,
+        "candidate_crypto_policy": candidate_policy,
+        "promoted_assets": recommendation.get("promoted_assets"),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -786,6 +1414,165 @@ def _row_passes_thresholds(row: GateLearningRow, thresholds: dict[str, Any]) -> 
         and row.edge_bps is not None
         and row.edge_bps <= max_edge
     )
+
+
+def _score_crypto_policy_rows(
+    rows: list[dict[str, Any]],
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy,
+    asset_symbol: str | None = None,
+) -> dict[str, Any]:
+    filtered = [
+        row for row in rows
+        if asset_symbol is None or normalize_asset_symbol(str(row.get("asset_symbol") or "")) == normalize_asset_symbol(asset_symbol)
+    ]
+    folds = _crypto_walk_forward_folds(filtered, min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)))
+    selected_pnls: list[Decimal] = []
+    selected_rows = 0
+    if folds:
+        for fold in folds:
+            model = _fit_crypto_calibration(fold["train_rows"], settings=settings, include_candidate_report=False)
+            for row in fold["test_rows"]:
+                fair = _predict_crypto_probability(row, model)
+                simulated = _simulate_crypto_trade(row, fair, settings=settings, crypto_policy=crypto_policy)
+                if simulated.get("status") == "fillable":
+                    selected_rows += 1
+                    selected_pnls.append(Decimal(str(simulated.get("net_pnl") or "0")))
+    else:
+        model = _fit_crypto_calibration(filtered, settings=settings, include_candidate_report=False)
+        for row in filtered:
+            fair = _predict_crypto_probability(row, model)
+            simulated = _simulate_crypto_trade(row, fair, settings=settings, crypto_policy=crypto_policy)
+            if simulated.get("status") == "fillable":
+                selected_rows += 1
+                selected_pnls.append(Decimal(str(simulated.get("net_pnl") or "0")))
+    net = sum(selected_pnls, Decimal("0"))
+    cumulative = Decimal("0")
+    min_cumulative = Decimal("0")
+    for pnl in selected_pnls:
+        cumulative += pnl
+        min_cumulative = min(min_cumulative, cumulative)
+    return {
+        "row_count": len(filtered),
+        "selected_count": selected_rows,
+        "net_pnl": net,
+        "drawdown_proxy": abs(min_cumulative),
+    }
+
+
+def _best_crypto_asset_candidate(
+    rows: list[dict[str, Any]],
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy,
+    asset_symbol: str,
+    min_support: int,
+    current_score: dict[str, Any],
+) -> dict[str, Any] | None:
+    if len(rows) < min_support:
+        return {
+            "promotion_status": "insufficient_evidence",
+            "reason": "asset_row_support_below_minimum",
+            "support_count": len(rows),
+        }
+    current_entry = crypto_policy.entry_for_asset(asset_symbol)
+    candidates: list[dict[str, Any]] = []
+    for field, values in {
+        "min_fee_adjusted_edge_bps": (250, 500, 750, 1000, 1500, 2500, 5000),
+        "max_spread_bps": (100, 250, 500, 800, 1000, 1500, 2500),
+        "min_confidence": (0.60, 0.70, 0.75, 0.80, 0.85, 0.90),
+        "min_contract_price_dollars": (0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.25),
+        "min_remaining_payout_bps": (500, 1000, 1500, 2000, 2500, 3000, 3500),
+        "max_credible_edge_bps": (2500, 5000, 7500, 10000),
+    }.items():
+        for value in values:
+            entry = dict(current_entry)
+            entry[field] = value
+            candidate_policy = _crypto_policy_with_asset_entry(
+                crypto_policy,
+                asset_symbol=asset_symbol,
+                entry=entry,
+            )
+            score = _score_crypto_policy_rows(
+                rows,
+                settings=settings,
+                crypto_policy=candidate_policy,
+                asset_symbol=asset_symbol,
+            )
+            support = int(score["selected_count"])
+            promoted = (
+                support >= min_support
+                and score["net_pnl"] > current_score["net_pnl"]
+                and score["drawdown_proxy"] <= current_score["drawdown_proxy"]
+            )
+            candidates.append(
+                {
+                    "promotion_status": "promoted" if promoted else "not_promoted",
+                    "candidate_policy": f"crypto.{asset_symbol}.{field}={value}",
+                    "entry": entry,
+                    "support_count": support,
+                    "current_score": _json_crypto_score(current_score),
+                    "candidate_score": _json_crypto_score(score),
+                    "net_improvement_dollars": _money(score["net_pnl"] - current_score["net_pnl"]),
+                    "promotion_reason": "walk_forward_pnl_improved_without_worse_drawdown"
+                    if promoted
+                    else "support_pnl_or_drawdown_rule_failed",
+                }
+            )
+    promoted = [candidate for candidate in candidates if candidate["promotion_status"] == "promoted"]
+    if promoted:
+        return max(
+            promoted,
+            key=lambda item: (
+                Decimal(str(item["net_improvement_dollars"])),
+                int(item["support_count"]),
+            ),
+        )
+    return max(
+        candidates,
+        key=lambda item: (
+            Decimal(str(item["net_improvement_dollars"])),
+            int(item["support_count"]),
+        ),
+        default=None,
+    )
+
+
+def _crypto_policy_with_asset_entry(
+    crypto_policy: RuntimeCryptoPolicy,
+    *,
+    asset_symbol: str,
+    entry: dict[str, Any],
+) -> RuntimeCryptoPolicy:
+    overrides = {**crypto_policy.asset_entry_overrides, normalize_asset_symbol(asset_symbol): dict(entry)}
+    return RuntimeCryptoPolicy(
+        min_fee_adjusted_edge_bps=crypto_policy.min_fee_adjusted_edge_bps,
+        max_spread_bps=crypto_policy.max_spread_bps,
+        min_confidence=crypto_policy.min_confidence,
+        min_contract_price_dollars=crypto_policy.min_contract_price_dollars,
+        min_remaining_payout_bps=crypto_policy.min_remaining_payout_bps,
+        max_credible_edge_bps=crypto_policy.max_credible_edge_bps,
+        replay_min_resolved_markets=crypto_policy.replay_min_resolved_markets,
+        replay_min_trade_candidates=crypto_policy.replay_min_trade_candidates,
+        replay_min_net_pl_dollars=crypto_policy.replay_min_net_pl_dollars,
+        replay_max_hard_cap_breaches=crypto_policy.replay_max_hard_cap_breaches,
+        replay_min_spot_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
+        replay_require_calibration_better_than_mid=crypto_policy.replay_require_calibration_better_than_mid,
+        trading_enabled=crypto_policy.trading_enabled,
+        production_autonomy_enabled=crypto_policy.production_autonomy_enabled,
+        asset_modes=dict(crypto_policy.asset_modes),
+        asset_entry_overrides=overrides,
+    )
+
+
+def _json_crypto_score(score: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "row_count": int(score.get("row_count") or 0),
+        "selected_count": int(score.get("selected_count") or 0),
+        "net_pnl": _money(score.get("net_pnl") or 0),
+        "drawdown_proxy": _money(score.get("drawdown_proxy") or 0),
+    }
 
 
 def _money(value: Any) -> str:

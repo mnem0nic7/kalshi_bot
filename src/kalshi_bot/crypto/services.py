@@ -60,7 +60,7 @@ from kalshi_bot.integrations.crypto_spot import (
     interval_seconds_for_frequency,
 )
 from kalshi_bot.integrations.kalshi import KalshiClient
-from kalshi_bot.services.agent_packs import AgentPackService
+from kalshi_bot.services.agent_packs import AgentPackService, RuntimeCryptoPolicy
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.fee_model import current_fee_model_version, estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext, approved_ticket_for_verdict
@@ -148,9 +148,21 @@ class CryptoAssetControlService:
             modes[symbol] = mode
         return modes
 
-    def mode_for_control(self, control: Any, asset_symbol: str) -> str:
+    def mode_for_control(
+        self,
+        control: Any,
+        asset_symbol: str,
+        *,
+        crypto_policy: RuntimeCryptoPolicy | None = None,
+    ) -> str:
         symbol = normalize_asset_symbol(asset_symbol)
-        return self.modes_from_notes(getattr(control, "notes", None)).get(symbol, CRYPTO_ASSET_MODE_SHADOW)
+        note_mode = self.modes_from_notes(getattr(control, "notes", None)).get(symbol)
+        if note_mode == CRYPTO_ASSET_MODE_OFF:
+            return CRYPTO_ASSET_MODE_OFF
+        policy_mode = (crypto_policy.asset_modes if crypto_policy is not None else {}).get(symbol)
+        if policy_mode in CRYPTO_ASSET_MODES:
+            return policy_mode
+        return note_mode or CRYPTO_ASSET_MODE_SHADOW
 
     def asset_mode_summary(
         self,
@@ -173,6 +185,7 @@ class CryptoAssetControlService:
         replay_gate: Any | None,
         has_write_credentials: bool,
         frequency: str = "15m",
+        crypto_policy: RuntimeCryptoPolicy | None = None,
     ) -> list[str]:
         blockers: list[str] = []
         normalized_frequency = normalize_frequency(frequency) or "15m"
@@ -180,7 +193,10 @@ class CryptoAssetControlService:
             blockers.append("Crypto is disabled.")
         if normalized_frequency == "15m" and not self.settings.crypto_15m_enabled:
             blockers.append("15-minute crypto is disabled.")
-        if not self.settings.crypto_trading_enabled:
+        trading_enabled = self.settings.crypto_trading_enabled or bool(
+            crypto_policy.trading_enabled if crypto_policy is not None else False
+        )
+        if not trading_enabled:
             blockers.append("Global crypto trading is disabled.")
         if self.settings.app_shadow_mode:
             blockers.append("App shadow mode is enabled.")
@@ -189,8 +205,8 @@ class CryptoAssetControlService:
         active_color = str(getattr(control, "active_color", "") or "")
         if active_color and active_color != self.settings.app_color:
             blockers.append(f"Active color is {active_color}; this app is {self.settings.app_color}.")
-        gate_status = getattr(replay_gate, "status", None) if replay_gate is not None else None
-        if gate_status != "passed":
+        if not _runtime_replay_gate_passed(replay_gate, crypto_policy):
+            gate_status = getattr(replay_gate, "status", None) if replay_gate is not None else None
             blockers.append(f"Crypto replay gate is {gate_status or 'missing'}.")
         if not has_write_credentials:
             blockers.append("Kalshi write credentials are missing.")
@@ -203,13 +219,15 @@ class CryptoAssetControlService:
         replay_gate: Any | None,
         market: CryptoMarket,
         has_write_credentials: bool,
+        crypto_policy: RuntimeCryptoPolicy | None = None,
     ) -> dict[str, Any]:
-        mode = self.mode_for_control(control, market.asset_symbol)
+        mode = self.mode_for_control(control, market.asset_symbol, crypto_policy=crypto_policy)
         global_blockers = self.global_live_blockers(
             control=control,
             replay_gate=replay_gate,
             has_write_credentials=has_write_credentials,
             frequency=market.frequency,
+            crypto_policy=crypto_policy,
         )
         blockers = list(global_blockers) if mode == CRYPTO_ASSET_MODE_LIVE else [
             f"Asset {market.asset_symbol} mode is {mode}; set it to live to allow live orders."
@@ -425,6 +443,8 @@ class CryptoMarketService:
                 artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
             )
+            active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             active_rooms: dict[str, dict[str, str]] = {}
             for market in markets:
                 room = await repo.get_latest_active_room_for_market(
@@ -438,13 +458,18 @@ class CryptoMarketService:
         asset_symbols = sorted({market.asset_symbol for market in markets})
         mode_summary = self.asset_control_service.asset_mode_summary(
             asset_symbols=asset_symbols,
-            modes=self.asset_control_service.modes_from_notes(control.notes),
+            modes=_resolved_crypto_asset_modes(
+                asset_symbols=asset_symbols,
+                note_modes=self.asset_control_service.modes_from_notes(control.notes),
+                crypto_policy=crypto_policy,
+            ),
         )
         global_live_blockers = self.asset_control_service.global_live_blockers(
             control=control,
             replay_gate=gate,
             has_write_credentials=self.kalshi.write_credentials is not None,
             frequency=frequency,
+            crypto_policy=crypto_policy,
         )
         return {
             "market_domain": "crypto",
@@ -458,6 +483,8 @@ class CryptoMarketService:
                 "crypto_trading_enabled": self.settings.crypto_trading_enabled,
                 "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
                 "crypto_order_mode": self.settings.crypto_order_mode,
+                "runtime_crypto_trading_enabled": crypto_policy.trading_enabled,
+                "runtime_crypto_production_autonomy_enabled": crypto_policy.production_autonomy_enabled,
             },
             "asset_modes": mode_summary["modes"],
             "asset_mode_counts": mode_summary["counts"],
@@ -476,6 +503,7 @@ class CryptoMarketService:
                         replay_gate=gate,
                         market=market,
                         has_write_credentials=self.kalshi.write_credentials is not None,
+                        crypto_policy=crypto_policy,
                     ),
                     "signal": signal_payloads.get(market.market_ticker),
                     "active_room": active_rooms.get(market.market_ticker),
@@ -491,6 +519,7 @@ class CryptoMarketService:
             repo = PlatformRepository(session)
             control = await repo.ensure_deployment_control(self.settings.app_color)
             pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(pack)
             gate = await repo.get_latest_crypto_model_artifact(
                 frequency=market.frequency,
                 artifact_type="replay_gate",
@@ -501,6 +530,7 @@ class CryptoMarketService:
                 replay_gate=gate,
                 market=market,
                 has_write_credentials=self.kalshi.write_credentials is not None,
+                crypto_policy=crypto_policy,
             )
             shadow_mode = self.settings.app_shadow_mode or not live_status["live_eligible"]
             room = await repo.create_room(
@@ -590,11 +620,17 @@ class CryptoMarketService:
                 kalshi_env=self.settings.kalshi_env,
                 market_tickers={row.market_ticker for row in all_snapshots},
             )
+            active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             await session.commit()
         asset_symbols = sorted({snapshot.asset_symbol for snapshot in snapshots})
         mode_summary = self.asset_control_service.asset_mode_summary(
             asset_symbols=asset_symbols,
-            modes=self.asset_control_service.modes_from_notes(control.notes),
+            modes=_resolved_crypto_asset_modes(
+                asset_symbols=asset_symbols,
+                note_modes=self.asset_control_service.modes_from_notes(control.notes),
+                crypto_policy=crypto_policy,
+            ),
         )
         data_quality = _crypto_data_quality(
             all_snapshots,
@@ -604,7 +640,7 @@ class CryptoMarketService:
         spot_quality = _crypto_spot_quality(
             spot_rows,
             expected_assets=sorted({row.asset_symbol for row in all_snapshots} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS)),
-            min_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
+            min_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
         )
         return {
             "market_domain": "crypto",
@@ -613,6 +649,8 @@ class CryptoMarketService:
             "crypto_15m_enabled": self.settings.crypto_15m_enabled,
             "crypto_trading_enabled": self.settings.crypto_trading_enabled,
             "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
+            "runtime_crypto_trading_enabled": crypto_policy.trading_enabled,
+            "runtime_crypto_production_autonomy_enabled": crypto_policy.production_autonomy_enabled,
             "stored_market_count": len(snapshots),
             "asset_modes": mode_summary["modes"],
             "asset_mode_counts": mode_summary["counts"],
@@ -621,6 +659,7 @@ class CryptoMarketService:
                 replay_gate=gate,
                 has_write_credentials=self.kalshi.write_credentials is not None,
                 frequency=frequency,
+                crypto_policy=crypto_policy,
             ),
             "model": _artifact_summary(model),
             "backtest": _artifact_summary(backtest),
@@ -641,6 +680,7 @@ class CryptoMarketService:
                     replay_gate=gate,
                     has_write_credentials=self.kalshi.write_credentials is not None,
                     frequency=frequency,
+                    crypto_policy=crypto_policy,
                 ),
             ),
         }
@@ -1073,9 +1113,16 @@ class CryptoSpotService:
         return stored
 
 class CryptoForecastService:
-    def __init__(self, *, settings: Settings, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        session_factory: async_sessionmaker[AsyncSession],
+        agent_pack_service: AgentPackService | None = None,
+    ) -> None:
         self.settings = settings
         self.session_factory = session_factory
+        self.agent_pack_service = agent_pack_service or AgentPackService(settings)
 
     async def train(self, *, frequency: str = "15m") -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
@@ -1220,6 +1267,8 @@ class CryptoForecastService:
                 artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
             )
+            active_pack = await self.agent_pack_service.get_active_pack(repo)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             await session.commit()
         mid = market.mid_yes_dollars or market.last_price_dollars or Decimal("0.5000")
         if artifact is None or artifact.status != "trained":
@@ -1238,8 +1287,10 @@ class CryptoForecastService:
             market=market,
             fair_yes=fair,
             settings=self.settings,
+            crypto_policy=crypto_policy,
         )
-        confidence = min(0.95, max(self.settings.risk_min_confidence, 0.80 + abs(edge_bps) / 20000))
+        entry_policy = crypto_policy.entry_for_asset(market.asset_symbol)
+        confidence = min(0.95, max(float(entry_policy["min_confidence"]), 0.80 + abs(edge_bps) / 20000))
         eligibility = None
         stand_down_reason = None
         outcome = trace["outcome"]
@@ -1317,6 +1368,7 @@ class CryptoForecastService:
                     "reason": trace.get("selection_reason") or ("crypto_live_trading_disabled" if not self.settings.crypto_trading_enabled else None),
                     "backtest_version": backtest.version if backtest is not None else None,
                     "replay_gate_status": gate.status if gate is not None else "missing",
+                    "runtime_crypto_policy": _runtime_crypto_policy_payload(crypto_policy, asset_symbol=market.asset_symbol),
                 },
             },
             capital_bucket="safe",
@@ -1382,9 +1434,16 @@ class CryptoForecastService:
 
 
 class CryptoReplayService:
-    def __init__(self, *, settings: Settings, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        session_factory: async_sessionmaker[AsyncSession],
+        agent_pack_service: AgentPackService | None = None,
+    ) -> None:
         self.settings = settings
         self.session_factory = session_factory
+        self.agent_pack_service = agent_pack_service or AgentPackService(settings)
 
     async def run(
         self,
@@ -1451,7 +1510,9 @@ class CryptoReplayService:
                 metrics["model_missing"] = True
             if backtest is None:
                 metrics["backtest_missing"] = True
-            gate = self.evaluate_gate(metrics)
+            active_pack = await self.agent_pack_service.get_active_pack(repo)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+            gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
                 artifact_type="replay_gate",
@@ -1475,72 +1536,27 @@ class CryptoReplayService:
             await session.commit()
         return {"status": artifact.status, "version": artifact.version, **gate}
 
-    def evaluate_gate(self, metrics: dict[str, Any]) -> dict[str, Any]:
-        reasons: list[str] = []
-        resolved = int(metrics.get("resolved_sample_count") or metrics.get("sample_count") or 0)
-        candidates = int(metrics.get("trade_candidate_count") or 0)
-        net_pl = float(metrics.get("net_simulated_pl_dollars") or 0.0)
-        hard_cap_breaches = int(metrics.get("hard_cap_breaches") or 0)
-        calibration = metrics.get("calibration_brier")
-        market_mid = metrics.get("market_mid_brier")
-        calibration_log_loss = metrics.get("calibration_log_loss")
-        market_mid_log_loss = metrics.get("market_mid_log_loss")
-        calibration_ece = metrics.get("calibration_ece")
-        market_mid_ece = metrics.get("market_mid_ece")
-        candle_count = int(metrics.get("candle_count") or 0)
-        leakage_rows = int(metrics.get("leakage_row_count") or 0)
-        spot_coverage = float(metrics.get("spot_feature_coverage_pct") or 0.0)
-        strict_trade_rows = int(metrics.get("strict_trade_eligible_count") or 0)
-        if metrics.get("model_missing"):
-            reasons.append("Crypto model artifact is missing.")
-        if metrics.get("backtest_missing"):
-            reasons.append("Crypto backtest artifact is missing.")
-        if candle_count <= 0:
-            reasons.append("Crypto candlestick coverage is missing.")
-        if leakage_rows > 0:
-            reasons.append(f"Replay includes {leakage_rows} non-point-in-time rows.")
-        if spot_coverage < self.settings.crypto_replay_min_spot_coverage_pct:
-            reasons.append(
-                f"Spot feature coverage {spot_coverage:.1%} below minimum "
-                f"{self.settings.crypto_replay_min_spot_coverage_pct:.1%}."
-            )
-        if strict_trade_rows < self.settings.crypto_replay_min_trade_candidates:
-            reasons.append(
-                f"Strict real-quote row coverage {strict_trade_rows} below minimum "
-                f"{self.settings.crypto_replay_min_trade_candidates}."
-            )
-        if resolved < self.settings.crypto_replay_min_resolved_markets:
-            reasons.append(
-                f"Resolved sample coverage {resolved} below minimum {self.settings.crypto_replay_min_resolved_markets}."
-            )
-        if candidates < self.settings.crypto_replay_min_trade_candidates:
-            reasons.append(
-                f"Trade candidate count {candidates} below minimum {self.settings.crypto_replay_min_trade_candidates}."
-            )
-        if net_pl <= self.settings.crypto_replay_min_net_pl_dollars:
-            reasons.append(f"Net simulated P/L ${net_pl:.2f} does not clear required positive threshold.")
-        if hard_cap_breaches > self.settings.crypto_replay_max_hard_cap_breaches:
-            reasons.append(f"Replay hard-cap breaches {hard_cap_breaches} exceed limit.")
-        if self.settings.crypto_replay_require_calibration_better_than_mid:
-            if calibration is None or market_mid is None or float(calibration) >= float(market_mid):
-                reasons.append("Calibration Brier does not beat the market-mid baseline.")
-            if calibration_log_loss is None or market_mid_log_loss is None or float(calibration_log_loss) >= float(market_mid_log_loss):
-                reasons.append("Calibration log-loss does not beat the market-mid baseline.")
-            if calibration_ece is None or market_mid_ece is None or float(calibration_ece) >= float(market_mid_ece):
-                reasons.append("Calibration ECE does not beat the market-mid baseline.")
+    def evaluate_gate(
+        self,
+        metrics: dict[str, Any],
+        *,
+        crypto_policy: RuntimeCryptoPolicy | None = None,
+    ) -> dict[str, Any]:
+        runtime_policy = crypto_policy or self.agent_pack_service.runtime_crypto_policy()
+        reasons = _crypto_replay_gate_reasons(metrics, crypto_policy=runtime_policy)
         return {
             "passed": not reasons,
             "reasons": reasons,
             "requirements": {
-                "min_resolved_markets": self.settings.crypto_replay_min_resolved_markets,
-                "min_trade_candidates": self.settings.crypto_replay_min_trade_candidates,
-                "min_net_pl_dollars": self.settings.crypto_replay_min_net_pl_dollars,
-                "max_hard_cap_breaches": self.settings.crypto_replay_max_hard_cap_breaches,
-                "calibration_better_than_mid": self.settings.crypto_replay_require_calibration_better_than_mid,
+                "min_resolved_markets": runtime_policy.replay_min_resolved_markets,
+                "min_trade_candidates": runtime_policy.replay_min_trade_candidates,
+                "min_net_pl_dollars": runtime_policy.replay_min_net_pl_dollars,
+                "max_hard_cap_breaches": runtime_policy.replay_max_hard_cap_breaches,
+                "calibration_better_than_mid": runtime_policy.replay_require_calibration_better_than_mid,
                 "calibration_metrics_required": ["brier", "log_loss", "ece"],
                 "requires_candles": True,
                 "requires_point_in_time_rows": True,
-                "min_spot_coverage_pct": self.settings.crypto_replay_min_spot_coverage_pct,
+                "min_spot_coverage_pct": runtime_policy.replay_min_spot_coverage_pct,
                 "requires_real_quotes_for_strict_trade_quality": True,
             },
         }
@@ -1580,6 +1596,8 @@ class CryptoReplayService:
                 artifact_type="model",
                 kalshi_env=self.settings.kalshi_env,
             )
+            active_pack = await self.agent_pack_service.get_active_pack(repo)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             await session.commit()
         rows = _crypto_decision_rows(snapshots, candles, spot_rows)
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
@@ -1594,7 +1612,7 @@ class CryptoReplayService:
         spot_quality = _crypto_spot_quality(
             spot_rows,
             expected_assets=sorted({row.asset_symbol for row in snapshots} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS)),
-            min_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
+            min_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
         )
         metrics = {
             **(backtest.get("metrics") or {}),
@@ -1609,7 +1627,7 @@ class CryptoReplayService:
             "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
             "metrics_scope": "walk_forward",
         }
-        gate = self.evaluate_gate(metrics)
+        gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
         issues: list[dict[str, Any]] = []
         if not self.settings.crypto_trading_enabled:
             issues.append({"severity": "info", "code": "crypto_trading_disabled", "message": "Global crypto trading is disabled."})
@@ -1639,6 +1657,7 @@ class CryptoReplayService:
             "data_quality": data_quality,
             "spot_quality": spot_quality,
             "model": _artifact_summary(model),
+            "runtime_crypto_policy": _runtime_crypto_policy_payload(crypto_policy),
             "walk_forward": backtest,
             "metrics": metrics,
             "promotion_gate": gate,
@@ -1690,11 +1709,16 @@ class CryptoExecutionService:
         fair_yes_dollars: Decimal,
         market: CryptoMarket,
         signal: StrategySignal,
+        crypto_policy: RuntimeCryptoPolicy | None = None,
     ) -> ExecReceiptPayload:
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=room.kalshi_env)
             fresh_control = await repo.get_deployment_control(kalshi_env=room.kalshi_env)
-            asset_mode = self.asset_control_service.mode_for_control(fresh_control, market.asset_symbol)
+            asset_mode = self.asset_control_service.mode_for_control(
+                fresh_control,
+                market.asset_symbol,
+                crypto_policy=crypto_policy,
+            )
             gate = await repo.get_latest_crypto_model_artifact(
                 frequency=market.frequency,
                 artifact_type="replay_gate",
@@ -1732,13 +1756,16 @@ class CryptoExecutionService:
                     "candidate_status": candidate_status,
                 },
             )
-        if not self.settings.crypto_trading_enabled:
+        trading_enabled = self.settings.crypto_trading_enabled or bool(
+            crypto_policy.trading_enabled if crypto_policy is not None else False
+        )
+        if not trading_enabled:
             return ExecReceiptPayload(
                 status="crypto_trading_disabled",
                 client_order_id=client_order_id,
                 details={"reason": "crypto_trading_enabled is false"},
             )
-        if gate is None or gate.status != "passed":
+        if not _runtime_replay_gate_passed(gate, crypto_policy):
             return ExecReceiptPayload(
                 status="crypto_replay_gate_blocked",
                 client_order_id=client_order_id,
@@ -1746,6 +1773,12 @@ class CryptoExecutionService:
                     "reason": "crypto replay gate has not passed",
                     "gate_status": gate.status if gate is not None else "missing",
                     "gate_version": gate.version if gate is not None else None,
+                    "runtime_crypto_policy": _runtime_crypto_policy_payload(
+                        crypto_policy,
+                        asset_symbol=market.asset_symbol,
+                    )
+                    if crypto_policy is not None
+                    else None,
                 },
             )
         passive_price = self.passive_yes_price(market, ticket.side)
@@ -1759,11 +1792,16 @@ class CryptoExecutionService:
                 ticket=passive_ticket,
                 client_order_id=f"{client_order_id}:maker",
                 fair_yes_dollars=fair_yes_dollars,
+                min_edge_bps=(
+                    int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+                    if crypto_policy is not None
+                    else None
+                ),
             )
             if passive_receipt.status not in {"unfilled_cancelled", "requote_edge_lost"}:
                 passive_receipt.details = {**passive_receipt.details, "crypto_order_mode": "passive_then_taker"}
                 return passive_receipt
-            if not self._allow_taker_fallback(market, signal):
+            if not self._allow_taker_fallback(market, signal, crypto_policy=crypto_policy):
                 return ExecReceiptPayload(
                     status="passive_unfilled_taker_blocked",
                     client_order_id=client_order_id,
@@ -1775,13 +1813,29 @@ class CryptoExecutionService:
             ticket=ticket,
             client_order_id=f"{client_order_id}:taker",
             fair_yes_dollars=fair_yes_dollars,
+            min_edge_bps=(
+                int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+                if crypto_policy is not None
+                else None
+            ),
         )
 
-    def _allow_taker_fallback(self, market: CryptoMarket, signal: StrategySignal) -> bool:
+    def _allow_taker_fallback(
+        self,
+        market: CryptoMarket,
+        signal: StrategySignal,
+        *,
+        crypto_policy: RuntimeCryptoPolicy | None = None,
+    ) -> bool:
         if market.close_time is None:
             return False
         seconds_to_close = (market.close_time - datetime.now(UTC)).total_seconds()
-        return seconds_to_close <= self.settings.crypto_taker_fallback_close_seconds and signal.edge_bps >= self.settings.risk_min_edge_bps
+        min_edge_bps = (
+            int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+            if crypto_policy is not None
+            else self.settings.risk_min_edge_bps
+        )
+        return seconds_to_close <= self.settings.crypto_taker_fallback_close_seconds and signal.edge_bps >= min_edge_bps
 
 
 class CryptoWorkflowService:
@@ -1795,6 +1849,7 @@ class CryptoWorkflowService:
         risk_engine: DeterministicRiskEngine,
         execution_service: CryptoExecutionService,
         asset_control_service: CryptoAssetControlService,
+        agent_pack_service: AgentPackService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -1803,6 +1858,7 @@ class CryptoWorkflowService:
         self.risk_engine = risk_engine
         self.execution_service = execution_service
         self.asset_control_service = asset_control_service
+        self.agent_pack_service = agent_pack_service or AgentPackService(settings)
 
     async def run_room(self, room_id: str, *, reason: str = "manual") -> None:
         market: CryptoMarket | None = None
@@ -1834,6 +1890,8 @@ class CryptoWorkflowService:
                 if room is None:
                     raise KeyError(room_id)
                 control = await repo.ensure_deployment_control(self.settings.app_color)
+                active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+                crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
                 gate = await repo.get_latest_crypto_model_artifact(
                     frequency=market.frequency,
                     artifact_type="replay_gate",
@@ -1849,6 +1907,7 @@ class CryptoWorkflowService:
                     replay_gate=gate,
                     market=market,
                     has_write_credentials=self.market_service.kalshi.write_credentials is not None,
+                    crypto_policy=crypto_policy,
                 )
                 market_artifact = await repo.save_artifact(
                     room_id=room.id,
@@ -1897,6 +1956,10 @@ class CryptoWorkflowService:
                             ),
                             "prediction_model": (signal.candidate_trace or {}).get("prediction_model"),
                             "trade_selection_model": (signal.candidate_trace or {}).get("trade_selection_model"),
+                            "runtime_crypto_policy": _runtime_crypto_policy_payload(
+                                crypto_policy,
+                                asset_symbol=market.asset_symbol,
+                            ),
                         },
                     },
                 )
@@ -1962,6 +2025,10 @@ class CryptoWorkflowService:
                     ticket=ticket,
                     signal=signal,
                     context=risk_context,
+                    thresholds=self.agent_pack_service.runtime_crypto_thresholds(
+                        crypto_policy,
+                        asset_symbol=market.asset_symbol,
+                    ),
                 )
                 await repo.save_risk_verdict(
                     room_id=room.id,
@@ -2023,6 +2090,7 @@ class CryptoWorkflowService:
                     fair_yes_dollars=signal.fair_yes_dollars,
                     market=market,
                     signal=signal,
+                    crypto_policy=crypto_policy,
                 )
                 no_order_statuses = {
                     "shadow_skipped",
@@ -2133,34 +2201,49 @@ class CryptoAutonomyService:
         market_service: CryptoMarketService,
         asset_control_service: CryptoAssetControlService,
         workflow_service: CryptoWorkflowService,
+        agent_pack_service: AgentPackService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.market_service = market_service
         self.asset_control_service = asset_control_service
         self.workflow_service = workflow_service
+        self.agent_pack_service = agent_pack_service or AgentPackService(settings)
 
     async def run_once(self, *, frequency: str = "15m", force: bool = False) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         if not self.settings.crypto_autonomy_enabled and not force:
             return {"status": "disabled", "frequency": freq, "reason": "crypto_autonomy_enabled is false"}
         production_mode = str(self.settings.kalshi_env or "").strip().lower() != "demo"
-        if production_mode and not self.settings.crypto_production_autonomy_enabled:
+        try:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+                active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+                crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+                gate = await repo.get_latest_crypto_model_artifact(
+                    frequency=freq,
+                    artifact_type="replay_gate",
+                    kalshi_env=self.settings.kalshi_env,
+                )
+                await session.commit()
+        except Exception:
+            if production_mode and not self.settings.crypto_production_autonomy_enabled:
+                return {
+                    "status": "production_blocked",
+                    "frequency": freq,
+                    "reason": "crypto production autonomy requires CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true or promoted runtime policy",
+                    "kalshi_env": self.settings.kalshi_env,
+                }
+            raise
+        production_autonomy_enabled = self.settings.crypto_production_autonomy_enabled or crypto_policy.production_autonomy_enabled
+        if production_mode and not production_autonomy_enabled:
             return {
                 "status": "production_blocked",
                 "frequency": freq,
-                "reason": "crypto production autonomy requires CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true",
+                "reason": "crypto production autonomy requires CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true or promoted runtime policy",
                 "kalshi_env": self.settings.kalshi_env,
             }
-        async with self.session_factory() as session:
-            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
-            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
-            gate = await repo.get_latest_crypto_model_artifact(
-                frequency=freq,
-                artifact_type="replay_gate",
-                kalshi_env=self.settings.kalshi_env,
-            )
-            await session.commit()
         if control.active_color != self.settings.app_color:
             return {
                 "status": "inactive_color",
@@ -2190,6 +2273,7 @@ class CryptoAutonomyService:
                     replay_gate=gate,
                     market=market,
                     has_write_credentials=self.market_service.kalshi.write_credentials is not None,
+                    crypto_policy=crypto_policy,
                 )
                 if production_mode and not live_status["live_eligible"]:
                     skipped.append(
@@ -2306,6 +2390,117 @@ def _artifact_summary(artifact: Any | None) -> dict[str, Any]:
         "payload": artifact.payload,
         "updated_at": artifact.updated_at.isoformat() if artifact.updated_at else None,
     }
+
+
+def _runtime_crypto_policy_payload(
+    crypto_policy: RuntimeCryptoPolicy,
+    *,
+    asset_symbol: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "entry": crypto_policy.entry_for_asset(asset_symbol),
+        "replay": {
+            "min_resolved_markets": crypto_policy.replay_min_resolved_markets,
+            "min_trade_candidates": crypto_policy.replay_min_trade_candidates,
+            "min_net_pl_dollars": crypto_policy.replay_min_net_pl_dollars,
+            "max_hard_cap_breaches": crypto_policy.replay_max_hard_cap_breaches,
+            "min_spot_coverage_pct": crypto_policy.replay_min_spot_coverage_pct,
+            "require_calibration_better_than_mid": crypto_policy.replay_require_calibration_better_than_mid,
+        },
+        "live": {
+            "trading_enabled": crypto_policy.trading_enabled,
+            "production_autonomy_enabled": crypto_policy.production_autonomy_enabled,
+            "asset_mode": crypto_policy.asset_modes.get(normalize_asset_symbol(asset_symbol or "UNKNOWN")),
+        },
+    }
+
+
+def _resolved_crypto_asset_modes(
+    *,
+    asset_symbols: list[str],
+    note_modes: dict[str, str],
+    crypto_policy: RuntimeCryptoPolicy,
+) -> dict[str, str]:
+    symbols = {normalize_asset_symbol(symbol) for symbol in asset_symbols}
+    symbols.update(note_modes)
+    symbols.update(crypto_policy.asset_modes)
+    resolved: dict[str, str] = {}
+    for symbol in sorted(symbols):
+        note_mode = note_modes.get(symbol)
+        if note_mode == CRYPTO_ASSET_MODE_OFF:
+            resolved[symbol] = CRYPTO_ASSET_MODE_OFF
+        elif symbol in crypto_policy.asset_modes:
+            resolved[symbol] = crypto_policy.asset_modes[symbol]
+        else:
+            resolved[symbol] = note_mode or CRYPTO_ASSET_MODE_SHADOW
+    return resolved
+
+
+def _runtime_replay_gate_passed(replay_gate: Any | None, crypto_policy: RuntimeCryptoPolicy | None) -> bool:
+    if replay_gate is None:
+        return False
+    if crypto_policy is None:
+        return getattr(replay_gate, "status", None) == "passed"
+    metrics = dict(getattr(replay_gate, "metrics", None) or {})
+    if not metrics:
+        return getattr(replay_gate, "status", None) == "passed"
+    return not _crypto_replay_gate_reasons(metrics, crypto_policy=crypto_policy)
+
+
+def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: RuntimeCryptoPolicy) -> list[str]:
+    reasons: list[str] = []
+    resolved = int(metrics.get("resolved_sample_count") or metrics.get("sample_count") or 0)
+    candidates = int(metrics.get("trade_candidate_count") or 0)
+    net_pl = float(metrics.get("net_simulated_pl_dollars") or 0.0)
+    hard_cap_breaches = int(metrics.get("hard_cap_breaches") or 0)
+    calibration = metrics.get("calibration_brier")
+    market_mid = metrics.get("market_mid_brier")
+    calibration_log_loss = metrics.get("calibration_log_loss")
+    market_mid_log_loss = metrics.get("market_mid_log_loss")
+    calibration_ece = metrics.get("calibration_ece")
+    market_mid_ece = metrics.get("market_mid_ece")
+    candle_count = int(metrics.get("candle_count") or 0)
+    leakage_rows = int(metrics.get("leakage_row_count") or 0)
+    spot_coverage = float(metrics.get("spot_feature_coverage_pct") or 0.0)
+    strict_trade_rows = int(metrics.get("strict_trade_eligible_count") or 0)
+    if metrics.get("model_missing"):
+        reasons.append("Crypto model artifact is missing.")
+    if metrics.get("backtest_missing"):
+        reasons.append("Crypto backtest artifact is missing.")
+    if candle_count <= 0:
+        reasons.append("Crypto candlestick coverage is missing.")
+    if leakage_rows > 0:
+        reasons.append(f"Replay includes {leakage_rows} non-point-in-time rows.")
+    if spot_coverage < crypto_policy.replay_min_spot_coverage_pct:
+        reasons.append(
+            f"Spot feature coverage {spot_coverage:.1%} below minimum "
+            f"{crypto_policy.replay_min_spot_coverage_pct:.1%}."
+        )
+    if strict_trade_rows < crypto_policy.replay_min_trade_candidates:
+        reasons.append(
+            f"Strict real-quote row coverage {strict_trade_rows} below minimum "
+            f"{crypto_policy.replay_min_trade_candidates}."
+        )
+    if resolved < crypto_policy.replay_min_resolved_markets:
+        reasons.append(
+            f"Resolved sample coverage {resolved} below minimum {crypto_policy.replay_min_resolved_markets}."
+        )
+    if candidates < crypto_policy.replay_min_trade_candidates:
+        reasons.append(
+            f"Trade candidate count {candidates} below minimum {crypto_policy.replay_min_trade_candidates}."
+        )
+    if net_pl <= crypto_policy.replay_min_net_pl_dollars:
+        reasons.append(f"Net simulated P/L ${net_pl:.2f} does not clear required positive threshold.")
+    if hard_cap_breaches > crypto_policy.replay_max_hard_cap_breaches:
+        reasons.append(f"Replay hard-cap breaches {hard_cap_breaches} exceed limit.")
+    if crypto_policy.replay_require_calibration_better_than_mid:
+        if calibration is None or market_mid is None or float(calibration) >= float(market_mid):
+            reasons.append("Calibration Brier does not beat the market-mid baseline.")
+        if calibration_log_loss is None or market_mid_log_loss is None or float(calibration_log_loss) >= float(market_mid_log_loss):
+            reasons.append("Calibration log-loss does not beat the market-mid baseline.")
+        if calibration_ece is None or market_mid_ece is None or float(calibration_ece) >= float(market_mid_ece):
+            reasons.append("Calibration ECE does not beat the market-mid baseline.")
+    return reasons
 
 
 def _nearest_market_per_asset(markets: list[CryptoMarket]) -> list[CryptoMarket]:
@@ -2528,9 +2723,11 @@ def _crypto_recommendation(
     market: CryptoMarket,
     fair_yes: Decimal,
     settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
     row = _crypto_live_market_row(market)
-    candidates = _crypto_trade_candidates(row, fair_yes, settings=settings)
+    candidates = _crypto_trade_candidates(row, fair_yes, settings=settings, crypto_policy=crypto_policy)
+    entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
     eligible = [
         candidate
         for candidate in candidates
@@ -2545,7 +2742,8 @@ def _crypto_recommendation(
         return None, None, None, edge_bps, {
             "outcome": "no_candidate",
             "fair_yes_dollars": _money_text(fair_yes),
-            "min_edge_bps": settings.risk_min_edge_bps,
+            "min_edge_bps": entry_policy["min_fee_adjusted_edge_bps"],
+            "max_spread_bps": entry_policy["max_spread_bps"],
             "spread_bps": market.spread_bps,
             "candidates": candidates,
         }
@@ -2564,7 +2762,8 @@ def _crypto_recommendation(
         "rank": selected.get("rank"),
         "bucket_key": selected.get("bucket_key"),
         "target_yes_price_dollars": _money_text(target_yes),
-        "min_edge_bps": settings.risk_min_edge_bps,
+        "min_edge_bps": entry_policy["min_fee_adjusted_edge_bps"],
+        "max_spread_bps": entry_policy["max_spread_bps"],
         "spread_bps": market.spread_bps,
         "candidates": candidates,
     }
@@ -4373,7 +4572,31 @@ def _crypto_walk_forward_folds(rows: list[dict[str, Any]], *, min_train_rows: in
     return folds
 
 
-def _crypto_trade_candidates(row: dict[str, Any], predicted_yes: Decimal, *, settings: Settings) -> list[dict[str, Any]]:
+def _crypto_entry_policy_for_row(
+    row: dict[str, Any],
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+) -> dict[str, Any]:
+    if crypto_policy is not None:
+        return crypto_policy.entry_for_asset(str(row.get("asset_symbol") or ""))
+    return {
+        "min_fee_adjusted_edge_bps": int(settings.risk_min_edge_bps),
+        "max_spread_bps": int(settings.trigger_max_spread_bps),
+        "min_confidence": float(settings.risk_min_confidence),
+        "min_contract_price_dollars": float(settings.risk_min_contract_price_dollars),
+        "min_remaining_payout_bps": int(settings.strategy_min_remaining_payout_bps),
+        "max_credible_edge_bps": int(settings.risk_max_credible_edge_bps),
+    }
+
+
+def _crypto_trade_candidates(
+    row: dict[str, Any],
+    predicted_yes: Decimal,
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     if row.get("strict_trade_eligible") is False:
         return [
@@ -4395,7 +4618,12 @@ def _crypto_trade_candidates(row: dict[str, Any], predicted_yes: Decimal, *, set
         ("yes", _decimal(row.get("yes_ask_dollars")) if row.get("yes_ask_dollars") is not None else None),
         ("no", _decimal(row.get("no_ask_dollars")) if row.get("no_ask_dollars") is not None else None),
     ]
-    min_live_edge = Decimal(settings.risk_min_edge_bps) / Decimal("10000")
+    entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
+    min_live_edge = Decimal(int(entry_policy["min_fee_adjusted_edge_bps"])) / Decimal("10000")
+    max_live_spread = int(entry_policy["max_spread_bps"])
+    min_contract_price = Decimal(str(entry_policy["min_contract_price_dollars"]))
+    min_remaining_payout = Decimal(int(entry_policy["min_remaining_payout_bps"])) / Decimal("10000")
+    max_credible_edge_bps = int(entry_policy["max_credible_edge_bps"])
     min_shadow_edge = Decimal(str(settings.crypto_shadow_exploration_min_expected_net_edge_dollars))
     max_shadow_spread = int(settings.crypto_shadow_exploration_max_spread_bps)
     spread_bps = int(row.get("spread_bps") or 0)
@@ -4422,10 +4650,20 @@ def _crypto_trade_candidates(row: dict[str, Any], predicted_yes: Decimal, *, set
         )
         expected_net_edge = raw_edge - fee
         target_yes = cost if side == "yes" else Decimal("1.0000") - cost
+        remaining_payout = Decimal("1.0000") - cost
+        raw_edge_bps = int((raw_edge * Decimal("10000")).to_integral_value())
         candidate_status = "blocked_fee_edge"
         status = "blocked"
         reason = "fee_adjusted_edge_below_live_min"
-        if expected_net_edge >= min_live_edge:
+        if spread_bps > max_live_spread:
+            reason = "spread_above_live_max"
+        elif cost < min_contract_price:
+            reason = "contract_price_below_crypto_min"
+        elif remaining_payout < min_remaining_payout:
+            reason = "remaining_payout_below_crypto_min"
+        elif raw_edge_bps > max_credible_edge_bps:
+            reason = "edge_above_crypto_credible_max"
+        elif expected_net_edge >= min_live_edge:
             status = "eligible"
             candidate_status = CRYPTO_LIVE_QUALITY
             reason = "positive_fee_adjusted_live_quality_edge"
@@ -4443,11 +4681,13 @@ def _crypto_trade_candidates(row: dict[str, Any], predicted_yes: Decimal, *, set
                 "reason": reason,
                 "target_yes_price_dollars": _money_text(_clamp_price(target_yes)),
                 "execution_price_dollars": _money_text(_clamp_price(cost)),
-                "edge_bps": int((raw_edge * Decimal("10000")).to_integral_value()),
+                "edge_bps": raw_edge_bps,
                 "expected_net_edge": str(expected_net_edge.quantize(Decimal("0.0001"))),
                 "expected_fee": str(fee.quantize(Decimal("0.0001"))),
+                "remaining_payout_dollars": str(remaining_payout.quantize(Decimal("0.0001"))),
                 "bucket_key": _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(cost)}),
                 "spread_bps": spread_bps,
+                "runtime_thresholds": dict(entry_policy),
                 "rank": None,
                 "live_eligible": candidate_status == CRYPTO_LIVE_QUALITY,
             }
@@ -4480,10 +4720,11 @@ def _simulate_crypto_trade(
     predicted_yes: Decimal,
     *,
     settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
     policy: str = "live_quality",
 ) -> dict[str, Any]:
     label_yes = int(row["label_yes"])
-    candidates = _crypto_trade_candidates(row, predicted_yes, settings=settings)
+    candidates = _crypto_trade_candidates(row, predicted_yes, settings=settings, crypto_policy=crypto_policy)
     allowed_statuses = {CRYPTO_LIVE_QUALITY}
     if policy == CRYPTO_EXPLORATORY_SHADOW:
         allowed_statuses = {CRYPTO_LIVE_QUALITY, CRYPTO_EXPLORATORY_SHADOW}

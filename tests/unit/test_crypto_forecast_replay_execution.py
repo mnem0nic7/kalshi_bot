@@ -8,7 +8,16 @@ from sqlalchemy import select
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, RiskStatus, RoomOrigin, StandDownReason, TradeAction
-from kalshi_bot.core.schemas import ExecReceiptPayload, RiskVerdictPayload, RoomCreate, TradeEligibilityVerdict, TradeTicket
+from kalshi_bot.core.schemas import (
+    AgentPackCryptoEntryPolicy,
+    AgentPackCryptoPolicy,
+    AgentPackCryptoReplayPolicy,
+    ExecReceiptPayload,
+    RiskVerdictPayload,
+    RoomCreate,
+    TradeEligibilityVerdict,
+    TradeTicket,
+)
 from kalshi_bot.crypto.models import CryptoMarket
 from kalshi_bot.crypto.services import (
     CRYPTO_EXPLORATORY_SHADOW,
@@ -29,6 +38,7 @@ from kalshi_bot.crypto.services import (
     _fit_crypto_calibration,
     _predict_crypto_probability,
 )
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.db.models import OrderRecord, RiskVerdictRecord, RoomMessage
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -383,6 +393,43 @@ def test_crypto_replay_gate_requires_positive_coverage_and_calibration(tmp_path)
 
     assert blocked["passed"] is False
     assert passed["passed"] is True
+
+
+def test_crypto_replay_gate_uses_runtime_crypto_thresholds(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_replay_min_resolved_markets=500)
+    service = CryptoReplayService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+    policy = AgentPackService(settings).runtime_crypto_policy(
+        AgentPackService(settings).default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    replay=AgentPackCryptoReplayPolicy(
+                        min_resolved_markets=2,
+                        min_trade_candidates=1,
+                        min_net_pl_dollars=0.0,
+                        max_hard_cap_breaches=0,
+                        min_spot_coverage_pct=0.80,
+                        require_calibration_better_than_mid=False,
+                    )
+                )
+            }
+        )
+    )
+
+    passed = service.evaluate_gate(
+        {
+            "resolved_sample_count": 2,
+            "trade_candidate_count": 1,
+            "strict_trade_eligible_count": 1,
+            "net_simulated_pl_dollars": 1.0,
+            "hard_cap_breaches": 0,
+            "candle_count": 1,
+            "spot_feature_coverage_pct": 1.0,
+        },
+        crypto_policy=policy,
+    )
+
+    assert passed["passed"] is True
+    assert passed["requirements"]["min_resolved_markets"] == 2
 
 
 def test_crypto_decision_rows_use_candle_proxy_when_snapshot_quotes_missing(tmp_path) -> None:
@@ -800,6 +847,77 @@ def test_crypto_candidate_quality_classifies_live_and_exploratory(tmp_path) -> N
     assert exploratory[0]["live_eligible"] is False
 
 
+def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=50, trigger_max_spread_bps=1000)
+    service = AgentPackService(settings)
+    pack = service.default_pack().model_copy(
+        update={
+            "crypto_policy": AgentPackCryptoPolicy(
+                entry=AgentPackCryptoEntryPolicy(
+                    min_fee_adjusted_edge_bps=500,
+                    max_spread_bps=100,
+                    min_confidence=0.50,
+                    min_contract_price_dollars=0.03,
+                    min_remaining_payout_bps=500,
+                    max_credible_edge_bps=5000,
+                ),
+                asset_entry_overrides={
+                    "BTC": AgentPackCryptoEntryPolicy(max_spread_bps=250),
+                },
+            )
+        }
+    )
+    policy = service.runtime_crypto_policy(pack)
+    row = {
+        "market_ticker": "KXBTC15M-RUNTIME",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.4700"),
+        "yes_ask_dollars": Decimal("0.4900"),
+        "no_ask_dollars": Decimal("0.5300"),
+        "spread_bps": 200,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.6000"), settings=settings, crypto_policy=policy)
+
+    assert candidates[0]["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert candidates[0]["runtime_thresholds"]["max_spread_bps"] == 250
+
+
+def test_crypto_candidate_quality_blocks_runtime_spread_over_asset_limit(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=50, trigger_max_spread_bps=1000)
+    service = AgentPackService(settings)
+    pack = service.default_pack().model_copy(
+        update={
+            "crypto_policy": AgentPackCryptoPolicy(
+                entry=AgentPackCryptoEntryPolicy(
+                    min_fee_adjusted_edge_bps=500,
+                    max_spread_bps=100,
+                    min_confidence=0.50,
+                    min_contract_price_dollars=0.03,
+                    min_remaining_payout_bps=500,
+                    max_credible_edge_bps=5000,
+                )
+            )
+        }
+    )
+    policy = service.runtime_crypto_policy(pack)
+    row = {
+        "market_ticker": "KXETH15M-RUNTIME",
+        "asset_symbol": "ETH",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.4700"),
+        "yes_ask_dollars": Decimal("0.4900"),
+        "no_ask_dollars": Decimal("0.5300"),
+        "spread_bps": 200,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.6000"), settings=settings, crypto_policy=policy)
+
+    assert candidates[0]["candidate_status"] != CRYPTO_LIVE_QUALITY
+    assert candidates[0]["reason"] == "spread_above_live_max"
+
+
 def test_crypto_proxy_quote_rows_are_prediction_only(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=50)
     row = {
@@ -955,6 +1073,71 @@ async def test_crypto_asset_modes_default_shadow_and_persist(tmp_path) -> None:
     assert preserved_notes["agent_packs"] == {"active_version": "green-pack"}
     assert preserved_notes["crypto_replay_gate"] == {"status": "passed"}
     await engine.dispose()
+
+
+def test_crypto_runtime_policy_can_make_asset_live_without_env_trading_flag(tmp_path) -> None:
+    settings = _settings(tmp_path, app_shadow_mode=False, crypto_trading_enabled=False)
+    service = AgentPackService(settings)
+    policy = service.runtime_crypto_policy(
+        service.default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    live={
+                        "trading_enabled": True,
+                        "production_autonomy_enabled": True,
+                        "asset_modes": {"BTC": "live"},
+                    }
+                )
+            }
+        )
+    )
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+    control = type("_Control", (), {"notes": {}, "kill_switch_enabled": False, "active_color": settings.app_color})()
+    gate = type("_Gate", (), {"status": "blocked", "metrics": {
+        "resolved_sample_count": settings.crypto_replay_min_resolved_markets,
+        "trade_candidate_count": settings.crypto_replay_min_trade_candidates,
+        "strict_trade_eligible_count": settings.crypto_replay_min_trade_candidates,
+        "net_simulated_pl_dollars": 10.0,
+        "hard_cap_breaches": 0,
+        "candle_count": 1,
+        "spot_feature_coverage_pct": 1.0,
+        "calibration_brier": 0.20,
+        "market_mid_brier": 0.25,
+        "calibration_log_loss": 0.55,
+        "market_mid_log_loss": 0.60,
+        "calibration_ece": 0.05,
+        "market_mid_ece": 0.08,
+    }})()
+
+    status = asset_control.market_live_status(
+        control=control,
+        replay_gate=gate,
+        market=_market(asset_symbol="BTC"),
+        has_write_credentials=True,
+        crypto_policy=policy,
+    )
+
+    assert status["asset_mode"] == "live"
+    assert status["live_eligible"] is True
+    assert status["global_live_blockers"] == []
+
+
+def test_crypto_manual_off_note_overrides_runtime_live_policy(tmp_path) -> None:
+    settings = _settings(tmp_path, app_shadow_mode=False, crypto_trading_enabled=False)
+    service = AgentPackService(settings)
+    policy = service.runtime_crypto_policy(
+        service.default_pack().model_copy(
+            update={"crypto_policy": AgentPackCryptoPolicy(live={"trading_enabled": True, "asset_modes": {"BTC": "live"}})}
+        )
+    )
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+    control = type(
+        "_Control",
+        (),
+        {"notes": {"crypto_asset_modes": {"BTC": "off"}}, "kill_switch_enabled": False, "active_color": settings.app_color},
+    )()
+
+    assert asset_control.mode_for_control(control, "BTC", crypto_policy=policy) == "off"
 
 
 @pytest.mark.asyncio

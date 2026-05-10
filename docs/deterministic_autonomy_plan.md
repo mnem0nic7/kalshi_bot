@@ -69,7 +69,7 @@ Phase 3 foundation now exists as a guarded degradation layer:
 
 Repurpose self-improve from agent-pack promotion into parameter-pack promotion. Candidate packs are tuned offline on strict-as-of replay data and promoted only after coverage, Brier, ECE, Sharpe, drawdown, city consistency, idempotency, and canary gates pass.
 
-Phase 4 foundation now exists without activating autonomous promotion:
+Phase 4 foundation now exists with deterministic gate autonomy active through agent-pack thresholds while parameter packs remain the longer-term sealed-hard-cap unit:
 
 - `kalshi_bot.learning.parameter_pack` defines bounded tunable parameters, stable pack hashing, sanitization, and hard-cap exclusion.
 - `kalshi_bot.learning.parameter_search` generates bounded grid candidates for offline replay and selects the first replay-gated candidate from search JSON without writing runtime state.
@@ -81,6 +81,9 @@ Phase 4 foundation now exists without activating autonomous promotion:
 - `parameter-pack status` exposes staged rollout notes, recent packs, parameter-pack promotion events, and the current `promotion_starvation` checkpoint, and marks stale staged/canary-pending candidates `stalled`; `parameter-pack drift` evaluates calibration drift from a JSON window without mutating runtime state; `parameter-pack grid` emits deterministic bounded candidates for offline replay; `parameter-pack select` turns offline replay search output into the first passing gated candidate artifact and reports `promotion_starvation` after the configured K failed candidates; `parameter-pack record-starvation` records the starvation checkpoint plus a warning/error ops event, escalating after repeated starvations while retaining the current pack; `parameter-pack stage` records a gated candidate into `parameter_packs`, `promotion_events`, and `deployment_control.notes.parameter_packs` without changing live color or risk, and clears any existing starvation streak; `parameter-pack canary` evaluates shadow-canary Brier/risk/source evidence; `parameter-pack promote-staged` lets an operator mark a canary-passed pack as champion metadata; `parameter-pack rollback-staged` clears that staged candidate as rejected.
 - `infra/config/parameter_pack_default.yaml` mirrors the built-in default parameter pack for audit and operator review.
 - The scheduled self-improve workflow now defaults to a parameter-pack preflight lane. It verifies the sealed hard-cap hash and staged rollout status, then exits success as `not_ready_for_parameter_pack_replay` until replay search artifacts and holdout evidence exist. Legacy agent-pack critique/eval/stage remains manual-only through the `agent_pack_legacy` workflow target.
+- `autonomous-gates --domain all` is the deterministic gate-upgrade lane for current production. Weather thresholds and crypto policy are stored in agent packs, staged with evidence fingerprints, canaried on newly labeled live rows, and promoted only through active-pack assignment.
+- Crypto now has runtime parity with weather for autonomous gating: separate entry/replay/live policy, per-asset threshold overrides, per-asset staging/canary/promotion, and live reads in crypto signal selection, replay gates, risk checks, execution requotes, and passive/taker fallback.
+- Crypto hard fuses remain outside autonomy: manual asset mode `off`, inactive color, app shadow mode, missing write credentials, disabled crypto feature flags, stale data, replay-gate failure, kill switch, position caps, and hard risk caps.
 
 Default promotion settings:
 
