@@ -19,6 +19,7 @@ from kalshi_bot.services.position_governance import (
     stop_loss_outcome_from_payloads,
     stop_loss_stopped_at_from_payloads,
 )
+from kalshi_bot.services.signal_attention import add_lifecycle_fields, extract_decision_fields
 from kalshi_bot.services.strategy_auto_evolve import AUTO_EVOLVE_EVENT_KIND, AUTO_EVOLVE_SOURCE
 from kalshi_bot.services.strategy_regression import (
     LEAN_RECOMMENDATION_MIN_GAP as STRATEGY_LEAN_RECOMMENDATION_GAP,
@@ -416,6 +417,7 @@ def _clean_reason_label(reason: Any) -> str:
         "market_stale": "Market data is stale",
         "spread_too_wide": "Spread too wide",
         "entry_freeze": "Entry freeze is on",
+        "static_signal_stale": "Static signal guard",
         "book_effectively_broken": "Order book is not usable",
         "below_min_contract_price": "Price below minimum entry",
         "below_min_edge": "Edge below minimum",
@@ -699,7 +701,7 @@ def _room_decision_description(
     return " ".join(sentences)
 
 
-def _room_decision_from_row(row: Any) -> dict[str, Any]:
+def _room_decision_from_row(row: Any, *, settings: Any | None = None) -> dict[str, Any]:
     payload = row.signal_payload if isinstance(getattr(row, "signal_payload", None), dict) else {}
     trace = _candidate_trace(payload)
     eligibility = payload.get("eligibility") if isinstance(payload.get("eligibility"), dict) else {}
@@ -812,7 +814,20 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
         selected_side=selected_side,
         risk_reasons=risk_reasons,
     )
-    return {
+    structured = extract_decision_fields(
+        payload,
+        settings=settings,
+        room_id=getattr(row, "room_id", None),
+        market_ticker=getattr(row, "market_ticker", None),
+        updated_at=getattr(row, "updated_at", None),
+        row_fair_yes=getattr(row, "fair_yes_dollars", None),
+        row_edge_bps=getattr(row, "edge_bps", None),
+        row_confidence=getattr(row, "confidence", None),
+        ticket_side=getattr(row, "ticket_side", None),
+        ticket_yes_price_dollars=getattr(row, "ticket_yes_price_dollars", None),
+        ticket_count_fp=getattr(row, "ticket_count_fp", None),
+    )
+    view = {
         "room_id": getattr(row, "room_id", None),
         "url": f"/rooms/{getattr(row, 'room_id', '')}",
         "market_ticker": getattr(row, "market_ticker", None),
@@ -856,6 +871,9 @@ def _room_decision_from_row(row: Any) -> dict[str, Any]:
         "orders_submitted": orders_submitted,
         "fills_observed": fills_observed,
     }
+    for key, value in structured.items():
+        view.setdefault(key, value)
+    return view
 
 
 def _compact_ticket(ticket: Any) -> dict[str, Any] | None:
@@ -1413,6 +1431,7 @@ async def _recent_room_decision_views(
     kalshi_env: str,
     limit: int = RECENT_ROOM_DECISION_LIMIT,
     market_prefix: str | None = None,
+    settings: Any | None = None,
 ) -> list[dict[str, Any]]:
     conditions = [
         Room.kalshi_env == kalshi_env,
@@ -1529,7 +1548,7 @@ async def _recent_room_decision_views(
         .outerjoin(fill_counts, fill_counts.c.trade_ticket_id == latest_ticket.c.trade_ticket_id)
         .order_by(recent_rooms.c.created_at.desc(), recent_rooms.c.updated_at.desc())
     )
-    return [_room_decision_from_row(row) for row in result.all()]
+    return list(reversed(add_lifecycle_fields(list(reversed([_room_decision_from_row(row, settings=settings) for row in result.all()])))))
 
 
 def _series_from_market_ticker(market_ticker: str | None) -> str:
@@ -2758,6 +2777,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
             session,
             kalshi_env=kalshi_env,
             market_prefix="KXHIGH",
+            settings=container.settings,
         )
         fallback_capital = thresholds.risk_max_position_notional_dollars
         if fallback_capital is None:

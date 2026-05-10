@@ -106,12 +106,48 @@
     ["summary", "Summary"],
     ["updated_at", "Updated"],
     ["url", "URL"],
+    ["gates_failed", "gates_failed"],
+    ["gates_passed", "gates_passed"],
+    ["primary_block_reason", "primary_block_reason"],
+    ["policy_variants", "policy_variants"],
+    ["policy_variant_applied", "policy_variant_applied"],
+    ["baseline_block_reason", "baseline_block_reason"],
+    ["forecast_high_f", "forecast_high_f"],
+    ["threshold_f", "threshold_f"],
+    ["forecast_threshold_delta_f", "forecast_threshold_delta_f"],
+    ["high_so_far_f", "high_so_far_f"],
+    ["contract_direction", "contract_direction"],
+    ["min_separation_f", "min_separation_f"],
+    ["yes_bid", "yes_bid"],
+    ["yes_ask", "yes_ask"],
+    ["yes_mid", "yes_mid"],
+    ["no_bid", "no_bid"],
+    ["no_ask", "no_ask"],
+    ["no_mid", "no_mid"],
+    ["entry_price", "entry_price"],
+    ["min_entry_price", "min_entry_price"],
+    ["quality_buffer_bps", "quality_buffer_bps"],
+    ["fair_yes_initial", "fair_yes_initial"],
+    ["fair_yes_adjusted", "fair_yes_adjusted"],
+    ["bucket_id", "bucket_id"],
+    ["bucket_sample_count", "bucket_sample_count"],
+    ["bucket_min_required", "bucket_min_required"],
+    ["bucket_recommended_size", "bucket_recommended_size"],
+    ["recommended_side", "recommended_side"],
+    ["recommended_price", "recommended_price"],
+    ["recommended_size", "recommended_size"],
+    ["recommended_size_cap", "recommended_size_cap"],
+    ["recommended_size_cap_reason", "recommended_size_cap_reason"],
+    ["market_close_time", "market_close_time"],
+    ["time_to_close_minutes", "time_to_close_minutes"],
+    ["evaluation_n", "evaluation_n"],
+    ["prev_room_id", "prev_room_id"],
+    ["edge_delta_from_prev_bps", "edge_delta_from_prev_bps"],
   ];
 
   function exportValue(value) {
     if (value === null || value === undefined) return "";
-    if (Array.isArray(value)) return value.join("; ");
-    if (typeof value === "object") return JSON.stringify(value);
+    if (Array.isArray(value) || typeof value === "object") return JSON.stringify(value);
     return String(value);
   }
 
@@ -177,10 +213,40 @@
     }
   }
 
+  async function exportSignalsWorthAttention(trigger) {
+    const panel = trigger.closest(".dash-panel");
+    const env = trigger.dataset.env || (panel && panel.dataset.env) || currentDashboardEnv();
+    const originalText = trigger.textContent;
+    trigger.disabled = true;
+    trigger.textContent = "Exporting...";
+    try {
+      const resp = await fetch(`/api/dashboard/${encodeURIComponent(env)}/signals-worth-attention?format=csv`);
+      if (!resp.ok) {
+        throw new Error(`Export failed (${resp.status})`);
+      }
+      const csv = await resp.text();
+      downloadTextFile(
+        `signals-worth-attention-${env}-${timestampForFilename()}.csv`,
+        csv,
+        "text/csv;charset=utf-8",
+      );
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Export failed.");
+    } finally {
+      trigger.textContent = originalText;
+      trigger.disabled = false;
+    }
+  }
+
   function initRoomDecisionExports() {
     document.querySelectorAll('[data-action="export-room-decisions"]').forEach((button) => {
       button.addEventListener("click", () => {
         exportRecentRoomDecisions(button);
+      });
+    });
+    document.querySelectorAll('[data-action="export-signals-attention"]').forEach((button) => {
+      button.addEventListener("click", () => {
+        exportSignalsWorthAttention(button);
       });
     });
   }

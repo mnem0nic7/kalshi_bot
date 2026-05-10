@@ -335,6 +335,7 @@ def _reason_label(reason: str | None) -> str:
         "market_stale": "Market data is stale",
         "research_stale": "Research is stale",
         "resolved_contract": "Resolved contract",
+        "static_signal_stale": "Static signal guard",
         "empirical_gate_block": "Trade-behavior gate blocked entry",
         "empirical_gate_under_sampled": "Trade-behavior history is too thin",
     }

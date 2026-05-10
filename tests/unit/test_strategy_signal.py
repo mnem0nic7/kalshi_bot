@@ -127,6 +127,124 @@ def test_trade_recommendation_filters_both_sides_below_price_floor() -> None:
     assert trace["no"]["reason"] == "below_min_contract_price"
 
 
+def test_low_price_high_edge_policy_selects_candidate_when_live_enabled() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+
+    action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=Decimal("0.3000"),
+        market_snapshot={"market": {"yes_bid_dollars": "0.0500", "yes_ask_dollars": "0.0600", "no_ask_dollars": "0.9400"}},
+        min_edge_bps=500,
+        settings=settings,
+    )
+
+    assert action == TradeAction.BUY
+    assert side == ContractSide.YES
+    assert target_yes == Decimal("0.0600")
+    assert edge_bps == 2400
+    assert trace["policy_variant_applied"] == "low_price_high_edge"
+    assert trace["yes"]["baseline_reason"] == "below_min_contract_price"
+
+
+def test_low_price_policy_shadow_mode_does_not_select_candidate() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        low_price_high_edge_live_enabled=False,
+        decision_policy_variants_shadow_enabled=True,
+    )
+
+    action, side, target_yes, _edge_bps, trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=Decimal("0.3000"),
+        market_snapshot={"market": {"yes_bid_dollars": "0.0500", "yes_ask_dollars": "0.0600", "no_ask_dollars": "0.9400"}},
+        min_edge_bps=500,
+        settings=settings,
+    )
+
+    assert action is None
+    assert side is None
+    assert target_yes is None
+    assert trace["policy_variant_applied"] is None
+    assert trace["policy_variants"]["low_price_high_edge"]["would_have_entered"] is True
+
+
+def test_policy_variants_all_disabled_preserve_baseline_candidate_filtering() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        decision_policy_variants_shadow_enabled=False,
+        low_price_high_edge_live_enabled=False,
+        remaining_payout_relaxation_live_enabled=False,
+        intraday_separation_override_live_enabled=False,
+        empirical_bootstrap_live_enabled=False,
+    )
+
+    action, side, target_yes, _edge_bps, trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=Decimal("0.3000"),
+        market_snapshot={"market": {"yes_bid_dollars": "0.0500", "yes_ask_dollars": "0.0600", "no_ask_dollars": "0.9400"}},
+        min_edge_bps=500,
+        settings=settings,
+    )
+
+    assert action is None
+    assert side is None
+    assert target_yes is None
+    assert trace["policy_variant_applied"] is None
+    assert trace["policy_variants"]["low_price_high_edge"]["would_have_entered"] is False
+
+
+def test_remaining_payout_policy_selects_candidate_when_live_enabled() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+
+    action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=Decimal("0.9900"),
+        market_snapshot={"market": {"yes_bid_dollars": "0.7900", "yes_ask_dollars": "0.8000", "no_ask_dollars": "0.2000"}},
+        min_edge_bps=500,
+        settings=settings,
+    )
+
+    assert action == TradeAction.BUY
+    assert side == ContractSide.YES
+    assert target_yes == Decimal("0.8000")
+    assert edge_bps == 1900
+    assert trace["policy_variant_applied"] == "remaining_payout_relaxation"
+    assert trace["yes"]["baseline_reason"] == "insufficient_remaining_payout"
+
+
+def test_remaining_payout_policy_passes_eligibility_before_risk_engine() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    market_snapshot = {"market": {"yes_bid_dollars": "0.7900", "yes_ask_dollars": "0.8000", "no_ask_dollars": "0.2000"}}
+    action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
+        fair_yes_dollars=Decimal("0.9900"),
+        market_snapshot=market_snapshot,
+        min_edge_bps=500,
+        settings=settings,
+    )
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.9900"),
+        confidence=0.95,
+        edge_bps=edge_bps,
+        recommended_action=action,
+        recommended_side=side,
+        target_yes_price_dollars=target_yes,
+        summary="remaining payout policy",
+        resolution_state=WeatherResolutionState.UNRESOLVED,
+        strategy_mode=StrategyMode.DIRECTIONAL_UNRESOLVED,
+        forecast_delta_f=10.0,
+        candidate_trace=trace,
+    )
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot=market_snapshot,
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.eligible is True
+    assert verdict.stand_down_reason is None
+    assert verdict.remaining_payout_dollars == Decimal("0.2000")
+
+
 def test_trade_recommendation_checks_no_when_yes_fails_remaining_payout() -> None:
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_contract_price_dollars=0.25)
 
@@ -697,3 +815,68 @@ def test_present_forecast_delta_above_threshold_passes() -> None:
 
     assert verdict.stand_down_reason is None
     assert verdict.eligible is True
+
+
+def test_intraday_resolved_fair_value_bypasses_forecast_separation_gate() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        strategy_min_abs_delta_f=8.0,
+        intraday_separation_override_live_enabled=True,
+    )
+    signal = _eligible_signal(forecast_delta_f=2.0)
+    signal.fair_yes_dollars = Decimal("0.9500")
+    signal.prediction_provenance = {
+        "intraday_model": {
+            "status": "used",
+            "baseline_fair_yes": "0.6500",
+            "intraday_fair_yes": "0.9500",
+        }
+    }
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.5600", "yes_ask_dollars": "0.5800", "no_ask_dollars": "0.4200"}},
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.stand_down_reason is None
+    assert verdict.eligible is True
+    assert verdict.candidate_trace["policy_variant_applied"] == "intraday_separation_override"
+    assert verdict.candidate_trace["policy_variants"]["intraday_separation_override"]["applied"] is True
+
+
+def test_intraday_separation_shadow_mode_preserves_forecast_block() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        strategy_min_abs_delta_f=8.0,
+        intraday_separation_override_live_enabled=False,
+        decision_policy_variants_shadow_enabled=True,
+    )
+    signal = _eligible_signal(forecast_delta_f=2.0)
+    signal.fair_yes_dollars = Decimal("0.9500")
+    signal.prediction_provenance = {
+        "intraday_model": {
+            "status": "used",
+            "baseline_fair_yes": "0.6500",
+            "intraday_fair_yes": "0.9500",
+        }
+    }
+
+    verdict = evaluate_trade_eligibility(
+        settings=settings,
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.5600", "yes_ask_dollars": "0.5800", "no_ask_dollars": "0.4200"}},
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.stand_down_reason == StandDownReason.INSUFFICIENT_FORECAST_SEPARATION
+    assert verdict.eligible is False
+    assert verdict.candidate_trace["policy_variant_applied"] is None
+    assert verdict.candidate_trace["policy_variants"]["intraday_separation_override"]["would_have_entered"] is True

@@ -287,6 +287,13 @@
             data-testid="export-room-decisions"
             {% if not recent_room_decisions %}disabled{% endif %}
           >Export CSV</button>
+          <button
+            type="button"
+            class="secondary-button room-decisions-export"
+            data-action="export-signals-attention"
+            data-env="{{ env_key }}"
+            data-testid="export-signals-attention"
+          >Signals CSV</button>
         </div>
       </div>
       {% if recent_room_decisions %}

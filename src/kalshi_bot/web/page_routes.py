@@ -5,10 +5,11 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 
 from kalshi_bot.services.container import AppContainer
+from kalshi_bot.services.signal_attention import SignalAttentionService, attention_rows_to_csv
 from kalshi_bot.web.control_room import build_env_dashboard, build_strategies_dashboard
 from kalshi_bot.web.faq_content import FAQ_SECTIONS
 
@@ -85,5 +86,31 @@ def create_page_router(
         app_container = container(request)
         payload = await build_env_dashboard_func(app_container, kalshi_env)
         return JSONResponse(jsonable_encoder(payload))
+
+    @router.get("/api/dashboard/{kalshi_env}/signals-worth-attention")
+    async def dashboard_signals_worth_attention(kalshi_env: str, request: Request):
+        if kalshi_env not in ("demo", "production"):
+            return JSONResponse({"error": "invalid env"}, status_code=400)
+        app_container = container(request)
+        query = request.query_params
+        try:
+            lookback_hours = int(query.get("lookback_hours") or app_container.settings.signals_attention_lookback_hours)
+        except ValueError:
+            return JSONResponse({"error": "invalid lookback_hours"}, status_code=400)
+        output_format = str(query.get("format") or "json").lower()
+        async with app_container.session_factory() as session:
+            service = SignalAttentionService(app_container.settings)
+            rows = service.detect_patterns(
+                await service.load_rows(
+                    session,
+                    kalshi_env=kalshi_env,
+                    lookback_hours=lookback_hours,
+                )
+            )
+        if output_format == "csv":
+            return PlainTextResponse(attention_rows_to_csv(rows), media_type="text/csv")
+        if output_format != "json":
+            return JSONResponse({"error": "invalid format"}, status_code=400)
+        return JSONResponse(jsonable_encoder({"kalshi_env": kalshi_env, "lookback_hours": lookback_hours, "patterns": rows}))
 
     return router

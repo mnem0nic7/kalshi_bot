@@ -14,6 +14,12 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, StandDownReason, StrategyMode, TradeAction, WeatherResolutionState
 from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.core.schemas import ResearchFreshness, TradeEligibilityVerdict
+from kalshi_bot.services.decision_policy_variants import (
+    INTRADAY_SEPARATION_OVERRIDE,
+    REMAINING_PAYOUT_RELAXATION,
+    DecisionPolicyVariantService,
+    policy_variant_applied,
+)
 from kalshi_bot.weather.models import WeatherMarketMapping
 from kalshi_bot.weather.scoring import SigmaContext, WeatherSignalSnapshot, confidence_band_for, score_weather_market
 
@@ -594,6 +600,23 @@ def _trade_recommendation_with_trace(
     )
     candidates = [yes_candidate, no_candidate]
     eligible_candidates = [candidate for candidate in candidates if candidate["status"] == "eligible"]
+    baseline_block_reason = None
+    if not eligible_candidates:
+        filtered_candidates = [
+            candidate for candidate in candidates
+            if candidate.get("edge_bps") is not None
+        ]
+        if filtered_candidates:
+            baseline_block_reason = str(
+                max(
+                    filtered_candidates,
+                    key=lambda candidate: (
+                        int(candidate.get("quality_adjusted_edge_bps") or -1_000_000),
+                        int(candidate.get("edge_bps") or -1_000_000),
+                    ),
+                ).get("reason")
+                or ""
+            )
 
     recommendation_action: TradeAction | None = None
     recommendation_side: ContractSide | None = None
@@ -607,6 +630,11 @@ def _trade_recommendation_with_trace(
         or [0]
     )
     selected: dict[str, Any] | None = None
+    policy_result = (
+        DecisionPolicyVariantService(settings).evaluate_candidate_variants(candidates)
+        if settings is not None
+        else None
+    )
     if eligible_candidates:
         selected = max(
             eligible_candidates,
@@ -618,6 +646,21 @@ def _trade_recommendation_with_trace(
         )
         selected["status"] = "selected"
         selected["reason"] = "selected_best_quality_adjusted_edge"
+        recommendation_action = TradeAction.BUY
+        recommendation_side = ContractSide(selected["side"])
+        target_raw = selected.get("target_yes_price_dollars")
+        target_yes = quantize_price(target_raw) if target_raw is not None else None
+        edge_bps = int(selected.get("edge_bps") or 0)
+    elif policy_result is not None and policy_result.selected_candidate is not None:
+        selected = policy_result.selected_candidate
+        selected["status"] = "selected"
+        selected["baseline_reason"] = selected.get("reason")
+        selected["reason"] = "selected_by_policy_variant"
+        selected["policy_variant_applied"] = policy_result.applied_variant
+        for candidate in candidates:
+            if candidate.get("side") == selected.get("side"):
+                candidate.update(selected)
+                break
         recommendation_action = TradeAction.BUY
         recommendation_side = ContractSide(selected["side"])
         target_raw = selected.get("target_yes_price_dollars")
@@ -646,6 +689,9 @@ def _trade_recommendation_with_trace(
         "yes": yes_candidate,
         "no": no_candidate,
         "candidates": candidates,
+        "policy_variants": policy_result.policy_variants if policy_result is not None else {},
+        "policy_variant_applied": policy_result.applied_variant if policy_result is not None else None,
+        "baseline_block_reason": baseline_block_reason,
     }
     return recommendation_action, recommendation_side, target_yes, edge_bps, trace
 
@@ -741,6 +787,26 @@ def _filtered_candidate_stand_down(candidate_trace: dict[str, Any]) -> tuple[Sta
             f"Best {side} candidate only had {edge}bps after quality checks versus required {min_edge}bps.",
         )
     return None
+
+
+def _intraday_resolution_override(
+    settings: Settings,
+    signal: StrategySignal,
+    *,
+    edge_after_quality_buffer_bps: float | int | None,
+) -> dict[str, Any] | None:
+    provenance = dict(signal.prediction_provenance or {})
+    if not provenance and signal.weather is not None and isinstance(signal.weather.prediction_provenance, dict):
+        provenance = dict(signal.weather.prediction_provenance or {})
+    decision = DecisionPolicyVariantService(settings).intraday_separation_decision(
+        fair_yes_dollars=signal.fair_yes_dollars,
+        forecast_delta_f=signal.forecast_delta_f,
+        prediction_provenance=provenance,
+        edge_after_quality_buffer_bps=edge_after_quality_buffer_bps,
+    )
+    if decision is None:
+        return None
+    return decision.to_trace()
 
 
 def apply_heuristic_application_to_signal(
@@ -897,6 +963,15 @@ def evaluate_trade_eligibility(
     forced_stand_down_value = heuristic_application.get("force_stand_down_reason")
     candidate_trace = dict(signal.candidate_trace or {})
     trace_outcome = candidate_trace.get("outcome") if isinstance(candidate_trace.get("outcome"), str) else None
+    baseline_minimum_remaining_payout_bps = int(minimum_remaining_payout_bps)
+    if (
+        policy_variant_applied(candidate_trace, REMAINING_PAYOUT_RELAXATION)
+        and DecisionPolicyVariantService(settings).live_enabled(REMAINING_PAYOUT_RELAXATION)
+    ):
+        minimum_remaining_payout_bps = min(
+            baseline_minimum_remaining_payout_bps,
+            int(settings.remaining_payout_variant_min_payout_bps),
+        )
 
     strategy_mode = signal.strategy_mode
     if isinstance(forced_strategy_mode, str) and forced_strategy_mode:
@@ -979,11 +1054,46 @@ def evaluate_trade_eligibility(
             reasons.append("Forecast delta unavailable; cannot verify weather separation.")
             stand_down_reason = StandDownReason.FORECAST_DELTA_MISSING
         elif abs(signal.forecast_delta_f) < settings.strategy_min_abs_delta_f:
-            reasons.append(
-                f"Forecast separation {signal.forecast_delta_f:.1f}°F is below minimum "
-                f"{settings.strategy_min_abs_delta_f:.1f}°F."
+            intraday_override = _intraday_resolution_override(
+                settings,
+                signal,
+                edge_after_quality_buffer_bps=edge_after_quality_buffer_bps,
             )
-            stand_down_reason = StandDownReason.INSUFFICIENT_FORECAST_SEPARATION
+            if intraday_override is not None:
+                service = DecisionPolicyVariantService(settings)
+                candidate_trace = service.merge_trace(
+                    candidate_trace,
+                    decisions={INTRADAY_SEPARATION_OVERRIDE: intraday_override},
+                    applied_variant=(
+                        INTRADAY_SEPARATION_OVERRIDE
+                        if intraday_override.get("live_enabled")
+                        else None
+                    ),
+                    baseline_block_reason=StandDownReason.INSUFFICIENT_FORECAST_SEPARATION.value,
+                )
+                if intraday_override.get("live_enabled"):
+                    candidate_trace["policy_variants"][INTRADAY_SEPARATION_OVERRIDE]["applied"] = True
+                    reasons.append(
+                        "Policy variant intraday_separation_override bypassed the forecast-separation rule."
+                    )
+                    if signal.confidence < settings.risk_min_confidence:
+                        reasons.append(
+                            f"Signal confidence {signal.confidence:.2f} is below minimum "
+                            f"{settings.risk_min_confidence:.2f}."
+                        )
+                        stand_down_reason = StandDownReason.CONFIDENCE_TOO_LOW
+                else:
+                    reasons.append(
+                        f"Forecast separation {signal.forecast_delta_f:.1f}°F is below minimum "
+                        f"{settings.strategy_min_abs_delta_f:.1f}°F."
+                    )
+                    stand_down_reason = StandDownReason.INSUFFICIENT_FORECAST_SEPARATION
+            else:
+                reasons.append(
+                    f"Forecast separation {signal.forecast_delta_f:.1f}°F is below minimum "
+                    f"{settings.strategy_min_abs_delta_f:.1f}°F."
+                )
+                stand_down_reason = StandDownReason.INSUFFICIENT_FORECAST_SEPARATION
         elif signal.confidence < settings.risk_min_confidence:
             reasons.append(
                 f"Signal confidence {signal.confidence:.2f} is below minimum "

@@ -7,6 +7,7 @@ from kalshi_bot.core.enums import ContractSide, DeploymentColor, RiskStatus, Tra
 from kalshi_bot.core.schemas import PortfolioBucketSnapshot, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.agent_packs import RuntimeThresholds
+from kalshi_bot.services.decision_policy_variants import LOW_PRICE_HIGH_EDGE, REMAINING_PAYOUT_RELAXATION
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
 from kalshi_bot.services.signal import StrategySignal
 from kalshi_bot.weather.scoring import WeatherSignalSnapshot
@@ -346,6 +347,40 @@ def test_risk_engine_blocks_high_cost_side_with_tiny_remaining_payout() -> None:
     assert verdict.diagnostics["remaining_payout"]["minimum_remaining_payout_bps"] == 2500
 
 
+def test_risk_engine_honors_remaining_payout_policy_variant_floor() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_fee_aware_edge_enabled=False,
+    )
+    signal = make_signal(edge_bps=1900)
+    signal.fair_yes_dollars = Decimal("0.9900")
+    signal.candidate_trace = {
+        "policy_variant_applied": REMAINING_PAYOUT_RELAXATION,
+        "policy_variants": {REMAINING_PAYOUT_RELAXATION: {"applied": True}},
+    }
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.8000"),
+            count_fp=Decimal("2.00"),
+        ),
+        signal=signal,
+        context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert "remaining_payout_policy_variant_applied" in verdict.reason_codes
+    assert verdict.diagnostics["remaining_payout"]["minimum_remaining_payout_bps"] == 1000
+
+
 def test_risk_engine_blocks_near_threshold_regime() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
@@ -553,6 +588,41 @@ def test_risk_engine_blocks_below_minimum_contract_price() -> None:
     assert verdict.status == RiskStatus.BLOCKED
     assert any("nearly impossible" in r for r in verdict.reasons)
     assert any("0.25" in r for r in verdict.reasons)
+
+
+def test_risk_engine_honors_low_price_policy_variant_floor() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_contract_price_dollars=0.25,
+        risk_min_probability_extremity_pct=0.0,
+        risk_fee_aware_edge_enabled=False,
+    )
+    signal = make_signal(edge_bps=2400)
+    signal.target_yes_price_dollars = Decimal("0.0600")
+    signal.candidate_trace = {
+        "policy_variant_applied": LOW_PRICE_HIGH_EDGE,
+        "policy_variants": {LOW_PRICE_HIGH_EDGE: {"applied": True}},
+    }
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.0600"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=signal,
+        context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert "low_price_policy_variant_applied" in verdict.reason_codes
+    assert verdict.diagnostics["minimum_contract_price"]["effective_min_price_dollars"] == "0.0500"
 
 
 def test_risk_engine_blocks_runaway_edge_as_model_error() -> None:

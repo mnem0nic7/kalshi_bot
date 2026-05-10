@@ -238,6 +238,22 @@ class Settings(BaseSettings):
     trade_behavior_empirical_gate_min_net_pnl_dollars: float = 0.0
     trade_behavior_empirical_gate_lookback_days: int = 180
     trade_behavior_snapshot_scoreability_since: str | None = None
+    signals_attention_lookback_hours: int = 24
+    decision_policy_variants_shadow_enabled: bool = True
+    low_price_high_edge_live_enabled: bool = True
+    intraday_separation_override_live_enabled: bool = True
+    remaining_payout_relaxation_live_enabled: bool = True
+    empirical_bootstrap_live_enabled: bool = True
+    policy_variant_min_quality_adjusted_edge_bps: int = 1500
+    low_price_variant_min_entry_price_dollars: float = 0.05
+    remaining_payout_variant_min_payout_bps: int = 1000
+    empirical_bootstrap_min_evaluations: int = 3
+    empirical_bootstrap_min_edge_bps: int = 1500
+    empirical_bootstrap_last_edge_bps: int = 2500
+    intraday_resolved_low_fair_yes: float = 0.10
+    intraday_resolved_high_fair_yes: float = 0.90
+    static_edge_min_evaluations: int = 3
+    static_fair_min_evaluations: int = 5
 
     strategy_c_cadence_idle_seconds: int = 3600
     strategy_c_cadence_approach_seconds: int = 900

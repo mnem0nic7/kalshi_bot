@@ -11,6 +11,12 @@ from kalshi_bot.core.fixed_point import as_decimal, quantize_count
 from kalshi_bot.core.schemas import PortfolioBucketSnapshot, RiskVerdictPayload, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.agent_packs import RuntimeThresholds
+from kalshi_bot.services.decision_policy_variants import (
+    LOW_PRICE_HIGH_EDGE,
+    REMAINING_PAYOUT_RELAXATION,
+    DecisionPolicyVariantService,
+    policy_variant_applied,
+)
 from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.risk_policy import probability_midband_block_reason
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars, remaining_payout_dollars
@@ -198,6 +204,9 @@ class DeterministicRiskEngine:
         approved_count = ticket.count_fp
         approved_notional = order_notional
         gross_edge_bps = signal.edge_bps
+        candidate_trace = dict(signal.candidate_trace or {})
+        policy_service = DecisionPolicyVariantService(self.settings)
+        applied_policy_variant = candidate_trace.get("policy_variant_applied")
         fee_estimate_dollars_per_contract: Decimal | None = None
         fee_edge_bps: int | None = None
         net_edge_bps: int | None = None
@@ -217,6 +226,10 @@ class DeterministicRiskEngine:
             )
         )
         diagnostics["risk_reducing_exit"] = risk_reducing_exit
+        diagnostics["policy_variants"] = {
+            "policy_variant_applied": applied_policy_variant,
+            "variants": candidate_trace.get("policy_variants") if isinstance(candidate_trace.get("policy_variants"), dict) else {},
+        }
 
         if is_sell_exit and not risk_reducing_exit:
             block("Sell ticket does not match an existing same-side position.")
@@ -243,7 +256,6 @@ class DeterministicRiskEngine:
         if signal.edge_bps < active_thresholds.risk_min_edge_bps:
             block(f"Edge {signal.edge_bps}bps is below configured minimum of {active_thresholds.risk_min_edge_bps}bps.")
         if signal.edge_bps > self.settings.risk_max_credible_edge_bps:
-            candidate_trace = dict(signal.candidate_trace or {})
             extreme_diag = candidate_trace.get("extreme_edge_diagnostic")
             validated_extreme_edge = (
                 candidate_trace.get("validated_extreme_edge") is True
@@ -281,27 +293,56 @@ class DeterministicRiskEngine:
                 f"Signal confidence {signal.confidence:.2f} is below minimum "
                 f"{self.settings.risk_min_confidence:.2f}."
             )
-        min_price = Decimal(str(self.settings.risk_min_contract_price_dollars))
+        baseline_min_price = Decimal(str(self.settings.risk_min_contract_price_dollars))
+        min_price = baseline_min_price
+        if policy_variant_applied(candidate_trace, LOW_PRICE_HIGH_EDGE) and policy_service.live_enabled(LOW_PRICE_HIGH_EDGE):
+            min_price = Decimal(str(self.settings.low_price_variant_min_entry_price_dollars))
         contract_price = (
             ticket.yes_price_dollars
             if ticket.side.value == "yes"
             else Decimal("1.0000") - ticket.yes_price_dollars
         )
+        diagnostics["minimum_contract_price"] = {
+            "contract_price_dollars": _decimal_text(contract_price),
+            "baseline_min_price_dollars": _decimal_text(baseline_min_price),
+            "effective_min_price_dollars": _decimal_text(min_price),
+            "policy_variant_applied": LOW_PRICE_HIGH_EDGE
+            if min_price != baseline_min_price
+            else None,
+        }
         if contract_price < min_price:
             block(
                 f"Contract price {contract_price} is below minimum {min_price}; "
                 f"market has priced this as nearly impossible."
             )
+            code("contract_price_below_min")
+        elif min_price != baseline_min_price:
+            note(
+                f"Policy variant {LOW_PRICE_HIGH_EDGE} lowered the minimum entry price "
+                f"from {baseline_min_price} to {min_price}."
+            )
+            code("low_price_policy_variant_applied")
         remaining_payout = remaining_payout_dollars(ticket.side, ticket.yes_price_dollars)
-        minimum_remaining_payout_bps = max(
+        baseline_minimum_remaining_payout_bps = max(
             int(active_thresholds.strategy_min_remaining_payout_bps),
             int(self.settings.strategy_min_remaining_payout_bps),
         )
+        if (
+            policy_variant_applied(candidate_trace, REMAINING_PAYOUT_RELAXATION)
+            and policy_service.live_enabled(REMAINING_PAYOUT_RELAXATION)
+        ):
+            minimum_remaining_payout_bps = int(self.settings.remaining_payout_variant_min_payout_bps)
+        else:
+            minimum_remaining_payout_bps = baseline_minimum_remaining_payout_bps
         minimum_remaining_payout = Decimal(minimum_remaining_payout_bps) / Decimal("10000")
         diagnostics["remaining_payout"] = {
             "remaining_payout_dollars": _decimal_text(remaining_payout),
             "minimum_remaining_payout_dollars": _decimal_text(minimum_remaining_payout),
             "minimum_remaining_payout_bps": minimum_remaining_payout_bps,
+            "baseline_minimum_remaining_payout_bps": baseline_minimum_remaining_payout_bps,
+            "policy_variant_applied": REMAINING_PAYOUT_RELAXATION
+            if minimum_remaining_payout_bps != baseline_minimum_remaining_payout_bps
+            else None,
         }
         if remaining_payout <= minimum_remaining_payout:
             block(
@@ -309,6 +350,12 @@ class DeterministicRiskEngine:
                 f"{minimum_remaining_payout:.4f}; payoff is too asymmetric for a new entry."
             )
             code("insufficient_remaining_payout")
+        elif minimum_remaining_payout_bps != baseline_minimum_remaining_payout_bps:
+            note(
+                f"Policy variant {REMAINING_PAYOUT_RELAXATION} lowered the remaining-payout floor "
+                f"from {baseline_minimum_remaining_payout_bps}bps to {minimum_remaining_payout_bps}bps."
+            )
+            code("remaining_payout_policy_variant_applied")
         if self.settings.risk_fee_aware_edge_enabled:
             (
                 fee_estimate_dollars_per_contract,

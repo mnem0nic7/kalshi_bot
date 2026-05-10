@@ -1115,8 +1115,18 @@ def test_recent_room_decisions_render_above_trading_activity(
                 assert download.suggested_filename.endswith(".csv")
                 export_text = Path(download.path()).read_text(encoding="utf-8")
                 assert "Room ID,Market,Origin,Stage,Status,Decision" in export_text
+                assert "gates_failed,gates_passed,primary_block_reason" in export_text
+                assert "policy_variants,policy_variant_applied,baseline_block_reason" in export_text
                 assert "room-sea,KXHIGHSEA-26MAY09-T67,live,complete,no_trade,No trade" in export_text
                 assert "Forecast high is 65.4F against a 67F threshold" in export_text
+                signals_export_button = decisions.locator('[data-testid="export-signals-attention"]')
+                assert signals_export_button.is_enabled(timeout=15_000)
+                with page.expect_download(timeout=15_000) as signals_download_info:
+                    signals_export_button.click(timeout=15_000)
+                signals_download = signals_download_info.value
+                assert signals_download.suggested_filename.startswith("signals-worth-attention-demo-")
+                signals_text = Path(signals_download.path()).read_text(encoding="utf-8")
+                assert "pattern,market,n_evaluations" in signals_text
             finally:
                 browser.close()
 
@@ -1485,4 +1495,4 @@ def test_dashboard_html_uses_room_decision_export_static_asset_version(
         with urllib.request.urlopen(base_url, timeout=5) as response:
             html = response.read().decode("utf-8")
 
-    assert "/static/dashboard.js?v=20260510-room-decisions-export" in html
+    assert "/static/dashboard.js?v=20260510-policy-variants" in html

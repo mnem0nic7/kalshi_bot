@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 from dataclasses import asdict
 from datetime import UTC, date, datetime
+import io
 import json
 from pathlib import Path
 import sys
@@ -21,7 +23,7 @@ from kalshi_bot.core.schemas import (
     ShadowCampaignRequest,
     TrainingBuildRequest,
 )
-from kalshi_bot.db.models import StrategyPromotionRecord
+from kalshi_bot.db.models import Room, Signal, StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import init_models
 from kalshi_bot.forecast.learned_head import (
@@ -54,8 +56,10 @@ from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
 from kalshi_bot.services.baseline_model_card import write_baseline_model_card
 from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, replay_decision_trace
+from kalshi_bot.services.decision_policy_variants import DecisionPolicyVariantService
 from kalshi_bot.services.parameter_packs import ParameterPackCanaryConfig, ParameterPackPromotionService
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
+from kalshi_bot.services.signal_attention import SignalAttentionService, attention_rows_to_csv
 from kalshi_bot.services.trade_analysis import format_trade_analysis_report
 from kalshi_bot.services.backtesting import (
     build_backtesting_report,
@@ -86,6 +90,35 @@ def _float_or_none(value: object) -> float | None:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _policy_audit_best_block_reason(candidate_trace: dict[str, object]) -> str | None:
+    baseline = candidate_trace.get("baseline_block_reason")
+    if baseline not in (None, ""):
+        return str(baseline)
+    candidates = [item for item in candidate_trace.get("candidates") or [] if isinstance(item, dict)]
+    if not candidates:
+        return None
+
+    def score(candidate: dict[str, object]) -> tuple[int, int]:
+        edge = _float_or_none(candidate.get("edge_bps"))
+        qa_edge = _float_or_none(candidate.get("quality_adjusted_edge_bps"))
+        return (
+            int(qa_edge) if qa_edge is not None else -1_000_000,
+            int(edge) if edge is not None else -1_000_000,
+        )
+
+    return str(max(candidates, key=score).get("reason") or "")
+
+
+def _policy_audit_csv(rows: list[dict[str, object]]) -> str:
+    output = io.StringIO()
+    columns = ["market_ticker", "room_id", "updated_at", "baseline_block_reason", "matched_variants", "live_variants"]
+    writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return output.getvalue()
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -1176,6 +1209,97 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(await container.training_corpus_service.get_status(persist_readiness=True), indent=2))
             return 0
 
+        if args.command == "signals-worth-attention":
+            async with container.session_factory() as session:
+                service = SignalAttentionService(container.settings)
+                rows = service.detect_patterns(
+                    await service.load_rows(
+                        session,
+                        kalshi_env=args.kalshi_env,
+                        lookback_hours=args.lookback_hours,
+                    )
+                )
+            if args.format == "csv":
+                print(attention_rows_to_csv(rows), end="")
+            else:
+                print(
+                    json.dumps(
+                        {
+                            "kalshi_env": args.kalshi_env,
+                            "lookback_hours": args.lookback_hours,
+                            "patterns": rows,
+                        },
+                        indent=2,
+                    )
+                )
+            return 0
+
+        if args.command == "decision-policy-variants-audit":
+            async with container.session_factory() as session:
+                stmt = (
+                    select(Signal, Room)
+                    .join(Room, Signal.room_id == Room.id)
+                    .where(Room.kalshi_env == args.kalshi_env)
+                    .order_by(Signal.updated_at.desc(), Signal.id.desc())
+                    .limit(args.limit)
+                )
+                result = await session.execute(stmt)
+                service = DecisionPolicyVariantService(container.settings)
+                detail_rows: list[dict[str, object]] = []
+                baseline_counts: dict[str, int] = {}
+                shadow_counts: dict[str, int] = {}
+                live_counts: dict[str, int] = {}
+                market_sets: dict[str, set[str]] = {}
+                for signal, room in result.all():
+                    payload = signal.payload if isinstance(signal.payload, dict) else {}
+                    trace = payload.get("candidate_trace") if isinstance(payload.get("candidate_trace"), dict) else {}
+                    candidates = [item for item in trace.get("candidates") or [] if isinstance(item, dict)]
+                    baseline = _policy_audit_best_block_reason(trace)
+                    if baseline:
+                        baseline_counts[baseline] = baseline_counts.get(baseline, 0) + 1
+                    policy_result = service.evaluate_candidate_variants(candidates)
+                    matched = sorted(policy_result.policy_variants)
+                    live = sorted(
+                        key for key, value in policy_result.policy_variants.items()
+                        if isinstance(value, dict) and value.get("live_enabled")
+                    )
+                    for key, value in policy_result.policy_variants.items():
+                        if value.get("shadow_enabled"):
+                            shadow_counts[key] = shadow_counts.get(key, 0) + 1
+                        if value.get("live_enabled"):
+                            live_counts[key] = live_counts.get(key, 0) + 1
+                        market_sets.setdefault(key, set()).add(signal.market_ticker)
+                    detail_rows.append(
+                        {
+                            "market_ticker": signal.market_ticker,
+                            "room_id": room.id,
+                            "updated_at": signal.updated_at.isoformat() if signal.updated_at is not None else "",
+                            "baseline_block_reason": baseline or "",
+                            "matched_variants": ",".join(matched),
+                            "live_variants": ",".join(live),
+                        }
+                    )
+            if args.format == "csv":
+                print(_policy_audit_csv(detail_rows), end="")
+            else:
+                print(
+                    json.dumps(
+                        {
+                            "kalshi_env": args.kalshi_env,
+                            "limit": args.limit,
+                            "baseline": {"blockers": baseline_counts},
+                            "shadow": {"would_have_entered_by_variant": shadow_counts},
+                            "live": {"would_have_entered_by_variant": live_counts},
+                            "unique_markets_by_variant": {
+                                key: len(value) for key, value in sorted(market_sets.items())
+                            },
+                            "rows": detail_rows,
+                        },
+                        indent=2,
+                    )
+                )
+            return 0
+
         if args.command == "trading-audit":
             audit_days = 3650 if args.full_history else args.days
             if args.trading_audit_command == "repair":
@@ -2041,6 +2165,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     discover = subparsers.add_parser("discover")
     discover.add_argument("--json", action="store_true")
+
+    signals_attention = subparsers.add_parser("signals-worth-attention")
+    signals_attention.add_argument("--kalshi-env", default="production")
+    signals_attention.add_argument("--lookback-hours", type=int, default=24)
+    signals_attention.add_argument("--format", choices=["csv", "json"], default="json")
+
+    policy_audit = subparsers.add_parser("decision-policy-variants-audit")
+    policy_audit.add_argument("--kalshi-env", default="production")
+    policy_audit.add_argument("--limit", type=int, default=500)
+    policy_audit.add_argument("--format", choices=["csv", "json"], default="json")
 
     stream = subparsers.add_parser("stream")
     stream.add_argument("--markets", nargs="*", default=None)

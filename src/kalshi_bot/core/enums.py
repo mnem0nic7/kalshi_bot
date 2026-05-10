@@ -97,6 +97,7 @@ class StandDownReason(StrEnum):
     CONTRACT_PRICE_TOO_LOW = "contract_price_too_low"
     ENTRY_FREEZE = "entry_freeze"
     EMPIRICAL_GATE_BLOCK = "empirical_gate_block"
+    STATIC_SIGNAL_STALE = "static_signal_stale"
     CRYPTO_DISABLED = "crypto_disabled"
     CRYPTO_MODEL_UNAVAILABLE = "crypto_model_unavailable"
     CRYPTO_DATA_INSUFFICIENT = "crypto_data_insufficient"

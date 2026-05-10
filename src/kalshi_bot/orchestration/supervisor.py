@@ -36,6 +36,11 @@ from kalshi_bot.services.decision_trace import (
     DETERMINISTIC_PATH_VERSION,
     build_deterministic_decision_trace,
 )
+from kalshi_bot.services.decision_policy_variants import (
+    EMPIRICAL_BOOTSTRAP,
+    DecisionPolicyVariantService,
+)
+from kalshi_bot.services.signal_attention import SignalAttentionService, extract_decision_fields
 
 from kalshi_bot.services.momentum_calibration import get_active_momentum_calibration_async
 from kalshi_bot.services.signal import (
@@ -825,6 +830,168 @@ class WorkflowSupervisor:
             return None
         return latest_trace.id
 
+    def _attention_row_for_signal(
+        self,
+        *,
+        room: Room,
+        signal: StrategySignal,
+        market_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        numeric_facts: dict[str, Any] = {}
+        if signal.weather is not None:
+            numeric_facts.update(
+                {
+                    "forecast_high_f": signal.weather.forecast_high_f,
+                    "forecast_delta_f": signal.weather.forecast_delta_f,
+                    "current_temp_f": signal.weather.current_temp_f,
+                    "observed_high_so_far_f": signal.weather.observed_high_so_far_f,
+                    "source_disagreement_f": signal.weather.source_disagreement_f,
+                    "prediction_provenance": dict(signal.prediction_provenance or {}),
+                }
+            )
+        payload = {
+            "candidate_trace": dict(signal.candidate_trace or {}),
+            "eligibility": signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None,
+            "empirical_gate": (
+                signal.eligibility.empirical_gate
+                if signal.eligibility is not None
+                else (signal.candidate_trace or {}).get("empirical_gate")
+            ),
+            "fair_yes_dollars": str(signal.fair_yes_dollars),
+            "confidence": signal.confidence,
+            "recommended_side": signal.recommended_side.value if signal.recommended_side is not None else None,
+            "target_yes_price_dollars": (
+                str(signal.target_yes_price_dollars) if signal.target_yes_price_dollars is not None else None
+            ),
+            "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason is not None else None,
+            "prediction_provenance": dict(signal.prediction_provenance or {}),
+            "trader_context": {"numeric_facts": numeric_facts},
+            "market_snapshot": market_snapshot or {},
+            "model_quality_reasons": list(signal.model_quality_reasons or []),
+            "recommended_size_cap_fp": (
+                str(signal.recommended_size_cap_fp) if signal.recommended_size_cap_fp is not None else None
+            ),
+        }
+        return extract_decision_fields(
+            payload,
+            settings=self.settings,
+            room_id=room.id,
+            market_ticker=room.market_ticker,
+            updated_at=datetime.now(UTC),
+            row_fair_yes=signal.fair_yes_dollars,
+            row_edge_bps=signal.edge_bps,
+            row_confidence=signal.confidence,
+        )
+
+    async def _apply_static_signal_guard(
+        self,
+        *,
+        session: Any,
+        room: Room,
+        signal: StrategySignal,
+        market_snapshot: dict[str, Any],
+    ) -> StrategySignal:
+        if (
+            not bool(getattr(self.settings, "static_signal_guard_live_enabled", False))
+            or signal.eligibility is None
+            or not signal.eligibility.eligible
+        ):
+            return signal
+        service = SignalAttentionService(self.settings)
+        rows = await service.load_rows(
+            session,
+            kalshi_env=room.kalshi_env,
+            lookback_hours=self.settings.signals_attention_lookback_hours,
+            market_ticker=room.market_ticker,
+        )
+        rows.append(self._attention_row_for_signal(room=room, signal=signal, market_snapshot=market_snapshot))
+        guard = service.static_signal_guard(rows)
+        if guard is None:
+            return signal
+        candidate_trace = {
+            **dict(signal.eligibility.candidate_trace or signal.candidate_trace or {}),
+            "eligibility_stand_down_reason": StandDownReason.STATIC_SIGNAL_STALE.value,
+            "trading_improvement": {
+                **dict((signal.candidate_trace or {}).get("trading_improvement") or {}),
+                "static_signal_guard": guard,
+            },
+        }
+        reasons = list(signal.eligibility.reasons or [])
+        reasons.append("Static signal guard blocked live entry because recent evaluations repeated unchanged fair value or edge.")
+        signal.eligibility = signal.eligibility.model_copy(
+            update={
+                "eligible": False,
+                "stand_down_reason": StandDownReason.STATIC_SIGNAL_STALE,
+                "evaluation_outcome": "pre_risk_filtered",
+                "candidate_trace": candidate_trace,
+                "reasons": reasons,
+                "blocked_upstream": True,
+            }
+        )
+        signal.stand_down_reason = StandDownReason.STATIC_SIGNAL_STALE
+        signal.evaluation_outcome = "pre_risk_filtered"
+        signal.candidate_trace = candidate_trace
+        return signal
+
+    async def _maybe_apply_empirical_bootstrap(
+        self,
+        *,
+        session: Any,
+        room: Room,
+        signal: StrategySignal,
+    ) -> StrategySignal:
+        if (
+            signal.eligibility is None
+            or signal.eligibility.stand_down_reason != StandDownReason.EMPIRICAL_GATE_BLOCK
+        ):
+            return signal
+        empirical = signal.eligibility.empirical_gate or (signal.candidate_trace or {}).get("empirical_gate") or {}
+        if not isinstance(empirical, dict) or empirical.get("reason") != "empirical_gate_under_sampled":
+            return signal
+        service = SignalAttentionService(self.settings)
+        rows = await service.load_rows(
+            session,
+            kalshi_env=room.kalshi_env,
+            lookback_hours=self.settings.signals_attention_lookback_hours,
+            market_ticker=room.market_ticker,
+        )
+        rows.append(self._attention_row_for_signal(room=room, signal=signal))
+        override = service.empirical_bootstrap_override(rows)
+        policy_service = DecisionPolicyVariantService(self.settings)
+        decision = policy_service.empirical_bootstrap_decision(override)
+        if decision is None:
+            return signal
+        candidate_trace = dict(signal.eligibility.candidate_trace or signal.candidate_trace or {})
+        candidate_trace = policy_service.merge_trace(
+            candidate_trace,
+            decisions={EMPIRICAL_BOOTSTRAP: decision.to_trace()},
+            applied_variant=EMPIRICAL_BOOTSTRAP if decision.live_enabled else None,
+            baseline_block_reason=StandDownReason.EMPIRICAL_GATE_BLOCK.value,
+        )
+        if not decision.live_enabled:
+            signal.eligibility = signal.eligibility.model_copy(update={"candidate_trace": candidate_trace})
+            signal.candidate_trace = candidate_trace
+            return signal
+        candidate_trace["policy_variants"][EMPIRICAL_BOOTSTRAP]["applied"] = True
+        candidate_trace["eligibility_stand_down_reason"] = None
+        candidate_trace["eligibility_outcome"] = "candidate_selected"
+        signal.eligibility = signal.eligibility.model_copy(
+            update={
+                "eligible": True,
+                "stand_down_reason": None,
+                "evaluation_outcome": "candidate_selected",
+                "candidate_trace": candidate_trace,
+                "reasons": [
+                    "Policy variant empirical_bootstrap bypassed empirical gate under-sampling."
+                ],
+                "blocked_upstream": False,
+            }
+        )
+        signal.stand_down_reason = None
+        signal.evaluation_outcome = "candidate_selected"
+        signal.candidate_trace = candidate_trace
+        return signal
+
     async def _run_deterministic_fast_path(
         self,
         *,
@@ -1340,8 +1507,15 @@ class WorkflowSupervisor:
         signal.stand_down_reason = signal.eligibility.stand_down_reason
         signal.evaluation_outcome = signal.eligibility.evaluation_outcome
         signal.candidate_trace = signal.eligibility.candidate_trace or signal.candidate_trace
-        if decision.blocks_live_entries:
+        signal = await self._maybe_apply_empirical_bootstrap(
+            session=session,
+            room=room,
+            signal=signal,
+        )
+        if decision.blocks_live_entries and signal.eligibility is not None and not signal.eligibility.eligible:
             signal.summary = f"{signal.summary} Stand down: empirical trade behavior gate blocked live entry ({decision.reason})."
+        elif decision.blocks_live_entries:
+            signal.summary = f"{signal.summary} Trading improvement: empirical bootstrap allowed an under-sampled high-edge entry to proceed to risk checks."
         return signal
 
     async def run_room(self, room_id: str, reason: str = "manual") -> None:
@@ -1586,6 +1760,12 @@ class WorkflowSupervisor:
                 signal.stand_down_reason = signal.eligibility.stand_down_reason
                 signal.evaluation_outcome = signal.eligibility.evaluation_outcome
                 signal.candidate_trace = signal.eligibility.candidate_trace or signal.candidate_trace
+                signal = await self._apply_static_signal_guard(
+                    session=session,
+                    room=room,
+                    signal=signal,
+                    market_snapshot=market_response,
+                )
                 if signal.eligibility.reasons and not signal.eligibility.eligible:
                     signal.summary = f"{signal.summary} Stand down: {' '.join(signal.eligibility.reasons)}"
                 # Market structure gates mutate the signal in-place. Run them before
@@ -1647,6 +1827,14 @@ class WorkflowSupervisor:
                             "current_temp_f": signal.weather.current_temp_f,
                             "observed_high_so_far_f": signal.weather.observed_high_so_far_f,
                             "threshold_f": getattr(mapping, "threshold_f", None) if mapping is not None else None,
+                            "operator": getattr(mapping, "operator", None) if mapping is not None else None,
+                            "contract_direction": (
+                                "below"
+                                if mapping is not None and getattr(mapping, "operator", None) in {"<", "<="}
+                                else "above"
+                                if mapping is not None and getattr(mapping, "operator", None) in {">", ">="}
+                                else None
+                            ),
                             "source_disagreement_f": signal.weather.source_disagreement_f,
                             "sigma_f": signal.weather.sigma_f,
                             "sigma_layer": signal.weather.sigma_layer,
