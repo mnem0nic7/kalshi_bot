@@ -520,6 +520,10 @@ class DaemonService:
             autonomous_gate_tuning = await self._maybe_run_autonomous_gate_tuning()
             if autonomous_gate_tuning is not None:
                 payload["autonomous_gate_tuning"] = autonomous_gate_tuning
+            if self.autonomous_gate_tuning_service is not None:
+                await self.autonomous_gate_tuning_service.maybe_emit_drift_alert(
+                    kalshi_env=self.settings.kalshi_env,
+                )
         rollout_result = await self.self_improve_service.monitor_rollouts()
         if rollout_result.status == "canary_running":
             canary = rollout_result.payload

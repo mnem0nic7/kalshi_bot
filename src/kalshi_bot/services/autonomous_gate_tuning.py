@@ -122,6 +122,58 @@ class AutonomousGateTuningService:
                 payload["last_promotion"] = payload["crypto"]["last_promotion"]
         return payload
 
+    async def maybe_emit_drift_alert(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        no_promotion_threshold_days: int = 14,
+        alert_cooldown_hours: int = 24,
+    ) -> dict[str, Any] | None:
+        """Emit a warning ops_event when active thresholds drift from settings
+        defaults and the autonomous tuner has not made a promotion recently.
+
+        Debounced via a checkpoint so at most one alert fires per ``alert_cooldown_hours``."""
+        env = kalshi_env or self.settings.kalshi_env
+        alert_checkpoint_name = f"autonomous_gate_drift_alert:{env}"
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=env)
+            await self.agent_pack_service.ensure_initialized(repo)
+            control = await repo.get_deployment_control()
+            active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+            active_thresholds = _threshold_values(self.agent_pack_service.runtime_thresholds(active_pack))
+            settings_thresholds = _settings_threshold_values(self.settings)
+            drift = _threshold_drift(active_thresholds, settings_thresholds)
+            if not drift:
+                return None
+            gate_checkpoint = await repo.get_checkpoint(_checkpoint_name(env))
+            checkpoint_payload = gate_checkpoint.payload if gate_checkpoint is not None else {}
+            last_promotion = _promotion_summary(checkpoint_payload)
+            now = datetime.now(UTC)
+            promoted_at = _as_utc((last_promotion or {}).get("promoted_at"))
+            if promoted_at is not None and now - promoted_at < timedelta(days=no_promotion_threshold_days):
+                return None
+            alert_checkpoint = await repo.get_checkpoint(alert_checkpoint_name)
+            alert_payload = alert_checkpoint.payload if alert_checkpoint is not None else {}
+            last_alerted = _as_utc((alert_payload or {}).get("alerted_at"))
+            if last_alerted is not None and now - last_alerted < timedelta(hours=alert_cooldown_hours):
+                return None
+            await repo.log_ops_event(
+                severity="warning",
+                summary=(
+                    f"Gate threshold drift: {len(drift)} tunable field(s) diverge from"
+                    " settings defaults with no recent autonomous promotion"
+                ),
+                source=OPS_SOURCE,
+                payload={"drift": drift, "last_promotion": last_promotion, "fields": list(drift.keys())},
+            )
+            await repo.set_checkpoint(
+                alert_checkpoint_name,
+                None,
+                {"alerted_at": now.isoformat(), "drift_fields": list(drift.keys())},
+            )
+            await session.commit()
+        return {"alerted": True, "drift_fields": list(drift.keys())}
+
     async def run(
         self,
         *,
