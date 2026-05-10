@@ -213,6 +213,25 @@
   gap: 0.2rem;
 }
 
+.dash-card-header-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.room-decisions-export {
+  padding: 0.48rem 0.78rem;
+  font-size: 0.82rem;
+  line-height: 1.1;
+}
+
+.room-decisions-export:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
 .bucket-usage-line {
   display: inline-flex;
   flex-wrap: wrap;

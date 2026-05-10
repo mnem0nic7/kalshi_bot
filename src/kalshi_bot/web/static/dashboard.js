@@ -88,6 +88,103 @@
     return `Selected ${selected}`;
   }
 
+  const ROOM_DECISION_EXPORT_COLUMNS = [
+    ["room_id", "Room ID"],
+    ["market_ticker", "Market"],
+    ["room_origin", "Origin"],
+    ["stage", "Stage"],
+    ["status", "Status"],
+    ["status_label", "Decision"],
+    ["selected_side", "Side"],
+    ["selected_edge_display", "Edge"],
+    ["quality_adjusted_edge_display", "Quality Adjusted Edge"],
+    ["fair_yes_display", "Fair YES"],
+    ["confidence_display", "Confidence"],
+    ["weather_display", "Weather"],
+    ["reason", "Reason"],
+    ["description", "Description"],
+    ["summary", "Summary"],
+    ["updated_at", "Updated"],
+    ["url", "URL"],
+  ];
+
+  function exportValue(value) {
+    if (value === null || value === undefined) return "";
+    if (Array.isArray(value)) return value.join("; ");
+    if (typeof value === "object") return JSON.stringify(value);
+    return String(value);
+  }
+
+  function csvCell(value) {
+    const text = exportValue(value);
+    if (/[",\r\n]/.test(text)) {
+      return `"${text.replaceAll('"', '""')}"`;
+    }
+    return text;
+  }
+
+  function rowsToCsv(columns, rows) {
+    const header = columns.map(([, label]) => csvCell(label)).join(",");
+    const body = rows.map((row) => columns.map(([key]) => csvCell(row[key])).join(","));
+    return [header].concat(body).join("\r\n").concat("\r\n");
+  }
+
+  function downloadTextFile(filename, contents, type) {
+    const blob = new Blob([contents], { type });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.hidden = true;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
+  function timestampForFilename() {
+    return new Date().toISOString().replace(/[:.]/g, "-");
+  }
+
+  async function exportRecentRoomDecisions(trigger) {
+    const panel = trigger.closest(".dash-panel");
+    const env = trigger.dataset.env || (panel && panel.dataset.env) || currentDashboardEnv();
+    const originalText = trigger.textContent;
+    trigger.disabled = true;
+    trigger.textContent = "Exporting...";
+    try {
+      const resp = await fetch(`/api/dashboard/${encodeURIComponent(env)}`);
+      if (!resp.ok) {
+        throw new Error(`Export failed (${resp.status})`);
+      }
+      const payload = await resp.json();
+      const decisions = Array.isArray(payload.recent_room_decisions) ? payload.recent_room_decisions : [];
+      if (!decisions.length) {
+        window.alert("No recent room decisions to export.");
+        return;
+      }
+      const csv = rowsToCsv(ROOM_DECISION_EXPORT_COLUMNS, decisions);
+      downloadTextFile(
+        `recent-room-decisions-${env}-${timestampForFilename()}.csv`,
+        csv,
+        "text/csv;charset=utf-8",
+      );
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Export failed.");
+    } finally {
+      trigger.textContent = originalText;
+      trigger.disabled = false;
+    }
+  }
+
+  function initRoomDecisionExports() {
+    document.querySelectorAll('[data-action="export-room-decisions"]').forEach((button) => {
+      button.addEventListener("click", () => {
+        exportRecentRoomDecisions(button);
+      });
+    });
+  }
+
   function parseBootstrap() {
     const node = document.getElementById("strategies-bootstrap");
     if (!node) return null;
@@ -641,6 +738,8 @@
     if (!card) return;
     const countLabel = card.querySelector(".room-decisions-count-label");
     if (countLabel) countLabel.textContent = `${decisions.length} room${decisions.length !== 1 ? "s" : ""}`;
+    const exportButton = card.querySelector('[data-action="export-room-decisions"]');
+    if (exportButton) exportButton.disabled = !decisions.length;
 
     const empty = card.querySelector("p.empty-state");
     if (!decisions.length) {
@@ -3184,6 +3283,7 @@
 
   initStrategySort();
   initStrategySearch();
+  initRoomDecisionExports();
   if (strategyState.payload) renderStrategies(strategyState.payload);
   refreshTimestamps();
   setLastRefreshed();

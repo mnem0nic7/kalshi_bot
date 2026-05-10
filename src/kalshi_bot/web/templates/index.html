@@ -277,7 +277,17 @@
           <h2>Recent Room Decisions</h2>
           <span class="muted-label">Latest room outcomes, including no-trade stand-downs</span>
         </div>
-        <span class="muted-label room-decisions-count-label">{{ recent_room_decisions | length }} room{{ "s" if recent_room_decisions | length != 1 }}</span>
+        <div class="dash-card-header-actions">
+          <span class="muted-label room-decisions-count-label">{{ recent_room_decisions | length }} room{{ "s" if recent_room_decisions | length != 1 }}</span>
+          <button
+            type="button"
+            class="secondary-button room-decisions-export"
+            data-action="export-room-decisions"
+            data-env="{{ env_key }}"
+            data-testid="export-room-decisions"
+            {% if not recent_room_decisions %}disabled{% endif %}
+          >Export CSV</button>
+        </div>
       </div>
       {% if recent_room_decisions %}
       <div class="table-wrap room-decisions-wrap">

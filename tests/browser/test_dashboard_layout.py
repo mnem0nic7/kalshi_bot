@@ -1083,7 +1083,7 @@ def test_recent_room_decisions_render_above_trading_activity(
     with _serve_dashboard(monkeypatch, tmp_path, payloads=payloads) as base_url:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            page = browser.new_page(viewport={"width": 1280, "height": 900}, accept_downloads=True)
             try:
                 page.goto(base_url, wait_until="load", timeout=15_000)
                 page.wait_for_selector('#panel-demo [data-testid="recent-room-decisions"]', timeout=15_000)
@@ -1106,6 +1106,17 @@ def test_recent_room_decisions_render_above_trading_activity(
                 assert "Existing live position blocks same-ticker add-ons." in decisions_text
                 timestamp = decisions.locator('[data-timestamp="2026-05-09T18:30:00+00:00"]').first
                 assert timestamp.count() == 1
+                export_button = decisions.locator('[data-testid="export-room-decisions"]')
+                assert export_button.is_enabled(timeout=15_000)
+                with page.expect_download(timeout=15_000) as download_info:
+                    export_button.click(timeout=15_000)
+                download = download_info.value
+                assert download.suggested_filename.startswith("recent-room-decisions-demo-")
+                assert download.suggested_filename.endswith(".csv")
+                export_text = Path(download.path()).read_text(encoding="utf-8")
+                assert "Room ID,Market,Origin,Stage,Status,Decision" in export_text
+                assert "room-sea,KXHIGHSEA-26MAY09-T67,live,complete,no_trade,No trade" in export_text
+                assert "Forecast high is 65.4F against a 67F threshold" in export_text
             finally:
                 browser.close()
 
