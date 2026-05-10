@@ -382,6 +382,32 @@ async def test_gate_learning_smoke_reads_existing_training_files() -> None:
 
 
 @pytest.mark.asyncio
+async def test_current_training_files_do_not_promote_full_policy_gate_changes() -> None:
+    report = await GateLearningService(_settings()).build_recommendation_report(
+        source="combined",
+        min_support=30,
+        now=datetime(2026, 5, 10, tzinfo=UTC),
+        days=3650,
+        episode_level=True,
+    )
+
+    changed_settings = {
+        field: details
+        for field, details in report["recommended_settings"].items()
+        if details["changed"]
+    }
+    promoted_evidence = [
+        row for row in report["gate_evidence"]
+        if row["promotion_status"] == "promoted"
+    ]
+
+    assert report["row_counts"]["labeled_rows"] == 266
+    assert report["row_counts"]["episodes"] == 191
+    assert changed_settings == {}
+    assert promoted_evidence == []
+
+
+@pytest.mark.asyncio
 async def test_source_specific_report_does_not_load_decision_trace_context(tmp_path) -> None:
     path = tmp_path / "historical.jsonl"
     _write_jsonl(path, [_bundle(1, pnl="4.0000", current_gate_passed=True)])

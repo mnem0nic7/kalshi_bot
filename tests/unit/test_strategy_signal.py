@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 from kalshi_bot.config import Settings
@@ -16,6 +19,13 @@ from kalshi_bot.services.signal import (
     evaluate_trade_eligibility,
 )
 from kalshi_bot.weather.scoring import WeatherSignalSnapshot
+
+
+TRAINING_CANDIDATE_SELECTION_PATHS = (
+    Path("data/training/historical_decision_eval_latest.jsonl"),
+    Path("data/training/forward_shadow_uncurated_bundles.jsonl"),
+    Path("data/training/forward_shadow_bundles.jsonl"),
+)
 
 
 def _signal(*, resolution_state: WeatherResolutionState = WeatherResolutionState.UNRESOLVED) -> StrategySignal:
@@ -72,6 +82,118 @@ def _thresholds() -> SimpleNamespace:
     )
 
 
+def _nested_dict_value(payload: dict, *path: str):
+    current = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _decimal_or_none(value) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _training_signal(row: dict) -> dict:
+    signal = row.get("signal")
+    return signal if isinstance(signal, dict) else {}
+
+
+def _training_signal_payload(row: dict) -> dict:
+    payload = _training_signal(row).get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _training_fair_yes(row: dict) -> Decimal | None:
+    signal = _training_signal(row)
+    payload = _training_signal_payload(row)
+    for value in (
+        signal.get("fair_yes_dollars"),
+        payload.get("fair_yes_dollars"),
+        _nested_dict_value(payload, "trader_context", "fair_yes_dollars"),
+        row.get("fair_yes_dollars"),
+    ):
+        fair = _decimal_or_none(value)
+        if fair is not None:
+            return fair
+    return None
+
+
+def _training_market_snapshot(row: dict) -> dict | None:
+    snapshot = row.get("market_snapshot")
+    if isinstance(snapshot, dict):
+        return snapshot
+    numeric_facts = _nested_dict_value(_training_signal_payload(row), "trader_context", "numeric_facts")
+    if not isinstance(numeric_facts, dict):
+        return None
+    market = {
+        key: numeric_facts.get(key)
+        for key in ("yes_bid_dollars", "yes_ask_dollars", "no_ask_dollars", "last_price_dollars")
+        if key in numeric_facts
+    }
+    return {"market": market} if market else None
+
+
+def _training_market_ticker(row: dict) -> str:
+    return str(
+        row.get("market_ticker")
+        or _nested_dict_value(row, "room", "market_ticker")
+        or _training_signal(row).get("market_ticker")
+        or ""
+    )
+
+
+def _current_weather_candidate_selection_rows() -> list[dict]:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        decision_policy_variants_shadow_enabled=False,
+        low_price_high_edge_live_enabled=False,
+        remaining_payout_relaxation_live_enabled=False,
+        intraday_separation_override_live_enabled=False,
+        empirical_bootstrap_live_enabled=False,
+    )
+    rows: list[dict] = []
+    for path in TRAINING_CANDIDATE_SELECTION_PATHS:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            ticker = _training_market_ticker(row)
+            if not ticker.startswith("KXHIGH") or "15M" in ticker:
+                continue
+            fair_yes = _training_fair_yes(row)
+            market_snapshot = _training_market_snapshot(row)
+            if fair_yes is None or market_snapshot is None:
+                continue
+            _action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
+                fair_yes_dollars=fair_yes,
+                market_snapshot=market_snapshot,
+                min_edge_bps=500,
+                settings=settings,
+                quality_buffer_bps=25,
+                minimum_remaining_payout_bps=2000,
+                min_contract_price_dollars=Decimal("0.25"),
+                spread_limit_bps=250,
+            )
+            rows.append(
+                {
+                    "source_path": str(path),
+                    "ticker": ticker,
+                    "side": side.value if side is not None else None,
+                    "target_yes": str(target_yes) if target_yes is not None else None,
+                    "edge_bps": edge_bps,
+                    "trace": trace,
+                }
+            )
+    return rows
+
+
 def test_trade_recommendation_selects_no_when_yes_is_below_price_floor() -> None:
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_contract_price_dollars=0.25)
 
@@ -106,6 +228,58 @@ def test_trade_recommendation_ranks_best_eligible_side() -> None:
     assert edge_bps == 1500
     assert trace["yes"]["status"] == "eligible"
     assert trace["no"]["reason"] == "selected_best_quality_adjusted_edge"
+
+
+def test_current_training_files_trade_candidate_selection_golden() -> None:
+    rows = _current_weather_candidate_selection_rows()
+    selected = [row for row in rows if row["trace"]["outcome"] == "candidate_selected"]
+
+    assert len(rows) == 552
+    assert Counter(row["trace"]["outcome"] for row in rows) == {
+        "no_candidate": 388,
+        "pre_risk_filtered": 146,
+        "candidate_selected": 18,
+    }
+    assert Counter(row["side"] for row in selected) == {"yes": 11, "no": 7}
+    assert Counter(row["ticker"] for row in selected) == {
+        "KXHIGHNY-25DEC27-T36": 2,
+        "KXHIGHNY-26FEB21-T43": 3,
+        "KXHIGHLAX-26MAR05-T75": 1,
+        "KXHIGHAUS-26MAR09-T79": 1,
+        "KXHIGHDEN-26MAR14-T71": 1,
+        "KXHIGHNY-26MAR15-T47": 1,
+        "KXHIGHTBOS-26MAR16-T59": 1,
+        "KXHIGHCHI-26MAR16-T36": 2,
+        "KXHIGHNY-26MAR16-T57": 1,
+        "KXHIGHNY-26APR22-T57": 5,
+    }
+    assert Counter(
+        row["trace"].get("baseline_block_reason")
+        for row in rows
+        if row["trace"]["outcome"] != "candidate_selected"
+    ) == {
+        "below_min_edge": 388,
+        "spread_too_wide": 81,
+        "below_min_contract_price": 64,
+        "insufficient_remaining_payout": 1,
+    }
+
+    for row in selected:
+        trace = row["trace"]
+        side = row["side"]
+        side_trace = trace[side]
+        assert trace["policy_variant_applied"] is None
+        assert trace["min_contract_price_dollars"] == "0.2500"
+        assert trace["min_edge_bps"] == 500
+        assert trace["quality_buffer_bps"] == 25
+        assert trace["spread_limit_bps"] == 250
+        assert row["target_yes"] is not None
+        assert side_trace["status"] == "selected"
+        assert side_trace["reason"] == "selected_best_quality_adjusted_edge"
+        assert Decimal(side_trace["traded_price_dollars"]) >= Decimal("0.25")
+        assert int(side_trace["quality_adjusted_edge_bps"]) >= 500
+        if side_trace["spread_bps"] is not None:
+            assert int(side_trace["spread_bps"]) <= 250
 
 
 def test_trade_recommendation_filters_both_sides_below_price_floor() -> None:
