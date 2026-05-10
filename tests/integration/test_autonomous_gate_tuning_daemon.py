@@ -115,3 +115,51 @@ async def test_inactive_color_reconcile_skips_autonomous_gate_tuning(tmp_path) -
     assert autonomous.calls == 0
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_triggers_autonomous_gate_tuning_periodically(tmp_path) -> None:
+    """_maybe_run_autonomous_gate_tuning fires on first call and is debounced on second."""
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-heartbeat-gate.db",
+        app_color="blue",
+        autonomous_gate_tuning_enabled=True,
+        autonomous_gate_tuning_periodic_interval_seconds=3600,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    # Set active color = app_color so the interval check runs.
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.set_active_color("blue")
+        await session.commit()
+
+    autonomous = FakeAutonomousGateTuningService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        weather_directory=None,
+        discovery_service=None,
+        stream_service=None,
+        reconciliation_service=None,
+        research_coordinator=None,
+        auto_trigger_service=None,
+        shadow_training_service=None,
+        shadow_campaign_service=None,
+        self_improve_service=None,
+        autonomous_gate_tuning_service=autonomous,
+    )
+
+    # First call: no prior checkpoint — should fire.
+    result = await daemon._maybe_run_autonomous_gate_tuning()
+    assert result == {"status": "staged", "triggered_by": "active_periodic"}
+    assert autonomous.calls == 1
+
+    # Second call: checkpoint was just written; interval not elapsed — should debounce.
+    result2 = await daemon._maybe_run_autonomous_gate_tuning()
+    assert result2 is None
+    assert autonomous.calls == 1  # no additional call
+
+    await engine.dispose()
