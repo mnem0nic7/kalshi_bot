@@ -106,6 +106,9 @@ x-production-key-volumes: &production-key-volumes
 x-codex-volumes: &codex-volumes
   - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
 
+x-training-data-volumes: &training-data-volumes
+  - training_data:/app/data/training
+
 x-app-common: &app-common
   <<: [*build, *cpu-limits]
   env_file: [../.env]
@@ -124,6 +127,7 @@ x-demo-app-base: &demo-app-base
   volumes:
     - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
+    - training_data:/app/data/training
   depends_on:
     postgres_demo:
       condition: service_healthy
@@ -135,6 +139,7 @@ x-production-app-base: &production-app-base
   volumes:
     - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
     - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
+    - training_data:/app/data/training
   depends_on:
     postgres_production:
       condition: service_healthy
@@ -153,6 +158,7 @@ x-demo-daemon-base: &demo-daemon-base
   volumes:
     - ${DEMO_KALSHI_KEY_PATH_HOST:-../Kalshi-2-Demo.txt}:${DEMO_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-demo.pem}:ro
     - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
+    - training_data:/app/data/training
   depends_on:
     postgres_demo:
       condition: service_healthy
@@ -164,6 +170,7 @@ x-production-daemon-base: &production-daemon-base
   volumes:
     - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
     - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
+    - training_data:/app/data/training
   depends_on:
     postgres_production:
       condition: service_healthy
@@ -373,3 +380,4 @@ volumes:
   postgres_production_data:
   caddy_data:
   caddy_config:
+  training_data:

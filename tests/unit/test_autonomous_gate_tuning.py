@@ -333,3 +333,136 @@ async def test_autonomous_crypto_gate_tuning_stages_per_asset_policy(tmp_path, m
     assert checkpoint.payload["changes"]["BTC"]["live_mode"] == "live"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_gate_tuning_dedup_skips_same_evidence(tmp_path) -> None:
+    settings, engine, session_factory, _agent_pack_service, service = await _service(tmp_path)
+    now = datetime(2026, 5, 10, tzinfo=UTC)
+
+    first = await service.run(now=now)
+    assert first["status"] == "staged"
+
+    # Reset checkpoint state to "rejected" so the next run attempts recommendation again.
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        checkpoint = await repo.get_checkpoint(f"autonomous_gate_tuning:{settings.kalshi_env}")
+        payload = dict(checkpoint.payload)
+        payload["status"] = "rejected"
+        await repo.set_checkpoint(f"autonomous_gate_tuning:{settings.kalshi_env}", None, payload)
+        await session.commit()
+
+    second = await service.run(now=now + timedelta(hours=1))
+
+    assert second["status"] == "duplicate_evidence"
+    assert second["evidence_fingerprint"] == first["evidence_fingerprint"]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_gate_tuning_canary_rejects_on_pnl_regression(tmp_path) -> None:
+    settings, engine, session_factory, agent_pack_service, service = await _service(tmp_path)
+    staged_at = datetime(2026, 5, 10, tzinfo=UTC)
+    staged = await service.run(now=staged_at)
+    assert staged["status"] == "staged"
+
+    # Seed a corpus row that passes all gates EXCEPT the current pack's entry-price floor.
+    # Current: risk_min_contract_price_dollars=0.25 → skips this row (price 0.10 < 0.25).
+    # Candidate: risk_min_contract_price_dollars=0.05 → selects this row (0.10 ≥ 0.05).
+    # The trade settles as a loss → candidate.net_pnl < current.net_pnl → canary rejects.
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        build = await repo.create_decision_corpus_build(
+            version="regression-corpus",
+            date_from=staged_at.date(),
+            date_to=staged_at.date(),
+            source={"kind": "unit"},
+            filters={},
+        )
+        await repo.add_decision_corpus_row(
+            corpus_build_id=build.id,
+            room_id="room-regress",
+            market_ticker="KXHIGHNY-26MAY10-T70",
+            series_ticker="KXHIGHNY",
+            local_market_day="2026-05-10",
+            checkpoint_ts=staged_at + timedelta(hours=1),
+            kalshi_env=settings.kalshi_env,
+            deployment_color=settings.app_color,
+            model_version="unit",
+            policy_version="unit",
+            fair_yes_dollars=Decimal("0.10"),
+            confidence=0.90,
+            edge_bps=600,
+            recommended_side="yes",
+            target_yes_price_dollars=Decimal("0.10"),
+            eligibility_status="eligible",
+            support_status="supported",
+            support_level="L5_global",
+            support_n=40,
+            support_market_days=40,
+            settlement_result="no",
+            settlement_value_dollars=Decimal("0.0000"),
+            pnl_counterfactual_target_frictionless=Decimal("-0.1000"),
+            pnl_counterfactual_target_with_fees=Decimal("-0.1000"),
+            source_provenance="historical_replay_full_checkpoint",
+            signal_payload={
+                "forecast_delta_f": 9.0,
+                "confidence": 0.90,
+                "candidate_trace": {
+                    "selected_side": "yes",
+                    "selected_candidate": {
+                        "side": "yes",
+                        "target_yes_price_dollars": "0.10",
+                        "quality_adjusted_edge_bps": 600,
+                        "edge_bps": 600,
+                        "remaining_payout_dollars": "0.90",
+                        "spread_bps": 100,
+                    },
+                },
+            },
+            quote_snapshot={"yes_bid_dollars": "0.09", "yes_ask_dollars": "0.10"},
+            diagnostics={"forecast_delta_f": 9.0},
+            created_at=staged_at + timedelta(hours=1),
+        )
+        await repo.mark_decision_corpus_build_successful(build.id, row_count=1)
+        await repo.promote_decision_corpus_build(build.id, kalshi_env=settings.kalshi_env, actor="unit")
+        await session.commit()
+
+    result = await service.run(now=staged_at + timedelta(hours=2))
+
+    assert result["status"] == "rejected"
+    assert result["canary"]["candidate_net_pnl"] < result["canary"]["current_net_pnl"]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_gate_tuning_no_candidate_when_no_changes(tmp_path) -> None:
+    class NoChangeFakeLearning(FakeGateLearningService):
+        async def build_recommendation_report(self, **_kwargs: Any) -> dict[str, Any]:
+            base = _recommendation(self.settings)
+            for field_data in base["recommended_settings"].values():
+                field_data["changed"] = False
+                field_data["reason"] = "holdout_net_pnl_not_improved"
+            return base
+
+    settings, engine, session_factory, agent_pack_service, _service_unused = await _service(tmp_path)
+    no_change_service = AutonomousGateTuningService(
+        settings=settings,
+        session_factory=session_factory,
+        agent_pack_service=agent_pack_service,
+        decision_corpus_service=None,
+        trade_analysis_service=None,
+        trading_audit_service=None,
+        backtesting_builder=_passing_backtesting,
+        modeling_builder=_passing_modeling,
+        gate_learning_service_factory=NoChangeFakeLearning,
+    )
+
+    result = await no_change_service.run(now=datetime(2026, 5, 10, tzinfo=UTC))
+
+    assert result["status"] == "no_candidate"
+    assert result["reason"] == "no_gate_changes_promoted"
+
+    await engine.dispose()

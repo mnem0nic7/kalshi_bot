@@ -73,6 +73,35 @@ def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
 
 
+def _apply_city_strategy_override(
+    thresholds: RuntimeThresholds,
+    strategy_thresholds: dict[str, Any],
+) -> RuntimeThresholds:
+    """Apply a city-strategy record's operational fields over the champion pack thresholds.
+
+    Tunable gate fields (owned exclusively by AutonomousGateTuningService) are always
+    taken from ``thresholds`` regardless of what the strategy record contains, ensuring
+    city-strategy assignments cannot silently override values the autonomous tuner promotes.
+    Strategy records may legitimately override sizing, cooldown, and quality-buffer fields.
+    """
+    d = strategy_thresholds
+    return RuntimeThresholds(
+        risk_min_edge_bps=thresholds.risk_min_edge_bps,
+        risk_max_order_notional_dollars=float(d["risk_max_order_notional_dollars"]),
+        risk_max_position_notional_dollars=float(d["risk_max_position_notional_dollars"]),
+        trigger_max_spread_bps=thresholds.trigger_max_spread_bps,
+        trigger_cooldown_seconds=int(d["trigger_cooldown_seconds"]),
+        strategy_quality_edge_buffer_bps=int(d["strategy_quality_edge_buffer_bps"]),
+        strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
+        risk_safe_capital_reserve_ratio=float(d["risk_safe_capital_reserve_ratio"]),
+        risk_risky_capital_max_ratio=float(d["risk_risky_capital_max_ratio"]),
+        risk_max_credible_edge_bps=thresholds.risk_max_credible_edge_bps,
+        risk_min_confidence=thresholds.risk_min_confidence,
+        risk_min_contract_price_dollars=thresholds.risk_min_contract_price_dollars,
+        strategy_min_abs_delta_f=thresholds.strategy_min_abs_delta_f,
+    )
+
+
 def _payload_with_trade_behavior_context(payload: Any, context: dict[str, Any]) -> dict[str, Any]:
     base = dict(payload) if isinstance(payload, dict) else {}
     base["trade_behavior_context"] = context
@@ -1631,22 +1660,7 @@ class WorkflowSupervisor:
                     if city_assignment is not None:
                         strategy_record = await repo.get_strategy_by_name(city_assignment.strategy_name)
                         if strategy_record is not None:
-                            d = strategy_record.thresholds
-                            thresholds = RuntimeThresholds(
-                                risk_min_edge_bps=int(d["risk_min_edge_bps"]),
-                                risk_max_order_notional_dollars=float(d["risk_max_order_notional_dollars"]),
-                                risk_max_position_notional_dollars=float(d["risk_max_position_notional_dollars"]),
-                                trigger_max_spread_bps=int(d["trigger_max_spread_bps"]),
-                                trigger_cooldown_seconds=int(d["trigger_cooldown_seconds"]),
-                                strategy_quality_edge_buffer_bps=int(d["strategy_quality_edge_buffer_bps"]),
-                                strategy_min_remaining_payout_bps=int(d["strategy_min_remaining_payout_bps"]),
-                                risk_safe_capital_reserve_ratio=float(d["risk_safe_capital_reserve_ratio"]),
-                                risk_risky_capital_max_ratio=float(d["risk_risky_capital_max_ratio"]),
-                                risk_max_credible_edge_bps=thresholds.risk_max_credible_edge_bps,
-                                risk_min_confidence=thresholds.risk_min_confidence,
-                                risk_min_contract_price_dollars=thresholds.risk_min_contract_price_dollars,
-                                strategy_min_abs_delta_f=thresholds.strategy_min_abs_delta_f,
-                            )
+                            thresholds = _apply_city_strategy_override(thresholds, strategy_record.thresholds)
                             thresholds = thresholds_with_production_freeze_floor(
                                 settings=self.settings,
                                 kalshi_env=room.kalshi_env,
