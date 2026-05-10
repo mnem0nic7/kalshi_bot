@@ -49,6 +49,35 @@ def _recommendation(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _bootstrap_rows(*, pnl: Decimal = Decimal("0.9000"), count: int = 40) -> list[GateLearningRow]:
+    rows: list[GateLearningRow] = []
+    start = datetime(2026, 5, 1, tzinfo=UTC)
+    for idx in range(count):
+        day = start + timedelta(days=idx // 10)
+        rows.append(
+            GateLearningRow(
+                source="historical",
+                room_id=f"bootstrap-room-{idx}",
+                market_ticker=f"KXHIGHNY-26MAY{day.day:02d}-T70-{idx}",
+                decision_time=day + timedelta(minutes=idx),
+                market_day=day.date().isoformat(),
+                settlement_ts=day + timedelta(hours=8),
+                series_ticker="KXHIGHNY",
+                side="yes",
+                entry_price=Decimal("0.1000"),
+                remaining_payout_bps=9000,
+                spread_bps=100,
+                confidence=0.90,
+                edge_bps=2000,
+                quality_adjusted_edge_bps=2000,
+                forecast_delta_f=9.0,
+                current_gate_passed=False,
+                counterfactual_pnl_dollars=pnl,
+            )
+        )
+    return rows
+
+
 class FakeGateLearningService:
     rows: list[GateLearningRow] = []
 
@@ -60,6 +89,9 @@ class FakeGateLearningService:
 
     def load_bundle_rows(self, *, source: str) -> list[GateLearningRow]:
         return list(self.rows)
+
+    def source_files(self, *, source: str) -> dict[str, list[str]]:
+        return {source: ["fixture.jsonl"]}
 
 
 async def _seed_live_canary_row(
@@ -267,6 +299,97 @@ async def test_autonomous_gate_tuning_promotes_after_canary_passes(tmp_path) -> 
     assert active_pack.thresholds.risk_min_contract_price_dollars == 0.05
     assert candidate is not None
     assert candidate.status == "champion"
+
+    FakeGateLearningService.rows = []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_gate_tuning_bootstrap_promotes_from_historical_holdout(tmp_path) -> None:
+    settings, engine, session_factory, agent_pack_service, service = await _service(tmp_path)
+    FakeGateLearningService.rows = _bootstrap_rows()
+    staged_at = datetime(2026, 5, 10, tzinfo=UTC)
+    staged = await service.run(now=staged_at, min_support=10)
+
+    promoted = await service.run(
+        now=staged_at + timedelta(minutes=5),
+        min_support=10,
+        bootstrap_promote_from_historical=True,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        active_pack = await agent_pack_service.get_pack_for_color(repo, settings.app_color)
+        checkpoint = await repo.get_checkpoint(f"autonomous_gate_tuning:{settings.kalshi_env}")
+        await session.commit()
+
+    assert staged["status"] == "staged"
+    assert promoted["status"] == "promoted"
+    assert promoted["promotion_source"] == "historical_bootstrap"
+    assert promoted["canary"]["evidence_source"] == "historical_bootstrap_holdout"
+    assert promoted["canary"]["candidate_selected_rows"] >= 10
+    assert active_pack.version == staged["candidate_version"]
+    assert active_pack.thresholds.risk_min_contract_price_dollars == 0.05
+    assert checkpoint is not None
+    assert checkpoint.payload["status"] == "champion"
+    assert checkpoint.payload["canary"]["promotion_source"] == "historical_bootstrap"
+
+    FakeGateLearningService.rows = []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_gate_tuning_bootstrap_requires_startup_pack(tmp_path) -> None:
+    settings, engine, session_factory, _agent_pack_service, service = await _service(tmp_path)
+    FakeGateLearningService.rows = _bootstrap_rows()
+    staged_at = datetime(2026, 5, 10, tzinfo=UTC)
+    staged = await service.run(now=staged_at, min_support=10)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        checkpoint = await repo.get_checkpoint(f"autonomous_gate_tuning:{settings.kalshi_env}")
+        payload = dict(checkpoint.payload)
+        payload["previous_version"] = "operator-promoted-pack"
+        await repo.set_checkpoint(f"autonomous_gate_tuning:{settings.kalshi_env}", None, payload)
+        await session.commit()
+
+    rejected = await service.run(
+        now=staged_at + timedelta(minutes=5),
+        min_support=10,
+        bootstrap_promote_from_historical=True,
+    )
+
+    assert staged["status"] == "staged"
+    assert rejected["status"] == "historical_bootstrap_rejected"
+    assert rejected["reason"] == "historical_bootstrap_requires_builtin_startup_pack"
+
+    FakeGateLearningService.rows = []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_gate_tuning_bootstrap_keeps_staged_when_holdout_fails(tmp_path) -> None:
+    settings, engine, session_factory, _agent_pack_service, service = await _service(tmp_path)
+    FakeGateLearningService.rows = _bootstrap_rows(pnl=Decimal("-0.1000"))
+    staged_at = datetime(2026, 5, 10, tzinfo=UTC)
+    staged = await service.run(now=staged_at, min_support=10)
+
+    failed = await service.run(
+        now=staged_at + timedelta(minutes=5),
+        min_support=10,
+        bootstrap_promote_from_historical=True,
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        checkpoint = await repo.get_checkpoint(f"autonomous_gate_tuning:{settings.kalshi_env}")
+        await session.commit()
+
+    assert staged["status"] == "staged"
+    assert failed["status"] == "historical_bootstrap_failed"
+    assert "historical_bootstrap_holdout_net_pnl_not_positive" in failed["reason"]
+    assert checkpoint is not None
+    assert checkpoint.payload["status"] == "staged"
 
     FakeGateLearningService.rows = []
     await engine.dispose()

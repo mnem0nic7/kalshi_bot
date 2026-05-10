@@ -341,7 +341,10 @@ kalshi-bot-cli self-improve eval --candidate-version <VERSION> --days 14 --limit
 kalshi-bot-cli self-improve promote --evaluation-run-id <EVALUATION_RUN_ID>
 kalshi-bot-cli autonomous-gates status --kalshi-env production --domain all --format json
 kalshi-bot-cli autonomous-gates run --kalshi-env production --domain all --source combined --days 3650 --dry-run --format json
+kalshi-bot-cli autonomous-gates run --kalshi-env production --domain weather --source combined --days 3650 --bootstrap-promote-from-historical --format json
 ```
+
+Use `--bootstrap-promote-from-historical` only for the one-time weather startup case where a staged candidate is still based on `builtin-deterministic-v1`. It scores the full staged candidate pack on the reserved historical holdout; failing support, P/L, or drawdown leaves the staged candidate untouched.
 
 For Docker blue or green deployments, the helper scripts mirror the same flow:
 

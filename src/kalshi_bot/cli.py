@@ -1306,6 +1306,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     side=args.side,
                     month=args.month,
                     lane=args.lane,
+                    bootstrap_promote_from_historical=args.bootstrap_promote_from_historical,
                 )
             else:
                 raise ValueError(f"unknown autonomous-gates command {args.autonomous_gates_command}")
@@ -2294,6 +2295,11 @@ def build_parser() -> argparse.ArgumentParser:
     autonomous_gate_run.add_argument("--side", choices=["yes", "no"], default=None)
     autonomous_gate_run.add_argument("--month", default=None)
     autonomous_gate_run.add_argument("--lane", default="entry_gate")
+    autonomous_gate_run.add_argument(
+        "--bootstrap-promote-from-historical",
+        action="store_true",
+        help="One-time startup path: promote a staged weather candidate using reserved historical holdout evidence.",
+    )
     autonomous_gate_run.add_argument("--format", choices=["json"], default="json")
     autonomous_gate_status = autonomous_gate_subparsers.add_parser("status")
     autonomous_gate_status.add_argument("--kalshi-env", default="production")

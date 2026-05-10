@@ -118,6 +118,7 @@ kalshi-bot-cli self-improve promote --evaluation-run-id <EVALUATION_RUN_ID>
 kalshi-bot-cli self-improve rollback --reason manual_rollback
 kalshi-bot-cli autonomous-gates status --kalshi-env production --domain all --format json
 kalshi-bot-cli autonomous-gates run --kalshi-env production --domain all --source combined --days 3650 --dry-run --format json
+kalshi-bot-cli autonomous-gates run --kalshi-env production --domain weather --source combined --days 3650 --bootstrap-promote-from-historical --format json
 kalshi-bot-cli health-check app --color blue
 kalshi-bot-cli health-check daemon --color blue
 kalshi-bot-cli watchdog status

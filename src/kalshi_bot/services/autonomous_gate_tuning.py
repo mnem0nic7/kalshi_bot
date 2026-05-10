@@ -213,6 +213,7 @@ class AutonomousGateTuningService:
         side: str | None = None,
         month: int | str | None = None,
         lane: str = "entry_gate",
+        bootstrap_promote_from_historical: bool = False,
     ) -> dict[str, Any]:
         normalized_domain = _normalize_domain(domain)
         if normalized_domain == "crypto":
@@ -239,6 +240,7 @@ class AutonomousGateTuningService:
                 side=side,
                 month=month,
                 lane=lane,
+                bootstrap_promote_from_historical=bootstrap_promote_from_historical,
             )
             crypto = await self._run_crypto(
                 kalshi_env=kalshi_env,
@@ -273,13 +275,25 @@ class AutonomousGateTuningService:
             checkpoint = await repo.get_checkpoint(_checkpoint_name(env))
             payload = dict(checkpoint.payload if checkpoint is not None else {})
             if payload.get("status") == "staged":
-                result = await self._evaluate_canary(
-                    repo,
-                    checkpoint_payload=payload,
-                    kalshi_env=env,
-                    dry_run=dry_run,
-                    now=now_utc,
-                )
+                if bootstrap_promote_from_historical:
+                    result = await self._evaluate_historical_bootstrap(
+                        repo,
+                        checkpoint_payload=payload,
+                        kalshi_env=env,
+                        source=run_source,
+                        days=run_days,
+                        min_support=support,
+                        dry_run=dry_run,
+                        now=now_utc,
+                    )
+                else:
+                    result = await self._evaluate_canary(
+                        repo,
+                        checkpoint_payload=payload,
+                        kalshi_env=env,
+                        dry_run=dry_run,
+                        now=now_utc,
+                    )
                 await session.commit()
                 return result
             pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
@@ -365,6 +379,21 @@ class AutonomousGateTuningService:
                 history=list(payload.get("evidence_fingerprint_history") or []),
                 weather_scope=weather_scope,
             )
+            if bootstrap_promote_from_historical:
+                checkpoint = await repo.get_checkpoint(_checkpoint_name(env))
+                staged_payload = dict(checkpoint.payload if checkpoint is not None else {})
+                result = await self._evaluate_historical_bootstrap(
+                    repo,
+                    checkpoint_payload=staged_payload,
+                    kalshi_env=env,
+                    source=run_source,
+                    days=run_days,
+                    min_support=support,
+                    dry_run=dry_run,
+                    now=now_utc,
+                )
+                await session.commit()
+                return result
             await session.commit()
         return staged
 
@@ -1136,6 +1165,135 @@ class AutonomousGateTuningService:
             now=now,
         )
 
+    async def _evaluate_historical_bootstrap(
+        self,
+        repo: PlatformRepository,
+        *,
+        checkpoint_payload: dict[str, Any],
+        kalshi_env: str,
+        source: str,
+        days: int,
+        min_support: int,
+        dry_run: bool,
+        now: datetime,
+    ) -> dict[str, Any]:
+        allowed, block_reason = await self._historical_bootstrap_allowed(repo, checkpoint_payload=checkpoint_payload)
+        if not allowed:
+            return {
+                "status": "historical_bootstrap_rejected",
+                "kalshi_env": kalshi_env,
+                "candidate_version": checkpoint_payload.get("candidate_version"),
+                "reason": block_reason,
+            }
+        gate_service = self.gate_learning_service_factory(self.settings)
+        cutoff = now - timedelta(days=days)
+        rows = [
+            row for row in gate_service.load_bundle_rows(source=source)
+            if row.decision_time is None or row.decision_time >= cutoff
+        ]
+        rows = _filter_weather_scope_rows(rows, dict(checkpoint_payload.get("weather_scope") or {}))
+        labeled = [row for row in rows if row.labeled]
+        train, holdout = _walk_forward_threshold_split(labeled)
+        current_thresholds = dict(checkpoint_payload.get("current_thresholds") or {})
+        candidate_thresholds = dict(checkpoint_payload.get("candidate_thresholds") or {})
+        current_train = _score_threshold_episode_rows(train, current_thresholds)
+        current_holdout = _score_threshold_episode_rows(holdout, current_thresholds)
+        candidate_train = _score_threshold_episode_rows(train, candidate_thresholds)
+        candidate_holdout = _score_threshold_episode_rows(holdout, candidate_thresholds)
+        total_candidate_support = candidate_train["selected_count"] + candidate_holdout["selected_count"]
+        required_holdout_rows = max(
+            10,
+            (int(min_support) + 3) // 4,
+            int(self.settings.autonomous_gate_tuning_canary_min_settled_rows),
+        )
+        failures: list[str] = []
+        if not labeled:
+            failures.append("historical_bootstrap_zero_labeled_rows")
+        if total_candidate_support < int(min_support):
+            failures.append("historical_bootstrap_insufficient_total_support")
+        if candidate_holdout["selected_count"] < required_holdout_rows:
+            failures.append("historical_bootstrap_insufficient_holdout_support")
+        if candidate_holdout["net_pnl"] <= Decimal("0"):
+            failures.append("historical_bootstrap_holdout_net_pnl_not_positive")
+        if candidate_holdout["net_pnl"] <= current_holdout["net_pnl"]:
+            failures.append("historical_bootstrap_holdout_net_pnl_not_improved")
+        if candidate_holdout["drawdown_proxy"] > current_holdout["drawdown_proxy"]:
+            failures.append("historical_bootstrap_holdout_drawdown_worse")
+        canary = {
+            "settled_rows": len(holdout),
+            "evidence_source": "historical_bootstrap_holdout",
+            "promotion_source": "historical_bootstrap",
+            "source": source,
+            "window_days": days,
+            "labeled_rows": len(labeled),
+            "train_rows": len(train),
+            "holdout_rows": len(holdout),
+            "required_total_support": int(min_support),
+            "required_holdout_rows": required_holdout_rows,
+            "candidate_total_selected_rows": total_candidate_support,
+            "candidate_train_selected_rows": candidate_train["selected_count"],
+            "current_train_selected_rows": current_train["selected_count"],
+            "candidate_selected_rows": candidate_holdout["selected_count"],
+            "current_selected_rows": current_holdout["selected_count"],
+            "candidate_train_net_pnl": _money(candidate_train["net_pnl"]),
+            "current_train_net_pnl": _money(current_train["net_pnl"]),
+            "candidate_net_pnl": _money(candidate_holdout["net_pnl"]),
+            "current_net_pnl": _money(current_holdout["net_pnl"]),
+            "candidate_drawdown_proxy": _money(candidate_holdout["drawdown_proxy"]),
+            "current_drawdown_proxy": _money(current_holdout["drawdown_proxy"]),
+            "source_files": gate_service.source_files(source=source),
+            "staged_at": checkpoint_payload.get("staged_at"),
+            "evaluated_at": now.isoformat(),
+            "failures": failures,
+        }
+        if failures:
+            return {
+                "status": "historical_bootstrap_failed",
+                "kalshi_env": kalshi_env,
+                "candidate_version": checkpoint_payload.get("candidate_version"),
+                "reason": ",".join(failures),
+                "canary": canary,
+            }
+        if dry_run:
+            return {
+                "status": "historical_bootstrap_passed",
+                "kalshi_env": kalshi_env,
+                "dry_run": True,
+                "candidate_version": checkpoint_payload.get("candidate_version"),
+                "canary": canary,
+            }
+        result = await self._promote_candidate(
+            repo,
+            checkpoint_payload=checkpoint_payload,
+            kalshi_env=kalshi_env,
+            canary=canary,
+            now=now,
+        )
+        result["promotion_source"] = "historical_bootstrap"
+        return result
+
+    async def _historical_bootstrap_allowed(
+        self,
+        repo: PlatformRepository,
+        *,
+        checkpoint_payload: dict[str, Any],
+    ) -> tuple[bool, str | None]:
+        if checkpoint_payload.get("status") != "staged":
+            return False, "historical_bootstrap_requires_staged_candidate"
+        candidate_version = str(checkpoint_payload.get("candidate_version") or "")
+        if not candidate_version:
+            return False, "historical_bootstrap_candidate_missing"
+        previous_version = str(checkpoint_payload.get("previous_version") or "")
+        if previous_version != "builtin-deterministic-v1":
+            return False, "historical_bootstrap_requires_builtin_startup_pack"
+        control = await repo.get_deployment_control()
+        active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+        if active_pack.version != previous_version:
+            return False, "historical_bootstrap_active_pack_changed"
+        if checkpoint_payload.get("promoted_at"):
+            return False, "historical_bootstrap_already_promoted"
+        return True, None
+
     async def _promote_candidate(
         self,
         repo: PlatformRepository,
@@ -1640,6 +1798,76 @@ def _score_threshold_rows(rows: list[GateLearningRow], thresholds: dict[str, Any
         "net_pnl": net,
         "drawdown_proxy": abs(min_cumulative),
     }
+
+
+def _walk_forward_threshold_split(rows: list[GateLearningRow]) -> tuple[list[GateLearningRow], list[GateLearningRow]]:
+    ordered = sorted(rows, key=_threshold_row_sort_key)
+    days = sorted({row.market_day for row in ordered if row.market_day})
+    if len(days) >= 3:
+        holdout_start = days[max(1, int(len(days) * 0.70))]
+        train = [row for row in ordered if (row.market_day or "") < holdout_start]
+        holdout = [row for row in ordered if (row.market_day or "") >= holdout_start]
+        if train and holdout:
+            return train, holdout
+    split_idx = max(1, int(len(ordered) * 0.70))
+    return ordered[:split_idx], ordered[split_idx:]
+
+
+def _score_threshold_episode_rows(rows: list[GateLearningRow], thresholds: dict[str, Any]) -> dict[str, Any]:
+    grouped: dict[tuple[str, str, str, str, str], list[GateLearningRow]] = {}
+    for row in rows:
+        grouped.setdefault(_threshold_episode_key(row), []).append(row)
+    selected: list[GateLearningRow] = []
+    for episode_rows in grouped.values():
+        ordered = sorted(episode_rows, key=_threshold_row_sort_key)
+        first_selected = next((row for row in ordered if _row_passes_thresholds(row, thresholds)), None)
+        if first_selected is not None:
+            selected.append(first_selected)
+    ordered_selected = sorted(selected, key=_threshold_row_sort_key)
+    selected_pnls = [
+        row.counterfactual_pnl_dollars or Decimal("0")
+        for row in ordered_selected
+        if row.counterfactual_pnl_dollars is not None
+    ]
+    net = sum(selected_pnls, Decimal("0"))
+    cumulative = Decimal("0")
+    peak = Decimal("0")
+    max_drawdown = Decimal("0")
+    for pnl in selected_pnls:
+        cumulative += pnl
+        peak = max(peak, cumulative)
+        max_drawdown = max(max_drawdown, peak - cumulative)
+    return {
+        "selected_count": len(selected_pnls),
+        "episode_count": len(grouped),
+        "net_pnl": net,
+        "drawdown_proxy": max_drawdown,
+    }
+
+
+def _threshold_episode_key(row: GateLearningRow) -> tuple[str, str, str, str, str]:
+    return (
+        row.strategy_code or "A",
+        row.series_ticker or _series_from_market_ticker(row.market_ticker) or "unknown_series",
+        row.market_ticker,
+        row.market_day or "unknown_day",
+        row.side or "any",
+    )
+
+
+def _series_from_market_ticker(market_ticker: str | None) -> str | None:
+    if not market_ticker:
+        return None
+    parts = str(market_ticker).split("-")
+    return parts[0] if parts else None
+
+
+def _threshold_row_sort_key(row: GateLearningRow) -> tuple[str, datetime, str]:
+    return (
+        row.market_day or "",
+        row.decision_time or datetime.min.replace(tzinfo=UTC),
+        row.room_id or "",
+    )
 
 
 def _row_passes_thresholds(row: GateLearningRow, thresholds: dict[str, Any]) -> bool:
