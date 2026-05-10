@@ -397,6 +397,37 @@ class AgentPackThresholds(BaseModel):
     strategy_min_remaining_payout_bps: int | None = None
 
 
+class AgentPackWeatherPolicy(BaseModel):
+    policy_key: str
+    domain: str = "weather"
+    strategy_code: str = "weather_baseline"
+    cohort_id: str = "global"
+    series_ticker: str = "any"
+    side: str = "any"
+    season: str = "all_season"
+    month: str = "all_month"
+    regime: str = "any"
+    threshold_band: str = "any"
+    lane: str = "entry_gate"
+    mode: str = "live"
+    action: str = "keep_current"
+    thresholds: AgentPackThresholds = Field(default_factory=AgentPackThresholds)
+    grid: dict[str, list[Any]] = Field(default_factory=dict)
+    parent_policy_key: str | None = None
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    scores: dict[str, Any] = Field(default_factory=dict)
+    reason_codes: list[str] = Field(default_factory=list)
+    deterministic_summary: str | None = None
+    valid_until: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentPackWeatherPolicyBook(BaseModel):
+    policies: dict[str, AgentPackWeatherPolicy] = Field(default_factory=dict)
+    cohort_memberships: dict[str, list[str]] = Field(default_factory=dict)
+    grid_versions: dict[str, str] = Field(default_factory=dict)
+
+
 class AgentPackCryptoEntryPolicy(BaseModel):
     min_fee_adjusted_edge_bps: int | None = None
     max_spread_bps: int | None = None
@@ -438,6 +469,7 @@ class AgentPack(BaseModel):
     research: AgentPackResearchConfig
     memory: AgentPackMemoryConfig
     thresholds: AgentPackThresholds = Field(default_factory=AgentPackThresholds)
+    weather_policy: AgentPackWeatherPolicyBook = Field(default_factory=AgentPackWeatherPolicyBook)
     crypto_policy: AgentPackCryptoPolicy = Field(default_factory=AgentPackCryptoPolicy)
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

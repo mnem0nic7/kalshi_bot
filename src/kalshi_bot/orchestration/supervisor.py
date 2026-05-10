@@ -41,6 +41,7 @@ from kalshi_bot.services.decision_policy_variants import (
     DecisionPolicyVariantService,
 )
 from kalshi_bot.services.signal_attention import SignalAttentionService, extract_decision_fields
+from kalshi_bot.services.weather_policy import weather_policy_context_from_market
 
 from kalshi_bot.services.momentum_calibration import get_active_momentum_calibration_async
 from kalshi_bot.services.signal import (
@@ -1666,6 +1667,26 @@ class WorkflowSupervisor:
                                 kalshi_env=room.kalshi_env,
                                 thresholds=thresholds,
                             )
+                weather_policy_context = weather_policy_context_from_market(
+                    market_ticker=room.market_ticker,
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                    local_market_day=_ticker_local_market_day(room.market_ticker),
+                    lane="entry_gate",
+                )
+                weather_policy_resolution = self.agent_pack_service.resolve_weather_policy(
+                    pack,
+                    weather_policy_context,
+                    fallback_thresholds=thresholds,
+                )
+                thresholds = thresholds_with_production_freeze_floor(
+                    settings=self.settings,
+                    kalshi_env=room.kalshi_env,
+                    thresholds=weather_policy_resolution.thresholds,
+                )
+                weather_policy_provenance = {
+                    **weather_policy_resolution.provenance(),
+                    "active_policy_pack_version": pack.version,
+                }
                 delta = self.research_coordinator.build_room_delta(
                     dossier=dossier,
                     market_response=market_response,
@@ -1784,6 +1805,15 @@ class WorkflowSupervisor:
                 signal.stand_down_reason = signal.eligibility.stand_down_reason
                 signal.evaluation_outcome = signal.eligibility.evaluation_outcome
                 signal.candidate_trace = signal.eligibility.candidate_trace or signal.candidate_trace
+                signal.candidate_trace = {
+                    **dict(signal.candidate_trace or {}),
+                    "weather_policy": weather_policy_provenance,
+                    "active_policy_pack_version": pack.version,
+                    "policy_key": weather_policy_provenance["policy_key"],
+                    "fallback_policy_key_used": weather_policy_provenance["fallback_policy_key_used"],
+                    "binding_policy_lane": weather_policy_provenance["binding_policy_lane"],
+                    "policy_disagreement": weather_policy_provenance["policy_disagreement"],
+                }
                 signal = await self._apply_static_signal_guard(
                     session=session,
                     room=room,

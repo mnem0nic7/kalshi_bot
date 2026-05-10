@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.schemas import AgentPack, AgentPackCryptoEntryPolicy, AgentPackCryptoPolicy
+from kalshi_bot.core.schemas import AgentPack, AgentPackCryptoEntryPolicy, AgentPackCryptoPolicy, AgentPackWeatherPolicy
 from kalshi_bot.crypto.services import (
     _crypto_decision_rows,
     _crypto_walk_forward_folds,
@@ -27,6 +27,7 @@ from kalshi_bot.services.gate_learning import (
     decision_corpus_row_to_gate_learning_row,
 )
 from kalshi_bot.services.modeling import build_modeling_report
+from kalshi_bot.services.weather_policy import WeatherPolicyContext, build_weather_policy_key
 
 
 CHECKPOINT_PREFIX = "autonomous_gate_tuning"
@@ -70,7 +71,17 @@ class AutonomousGateTuningService:
         self.modeling_builder = modeling_builder
         self.gate_learning_service_factory = gate_learning_service_factory or GateLearningService
 
-    async def status(self, *, kalshi_env: str | None = None, domain: str = "all") -> dict[str, Any]:
+    async def status(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        domain: str = "all",
+        policy_scope: str = "global",
+        series_ticker: str | None = None,
+        side: str | None = None,
+        month: int | str | None = None,
+        lane: str = "entry_gate",
+    ) -> dict[str, Any]:
         normalized_domain = _normalize_domain(domain)
         env = kalshi_env or self.settings.kalshi_env
         async with self.session_factory() as session:
@@ -81,6 +92,17 @@ class AutonomousGateTuningService:
             control = await repo.get_deployment_control()
             active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
             active_thresholds = _threshold_values(self.agent_pack_service.runtime_thresholds(active_pack))
+            weather_scope = _weather_scope_payload(
+                policy_scope=policy_scope,
+                series_ticker=series_ticker,
+                side=side,
+                month=month,
+                lane=lane,
+            )
+            weather_resolution = self.agent_pack_service.resolve_weather_policy(
+                active_pack,
+                _weather_policy_context_from_scope(weather_scope),
+            )
             active_crypto_policy = _crypto_policy_values(self.agent_pack_service.runtime_crypto_policy(active_pack))
             await session.commit()
         settings_thresholds = _settings_threshold_values(self.settings)
@@ -94,6 +116,7 @@ class AutonomousGateTuningService:
             "active_color": control.active_color,
             "active_pack_version": active_pack.version,
             "active_thresholds": active_thresholds,
+            "active_weather_policy": weather_resolution.provenance(),
             "active_crypto_policy": active_crypto_policy,
             "settings_thresholds": settings_thresholds,
             "threshold_drift": _threshold_drift(active_thresholds, settings_thresholds),
@@ -185,6 +208,11 @@ class AutonomousGateTuningService:
         triggered_by: str = "manual",
         now: datetime | None = None,
         domain: str = "weather",
+        policy_scope: str = "global",
+        series_ticker: str | None = None,
+        side: str | None = None,
+        month: int | str | None = None,
+        lane: str = "entry_gate",
     ) -> dict[str, Any]:
         normalized_domain = _normalize_domain(domain)
         if normalized_domain == "crypto":
@@ -206,6 +234,11 @@ class AutonomousGateTuningService:
                 triggered_by=triggered_by,
                 now=now,
                 domain="weather",
+                policy_scope=policy_scope,
+                series_ticker=series_ticker,
+                side=side,
+                month=month,
+                lane=lane,
             )
             crypto = await self._run_crypto(
                 kalshi_env=kalshi_env,
@@ -227,6 +260,13 @@ class AutonomousGateTuningService:
         run_days = int(days if days is not None else self.settings.autonomous_gate_tuning_days)
         support = int(min_support if min_support is not None else self.settings.autonomous_gate_tuning_min_support)
         now_utc = _as_utc(now) or datetime.now(UTC)
+        weather_scope = _weather_scope_payload(
+            policy_scope=policy_scope,
+            series_ticker=series_ticker,
+            side=side,
+            month=month,
+            lane=lane,
+        )
 
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=env)
@@ -243,7 +283,10 @@ class AutonomousGateTuningService:
                 await session.commit()
                 return result
             pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
-            runtime_thresholds = self.agent_pack_service.runtime_thresholds(pack)
+            runtime_thresholds = self.agent_pack_service.resolve_weather_policy(
+                pack,
+                _weather_policy_context_from_scope(weather_scope),
+            ).thresholds
             await session.commit()
 
         active_settings = _settings_with_thresholds(self.settings, runtime_thresholds)
@@ -254,6 +297,12 @@ class AutonomousGateTuningService:
             source=run_source,
             min_support=support,
             now=now_utc,
+            policy_scope=policy_scope,
+            series_ticker=series_ticker,
+            side=side,
+            month=month,
+            lane=lane,
+            episode_level=True,
         )
         candidate = _candidate_threshold_values(recommendation, runtime_thresholds)
         if not candidate["changes"]:
@@ -314,6 +363,7 @@ class AutonomousGateTuningService:
                 triggered_by=triggered_by,
                 now=now_utc,
                 history=list(payload.get("evidence_fingerprint_history") or []),
+                weather_scope=weather_scope,
             )
             await session.commit()
         return staged
@@ -853,10 +903,52 @@ class AutonomousGateTuningService:
         triggered_by: str,
         now: datetime,
         history: list[str],
+        weather_scope: dict[str, Any],
     ) -> dict[str, Any]:
         version = f"gate-tuning-{now.strftime('%Y%m%dT%H%M%SZ')}"
         threshold_payload = current_pack.thresholds.model_dump(mode="json")
-        threshold_payload.update(candidate_thresholds)
+        if str(weather_scope.get("scope") or "global") == "global":
+            threshold_payload.update(candidate_thresholds)
+        weather_policy = current_pack.weather_policy.model_copy(deep=True)
+        policy_key = str(weather_scope.get("policy_key") or "")
+        if policy_key:
+            policy_thresholds = current_pack.thresholds.model_copy(update=candidate_thresholds)
+            weather_policy.policies[policy_key] = AgentPackWeatherPolicy(
+                policy_key=policy_key,
+                strategy_code=str(weather_scope.get("strategy_code") or "A"),
+                cohort_id=str(weather_scope.get("cohort_id") or "global"),
+                series_ticker=str(weather_scope.get("series_ticker") or "any"),
+                side=str(weather_scope.get("side") or "any"),
+                season=str(weather_scope.get("season") or "all_season"),
+                month=str(weather_scope.get("month") or "all_month"),
+                regime=str(weather_scope.get("regime") or "any"),
+                threshold_band=str(weather_scope.get("threshold_band") or "any"),
+                lane=str(weather_scope.get("lane") or "entry_gate"),
+                mode="live",
+                action="loosen" if _thresholds_are_relaxed(changes) else "tighten",
+                thresholds=policy_thresholds,
+                parent_policy_key=str(weather_scope.get("parent_policy_key") or ""),
+                evidence={
+                    "evidence_fingerprint": evidence_fingerprint,
+                    "source": source,
+                    "days": days,
+                    "min_support": min_support,
+                    "row_counts": recommendation.get("row_counts") or {},
+                    "source_files": recommendation.get("source_files") or {},
+                },
+                scores={
+                    "changes": changes,
+                    "gate_evidence": [
+                        row for row in recommendation.get("gate_evidence") or []
+                        if row.get("promotion_status") == "promoted"
+                    ],
+                },
+                reason_codes=["staged_by_autonomous_gate_tuning"],
+                deterministic_summary=(
+                    f"Scoped weather policy {policy_key} staged with {len(changes)} threshold change(s)."
+                ),
+                metadata={"triggered_by": triggered_by, "staged_at": now.isoformat()},
+            )
         candidate_pack = current_pack.model_copy(
             update={
                 "version": version,
@@ -865,6 +957,7 @@ class AutonomousGateTuningService:
                 "source": OPS_SOURCE,
                 "description": "Autonomous gate tuning candidate from bundle-backed backtests and modeling.",
                 "thresholds": current_pack.thresholds.model_copy(update=threshold_payload),
+                "weather_policy": weather_policy,
                 "metadata": {
                     **dict(current_pack.metadata or {}),
                     "autonomous_gate_tuning": {
@@ -876,10 +969,12 @@ class AutonomousGateTuningService:
                         "min_support": min_support,
                         "evidence_fingerprint": evidence_fingerprint,
                         "changes": changes,
+                        "weather_scope": weather_scope,
                     },
                 },
             }
         )
+        candidate_pack = self.agent_pack_service.sanitize_candidate_pack(candidate_pack, parent_version=current_pack.version)
         await repo.update_agent_pack(candidate_pack)
         promotion = await repo.create_promotion_event(
             candidate_version=version,
@@ -892,6 +987,7 @@ class AutonomousGateTuningService:
                 "current_thresholds": current_thresholds,
                 "candidate_thresholds": candidate_thresholds,
                 "changes": changes,
+                "weather_scope": weather_scope,
                 "recommendation_summary": {
                     "row_counts": recommendation.get("row_counts"),
                     "source_files": recommendation.get("source_files"),
@@ -929,6 +1025,7 @@ class AutonomousGateTuningService:
             "current_thresholds": current_thresholds,
             "candidate_thresholds": candidate_thresholds,
             "changes": changes,
+            "weather_scope": weather_scope,
             "recommendation_summary": {
                 "row_counts": recommendation.get("row_counts"),
                 "source_files": recommendation.get("source_files"),
@@ -950,6 +1047,7 @@ class AutonomousGateTuningService:
             "previous_version": current_pack.version,
             "promotion_event_id": promotion.id,
             "changes": changes,
+            "weather_scope": weather_scope,
             "evidence_fingerprint": evidence_fingerprint,
             "validation": validation,
         }
@@ -973,6 +1071,7 @@ class AutonomousGateTuningService:
             ],
             staged_at=staged_at,
         )
+        rows = _filter_weather_scope_rows(rows, dict(checkpoint_payload.get("weather_scope") or {}))
         current_score = _score_threshold_rows(rows, dict(checkpoint_payload.get("current_thresholds") or {}))
         candidate_score = _score_threshold_rows(rows, dict(checkpoint_payload.get("candidate_thresholds") or {}))
         canary = {
@@ -1210,6 +1309,15 @@ def _as_utc(value: Any) -> datetime | None:
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
 def _settings_with_thresholds(settings: Settings, thresholds: RuntimeThresholds) -> Settings:
     return settings.model_copy(update=_threshold_values(thresholds))
 
@@ -1220,6 +1328,74 @@ def _threshold_values(thresholds: RuntimeThresholds) -> dict[str, Any]:
 
 def _settings_threshold_values(settings: Settings) -> dict[str, Any]:
     return {field: getattr(settings, field) for field in TUNABLE_GATE_FIELDS}
+
+
+def _weather_scope_payload(
+    *,
+    policy_scope: str,
+    series_ticker: str | None,
+    side: str | None,
+    month: int | str | None,
+    lane: str,
+) -> dict[str, Any]:
+    context = WeatherPolicyContext(
+        strategy_code="A",
+        cohort_id="global",
+        series_ticker=series_ticker if str(policy_scope or "global") == "city" else None,
+        side=side,
+        month=month,
+        lane=lane,
+    )
+    policy_key = build_weather_policy_key(context)
+    parts = policy_key.split("/")
+    return {
+        "scope": str(policy_scope or "global"),
+        "policy_key": policy_key,
+        "strategy_code": parts[1],
+        "cohort_id": parts[2],
+        "series_ticker": parts[3],
+        "side": parts[4],
+        "season": parts[5],
+        "month": parts[6],
+        "regime": parts[7],
+        "threshold_band": parts[8],
+        "lane": parts[9],
+    }
+
+
+def _weather_policy_context_from_scope(scope: dict[str, Any]) -> WeatherPolicyContext:
+    return WeatherPolicyContext(
+        strategy_code=str(scope.get("strategy_code") or "A"),
+        cohort_id=str(scope.get("cohort_id") or "global"),
+        series_ticker=str(scope.get("series_ticker") or "any"),
+        side=str(scope.get("side") or "any"),
+        season=str(scope.get("season") or "all_season"),
+        month=str(scope.get("month") or "all_month"),
+        regime=str(scope.get("regime") or "any"),
+        threshold_band=str(scope.get("threshold_band") or "any"),
+        lane=str(scope.get("lane") or "entry_gate"),
+    )
+
+
+def _thresholds_are_relaxed(changes: dict[str, dict[str, Any]]) -> bool:
+    relaxing_lower_is_better = {
+        "risk_min_contract_price_dollars",
+        "strategy_min_remaining_payout_bps",
+        "risk_min_confidence",
+        "risk_min_edge_bps",
+        "strategy_min_abs_delta_f",
+    }
+    relaxing_higher_is_better = {"trigger_max_spread_bps", "risk_max_credible_edge_bps"}
+    for field, details in changes.items():
+        current = _decimal_or_none(details.get("current"))
+        recommended = _decimal_or_none(details.get("recommended"))
+        if current is None or recommended is None:
+            continue
+        if field in relaxing_lower_is_better and recommended < current:
+            return True
+        if field in relaxing_higher_is_better and recommended > current:
+            return True
+    return False
 
 
 def _crypto_policy_values(policy: RuntimeCryptoPolicy) -> dict[str, Any]:
@@ -1422,6 +1598,30 @@ def _canary_rows(rows: list[GateLearningRow], *, staged_at: datetime) -> list[Ga
             continue
         output.append(row)
     return output
+
+
+def _filter_weather_scope_rows(rows: list[GateLearningRow], scope: dict[str, Any]) -> list[GateLearningRow]:
+    series = str(scope.get("series_ticker") or "any").upper()
+    side = str(scope.get("side") or "any").lower()
+    month = str(scope.get("month") or "all_month").lower()
+    filtered: list[GateLearningRow] = []
+    for row in rows:
+        if series not in {"", "ANY"} and (row.series_ticker or "").upper() != series:
+            continue
+        if side not in {"", "any"} and (row.side or "").lower() != side:
+            continue
+        if month not in {"", "all_month", "any"} and _gate_row_month(row) != month:
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def _gate_row_month(row: GateLearningRow) -> str:
+    if row.market_day:
+        parts = str(row.market_day).split("-")
+        if len(parts) >= 2 and parts[1].isdigit():
+            return f"m{int(parts[1]):02d}"
+    return "all_month"
 
 
 def _score_threshold_rows(rows: list[GateLearningRow], thresholds: dict[str, Any]) -> dict[str, Any]:

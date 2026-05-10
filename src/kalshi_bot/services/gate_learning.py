@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import DecisionCorpusRowRecord, DecisionTraceRecord, Room
+from kalshi_bot.services.weather_policy import WeatherPolicyContext, build_weather_policy_key
 
 
 SCHEMA_VERSION = "gate-learning-report-v1"
@@ -55,6 +56,8 @@ class GateLearningRow:
     forecast_delta_band: str | None = None
     primary_block_reason: str | None = None
     blocked_by: str | None = None
+    strategy_code: str = "A"
+    evidence_quality: str = "executable"
     current_gate_passed: bool = False
     stale_data_mismatch: bool = False
     counterfactual_pnl_dollars: Decimal | None = None
@@ -625,6 +628,50 @@ def _score_rows(rows: list[GateLearningRow], predicate: Callable[[GateLearningRo
     }
 
 
+def _episode_key(row: GateLearningRow) -> tuple[str, str, str, str, str]:
+    return (
+        row.strategy_code or "A",
+        row.series_ticker or _series_from_ticker(row.market_ticker) or "unknown_series",
+        row.market_ticker,
+        row.market_day or "unknown_day",
+        row.side or "any",
+    )
+
+
+def _score_episodes(rows: list[GateLearningRow], predicate: Callable[[GateLearningRow], bool]) -> dict[str, Any]:
+    grouped: dict[tuple[str, str, str, str, str], list[GateLearningRow]] = {}
+    for row in rows:
+        grouped.setdefault(_episode_key(row), []).append(row)
+    selected: list[GateLearningRow] = []
+    blocked: list[GateLearningRow] = []
+    for episode_rows in grouped.values():
+        ordered = sorted(
+            episode_rows,
+            key=lambda row: (row.decision_time or datetime.min.replace(tzinfo=UTC), row.room_id or ""),
+        )
+        first_selected = next((row for row in ordered if predicate(row)), None)
+        if first_selected is not None:
+            selected.append(first_selected)
+        else:
+            labeled = [row for row in ordered if row.counterfactual_pnl_dollars is not None]
+            if labeled:
+                blocked.append(max(labeled, key=lambda row: row.counterfactual_pnl_dollars or Decimal("0")))
+    kept_pnls = [row.counterfactual_pnl_dollars for row in selected if row.counterfactual_pnl_dollars is not None]
+    blocked_pnls = [row.counterfactual_pnl_dollars for row in blocked if row.counterfactual_pnl_dollars is not None]
+    net = sum(kept_pnls, Decimal("0"))
+    wins = sum(1 for value in kept_pnls if value > Decimal("0"))
+    return {
+        "sample_count": len(kept_pnls),
+        "episode_count": len(grouped),
+        "net_pnl": net,
+        "win_rate": (wins / len(kept_pnls)) if kept_pnls else None,
+        "missed_profit": sum((value for value in blocked_pnls if value > Decimal("0")), Decimal("0")),
+        "blocked_loss": sum((-value for value in blocked_pnls if value < Decimal("0")), Decimal("0")),
+        "stale_regression_count": sum(1 for row in selected if row.stale_data_mismatch),
+        "max_drawdown_proxy": _max_drawdown_proxy(selected),
+    }
+
+
 def _max_drawdown_proxy(rows: list[GateLearningRow]) -> Decimal:
     ordered = sorted(rows, key=lambda row: (row.market_day or "", row.decision_time or datetime.min.replace(tzinfo=UTC), row.room_id or ""))
     equity = Decimal("0")
@@ -650,6 +697,15 @@ def _walk_forward_split(rows: list[GateLearningRow]) -> tuple[list[GateLearningR
             return train, holdout
     split_idx = max(1, int(len(ordered) * 0.70))
     return ordered[:split_idx], ordered[split_idx:]
+
+
+def _score_with_mode(
+    rows: list[GateLearningRow],
+    predicate: Callable[[GateLearningRow], bool],
+    *,
+    episode_level: bool,
+) -> dict[str, Any]:
+    return _score_episodes(rows, predicate) if episode_level else _score_rows(rows, predicate)
 
 
 def _numeric_min(field: str, threshold: float) -> Callable[[GateLearningRow], bool]:
@@ -881,6 +937,122 @@ def _baseline_gate_policies(settings: Settings) -> list[BaselineGatePolicy]:
     return policies
 
 
+def _row_month(row: GateLearningRow) -> str:
+    if row.market_day:
+        parts = str(row.market_day).split("-")
+        if len(parts) >= 2 and parts[1].isdigit():
+            return f"m{int(parts[1]):02d}"
+    return "all_month"
+
+
+def _filter_scope(
+    rows: list[GateLearningRow],
+    *,
+    policy_scope: str,
+    series_ticker: str | None,
+    side: str | None,
+    month: int | str | None,
+) -> list[GateLearningRow]:
+    scope = str(policy_scope or "global").lower()
+    expected_month = _scope_month(month)
+    expected_side = str(side or "").lower() or None
+    expected_series = str(series_ticker or "").upper() or None
+    filtered: list[GateLearningRow] = []
+    for row in rows:
+        if scope == "city" and expected_series and (row.series_ticker or "").upper() != expected_series:
+            continue
+        if expected_side and (row.side or "").lower() != expected_side:
+            continue
+        if expected_month and _row_month(row) != expected_month:
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def _scope_month(value: int | str | None) -> str | None:
+    if value in (None, "", "all", "all_month"):
+        return None
+    try:
+        return f"m{max(1, min(12, int(value))):02d}"
+    except (TypeError, ValueError):
+        text = str(value).lower().removeprefix("m")
+        return f"m{text.zfill(2)}" if text.isdigit() else None
+
+
+def _policy_scope_payload(
+    *,
+    policy_scope: str,
+    series_ticker: str | None,
+    side: str | None,
+    month: int | str | None,
+    lane: str,
+) -> dict[str, Any]:
+    scope = str(policy_scope or "global").lower()
+    context = WeatherPolicyContext(
+        strategy_code="A",
+        cohort_id="global",
+        series_ticker=series_ticker if scope == "city" else None,
+        side=side,
+        month=month,
+        lane=lane,
+    )
+    return {
+        "scope": scope,
+        "series_ticker": series_ticker,
+        "side": side,
+        "month": _scope_month(month) or "all_month",
+        "lane": lane,
+        "policy_key": build_weather_policy_key(context),
+    }
+
+
+def _promotion_reason_codes(
+    *,
+    support_count: int,
+    holdout_support: int,
+    net_improvement: Decimal,
+    drawdown_delta: Decimal,
+    min_support: int,
+) -> list[str]:
+    codes: list[str] = []
+    if support_count >= min_support:
+        codes.append("support_met")
+    else:
+        codes.append("support_not_met")
+    if holdout_support >= max(10, math.ceil(min_support / 4)):
+        codes.append("holdout_support_met")
+    else:
+        codes.append("holdout_support_not_met")
+    if net_improvement > Decimal("0"):
+        codes.append("holdout_net_pnl_improved")
+    else:
+        codes.append("holdout_net_pnl_not_improved")
+    if net_improvement >= Decimal("5.00"):
+        codes.append("materiality_met")
+    else:
+        codes.append("materiality_not_met")
+    if drawdown_delta <= Decimal("0"):
+        codes.append("drawdown_not_worse")
+    else:
+        codes.append("drawdown_worse")
+    return codes
+
+
+def _deterministic_policy_summary(
+    *,
+    policy_key: str,
+    policy: BaselineGatePolicy,
+    promotion_status: str,
+    support_count: int,
+    holdout_support: int,
+    net_improvement: Decimal,
+) -> str:
+    return (
+        f"{policy_key} {policy.config_field} candidate {policy.threshold} -> {promotion_status}; "
+        f"support={support_count}, holdout={holdout_support}, net_improvement={_money(net_improvement)}."
+    )
+
+
 class GateLearningService:
     def __init__(
         self,
@@ -902,6 +1074,12 @@ class GateLearningService:
         min_support: int | None = None,
         session: AsyncSession | None = None,
         now: datetime | None = None,
+        policy_scope: str = "global",
+        series_ticker: str | None = None,
+        side: str | None = None,
+        month: int | str | None = None,
+        lane: str = "entry_gate",
+        episode_level: bool = False,
     ) -> dict[str, Any]:
         if source not in SOURCE_CHOICES:
             raise ValueError(f"unsupported gate-learning source {source!r}")
@@ -915,10 +1093,11 @@ class GateLearningService:
             row for row in rows
             if row.decision_time is None or row.decision_time >= cutoff
         ]
+        rows = _filter_scope(rows, policy_scope=policy_scope, series_ticker=series_ticker, side=side, month=month)
         labeled = [row for row in rows if row.labeled]
         train, holdout = _walk_forward_split(labeled)
-        current_train = _score_rows(train, lambda row: row.current_gate_passed)
-        current_holdout = _score_rows(holdout, lambda row: row.current_gate_passed)
+        current_train = _score_with_mode(train, lambda row: row.current_gate_passed, episode_level=episode_level)
+        current_holdout = _score_with_mode(holdout, lambda row: row.current_gate_passed, episode_level=episode_level)
         recommendations = [
             self._score_policy(
                 policy,
@@ -926,6 +1105,7 @@ class GateLearningService:
                 holdout=holdout,
                 current_holdout_net=current_holdout["net_pnl"],
                 min_support=min_support,
+                episode_level=episode_level,
             )
             for policy in _candidate_policies(labeled)
         ]
@@ -946,6 +1126,14 @@ class GateLearningService:
             "source_files": self.source_files(source=source),
             "read_only": True,
             "objective": "net_counterfactual_pnl",
+            "episode_level": episode_level,
+            "policy_scope": _policy_scope_payload(
+                policy_scope=policy_scope,
+                series_ticker=series_ticker,
+                side=side,
+                month=month,
+                lane=lane,
+            ),
             "min_support": min_support,
             "row_counts": {
                 "total_rows": len(rows),
@@ -953,6 +1141,7 @@ class GateLearningService:
                 "unlabeled_rows": len(rows) - len(labeled),
                 "train_rows": len(train),
                 "holdout_rows": len(holdout),
+                "episodes": len({_episode_key(row) for row in labeled}),
                 "sources": dict(Counter(row.source for row in rows)),
             },
             "current_gate_performance": {
@@ -982,6 +1171,12 @@ class GateLearningService:
         source: str = "combined",
         min_support: int | None = None,
         now: datetime | None = None,
+        policy_scope: str = "global",
+        series_ticker: str | None = None,
+        side: str | None = None,
+        month: int | str | None = None,
+        lane: str = "entry_gate",
+        episode_level: bool = False,
     ) -> dict[str, Any]:
         if source not in SOURCE_CHOICES:
             raise ValueError(f"unsupported gate-learning source {source!r}")
@@ -992,14 +1187,24 @@ class GateLearningService:
             row for row in self.load_bundle_rows(source=source)
             if row.decision_time is None or row.decision_time >= cutoff
         ]
+        rows = _filter_scope(rows, policy_scope=policy_scope, series_ticker=series_ticker, side=side, month=month)
         labeled = [row for row in rows if row.labeled]
         train, holdout = _walk_forward_split(labeled)
+        policy_scope_payload = _policy_scope_payload(
+            policy_scope=policy_scope,
+            series_ticker=series_ticker,
+            side=side,
+            month=month,
+            lane=lane,
+        )
         gate_evidence = [
             self._score_baseline_gate_policy(
                 policy,
                 train=train,
                 holdout=holdout,
                 min_support=min_support,
+                episode_level=episode_level,
+                policy_key=policy_scope_payload["policy_key"],
             )
             for policy in _baseline_gate_policies(self.settings)
         ]
@@ -1037,6 +1242,8 @@ class GateLearningService:
             "source_files": self.source_files(source=source),
             "read_only": True,
             "objective": "replace_baseline_defaults_when_holdout_net_pnl_improves_without_worse_drawdown",
+            "episode_level": episode_level,
+            "policy_scope": policy_scope_payload,
             "min_support": min_support,
             "promotion_holdout_support": max(10, math.ceil(min_support / 4)),
             "row_counts": {
@@ -1045,6 +1252,7 @@ class GateLearningService:
                 "unlabeled_rows": len(rows) - len(labeled),
                 "train_rows": len(train),
                 "holdout_rows": len(holdout),
+                "episodes": len({_episode_key(row) for row in labeled}),
                 "sources": dict(Counter(row.source for row in rows)),
             },
             "recommended_settings": recommended_settings,
@@ -1128,9 +1336,10 @@ class GateLearningService:
         holdout: list[GateLearningRow],
         current_holdout_net: Decimal,
         min_support: int,
+        episode_level: bool,
     ) -> dict[str, Any]:
-        train_score = _score_rows(train, policy.predicate)
-        holdout_score = _score_rows(holdout, policy.predicate)
+        train_score = _score_with_mode(train, policy.predicate, episode_level=episode_level)
+        holdout_score = _score_with_mode(holdout, policy.predicate, episode_level=episode_level)
         total_support = train_score["sample_count"] + holdout_score["sample_count"]
         net_improvement = holdout_score["net_pnl"] - current_holdout_net
         recommendation = self._recommendation(
@@ -1144,6 +1353,7 @@ class GateLearningService:
             "gate": policy.gate,
             "candidate_policy": policy.candidate_policy,
             "support_count": total_support,
+            "episode_level": episode_level,
             "train_net_pnl": _money(train_score["net_pnl"]),
             "holdout_net_pnl": _money(holdout_score["net_pnl"]),
             "holdout_win_rate": holdout_score["win_rate"],
@@ -1162,13 +1372,15 @@ class GateLearningService:
         train: list[GateLearningRow],
         holdout: list[GateLearningRow],
         min_support: int,
+        episode_level: bool,
+        policy_key: str,
     ) -> dict[str, Any]:
         feature_train = [row for row in train if policy.feature_predicate(row)]
         feature_holdout = [row for row in holdout if policy.feature_predicate(row)]
-        current_train = _score_rows(feature_train, policy.current_predicate)
-        current_holdout = _score_rows(feature_holdout, policy.current_predicate)
-        candidate_train = _score_rows(feature_train, policy.predicate)
-        candidate_holdout = _score_rows(feature_holdout, policy.predicate)
+        current_train = _score_with_mode(feature_train, policy.current_predicate, episode_level=episode_level)
+        current_holdout = _score_with_mode(feature_holdout, policy.current_predicate, episode_level=episode_level)
+        candidate_train = _score_with_mode(feature_train, policy.predicate, episode_level=episode_level)
+        candidate_holdout = _score_with_mode(feature_holdout, policy.predicate, episode_level=episode_level)
         support_count = candidate_train["sample_count"] + candidate_holdout["sample_count"]
         holdout_support = candidate_holdout["sample_count"]
         net_improvement = candidate_holdout["net_pnl"] - current_holdout["net_pnl"]
@@ -1182,6 +1394,10 @@ class GateLearningService:
         )
         return {
             "config_field": policy.config_field,
+            "policy_key": policy_key,
+            "lane": "entry_gate",
+            "mode": "live",
+            "winner": "candidate" if promotion_status == "promoted" else "keep_current",
             "gate": policy.gate,
             "candidate_policy": policy.candidate_policy,
             "threshold": self._json_threshold(policy.threshold),
@@ -1202,6 +1418,23 @@ class GateLearningService:
             "blocked_loss_dollars": _money(candidate_holdout["blocked_loss"]),
             "net_improvement_dollars": _money(net_improvement),
             "drawdown_delta_dollars": _money(drawdown_delta),
+            "materiality_met": net_improvement >= Decimal("5.00"),
+            "reason_codes": _promotion_reason_codes(
+                support_count=support_count,
+                holdout_support=holdout_support,
+                net_improvement=net_improvement,
+                drawdown_delta=drawdown_delta,
+                min_support=min_support,
+            ),
+            "deterministic_summary": _deterministic_policy_summary(
+                policy_key=policy_key,
+                policy=policy,
+                promotion_status=promotion_status,
+                support_count=support_count,
+                holdout_support=holdout_support,
+                net_improvement=net_improvement,
+            ),
+            "next_review_after": None,
             "promotion_status": promotion_status,
         }
 
@@ -1241,6 +1474,8 @@ class GateLearningService:
             return "insufficient_evidence"
         if net_improvement <= Decimal("0"):
             return "holdout_net_pnl_not_improved"
+        if net_improvement < Decimal("5.00"):
+            return "materiality_not_met"
         if drawdown_delta > Decimal("0"):
             return "holdout_drawdown_worse"
         return "promoted"

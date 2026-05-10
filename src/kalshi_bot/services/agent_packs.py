@@ -16,6 +16,7 @@ from kalshi_bot.core.schemas import (
     AgentPackResearchConfig,
     AgentPackRoleConfig,
     AgentPackThresholds,
+    AgentPackWeatherPolicyBook,
 )
 from kalshi_bot.db.models import DeploymentControl
 from kalshi_bot.db.repositories import PlatformRepository
@@ -154,6 +155,7 @@ class AgentPackService:
                 strategy_min_abs_delta_f=self.settings.strategy_min_abs_delta_f,
                 strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
             ),
+            weather_policy=AgentPackWeatherPolicyBook(),
             crypto_policy=AgentPackCryptoPolicy(
                 entry=AgentPackCryptoEntryPolicy(
                     min_fee_adjusted_edge_bps=self.settings.risk_min_edge_bps,
@@ -371,6 +373,19 @@ class AgentPackService:
             ),
         )
 
+    def resolve_weather_policy(self, pack: AgentPack | None, context: Any, fallback_thresholds: RuntimeThresholds | None = None):
+        from kalshi_bot.services.weather_policy import WeatherPolicyResolver
+
+        active_pack = pack or self.default_pack()
+        return WeatherPolicyResolver().resolve(
+            pack=active_pack,
+            context=context,
+            fallback_thresholds=fallback_thresholds or self.runtime_thresholds(active_pack),
+        )
+
+    def runtime_weather_thresholds(self, pack: AgentPack | None, context: Any) -> RuntimeThresholds:
+        return self.resolve_weather_policy(pack, context).thresholds
+
     def runtime_crypto_policy(self, pack: AgentPack | None = None) -> RuntimeCryptoPolicy:
         policy = (pack.crypto_policy if pack is not None else AgentPackCryptoPolicy()) or AgentPackCryptoPolicy()
         entry = policy.entry or AgentPackCryptoEntryPolicy()
@@ -456,6 +471,7 @@ class AgentPackService:
 
     def sanitize_candidate_pack(self, candidate: AgentPack, *, parent_version: str) -> AgentPack:
         thresholds = candidate.thresholds.model_copy(deep=True)
+        weather_policy = candidate.weather_policy.model_copy(deep=True)
         crypto_policy = candidate.crypto_policy.model_copy(deep=True)
         thresholds.risk_min_edge_bps = self._clamp_int(thresholds.risk_min_edge_bps, 250, 5000)
         thresholds.risk_max_credible_edge_bps = self._clamp_int(thresholds.risk_max_credible_edge_bps, 2500, 10000)
@@ -504,6 +520,7 @@ class AgentPackService:
             _normalize_crypto_asset_symbol(symbol): self._sanitize_crypto_entry(entry)
             for symbol, entry in (crypto_policy.asset_entry_overrides or {}).items()
         }
+        weather_policy.policies = self._sanitize_weather_policies(weather_policy.policies)
         sanitized_roles = {
             role_name: role.model_copy(update={"temperature": max(0.0, min(1.0, role.temperature))})
             for role_name, role in candidate.roles.items()
@@ -512,6 +529,7 @@ class AgentPackService:
             update={
                 "parent_version": parent_version,
                 "thresholds": thresholds,
+                "weather_policy": weather_policy,
                 "crypto_policy": crypto_policy,
                 "roles": sanitized_roles,
             }
@@ -545,6 +563,32 @@ class AgentPackService:
             min_remaining_payout_bps=self._clamp_int(entry.min_remaining_payout_bps, 100, 9900),
             max_credible_edge_bps=self._clamp_int(entry.max_credible_edge_bps, 2500, 10000),
         )
+
+    def _sanitize_weather_policies(self, policies: dict[str, Any]) -> dict[str, Any]:
+        from kalshi_bot.services.weather_policy import sanitize_weather_policy
+
+        sanitized: dict[str, Any] = {}
+        for key, policy in (policies or {}).items():
+            normalized = sanitize_weather_policy(policy)
+            thresholds = normalized.thresholds.model_copy(deep=True)
+            thresholds.risk_min_edge_bps = self._clamp_int(thresholds.risk_min_edge_bps, 250, 5000)
+            thresholds.risk_max_credible_edge_bps = self._clamp_int(thresholds.risk_max_credible_edge_bps, 2500, 10000)
+            thresholds.risk_min_confidence = self._clamp_float(thresholds.risk_min_confidence, 0.60, 0.90)
+            thresholds.risk_min_contract_price_dollars = self._clamp_float(
+                thresholds.risk_min_contract_price_dollars,
+                0.03,
+                0.25,
+            )
+            thresholds.trigger_max_spread_bps = self._clamp_int(thresholds.trigger_max_spread_bps, 50, 2500)
+            thresholds.trigger_cooldown_seconds = self._clamp_int(thresholds.trigger_cooldown_seconds, 30, 3600)
+            thresholds.strategy_min_abs_delta_f = self._clamp_float(thresholds.strategy_min_abs_delta_f, 0.0, 10.0)
+            thresholds.strategy_min_remaining_payout_bps = self._clamp_int(
+                thresholds.strategy_min_remaining_payout_bps,
+                500,
+                3500,
+            )
+            sanitized[normalized.policy_key or str(key)] = normalized.model_copy(update={"thresholds": thresholds})
+        return sanitized
 
     @staticmethod
     def _notes(control: DeploymentControl) -> dict[str, Any]:

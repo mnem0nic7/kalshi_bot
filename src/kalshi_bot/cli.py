@@ -1249,6 +1249,12 @@ async def _run_cli(args: argparse.Namespace) -> int:
                         source=args.source,
                         min_support=args.min_support,
                         session=session,
+                        policy_scope=args.policy_scope,
+                        series_ticker=args.series_ticker,
+                        side=args.side,
+                        month=args.month,
+                        lane=args.lane,
+                        episode_level=args.episode_level,
                     )
                 if args.format == "json":
                     print(json.dumps(report, indent=2))
@@ -1261,6 +1267,12 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     days=args.days,
                     source=args.source,
                     min_support=args.min_support,
+                    policy_scope=args.policy_scope,
+                    series_ticker=args.series_ticker,
+                    side=args.side,
+                    month=args.month,
+                    lane=args.lane,
+                    episode_level=args.episode_level,
                 )
                 if args.format == "json":
                     print(json.dumps(report, indent=2))
@@ -1274,6 +1286,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 payload = await container.autonomous_gate_tuning_service.status(
                     kalshi_env=args.kalshi_env,
                     domain=args.domain,
+                    policy_scope=args.scope,
+                    series_ticker=args.series_ticker,
+                    side=args.side,
+                    month=args.month,
+                    lane=args.lane,
                 )
             elif args.autonomous_gates_command == "run":
                 payload = await container.autonomous_gate_tuning_service.run(
@@ -1284,6 +1301,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     dry_run=args.dry_run,
                     triggered_by="cli",
                     domain=args.domain,
+                    policy_scope=args.scope,
+                    series_ticker=args.series_ticker,
+                    side=args.side,
+                    month=args.month,
+                    lane=args.lane,
                 )
             else:
                 raise ValueError(f"unknown autonomous-gates command {args.autonomous_gates_command}")
@@ -2251,6 +2273,12 @@ def build_parser() -> argparse.ArgumentParser:
         gate_learning_command.add_argument("--format", choices=["json", "md"], default="json")
         gate_learning_command.add_argument("--source", choices=["historical", "forward-shadow", "combined"], default="combined")
         gate_learning_command.add_argument("--min-support", type=int, default=None)
+        gate_learning_command.add_argument("--policy-scope", choices=["global", "cohort", "city"], default="global")
+        gate_learning_command.add_argument("--series-ticker", default=None)
+        gate_learning_command.add_argument("--side", choices=["yes", "no"], default=None)
+        gate_learning_command.add_argument("--month", default=None)
+        gate_learning_command.add_argument("--lane", default="entry_gate")
+        gate_learning_command.add_argument("--episode-level", action="store_true")
 
     autonomous_gates = subparsers.add_parser("autonomous-gates")
     autonomous_gate_subparsers = autonomous_gates.add_subparsers(dest="autonomous_gates_command", required=True)
@@ -2261,10 +2289,20 @@ def build_parser() -> argparse.ArgumentParser:
     autonomous_gate_run.add_argument("--min-support", type=int, default=None)
     autonomous_gate_run.add_argument("--dry-run", action="store_true")
     autonomous_gate_run.add_argument("--domain", choices=["weather", "crypto", "all"], default="all")
+    autonomous_gate_run.add_argument("--scope", choices=["global", "cohort", "city"], default="global")
+    autonomous_gate_run.add_argument("--series-ticker", default=None)
+    autonomous_gate_run.add_argument("--side", choices=["yes", "no"], default=None)
+    autonomous_gate_run.add_argument("--month", default=None)
+    autonomous_gate_run.add_argument("--lane", default="entry_gate")
     autonomous_gate_run.add_argument("--format", choices=["json"], default="json")
     autonomous_gate_status = autonomous_gate_subparsers.add_parser("status")
     autonomous_gate_status.add_argument("--kalshi-env", default="production")
     autonomous_gate_status.add_argument("--domain", choices=["weather", "crypto", "all"], default="all")
+    autonomous_gate_status.add_argument("--scope", choices=["global", "cohort", "city"], default="global")
+    autonomous_gate_status.add_argument("--series-ticker", default=None)
+    autonomous_gate_status.add_argument("--side", choices=["yes", "no"], default=None)
+    autonomous_gate_status.add_argument("--month", default=None)
+    autonomous_gate_status.add_argument("--lane", default="entry_gate")
     autonomous_gate_status.add_argument("--format", choices=["json"], default="json")
 
     stream = subparsers.add_parser("stream")
