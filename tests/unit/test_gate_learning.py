@@ -281,6 +281,38 @@ async def test_gate_recommendation_promotes_only_comparable_supported_gate(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_gate_recommendation_scores_candidate_as_full_policy(tmp_path) -> None:
+    path = tmp_path / "historical.jsonl"
+    rows = [_bundle(idx, pnl="5.0000", entry_price="0.0500", qa_edge=400) for idx in range(1, 41)]
+    _write_jsonl(path, rows)
+    service = GateLearningService(
+        Settings(
+            database_url="sqlite+aiosqlite:///./test.db",
+            risk_min_contract_price_dollars=0.25,
+            risk_min_edge_bps=500,
+        ),
+        historical_paths=(path,),
+        forward_shadow_paths=(),
+    )
+
+    report = await service.build_recommendation_report(
+        source="historical",
+        min_support=30,
+        now=datetime(2026, 2, 20, tzinfo=UTC),
+        days=3650,
+    )
+
+    price = report["recommended_settings"]["risk_min_contract_price_dollars"]
+    evidence = next(
+        row for row in report["gate_evidence"]
+        if row["config_field"] == "risk_min_contract_price_dollars" and row["threshold"] == 0.05
+    )
+    assert price["changed"] is False
+    assert evidence["support_count"] == 0
+    assert evidence["promotion_status"] == "insufficient_evidence"
+
+
+@pytest.mark.asyncio
 async def test_gate_recommendation_keeps_gate_when_drawdown_worsens(tmp_path) -> None:
     path = tmp_path / "historical.jsonl"
     rows = []

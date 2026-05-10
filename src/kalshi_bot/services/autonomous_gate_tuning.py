@@ -1247,6 +1247,15 @@ class AutonomousGateTuningService:
             "failures": failures,
         }
         if failures:
+            if not dry_run:
+                return await self._reject_candidate(
+                    repo,
+                    checkpoint_payload=checkpoint_payload,
+                    kalshi_env=kalshi_env,
+                    reason=f"historical_bootstrap_failed:{','.join(failures)}",
+                    canary=canary,
+                    now=now,
+                )
             return {
                 "status": "historical_bootstrap_failed",
                 "kalshi_env": kalshi_env,

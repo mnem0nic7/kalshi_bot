@@ -344,7 +344,7 @@ kalshi-bot-cli autonomous-gates run --kalshi-env production --domain all --sourc
 kalshi-bot-cli autonomous-gates run --kalshi-env production --domain weather --source combined --days 3650 --bootstrap-promote-from-historical --format json
 ```
 
-Use `--bootstrap-promote-from-historical` only for the one-time weather startup case where a staged candidate is still based on `builtin-deterministic-v1`. It scores the full staged candidate pack on the reserved historical holdout; failing support, P/L, or drawdown leaves the staged candidate untouched.
+Use `--bootstrap-promote-from-historical` only for the one-time weather startup case where a staged candidate is still based on `builtin-deterministic-v1`. It scores the full staged candidate pack on the reserved historical holdout; failing support, P/L, or drawdown rejects that startup candidate so the next tuning run recomputes from clean evidence.
 
 For Docker blue or green deployments, the helper scripts mirror the same flow:
 

@@ -720,6 +720,56 @@ def _numeric_max(field: str, threshold: float) -> Callable[[GateLearningRow], bo
     return lambda row: (value := getattr(row, field)) is not None and float(value) <= threshold
 
 
+def _settings_threshold_values(settings: Settings) -> dict[str, Any]:
+    return {
+        "risk_min_contract_price_dollars": Decimal(str(settings.risk_min_contract_price_dollars)),
+        "strategy_min_remaining_payout_bps": int(settings.strategy_min_remaining_payout_bps),
+        "trigger_max_spread_bps": int(settings.trigger_max_spread_bps),
+        "risk_min_confidence": float(settings.risk_min_confidence),
+        "risk_min_edge_bps": int(settings.risk_min_edge_bps),
+        "strategy_min_abs_delta_f": float(settings.strategy_min_abs_delta_f),
+        "risk_max_credible_edge_bps": int(settings.risk_max_credible_edge_bps),
+    }
+
+
+def _row_has_full_threshold_features(row: GateLearningRow) -> bool:
+    return (
+        row.entry_price is not None
+        and row.remaining_payout_bps is not None
+        and row.spread_bps is not None
+        and row.confidence is not None
+        and row.quality_adjusted_edge_bps is not None
+        and row.forecast_delta_f is not None
+        and row.edge_bps is not None
+    )
+
+
+def _row_passes_thresholds(row: GateLearningRow, thresholds: dict[str, Any]) -> bool:
+    min_price = Decimal(str(thresholds.get("risk_min_contract_price_dollars", "0.25")))
+    min_remaining = int(thresholds.get("strategy_min_remaining_payout_bps", 2500))
+    max_spread = int(thresholds.get("trigger_max_spread_bps", 1200))
+    min_confidence = float(thresholds.get("risk_min_confidence", 0.80))
+    min_edge = int(thresholds.get("risk_min_edge_bps", 500))
+    min_delta = float(thresholds.get("strategy_min_abs_delta_f", 8.0))
+    max_edge = int(thresholds.get("risk_max_credible_edge_bps", 5000))
+    return (
+        row.entry_price is not None
+        and row.entry_price >= min_price
+        and row.remaining_payout_bps is not None
+        and row.remaining_payout_bps >= min_remaining
+        and row.spread_bps is not None
+        and row.spread_bps <= max_spread
+        and row.confidence is not None
+        and row.confidence >= min_confidence
+        and row.quality_adjusted_edge_bps is not None
+        and row.quality_adjusted_edge_bps >= min_edge
+        and row.forecast_delta_f is not None
+        and abs(row.forecast_delta_f) >= min_delta
+        and row.edge_bps is not None
+        and row.edge_bps <= max_edge
+    )
+
+
 def _categorical_not(field: str, value: str) -> Callable[[GateLearningRow], bool]:
     return lambda row: str(getattr(row, field) or "<unknown>") != value
 
@@ -1375,12 +1425,30 @@ class GateLearningService:
         episode_level: bool,
         policy_key: str,
     ) -> dict[str, Any]:
-        feature_train = [row for row in train if policy.feature_predicate(row)]
-        feature_holdout = [row for row in holdout if policy.feature_predicate(row)]
-        current_train = _score_with_mode(feature_train, policy.current_predicate, episode_level=episode_level)
-        current_holdout = _score_with_mode(feature_holdout, policy.current_predicate, episode_level=episode_level)
-        candidate_train = _score_with_mode(feature_train, policy.predicate, episode_level=episode_level)
-        candidate_holdout = _score_with_mode(feature_holdout, policy.predicate, episode_level=episode_level)
+        current_thresholds = _settings_threshold_values(self.settings)
+        candidate_thresholds = {**current_thresholds, policy.config_field: policy.threshold}
+        feature_train = [row for row in train if _row_has_full_threshold_features(row)]
+        feature_holdout = [row for row in holdout if _row_has_full_threshold_features(row)]
+        current_train = _score_with_mode(
+            feature_train,
+            lambda row, thresholds=current_thresholds: _row_passes_thresholds(row, thresholds),
+            episode_level=episode_level,
+        )
+        current_holdout = _score_with_mode(
+            feature_holdout,
+            lambda row, thresholds=current_thresholds: _row_passes_thresholds(row, thresholds),
+            episode_level=episode_level,
+        )
+        candidate_train = _score_with_mode(
+            feature_train,
+            lambda row, thresholds=candidate_thresholds: _row_passes_thresholds(row, thresholds),
+            episode_level=episode_level,
+        )
+        candidate_holdout = _score_with_mode(
+            feature_holdout,
+            lambda row, thresholds=candidate_thresholds: _row_passes_thresholds(row, thresholds),
+            episode_level=episode_level,
+        )
         support_count = candidate_train["sample_count"] + candidate_holdout["sample_count"]
         holdout_support = candidate_holdout["sample_count"]
         net_improvement = candidate_holdout["net_pnl"] - current_holdout["net_pnl"]

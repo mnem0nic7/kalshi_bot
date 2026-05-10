@@ -374,7 +374,7 @@ async def test_autonomous_gate_tuning_bootstrap_keeps_staged_when_holdout_fails(
     staged_at = datetime(2026, 5, 10, tzinfo=UTC)
     staged = await service.run(now=staged_at, min_support=10)
 
-    failed = await service.run(
+    rejected = await service.run(
         now=staged_at + timedelta(minutes=5),
         min_support=10,
         bootstrap_promote_from_historical=True,
@@ -386,10 +386,11 @@ async def test_autonomous_gate_tuning_bootstrap_keeps_staged_when_holdout_fails(
         await session.commit()
 
     assert staged["status"] == "staged"
-    assert failed["status"] == "historical_bootstrap_failed"
-    assert "historical_bootstrap_holdout_net_pnl_not_positive" in failed["reason"]
+    assert rejected["status"] == "rejected"
+    assert "historical_bootstrap_holdout_net_pnl_not_positive" in rejected["reason"]
     assert checkpoint is not None
-    assert checkpoint.payload["status"] == "staged"
+    assert checkpoint.payload["status"] == "rejected"
+    assert checkpoint.payload["canary"]["promotion_source"] == "historical_bootstrap"
 
     FakeGateLearningService.rows = []
     await engine.dispose()
