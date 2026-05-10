@@ -62,6 +62,71 @@ class FakeGateLearningService:
         return list(self.rows)
 
 
+async def _seed_live_canary_row(
+    session_factory,
+    *,
+    settings: Settings,
+    observed_at: datetime,
+) -> None:
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        build = await repo.create_decision_corpus_build(
+            version="canary-corpus",
+            date_from=observed_at.date(),
+            date_to=observed_at.date(),
+            source={"kind": "unit"},
+            filters={},
+        )
+        await repo.add_decision_corpus_row(
+            corpus_build_id=build.id,
+            room_id="room-1",
+            market_ticker="KXHIGHNY-26MAY10-T70",
+            series_ticker="KXHIGHNY",
+            local_market_day="2026-05-10",
+            checkpoint_ts=observed_at,
+            kalshi_env=settings.kalshi_env,
+            deployment_color=settings.app_color,
+            model_version="unit",
+            policy_version="unit",
+            fair_yes_dollars=Decimal("0.3000"),
+            confidence=0.90,
+            edge_bps=2000,
+            recommended_side="yes",
+            target_yes_price_dollars=Decimal("0.1000"),
+            eligibility_status="eligible",
+            support_status="supported",
+            support_level="L5_global",
+            support_n=40,
+            support_market_days=40,
+            settlement_result="yes",
+            settlement_value_dollars=Decimal("1.0000"),
+            pnl_counterfactual_target_frictionless=Decimal("0.9000"),
+            pnl_counterfactual_target_with_fees=Decimal("0.9000"),
+            source_provenance="historical_replay_full_checkpoint",
+            signal_payload={
+                "forecast_delta_f": 9.0,
+                "confidence": 0.90,
+                "candidate_trace": {
+                    "selected_side": "yes",
+                    "selected_candidate": {
+                        "side": "yes",
+                        "target_yes_price_dollars": "0.1000",
+                        "quality_adjusted_edge_bps": 2000,
+                        "edge_bps": 2000,
+                        "remaining_payout_dollars": "0.9000",
+                        "spread_bps": 100,
+                    },
+                },
+            },
+            quote_snapshot={"yes_bid_dollars": "0.09", "yes_ask_dollars": "0.10"},
+            diagnostics={"forecast_delta_f": 9.0},
+            created_at=observed_at,
+        )
+        await repo.mark_decision_corpus_build_successful(build.id, row_count=1)
+        await repo.promote_decision_corpus_build(build.id, kalshi_env=settings.kalshi_env, actor="unit")
+        await session.commit()
+
+
 async def _passing_backtesting(**_kwargs: Any) -> dict[str, Any]:
     return {"status": "pass", "dataset": {"row_count": 40}, "issues": [], "promotion_gates": {"status": "pass"}}
 
@@ -72,6 +137,14 @@ async def _passing_modeling(**_kwargs: Any) -> dict[str, Any]:
 
 async def _failing_modeling(**_kwargs: Any) -> dict[str, Any]:
     return {"status": "fail", "dataset": {"row_count": 40}, "issues": [{"severity": "fail", "code": "bad"}]}
+
+
+async def _freeze_only_failing_modeling(**_kwargs: Any) -> dict[str, Any]:
+    return {
+        "status": "fail",
+        "dataset": {"row_count": 40},
+        "issues": [{"severity": "fail", "code": "production_entry_freeze_disabled"}],
+    }
 
 
 async def _service(tmp_path, *, modeling_builder=_passing_modeling):
@@ -113,6 +186,10 @@ async def test_autonomous_gate_tuning_dry_run_does_not_stage(tmp_path) -> None:
     assert result["status"] == "dry_run"
     assert result["changes"]["risk_min_contract_price_dollars"]["recommended"] == 0.05
     assert status["status"] == "not_started"
+    assert status["llm_calls_enabled"] is False
+    assert status["deterministic_runtime"] is True
+    assert status["active_pack_version"] == "builtin-deterministic-v1"
+    assert status["active_thresholds"]["risk_min_edge_bps"] == status["settings_thresholds"]["risk_min_edge_bps"]
 
     await engine.dispose()
 
@@ -144,25 +221,7 @@ async def test_autonomous_gate_tuning_promotes_after_canary_passes(tmp_path) -> 
     settings, engine, session_factory, agent_pack_service, service = await _service(tmp_path)
     staged_at = datetime(2026, 5, 10, tzinfo=UTC)
     staged = await service.run(now=staged_at)
-    FakeGateLearningService.rows = [
-        GateLearningRow(
-            source="fixture",
-            room_id="room-1",
-            market_ticker="KXHIGHNY-26MAY10-T70",
-            decision_time=staged_at + timedelta(minutes=5),
-            market_day="2026-05-10",
-            side="yes",
-            entry_price=Decimal("0.10"),
-            remaining_payout_bps=9000,
-            spread_bps=100,
-            confidence=0.90,
-            edge_bps=2000,
-            quality_adjusted_edge_bps=2000,
-            forecast_delta_f=9.0,
-            counterfactual_pnl_dollars=Decimal("0.90"),
-            settlement_ts=staged_at + timedelta(hours=1),
-        )
-    ]
+    await _seed_live_canary_row(session_factory, settings=settings, observed_at=staged_at + timedelta(hours=1))
 
     promoted = await service.run(now=staged_at + timedelta(hours=2))
 
@@ -173,6 +232,7 @@ async def test_autonomous_gate_tuning_promotes_after_canary_passes(tmp_path) -> 
         await session.commit()
 
     assert promoted["status"] == "promoted"
+    assert promoted["canary"]["evidence_source"] == "live_decision_corpus"
     assert active_pack.version == staged["candidate_version"]
     assert active_pack.thresholds.risk_min_contract_price_dollars == 0.05
     assert candidate is not None
@@ -193,5 +253,20 @@ async def test_autonomous_gate_tuning_validation_failure_does_not_stage(tmp_path
 
     assert result["status"] == "validation_failed"
     assert "modeling:bad" in result["validation"]["failures"]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_gate_tuning_validation_ignores_production_entry_freeze(tmp_path) -> None:
+    _settings, engine, _session_factory, _agent_pack_service, service = await _service(
+        tmp_path,
+        modeling_builder=_freeze_only_failing_modeling,
+    )
+
+    result = await service.run(now=datetime(2026, 5, 10, tzinfo=UTC))
+
+    assert result["status"] == "staged"
+    assert result["validation"]["failures"] == []
 
     await engine.dispose()

@@ -128,6 +128,25 @@ async def test_limit_order_aborts_requote_when_edge_lost():
 
 
 @pytest.mark.asyncio
+async def test_limit_order_requote_uses_runtime_min_edge_override():
+    kalshi = _kalshi(order_statuses=["resting"] * 10, market_ask="0.6350")
+    svc = ExecutionService(_settings(10), kalshi)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        receipt = await svc.execute(
+            room=_room(),
+            control=_control(),
+            ticket=_ticket(price="0.5800"),
+            client_order_id="coid-1",
+            fair_yes_dollars=Decimal("0.6400"),
+            min_edge_bps=51,
+        )
+
+    assert receipt.status == "requote_edge_lost"
+    assert kalshi.create_order.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_limit_order_aborts_requote_when_fee_adjusted_edge_lost():
     kalshi = _kalshi(order_statuses=["resting"] * 10, market_ask="0.6300")
     svc = ExecutionService(_settings(50), kalshi)

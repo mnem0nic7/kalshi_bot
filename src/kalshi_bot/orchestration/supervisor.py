@@ -1332,6 +1332,7 @@ class WorkflowSupervisor:
                                 ticket=approved_ticket,
                                 client_order_id=client_order_id,
                                 fair_yes_dollars=signal.fair_yes_dollars,
+                                min_edge_bps=effective_thresholds.risk_min_edge_bps,
                             )
                         else:
                             receipt = ExecReceiptPayload(
@@ -2343,6 +2344,7 @@ class WorkflowSupervisor:
                                         ticket=approved_ticket,
                                         client_order_id=client_order_id,
                                         fair_yes_dollars=signal.fair_yes_dollars,
+                                        min_edge_bps=effective_thresholds.risk_min_edge_bps,
                                     )
                                 else:
                                     receipt = ExecReceiptPayload(

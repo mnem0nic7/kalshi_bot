@@ -640,6 +640,14 @@ class StrategyAutoEvolveService:
             payload.update({"status": "skipped", "reason": "disabled"})
             await self._record_result(payload, severity="info", summary="Strategy Auto-Evolve skipped: disabled")
             return payload
+        if not self.settings.llm_calls_enabled:
+            payload.update({"status": "skipped", "reason": "llm_calls_disabled"})
+            await self._record_result(
+                payload,
+                severity="info",
+                summary="Strategy Auto-Evolve skipped: LLM calls disabled",
+            )
+            return payload
 
         active_color = await self._active_deployment_color()
         if active_color and active_color != self.settings.app_color:

@@ -17,6 +17,10 @@ from kalshi_bot.db.models import DeploymentControl
 from kalshi_bot.db.repositories import PlatformRepository
 
 
+LEGACY_BUILTIN_AGENT_PACK_VERSION = "builtin-gemini-v1"
+DETERMINISTIC_BUILTIN_AGENT_PACK_VERSION = "builtin-deterministic-v1"
+
+
 @dataclass(slots=True)
 class RuntimeThresholds:
     risk_min_edge_bps: int
@@ -40,46 +44,46 @@ class AgentPackService:
 
     def default_pack(self) -> AgentPack:
         return AgentPack(
-            version=self.settings.active_agent_pack_version,
+            version=DETERMINISTIC_BUILTIN_AGENT_PACK_VERSION,
             status="champion",
-            source="builtin",
-            description="Built-in Gemini-first runtime pack.",
+            source="builtin_deterministic",
+            description="Built-in deterministic runtime pack. All role text is generated without LLM calls.",
             roles={
                 AgentRole.RESEARCHER.value: AgentPackRoleConfig(
-                    provider="gemini",
-                    model=self.settings.gemini_model_researcher,
-                    temperature=0.2,
-                    system_prompt="You are the researcher agent in a Kalshi trading room. Be factual, cite evidence, and stay concise.",
+                    provider="none",
+                    model=None,
+                    temperature=0.0,
+                    system_prompt="Deterministic researcher role. Use structured weather, market, and trace data only.",
                 ),
                 AgentRole.PRESIDENT.value: AgentPackRoleConfig(
-                    provider="gemini",
-                    model=self.settings.gemini_model_president,
-                    temperature=0.2,
-                    system_prompt="You are an advisory president agent setting posture for a trading room.",
+                    provider="none",
+                    model=None,
+                    temperature=0.0,
+                    system_prompt="Deterministic president role. Summarize posture from configured gates only.",
                 ),
                 AgentRole.TRADER.value: AgentPackRoleConfig(
-                    provider="gemini",
-                    model=self.settings.gemini_model_trader,
-                    temperature=0.1,
-                    system_prompt="You are the trader agent. Speak clearly and reference the deterministic rationale.",
+                    provider="none",
+                    model=None,
+                    temperature=0.0,
+                    system_prompt="Deterministic trader role. Propose tickets only from the signal engine.",
                 ),
                 AgentRole.RISK_OFFICER.value: AgentPackRoleConfig(
-                    provider="gemini",
-                    model=self.settings.gemini_model_risk_officer,
-                    temperature=0.1,
-                    system_prompt="You are the risk officer explaining a deterministic verdict.",
+                    provider="none",
+                    model=None,
+                    temperature=0.0,
+                    system_prompt="Deterministic risk role. Report the risk engine verdict.",
                 ),
                 AgentRole.OPS_MONITOR.value: AgentPackRoleConfig(
-                    provider="gemini",
-                    model=self.settings.gemini_model_ops_monitor,
-                    temperature=0.1,
-                    system_prompt="You are the ops monitor. Report concrete issues, stale data, and operational state without embellishment.",
+                    provider="none",
+                    model=None,
+                    temperature=0.0,
+                    system_prompt="Deterministic ops role. Report concrete operational state.",
                 ),
                 AgentRole.MEMORY_LIBRARIAN.value: AgentPackRoleConfig(
-                    provider="gemini",
-                    model=self.settings.gemini_model_memory_librarian,
-                    temperature=0.2,
-                    system_prompt="You write concise trading memory notes for future retrieval.",
+                    provider="none",
+                    model=None,
+                    temperature=0.0,
+                    system_prompt="Deterministic memory role. Persist concise rule-based notes.",
                 ),
             },
             research=AgentPackResearchConfig(
@@ -120,12 +124,17 @@ class AgentPackService:
         existing = await repo.get_agent_pack(builtin.version)
         if existing is None:
             await repo.create_agent_pack(builtin)
+        else:
+            await repo.update_agent_pack(builtin)
         control = await repo.get_deployment_control()
         notes = self._notes(control)
         notes.setdefault("blue_version", builtin.version)
         notes.setdefault("green_version", builtin.version)
         notes.setdefault("champion_version", builtin.version)
         notes.setdefault("active_version", builtin.version)
+        for key in ("blue_version", "green_version", "champion_version", "active_version"):
+            if notes.get(key) == LEGACY_BUILTIN_AGENT_PACK_VERSION:
+                notes[key] = builtin.version
         control.notes = self._replace_notes(control.notes, notes)
         await repo.update_deployment_notes(control.notes)
         return builtin
@@ -133,7 +142,11 @@ class AgentPackService:
     async def get_pack(self, repo: PlatformRepository, version: str) -> AgentPack:
         record = await repo.get_agent_pack(version)
         if record is None:
-            if version == self.settings.active_agent_pack_version:
+            if version in {self.settings.active_agent_pack_version, DETERMINISTIC_BUILTIN_AGENT_PACK_VERSION}:
+                builtin = self.default_pack()
+                await repo.update_agent_pack(builtin)
+                return builtin
+            if version == LEGACY_BUILTIN_AGENT_PACK_VERSION:
                 builtin = self.default_pack()
                 await repo.update_agent_pack(builtin)
                 return builtin

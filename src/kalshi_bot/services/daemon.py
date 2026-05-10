@@ -158,13 +158,16 @@ class DaemonService:
         result = asdict(summary)
         if summary.settlements_count > 0:
             if self.settings.autonomous_gate_tuning_enabled and self.autonomous_gate_tuning_service is not None:
-                result["autonomous_gate_tuning"] = await self.autonomous_gate_tuning_service.run(
-                    kalshi_env=self.settings.kalshi_env,
-                    source=self.settings.autonomous_gate_tuning_source,
-                    days=self.settings.autonomous_gate_tuning_days,
-                    min_support=self.settings.autonomous_gate_tuning_min_support,
-                    triggered_by="settlement_reconcile",
-                )
+                if await self._is_active_color():
+                    result["autonomous_gate_tuning"] = await self.autonomous_gate_tuning_service.run(
+                        kalshi_env=self.settings.kalshi_env,
+                        source=self.settings.autonomous_gate_tuning_source,
+                        days=self.settings.autonomous_gate_tuning_days,
+                        min_support=self.settings.autonomous_gate_tuning_min_support,
+                        triggered_by="settlement_reconcile",
+                    )
+                else:
+                    result["autonomous_gate_tuning"] = {"status": "skipped", "reason": "inactive_color"}
             else:
                 result["autonomous_gate_tuning"] = {"status": "disabled"}
         return result
@@ -516,6 +519,9 @@ class DaemonService:
             decision_corpus_promotion = await self._maybe_run_decision_corpus_promotion()
             if decision_corpus_promotion is not None:
                 payload["decision_corpus_promotion"] = decision_corpus_promotion
+            autonomous_gate_tuning = await self._maybe_run_autonomous_gate_tuning()
+            if autonomous_gate_tuning is not None:
+                payload["autonomous_gate_tuning"] = autonomous_gate_tuning
         rollout_result = await self.self_improve_service.monitor_rollouts()
         if rollout_result.status == "canary_running":
             canary = rollout_result.payload
@@ -741,6 +747,39 @@ class DaemonService:
             return await self.strategy_regression_service.run_regression()
         except Exception:
             logger.warning("strategy_regression failed", exc_info=True)
+            return None
+
+    async def _maybe_run_autonomous_gate_tuning(self) -> dict[str, Any] | None:
+        if not self.settings.autonomous_gate_tuning_enabled or self.autonomous_gate_tuning_service is None:
+            return None
+        checkpoint_name = f"daemon_autonomous_gate_tuning:{self.settings.kalshi_env}:{self.settings.app_color}"
+        last_run_at = await self._checkpoint_time(checkpoint_name)
+        now = self._utc_now()
+        interval = timedelta(seconds=max(60, int(self.settings.autonomous_gate_tuning_periodic_interval_seconds)))
+        if last_run_at is not None and now - last_run_at < interval:
+            return None
+        try:
+            result = await self.autonomous_gate_tuning_service.run(
+                kalshi_env=self.settings.kalshi_env,
+                source=self.settings.autonomous_gate_tuning_source,
+                days=self.settings.autonomous_gate_tuning_days,
+                min_support=self.settings.autonomous_gate_tuning_min_support,
+                triggered_by="active_periodic",
+            )
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                await repo.set_checkpoint(
+                    checkpoint_name,
+                    None,
+                    {
+                        "ran_at": now.isoformat(),
+                        "result": result,
+                    },
+                )
+                await session.commit()
+            return result
+        except Exception:
+            logger.warning("autonomous gate tuning periodic run failed", exc_info=True)
             return None
 
     async def _maybe_run_strategy_promotion_watchdog(self) -> dict[str, Any] | None:

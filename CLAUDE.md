@@ -106,8 +106,8 @@ Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In test
 ### Learning sub-package (`learning/`)
 Drift watcher and parameter-search utilities used by the self-improve and strategy-evolution pipelines.
 
-### Repo memory: autonomous gate tuning
-Gate thresholds that are learned from backtests/modeling are runtime data, not code rewrites. `AutonomousGateTuningService` runs after settlement reconciliation, builds a gate-learning recommendation from historical + forward-shadow bundles, validates the candidate through bundle-backed backtesting/modeling, stores promoted values in `AgentPackThresholds`, and uses settled out-of-sample rows as a canary before assigning the agent pack live. Do not update `.env` or `config.py` at runtime for these thresholds; code defaults remain fallback values only.
+### Repo memory: deterministic autonomous gate tuning
+LLM calls are hard-disabled by default (`LLM_CALLS_ENABLED=false`), and the built-in runtime pack is `builtin-deterministic-v1` with provider `none` roles. Gate thresholds learned from backtests/modeling are runtime data, not code rewrites. `AutonomousGateTuningService` runs after settlement reconciliation and on the active-color periodic heartbeat, builds a gate-learning recommendation from historical + forward-shadow bundles, validates the candidate through bundle-backed backtesting/modeling, stages threshold changes in `AgentPackThresholds`, and promotes only after newly labeled live decision-corpus rows pass the canary. Do not update `.env` or `config.py` at runtime for these thresholds; code defaults remain fallback values only. Legacy Strategy Codex, Strategy Auto-Evolve, Self-Improve, and strategy-eval paths must not mutate tunable gate thresholds; `autonomous_gate_tuning` is the sole threshold authority.
 
 ### Control room (`web/`)
 FastAPI app with server-rendered Jinja2 templates, SSE transcript stream, and REST endpoints. The top-level summary strip (`/api/control-room/summary`) is designed to be fast — it avoids live market discovery and uses lightweight room snapshots. The `Research` view also exposes an 180d-only assignment review queue (`ready_for_approval`, `drifted_assignment`, `evidence_weakened`, `aligned`, `waiting_for_evidence`), and city detail includes the latest approval note plus next-action copy. The operator win-rate card uses `PlatformRepository.get_fill_win_rate_30d()` and treats wins as realized-P&L-positive exits first, falling back to settlement results only when no sell fill exists for that ticker and side.
@@ -126,7 +126,8 @@ A DB-backed single-writer lock enforces that only the active color (`app_color` 
 - `KALSHI_ENV` — `demo` or `live`
 - `LIVE_KALSHI_API_KEY` / `DEMO_KALSHI_API_KEY` — API key IDs
 - `LIVE_KALSHI_READ_PRIVATE_KEY_PATH` / `DEMO_*` — RSA PEM paths
-- `GEMINI_KEY` or `GEMINI_API_KEY` — primary LLM provider
+- `LLM_CALLS_ENABLED=false` — disables Gemini, OpenAI, Codex, and local OpenAI-compatible LLM paths
+- `GEMINI_KEY` or `GEMINI_API_KEY` — optional LLM provider only when `LLM_CALLS_ENABLED=true`
 - `APP_SHADOW_MODE=true` — prevents live order submission (default on)
 - `APP_COLOR` — `blue` or `green` for blue/green deployment
 - `SELF_IMPROVE_CANARY_MAX_SECONDS` — max staged-canary lifetime before status becomes `stalled`

@@ -103,7 +103,8 @@ class Settings(BaseSettings):
     gemini_model_risk_officer: str = "gemini-2.5-flash"
     gemini_model_ops_monitor: str = "gemini-2.5-flash"
     gemini_model_memory_librarian: str = "gemini-2.5-flash"
-    active_agent_pack_version: str = "builtin-gemini-v1"
+    llm_calls_enabled: bool = False
+    active_agent_pack_version: str = "builtin-deterministic-v1"
     llm_request_timeout_seconds: float = 30.0
     llm_trading_enabled: bool = False
 
@@ -211,6 +212,7 @@ class Settings(BaseSettings):
     autonomous_gate_tuning_min_support: int = 30
     autonomous_gate_tuning_canary_min_settled_rows: int = 10
     autonomous_gate_tuning_canary_max_wait_hours: int = 72
+    autonomous_gate_tuning_periodic_interval_seconds: int = 3600
     weather_prediction_enabled: bool = False
     weather_source_ensemble_enabled: bool = True
     weather_source_disagreement_widen_f: float = 3.0
@@ -378,10 +380,10 @@ class Settings(BaseSettings):
     strategy_regression_min_clusters_for_ranking: int = 3
     strategy_regression_min_sortino_for_promotion: float = 0.5
     strategy_regression_sortino_downside_epsilon_dollars: float = 1.0
-    strategy_codex_nightly_enabled: bool = True
+    strategy_codex_nightly_enabled: bool = False
     strategy_codex_nightly_timezone: str = "America/Los_Angeles"
     strategy_codex_nightly_hour_local: int = 1
-    strategy_auto_evolve_enabled: bool = True
+    strategy_auto_evolve_enabled: bool = False
     strategy_auto_evolve_window_days: int = 180
     strategy_auto_evolve_assign_eligible: bool = False
     strategy_auto_evolve_accept_suggestions: bool = True

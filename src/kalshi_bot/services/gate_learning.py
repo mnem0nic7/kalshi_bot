@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import DecisionTraceRecord, Room
+from kalshi_bot.db.models import DecisionCorpusRowRecord, DecisionTraceRecord, Room
 
 
 SCHEMA_VERSION = "gate-learning-report-v1"
@@ -435,6 +435,98 @@ def _row_from_decision_trace(record: DecisionTraceRecord, room: Room | None = No
         current_gate_passed=bool(ticket),
         stale_data_mismatch=False,
         counterfactual_pnl_dollars=None,
+    )
+
+
+def _spread_bps_from_quote_snapshot(snapshot: dict[str, Any]) -> int | None:
+    yes_bid = _decimal_or_none(snapshot.get("yes_bid_dollars") or snapshot.get("yes_bid"))
+    yes_ask = _decimal_or_none(snapshot.get("yes_ask_dollars") or snapshot.get("yes_ask"))
+    spread = _decimal_or_none(snapshot.get("spread_dollars"))
+    spread_bps = _int_or_none(snapshot.get("spread_bps"))
+    if spread_bps is not None:
+        return spread_bps
+    if spread is not None:
+        return int((spread * Decimal("10000")).to_integral_value())
+    if yes_bid is not None and yes_ask is not None:
+        return int(((yes_ask - yes_bid) * Decimal("10000")).to_integral_value())
+    return None
+
+
+def decision_corpus_row_to_gate_learning_row(record: DecisionCorpusRowRecord) -> GateLearningRow | None:
+    market_ticker = str(record.market_ticker or "")
+    if not market_ticker:
+        return None
+    signal_payload = _dict(record.signal_payload)
+    quote_snapshot = _dict(record.quote_snapshot)
+    diagnostics = _dict(record.diagnostics)
+    settlement_payload = _dict(record.settlement_payload)
+    eligibility = _dict(signal_payload.get("eligibility"))
+    candidate_trace = _dict(signal_payload.get("candidate_trace") or eligibility.get("candidate_trace"))
+    selected = _selected_candidate(candidate_trace)
+
+    side = str(record.recommended_side or selected.get("side") or candidate_trace.get("selected_side") or "").lower() or None
+    yes_price = record.target_yes_price_dollars or signal_payload.get("target_yes_price_dollars") or selected.get("target_yes_price_dollars")
+    entry_price = _entry_price_for_side(side, yes_price, selected)
+    remaining_payout = _remaining_payout_bps(
+        eligibility.get("remaining_payout_dollars")
+        or selected.get("remaining_payout_dollars")
+        or (Decimal("1.0000") - entry_price if entry_price is not None else None)
+    )
+    edge_bps = _int_or_none(record.edge_bps or selected.get("edge_bps") or signal_payload.get("edge_bps"))
+    qa_edge = _int_or_none(
+        selected.get("quality_adjusted_edge_bps")
+        or eligibility.get("edge_after_quality_buffer_bps")
+        or signal_payload.get("quality_adjusted_edge_bps")
+    )
+    if qa_edge is None:
+        qa_edge = edge_bps
+    spread_bps = _int_or_none(selected.get("spread_bps") or eligibility.get("market_spread_bps"))
+    if spread_bps is None:
+        spread_bps = _spread_bps_from_quote_snapshot(quote_snapshot)
+    observed_at = (
+        _as_utc(record.created_at)
+        or _as_utc(settlement_payload.get("settlement_ts"))
+        or _as_utc(settlement_payload.get("updated_at"))
+        or _as_utc(record.checkpoint_ts)
+    )
+    pnl = _decimal_or_none(record.pnl_counterfactual_target_with_fees)
+    if pnl is None:
+        pnl = _decimal_or_none(record.pnl_counterfactual_target_frictionless)
+
+    return GateLearningRow(
+        source="decision_corpus",
+        room_id=str(record.room_id or "") or None,
+        market_ticker=market_ticker,
+        decision_time=_as_utc(record.checkpoint_ts),
+        market_day=str(record.local_market_day or "") or _market_day_from_ticker(market_ticker),
+        fair_yes_dollars=_decimal_or_none(record.fair_yes_dollars or signal_payload.get("fair_yes_dollars")),
+        settlement_result=str(record.settlement_result).lower() if record.settlement_result not in (None, "") else None,
+        settlement_value_dollars=_decimal_or_none(record.settlement_value_dollars),
+        settlement_ts=observed_at,
+        series_ticker=record.series_ticker or _series_from_ticker(market_ticker),
+        city=str(diagnostics.get("city") or diagnostics.get("city_bucket") or "") or None,
+        side=side,
+        entry_price=entry_price,
+        remaining_payout_bps=remaining_payout,
+        spread_bps=spread_bps,
+        confidence=_float_or_none(record.confidence or signal_payload.get("confidence")),
+        edge_bps=edge_bps,
+        quality_adjusted_edge_bps=qa_edge,
+        forecast_delta_f=_float_or_none(signal_payload.get("forecast_delta_f") or diagnostics.get("forecast_delta_f")),
+        trade_regime=str(record.trade_regime or signal_payload.get("trade_regime") or "") or None,
+        confidence_band=str(signal_payload.get("confidence_band") or _confidence_band(record.confidence) or "") or None,
+        spread_band=str(record.liquidity_regime or _spread_band(spread_bps) or "") or None,
+        forecast_delta_band=str(signal_payload.get("forecast_delta_band") or _forecast_delta_bucket(_float_or_none(signal_payload.get("forecast_delta_f"))) or "") or None,
+        primary_block_reason=str(
+            candidate_trace.get("primary_block_reason")
+            or candidate_trace.get("baseline_block_reason")
+            or record.stand_down_reason
+            or ""
+        ) or None,
+        blocked_by=str(record.eligibility_status or record.stand_down_reason or "") or None,
+        current_gate_passed=str(record.eligibility_status or "").lower() in {"eligible", "selected", "approved", "executed"},
+        stale_data_mismatch=bool(diagnostics.get("stale_data_mismatch")),
+        counterfactual_pnl_dollars=pnl,
     )
 
 

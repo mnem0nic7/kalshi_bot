@@ -33,6 +33,16 @@ class SelfImproveResult:
 
 logger = logging.getLogger(__name__)
 
+_AUTONOMOUS_GATE_FIELDS = (
+    "risk_min_contract_price_dollars",
+    "strategy_min_remaining_payout_bps",
+    "trigger_max_spread_bps",
+    "risk_min_confidence",
+    "risk_min_edge_bps",
+    "strategy_min_abs_delta_f",
+    "risk_max_credible_edge_bps",
+)
+
 
 class SelfImproveService:
     def __init__(
@@ -195,6 +205,7 @@ class SelfImproveService:
                 critiques.append(await self._critique_bundle(champion_pack, bundle))
             candidate = await self._build_candidate_pack(champion_pack, critiques, critique_run_id=critique_run.id)
             candidate = self.agent_pack_service.sanitize_candidate_pack(candidate, parent_version=champion_pack.version)
+            candidate = self._preserve_gate_threshold_authority(candidate, champion_pack)
             async with self.session_factory() as session:
                 repo = PlatformRepository(session)
                 await repo.update_agent_pack(candidate)
@@ -495,13 +506,8 @@ class SelfImproveService:
         *,
         critique_run_id: str,
     ) -> AgentPack:
-        avg_direction = self._average([item.directional_agreement for item in critiques])
         avg_risk = self._average([item.risk_compliance for item in critiques])
         thresholds = champion_pack.thresholds.model_copy(deep=True)
-        if avg_direction < 0.6:
-            thresholds.risk_min_edge_bps = (thresholds.risk_min_edge_bps or self.settings.risk_min_edge_bps) + 10
-        elif avg_direction > 0.8 and avg_risk > 0.9:
-            thresholds.risk_min_edge_bps = max(5, (thresholds.risk_min_edge_bps or self.settings.risk_min_edge_bps) - 5)
         if avg_risk < 0.7:
             thresholds.risk_max_order_notional_dollars = max(
                 5.0,
@@ -518,6 +524,23 @@ class SelfImproveService:
                     **champion_pack.metadata,
                     "critique_run_id": critique_run_id,
                     "weakness_count": sum(len(item.weaknesses) for item in critiques),
+                    "threshold_mutation_policy": "tunable_gate_thresholds_reserved_for_autonomous_gate_tuning",
+                },
+            }
+        )
+
+    @staticmethod
+    def _preserve_gate_threshold_authority(candidate: AgentPack, champion_pack: AgentPack) -> AgentPack:
+        threshold_updates = candidate.thresholds.model_dump(mode="json")
+        champion_thresholds = champion_pack.thresholds.model_dump(mode="json")
+        for field in _AUTONOMOUS_GATE_FIELDS:
+            threshold_updates[field] = champion_thresholds.get(field)
+        return candidate.model_copy(
+            update={
+                "thresholds": candidate.thresholds.model_copy(update=threshold_updates),
+                "metadata": {
+                    **dict(candidate.metadata or {}),
+                    "threshold_mutation_policy": "tunable_gate_thresholds_reserved_for_autonomous_gate_tuning",
                 },
             }
         )

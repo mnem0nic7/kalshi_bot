@@ -227,6 +227,11 @@ class ProviderRouter:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        if not settings.llm_calls_enabled:
+            self.gemini = None
+            self.hosted = None
+            self.local = None
+            return
         self.gemini = (
             NativeGeminiProvider(
                 ProviderConfig(
@@ -265,9 +270,12 @@ class ProviderRouter:
             await self.gemini.close()
         if self.hosted is not None:
             await self.hosted.close()
-        await self.local.close()
+        if self.local is not None:
+            await self.local.close()
 
     def default_role_runtime(self, role: AgentRole) -> AgentRoleRuntime:
+        if not self.settings.llm_calls_enabled:
+            return AgentRoleRuntime(provider="none", model=None, temperature=0.0)
         if self.gemini is not None and role in self.GEMINI_ROLE_DEFAULTS:
             default_model = getattr(self.settings, self.GEMINI_ROLE_DEFAULTS[role])
             return AgentRoleRuntime(provider="gemini", model=default_model, temperature=0.2)
@@ -276,6 +284,8 @@ class ProviderRouter:
         return AgentRoleRuntime(provider="local", model=self.settings.llm_local_model, temperature=0.2)
 
     def resolve_usage(self, *, role: AgentRole, role_config: AgentRoleRuntime | None = None) -> tuple[Any | None, ProviderUsage]:
+        if not self.settings.llm_calls_enabled:
+            return None, ProviderUsage(provider="none", model=None, temperature=0.0, fallback_used=True)
         config = role_config or self.default_role_runtime(role)
         requested_provider = config.provider.lower()
         temperature = config.temperature
@@ -295,7 +305,7 @@ class ProviderRouter:
                     fallback_used=(role_config is not None and role_config.provider.lower() not in {"hosted", "openai"}),
                 )
             requested_provider = "local"
-        if requested_provider == "local":
+        if requested_provider == "local" and self.local is not None:
             return self.local, ProviderUsage(
                 provider="local",
                 model=config.model or self.settings.llm_local_model,

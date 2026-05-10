@@ -322,7 +322,7 @@ Recovery actions are recorded in ops events and surfaced in `/api/status` plus t
 
 ## Self-improvement loop
 
-The Gemini-first runtime and versioned agent-pack system are documented in [self_improve.md](self_improve.md).
+The deterministic runtime and versioned agent-pack system are documented in [self_improve.md](self_improve.md). LLM-backed Strategy Codex and Strategy Auto-Evolve are disabled unless `LLM_CALLS_ENABLED=true`; autonomous gate tuning is deterministic and stages/promotes threshold changes through agent packs.
 
 Typical operator flow:
 

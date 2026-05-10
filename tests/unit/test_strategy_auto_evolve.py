@@ -196,6 +196,8 @@ def _dashboard_payload(*, assigned: str | None = None) -> dict:
 async def auto_evolve_harness(tmp_path):
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto-evolve.db",
+        llm_calls_enabled=True,
+        strategy_auto_evolve_enabled=True,
         strategy_codex_nightly_timezone="UTC",
         strategy_auto_evolve_activate_suggestions=True,
         strategy_auto_evolve_assign_eligible=True,
@@ -285,6 +287,17 @@ async def test_auto_evolve_accepts_activates_and_assigns(auto_evolve_harness) ->
     assert events[0].event_metadata["basis_run_at"] is not None
     assert checkpoint is not None
     assert checkpoint.payload["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_auto_evolve_skips_when_llm_calls_disabled(auto_evolve_harness) -> None:
+    auto_evolve_harness.settings.llm_calls_enabled = False
+    service = await auto_evolve_harness.build(codex=FakeCodexService())
+
+    result = await service.run_once(trigger_source="manual")
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "llm_calls_disabled"
 
 
 @pytest.mark.asyncio

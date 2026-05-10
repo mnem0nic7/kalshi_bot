@@ -122,7 +122,11 @@ async def test_strategy_codex_unique_strategy_name_uses_deterministic_suffixes()
 
 def test_strategy_codex_service_prefers_gemini_then_openai_when_available() -> None:
     service = StrategyCodexService(
-        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-gemini.db"),
+        Settings(
+            database_url="sqlite+aiosqlite:///./strategy-codex-gemini.db",
+            llm_calls_enabled=True,
+            llm_hosted_model="gpt-5.4",
+        ),
         SimpleNamespace(),
         SimpleNamespace(),
         FakeProviderRouter(gemini=object(), openai=object()),
@@ -143,7 +147,11 @@ def test_strategy_codex_service_prefers_gemini_then_openai_when_available() -> N
 
 def test_strategy_codex_service_uses_openai_when_gemini_unavailable() -> None:
     service = StrategyCodexService(
-        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-openai.db"),
+        Settings(
+            database_url="sqlite+aiosqlite:///./strategy-codex-openai.db",
+            llm_calls_enabled=True,
+            llm_hosted_model="gpt-5.4",
+        ),
         SimpleNamespace(),
         SimpleNamespace(),
         FakeProviderRouter(gemini=None, openai=object()),
@@ -160,7 +168,7 @@ def test_strategy_codex_service_uses_openai_when_gemini_unavailable() -> None:
 
 def test_strategy_codex_service_reports_unavailable_without_strategy_providers() -> None:
     service = StrategyCodexService(
-        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-none.db"),
+        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-none.db", llm_calls_enabled=True),
         SimpleNamespace(),
         SimpleNamespace(),
         FakeProviderRouter(gemini=None, openai=None),
@@ -168,6 +176,17 @@ def test_strategy_codex_service_reports_unavailable_without_strategy_providers()
 
     assert service.is_available() is False
     assert service._provider_options() == []
+
+
+def test_strategy_codex_service_reports_unavailable_when_llm_calls_disabled() -> None:
+    service = StrategyCodexService(
+        Settings(database_url="sqlite+aiosqlite:///./strategy-codex-disabled.db", llm_calls_enabled=False),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        FakeProviderRouter(gemini=object(), openai=object()),
+    )
+
+    assert service.is_available() is False
 
 
 def test_strategy_codex_json_safe_normalizes_decimal_payloads() -> None:
@@ -281,7 +300,7 @@ def test_decision_corpus_backtest_summary_stamps_corpus_and_assignment_baseline(
 
 @pytest.mark.asyncio
 async def test_strategy_codex_create_run_persists_selected_provider_and_model(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-codex-provider.db")
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-codex-provider.db", llm_calls_enabled=True)
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)
@@ -313,7 +332,11 @@ async def test_strategy_codex_create_run_persists_selected_provider_and_model(tm
 
 @pytest.mark.asyncio
 async def test_strategy_codex_create_run_persists_hosted_alias_as_openai(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-codex-hosted.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-codex-hosted.db",
+        llm_calls_enabled=True,
+        llm_hosted_model="gpt-5.4",
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)

@@ -175,9 +175,9 @@ Each workflow writes the PEM to a temporary file at runtime, runs REST plus WebS
 - Add required reviewers before the workflow can run
 - Move `LIVE_KALSHI_API_KEY` and `LIVE_KALSHI_PRIVATE_KEY_PEM` into that environment if you want the live credentials isolated from repo-wide secrets
 
-`Self Improve` runs a local offline guard test slice, then critiques and evaluates the last 14 days of shadow or demo rooms on the VPS. If the candidate pack passes the holdout gates, it writes a pending promotion checkpoint for the inactive color, restarts only that color, and lets the inactive daemon apply the new pack on startup before canary shadow rooms begin. Canary runs now carry a max window via `SELF_IMPROVE_CANARY_MAX_SECONDS`, and `self-improve status` marks them `stalled` if they sit too long without promotion or rollback. `Rollback Agent Pack` is manual-only and is designed to live behind the GitHub Actions `live` environment.
+`Self Improve` runs a local offline guard test slice, then critiques and evaluates the last 14 days of shadow or demo rooms on the VPS. It can adjust prompts and non-gate safety caps, but tunable gate thresholds are reserved for the deterministic `autonomous-gates` pipeline. Canary runs now carry a max window via `SELF_IMPROVE_CANARY_MAX_SECONDS`, and `self-improve status` marks them `stalled` if they sit too long without promotion or rollback. `Rollback Agent Pack` is manual-only and is designed to live behind the GitHub Actions `live` environment.
 
-`Sync Gemini Runtime` is the simplest way to use the repo Gemini secret on the VPS. It syncs `GEMINI_KEY` (or `GEMINI_API_KEY`) into the remote `.env`, recreates both app and daemon colors so Docker picks the new env up, and confirms the runtime can see the Gemini key.
+LLM calls are disabled by default with `LLM_CALLS_ENABLED=false`. `Sync Gemini Runtime` is only for an explicit LLM-enabled experiment; it syncs `GEMINI_KEY` (or `GEMINI_API_KEY`) into the remote `.env`, recreates both app and daemon colors so Docker picks the new env up, and confirms the runtime can see the Gemini key.
 
 ## Current defaults
 
@@ -194,8 +194,8 @@ Each workflow writes the PEM to a temporary file at runtime, runs REST plus WebS
 - Long-running daemon mode via `kalshi-bot-cli daemon`
 - Training-first corpus engine with research-health scoring, reproducible dataset builds, and readiness gates
 - Optional structured-weather shadow campaigns via `kalshi-bot-cli shadow-campaign run`
-- Gemini-first runtime routing for LLM-backed roles with local fallback
-- Versioned agent packs and GitHub Actions self-improvement loop
+- Deterministic `builtin-deterministic-v1` agent pack with provider `none` roles by default
+- Versioned agent packs, GitHub Actions self-improvement loop, and deterministic autonomous gate tuning
 - Host-native watchdog recovery with compose healthchecks and color failover
 
 ## Important safety note

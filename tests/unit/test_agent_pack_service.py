@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+import pytest
+
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
 from kalshi_bot.core.schemas import AgentPack, AgentPackThresholds
+from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.agent_packs import AgentPackService
 
 
-def test_agent_pack_service_builds_gemini_first_default_pack() -> None:
+def test_agent_pack_service_builds_deterministic_default_pack() -> None:
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
     service = AgentPackService(settings)
 
     pack = service.default_pack()
 
     assert pack.version == settings.active_agent_pack_version
-    assert pack.roles[AgentRole.RESEARCHER.value].provider == "gemini"
-    assert pack.roles[AgentRole.TRADER.value].model == settings.gemini_model_trader
+    assert pack.roles[AgentRole.RESEARCHER.value].provider == "none"
+    assert pack.roles[AgentRole.TRADER.value].model is None
     assert pack.thresholds.risk_min_contract_price_dollars == settings.risk_min_contract_price_dollars
     assert pack.thresholds.risk_min_confidence == settings.risk_min_confidence
     assert pack.thresholds.strategy_min_abs_delta_f == settings.strategy_min_abs_delta_f
@@ -82,3 +86,35 @@ def test_agent_pack_service_clamps_role_temperature() -> None:
     sanitized = service.sanitize_candidate_pack(AgentPack(**payload), parent_version="builtin")
 
     assert sanitized.roles[AgentRole.RESEARCHER.value].temperature == 1.0
+
+
+@pytest.mark.asyncio
+async def test_agent_pack_service_migrates_legacy_builtin_notes_to_deterministic(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/agent-packs.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = AgentPackService(settings)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        control = await repo.ensure_deployment_control(settings.app_color)
+        control.notes = {
+            "agent_packs": {
+                "blue_version": "builtin-gemini-v1",
+                "green_version": "autonomous-pack-v2",
+                "champion_version": "builtin-gemini-v1",
+                "active_version": "builtin-gemini-v1",
+            }
+        }
+        await service.ensure_initialized(repo)
+        migrated = await repo.get_deployment_control()
+        await session.commit()
+
+    notes = migrated.notes["agent_packs"]
+    assert notes["blue_version"] == "builtin-deterministic-v1"
+    assert notes["champion_version"] == "builtin-deterministic-v1"
+    assert notes["active_version"] == "builtin-deterministic-v1"
+    assert notes["green_version"] == "autonomous-pack-v2"
+
+    await engine.dispose()

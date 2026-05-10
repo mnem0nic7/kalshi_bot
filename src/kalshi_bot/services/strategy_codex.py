@@ -106,6 +106,8 @@ class StrategyCodexService:
             await self.providers.close()
 
     def is_available(self) -> bool:
+        if not self.settings.llm_calls_enabled:
+            return False
         return bool(self._provider_options())
 
     @staticmethod
@@ -233,14 +235,23 @@ class StrategyCodexService:
             if not strategy.is_active and strategy.source in LEGACY_STRATEGY_LAB_SOURCES
         ]
 
-        provider_options = self._provider_options()
+        provider_options = self._provider_options() if self.settings.llm_calls_enabled else []
         default_provider = provider_options[0] if provider_options else None
+        unavailable_reason = (
+            None
+            if default_provider
+            else "llm_calls_disabled"
+            if not self.settings.llm_calls_enabled
+            else "provider_unavailable"
+        )
         return {
             "available": bool(default_provider),
             "provider": default_provider["id"] if default_provider else "unavailable",
             "provider_label": default_provider["label"] if default_provider else "Unavailable",
             "model": default_provider["default_model"] if default_provider else None,
             "provider_options": provider_options,
+            "llm_calls_enabled": bool(self.settings.llm_calls_enabled),
+            "unavailable_reason": unavailable_reason,
             "creation_window_days": CODEX_CREATION_WINDOW_DAYS,
             "recent_runs": [self._compact_run_view(record) for record in recent_runs],
             "inactive_codex_strategies": inactive_codex_strategies,
@@ -253,6 +264,8 @@ class StrategyCodexService:
         dashboard_snapshot: dict[str, Any],
         trigger_source: str = "manual",
     ) -> dict[str, Any]:
+        if not self.settings.llm_calls_enabled:
+            raise RuntimeError("Strategy lab is unavailable because LLM calls are disabled")
         if not self.is_available():
             raise RuntimeError("Strategy lab provider is not available")
         if trigger_source not in CODEX_TRIGGER_SOURCES:

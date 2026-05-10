@@ -55,6 +55,7 @@ async def test_provider_router_prefers_gemini_when_available() -> None:
         Settings(
             database_url="sqlite+aiosqlite:///./test.db",
             gemini_api_key="test-key",
+            llm_calls_enabled=True,
             llm_local_base_url="http://localhost:11434/v1",
             llm_local_api_key="dummy",
         )
@@ -75,6 +76,7 @@ async def test_provider_router_falls_back_to_local_without_gemini_or_openai() ->
             database_url="sqlite+aiosqlite:///./test.db",
             gemini_api_key=None,
             llm_hosted_api_key=None,
+            llm_calls_enabled=True,
             llm_local_base_url="http://localhost:11434/v1",
             llm_local_api_key="dummy",
         )
@@ -94,6 +96,7 @@ async def test_provider_router_uses_openai_key_alias_and_never_builds_codex() ->
         database_url="sqlite+aiosqlite:///./test.db",
         gemini_api_key=None,
         OPENAI_API_KEY="openai-alias-key",
+        llm_calls_enabled=True,
     )
 
     assert settings.llm_hosted_api_key == "openai-alias-key"
@@ -176,6 +179,7 @@ def test_provider_router_uses_gemini_defaults_for_llm_roles() -> None:
         Settings(
             database_url="sqlite+aiosqlite:///./test.db",
             gemini_api_key="test-key",
+            llm_calls_enabled=True,
         )
     )
 
@@ -183,6 +187,52 @@ def test_provider_router_uses_gemini_defaults_for_llm_roles() -> None:
 
     assert runtime.provider == "gemini"
     assert runtime.model == "gemini-2.5-pro"
+
+
+@pytest.mark.asyncio
+async def test_provider_router_llm_disabled_never_builds_provider_clients() -> None:
+    router = ProviderRouter(
+        Settings(
+            database_url="sqlite+aiosqlite:///./test.db",
+            gemini_api_key="test-key",
+            llm_hosted_api_key="hosted-key",
+            llm_local_base_url="http://localhost:11434/v1",
+            llm_calls_enabled=False,
+        )
+    )
+
+    assert router.gemini is None
+    assert router.hosted is None
+    assert router.local is None
+
+    provider, usage = router.resolve_usage(
+        role=AgentRole.RESEARCHER,
+        role_config=AgentRoleRuntime(provider="gemini", model="gemini-test"),
+    )
+    assert provider is None
+    assert usage.provider == "none"
+    assert usage.model is None
+    assert usage.fallback_used is True
+
+    text, text_usage = await router.rewrite_with_metadata(
+        role=AgentRole.TRADER,
+        fallback_text="deterministic text",
+        system_prompt="system",
+        user_prompt="user",
+    )
+    assert text == "deterministic text"
+    assert text_usage.provider == "none"
+
+    payload, payload_usage = await router.complete_json_with_metadata(
+        role=AgentRole.RISK_OFFICER,
+        fallback_payload={"status": "deterministic"},
+        system_prompt="system",
+        user_prompt="user",
+    )
+    assert payload == {"status": "deterministic"}
+    assert payload_usage.provider == "none"
+
+    await router.close()
 
 
 @pytest.mark.asyncio

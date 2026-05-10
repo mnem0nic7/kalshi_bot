@@ -54,6 +54,7 @@ class ExecutionService:
         ticket: TradeTicket,
         client_order_id: str,
         fair_yes_dollars: Decimal | None = None,
+        min_edge_bps: int | None = None,
     ) -> ExecReceiptPayload:
         if self.settings.app_shadow_mode:
             return ExecReceiptPayload(
@@ -91,6 +92,7 @@ class ExecutionService:
                 ticket=ticket,
                 client_order_id=client_order_id,
                 fair_yes_dollars=fair_yes_dollars,
+                min_edge_bps=min_edge_bps,
             )
 
         return await self._place_order(ticket, client_order_id)
@@ -138,8 +140,10 @@ class ExecutionService:
         ticket: TradeTicket,
         client_order_id: str,
         fair_yes_dollars: Decimal | None,
+        min_edge_bps: int | None = None,
     ) -> ExecReceiptPayload:
-        min_edge = Decimal(str(self.settings.risk_min_edge_bps)) / Decimal("10000")
+        threshold_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
+        min_edge = Decimal(str(threshold_bps)) / Decimal("10000")
         current_ticket = ticket
 
         for attempt in range(1, _MAX_REQUOTES + 1):

@@ -119,28 +119,30 @@ The Evaluation Lab supports two providers for new runs: **Gemini** (primary) and
 
 | Provider | How it works |
 |----------|-------------|
-| Gemini | `NativeGeminiProvider` via `GEMINI_API_KEY` or the legacy `GEMINI_KEY` alias. Used by default when available. |
-| OpenAI | `OpenAICompatibleProvider` via `OPENAI_API_KEY` or `LLM_HOSTED_API_KEY`. Uses `LLM_HOSTED_BASE_URL` and `LLM_HOSTED_MODEL` for OpenAI-compatible overrides. |
+| None | Default deterministic runtime. `LLM_CALLS_ENABLED=false` prevents construction of Gemini, hosted OpenAI, and local OpenAI-compatible clients. |
+| Gemini | `NativeGeminiProvider` via `GEMINI_API_KEY` or the legacy `GEMINI_KEY` alias. Used only when `LLM_CALLS_ENABLED=true`. |
+| OpenAI | `OpenAICompatibleProvider` via `OPENAI_API_KEY` or `LLM_HOSTED_API_KEY`. Uses `LLM_HOSTED_BASE_URL` and `LLM_HOSTED_MODEL` for OpenAI-compatible overrides; used only when `LLM_CALLS_ENABLED=true`. |
 
 Config:
 ```
+LLM_CALLS_ENABLED=false     # hard default; disables all LLM-backed strategy lab calls
 GEMINI_API_KEY=...          # enables Gemini provider; GEMINI_KEY is also accepted
 OPENAI_API_KEY=...          # enables OpenAI provider; LLM_HOSTED_API_KEY is also accepted
 LLM_HOSTED_BASE_URL=https://api.openai.com/v1
 LLM_HOSTED_MODEL=gpt-5.4
 ```
 
-If neither provider is available, the Evaluation Lab is disabled (`is_available()` returns false).
+If LLM calls are disabled, or no enabled provider is available, the Evaluation Lab is disabled (`is_available()` returns false).
 
 ## Auto-Evolve Lifecycle
 
-Auto-Evolve is the production-on automation path for the Strategies page. It has one service entrypoint:
+Auto-Evolve is now a legacy LLM-backed strategy workflow and is off by default. It has one service entrypoint:
 
 ```
 StrategyAutoEvolveService.run_once(trigger_source="nightly" | "manual")
 ```
 
-Daily cadence:
+When explicitly enabled with `LLM_CALLS_ENABLED=true`, daily cadence is:
 
 1. The daemon reaches the local nightly target from `STRATEGY_CODEX_NIGHTLY_TIMEZONE` and `STRATEGY_CODEX_NIGHTLY_HOUR_LOCAL`.
 2. `_maybe_run_strategy_codex_nightly()` delegates to `StrategyAutoEvolveService` when `STRATEGY_AUTO_EVOLVE_ENABLED=true`.
@@ -159,9 +161,10 @@ Checkpoint names:
 | `strategy_regression` | Latest regression refresh used as the 180d evidence base |
 | `daemon_strategy_codex_nightly:{kalshi_env}:{app_color}` | Legacy nightly Codex checkpoint when Auto-Evolve is disabled |
 
-Default settings:
+Legacy opt-in settings for exercising the Auto-Evolve workflow:
 
 ```
+LLM_CALLS_ENABLED=true
 STRATEGY_AUTO_EVOLVE_ENABLED=true
 STRATEGY_AUTO_EVOLVE_WINDOW_DAYS=180
 STRATEGY_AUTO_EVOLVE_ACCEPT_SUGGESTIONS=true
@@ -169,9 +172,18 @@ STRATEGY_AUTO_EVOLVE_ACTIVATE_SUGGESTIONS=false
 STRATEGY_AUTO_EVOLVE_ASSIGN_ELIGIBLE=false
 ```
 
-That default is staged-only: suggestions may be evaluated and accepted as inactive presets, but activation and city assignment stay off until the remaining safety gates are explicitly verified.
+Current defaults keep this path off:
 
-Provider precedence is Gemini first, then OpenAI when available. Gemini requires `GEMINI_API_KEY` or `GEMINI_KEY`; OpenAI requires `OPENAI_API_KEY` or `LLM_HOSTED_API_KEY`. If no provider is available, Auto-Evolve writes a skipped checkpoint and does not mutate strategies or assignments.
+```
+LLM_CALLS_ENABLED=false
+STRATEGY_CODEX_NIGHTLY_ENABLED=false
+STRATEGY_AUTO_EVOLVE_ENABLED=false
+ACTIVE_AGENT_PACK_VERSION=builtin-deterministic-v1
+```
+
+When an operator explicitly enables LLM strategy evolution, the old staged-only posture still applies: suggestions may be evaluated and accepted as inactive presets, but activation and city assignment stay off until the remaining safety gates are explicitly verified.
+
+Provider precedence is Gemini first, then OpenAI when available, but only when `LLM_CALLS_ENABLED=true`. Gemini requires `GEMINI_API_KEY` or `GEMINI_KEY`; OpenAI requires `OPENAI_API_KEY` or `LLM_HOSTED_API_KEY`. If LLM calls are disabled or no provider is available, Auto-Evolve writes a skipped checkpoint and does not mutate strategies or assignments.
 
 Automatic mutations:
 
@@ -204,7 +216,7 @@ Failure modes:
 
 ### Nightly Evaluation
 
-When `STRATEGY_CODEX_NIGHTLY_ENABLED=true`, the daemon enters the nightly strategy window defined by `STRATEGY_CODEX_NIGHTLY_TIMEZONE` and `STRATEGY_CODEX_NIGHTLY_HOUR_LOCAL`. With Auto-Evolve enabled, that nightly path delegates to `StrategyAutoEvolveService` and writes `daemon_strategy_auto_evolve:{kalshi_env}`. With Auto-Evolve disabled, it falls back to the legacy Codex-only checkpoint `daemon_strategy_codex_nightly:{kalshi_env}:{app_color}`.
+When `STRATEGY_CODEX_NIGHTLY_ENABLED=true` and `LLM_CALLS_ENABLED=true`, the daemon enters the nightly strategy window defined by `STRATEGY_CODEX_NIGHTLY_TIMEZONE` and `STRATEGY_CODEX_NIGHTLY_HOUR_LOCAL`. With Auto-Evolve enabled, that nightly path delegates to `StrategyAutoEvolveService` and writes `daemon_strategy_auto_evolve:{kalshi_env}`. With Auto-Evolve disabled, it falls back to the legacy Codex-only checkpoint `daemon_strategy_codex_nightly:{kalshi_env}:{app_color}`.
 
 ---
 

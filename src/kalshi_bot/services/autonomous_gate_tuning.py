@@ -13,7 +13,11 @@ from kalshi_bot.core.schemas import AgentPack
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
 from kalshi_bot.services.backtesting import build_backtesting_report
-from kalshi_bot.services.gate_learning import GateLearningRow, GateLearningService
+from kalshi_bot.services.gate_learning import (
+    GateLearningRow,
+    GateLearningService,
+    decision_corpus_row_to_gate_learning_row,
+)
 from kalshi_bot.services.modeling import build_modeling_report
 
 
@@ -62,14 +66,31 @@ class AutonomousGateTuningService:
         env = kalshi_env or self.settings.kalshi_env
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=env)
+            await self.agent_pack_service.ensure_initialized(repo)
             checkpoint = await repo.get_checkpoint(_checkpoint_name(env))
             control = await repo.get_deployment_control()
+            active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+            active_thresholds = _threshold_values(self.agent_pack_service.runtime_thresholds(active_pack))
             await session.commit()
+        settings_thresholds = _settings_threshold_values(self.settings)
+        checkpoint_payload = checkpoint.payload if checkpoint is not None else None
         return {
-            "status": ((checkpoint.payload or {}).get("status") if checkpoint is not None else "not_started"),
+            "status": ((checkpoint_payload or {}).get("status") if checkpoint_payload is not None else "not_started"),
             "kalshi_env": env,
-            "checkpoint": checkpoint.payload if checkpoint is not None else None,
+            "llm_calls_enabled": bool(self.settings.llm_calls_enabled),
+            "deterministic_runtime": not bool(self.settings.llm_calls_enabled),
+            "active_color": control.active_color,
+            "active_pack_version": active_pack.version,
+            "active_thresholds": active_thresholds,
+            "settings_thresholds": settings_thresholds,
+            "threshold_drift": _threshold_drift(active_thresholds, settings_thresholds),
+            "checkpoint": checkpoint_payload,
             "agent_pack_notes": dict((control.notes or {}).get("agent_packs") or {}),
+            "last_recommendation": (checkpoint_payload or {}).get("recommendation_summary")
+            or (checkpoint_payload or {}).get("recommendation"),
+            "last_stage": _stage_summary(checkpoint_payload),
+            "last_canary": (checkpoint_payload or {}).get("canary") if checkpoint_payload else None,
+            "last_promotion": _promotion_summary(checkpoint_payload),
         }
 
     async def run(
@@ -219,11 +240,21 @@ class AutonomousGateTuningService:
             failures.append("backtesting_zero_rows")
         if modeling_rows <= 0:
             failures.append("modeling_zero_rows")
-        failures.extend(_fail_issue_codes(backtesting, prefix="backtesting"))
-        failures.extend(_fail_issue_codes(modeling, prefix="modeling"))
-        if str(backtesting.get("status")) == "fail":
+        backtesting_failures = _fail_issue_codes(
+            backtesting,
+            prefix="backtesting",
+            ignored_codes={"production_entry_freeze_disabled"},
+        )
+        modeling_failures = _fail_issue_codes(
+            modeling,
+            prefix="modeling",
+            ignored_codes={"production_entry_freeze_disabled"},
+        )
+        failures.extend(backtesting_failures)
+        failures.extend(modeling_failures)
+        if str(backtesting.get("status")) == "fail" and backtesting_failures:
             failures.append("backtesting_status_fail")
-        if str(modeling.get("status")) == "fail":
+        if str(modeling.get("status")) == "fail" and modeling_failures:
             failures.append("modeling_status_fail")
         return {
             "passed": not failures,
@@ -330,6 +361,11 @@ class AutonomousGateTuningService:
             "current_thresholds": current_thresholds,
             "candidate_thresholds": candidate_thresholds,
             "changes": changes,
+            "recommendation_summary": {
+                "row_counts": recommendation.get("row_counts"),
+                "source_files": recommendation.get("source_files"),
+                "confidence_warnings": recommendation.get("confidence_warnings") or [],
+            },
         }
         await repo.set_checkpoint(_checkpoint_name(kalshi_env), cursor=None, payload=checkpoint_payload)
         await repo.log_ops_event(
@@ -360,16 +396,20 @@ class AutonomousGateTuningService:
         now: datetime,
     ) -> dict[str, Any]:
         staged_at = _as_utc(checkpoint_payload.get("staged_at")) or now
+        records = await repo.list_current_decision_corpus_rows(kalshi_env=kalshi_env, limit=10000)
         rows = _canary_rows(
-            self.gate_learning_service_factory(self.settings).load_bundle_rows(
-                source=str(checkpoint_payload.get("source") or "combined")
-            ),
+            [
+                row
+                for record in records
+                if (row := decision_corpus_row_to_gate_learning_row(record)) is not None
+            ],
             staged_at=staged_at,
         )
         current_score = _score_threshold_rows(rows, dict(checkpoint_payload.get("current_thresholds") or {}))
         candidate_score = _score_threshold_rows(rows, dict(checkpoint_payload.get("candidate_thresholds") or {}))
         canary = {
             "settled_rows": len(rows),
+            "evidence_source": "live_decision_corpus",
             "candidate_selected_rows": candidate_score["selected_count"],
             "current_selected_rows": current_score["selected_count"],
             "candidate_net_pnl": _money(candidate_score["net_pnl"]),
@@ -586,6 +626,45 @@ def _threshold_values(thresholds: RuntimeThresholds) -> dict[str, Any]:
     return {field: getattr(thresholds, field) for field in TUNABLE_GATE_FIELDS}
 
 
+def _settings_threshold_values(settings: Settings) -> dict[str, Any]:
+    return {field: getattr(settings, field) for field in TUNABLE_GATE_FIELDS}
+
+
+def _threshold_drift(active_thresholds: dict[str, Any], settings_thresholds: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    drift: dict[str, dict[str, Any]] = {}
+    for field in TUNABLE_GATE_FIELDS:
+        active = active_thresholds.get(field)
+        baseline = settings_thresholds.get(field)
+        if active != baseline:
+            drift[field] = {"settings": baseline, "active": active}
+    return drift
+
+
+def _stage_summary(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not payload:
+        return None
+    if not payload.get("candidate_version"):
+        return None
+    return {
+        "status": payload.get("status"),
+        "candidate_version": payload.get("candidate_version"),
+        "previous_version": payload.get("previous_version"),
+        "staged_at": payload.get("staged_at"),
+        "changes": payload.get("changes") or {},
+        "evidence_fingerprint": payload.get("evidence_fingerprint"),
+    }
+
+
+def _promotion_summary(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not payload or payload.get("status") != "champion":
+        return None
+    return {
+        "candidate_version": payload.get("candidate_version"),
+        "previous_version": payload.get("previous_version"),
+        "promoted_at": payload.get("promoted_at"),
+    }
+
+
 def _candidate_threshold_values(
     recommendation: dict[str, Any],
     runtime_thresholds: RuntimeThresholds,
@@ -630,11 +709,17 @@ def _evidence_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _fail_issue_codes(report: dict[str, Any], *, prefix: str) -> list[str]:
+def _fail_issue_codes(
+    report: dict[str, Any],
+    *,
+    prefix: str,
+    ignored_codes: set[str] | None = None,
+) -> list[str]:
+    ignored = ignored_codes or set()
     return [
         f"{prefix}:{issue.get('code') or 'unknown'}"
         for issue in report.get("issues") or []
-        if isinstance(issue, dict) and issue.get("severity") == "fail"
+        if isinstance(issue, dict) and issue.get("severity") == "fail" and str(issue.get("code") or "unknown") not in ignored
     ]
 
 
