@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_FLOOR
 from typing import Any
@@ -336,17 +336,7 @@ def thresholds_with_production_freeze_floor(
     floor = int(settings.trade_behavior_freeze_min_edge_bps)
     if int(thresholds.risk_min_edge_bps) >= floor:
         return thresholds
-    return RuntimeThresholds(
-        risk_min_edge_bps=floor,
-        risk_max_order_notional_dollars=thresholds.risk_max_order_notional_dollars,
-        risk_max_position_notional_dollars=thresholds.risk_max_position_notional_dollars,
-        risk_safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
-        risk_risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
-        trigger_max_spread_bps=thresholds.trigger_max_spread_bps,
-        trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds,
-        strategy_quality_edge_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
-        strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
-    )
+    return replace(thresholds, risk_min_edge_bps=floor)
 
 
 async def evaluate_empirical_gate(

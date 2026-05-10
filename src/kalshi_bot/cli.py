@@ -68,6 +68,11 @@ from kalshi_bot.services.backtesting import (
 )
 from kalshi_bot.services.model_quality import build_model_quality_report, format_model_quality_report
 from kalshi_bot.services.modeling import build_modeling_report, format_modeling_report
+from kalshi_bot.services.gate_learning import (
+    GateLearningService,
+    format_gate_learning_report,
+    format_gate_recommendation_report,
+)
 from kalshi_bot.services.overnight_readiness import (
     OvernightReadinessService,
     format_overnight_readiness_report,
@@ -1234,6 +1239,56 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 )
             return 0
 
+        if args.command == "gate-learning":
+            service = GateLearningService(container.settings)
+            if args.gate_learning_command == "report":
+                async with container.session_factory() as session:
+                    report = await service.build_report(
+                        kalshi_env=args.kalshi_env,
+                        days=args.days,
+                        source=args.source,
+                        min_support=args.min_support,
+                        session=session,
+                    )
+                if args.format == "json":
+                    print(json.dumps(report, indent=2))
+                else:
+                    print(format_gate_learning_report(report))
+                return 0
+            if args.gate_learning_command == "recommend":
+                report = await service.build_recommendation_report(
+                    kalshi_env=args.kalshi_env,
+                    days=args.days,
+                    source=args.source,
+                    min_support=args.min_support,
+                )
+                if args.format == "json":
+                    print(json.dumps(report, indent=2))
+                else:
+                    print(format_gate_recommendation_report(report))
+                return 0
+            raise ValueError(f"unknown gate-learning command {args.gate_learning_command}")
+
+        if args.command == "autonomous-gates":
+            if args.autonomous_gates_command == "status":
+                payload = await container.autonomous_gate_tuning_service.status(kalshi_env=args.kalshi_env)
+            elif args.autonomous_gates_command == "run":
+                payload = await container.autonomous_gate_tuning_service.run(
+                    kalshi_env=args.kalshi_env,
+                    source=args.source,
+                    days=args.days,
+                    min_support=args.min_support,
+                    dry_run=args.dry_run,
+                    triggered_by="cli",
+                )
+            else:
+                raise ValueError(f"unknown autonomous-gates command {args.autonomous_gates_command}")
+            if args.format == "json":
+                print(json.dumps(payload, indent=2, default=str))
+            else:
+                print(json.dumps(payload, indent=2, default=str))
+            return 0
+
         if args.command == "decision-policy-variants-audit":
             async with container.session_factory() as session:
                 stmt = (
@@ -1402,6 +1457,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "modeling":
             modeling_days = 3650 if args.full_history else args.days
+            modeling_row_limit = None if args.source == "gate-learning-bundles" else args.limit if args.limit and args.limit > 0 else None
             report = await build_modeling_report(
                 settings=container.settings,
                 decision_corpus_service=container.decision_corpus_service,
@@ -1410,8 +1466,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 kalshi_env=args.kalshi_env,
                 days=modeling_days,
                 command=args.modeling_command,
+                dataset_source=args.source,
                 limit=args.limit,
-                row_limit=args.limit if args.limit and args.limit > 0 else None,
+                row_limit=modeling_row_limit,
             )
             if args.json:
                 print(json.dumps(report, indent=2))
@@ -1423,6 +1480,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "backtesting":
             backtesting_days = 3650 if args.full_history else args.days
+            backtesting_row_limit = (
+                None
+                if args.dataset_source == "gate-learning-bundles"
+                else args.limit if args.limit and args.limit > 0 else None
+            )
             report = await build_backtesting_report(
                 settings=container.settings,
                 session_factory=container.session_factory,
@@ -1434,7 +1496,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 command=args.backtesting_command,
                 dataset_source=args.dataset_source,
                 limit=args.limit,
-                row_limit=args.limit if args.limit and args.limit > 0 else None,
+                row_limit=backtesting_row_limit,
             )
             if args.output:
                 write_backtesting_report(report, Path(args.output))
@@ -2176,6 +2238,29 @@ def build_parser() -> argparse.ArgumentParser:
     policy_audit.add_argument("--limit", type=int, default=500)
     policy_audit.add_argument("--format", choices=["csv", "json"], default="json")
 
+    gate_learning = subparsers.add_parser("gate-learning")
+    gate_learning_subparsers = gate_learning.add_subparsers(dest="gate_learning_command", required=True)
+    for name in ("report", "recommend"):
+        gate_learning_command = gate_learning_subparsers.add_parser(name)
+        gate_learning_command.add_argument("--kalshi-env", default="production")
+        gate_learning_command.add_argument("--days", type=int, default=180)
+        gate_learning_command.add_argument("--format", choices=["json", "md"], default="json")
+        gate_learning_command.add_argument("--source", choices=["historical", "forward-shadow", "combined"], default="combined")
+        gate_learning_command.add_argument("--min-support", type=int, default=None)
+
+    autonomous_gates = subparsers.add_parser("autonomous-gates")
+    autonomous_gate_subparsers = autonomous_gates.add_subparsers(dest="autonomous_gates_command", required=True)
+    autonomous_gate_run = autonomous_gate_subparsers.add_parser("run")
+    autonomous_gate_run.add_argument("--kalshi-env", default="production")
+    autonomous_gate_run.add_argument("--source", choices=["historical", "forward-shadow", "combined"], default=None)
+    autonomous_gate_run.add_argument("--days", type=int, default=None)
+    autonomous_gate_run.add_argument("--min-support", type=int, default=None)
+    autonomous_gate_run.add_argument("--dry-run", action="store_true")
+    autonomous_gate_run.add_argument("--format", choices=["json"], default="json")
+    autonomous_gate_status = autonomous_gate_subparsers.add_parser("status")
+    autonomous_gate_status.add_argument("--kalshi-env", default="production")
+    autonomous_gate_status.add_argument("--format", choices=["json"], default="json")
+
     stream = subparsers.add_parser("stream")
     stream.add_argument("--markets", nargs="*", default=None)
     stream.add_argument("--public-only", action="store_true")
@@ -2420,6 +2505,7 @@ def build_parser() -> argparse.ArgumentParser:
             default=20,
             help="Bound rows and bucket output; use 0 for an unbounded dataset pass.",
         )
+        modeling_command.add_argument("--source", choices=["trade-analysis", "gate-learning-bundles"], default="trade-analysis")
         modeling_command.add_argument("--json", action="store_true")
 
     backtesting = subparsers.add_parser(
@@ -2440,7 +2526,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         backtesting_command.add_argument(
             "--dataset-source",
-            choices=["auto", "trade-analysis", "decision-corpus"],
+            choices=["auto", "trade-analysis", "decision-corpus", "gate-learning-bundles"],
             default="auto",
         )
         backtesting_command.add_argument("--json", action="store_true")

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from kalshi_bot.config import Settings
 from kalshi_bot.services.backtesting import evaluate_walk_forward_backtest, normalize_trade_analysis_row
+from kalshi_bot.services.gate_learning import GateLearningService, gate_learning_rows_to_backtesting_rows
 from kalshi_bot.services.signal import StrategySignal
 from kalshi_bot.services.trade_behavior import production_entry_freeze_enabled
 from kalshi_bot.services.trade_behavior_quality import (
@@ -664,6 +665,7 @@ async def build_modeling_report(
     kalshi_env: str = "demo",
     days: int = 180,
     command: str = "backtest",
+    dataset_source: str = "trade-analysis",
     limit: int = 20,
     row_limit: int | None = None,
     now: datetime | None = None,
@@ -673,11 +675,32 @@ async def build_modeling_report(
         corpus = await decision_corpus_service.current(kalshi_env=kalshi_env)
     except Exception as exc:
         corpus = {"status": "error", "kalshi_env": kalshi_env, "error": str(exc), "build": None}
-    dataset = await trade_analysis_service.build_dataset(kalshi_env=kalshi_env, days=days, limit=row_limit)
+    if dataset_source == "gate-learning-bundles":
+        gate_service = GateLearningService(settings)
+        now_utc = now or datetime.now(UTC)
+        now_utc = now_utc.replace(tzinfo=UTC) if now_utc.tzinfo is None else now_utc.astimezone(UTC)
+        cutoff = now_utc - timedelta(days=days)
+        bundle_rows = [
+            row for row in gate_service.load_bundle_rows(source="combined")
+            if row.decision_time is None or row.decision_time >= cutoff
+        ]
+        normalized_rows = gate_learning_rows_to_backtesting_rows(bundle_rows, kalshi_env=kalshi_env)
+        if row_limit is not None:
+            normalized_rows = normalized_rows[:row_limit]
+        dataset_rows: list[dict[str, Any]] = []
+        dataset_summary = {
+            "source": "gate-learning-bundles",
+            "row_count": len(normalized_rows),
+            "source_files": gate_service.source_files(source="combined"),
+        }
+    else:
+        dataset = await trade_analysis_service.build_dataset(kalshi_env=kalshi_env, days=days, limit=row_limit)
+        dataset_rows = list(dataset.rows)
+        normalized_rows = [normalize_trade_analysis_row(row) for row in dataset.rows]
+        dataset_summary = {"source": "trade-analysis", "row_count": len(dataset.rows)}
     audit = {"lifecycle": {}}
-    if command != "status" and row_limit is None:
+    if command != "status" and row_limit is None and dataset_source != "gate-learning-bundles":
         audit = await trading_audit_service.build_report(kalshi_env=kalshi_env, days=days)
-    normalized_rows = [normalize_trade_analysis_row(row) for row in dataset.rows]
     walk_forward = evaluate_walk_forward_backtest(normalized_rows, settings=settings)
     prediction = _prediction_from_walk_forward(
         walk_forward,
@@ -689,8 +712,8 @@ async def build_modeling_report(
     )
     lifecycle = dict(audit.get("lifecycle") or {})
     bucket_rows = list(lifecycle.get("buckets") or [])
-    if not bucket_rows:
-        bucket_rows = _dataset_bucket_matrix(dataset.rows)
+    if not bucket_rows and dataset_rows:
+        bucket_rows = _dataset_bucket_matrix(dataset_rows)
     annotated_buckets = annotate_bucket_matrix(
         bucket_rows,
         settings=settings,
@@ -721,7 +744,7 @@ async def build_modeling_report(
         "demo_exploratory": str(kalshi_env).lower() == "demo",
         "decision_corpus": corpus,
         "dataset": {
-            "row_count": len(dataset.rows),
+            **dataset_summary,
             "prediction_eligible_rows": int(prediction.get("eligible_rows") or 0),
             "trade_selection_eligible_rows": int(selection.get("eligible_rows") or 0),
         },

@@ -384,12 +384,17 @@ class AgentPackMemoryConfig(BaseModel):
 
 class AgentPackThresholds(BaseModel):
     risk_min_edge_bps: int | None = None
+    risk_max_credible_edge_bps: int | None = None
+    risk_min_confidence: float | None = None
+    risk_min_contract_price_dollars: float | None = None
     risk_max_order_notional_dollars: float | None = None
     risk_max_position_notional_dollars: float | None = None
     risk_safe_capital_reserve_ratio: float | None = None
     risk_risky_capital_max_ratio: float | None = None
     trigger_max_spread_bps: int | None = None
     trigger_cooldown_seconds: int | None = None
+    strategy_min_abs_delta_f: float | None = None
+    strategy_min_remaining_payout_bps: int | None = None
 
 
 class AgentPack(BaseModel):

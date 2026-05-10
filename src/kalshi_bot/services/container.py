@@ -35,6 +35,7 @@ from kalshi_bot.services.historical_pipeline import HistoricalPipelineService
 from kalshi_bot.services.historical_training import HistoricalTrainingService
 from kalshi_bot.services.memory import MemoryService
 from kalshi_bot.services.auto_trigger import AutoTriggerService
+from kalshi_bot.services.autonomous_gate_tuning import AutonomousGateTuningService
 from kalshi_bot.services.daemon import DaemonService
 from kalshi_bot.services.decision_corpus import DecisionCorpusService
 from kalshi_bot.services.decision_corpus_calibration import DecisionCorpusCalibrationReportService
@@ -99,6 +100,7 @@ class AppContainer:
     research_coordinator: ResearchCoordinator
     research_health_backfill_service: ResearchHealthBackfillService
     auto_trigger_service: AutoTriggerService
+    autonomous_gate_tuning_service: AutonomousGateTuningService
     daemon_service: DaemonService
     decision_corpus_service: DecisionCorpusService
     decision_corpus_calibration_service: DecisionCorpusCalibrationReportService
@@ -409,6 +411,14 @@ class AppContainer:
             weather_directory,
             trading_audit_service=trading_audit_service,
         )
+        autonomous_gate_tuning_service = AutonomousGateTuningService(
+            settings=settings,
+            session_factory=session_factory,
+            agent_pack_service=agent_pack_service,
+            decision_corpus_service=decision_corpus_service,
+            trade_analysis_service=trade_analysis_service,
+            trading_audit_service=trading_audit_service,
+        )
         strategy_auto_evolve_service = StrategyAutoEvolveService(
             settings=settings,
             session_factory=session_factory,
@@ -442,6 +452,7 @@ class AppContainer:
             historical_pipeline_service=historical_pipeline_service,
             market_history_service=market_history_service,
             strategy_eval_service=strategy_eval_service,
+            autonomous_gate_tuning_service=autonomous_gate_tuning_service,
             strategy_regression_service=strategy_regression_service,
             strategy_cleanup_service=strategy_cleanup_service,
             monotonicity_arb_service=monotonicity_arb_service,
@@ -480,6 +491,7 @@ class AppContainer:
             research_coordinator=research_coordinator,
             research_health_backfill_service=research_health_backfill_service,
             auto_trigger_service=auto_trigger_service,
+            autonomous_gate_tuning_service=autonomous_gate_tuning_service,
             daemon_service=daemon_service,
             decision_corpus_service=decision_corpus_service,
             decision_corpus_calibration_service=decision_corpus_calibration_service,

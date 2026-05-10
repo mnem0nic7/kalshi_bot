@@ -15,6 +15,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.db.models import OrderRecord, Room, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.fee_model import current_fee_model_version, estimate_kalshi_taker_fee_dollars
+from kalshi_bot.services.gate_learning import GateLearningService, gate_learning_rows_to_backtesting_rows
 from kalshi_bot.services.market_snapshot_archive import (
     DAEMON_MARKET_PRICE_SOURCE_KIND,
     DECISION_SIGNAL_MARKET_SOURCE_KIND,
@@ -1012,6 +1013,32 @@ async def _load_rows(
     if source == "decision-corpus":
         corpus, rows = await _decision_corpus_rows(session_factory=session_factory, kalshi_env=kalshi_env, limit=row_limit)
         dataset = {"source": "decision-corpus", "row_count": len(rows)}
+        return dataset, corpus, rows
+    if source == "gate-learning-bundles":
+        service = GateLearningService(settings)
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        bundle_rows = [
+            row for row in service.load_bundle_rows(source="combined")
+            if row.decision_time is None or row.decision_time >= cutoff
+        ]
+        rows = gate_learning_rows_to_backtesting_rows(bundle_rows, kalshi_env=kalshi_env)
+        if row_limit is not None:
+            rows = rows[:row_limit]
+        dataset = {
+            "source": "gate-learning-bundles",
+            "row_count": len(rows),
+            "window_days": days,
+            "source_files": service.source_files(source="combined"),
+        }
+        corpus = {
+            "status": "ok",
+            "kalshi_env": kalshi_env,
+            "build": {
+                "id": "gate-learning-bundles",
+                "status": "read_only",
+                "row_count": len(rows),
+            },
+        }
         return dataset, corpus, rows
     dataset_obj = await trade_analysis_service.build_dataset(kalshi_env=kalshi_env, days=days, limit=row_limit)
     rows = [normalize_trade_analysis_row(row) for row in dataset_obj.rows]

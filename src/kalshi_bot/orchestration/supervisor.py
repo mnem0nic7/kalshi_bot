@@ -1214,6 +1214,10 @@ class WorkflowSupervisor:
                     strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
                     risk_safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
                     risk_risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
+                    risk_max_credible_edge_bps=thresholds.risk_max_credible_edge_bps,
+                    risk_min_confidence=thresholds.risk_min_confidence,
+                    risk_min_contract_price_dollars=thresholds.risk_min_contract_price_dollars,
+                    strategy_min_abs_delta_f=thresholds.strategy_min_abs_delta_f,
                 )
                 trace_thresholds = effective_thresholds
                 portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
@@ -1637,6 +1641,10 @@ class WorkflowSupervisor:
                                 strategy_min_remaining_payout_bps=int(d["strategy_min_remaining_payout_bps"]),
                                 risk_safe_capital_reserve_ratio=float(d["risk_safe_capital_reserve_ratio"]),
                                 risk_risky_capital_max_ratio=float(d["risk_risky_capital_max_ratio"]),
+                                risk_max_credible_edge_bps=thresholds.risk_max_credible_edge_bps,
+                                risk_min_confidence=thresholds.risk_min_confidence,
+                                risk_min_contract_price_dollars=thresholds.risk_min_contract_price_dollars,
+                                strategy_min_abs_delta_f=thresholds.strategy_min_abs_delta_f,
                             )
                             thresholds = thresholds_with_production_freeze_floor(
                                 settings=self.settings,
@@ -1697,6 +1705,7 @@ class WorkflowSupervisor:
                         market_response,
                         weather_bundle,
                         min_edge_bps=thresholds.risk_min_edge_bps,
+                        thresholds=thresholds,
                     )
                     signal.candidate_trace = {
                         **dict(signal.candidate_trace or {}),
@@ -2222,6 +2231,10 @@ class WorkflowSupervisor:
                             trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds,
                             strategy_quality_edge_buffer_bps=thresholds.strategy_quality_edge_buffer_bps,
                             strategy_min_remaining_payout_bps=thresholds.strategy_min_remaining_payout_bps,
+                            risk_max_credible_edge_bps=thresholds.risk_max_credible_edge_bps,
+                            risk_min_confidence=thresholds.risk_min_confidence,
+                            risk_min_contract_price_dollars=thresholds.risk_min_contract_price_dollars,
+                            strategy_min_abs_delta_f=thresholds.strategy_min_abs_delta_f,
                         )
                         portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
                             kalshi_env=room.kalshi_env,

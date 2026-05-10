@@ -128,7 +128,7 @@ def test_trade_recommendation_filters_both_sides_below_price_floor() -> None:
 
 
 def test_low_price_high_edge_policy_selects_candidate_when_live_enabled() -> None:
-    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", low_price_high_edge_live_enabled=True)
 
     action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
         fair_yes_dollars=Decimal("0.3000"),
@@ -191,7 +191,7 @@ def test_policy_variants_all_disabled_preserve_baseline_candidate_filtering() ->
 
 
 def test_remaining_payout_policy_selects_candidate_when_live_enabled() -> None:
-    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", remaining_payout_relaxation_live_enabled=True)
 
     action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
         fair_yes_dollars=Decimal("0.9900"),
@@ -209,7 +209,7 @@ def test_remaining_payout_policy_selects_candidate_when_live_enabled() -> None:
 
 
 def test_remaining_payout_policy_passes_eligibility_before_risk_engine() -> None:
-    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", remaining_payout_relaxation_live_enabled=True)
     market_snapshot = {"market": {"yes_bid_dollars": "0.7900", "yes_ask_dollars": "0.8000", "no_ask_dollars": "0.2000"}}
     action, side, target_yes, edge_bps, trace = _trade_recommendation_with_trace(
         fair_yes_dollars=Decimal("0.9900"),

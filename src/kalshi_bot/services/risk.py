@@ -190,6 +190,9 @@ class DeterministicRiskEngine:
         research_observed_at = self._as_utc(context.research_observed_at)
         active_thresholds = thresholds or RuntimeThresholds(
             risk_min_edge_bps=self.settings.risk_min_edge_bps,
+            risk_max_credible_edge_bps=self.settings.risk_max_credible_edge_bps,
+            risk_min_confidence=self.settings.risk_min_confidence,
+            risk_min_contract_price_dollars=self.settings.risk_min_contract_price_dollars,
             risk_max_order_notional_dollars=self.settings.risk_max_order_notional_dollars,
             risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
             risk_safe_capital_reserve_ratio=self.settings.risk_safe_capital_reserve_ratio,
@@ -197,6 +200,7 @@ class DeterministicRiskEngine:
             trigger_max_spread_bps=self.settings.trigger_max_spread_bps,
             trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
             strategy_quality_edge_buffer_bps=self.settings.strategy_quality_edge_buffer_bps,
+            strategy_min_abs_delta_f=self.settings.strategy_min_abs_delta_f,
             strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
         )
         capital_bucket = signal.capital_bucket or "safe"
@@ -255,7 +259,7 @@ class DeterministicRiskEngine:
                 block(reason)
         if signal.edge_bps < active_thresholds.risk_min_edge_bps:
             block(f"Edge {signal.edge_bps}bps is below configured minimum of {active_thresholds.risk_min_edge_bps}bps.")
-        if signal.edge_bps > self.settings.risk_max_credible_edge_bps:
+        if signal.edge_bps > active_thresholds.risk_max_credible_edge_bps:
             extreme_diag = candidate_trace.get("extreme_edge_diagnostic")
             validated_extreme_edge = (
                 candidate_trace.get("validated_extreme_edge") is True
@@ -280,7 +284,7 @@ class DeterministicRiskEngine:
             else:
                 block(
                     f"Edge {signal.edge_bps}bps exceeds credibility limit of "
-                    f"{self.settings.risk_max_credible_edge_bps}bps; likely model error."
+                    f"{active_thresholds.risk_max_credible_edge_bps}bps; likely model error."
                 )
                 code("max_credible_edge")
                 diagnostics["max_credible_edge"] = _max_credible_edge_diagnostics(
@@ -288,12 +292,12 @@ class DeterministicRiskEngine:
                     signal=signal,
                     context=context,
                 )
-        if signal.confidence < self.settings.risk_min_confidence:
+        if signal.confidence < active_thresholds.risk_min_confidence:
             block(
                 f"Signal confidence {signal.confidence:.2f} is below minimum "
-                f"{self.settings.risk_min_confidence:.2f}."
+                f"{active_thresholds.risk_min_confidence:.2f}."
             )
-        baseline_min_price = Decimal(str(self.settings.risk_min_contract_price_dollars))
+        baseline_min_price = Decimal(str(active_thresholds.risk_min_contract_price_dollars))
         min_price = baseline_min_price
         if policy_variant_applied(candidate_trace, LOW_PRICE_HIGH_EDGE) and policy_service.live_enabled(LOW_PRICE_HIGH_EDGE):
             min_price = Decimal(str(self.settings.low_price_variant_min_entry_price_dollars))
@@ -323,10 +327,7 @@ class DeterministicRiskEngine:
             )
             code("low_price_policy_variant_applied")
         remaining_payout = remaining_payout_dollars(ticket.side, ticket.yes_price_dollars)
-        baseline_minimum_remaining_payout_bps = max(
-            int(active_thresholds.strategy_min_remaining_payout_bps),
-            int(self.settings.strategy_min_remaining_payout_bps),
-        )
+        baseline_minimum_remaining_payout_bps = int(active_thresholds.strategy_min_remaining_payout_bps)
         if (
             policy_variant_applied(candidate_trace, REMAINING_PAYOUT_RELAXATION)
             and policy_service.live_enabled(REMAINING_PAYOUT_RELAXATION)

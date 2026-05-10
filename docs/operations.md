@@ -47,6 +47,14 @@ Use `infra/scripts/restart-color.sh --refresh-caddy <demo|production|all> <blue|
 
 Always migrate before enabling the watchdog timer on an already-running deployment, because the runtime now depends on the newer agent-pack tables and checkpoints.
 
+After gate-tuning changes, run a dry autonomous validation before restarting live services:
+
+```bash
+kalshi-bot-cli autonomous-gates run --kalshi-env production --source combined --days 3650 --dry-run --format json
+```
+
+The command should either return `dry_run` with a passing validation payload, or an explicit safety failure such as production entry freeze being disabled. Do not hand-edit `.env` to apply learned gate thresholds; promoted thresholds live in agent packs and are applied by the settlement-triggered autonomous canary flow.
+
 Deploy finding from April 12, 2026:
 
 - rebuilding `app_*` or `daemon_*` alone is not enough when a new Alembic revision has been added
@@ -323,6 +331,8 @@ kalshi-bot-cli self-improve status
 kalshi-bot-cli self-improve critique --days 14 --limit 200
 kalshi-bot-cli self-improve eval --candidate-version <VERSION> --days 14 --limit 200
 kalshi-bot-cli self-improve promote --evaluation-run-id <EVALUATION_RUN_ID>
+kalshi-bot-cli autonomous-gates status --kalshi-env production --format json
+kalshi-bot-cli autonomous-gates run --kalshi-env production --source combined --days 3650 --dry-run --format json
 ```
 
 For Docker blue or green deployments, the helper scripts mirror the same flow:

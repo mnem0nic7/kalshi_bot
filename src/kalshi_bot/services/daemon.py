@@ -16,6 +16,7 @@ from kalshi_bot.core.schemas import HistoricalIntelligenceRunRequest, ShadowCamp
 from kalshi_bot.crypto.services import CryptoAutonomyService, CryptoHistoryService, CryptoSpotService
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.auto_trigger import AutoTriggerService
+from kalshi_bot.services.autonomous_gate_tuning import AutonomousGateTuningService
 from kalshi_bot.services.discovery import DiscoveryService
 from kalshi_bot.services.historical_training import HistoricalTrainingService
 from kalshi_bot.services.historical_intelligence import HistoricalIntelligenceService
@@ -63,6 +64,7 @@ class DaemonService:
         historical_pipeline_service: HistoricalPipelineService | None = None,
         market_history_service: MarketHistoryService | None = None,
         strategy_eval_service: StrategyEvaluationService | None = None,
+        autonomous_gate_tuning_service: AutonomousGateTuningService | None = None,
         strategy_regression_service: StrategyRegressionService | None = None,
         stop_loss_service: StopLossService | None = None,
         strategy_cleanup_service: StrategyCleanupService | None = None,
@@ -93,6 +95,7 @@ class DaemonService:
         self.historical_pipeline_service = historical_pipeline_service
         self.market_history_service = market_history_service
         self.strategy_eval_service = strategy_eval_service
+        self.autonomous_gate_tuning_service = autonomous_gate_tuning_service
         self.strategy_regression_service = strategy_regression_service
         self.strategy_cleanup_service = strategy_cleanup_service
         self.monotonicity_arb_service = monotonicity_arb_service
@@ -153,10 +156,17 @@ class DaemonService:
                 logger.info("Vacuumed %d memory notes older than %d days", purged, self.settings.daemon_memory_note_retention_days)
             await session.commit()
         result = asdict(summary)
-        if summary.settlements_count > 0 and self.strategy_eval_service is not None:
-            adjustment = await self.strategy_eval_service.maybe_adjust()
-            if adjustment:
-                result["edge_adjustment"] = adjustment
+        if summary.settlements_count > 0:
+            if self.settings.autonomous_gate_tuning_enabled and self.autonomous_gate_tuning_service is not None:
+                result["autonomous_gate_tuning"] = await self.autonomous_gate_tuning_service.run(
+                    kalshi_env=self.settings.kalshi_env,
+                    source=self.settings.autonomous_gate_tuning_source,
+                    days=self.settings.autonomous_gate_tuning_days,
+                    min_support=self.settings.autonomous_gate_tuning_min_support,
+                    triggered_by="settlement_reconcile",
+                )
+            else:
+                result["autonomous_gate_tuning"] = {"status": "disabled"}
         return result
 
     async def heartbeat_once(self, *, run_follow_up: bool = True) -> dict[str, Any]:

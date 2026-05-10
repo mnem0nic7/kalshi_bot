@@ -134,6 +134,7 @@ def test_risk_engine_blocks_production_entries_during_trade_behavior_freeze() ->
         risk_max_position_notional_dollars=300,
         risk_min_edge_bps=50,
         risk_min_probability_extremity_pct=0.0,
+        trade_behavior_production_entry_freeze_enabled=True,
     )
     engine = DeterministicRiskEngine(settings)
 
@@ -314,7 +315,7 @@ def test_risk_engine_blocks_high_cost_side_with_tiny_remaining_payout() -> None:
     )
     signal = make_signal(edge_bps=2300)
     signal.recommended_side = ContractSide.NO
-    signal.target_yes_price_dollars = Decimal("0.2300")
+    signal.target_yes_price_dollars = Decimal("0.1900")
     signal.fair_yes_dollars = Decimal("0.0000")
     engine = DeterministicRiskEngine(settings)
 
@@ -325,7 +326,7 @@ def test_risk_engine_blocks_high_cost_side_with_tiny_remaining_payout() -> None:
             market_ticker="WX-TEST",
             action=TradeAction.BUY,
             side=ContractSide.NO,
-            yes_price_dollars=Decimal("0.2300"),
+            yes_price_dollars=Decimal("0.1900"),
             count_fp=Decimal("2.31"),
         ),
         signal=signal,
@@ -337,13 +338,13 @@ def test_risk_engine_blocks_high_cost_side_with_tiny_remaining_payout() -> None:
             trigger_max_spread_bps=1200,
             trigger_cooldown_seconds=300,
             strategy_quality_edge_buffer_bps=25,
-            strategy_min_remaining_payout_bps=300,
+            strategy_min_remaining_payout_bps=2500,
         ),
     )
 
     assert verdict.status == RiskStatus.BLOCKED
     assert "insufficient_remaining_payout" in verdict.reason_codes
-    assert any("Remaining payout 0.2300" in reason for reason in verdict.reasons)
+    assert any("Remaining payout 0.1900" in reason for reason in verdict.reasons)
     assert verdict.diagnostics["remaining_payout"]["minimum_remaining_payout_bps"] == 2500
 
 
@@ -353,6 +354,7 @@ def test_risk_engine_honors_remaining_payout_policy_variant_floor() -> None:
         risk_min_edge_bps=50,
         risk_min_probability_extremity_pct=0.0,
         risk_fee_aware_edge_enabled=False,
+        remaining_payout_relaxation_live_enabled=True,
     )
     signal = make_signal(edge_bps=1900)
     signal.fair_yes_dollars = Decimal("0.9900")
@@ -597,6 +599,7 @@ def test_risk_engine_honors_low_price_policy_variant_floor() -> None:
         risk_min_contract_price_dollars=0.25,
         risk_min_probability_extremity_pct=0.0,
         risk_fee_aware_edge_enabled=False,
+        low_price_high_edge_live_enabled=True,
     )
     signal = make_signal(edge_bps=2400)
     signal.target_yes_price_dollars = Decimal("0.0600")

@@ -948,6 +948,8 @@ def evaluate_trade_eligibility(
     spread_bps = market_spread_bps(market_snapshot)
     remaining_payout: Decimal | None = None
     quality_buffer_bps = getattr(thresholds, "strategy_quality_edge_buffer_bps", settings.strategy_quality_edge_buffer_bps)
+    minimum_confidence = float(getattr(thresholds, "risk_min_confidence", settings.risk_min_confidence))
+    minimum_forecast_delta_f = float(getattr(thresholds, "strategy_min_abs_delta_f", settings.strategy_min_abs_delta_f))
     minimum_remaining_payout_bps = getattr(
         thresholds,
         "strategy_min_remaining_payout_bps",
@@ -1053,7 +1055,7 @@ def evaluate_trade_eligibility(
         elif signal.forecast_delta_f is None:
             reasons.append("Forecast delta unavailable; cannot verify weather separation.")
             stand_down_reason = StandDownReason.FORECAST_DELTA_MISSING
-        elif abs(signal.forecast_delta_f) < settings.strategy_min_abs_delta_f:
+        elif abs(signal.forecast_delta_f) < minimum_forecast_delta_f:
             intraday_override = _intraday_resolution_override(
                 settings,
                 signal,
@@ -1076,28 +1078,28 @@ def evaluate_trade_eligibility(
                     reasons.append(
                         "Policy variant intraday_separation_override bypassed the forecast-separation rule."
                     )
-                    if signal.confidence < settings.risk_min_confidence:
+                    if signal.confidence < minimum_confidence:
                         reasons.append(
                             f"Signal confidence {signal.confidence:.2f} is below minimum "
-                            f"{settings.risk_min_confidence:.2f}."
+                            f"{minimum_confidence:.2f}."
                         )
                         stand_down_reason = StandDownReason.CONFIDENCE_TOO_LOW
                 else:
                     reasons.append(
                         f"Forecast separation {signal.forecast_delta_f:.1f}°F is below minimum "
-                        f"{settings.strategy_min_abs_delta_f:.1f}°F."
+                        f"{minimum_forecast_delta_f:.1f}°F."
                     )
                     stand_down_reason = StandDownReason.INSUFFICIENT_FORECAST_SEPARATION
             else:
                 reasons.append(
                     f"Forecast separation {signal.forecast_delta_f:.1f}°F is below minimum "
-                    f"{settings.strategy_min_abs_delta_f:.1f}°F."
+                    f"{minimum_forecast_delta_f:.1f}°F."
                 )
                 stand_down_reason = StandDownReason.INSUFFICIENT_FORECAST_SEPARATION
-        elif signal.confidence < settings.risk_min_confidence:
+        elif signal.confidence < minimum_confidence:
             reasons.append(
                 f"Signal confidence {signal.confidence:.2f} is below minimum "
-                f"{settings.risk_min_confidence:.2f}."
+                f"{minimum_confidence:.2f}."
             )
             stand_down_reason = StandDownReason.CONFIDENCE_TOO_LOW
 
@@ -1174,6 +1176,7 @@ class WeatherSignalEngine:
         weather_bundle: dict[str, Any],
         *,
         min_edge_bps: int | None = None,
+        thresholds: Any | None = None,
         sigma_params: dict | None = None,
         lead_factors: dict | None = None,
     ) -> StrategySignal:
@@ -1222,13 +1225,29 @@ class WeatherSignalEngine:
             external_forecast_members=self._external_forecast_members(weather_bundle),
             observed_high_so_far_f=self._observed_high_so_far(weather_bundle),
         )
-        effective_min_edge_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
+        effective_min_edge_bps = (
+            min_edge_bps
+            if min_edge_bps is not None
+            else getattr(thresholds, "risk_min_edge_bps", self.settings.risk_min_edge_bps)
+        )
+        spread_limit_bps = int(getattr(thresholds, "trigger_max_spread_bps", self.settings.trigger_max_spread_bps))
         recommendation_action, recommendation_side, target_yes, edge_bps, candidate_trace = _trade_recommendation_with_trace(
             fair_yes_dollars=weather.fair_yes_dollars,
             market_snapshot=market_snapshot,
             min_edge_bps=effective_min_edge_bps,
             settings=self.settings,
-            spread_limit_bps=self.settings.trigger_max_spread_bps,
+            quality_buffer_bps=getattr(thresholds, "strategy_quality_edge_buffer_bps", self.settings.strategy_quality_edge_buffer_bps),
+            minimum_remaining_payout_bps=getattr(
+                thresholds,
+                "strategy_min_remaining_payout_bps",
+                self.settings.strategy_min_remaining_payout_bps,
+            ),
+            min_contract_price_dollars=Decimal(str(getattr(
+                thresholds,
+                "risk_min_contract_price_dollars",
+                self.settings.risk_min_contract_price_dollars,
+            ))),
+            spread_limit_bps=spread_limit_bps,
         )
 
         summary = summarize_signal_action(
@@ -1238,7 +1257,7 @@ class WeatherSignalEngine:
             target_yes_price_dollars=target_yes,
             edge_bps=edge_bps,
             market_snapshot=market_snapshot,
-            spread_limit_bps=self.settings.trigger_max_spread_bps,
+            spread_limit_bps=spread_limit_bps,
         )
 
         signal = StrategySignal(

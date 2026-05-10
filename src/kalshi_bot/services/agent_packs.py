@@ -28,6 +28,10 @@ class RuntimeThresholds:
     strategy_min_remaining_payout_bps: int
     risk_safe_capital_reserve_ratio: float = 0.70
     risk_risky_capital_max_ratio: float = 0.30
+    risk_max_credible_edge_bps: int = 10000
+    risk_min_confidence: float = 0.80
+    risk_min_contract_price_dollars: float = 0.25
+    strategy_min_abs_delta_f: float = 8.0
 
 
 class AgentPackService:
@@ -97,12 +101,17 @@ class AgentPackService:
             ),
             thresholds=AgentPackThresholds(
                 risk_min_edge_bps=self.settings.risk_min_edge_bps,
+                risk_max_credible_edge_bps=self.settings.risk_max_credible_edge_bps,
+                risk_min_confidence=self.settings.risk_min_confidence,
+                risk_min_contract_price_dollars=self.settings.risk_min_contract_price_dollars,
                 risk_max_order_notional_dollars=self.settings.risk_max_order_notional_dollars,
                 risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
                 risk_safe_capital_reserve_ratio=self.settings.risk_safe_capital_reserve_ratio,
                 risk_risky_capital_max_ratio=self.settings.risk_risky_capital_max_ratio,
                 trigger_max_spread_bps=self.settings.trigger_max_spread_bps,
                 trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
+                strategy_min_abs_delta_f=self.settings.strategy_min_abs_delta_f,
+                strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
             ),
         )
 
@@ -232,31 +241,82 @@ class AgentPackService:
 
     def runtime_thresholds(self, pack: AgentPack | None = None) -> RuntimeThresholds:
         thresholds = (pack.thresholds if pack is not None else AgentPackThresholds()) or AgentPackThresholds()
+        def value_or_settings(value: Any, fallback: Any) -> Any:
+            return fallback if value is None else value
+
         return RuntimeThresholds(
-            risk_min_edge_bps=thresholds.risk_min_edge_bps or self.settings.risk_min_edge_bps,
+            risk_min_edge_bps=value_or_settings(thresholds.risk_min_edge_bps, self.settings.risk_min_edge_bps),
+            risk_max_credible_edge_bps=value_or_settings(
+                thresholds.risk_max_credible_edge_bps,
+                self.settings.risk_max_credible_edge_bps,
+            ),
+            risk_min_confidence=value_or_settings(thresholds.risk_min_confidence, self.settings.risk_min_confidence),
+            risk_min_contract_price_dollars=(
+                value_or_settings(
+                    thresholds.risk_min_contract_price_dollars,
+                    self.settings.risk_min_contract_price_dollars,
+                )
+            ),
             risk_max_order_notional_dollars=(
-                thresholds.risk_max_order_notional_dollars or self.settings.risk_max_order_notional_dollars
+                value_or_settings(
+                    thresholds.risk_max_order_notional_dollars,
+                    self.settings.risk_max_order_notional_dollars,
+                )
             ),
             risk_max_position_notional_dollars=(
-                thresholds.risk_max_position_notional_dollars or self.settings.risk_max_position_notional_dollars
+                value_or_settings(
+                    thresholds.risk_max_position_notional_dollars,
+                    self.settings.risk_max_position_notional_dollars,
+                )
             ),
             risk_safe_capital_reserve_ratio=(
-                thresholds.risk_safe_capital_reserve_ratio or self.settings.risk_safe_capital_reserve_ratio
+                value_or_settings(
+                    thresholds.risk_safe_capital_reserve_ratio,
+                    self.settings.risk_safe_capital_reserve_ratio,
+                )
             ),
             risk_risky_capital_max_ratio=(
-                thresholds.risk_risky_capital_max_ratio or self.settings.risk_risky_capital_max_ratio
+                value_or_settings(
+                    thresholds.risk_risky_capital_max_ratio,
+                    self.settings.risk_risky_capital_max_ratio,
+                )
             ),
-            trigger_max_spread_bps=thresholds.trigger_max_spread_bps or self.settings.trigger_max_spread_bps,
-            trigger_cooldown_seconds=thresholds.trigger_cooldown_seconds or self.settings.trigger_cooldown_seconds,
+            trigger_max_spread_bps=value_or_settings(thresholds.trigger_max_spread_bps, self.settings.trigger_max_spread_bps),
+            trigger_cooldown_seconds=value_or_settings(
+                thresholds.trigger_cooldown_seconds,
+                self.settings.trigger_cooldown_seconds,
+            ),
             strategy_quality_edge_buffer_bps=self.settings.strategy_quality_edge_buffer_bps,
-            strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
+            strategy_min_abs_delta_f=value_or_settings(
+                thresholds.strategy_min_abs_delta_f,
+                self.settings.strategy_min_abs_delta_f,
+            ),
+            strategy_min_remaining_payout_bps=(
+                value_or_settings(
+                    thresholds.strategy_min_remaining_payout_bps,
+                    self.settings.strategy_min_remaining_payout_bps,
+                )
+            ),
         )
 
     def sanitize_candidate_pack(self, candidate: AgentPack, *, parent_version: str) -> AgentPack:
         thresholds = candidate.thresholds.model_copy(deep=True)
-        thresholds.risk_min_edge_bps = self._clamp_int(thresholds.risk_min_edge_bps, 5, 500)
+        thresholds.risk_min_edge_bps = self._clamp_int(thresholds.risk_min_edge_bps, 250, 5000)
+        thresholds.risk_max_credible_edge_bps = self._clamp_int(thresholds.risk_max_credible_edge_bps, 2500, 10000)
+        thresholds.risk_min_confidence = self._clamp_float(thresholds.risk_min_confidence, 0.60, 0.90)
+        thresholds.risk_min_contract_price_dollars = self._clamp_float(
+            thresholds.risk_min_contract_price_dollars,
+            0.03,
+            0.25,
+        )
         thresholds.trigger_max_spread_bps = self._clamp_int(thresholds.trigger_max_spread_bps, 50, 2500)
         thresholds.trigger_cooldown_seconds = self._clamp_int(thresholds.trigger_cooldown_seconds, 30, 3600)
+        thresholds.strategy_min_abs_delta_f = self._clamp_float(thresholds.strategy_min_abs_delta_f, 0.0, 10.0)
+        thresholds.strategy_min_remaining_payout_bps = self._clamp_int(
+            thresholds.strategy_min_remaining_payout_bps,
+            500,
+            3500,
+        )
         thresholds.risk_max_order_notional_dollars = self._clamp_float(thresholds.risk_max_order_notional_dollars, 5.0, 250.0)
         thresholds.risk_max_position_notional_dollars = self._clamp_float(
             thresholds.risk_max_position_notional_dollars, 25.0, 1000.0
