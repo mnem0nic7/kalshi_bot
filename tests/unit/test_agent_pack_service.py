@@ -4,10 +4,17 @@ import pytest
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
-from kalshi_bot.core.schemas import AgentPack, AgentPackCryptoEntryPolicy, AgentPackCryptoPolicy, AgentPackThresholds
+from kalshi_bot.core.schemas import (
+    AgentPack,
+    AgentPackCryptoEntryPolicy,
+    AgentPackCryptoPolicy,
+    AgentPackThresholds,
+    AgentPackWeatherPolicy,
+)
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.agent_packs import AgentPackService
+from kalshi_bot.services.weather_policy import WeatherPolicyContext, build_weather_policy_key
 
 
 def test_agent_pack_service_builds_deterministic_default_pack() -> None:
@@ -89,6 +96,38 @@ def test_agent_pack_runtime_crypto_policy_overrides_per_asset() -> None:
     assert thresholds.risk_min_edge_bps == 1500
     assert thresholds.trigger_max_spread_bps == 250
     assert thresholds.strategy_min_remaining_payout_bps == 1500
+
+
+def test_agent_pack_resolves_scoped_weather_policy_with_flat_threshold_fallback() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_contract_price_dollars=0.25)
+    service = AgentPackService(settings)
+    context = WeatherPolicyContext(
+        strategy_code="A",
+        series_ticker="KXHIGHNY",
+        side="yes",
+        month=5,
+        lane="entry_gate",
+    )
+    key = build_weather_policy_key(context)
+    pack = service.default_pack()
+    pack.weather_policy.policies[key] = AgentPackWeatherPolicy(
+        policy_key=key,
+        strategy_code="A",
+        series_ticker="KXHIGHNY",
+        side="yes",
+        season="warm_season",
+        month="m05",
+        lane="entry_gate",
+        thresholds=AgentPackThresholds(risk_min_contract_price_dollars=0.05),
+        reason_codes=["unit_scoped_policy"],
+    )
+
+    resolved = service.resolve_weather_policy(pack, context)
+
+    assert resolved.policy_key == key
+    assert resolved.thresholds.risk_min_contract_price_dollars == 0.05
+    assert resolved.thresholds.risk_min_edge_bps == settings.risk_min_edge_bps
+    assert resolved.provenance()["reason_codes"] == ["unit_scoped_policy"]
 
 
 def test_agent_pack_service_sanitizes_mutable_threshold_bounds() -> None:

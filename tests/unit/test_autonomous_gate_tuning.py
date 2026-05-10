@@ -217,6 +217,36 @@ async def test_autonomous_gate_tuning_stages_candidate_pack(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_autonomous_gate_tuning_stages_scoped_weather_policy_without_global_threshold_mutation(tmp_path) -> None:
+    settings, engine, session_factory, _agent_pack_service, service = await _service(tmp_path)
+
+    result = await service.run(
+        now=datetime(2026, 5, 10, tzinfo=UTC),
+        policy_scope="city",
+        series_ticker="KXHIGHNY",
+        month=5,
+        side="yes",
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        candidate = await repo.get_agent_pack(result["candidate_version"])
+        await session.commit()
+
+    assert result["status"] == "staged"
+    assert result["weather_scope"]["series_ticker"] == "KXHIGHNY"
+    assert candidate is not None
+    assert candidate.payload["thresholds"]["risk_min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
+    policy_key = result["weather_scope"]["policy_key"]
+    policy = candidate.payload["weather_policy"]["policies"][policy_key]
+    assert policy["thresholds"]["risk_min_contract_price_dollars"] == 0.05
+    assert policy["mode"] == "live"
+    assert policy["lane"] == "entry_gate"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_autonomous_gate_tuning_promotes_after_canary_passes(tmp_path) -> None:
     settings, engine, session_factory, agent_pack_service, service = await _service(tmp_path)
     staged_at = datetime(2026, 5, 10, tzinfo=UTC)

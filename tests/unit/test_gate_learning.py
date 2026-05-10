@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.services.gate_learning import (
     GateLearningService,
     GateLearningRow,
+    _score_episodes,
     _walk_forward_split,
 )
 
@@ -118,6 +120,30 @@ def test_gate_learning_extracts_bundle_fields(tmp_path) -> None:
     assert row.primary_block_reason == "below_min_contract_price"
     assert row.counterfactual_pnl_dollars is not None
     assert str(row.counterfactual_pnl_dollars) == "4.2500"
+
+
+def test_episode_scoring_counts_repeated_market_snapshots_once() -> None:
+    rows = [
+        GateLearningRow(
+            source="unit",
+            room_id=f"room-{idx}",
+            market_ticker="KXHIGHNY-26MAY10-T70",
+            decision_time=datetime(2026, 5, 10, 12 + idx, tzinfo=UTC),
+            market_day="2026-05-10",
+            series_ticker="KXHIGHNY",
+            side="yes",
+            entry_price=None if idx == 0 else None,
+            quality_adjusted_edge_bps=2000,
+            counterfactual_pnl_dollars=Decimal("1.0000"),
+        )
+        for idx in range(3)
+    ]
+
+    score = _score_episodes(rows, lambda row: True)
+
+    assert score["episode_count"] == 1
+    assert score["sample_count"] == 1
+    assert score["net_pnl"] == Decimal("1.0000")
 
 
 def test_gate_learning_merges_sparse_outcome_with_rich_decision_row(tmp_path) -> None:

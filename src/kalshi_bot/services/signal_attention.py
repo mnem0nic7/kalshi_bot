@@ -252,6 +252,7 @@ def extract_decision_fields(
     policy_variants = trace.get("policy_variants")
     if not isinstance(policy_variants, dict):
         policy_variants = {}
+    weather_policy = trace.get("weather_policy") if isinstance(trace.get("weather_policy"), dict) else {}
 
     stand_down_reason = (
         payload.get("final_stand_down_reason")
@@ -346,6 +347,16 @@ def extract_decision_fields(
         "policy_variants": policy_variants,
         "policy_variant_applied": trace.get("policy_variant_applied"),
         "baseline_block_reason": trace.get("baseline_block_reason"),
+        "active_policy_pack_version": trace.get("active_policy_pack_version") or weather_policy.get("active_policy_pack_version"),
+        "policy_key": trace.get("policy_key") or weather_policy.get("policy_key"),
+        "fallback_policy_key_used": trace.get("fallback_policy_key_used") or weather_policy.get("fallback_policy_key_used"),
+        "gate_thresholds_used": weather_policy.get("gate_thresholds_used"),
+        "capital_thresholds_used": weather_policy.get("capital_thresholds_used"),
+        "model_policy_version": weather_policy.get("model_policy_version"),
+        "binding_policy_lane": trace.get("binding_policy_lane") or weather_policy.get("binding_policy_lane"),
+        "policy_disagreement": trace.get("policy_disagreement") if trace.get("policy_disagreement") is not None else weather_policy.get("policy_disagreement"),
+        "counterfactual_parent_policy_decision": weather_policy.get("counterfactual_parent_policy_decision"),
+        "why_allowed_or_blocked": weather_policy.get("deterministic_summary"),
         "forecast_high_f": _float_or_none(numeric_facts.get("forecast_high_f")),
         "threshold_f": _float_or_none(numeric_facts.get("threshold_f")),
         "forecast_threshold_delta_f": _float_or_none(numeric_facts.get("forecast_delta_f")),

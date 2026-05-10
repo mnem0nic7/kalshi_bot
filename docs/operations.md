@@ -53,7 +53,7 @@ After gate-tuning changes, run a dry autonomous validation before restarting liv
 kalshi-bot-cli autonomous-gates run --kalshi-env production --domain all --source combined --days 3650 --dry-run --format json
 ```
 
-The command should either return `dry_run` with a passing validation payload, `no_candidate` when a domain has no promoted evidence-backed change, or an explicit safety failure. Do not hand-edit `.env` to apply learned gate thresholds; promoted weather thresholds and crypto policies live in agent packs and are applied by the settlement-triggered autonomous canary flow.
+The command should either return `dry_run` with a passing validation payload, `no_candidate` when a domain has no promoted evidence-backed change, or an explicit safety failure. To evaluate a scoped weather candidate, add flags such as `--domain weather --scope city --series-ticker KXHIGHNY --month 5 --side yes`. Do not hand-edit `.env` to apply learned gate thresholds; promoted weather policies and crypto policies live in agent packs and are applied by the settlement-triggered autonomous canary flow.
 
 Crypto autonomous gating now follows the same runtime source of truth as weather, with crypto-specific policy inside the active agent pack. The normal operator status check is:
 

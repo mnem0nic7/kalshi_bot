@@ -1495,4 +1495,4 @@ def test_dashboard_html_uses_room_decision_export_static_asset_version(
         with urllib.request.urlopen(base_url, timeout=5) as response:
             html = response.read().decode("utf-8")
 
-    assert "/static/dashboard.js?v=20260510-policy-variants" in html
+    assert "/static/dashboard.js?v=20260510-weather-policy-provenance" in html
