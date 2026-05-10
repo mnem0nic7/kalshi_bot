@@ -1476,3 +1476,13 @@ def test_single_site_shell_renders_static_site_label(monkeypatch: pytest.MonkeyP
                 assert page.locator("#panel-demo").is_visible()
             finally:
                 browser.close()
+
+
+def test_dashboard_html_uses_room_decision_export_static_asset_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with _serve_dashboard(monkeypatch, tmp_path, site_kind="demo") as base_url:
+        with urllib.request.urlopen(base_url, timeout=5) as response:
+            html = response.read().decode("utf-8")
+
+    assert "/static/dashboard.js?v=20260510-room-decisions-export" in html
