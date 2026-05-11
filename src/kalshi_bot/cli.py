@@ -26,7 +26,7 @@ from kalshi_bot.core.schemas import (
 )
 from kalshi_bot.db.models import Room, Signal, StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
-from kalshi_bot.db.session import init_models
+from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.forecast.learned_head import (
     LearnedHeadHoldoutMetrics,
     evaluate_learned_head_gate,
@@ -83,6 +83,11 @@ from kalshi_bot.services.gate_learning import (
     GateLearningService,
     format_gate_learning_report,
     format_gate_recommendation_report,
+)
+from kalshi_bot.services.leaderboard_mirror_analysis import (
+    LeaderboardMirrorAnalysisService,
+    format_leaderboard_mirror_report,
+    leaderboard_mirror_report_to_csv,
 )
 from kalshi_bot.services.overnight_readiness import (
     OvernightReadinessService,
@@ -1001,6 +1006,51 @@ async def _run_cli(args: argparse.Namespace) -> int:
         finally:
             await scraper.close()
             await kalshi.close()
+            if args.kalshi_env:
+                if previous_kalshi_env is None:
+                    os.environ.pop("KALSHI_ENV", None)
+                else:
+                    os.environ["KALSHI_ENV"] = previous_kalshi_env
+                get_settings.cache_clear()
+
+    if args.command == "kalshi-leaderboard-analyze":
+        previous_kalshi_env = os.environ.get("KALSHI_ENV")
+        if args.kalshi_env:
+            os.environ["KALSHI_ENV"] = args.kalshi_env
+            get_settings.cache_clear()
+        settings = get_settings()
+        engine = create_engine(settings)
+        session_factory = create_session_factory(engine)
+        kalshi = KalshiClient(settings)
+        scraper = KalshiLeaderboardScraper(settings, kalshi)
+        service = LeaderboardMirrorAnalysisService(settings, session_factory, scraper)
+        try:
+            report = await service.analyze(
+                kalshi_env=args.kalshi_env,
+                explicit_market_tickers=args.market,
+                categories=args.category,
+                metrics=args.metric,
+                time_windows=args.time,
+                limit_per_board=args.limit_per_board,
+                top=args.top,
+                source=args.source,
+                require_auth=not args.allow_unsigned,
+                include_all_category=args.include_all_category,
+                skip_database_active_markets=args.skip_db_active_markets,
+                position_limit=args.position_limit,
+                active_room_limit=args.active_room_limit,
+            )
+            if args.format == "csv":
+                print(leaderboard_mirror_report_to_csv(report), end="")
+            elif args.format == "md":
+                print(format_leaderboard_mirror_report(report), end="")
+            else:
+                print(json.dumps(report.to_dict(), indent=2))
+            return 0
+        finally:
+            await scraper.close()
+            await kalshi.close()
+            await engine.dispose()
             if args.kalshi_env:
                 if previous_kalshi_env is None:
                     os.environ.pop("KALSHI_ENV", None)
@@ -2360,6 +2410,59 @@ def build_parser() -> argparse.ArgumentParser:
     kalshi_leaderboard.add_argument("--source", choices=LEADERBOARD_SOURCES, default="direct")
     kalshi_leaderboard.add_argument("--format", choices=["json", "csv"], default="json")
     kalshi_leaderboard.add_argument(
+        "--allow-unsigned",
+        action="store_true",
+        help="Try the request without read credentials if no Kalshi key is configured.",
+    )
+
+    kalshi_leaderboard_analyze = subparsers.add_parser(
+        "kalshi-leaderboard-analyze",
+        help="Score leaderboard traders for shadow mirroring against markets we are trading.",
+    )
+    kalshi_leaderboard_analyze.add_argument("--kalshi-env", choices=["demo", "production"], default="production")
+    kalshi_leaderboard_analyze.add_argument(
+        "--market",
+        action="append",
+        default=[],
+        help="Add an explicit market ticker to the active-market basis. Can be repeated.",
+    )
+    kalshi_leaderboard_analyze.add_argument(
+        "--category",
+        action="append",
+        default=None,
+        help="Leaderboard category override. Can be repeated; omit to infer from active markets.",
+    )
+    kalshi_leaderboard_analyze.add_argument(
+        "--metric",
+        action="append",
+        choices=LEADERBOARD_NAMES,
+        default=None,
+        help="Leaderboard metric to include. Can be repeated.",
+    )
+    kalshi_leaderboard_analyze.add_argument(
+        "--time",
+        action="append",
+        choices=LEADERBOARD_TIME_WINDOWS,
+        default=None,
+        help="Leaderboard time window to include. Can be repeated.",
+    )
+    kalshi_leaderboard_analyze.add_argument("--limit-per-board", type=int, default=50)
+    kalshi_leaderboard_analyze.add_argument("--top", type=int, default=20)
+    kalshi_leaderboard_analyze.add_argument("--source", choices=LEADERBOARD_SOURCES, default="direct")
+    kalshi_leaderboard_analyze.add_argument("--format", choices=["json", "csv", "md"], default="md")
+    kalshi_leaderboard_analyze.add_argument(
+        "--include-all-category",
+        action="store_true",
+        help="Also fetch the all-category leaderboard as extra context.",
+    )
+    kalshi_leaderboard_analyze.add_argument(
+        "--skip-db-active-markets",
+        action="store_true",
+        help="Only use --market and --category inputs instead of scanning DB positions and active rooms.",
+    )
+    kalshi_leaderboard_analyze.add_argument("--position-limit", type=int, default=200)
+    kalshi_leaderboard_analyze.add_argument("--active-room-limit", type=int, default=100)
+    kalshi_leaderboard_analyze.add_argument(
         "--allow-unsigned",
         action="store_true",
         help="Try the request without read credentials if no Kalshi key is configured.",
