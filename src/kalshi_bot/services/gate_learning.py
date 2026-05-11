@@ -56,6 +56,10 @@ class GateLearningRow:
     forecast_delta_band: str | None = None
     primary_block_reason: str | None = None
     blocked_by: str | None = None
+    bucket_key: str | None = None
+    fair_value_source: str | None = None
+    confidence_source: str | None = None
+    data_stale: bool = False
     strategy_code: str = "A"
     evidence_quality: str = "executable"
     current_gate_passed: bool = False
@@ -163,6 +167,61 @@ def _selected_candidate(trace: dict[str, Any]) -> dict[str, Any]:
             _int_or_none(row.get("edge_bps")) or -1_000_000,
         ),
     )
+
+
+def _bucket_key_from(*payloads: dict[str, Any]) -> str | None:
+    for payload in payloads:
+        empirical = _dict(payload.get("empirical_gate"))
+        value = (
+            payload.get("bucket_key")
+            or payload.get("bucket_id")
+            or empirical.get("bucket_key")
+            or empirical.get("bucket_id")
+        )
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _prediction_provenance_from(*payloads: dict[str, Any]) -> dict[str, Any]:
+    for payload in payloads:
+        provenance = _dict(payload.get("prediction_provenance") or payload.get("provenance"))
+        if provenance:
+            return provenance
+    return {}
+
+
+def _fair_value_source_from(*payloads: dict[str, Any]) -> str | None:
+    provenance = _prediction_provenance_from(*payloads)
+    value = (
+        provenance.get("fair_value_source")
+        or provenance.get("source")
+        or next((payload.get("fair_value_source") for payload in payloads if payload.get("fair_value_source")), None)
+    )
+    return str(value) if value not in (None, "") else None
+
+
+def _confidence_source_from(*payloads: dict[str, Any]) -> str | None:
+    provenance = _prediction_provenance_from(*payloads)
+    value = (
+        next((payload.get("confidence_source") for payload in payloads if payload.get("confidence_source")), None)
+        or provenance.get("confidence_source")
+    )
+    return str(value) if value not in (None, "") else None
+
+
+def _data_stale_from(*payloads: dict[str, Any]) -> bool:
+    for payload in payloads:
+        stale = _dict(payload.get("stale_signal_evidence"))
+        if bool(
+            payload.get("data_stale")
+            or payload.get("market_stale")
+            or payload.get("research_stale")
+            or payload.get("stale")
+            or stale.get("stale")
+        ):
+            return True
+    return False
 
 
 def _entry_price_for_side(side: str | None, yes_price: Any, selected: dict[str, Any]) -> Decimal | None:
@@ -382,6 +441,10 @@ def _row_from_bundle(payload: dict[str, Any], *, source: str) -> GateLearningRow
         forecast_delta_band=str(signal_payload.get("forecast_delta_band") or _forecast_delta_bucket(forecast_delta) or "") or None,
         primary_block_reason=str(primary_block_reason) if primary_block_reason not in (None, "") else None,
         blocked_by=str(outcome.get("blocked_by") or audit.get("blocked_by") or "") or None,
+        bucket_key=_bucket_key_from(candidate_trace, selected, eligibility, signal_payload),
+        fair_value_source=_fair_value_source_from(candidate_trace, signal_payload, selected),
+        confidence_source=_confidence_source_from(candidate_trace, signal_payload, selected),
+        data_stale=bool(audit.get("stale_data_mismatch")) or _data_stale_from(candidate_trace, selected, eligibility, signal_payload),
         current_gate_passed=current_gate_passed,
         stale_data_mismatch=bool(audit.get("stale_data_mismatch")),
         counterfactual_pnl_dollars=cfpnl,
@@ -435,6 +498,10 @@ def _row_from_decision_trace(record: DecisionTraceRecord, room: Room | None = No
             or ""
         ) or None,
         blocked_by=str(trace.get("evaluation_outcome") or "") or None,
+        bucket_key=_bucket_key_from(candidate_trace, selected, eligibility, signal),
+        fair_value_source=_fair_value_source_from(candidate_trace, signal, selected),
+        confidence_source=_confidence_source_from(candidate_trace, signal, selected),
+        data_stale=_data_stale_from(candidate_trace, selected, eligibility, signal),
         current_gate_passed=bool(ticket),
         stale_data_mismatch=False,
         counterfactual_pnl_dollars=None,
@@ -527,6 +594,11 @@ def decision_corpus_row_to_gate_learning_row(record: DecisionCorpusRowRecord) ->
             or ""
         ) or None,
         blocked_by=str(record.eligibility_status or record.stand_down_reason or "") or None,
+        bucket_key=_bucket_key_from(candidate_trace, selected, eligibility, signal_payload, diagnostics),
+        fair_value_source=_fair_value_source_from(candidate_trace, signal_payload, selected, diagnostics),
+        confidence_source=_confidence_source_from(candidate_trace, signal_payload, selected, diagnostics),
+        data_stale=bool(diagnostics.get("stale_data_mismatch"))
+        or _data_stale_from(candidate_trace, selected, eligibility, signal_payload, diagnostics),
         current_gate_passed=str(record.eligibility_status or "").lower() in {"eligible", "selected", "approved", "executed"},
         stale_data_mismatch=bool(diagnostics.get("stale_data_mismatch")),
         counterfactual_pnl_dollars=pnl,
@@ -563,6 +635,9 @@ def _feature_richness(row: GateLearningRow) -> int:
             "spread_band",
             "forecast_delta_band",
             "primary_block_reason",
+            "bucket_key",
+            "fair_value_source",
+            "confidence_source",
         )
     )
 
@@ -590,6 +665,9 @@ def _merge_bundle_rows(existing: GateLearningRow, incoming: GateLearningRow) -> 
         "forecast_delta_band",
         "primary_block_reason",
         "blocked_by",
+        "bucket_key",
+        "fair_value_source",
+        "confidence_source",
     )
     for field in rich_fields:
         existing_value = getattr(existing, field)
@@ -603,6 +681,7 @@ def _merge_bundle_rows(existing: GateLearningRow, incoming: GateLearningRow) -> 
             setattr(existing, field, getattr(incoming, field))
     existing.current_gate_passed = existing.current_gate_passed or incoming.current_gate_passed
     existing.stale_data_mismatch = existing.stale_data_mismatch or incoming.stale_data_mismatch
+    existing.data_stale = existing.data_stale or incoming.data_stale
     if existing.counterfactual_pnl_dollars is None and incoming.counterfactual_pnl_dollars is not None:
         existing.counterfactual_pnl_dollars = incoming.counterfactual_pnl_dollars
     return existing

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kalshi_bot.config import Settings
@@ -18,6 +19,7 @@ from kalshi_bot.crypto.services import (
     _simulate_crypto_trade,
     normalize_asset_symbol,
 )
+from kalshi_bot.db.models import DecisionTraceRecord, WeatherBootstrapEventRecord, WeatherBootstrapHistoricalEvidenceRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeCryptoPolicy, RuntimeThresholds
 from kalshi_bot.services.backtesting import build_backtesting_report
@@ -27,8 +29,20 @@ from kalshi_bot.services.gate_learning import (
     decision_corpus_row_to_gate_learning_row,
 )
 from kalshi_bot.services.modeling import build_modeling_report
-from kalshi_bot.services.weather_empirical_bootstrap import WeatherEmpiricalBootstrapService
-from kalshi_bot.services.weather_policy import WeatherPolicyContext, build_weather_policy_key
+from kalshi_bot.services.trade_behavior import series_from_ticker
+from kalshi_bot.services.weather_empirical_bootstrap import (
+    WeatherEmpiricalBootstrapContext,
+    WeatherEmpiricalBootstrapService,
+    confidence_source_from_trace,
+    fair_value_source_from_provenance,
+    market_day_from_ticker,
+    stale_signal_evidence_from_trace,
+)
+from kalshi_bot.services.weather_policy import (
+    WeatherPolicyContext,
+    build_weather_policy_key,
+    weather_policy_context_from_market,
+)
 
 
 CHECKPOINT_PREFIX = "autonomous_gate_tuning"
@@ -46,6 +60,146 @@ TUNABLE_GATE_FIELDS = (
 
 BacktestingBuilder = Callable[..., Awaitable[dict[str, Any]]]
 ModelingBuilder = Callable[..., Awaitable[dict[str, Any]]]
+
+_UNKNOWN_ORIGINAL_GATE = "__unknown_original_gate__"
+_EMPIRICAL_VISIBLE_REASONS = {
+    "empirical_gate_block",
+    "empirical_gate_under_sampled",
+    "trade_behavior_gate_blocked",
+}
+_ALLOWED_BOOTSTRAP_ORIGINAL_REASONS = {None, "insufficient_forecast_separation"}
+_REASON_ALIASES = {
+    "forecast_too_close_to_threshold": "insufficient_forecast_separation",
+    "forecast_separation": "insufficient_forecast_separation",
+    "min_entry_price": "below_min_contract_price",
+    "contract_price_too_low": "below_min_contract_price",
+    "price_below_minimum_entry": "below_min_contract_price",
+    "remaining_payout_min": "insufficient_remaining_payout",
+    "below_min_remaining_payout": "insufficient_remaining_payout",
+    "min_edge": "no_actionable_edge",
+}
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    numeric = _float_or_none(value)
+    return int(round(numeric)) if numeric is not None else None
+
+
+def _selected_trace_candidate(candidate_trace: dict[str, Any]) -> dict[str, Any]:
+    side = str(candidate_trace.get("selected_side") or "").lower()
+    if side in {"yes", "no"} and isinstance(candidate_trace.get(side), dict):
+        return dict(candidate_trace[side])
+    selected = candidate_trace.get("selected_candidate")
+    if isinstance(selected, dict):
+        return dict(selected)
+    candidates = [row for row in candidate_trace.get("candidates") or [] if isinstance(row, dict)]
+    if candidates:
+        return max(
+            candidates,
+            key=lambda row: (
+                _int_or_none(row.get("quality_adjusted_edge_bps")) or -1_000_000,
+                _int_or_none(row.get("edge_bps")) or -1_000_000,
+            ),
+        )
+    return {}
+
+
+def _empirical_reason(empirical: dict[str, Any]) -> str:
+    return _normalize_block_reason(empirical.get("underlying_reason") or empirical.get("reason")) or ""
+
+
+def _trace_side(signal: dict[str, Any], candidate_trace: dict[str, Any], selected: dict[str, Any]) -> str | None:
+    side = signal.get("recommended_side") or candidate_trace.get("selected_side") or selected.get("side")
+    text = str(side or "").lower()
+    return text if text in {"yes", "no"} else None
+
+
+def _str_or_none(value: Any) -> str | None:
+    return str(value).strip() if value not in (None, "") else None
+
+
+def _normalize_block_reason(value: Any) -> str | None:
+    text = _str_or_none(value)
+    if text is None:
+        return None
+    normalized = text.lower().strip()
+    return _REASON_ALIASES.get(normalized, normalized)
+
+
+def _trace_reason_candidates(
+    *,
+    trace: dict[str, Any],
+    signal: dict[str, Any],
+    eligibility: dict[str, Any],
+    candidate_trace: dict[str, Any],
+    selected: dict[str, Any],
+) -> list[str]:
+    nested_candidate = _dict(eligibility.get("candidate_trace"))
+    raw_values = [
+        candidate_trace.get("pre_empirical_stand_down_reason"),
+        nested_candidate.get("pre_empirical_stand_down_reason"),
+        candidate_trace.get("baseline_block_reason"),
+        nested_candidate.get("baseline_block_reason"),
+        trace.get("baseline_block_reason"),
+        candidate_trace.get("eligibility_stand_down_reason"),
+        nested_candidate.get("eligibility_stand_down_reason"),
+        trace.get("eligibility_stand_down_reason"),
+        eligibility.get("stand_down_reason"),
+        candidate_trace.get("stand_down_reason"),
+        candidate_trace.get("final_stand_down_reason"),
+        trace.get("final_stand_down_reason"),
+        signal.get("stand_down_reason"),
+        trace.get("stand_down_reason"),
+        selected.get("baseline_reason"),
+        selected.get("reason"),
+        selected.get("stand_down_reason"),
+    ]
+    reasons: list[str] = []
+    for value in raw_values:
+        reason = _normalize_block_reason(value)
+        if reason is not None:
+            reasons.append(reason)
+    return reasons
+
+
+def _trace_policy_original_reason(
+    *,
+    trace: dict[str, Any],
+    signal: dict[str, Any],
+    eligibility: dict[str, Any],
+    candidate_trace: dict[str, Any],
+    selected: dict[str, Any],
+) -> str | None:
+    reasons = _trace_reason_candidates(
+        trace=trace,
+        signal=signal,
+        eligibility=eligibility,
+        candidate_trace=candidate_trace,
+        selected=selected,
+    )
+    non_empirical = [reason for reason in reasons if reason not in _EMPIRICAL_VISIBLE_REASONS]
+    if non_empirical:
+        return non_empirical[0]
+    if any(reason in _EMPIRICAL_VISIBLE_REASONS for reason in reasons):
+        return None
+    return _UNKNOWN_ORIGINAL_GATE
+
+
+def _bootstrap_original_reason_allowed(reason: str | None) -> bool:
+    return reason in _ALLOWED_BOOTSTRAP_ORIGINAL_REASONS
 
 
 class AutonomousGateTuningService:
@@ -114,6 +268,11 @@ class AutonomousGateTuningService:
                 since=datetime.now(UTC) - timedelta(days=7),
                 limit=2000,
             )
+            bootstrap_historical_evidence = await repo.list_weather_bootstrap_historical_evidence(
+                kalshi_env=env,
+                strict_replay=True,
+                limit=5000,
+            )
             bootstrap_shadow = (
                 WeatherEmpiricalBootstrapService().shadow_gate_status(
                     policy=bootstrap_policy,
@@ -121,6 +280,16 @@ class AutonomousGateTuningService:
                     policy_key=weather_resolution.policy_key,
                     now=datetime.now(UTC),
                 ).to_payload()
+                if bootstrap_policy is not None
+                else None
+            )
+            bootstrap_historical = (
+                _historical_bootstrap_shadow_gate_status(
+                    policy=bootstrap_policy,
+                    evidence=bootstrap_historical_evidence,
+                    policy_key=weather_resolution.policy_key,
+                    now=datetime.now(UTC),
+                )
                 if bootstrap_policy is not None
                 else None
             )
@@ -141,7 +310,9 @@ class AutonomousGateTuningService:
             "weather_bootstrap": {
                 "policy": bootstrap_policy.model_dump(mode="json") if bootstrap_policy is not None else None,
                 "shadow_gate": bootstrap_shadow,
+                "historical_gate": bootstrap_historical,
                 "recent_event_count": len(bootstrap_events),
+                "strict_historical_evidence_count": len(bootstrap_historical_evidence),
             },
             "active_crypto_policy": active_crypto_policy,
             "settings_thresholds": settings_thresholds,
@@ -328,6 +499,24 @@ class AutonomousGateTuningService:
                 _weather_policy_context_from_scope(weather_scope),
             )
             runtime_thresholds = weather_resolution.thresholds
+            bootstrap_sync = await self._sync_weather_bootstrap_shadow_from_decision_traces(
+                repo,
+                current_pack=pack,
+                kalshi_env=env,
+                since=now_utc - timedelta(days=max(1, run_days)),
+                limit=5000,
+                dry_run=dry_run,
+                now=now_utc,
+            )
+            historical_sync = await self._sync_weather_bootstrap_historical_evidence(
+                repo,
+                current_pack=pack,
+                kalshi_env=env,
+                source=run_source,
+                since=now_utc - timedelta(days=max(1, run_days)),
+                dry_run=dry_run,
+                now=now_utc,
+            )
             bootstrap_result = await self._maybe_promote_weather_bootstrap_shadow(
                 repo,
                 current_pack=pack,
@@ -337,6 +526,8 @@ class AutonomousGateTuningService:
                 triggered_by=triggered_by,
                 now=now_utc,
             )
+            bootstrap_result["decision_trace_sync"] = bootstrap_sync
+            bootstrap_result["historical_evidence_sync"] = historical_sync
             await session.commit()
 
         active_settings = _settings_with_thresholds(self.settings, runtime_thresholds)
@@ -436,6 +627,434 @@ class AutonomousGateTuningService:
             await session.commit()
         return staged
 
+    async def _sync_weather_bootstrap_shadow_from_decision_traces(
+        self,
+        repo: PlatformRepository,
+        *,
+        current_pack: AgentPack,
+        kalshi_env: str,
+        since: datetime,
+        limit: int,
+        dry_run: bool,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Backfill shadow bootstrap events from persisted decision traces."""
+        page_size = max(1, min(int(limit), 1000))
+        max_scan = max(int(limit), 50_000 if int(limit) >= 5000 else int(limit) * 10)
+        historical_cache: dict[str, list[Any]] = {}
+        event_cache: dict[str, list[WeatherBootstrapEventRecord]] = {}
+        base_thresholds = self.agent_pack_service.runtime_thresholds(current_pack)
+        service = WeatherEmpiricalBootstrapService()
+        skipped: dict[str, int] = {}
+        scanned = 0
+        evaluated = 0
+        matched = 0
+        created = 0
+        would_create = 0
+        exhausted = False
+        last_cursor: dict[str, str] | None = None
+
+        def skip(reason: str) -> None:
+            skipped[reason] = skipped.get(reason, 0) + 1
+
+        cursor_time: datetime | None = None
+        cursor_id: str | None = None
+        while scanned < max_scan:
+            stmt = select(DecisionTraceRecord).where(
+                DecisionTraceRecord.kalshi_env == kalshi_env,
+                DecisionTraceRecord.decision_time >= since,
+            )
+            if cursor_time is not None and cursor_id is not None:
+                stmt = stmt.where(
+                    or_(
+                        DecisionTraceRecord.decision_time > cursor_time,
+                        (DecisionTraceRecord.decision_time == cursor_time) & (DecisionTraceRecord.id > cursor_id),
+                    )
+                )
+            records = list(
+                (
+                    await repo.session.execute(
+                        stmt.order_by(DecisionTraceRecord.decision_time.asc(), DecisionTraceRecord.id.asc()).limit(
+                            min(page_size, max_scan - scanned)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not records:
+                exhausted = True
+                break
+            scanned += len(records)
+            cursor_time = _as_utc(records[-1].decision_time) or records[-1].decision_time
+            cursor_id = records[-1].id
+            last_cursor = {"decision_time": cursor_time.isoformat() if cursor_time is not None else "", "id": cursor_id}
+
+            trace_ids = [record.id for record in records]
+            existing_stmt = select(WeatherBootstrapEventRecord.decision_trace_id).where(
+                WeatherBootstrapEventRecord.kalshi_env == kalshi_env,
+                WeatherBootstrapEventRecord.event_type == "decision",
+                WeatherBootstrapEventRecord.decision_trace_id.in_(trace_ids),
+            )
+            existing_ids = {
+                trace_id
+                for trace_id in (await repo.session.execute(existing_stmt)).scalars().all()
+                if trace_id is not None
+            }
+
+            for record in records:
+                if record.id in existing_ids:
+                    skip("already_synced")
+                    continue
+                trace = _dict(record.trace)
+                signal = _dict(trace.get("signal"))
+                eligibility = _dict(signal.get("eligibility"))
+                candidate_trace = _dict(trace.get("candidate_trace"))
+                selected = _selected_trace_candidate(candidate_trace)
+                empirical = _dict(eligibility.get("empirical_gate") or candidate_trace.get("empirical_gate"))
+                if _empirical_reason(empirical) != "empirical_gate_under_sampled":
+                    skip("not_empirical_under_sampled")
+                    continue
+                original_reason = _trace_policy_original_reason(
+                    trace=trace,
+                    signal=signal,
+                    eligibility=eligibility,
+                    candidate_trace=candidate_trace,
+                    selected=selected,
+                )
+                if original_reason == _UNKNOWN_ORIGINAL_GATE:
+                    skip("unknown_original_gate")
+                    continue
+                if not _bootstrap_original_reason_allowed(original_reason):
+                    skip("original_gate_not_bootstrap_bypassable")
+                    continue
+                bucket_key = empirical.get("bucket_key") or selected.get("bucket_id") or selected.get("bucket_key")
+                if not bucket_key:
+                    skip("missing_bucket_key")
+                    continue
+
+                bucket_key_text = str(bucket_key)
+                side = _trace_side(signal, candidate_trace, selected)
+                policy_resolution = self.agent_pack_service.resolve_weather_policy(
+                    current_pack,
+                    weather_policy_context_from_market(
+                        market_ticker=record.market_ticker,
+                        strategy_code="A",
+                        side=side,
+                        local_market_day=market_day_from_ticker(record.market_ticker),
+                        trade_regime=str(signal.get("trade_regime") or "") or None,
+                        lane="entry_gate",
+                    ),
+                    fallback_thresholds=base_thresholds,
+                )
+                bootstrap_policy = (
+                    policy_resolution.policy.bootstrap
+                    if policy_resolution.policy is not None and policy_resolution.policy.bootstrap is not None
+                    else None
+                )
+                if bootstrap_policy is None:
+                    skip("bootstrap_policy_missing")
+                    continue
+
+                weather_payload = _dict(signal.get("weather") or trace.get("weather"))
+                provenance = _dict(
+                    signal.get("prediction_provenance")
+                    or candidate_trace.get("prediction_provenance")
+                    or weather_payload.get("prediction_provenance")
+                )
+                fair_yes = _decimal_or_none(signal.get("fair_yes_dollars") or trace.get("fair_yes_dollars"))
+                stale = stale_signal_evidence_from_trace(candidate_trace)
+                if bucket_key_text not in event_cache:
+                    event_cache[bucket_key_text] = await repo.list_weather_bootstrap_events(
+                        kalshi_env=kalshi_env,
+                        bucket_key=bucket_key_text,
+                        since=since,
+                        limit=2000,
+                    )
+                if bucket_key_text not in historical_cache:
+                    historical_cache[bucket_key_text] = await repo.list_weather_bootstrap_historical_evidence(
+                        kalshi_env=kalshi_env,
+                        bucket_key=bucket_key_text,
+                        strict_replay=True,
+                        limit=2000,
+                    )
+                context = WeatherEmpiricalBootstrapContext(
+                    kalshi_env=kalshi_env,
+                    market_ticker=record.market_ticker,
+                    side=side,
+                    confidence=_float_or_none(signal.get("confidence")),
+                    edge_bps_after_buffer=(
+                        _int_or_none(eligibility.get("edge_after_quality_buffer_bps"))
+                        or _int_or_none(selected.get("quality_adjusted_edge_bps"))
+                        or _int_or_none(signal.get("edge_bps"))
+                    ),
+                    fair_yes_dollars=fair_yes,
+                    fair_value_source=fair_value_source_from_provenance(provenance, fair_yes_dollars=fair_yes),
+                    confidence_source=confidence_source_from_trace(candidate_trace, provenance),
+                    bucket_key=bucket_key_text,
+                    actual_sample_count=int(empirical.get("actual_sample_count") or 0),
+                    actual_net_pnl=_decimal_or_none(empirical.get("actual_net_pnl")),
+                    current_stand_down_reason=_str_or_none(
+                        eligibility.get("stand_down_reason") or signal.get("stand_down_reason")
+                    ),
+                    pre_empirical_stand_down_reason=original_reason,
+                    policy_key=policy_resolution.policy_key,
+                    fallback_policy_key=policy_resolution.fallback_policy_key_used,
+                    data_stale=bool(
+                        eligibility.get("market_stale")
+                        or eligibility.get("research_stale")
+                        or stale.get("stale")
+                    ),
+                    source_stale_reasons=tuple(stale.get("reason_codes") or ()),
+                    room_id=record.room_id,
+                    policy_pack_version=current_pack.version,
+                )
+                decision = service.evaluate(
+                    context=context,
+                    policy=bootstrap_policy,
+                    recent_events=event_cache[bucket_key_text],
+                    historical_evidence=historical_cache[bucket_key_text],
+                    now=_as_utc(record.decision_time) or now,
+                )
+                event_trace = decision.to_trace()
+                event_trace["bucket_id"] = bucket_key_text
+                event_trace["original_stand_down_reason"] = original_reason
+                event_trace["empirical_reason"] = "empirical_gate_under_sampled"
+                event_trace["stale_signal_evidence"] = stale
+                event_trace["source_decision_trace_id"] = record.id
+                evaluated += 1
+                if event_trace.get("matched") or event_trace.get("would_have_entered"):
+                    matched += 1
+                if dry_run:
+                    would_create += 1
+                    continue
+                event = await repo.save_weather_bootstrap_event(
+                    kalshi_env=kalshi_env,
+                    market_ticker=record.market_ticker,
+                    series_ticker=series_from_ticker(record.market_ticker),
+                    local_market_day=market_day_from_ticker(record.market_ticker),
+                    bucket_key=bucket_key_text,
+                    policy_key=event_trace.get("policy_key"),
+                    tier=event_trace.get("tier"),
+                    event_type="decision",
+                    status=event_trace.get("outcome") or "block",
+                    side=side,
+                    confidence=context.confidence,
+                    edge_bps=event_trace.get("edge_bps_after_buffer"),
+                    size_factor=event_trace.get("size_factor"),
+                    source="decision_trace_backfill",
+                    occurred_at=_as_utc(record.decision_time) or now,
+                    room_id=record.room_id,
+                    decision_trace_id=record.id,
+                    payload={
+                        **event_trace,
+                        "fair_value_source": context.fair_value_source,
+                        "data_stale": context.data_stale,
+                    },
+                )
+                event_cache[bucket_key_text].append(event)
+                existing_ids.add(record.id)
+                created += 1
+
+        return {
+            "status": "empty" if scanned == 0 else ("dry_run" if dry_run else ("synced" if created else "no_new_events")),
+            "scanned": scanned,
+            "evaluated": evaluated,
+            "matched_evaluations": matched,
+            "created": created,
+            "would_create": would_create,
+            "exhausted": exhausted,
+            "last_cursor": last_cursor,
+            "skipped": skipped,
+        }
+
+    async def _sync_weather_bootstrap_historical_evidence(
+        self,
+        repo: PlatformRepository,
+        *,
+        current_pack: AgentPack,
+        kalshi_env: str,
+        source: str,
+        since: datetime,
+        dry_run: bool,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Persist strict replay-equivalent bundle rows as bootstrap historical evidence."""
+        gate_service = self.gate_learning_service_factory(self.settings)
+        rows = [
+            row
+            for row in gate_service.load_bundle_rows(source=source)
+            if row.decision_time is None or row.decision_time >= since
+        ]
+        if not rows:
+            return {
+                "status": "empty",
+                "source": source,
+                "scanned": 0,
+                "evaluated": 0,
+                "matched_evaluations": 0,
+                "created": 0,
+                "would_create": 0,
+                "skipped": {},
+            }
+
+        source_files = gate_service.source_files(source=source)
+        base_thresholds = self.agent_pack_service.runtime_thresholds(current_pack)
+        service = WeatherEmpiricalBootstrapService()
+        skipped: dict[str, int] = {}
+        evaluated = 0
+        matched = 0
+        created = 0
+        would_create = 0
+
+        def skip(reason: str) -> None:
+            skipped[reason] = skipped.get(reason, 0) + 1
+
+        for row in rows:
+            if not row.labeled:
+                skip("unlabeled")
+                continue
+            if row.current_gate_passed:
+                skip("current_gate_already_passed")
+                continue
+            if str(row.evidence_quality or "").lower() != "executable":
+                skip("non_executable_evidence")
+                continue
+            if row.data_stale or row.stale_data_mismatch:
+                skip("stale_data")
+                continue
+            fair_value_source = _normalize_fair_value_source(row.fair_value_source)
+            if fair_value_source in {None, "fallback", "unavailable", "dark", "none"}:
+                skip("fair_value_source_disqualified")
+                continue
+            original_reason = _historical_row_original_reason(row)
+            if original_reason == _UNKNOWN_ORIGINAL_GATE:
+                skip("unknown_original_gate")
+                continue
+            if not _bootstrap_original_reason_allowed(original_reason):
+                skip("original_gate_not_bootstrap_bypassable")
+                continue
+            if not row.bucket_key:
+                skip("missing_bucket_key")
+                continue
+            if row.side not in {"yes", "no"}:
+                skip("missing_side")
+                continue
+
+            policy_resolution = self.agent_pack_service.resolve_weather_policy(
+                current_pack,
+                weather_policy_context_from_market(
+                    market_ticker=row.market_ticker,
+                    strategy_code=row.strategy_code or "A",
+                    side=row.side,
+                    local_market_day=row.market_day or market_day_from_ticker(row.market_ticker),
+                    trade_regime=row.trade_regime,
+                    lane="entry_gate",
+                ),
+                fallback_thresholds=base_thresholds,
+            )
+            bootstrap_policy = (
+                policy_resolution.policy.bootstrap
+                if policy_resolution.policy is not None and policy_resolution.policy.bootstrap is not None
+                else None
+            )
+            if bootstrap_policy is None:
+                skip("bootstrap_policy_missing")
+                continue
+
+            context = WeatherEmpiricalBootstrapContext(
+                kalshi_env=kalshi_env,
+                market_ticker=row.market_ticker,
+                side=row.side,
+                confidence=row.confidence,
+                edge_bps_after_buffer=row.quality_adjusted_edge_bps or row.edge_bps,
+                fair_yes_dollars=row.fair_yes_dollars,
+                fair_value_source=fair_value_source,
+                confidence_source=row.confidence_source or "raw",
+                bucket_key=str(row.bucket_key),
+                actual_sample_count=0,
+                actual_net_pnl=None,
+                current_stand_down_reason="empirical_gate_block"
+                if original_reason is None
+                else original_reason,
+                pre_empirical_stand_down_reason=original_reason,
+                policy_key=policy_resolution.policy_key,
+                fallback_policy_key=policy_resolution.fallback_policy_key_used,
+                data_stale=False,
+                source_stale_reasons=(),
+                room_id=row.room_id,
+                policy_pack_version=current_pack.version,
+            )
+            decision = service.evaluate(
+                context=context,
+                policy=bootstrap_policy,
+                recent_events=(),
+                historical_evidence=(),
+                now=row.decision_time or now,
+            )
+            evaluated += 1
+            if not decision.matched:
+                skip(f"bootstrap_not_matched:{decision.reason}")
+                continue
+            matched += 1
+            fingerprint = _historical_bootstrap_source_fingerprint(
+                row=row,
+                source_files=source_files,
+                policy_key=policy_resolution.policy_key,
+                decision_trace=decision.to_trace(),
+            )
+            existing_stmt = select(WeatherBootstrapHistoricalEvidenceRecord.id).where(
+                WeatherBootstrapHistoricalEvidenceRecord.kalshi_env == kalshi_env,
+                WeatherBootstrapHistoricalEvidenceRecord.source_fingerprint == fingerprint,
+                WeatherBootstrapHistoricalEvidenceRecord.market_ticker == row.market_ticker,
+                WeatherBootstrapHistoricalEvidenceRecord.bucket_key == str(row.bucket_key),
+                WeatherBootstrapHistoricalEvidenceRecord.policy_key == policy_resolution.policy_key,
+            )
+            existing_id = (await repo.session.execute(existing_stmt)).scalar_one_or_none()
+            if existing_id is not None:
+                skip("already_synced")
+                continue
+            if dry_run:
+                would_create += 1
+                continue
+            trace_payload = decision.to_trace()
+            trace_payload["source_files"] = source_files
+            trace_payload["primary_block_reason"] = row.primary_block_reason
+            await repo.save_weather_bootstrap_historical_evidence(
+                kalshi_env=kalshi_env,
+                market_ticker=row.market_ticker,
+                series_ticker=row.series_ticker or series_from_ticker(row.market_ticker),
+                local_market_day=row.market_day or market_day_from_ticker(row.market_ticker),
+                bucket_key=str(row.bucket_key),
+                policy_key=policy_resolution.policy_key,
+                tier=decision.tier,
+                replay_version="gate-learning-strict-bootstrap-v1",
+                source_fingerprint=fingerprint,
+                strict_replay=True,
+                side=row.side,
+                confidence=row.confidence,
+                edge_bps=decision.edge_bps_after_buffer,
+                count_fp=Decimal("1.00"),
+                pnl_dollars=row.counterfactual_pnl_dollars,
+                evidence_weight=1.0,
+                outcome=_historical_outcome(row.counterfactual_pnl_dollars),
+                observed_at=row.settlement_ts or row.decision_time or now,
+                payload=trace_payload,
+            )
+            created += 1
+
+        return {
+            "status": "dry_run" if dry_run else ("synced" if created else "no_new_evidence"),
+            "source": source,
+            "scanned": len(rows),
+            "evaluated": evaluated,
+            "matched_evaluations": matched,
+            "created": created,
+            "would_create": would_create,
+            "skipped": skipped,
+            "source_files": source_files,
+        }
+
     async def _maybe_promote_weather_bootstrap_shadow(
         self,
         repo: PlatformRepository,
@@ -456,24 +1075,43 @@ class AutonomousGateTuningService:
             since=now - timedelta(days=7),
             limit=5000,
         )
+        historical_evidence = await repo.list_weather_bootstrap_historical_evidence(
+            kalshi_env=kalshi_env,
+            strict_replay=True,
+            limit=10_000,
+        )
         shadow_gate = WeatherEmpiricalBootstrapService().shadow_gate_status(
             policy=bootstrap,
             events=events,
             policy_key=weather_resolution.policy_key,
             now=now,
         ).to_payload()
+        historical_gate = _historical_bootstrap_shadow_gate_status(
+            policy=bootstrap,
+            evidence=historical_evidence,
+            policy_key=weather_resolution.policy_key,
+            now=now,
+        )
         if bootstrap.rollout_state != "shadow":
             return {
                 "status": "no_action",
                 "reason": "bootstrap_not_in_shadow_rollout",
                 "rollout_state": bootstrap.rollout_state,
                 "shadow_gate": shadow_gate,
+                "historical_gate": historical_gate,
             }
-        if not shadow_gate["eligible_for_promotion"]:
+        if shadow_gate["eligible_for_promotion"]:
+            evidence_source = "shadow_decision_events"
+            evidence_gate = shadow_gate
+        elif historical_gate["eligible_for_promotion"]:
+            evidence_source = "strict_historical_startup"
+            evidence_gate = historical_gate
+        else:
             return {
                 "status": "pending",
                 "reason": "shadow_evidence_gate_not_met",
                 "shadow_gate": shadow_gate,
+                "historical_gate": historical_gate,
             }
 
         cold = bootstrap.tiers["cold"].model_copy(update={"live_enabled": True})
@@ -488,6 +1126,8 @@ class AutonomousGateTuningService:
                     "cold_tier_promoted_at": now.isoformat(),
                     "triggered_by": triggered_by,
                     "shadow_gate": shadow_gate,
+                    "historical_gate": historical_gate,
+                    "evidence_source": evidence_source,
                 },
             },
         )
@@ -505,7 +1145,8 @@ class AutonomousGateTuningService:
         fingerprint = _bootstrap_evidence_fingerprint(
             pack_version=current_pack.version,
             policy_key=policy.policy_key,
-            shadow_gate=shadow_gate,
+            evidence_gate=evidence_gate,
+            evidence_source=evidence_source,
             target_rollout="promoted_low",
         )
         version = f"weather-bootstrap-cold-{fingerprint[:12]}"
@@ -516,6 +1157,8 @@ class AutonomousGateTuningService:
                 "candidate_version": version,
                 "evidence_fingerprint": fingerprint,
                 "shadow_gate": shadow_gate,
+                "historical_gate": historical_gate,
+                "evidence_source": evidence_source,
             }
 
         book = current_pack.weather_policy.model_copy(deep=True) if current_pack.weather_policy is not None else None
@@ -539,7 +1182,9 @@ class AutonomousGateTuningService:
                         "kalshi_env": kalshi_env,
                         "policy_key": policy.policy_key,
                         "evidence_fingerprint": fingerprint,
+                        "evidence_source": evidence_source,
                         "shadow_gate": shadow_gate,
+                        "historical_gate": historical_gate,
                     },
                 },
             },
@@ -555,7 +1200,9 @@ class AutonomousGateTuningService:
                 "kind": "weather_empirical_bootstrap_cold_promotion",
                 "policy_key": policy.policy_key,
                 "evidence_fingerprint": fingerprint,
+                "evidence_source": evidence_source,
                 "shadow_gate": shadow_gate,
+                "historical_gate": historical_gate,
             },
             status="promoted",
         )
@@ -569,7 +1216,9 @@ class AutonomousGateTuningService:
             "candidate_version": version,
             "promotion_event_id": promotion.id,
             "evidence_fingerprint": fingerprint,
+            "evidence_source": evidence_source,
             "shadow_gate": shadow_gate,
+            "historical_gate": historical_gate,
         }
 
     async def _run_crypto(
@@ -1871,6 +2520,165 @@ def _candidate_crypto_policy_values(recommendation: dict[str, Any], current_pack
     }
 
 
+def _normalize_fair_value_source(value: Any) -> str | None:
+    text = _str_or_none(value)
+    return text.lower() if text is not None else None
+
+
+def _historical_row_original_reason(row: GateLearningRow) -> str | None:
+    reasons = [
+        reason
+        for reason in (
+            _normalize_block_reason(row.primary_block_reason),
+            _normalize_block_reason(row.blocked_by),
+        )
+        if reason is not None
+    ]
+    non_empirical = [reason for reason in reasons if reason not in _EMPIRICAL_VISIBLE_REASONS]
+    if non_empirical:
+        return non_empirical[0]
+    if any(reason in _EMPIRICAL_VISIBLE_REASONS for reason in reasons):
+        return None
+    return _UNKNOWN_ORIGINAL_GATE
+
+
+def _historical_outcome(pnl: Decimal | None) -> str | None:
+    if pnl is None:
+        return None
+    if pnl > Decimal("0"):
+        return "win"
+    if pnl < Decimal("0"):
+        return "loss"
+    return "flat"
+
+
+def _historical_bootstrap_source_fingerprint(
+    *,
+    row: GateLearningRow,
+    source_files: dict[str, list[str]],
+    policy_key: str,
+    decision_trace: dict[str, Any],
+) -> str:
+    payload = {
+        "schema_version": "weather-bootstrap-historical-evidence-v1",
+        "source": row.source,
+        "source_files": source_files,
+        "room_id": row.room_id,
+        "market_ticker": row.market_ticker,
+        "decision_time": row.decision_time.isoformat() if row.decision_time is not None else None,
+        "market_day": row.market_day,
+        "side": row.side,
+        "bucket_key": row.bucket_key,
+        "policy_key": policy_key,
+        "quality_adjusted_edge_bps": row.quality_adjusted_edge_bps,
+        "confidence": row.confidence,
+        "fair_value_source": row.fair_value_source,
+        "counterfactual_pnl_dollars": _money(row.counterfactual_pnl_dollars),
+        "decision": {
+            "tier": decision_trace.get("tier"),
+            "reason": decision_trace.get("reason"),
+            "thresholds": decision_trace.get("thresholds"),
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _historical_bootstrap_shadow_gate_status(
+    *,
+    policy: Any,
+    evidence: list[WeatherBootstrapHistoricalEvidenceRecord],
+    policy_key: str | None,
+    now: datetime,
+) -> dict[str, Any]:
+    records = [
+        row
+        for row in evidence
+        if row.strict_replay
+        and row.tier == "cold"
+        and row.pnl_dollars is not None
+        and (policy_key is None or row.policy_key == policy_key)
+    ]
+    episodes: dict[tuple[str, str | None, str | None], WeatherBootstrapHistoricalEvidenceRecord] = {}
+    for row in sorted(records, key=lambda item: _as_utc(item.observed_at) or datetime.min.replace(tzinfo=UTC)):
+        key = (
+            row.market_ticker,
+            row.local_market_day or market_day_from_ticker(row.market_ticker),
+            row.bucket_key,
+        )
+        episodes.setdefault(key, row)
+    episode_rows = list(episodes.values())
+    train, holdout = _split_historical_bootstrap_evidence(episode_rows)
+    total_score = _score_historical_bootstrap_evidence(episode_rows)
+    holdout_score = _score_historical_bootstrap_evidence(holdout)
+    required_total = max(1, int(getattr(policy.caps, "shadow_min_market_episodes", 5)))
+    required_holdout = max(1, (required_total + 3) // 4)
+    reason_codes: list[str] = []
+    if len(episode_rows) < required_total:
+        reason_codes.append("historical_bootstrap_total_support_not_met")
+    if len(holdout) < required_holdout:
+        reason_codes.append("historical_bootstrap_holdout_support_not_met")
+    if holdout_score["net_pnl"] <= Decimal("0"):
+        reason_codes.append("historical_bootstrap_holdout_net_pnl_not_positive")
+    if holdout_score["drawdown_proxy"] > Decimal("0"):
+        reason_codes.append("historical_bootstrap_holdout_drawdown_worse")
+    eligible = not reason_codes and bool(episode_rows)
+    return {
+        "status": "eligible" if eligible else "pending",
+        "eligible_for_promotion": eligible,
+        "evidence_source": "strict_historical_startup",
+        "evaluated_at": now.isoformat(),
+        "market_episodes": len(episode_rows),
+        "train_episodes": len(train),
+        "holdout_episodes": len(holdout),
+        "required_market_episodes": required_total,
+        "required_holdout_episodes": required_holdout,
+        "candidate_net_pnl": _money(total_score["net_pnl"]),
+        "candidate_holdout_net_pnl": _money(holdout_score["net_pnl"]),
+        "current_holdout_net_pnl": _money(Decimal("0")),
+        "candidate_drawdown_proxy": _money(total_score["drawdown_proxy"]),
+        "candidate_holdout_drawdown_proxy": _money(holdout_score["drawdown_proxy"]),
+        "current_holdout_drawdown_proxy": _money(Decimal("0")),
+        "reason_codes": reason_codes,
+    }
+
+
+def _split_historical_bootstrap_evidence(
+    rows: list[WeatherBootstrapHistoricalEvidenceRecord],
+) -> tuple[list[WeatherBootstrapHistoricalEvidenceRecord], list[WeatherBootstrapHistoricalEvidenceRecord]]:
+    ordered = sorted(rows, key=lambda item: _as_utc(item.observed_at) or datetime.min.replace(tzinfo=UTC))
+    days = sorted({(_as_utc(row.observed_at) or datetime.min.replace(tzinfo=UTC)).date().isoformat() for row in ordered})
+    if len(days) >= 3:
+        holdout_start = days[max(1, int(len(days) * 0.70))]
+        train = [
+            row
+            for row in ordered
+            if (_as_utc(row.observed_at) or datetime.min.replace(tzinfo=UTC)).date().isoformat() < holdout_start
+        ]
+        holdout = [
+            row
+            for row in ordered
+            if (_as_utc(row.observed_at) or datetime.min.replace(tzinfo=UTC)).date().isoformat() >= holdout_start
+        ]
+        if train and holdout:
+            return train, holdout
+    split_idx = max(1, int(len(ordered) * 0.70))
+    return ordered[:split_idx], ordered[split_idx:]
+
+
+def _score_historical_bootstrap_evidence(rows: list[WeatherBootstrapHistoricalEvidenceRecord]) -> dict[str, Decimal]:
+    pnls = [row.pnl_dollars or Decimal("0") for row in rows if row.pnl_dollars is not None]
+    net = sum(pnls, Decimal("0"))
+    cumulative = Decimal("0")
+    peak = Decimal("0")
+    max_drawdown = Decimal("0")
+    for pnl in pnls:
+        cumulative += pnl
+        peak = max(peak, cumulative)
+        max_drawdown = max(max_drawdown, peak - cumulative)
+    return {"net_pnl": net, "drawdown_proxy": max_drawdown}
+
+
 def _evidence_fingerprint(
     *,
     recommendation: dict[str, Any],
@@ -1894,14 +2702,16 @@ def _bootstrap_evidence_fingerprint(
     *,
     pack_version: str,
     policy_key: str,
-    shadow_gate: dict[str, Any],
+    evidence_gate: dict[str, Any],
+    evidence_source: str,
     target_rollout: str,
 ) -> str:
     payload = {
         "schema_version": "weather-empirical-bootstrap-promotion-v1",
         "pack_version": pack_version,
         "policy_key": policy_key,
-        "shadow_gate": shadow_gate,
+        "evidence_gate": evidence_gate,
+        "evidence_source": evidence_source,
         "target_rollout": target_rollout,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
