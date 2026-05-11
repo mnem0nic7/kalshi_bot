@@ -13,12 +13,15 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import AgentPack, AgentPackCryptoEntryPolicy, AgentPackCryptoPolicy, AgentPackWeatherPolicy
 from kalshi_bot.crypto.services import (
     _crypto_decision_rows,
+    _crypto_artifact_type,
     _crypto_walk_forward_folds,
     _decimal,
+    _filter_crypto_snapshot_rows,
     _fit_crypto_calibration,
     _predict_crypto_probability,
     _simulate_crypto_trade,
     normalize_asset_symbol,
+    normalize_asset_symbols,
 )
 from kalshi_bot.db.models import DecisionTraceRecord, WeatherBootstrapEventRecord, WeatherBootstrapHistoricalEvidenceRecord
 from kalshi_bot.db.repositories import PlatformRepository
@@ -412,6 +415,7 @@ class AutonomousGateTuningService:
         month: int | str | None = None,
         lane: str = "entry_gate",
         bootstrap_promote_from_historical: bool = False,
+        crypto_assets: list[str] | None = None,
     ) -> dict[str, Any]:
         normalized_domain = _normalize_domain(domain)
         if normalized_domain == "crypto":
@@ -422,6 +426,7 @@ class AutonomousGateTuningService:
                 dry_run=dry_run,
                 triggered_by=triggered_by,
                 now=now,
+                asset_symbols=crypto_assets,
             )
         if normalized_domain == "all":
             weather = await self.run(
@@ -447,6 +452,7 @@ class AutonomousGateTuningService:
                 dry_run=dry_run,
                 triggered_by=triggered_by,
                 now=now,
+                asset_symbols=crypto_assets,
             )
             return {
                 "status": _combined_status(weather, crypto),
@@ -1231,8 +1237,10 @@ class AutonomousGateTuningService:
         dry_run: bool,
         triggered_by: str,
         now: datetime | None,
+        asset_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         env = kalshi_env or self.settings.kalshi_env
+        requested_assets = normalize_asset_symbols(asset_symbols)
         run_days = int(days if days is not None else self.settings.autonomous_gate_tuning_days)
         support = int(min_support if min_support is not None else self.settings.autonomous_gate_tuning_min_support)
         now_utc = _as_utc(now) or datetime.now(UTC)
@@ -1259,6 +1267,7 @@ class AutonomousGateTuningService:
                 days=run_days,
                 min_support=support,
                 now=now_utc,
+                asset_symbols=requested_assets,
             )
             if recommendation.get("validation_short_circuit"):
                 validation = recommendation.get("validation") or {
@@ -1363,21 +1372,23 @@ class AutonomousGateTuningService:
         days: int,
         min_support: int,
         now: datetime,
+        asset_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         cutoff = now - timedelta(days=days)
+        requested_assets = normalize_asset_symbols(asset_symbols)
         model = await repo.get_latest_crypto_model_artifact(
             frequency="15m",
-            artifact_type="model",
+            artifact_type=_crypto_artifact_type("model", requested_assets),
             kalshi_env=kalshi_env,
         )
         backtest = await repo.get_latest_crypto_model_artifact(
             frequency="15m",
-            artifact_type="backtest",
+            artifact_type=_crypto_artifact_type("backtest", requested_assets),
             kalshi_env=kalshi_env,
         )
         replay_gate = await repo.get_latest_crypto_model_artifact(
             frequency="15m",
-            artifact_type="replay_gate",
+            artifact_type=_crypto_artifact_type("replay_gate", requested_assets),
             kalshi_env=kalshi_env,
         )
         artifact_checks = {
@@ -1422,26 +1433,30 @@ class AutonomousGateTuningService:
                         artifact_checks=artifact_checks,
                         validation_failures=validation_failures,
                         crypto_policy=crypto_policy,
+                        asset_symbols=requested_assets,
                     )
             else:
                 probe_snapshots = await repo.list_crypto_market_snapshots(
                     frequency="15m",
                     kalshi_env=kalshi_env,
                     since=cutoff,
-                    limit=1,
+                    limit=500,
                 )
                 probe_candles = await repo.list_crypto_market_candlesticks(
                     frequency="15m",
                     kalshi_env=kalshi_env,
                     since=cutoff,
-                    limit=1,
+                    limit=500,
                 )
                 probe_spot_rows = await repo.list_crypto_spot_ohlc(
                     frequency="15m",
                     kalshi_env=kalshi_env,
                     since=cutoff,
-                    limit=1,
+                    limit=500,
                 )
+                probe_snapshots = _filter_crypto_snapshot_rows(probe_snapshots, requested_assets)
+                probe_candles = _filter_crypto_snapshot_rows(probe_candles, requested_assets)
+                probe_spot_rows = _filter_crypto_snapshot_rows(probe_spot_rows, requested_assets)
                 row_counts = {
                     "snapshot_rows": len(probe_snapshots),
                     "candle_rows": len(probe_candles),
@@ -1468,6 +1483,7 @@ class AutonomousGateTuningService:
                         artifact_checks=artifact_checks,
                         validation_failures=validation_failures,
                         crypto_policy=crypto_policy,
+                        asset_symbols=requested_assets,
                     )
                 return {
                     "schema_version": "crypto-autonomous-gate-recommendations-v1",
@@ -1481,6 +1497,7 @@ class AutonomousGateTuningService:
                     "current_policy": _crypto_policy_values(crypto_policy),
                     "asset_diagnostics": [],
                     "promoted_assets": {},
+                    "asset_symbols": requested_assets,
                 }
         snapshots = await repo.list_crypto_market_snapshots(
             frequency="15m",
@@ -1500,6 +1517,9 @@ class AutonomousGateTuningService:
             since=cutoff,
             limit=500_000,
         )
+        snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
+        candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
         rows = _crypto_decision_rows(snapshots, candles, spot_rows)
         labeled = [row for row in rows if row.get("label_yes") in {0, 1}]
         assets = sorted({normalize_asset_symbol(str(row.get("asset_symbol") or "")) for row in labeled})
@@ -1558,6 +1578,7 @@ class AutonomousGateTuningService:
             "domain": "crypto",
             "window_days": days,
             "min_support": min_support,
+            "asset_symbols": requested_assets,
             "row_counts": row_counts,
             "data_gap_reason": data_gap_reason,
             "artifact_checks": artifact_checks,
@@ -2618,13 +2639,16 @@ def _crypto_validation_short_circuit_recommendation(
     artifact_checks: dict[str, Any],
     validation_failures: list[str],
     crypto_policy: RuntimeCryptoPolicy,
+    asset_symbols: list[str] | None = None,
 ) -> dict[str, Any]:
+    requested_assets = normalize_asset_symbols(asset_symbols)
     return {
         "schema_version": "crypto-autonomous-gate-recommendations-v1",
         "kalshi_env": kalshi_env,
         "domain": "crypto",
         "window_days": days,
         "min_support": min_support,
+        "asset_symbols": requested_assets,
         "row_counts": row_counts,
         "data_gap_reason": None,
         "artifact_checks": artifact_checks,
