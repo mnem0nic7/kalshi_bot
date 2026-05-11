@@ -649,7 +649,10 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
     elif args.crypto_history_command == "daily":
         result = await container.crypto_history_service.daily(frequency=args.frequency)
     elif args.crypto_history_command == "collect-open":
-        result = await container.crypto_history_service.collect_open(frequency=args.frequency)
+        result = await container.crypto_history_service.collect_open(
+            frequency=args.frequency,
+            asset_symbols=getattr(args, "assets", None),
+        )
     elif args.crypto_history_command == "status":
         result = await container.crypto_history_service.status(
             frequency=args.frequency,
@@ -683,11 +686,15 @@ async def _run_crypto_spot_command(args: argparse.Namespace, container: AppConta
 
 async def _run_crypto_model_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.crypto_model_command == "train":
-        result = await container.crypto_forecast_service.train(frequency=args.frequency)
+        result = await container.crypto_forecast_service.train(
+            frequency=args.frequency,
+            asset_symbols=getattr(args, "assets", None),
+        )
     elif args.crypto_model_command == "candidates":
         result = await container.crypto_forecast_service.candidates(
             frequency=args.frequency,
             days=args.days if args.days and args.days > 0 else None,
+            asset_symbols=getattr(args, "assets", None),
         )
     else:
         raise ValueError(f"unknown crypto-model command {args.crypto_model_command}")
@@ -699,18 +706,23 @@ async def _run_crypto_model_command(args: argparse.Namespace, container: AppCont
 
 async def _run_crypto_replay_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.crypto_replay_command == "gate":
-        result = await container.crypto_replay_service.gate(frequency=args.frequency)
+        result = await container.crypto_replay_service.gate(
+            frequency=args.frequency,
+            asset_symbols=getattr(args, "assets", None),
+        )
     elif args.crypto_replay_command == "run":
         result = await container.crypto_replay_service.run(
             frequency=args.frequency,
             days=args.days,
             limit=args.limit if args.limit and args.limit > 0 else None,
+            asset_symbols=getattr(args, "assets", None),
         )
     elif args.crypto_replay_command == "validate":
         result = await container.crypto_replay_service.validate(
             frequency=args.frequency,
             days=args.days,
             limit=args.limit if args.limit and args.limit > 0 else None,
+            asset_symbols=getattr(args, "assets", None),
         )
     else:
         raise ValueError(f"unknown crypto-replay command {args.crypto_replay_command}")
@@ -722,8 +734,11 @@ async def _run_crypto_replay_command(args: argparse.Namespace, container: AppCon
     return 0 if result.get("status") in {"pass", "warn"} else 1
 
 
-async def _run_crypto_status_command(container: AppContainer) -> int:
-    result = await container.crypto_market_service.status(frequency="15m")
+async def _run_crypto_status_command(args: argparse.Namespace, container: AppContainer) -> int:
+    result = await container.crypto_market_service.status(
+        frequency=getattr(args, "frequency", "15m"),
+        asset_symbols=getattr(args, "assets", None),
+    )
     print(json.dumps(result, indent=2, default=str))
     return 0
 
@@ -759,7 +774,11 @@ async def _run_training_backfill_command(args: argparse.Namespace, container: Ap
 async def _run_crypto_autonomy_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.crypto_autonomy_command != "run-once":
         raise ValueError(f"unknown crypto-autonomy command {args.crypto_autonomy_command}")
-    result = await container.crypto_autonomy_service.run_once(frequency=args.frequency, force=True)
+    result = await container.crypto_autonomy_service.run_once(
+        frequency=args.frequency,
+        force=True,
+        asset_symbols=getattr(args, "assets", None),
+    )
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("status") in {"ok", "inactive_color"} else 1
 
@@ -1149,7 +1168,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return await _run_crypto_replay_command(args, container)
 
         if args.command == "crypto-status":
-            return await _run_crypto_status_command(container)
+            return await _run_crypto_status_command(args, container)
 
         if args.command == "crypto-autonomy":
             return await _run_crypto_autonomy_command(args, container)
@@ -1441,6 +1460,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     month=args.month,
                     lane=args.lane,
                     bootstrap_promote_from_historical=args.bootstrap_promote_from_historical,
+                    crypto_assets=getattr(args, "crypto_assets", None),
                 )
             else:
                 raise ValueError(f"unknown autonomous-gates command {args.autonomous_gates_command}")
@@ -2513,6 +2533,7 @@ def build_parser() -> argparse.ArgumentParser:
     autonomous_gate_run.add_argument("--side", choices=["yes", "no"], default=None)
     autonomous_gate_run.add_argument("--month", default=None)
     autonomous_gate_run.add_argument("--lane", default="entry_gate")
+    autonomous_gate_run.add_argument("--crypto-assets", nargs="*", default=None)
     autonomous_gate_run.add_argument(
         "--bootstrap-promote-from-historical",
         action="store_true",
@@ -2556,6 +2577,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_history_collect_open = crypto_history_subparsers.add_parser("collect-open")
     add_kalshi_env_argument(crypto_history_collect_open)
     crypto_history_collect_open.add_argument("--frequency", default="15m")
+    crypto_history_collect_open.add_argument("--assets", nargs="*", default=None)
     crypto_history_collect_open.add_argument("--json", action="store_true")
     crypto_history_status = crypto_history_subparsers.add_parser("status")
     add_kalshi_env_argument(crypto_history_status)
@@ -2583,10 +2605,12 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_model_train = crypto_model_subparsers.add_parser("train")
     add_kalshi_env_argument(crypto_model_train)
     crypto_model_train.add_argument("--frequency", default="15m")
+    crypto_model_train.add_argument("--assets", nargs="*", default=None)
     crypto_model_candidates = crypto_model_subparsers.add_parser("candidates")
     add_kalshi_env_argument(crypto_model_candidates)
     crypto_model_candidates.add_argument("--frequency", default="15m")
     crypto_model_candidates.add_argument("--days", type=int, default=30)
+    crypto_model_candidates.add_argument("--assets", nargs="*", default=None)
     crypto_model_candidates.add_argument("--json", action="store_true")
 
     crypto_replay = subparsers.add_parser("crypto-replay")
@@ -2594,22 +2618,27 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_replay_gate = crypto_replay_subparsers.add_parser("gate")
     add_kalshi_env_argument(crypto_replay_gate)
     crypto_replay_gate.add_argument("--frequency", default="15m")
+    crypto_replay_gate.add_argument("--assets", nargs="*", default=None)
     for name in ("run", "validate"):
         crypto_replay_command = crypto_replay_subparsers.add_parser(name)
         add_kalshi_env_argument(crypto_replay_command)
         crypto_replay_command.add_argument("--frequency", default="15m")
         crypto_replay_command.add_argument("--days", type=int, default=30)
         crypto_replay_command.add_argument("--limit", type=int, default=0)
+        crypto_replay_command.add_argument("--assets", nargs="*", default=None)
         crypto_replay_command.add_argument("--json", action="store_true")
 
     crypto_status = subparsers.add_parser("crypto-status")
     add_kalshi_env_argument(crypto_status)
+    crypto_status.add_argument("--frequency", default="15m")
+    crypto_status.add_argument("--assets", nargs="*", default=None)
 
     crypto_autonomy = subparsers.add_parser("crypto-autonomy")
     crypto_autonomy_subparsers = crypto_autonomy.add_subparsers(dest="crypto_autonomy_command", required=True)
     crypto_autonomy_run_once = crypto_autonomy_subparsers.add_parser("run-once")
     add_kalshi_env_argument(crypto_autonomy_run_once)
     crypto_autonomy_run_once.add_argument("--frequency", default="15m")
+    crypto_autonomy_run_once.add_argument("--assets", nargs="*", default=None)
     crypto_autonomy_run_once.add_argument("--json", action="store_true")
 
     crypto_asset_mode = subparsers.add_parser("crypto-asset-mode")
