@@ -123,6 +123,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     parser = cli_module.build_parser()
 
     history_args = parser.parse_args(["crypto-history", "status", "--kalshi-env", "production", "--frequency", "15m", "--json"])
+    history_bootstrap_args = parser.parse_args(
+        ["crypto-history", "bootstrap", "--kalshi-env", "production", "--frequency", "15m", "--assets", "XRP"]
+    )
     spot_args = parser.parse_args(["crypto-spot", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "--json"])
     model_args = parser.parse_args(["crypto-model", "train", "--kalshi-env", "production", "--frequency", "15m"])
     replay_args = parser.parse_args(["crypto-replay", "gate", "--kalshi-env", "production", "--frequency", "15m"])
@@ -136,6 +139,8 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert history_args.crypto_history_command == "status"
     assert history_args.kalshi_env == "production"
     assert history_args.frequency == "15m"
+    assert history_bootstrap_args.crypto_history_command == "bootstrap"
+    assert history_bootstrap_args.assets == ["XRP"]
     assert spot_args.command == "crypto-spot"
     assert spot_args.crypto_spot_command == "status"
     assert spot_args.kalshi_env == "production"

@@ -18,7 +18,7 @@ from kalshi_bot.core.schemas import (
     TradeEligibilityVerdict,
     TradeTicket,
 )
-from kalshi_bot.crypto.models import CryptoMarket
+from kalshi_bot.crypto.models import CryptoMarket, CryptoSeries
 from kalshi_bot.crypto.services import (
     CRYPTO_EXPLORATORY_SHADOW,
     CRYPTO_LIVE_QUALITY,
@@ -264,6 +264,105 @@ async def test_crypto_history_refetches_existing_historical_candles_to_fill_gaps
 
     assert result == {"status": "ok", "stored": 0}
     assert fake_kalshi.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_crypto_history_bootstrap_scopes_requested_assets(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    class _FakeMarketService:
+        def __init__(self) -> None:
+            self.markets = [
+                _market(market_ticker="KXBTC15M-OPEN", series_ticker="KXBTC15M", asset_symbol="BTC"),
+                _market(market_ticker="KXXRP15M-OPEN", series_ticker="KXXRP15M", asset_symbol="XRP"),
+            ]
+            self.series = [
+                CryptoSeries(
+                    series_ticker="KXBTC15M",
+                    title="BTC 15m",
+                    category="Crypto",
+                    frequency="15m",
+                    asset_symbol="BTC",
+                ),
+                CryptoSeries(
+                    series_ticker="KXXRP15M",
+                    title="XRP 15m",
+                    category="Crypto",
+                    frequency="15m",
+                    asset_symbol="XRP",
+                ),
+            ]
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            assert kwargs["status"] == "open"
+            assert kwargs["persist"] is True
+            return self.markets
+
+        async def discover_series(self, **kwargs) -> list[CryptoSeries]:
+            assert kwargs["frequency"] == "15m"
+            return self.series
+
+        async def record_market_snapshot(self, repo, market: CryptoMarket, *, source_kind: str, observed_at: datetime):
+            return await repo.record_crypto_market_snapshot(
+                kalshi_env=settings.kalshi_env,
+                series_ticker=market.series_ticker,
+                market_ticker=market.market_ticker,
+                asset_symbol=market.asset_symbol,
+                frequency=market.frequency,
+                status=market.status,
+                close_time=market.close_time,
+                target_price_dollars=market.target_price_dollars,
+                yes_bid_dollars=market.yes_bid_dollars,
+                yes_ask_dollars=market.yes_ask_dollars,
+                no_ask_dollars=market.no_ask_dollars,
+                last_price_dollars=market.last_price_dollars,
+                source_kind=source_kind,
+                observed_at=observed_at,
+                payload=market.to_payload(),
+            )
+
+    service = CryptoHistoryService(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=object(),  # type: ignore[arg-type]
+        market_service=_FakeMarketService(),  # type: ignore[arg-type]
+    )
+    historical_calls: list[str] = []
+    captured_assets: list[str] = []
+
+    async def fake_list_historical_markets(series_ticker: str) -> dict[str, object]:
+        historical_calls.append(series_ticker)
+        return {"rows": [], "errors": [], "pages_fetched": 0, "rows_seen": 0}
+
+    async def fake_capture_candles(repo, market: CryptoMarket, *, cutoff: datetime) -> dict[str, object]:
+        del repo, cutoff
+        captured_assets.append(market.asset_symbol)
+        return {"status": "ok", "stored": 0}
+
+    service._list_historical_markets = fake_list_historical_markets  # type: ignore[method-assign]
+    service._capture_candles = fake_capture_candles  # type: ignore[method-assign]
+
+    result = await service.bootstrap(days=10, frequency="15m", asset_symbols=["xrp"])
+
+    assert result["asset_symbols"] == ["XRP"]
+    assert result["markets_stored"] == 1
+    assert result["series"] == [
+        {
+            "series_ticker": "KXXRP15M",
+            "asset_symbol": "XRP",
+            "pages_fetched": 0,
+            "rows_seen": 0,
+            "markets_in_window": 0,
+            "errors": [],
+        }
+    ]
+    assert historical_calls == ["KXXRP15M"]
+    assert captured_assets == ["XRP"]
+    assert set(result["data_quality"]["assets"]) == {"XRP"}
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

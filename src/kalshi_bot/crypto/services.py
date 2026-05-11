@@ -831,12 +831,27 @@ class CryptoHistoryService:
         self.kalshi = kalshi
         self.market_service = market_service
 
-    async def bootstrap(self, *, days: int | None = None, frequency: str = "15m") -> dict[str, Any]:
+    async def bootstrap(
+        self,
+        *,
+        days: int | None = None,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
         lookback_days = days or self.settings.crypto_history_lookback_days
         cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
+        requested_assets = set(normalize_asset_symbols(asset_symbols))
         live_markets = await self.market_service.discover_markets(frequency=frequency, status="open", persist=True)
+        if requested_assets:
+            live_markets = [
+                market for market in live_markets if normalize_asset_symbol(market.asset_symbol) in requested_assets
+            ]
         historical_markets: list[CryptoMarket] = []
         series_rows = await self.market_service.discover_series(frequency=frequency)
+        if requested_assets:
+            series_rows = [
+                series for series in series_rows if normalize_asset_symbol(series.asset_symbol) in requested_assets
+            ]
         errors: list[dict[str, str]] = []
         series_stats: list[dict[str, Any]] = []
         for series in series_rows:
@@ -901,11 +916,17 @@ class CryptoHistoryService:
                 since=cutoff,
                 limit=200_000,
             )
+            if requested_assets:
+                snapshots = [
+                    row for row in snapshots if normalize_asset_symbol(row.asset_symbol) in requested_assets
+                ]
+                candles = [row for row in candles if normalize_asset_symbol(row.asset_symbol) in requested_assets]
             await session.commit()
         return {
             "status": "ok",
             "kalshi_env": self.settings.kalshi_env,
             "frequency": normalize_frequency(frequency) or "15m",
+            "asset_symbols": sorted(requested_assets),
             "lookback_days": lookback_days,
             "markets_stored": len(all_markets),
             "live_markets": len(live_markets),

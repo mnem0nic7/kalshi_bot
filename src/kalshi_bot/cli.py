@@ -645,7 +645,11 @@ async def _run_run_room_command(
 
 async def _run_crypto_history_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.crypto_history_command == "bootstrap":
-        result = await container.crypto_history_service.bootstrap(days=args.days, frequency=args.frequency)
+        result = await container.crypto_history_service.bootstrap(
+            days=args.days,
+            frequency=args.frequency,
+            asset_symbols=getattr(args, "assets", None),
+        )
     elif args.crypto_history_command == "daily":
         result = await container.crypto_history_service.daily(frequency=args.frequency)
     elif args.crypto_history_command == "collect-open":
@@ -2571,6 +2575,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_history_bootstrap)
     crypto_history_bootstrap.add_argument("--days", type=int, default=180)
     crypto_history_bootstrap.add_argument("--frequency", default="15m")
+    crypto_history_bootstrap.add_argument("--assets", nargs="*", default=None)
     crypto_history_daily = crypto_history_subparsers.add_parser("daily")
     add_kalshi_env_argument(crypto_history_daily)
     crypto_history_daily.add_argument("--frequency", default="15m")
