@@ -577,10 +577,12 @@ class CryptoMarketService:
             control = await repo.ensure_deployment_control(self.settings.app_color)
             pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(pack)
-            gate = await repo.get_latest_crypto_model_artifact(
+            gate = await _latest_crypto_artifact_for_asset(
+                repo,
                 frequency=market.frequency,
                 artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbol=market.asset_symbol,
             )
             live_status = self.asset_control_service.market_live_status(
                 control=control,
@@ -1943,10 +1945,12 @@ class CryptoExecutionService:
                 market.asset_symbol,
                 crypto_policy=crypto_policy,
             )
-            gate = await repo.get_latest_crypto_model_artifact(
+            gate = await _latest_crypto_artifact_for_asset(
+                repo,
                 frequency=market.frequency,
                 artifact_type="replay_gate",
                 kalshi_env=room.kalshi_env,
+                asset_symbol=market.asset_symbol,
             )
             await session.commit()
         if asset_mode != CRYPTO_ASSET_MODE_LIVE:
@@ -2116,15 +2120,19 @@ class CryptoWorkflowService:
                 control = await repo.ensure_deployment_control(self.settings.app_color)
                 active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
                 crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
-                gate = await repo.get_latest_crypto_model_artifact(
+                gate = await _latest_crypto_artifact_for_asset(
+                    repo,
                     frequency=market.frequency,
                     artifact_type="replay_gate",
                     kalshi_env=room.kalshi_env,
+                    asset_symbol=market.asset_symbol,
                 )
-                backtest = await repo.get_latest_crypto_model_artifact(
+                backtest = await _latest_crypto_artifact_for_asset(
+                    repo,
                     frequency=market.frequency,
                     artifact_type="backtest",
                     kalshi_env=room.kalshi_env,
+                    asset_symbol=market.asset_symbol,
                 )
                 live_status = self.asset_control_service.market_live_status(
                     control=control,
@@ -2434,8 +2442,15 @@ class CryptoAutonomyService:
         self.workflow_service = workflow_service
         self.agent_pack_service = agent_pack_service or AgentPackService(settings)
 
-    async def run_once(self, *, frequency: str = "15m", force: bool = False) -> dict[str, Any]:
+    async def run_once(
+        self,
+        *,
+        frequency: str = "15m",
+        force: bool = False,
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
+        requested_assets = set(normalize_asset_symbols(asset_symbols))
         production_mode = str(self.settings.kalshi_env or "").strip().lower() != "demo"
         try:
             async with self.session_factory() as session:
@@ -2489,6 +2504,8 @@ class CryptoAutonomyService:
             }
 
         discovered = await self.market_service.discover_markets(frequency=freq, status="open", persist=True)
+        if requested_assets:
+            discovered = [market for market in discovered if normalize_asset_symbol(market.asset_symbol) in requested_assets]
         created: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
@@ -2581,6 +2598,7 @@ class CryptoAutonomyService:
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "forced": force,
+            "asset_symbols": sorted(requested_assets),
             "shadow_evidence_mode": shadow_evidence_mode,
             "checked_markets": len(discovered),
             "eligible_markets": len(markets),
