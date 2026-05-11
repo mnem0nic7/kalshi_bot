@@ -678,7 +678,6 @@ class CryptoMarketService:
                 kalshi_env=self.settings.kalshi_env,
                 limit=500_000,
             )
-            quote_rows = _crypto_decision_rows(all_snapshots, candles, spot_rows)
             shadow_evidence = await _crypto_shadow_evidence_counts(
                 session,
                 kalshi_env=self.settings.kalshi_env,
@@ -691,6 +690,7 @@ class CryptoMarketService:
         all_snapshots = _filter_crypto_snapshot_rows(all_snapshots, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
         spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+        quote_rows = _crypto_decision_rows(all_snapshots, candles, spot_rows)
         if len(requested_assets) == 1:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session)
