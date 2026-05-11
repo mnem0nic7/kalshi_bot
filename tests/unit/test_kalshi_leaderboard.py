@@ -33,30 +33,37 @@ async def test_leaderboard_scraper_fetches_authenticated_json() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         seen["path"] = request.url.path
         seen["params"] = dict(request.url.params)
-        seen["auth_header"] = request.headers.get("KALSHI-ACCESS-KEY")
+        seen["cookie"] = request.headers.get("Cookie")
+        seen["csrf"] = request.headers.get("X-CSRF-Token")
         seen["user_agent"] = request.headers.get("User-Agent")
         return httpx.Response(
             200,
             json={
-                "data": {
-                    "leaderboard": [
-                        {
-                            "rank": 1,
-                            "username": "top_trader",
-                            "displayName": "Top Trader",
-                            "userId": "user-1",
-                            "projected_pnl": "$123.45",
-                        }
-                    ]
-                }
+                "rank_list": [
+                    {
+                        "rank": 1,
+                        "nickname": "top_trader",
+                        "social_id": "user-1",
+                        "value": "$123.45",
+                        "is_anonymous": False,
+                    }
+                ]
             },
         )
 
-    settings = _settings()
-    kalshi = KalshiClient(settings)
-    kalshi._auth_headers = (  # type: ignore[method-assign]
-        lambda method, path, write: {"KALSHI-ACCESS-KEY": "test-key"}
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///:memory:",
+        kalshi_env="production",
+        kalshi_read_api_key_id=None,
+        kalshi_read_private_key_path=None,
+        kalshi_write_api_key_id=None,
+        kalshi_write_private_key_path=None,
+        demo_kalshi_api_key=None,
+        live_kalshi_api_key=None,
+        kalshi_leaderboard_cookie="sessionid=secret",
+        kalshi_leaderboard_csrf_token="csrf-token",
     )
+    kalshi = KalshiClient(settings)
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     scraper = KalshiLeaderboardScraper(settings, kalshi, http_client=client)
 
@@ -68,35 +75,37 @@ async def test_leaderboard_scraper_fetches_authenticated_json() -> None:
         source="direct",
     )
 
-    assert seen["path"] == "/trade-api/v2/leaderboard"
+    assert seen["path"] == "/v1/social/leaderboard"
     assert seen["params"] == {
-        "name": "projected_pnl",
-        "time": "daily",
+        "metric_name": "projected_pnl",
+        "time_period": "daily",
         "category": "Climate and Weather",
         "limit": "10",
     }
-    assert seen["auth_header"] == "test-key"
+    assert seen["cookie"] == "sessionid=secret"
+    assert seen["csrf"] == "csrf-token"
     assert seen["user_agent"] == settings.kalshi_leaderboard_user_agent
     assert snapshot.category == "Climate and Weather"
     assert len(snapshot.entries) == 1
     assert snapshot.entries[0].rank == 1
     assert snapshot.entries[0].username == "top_trader"
-    assert snapshot.entries[0].display_name == "Top Trader"
+    assert snapshot.entries[0].display_name == "top_trader"
     assert snapshot.entries[0].member_id == "user-1"
     assert snapshot.entries[0].value == "$123.45"
+    assert snapshot.entries[0].is_anonymous is False
 
     await client.aclose()
     await kalshi.close()
 
 
 @pytest.mark.asyncio
-async def test_leaderboard_scraper_requires_read_credentials_by_default() -> None:
+async def test_leaderboard_scraper_requires_web_credentials_by_default() -> None:
     settings = _settings()
     kalshi = KalshiClient(settings)
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})))
     scraper = KalshiLeaderboardScraper(settings, kalshi, http_client=client)
 
-    with pytest.raises(RuntimeError, match="Missing Kalshi read credentials"):
+    with pytest.raises(RuntimeError, match="Missing Kalshi leaderboard web credentials"):
         await scraper.fetch(source="direct")
 
     await client.aclose()
@@ -122,6 +131,8 @@ async def test_leaderboard_scraper_reads_first_party_web_page_state() -> None:
     """
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/social/leaderboard":
+            return httpx.Response(404, json={"error": "not mocked"})
         seen["url"] = str(request.url)
         seen["accept"] = request.headers.get("Accept")
         seen["cookie"] = request.headers.get("Cookie")
@@ -146,7 +157,7 @@ async def test_leaderboard_scraper_reads_first_party_web_page_state() -> None:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     scraper = KalshiLeaderboardScraper(settings, kalshi, http_client=client)
 
-    snapshot = await scraper.fetch(name="projected_pnl", time_window="daily", limit=5)
+    snapshot = await scraper.fetch(name="projected_pnl", time_window="daily", limit=5, source="web")
 
     assert settings.kalshi_leaderboard_web_url in seen["url"]
     assert "text/html" in str(seen["accept"])
@@ -170,7 +181,7 @@ async def test_leaderboard_web_auth_error_mentions_session_cookie() -> None:
     scraper = KalshiLeaderboardScraper(settings, kalshi, http_client=client)
 
     with pytest.raises(RuntimeError, match="KALSHI_LEADERBOARD_COOKIE"):
-        await scraper.fetch()
+        await scraper.fetch(source="web")
 
     await client.aclose()
     await kalshi.close()

@@ -2357,7 +2357,7 @@ def build_parser() -> argparse.ArgumentParser:
         + ", ".join(item or "(all)" for item in LEADERBOARD_CATEGORIES),
     )
     kalshi_leaderboard.add_argument("--limit", type=int, default=100)
-    kalshi_leaderboard.add_argument("--source", choices=LEADERBOARD_SOURCES, default="web")
+    kalshi_leaderboard.add_argument("--source", choices=LEADERBOARD_SOURCES, default="direct")
     kalshi_leaderboard.add_argument("--format", choices=["json", "csv"], default="json")
     kalshi_leaderboard.add_argument(
         "--allow-unsigned",

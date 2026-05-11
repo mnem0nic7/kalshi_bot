@@ -152,14 +152,14 @@ class KalshiLeaderboardScraper:
         time_window: str = "daily",
         category: str | None = "",
         limit: int | None = None,
-        source: str = "web",
+        source: str = "direct",
         require_auth: bool = True,
     ) -> KalshiLeaderboardSnapshot:
         name = normalize_leaderboard_name(name)
         time_window = normalize_leaderboard_time_window(time_window)
         category = normalize_leaderboard_category(category)
         source = _normalize_source(source)
-        if source in {"web", "auto"}:
+        if source == "web":
             try:
                 return await self._fetch_web(
                     name=name,
@@ -168,8 +168,23 @@ class KalshiLeaderboardScraper:
                     limit=limit,
                 )
             except RuntimeError:
-                if source == "web":
-                    raise
+                raise
+        if source == "auto":
+            try:
+                return await self._fetch_direct(
+                    name=name,
+                    time_window=time_window,
+                    category=category,
+                    limit=limit,
+                    require_auth=require_auth,
+                )
+            except RuntimeError:
+                return await self._fetch_web(
+                    name=name,
+                    time_window=time_window,
+                    category=category,
+                    limit=limit,
+                )
         return await self._fetch_direct(
             name=name,
             time_window=time_window,
@@ -186,6 +201,18 @@ class KalshiLeaderboardScraper:
         category: str,
         limit: int | None,
     ) -> KalshiLeaderboardSnapshot:
+        try:
+            return await self._fetch_direct(
+                name=name,
+                time_window=time_window,
+                category=category,
+                limit=limit,
+                require_auth=True,
+                source="web",
+            )
+        except RuntimeError:
+            pass
+
         params: dict[str, Any] = {"name": name, "time": time_window}
         if category:
             params["category"] = category
@@ -235,44 +262,47 @@ class KalshiLeaderboardScraper:
         category: str,
         limit: int | None,
         require_auth: bool,
+        source: str = "direct",
     ) -> KalshiLeaderboardSnapshot:
         path = self.settings.kalshi_leaderboard_path
-        params: dict[str, Any] = {"name": name, "time": time_window, "category": category}
+        params: dict[str, Any] = {"metric_name": name, "time_period": time_window}
+        if category:
+            params["category"] = category
         if limit is not None and limit > 0:
             params["limit"] = limit
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": self.settings.kalshi_leaderboard_user_agent,
-        }
-        try:
-            headers.update(self.kalshi._auth_headers("GET", path, write=False))
-        except RuntimeError as exc:
-            if require_auth:
-                raise RuntimeError("Missing Kalshi read credentials for leaderboard access") from exc
+        if require_auth and not self._has_web_credentials():
+            raise RuntimeError(
+                "Missing Kalshi leaderboard web credentials; set KALSHI_LEADERBOARD_COOKIE "
+                "and KALSHI_LEADERBOARD_CSRF_TOKEN"
+            )
 
-        await self.kalshi._rate_limiter.acquire()
         response = await self.http_client.get(
             _join_url(self.settings.kalshi_leaderboard_base_url, path),
             params=params,
-            headers=headers,
+            headers=self._api_headers(),
         )
-        if response.status_code == 401:
+        if response.status_code in {401, 403}:
             raise RuntimeError(
-                "Kalshi leaderboard request was unauthorized; check read credentials "
-                "and leaderboard access"
+                "Kalshi leaderboard request was unauthorized; check KALSHI_LEADERBOARD_COOKIE "
+                "and KALSHI_LEADERBOARD_CSRF_TOKEN"
             )
         if response.is_error:
             raise RuntimeError(
                 f"Kalshi leaderboard request failed with HTTP {response.status_code}: "
                 f"{response.text[:500]}"
             )
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Kalshi leaderboard request did not return JSON: {response.text[:500]}"
+            ) from exc
         raw = payload if isinstance(payload, dict) else {"data": payload}
         rows = _extract_rows(raw)
         if limit is not None and limit > 0:
             rows = rows[:limit]
         return KalshiLeaderboardSnapshot(
-            source="direct",
+            source=source,
             name=name,
             time_window=time_window,
             category=category,
@@ -282,12 +312,32 @@ class KalshiLeaderboardScraper:
             raw=raw,
         )
 
+    def _api_headers(self) -> dict[str, str]:
+        headers = self._credential_headers()
+        headers.update(
+            {
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin": "https://kalshi.com",
+                "Referer": self.settings.kalshi_leaderboard_web_url,
+                "User-Agent": self.settings.kalshi_leaderboard_user_agent,
+            }
+        )
+        return headers
+
     def _web_headers(self) -> dict[str, str]:
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "User-Agent": self.settings.kalshi_leaderboard_user_agent,
-        }
+        headers = self._credential_headers()
+        headers.update(
+            {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": self.settings.kalshi_leaderboard_user_agent,
+            }
+        )
+        return headers
+
+    def _credential_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
         if self.settings.kalshi_leaderboard_cookie:
             headers["Cookie"] = self.settings.kalshi_leaderboard_cookie
         if self.settings.kalshi_leaderboard_authorization:
@@ -409,7 +459,7 @@ def _extract_rows(payload: Any) -> list[dict[str, Any]]:
         return []
     if not isinstance(payload, dict):
         return []
-    for key in ("leaderboard", "rankings", "entries", "results", "items", "rows", "users"):
+    for key in ("rank_list", "leaderboard", "rankings", "entries", "results", "items", "rows", "users"):
         rows = _extract_rows(payload.get(key))
         if rows:
             return rows
@@ -460,7 +510,7 @@ def _entry_from_row(row: dict[str, Any], *, index: int, metric: str) -> KalshiLe
         rank=_int_or_none(_first_present(row, "rank", "position", "place", "ranking")) or index,
         username=_str_or_none(_first_present(row, "username", "user_name", "userName", "handle", "nickname")),
         display_name=_str_or_none(_first_present(row, "display_name", "displayName", "name", "nickname")),
-        member_id=_str_or_none(_first_present(row, "member_id", "memberId", "user_id", "userId", "id")),
+        member_id=_str_or_none(_first_present(row, "member_id", "memberId", "social_id", "socialId", "user_id", "userId", "id")),
         value=_first_present(row, *_METRIC_KEYS.get(metric, ("value", "score"))),
         profile_image_url=_str_or_none(
             _first_present(row, "profile_image_url", "profileImageUrl", "profile_image_path", "profileImagePath")

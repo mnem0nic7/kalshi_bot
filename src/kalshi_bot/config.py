@@ -75,11 +75,14 @@ class Settings(BaseSettings):
     demo_kalshi_write_private_key_path: str | None = None
     kalshi_subaccount: int = 0
     kalshi_taker_fee_rate: float = 0.07
-    kalshi_leaderboard_base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
-    kalshi_leaderboard_path: str = "/leaderboard"
+    kalshi_leaderboard_base_url: str = "https://api.elections.kalshi.com/v1"
+    kalshi_leaderboard_path: str = "/social/leaderboard"
     kalshi_leaderboard_web_url: str = "https://kalshi.com/social/leaderboard"
     kalshi_leaderboard_timeout_seconds: float = 30.0
-    kalshi_leaderboard_user_agent: str = "kalshi-bot/0.1 leaderboard-reader"
+    kalshi_leaderboard_user_agent: str = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    )
     kalshi_leaderboard_cookie: str | None = Field(
         default=None,
         validation_alias=AliasChoices("KALSHI_LEADERBOARD_COOKIE", "KALSHI_WEB_COOKIE"),
