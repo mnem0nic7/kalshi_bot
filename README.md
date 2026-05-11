@@ -74,6 +74,7 @@ After activating the virtualenv:
 
 ```bash
 kalshi-bot-cli init-db
+kalshi-bot-cli kalshi-leaderboard --name projected_pnl --time daily --format json
 kalshi-bot-cli discover --json
 kalshi-bot-cli stream --max-messages 25
 kalshi-bot-cli stream --auto-trigger
@@ -129,6 +130,11 @@ kalshi-bot-cli status
 kalshi-bot-cli kill-switch on
 infra/scripts/promote.sh demo green
 ```
+
+Kalshi's social leaderboard may require a logged-in first-party web session. Set
+`KALSHI_LEADERBOARD_COOKIE` in the runtime environment before using
+`kalshi-leaderboard`; `KALSHI_LEADERBOARD_AUTHORIZATION` and
+`KALSHI_LEADERBOARD_CSRF_TOKEN` are also supported when Kalshi requires them.
 
 `discover --json` now expands any configured `series_templates` into the currently active greater/less daily temperature markets, and the control room uses the same live discovery path.
 

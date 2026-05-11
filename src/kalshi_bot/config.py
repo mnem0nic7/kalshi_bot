@@ -75,6 +75,23 @@ class Settings(BaseSettings):
     demo_kalshi_write_private_key_path: str | None = None
     kalshi_subaccount: int = 0
     kalshi_taker_fee_rate: float = 0.07
+    kalshi_leaderboard_base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
+    kalshi_leaderboard_path: str = "/leaderboard"
+    kalshi_leaderboard_web_url: str = "https://kalshi.com/social/leaderboard"
+    kalshi_leaderboard_timeout_seconds: float = 30.0
+    kalshi_leaderboard_user_agent: str = "kalshi-bot/0.1 leaderboard-reader"
+    kalshi_leaderboard_cookie: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("KALSHI_LEADERBOARD_COOKIE", "KALSHI_WEB_COOKIE"),
+    )
+    kalshi_leaderboard_authorization: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("KALSHI_LEADERBOARD_AUTHORIZATION", "KALSHI_WEB_AUTHORIZATION"),
+    )
+    kalshi_leaderboard_csrf_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("KALSHI_LEADERBOARD_CSRF_TOKEN", "KALSHI_WEB_CSRF_TOKEN"),
+    )
 
     weather_user_agent: str = "kalshi-bot/0.1 (ops@example.com)"
     weather_market_map_path: str = "docs/examples/weather_markets.example.yaml"

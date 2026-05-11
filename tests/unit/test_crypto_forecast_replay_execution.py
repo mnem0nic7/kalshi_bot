@@ -1686,6 +1686,82 @@ async def test_crypto_autonomy_requires_explicit_production_fuse(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+async def test_crypto_autonomy_runtime_policy_satisfies_production_fuse(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        kalshi_env="production",
+        app_shadow_mode=False,
+        crypto_autonomy_enabled=False,
+        crypto_production_autonomy_enabled=False,
+        crypto_trading_enabled=False,
+        crypto_autonomy_min_seconds_to_close=120,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    agent_pack_service = AgentPackService(settings)
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    runtime_pack = agent_pack_service.default_pack().model_copy(
+        update={
+            "version": "crypto-runtime-live-test",
+            "crypto_policy": AgentPackCryptoPolicy(
+                live={
+                    "trading_enabled": True,
+                    "production_autonomy_enabled": True,
+                    "asset_modes": {"BTC": "live"},
+                }
+            ),
+        }
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            kalshi_env=settings.kalshi_env,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await agent_pack_service.ensure_initialized(repo)
+        await repo.update_agent_pack(runtime_pack)
+        await agent_pack_service.assign_pack_to_color(repo, color=settings.app_color, version=runtime_pack.version)
+        await session.commit()
+
+    class _FakeKalshi:
+        write_credentials = None
+
+    class _FakeMarketService:
+        kalshi = _FakeKalshi()
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            return [
+                _market(
+                    market_ticker="KXBTC15M-RUNTIME",
+                    asset_symbol="BTC",
+                    close_time=datetime.now(UTC) + timedelta(minutes=10),
+                )
+            ]
+
+    class _FakeWorkflowService:
+        async def run_room(self, room_id: str, *, reason: str) -> None:
+            raise AssertionError("runtime policy test should not create a live room while write credentials are missing")
+
+    result = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=_FakeMarketService(),  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=_FakeWorkflowService(),  # type: ignore[arg-type]
+        agent_pack_service=agent_pack_service,
+    ).run_once()
+
+    assert result["status"] == "ok"
+    assert result["kalshi_env"] == "production"
+    assert result["skipped"][0]["reason"] == "not_live_eligible"
+    assert "Kalshi write credentials are missing." in result["skipped"][0]["live_blockers"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_crypto_autonomy_production_fuse_skips_non_live_eligible_markets(tmp_path) -> None:
     settings = _settings(
         tmp_path,

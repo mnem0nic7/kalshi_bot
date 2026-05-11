@@ -434,7 +434,7 @@ class DaemonService:
     async def _periodic_crypto_autonomy_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.crypto_autonomy_interval_seconds)
-            if self.crypto_autonomy_service is None or not self.settings.crypto_autonomy_enabled:
+            if self.crypto_autonomy_service is None:
                 continue
             if not await self._is_active_color():
                 continue

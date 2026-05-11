@@ -7,6 +7,7 @@ from dataclasses import asdict
 from datetime import UTC, date, datetime
 import io
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -52,8 +53,18 @@ from kalshi_bot.learning.promotion_gates import (
     evaluate_parameter_pack_promotion,
     promotion_gate_config_from_hard_caps,
 )
+from kalshi_bot.integrations.kalshi import KalshiClient
+from kalshi_bot.integrations.kalshi_leaderboard import (
+    LEADERBOARD_CATEGORIES,
+    LEADERBOARD_NAMES,
+    LEADERBOARD_SOURCES,
+    LEADERBOARD_TIME_WINDOWS,
+    KalshiLeaderboardScraper,
+    leaderboard_snapshot_to_csv,
+)
 from kalshi_bot.logging import configure_logging
 from kalshi_bot.services.container import AppContainer
+from kalshi_bot.config import get_settings
 from kalshi_bot.services.baseline_model_card import write_baseline_model_card
 from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, replay_decision_trace
 from kalshi_bot.services.decision_policy_variants import DecisionPolicyVariantService
@@ -86,6 +97,17 @@ from kalshi_bot.services.trade_behavior_quality import (
     format_trade_behavior_quality_report,
 )
 from kalshi_bot.services.trading_audit import format_trading_audit_text
+
+
+CRYPTO_ENV_COMMANDS = {
+    "crypto-history",
+    "crypto-spot",
+    "crypto-model",
+    "crypto-replay",
+    "crypto-status",
+    "crypto-autonomy",
+    "crypto-asset-mode",
+}
 
 
 def _float_or_none(value: object) -> float | None:
@@ -699,6 +721,19 @@ async def _run_crypto_status_command(container: AppContainer) -> int:
     return 0
 
 
+def _apply_crypto_cli_env(args: argparse.Namespace, container: AppContainer) -> None:
+    requested = _crypto_cli_env_override(args)
+    if requested:
+        container.settings.kalshi_env = requested
+
+
+def _crypto_cli_env_override(args: argparse.Namespace) -> str | None:
+    if getattr(args, "command", None) not in CRYPTO_ENV_COMMANDS:
+        return None
+    requested = str(getattr(args, "kalshi_env", "") or "").strip()
+    return requested or None
+
+
 async def _run_training_backfill_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.training_backfill_command != "research-health":
         raise ValueError(f"unknown training-backfill command {args.training_backfill_command}")
@@ -941,7 +976,54 @@ async def _run_cli(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
         return 0
 
-    container = await AppContainer.build(bootstrap_db=args.command not in {"init-db", "trading-audit", "trade-analysis", "overnight-readiness"})
+    if args.command == "kalshi-leaderboard":
+        previous_kalshi_env = os.environ.get("KALSHI_ENV")
+        if args.kalshi_env:
+            os.environ["KALSHI_ENV"] = args.kalshi_env
+            get_settings.cache_clear()
+        settings = get_settings()
+        kalshi = KalshiClient(settings)
+        scraper = KalshiLeaderboardScraper(settings, kalshi)
+        try:
+            snapshot = await scraper.fetch(
+                name=args.name,
+                time_window=args.time,
+                category=args.category,
+                limit=args.limit,
+                source=args.source,
+                require_auth=not args.allow_unsigned,
+            )
+            if args.format == "csv":
+                print(leaderboard_snapshot_to_csv(snapshot), end="")
+            else:
+                print(json.dumps(snapshot.to_dict(), indent=2))
+            return 0
+        finally:
+            await scraper.close()
+            await kalshi.close()
+            if args.kalshi_env:
+                if previous_kalshi_env is None:
+                    os.environ.pop("KALSHI_ENV", None)
+                else:
+                    os.environ["KALSHI_ENV"] = previous_kalshi_env
+                get_settings.cache_clear()
+
+    crypto_env_override = _crypto_cli_env_override(args)
+    previous_kalshi_env = os.environ.get("KALSHI_ENV")
+    if crypto_env_override:
+        os.environ["KALSHI_ENV"] = crypto_env_override
+        get_settings.cache_clear()
+    try:
+        container = await AppContainer.build(bootstrap_db=args.command not in {"init-db", "trading-audit", "trade-analysis", "overnight-readiness"})
+    except Exception:
+        if crypto_env_override:
+            if previous_kalshi_env is None:
+                os.environ.pop("KALSHI_ENV", None)
+            else:
+                os.environ["KALSHI_ENV"] = previous_kalshi_env
+            get_settings.cache_clear()
+        raise
+    _apply_crypto_cli_env(args, container)
     try:
         if args.command == "init-db":
             await init_models(container.engine)
@@ -2244,13 +2326,44 @@ async def _run_cli(args: argparse.Namespace) -> int:
         raise ValueError(f"Unknown command: {args.command}")
     finally:
         await container.close()
+        if crypto_env_override:
+            if previous_kalshi_env is None:
+                os.environ.pop("KALSHI_ENV", None)
+            else:
+                os.environ["KALSHI_ENV"] = previous_kalshi_env
+            get_settings.cache_clear()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kalshi-bot-cli")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def add_kalshi_env_argument(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--kalshi-env", default=None)
+
     subparsers.add_parser("init-db")
+
+    kalshi_leaderboard = subparsers.add_parser(
+        "kalshi-leaderboard",
+        help="Read Kalshi's social leaderboard.",
+    )
+    kalshi_leaderboard.add_argument("--kalshi-env", choices=["demo", "production"], default="production")
+    kalshi_leaderboard.add_argument("--name", choices=LEADERBOARD_NAMES, default="projected_pnl")
+    kalshi_leaderboard.add_argument("--time", choices=LEADERBOARD_TIME_WINDOWS, default="daily")
+    kalshi_leaderboard.add_argument(
+        "--category",
+        default="",
+        help="Leaderboard category; omit for all categories. Known values: "
+        + ", ".join(item or "(all)" for item in LEADERBOARD_CATEGORIES),
+    )
+    kalshi_leaderboard.add_argument("--limit", type=int, default=100)
+    kalshi_leaderboard.add_argument("--source", choices=LEADERBOARD_SOURCES, default="web")
+    kalshi_leaderboard.add_argument("--format", choices=["json", "csv"], default="json")
+    kalshi_leaderboard.add_argument(
+        "--allow-unsigned",
+        action="store_true",
+        help="Try the request without read credentials if no Kalshi key is configured.",
+    )
 
     discover = subparsers.add_parser("discover")
     discover.add_argument("--json", action="store_true")
@@ -2329,11 +2442,14 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_history = subparsers.add_parser("crypto-history")
     crypto_history_subparsers = crypto_history.add_subparsers(dest="crypto_history_command", required=True)
     crypto_history_bootstrap = crypto_history_subparsers.add_parser("bootstrap")
+    add_kalshi_env_argument(crypto_history_bootstrap)
     crypto_history_bootstrap.add_argument("--days", type=int, default=180)
     crypto_history_bootstrap.add_argument("--frequency", default="15m")
     crypto_history_daily = crypto_history_subparsers.add_parser("daily")
+    add_kalshi_env_argument(crypto_history_daily)
     crypto_history_daily.add_argument("--frequency", default="15m")
     crypto_history_status = crypto_history_subparsers.add_parser("status")
+    add_kalshi_env_argument(crypto_history_status)
     crypto_history_status.add_argument("--frequency", default="15m")
     crypto_history_status.add_argument("--days", type=int, default=0)
     crypto_history_status.add_argument("--json", action="store_true")
@@ -2341,11 +2457,13 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_spot = subparsers.add_parser("crypto-spot")
     crypto_spot_subparsers = crypto_spot.add_subparsers(dest="crypto_spot_command", required=True)
     crypto_spot_backfill = crypto_spot_subparsers.add_parser("backfill")
+    add_kalshi_env_argument(crypto_spot_backfill)
     crypto_spot_backfill.add_argument("--days", type=int, default=180)
     crypto_spot_backfill.add_argument("--frequency", default="15m")
     crypto_spot_backfill.add_argument("--assets", nargs="*", default=None)
     crypto_spot_backfill.add_argument("--json", action="store_true")
     crypto_spot_status = crypto_spot_subparsers.add_parser("status")
+    add_kalshi_env_argument(crypto_spot_status)
     crypto_spot_status.add_argument("--frequency", default="15m")
     crypto_spot_status.add_argument("--days", type=int, default=0)
     crypto_spot_status.add_argument("--assets", nargs="*", default=None)
@@ -2354,8 +2472,10 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_model = subparsers.add_parser("crypto-model")
     crypto_model_subparsers = crypto_model.add_subparsers(dest="crypto_model_command", required=True)
     crypto_model_train = crypto_model_subparsers.add_parser("train")
+    add_kalshi_env_argument(crypto_model_train)
     crypto_model_train.add_argument("--frequency", default="15m")
     crypto_model_candidates = crypto_model_subparsers.add_parser("candidates")
+    add_kalshi_env_argument(crypto_model_candidates)
     crypto_model_candidates.add_argument("--frequency", default="15m")
     crypto_model_candidates.add_argument("--days", type=int, default=30)
     crypto_model_candidates.add_argument("--json", action="store_true")
@@ -2363,27 +2483,33 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_replay = subparsers.add_parser("crypto-replay")
     crypto_replay_subparsers = crypto_replay.add_subparsers(dest="crypto_replay_command", required=True)
     crypto_replay_gate = crypto_replay_subparsers.add_parser("gate")
+    add_kalshi_env_argument(crypto_replay_gate)
     crypto_replay_gate.add_argument("--frequency", default="15m")
     for name in ("run", "validate"):
         crypto_replay_command = crypto_replay_subparsers.add_parser(name)
+        add_kalshi_env_argument(crypto_replay_command)
         crypto_replay_command.add_argument("--frequency", default="15m")
         crypto_replay_command.add_argument("--days", type=int, default=30)
         crypto_replay_command.add_argument("--limit", type=int, default=0)
         crypto_replay_command.add_argument("--json", action="store_true")
 
-    subparsers.add_parser("crypto-status")
+    crypto_status = subparsers.add_parser("crypto-status")
+    add_kalshi_env_argument(crypto_status)
 
     crypto_autonomy = subparsers.add_parser("crypto-autonomy")
     crypto_autonomy_subparsers = crypto_autonomy.add_subparsers(dest="crypto_autonomy_command", required=True)
     crypto_autonomy_run_once = crypto_autonomy_subparsers.add_parser("run-once")
+    add_kalshi_env_argument(crypto_autonomy_run_once)
     crypto_autonomy_run_once.add_argument("--frequency", default="15m")
     crypto_autonomy_run_once.add_argument("--json", action="store_true")
 
     crypto_asset_mode = subparsers.add_parser("crypto-asset-mode")
     crypto_asset_mode_subparsers = crypto_asset_mode.add_subparsers(dest="crypto_asset_mode_command", required=True)
     crypto_asset_mode_list = crypto_asset_mode_subparsers.add_parser("list")
+    add_kalshi_env_argument(crypto_asset_mode_list)
     crypto_asset_mode_list.add_argument("--frequency", default="15m")
     crypto_asset_mode_set = crypto_asset_mode_subparsers.add_parser("set")
+    add_kalshi_env_argument(crypto_asset_mode_set)
     crypto_asset_mode_set.add_argument("symbol")
     crypto_asset_mode_set.add_argument("mode", choices=["off", "shadow", "live"])
 

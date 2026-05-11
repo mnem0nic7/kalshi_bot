@@ -1266,7 +1266,8 @@ class AutonomousGateTuningService:
                     "status": "no_candidate",
                     "kalshi_env": env,
                     "domain": "crypto",
-                    "reason": "no_crypto_asset_gate_changes_promoted",
+                    "reason": recommendation.get("data_gap_reason") or "no_crypto_asset_gate_changes_promoted",
+                    "data_gap_reason": recommendation.get("data_gap_reason"),
                     "recommendation": recommendation,
                 }
             evidence_fingerprint = _crypto_evidence_fingerprint(
@@ -1283,10 +1284,24 @@ class AutonomousGateTuningService:
                     "evidence_fingerprint": evidence_fingerprint,
                     "changes": candidate["changes"],
                 }
+            artifact_checks = recommendation.get("artifact_checks") or {}
+            validation_failures: list[str] = []
+            if recommendation["row_counts"]["labeled_rows"] <= 0:
+                validation_failures.append("crypto_zero_labeled_rows")
+            if recommendation.get("data_gap_reason"):
+                validation_failures.append(str(recommendation["data_gap_reason"]))
+            if artifact_checks.get("model_status") != "trained":
+                validation_failures.append("crypto_model_not_trained")
+            if artifact_checks.get("backtest_status") in {None, "missing"}:
+                validation_failures.append("crypto_backtest_missing")
+            if artifact_checks.get("replay_gate_status") != "passed":
+                validation_failures.append("crypto_replay_gate_not_passed")
             validation = {
-                "passed": recommendation["row_counts"]["labeled_rows"] > 0,
-                "failures": [] if recommendation["row_counts"]["labeled_rows"] > 0 else ["crypto_zero_rows"],
+                "passed": not validation_failures,
+                "failures": validation_failures,
                 "row_counts": recommendation["row_counts"],
+                "artifact_checks": artifact_checks,
+                "data_gap_reason": recommendation.get("data_gap_reason"),
             }
             if dry_run or not validation["passed"]:
                 await session.commit()
@@ -1349,9 +1364,33 @@ class AutonomousGateTuningService:
             since=cutoff,
             limit=500_000,
         )
+        model = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="model",
+            kalshi_env=kalshi_env,
+        )
+        backtest = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="backtest",
+            kalshi_env=kalshi_env,
+        )
+        replay_gate = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            kalshi_env=kalshi_env,
+        )
         rows = _crypto_decision_rows(snapshots, candles, spot_rows)
         labeled = [row for row in rows if row.get("label_yes") in {0, 1}]
         assets = sorted({normalize_asset_symbol(str(row.get("asset_symbol") or "")) for row in labeled})
+        settled_snapshot_rows = sum(1 for row in snapshots if row.settlement_result in {"yes", "no"})
+        data_gap_reason = _crypto_data_gap_reason(
+            snapshot_rows=len(snapshots),
+            candle_rows=len(candles),
+            spot_rows=len(spot_rows),
+            decision_rows=len(rows),
+            labeled_rows=len(labeled),
+            settled_snapshot_rows=settled_snapshot_rows,
+        )
         current_scores: dict[str, Any] = {}
         promoted: dict[str, Any] = {}
         diagnostics: list[dict[str, Any]] = []
@@ -1390,9 +1429,21 @@ class AutonomousGateTuningService:
             "min_support": min_support,
             "row_counts": {
                 "snapshot_rows": len(snapshots),
+                "candle_rows": len(candles),
+                "spot_rows": len(spot_rows),
+                "settled_snapshot_rows": settled_snapshot_rows,
                 "decision_rows": len(rows),
                 "labeled_rows": len(labeled),
                 "assets": assets,
+            },
+            "data_gap_reason": data_gap_reason,
+            "artifact_checks": {
+                "model_status": _crypto_artifact_status(model),
+                "model_version": getattr(model, "version", None),
+                "backtest_status": _crypto_artifact_status(backtest),
+                "backtest_version": getattr(backtest, "version", None),
+                "replay_gate_status": _crypto_artifact_status(replay_gate),
+                "replay_gate_version": getattr(replay_gate, "version", None),
             },
             "current_policy": _crypto_policy_values(crypto_policy),
             "asset_diagnostics": diagnostics,
@@ -2417,6 +2468,34 @@ def _crypto_policy_values(policy: RuntimeCryptoPolicy) -> dict[str, Any]:
             for symbol, values in policy.asset_entry_overrides.items()
         },
     }
+
+
+def _crypto_artifact_status(artifact: Any | None) -> str:
+    return str(getattr(artifact, "status", None) or "missing")
+
+
+def _crypto_data_gap_reason(
+    *,
+    snapshot_rows: int,
+    candle_rows: int,
+    spot_rows: int,
+    decision_rows: int,
+    labeled_rows: int,
+    settled_snapshot_rows: int,
+) -> str | None:
+    if snapshot_rows <= 0:
+        return "no_crypto_market_snapshots_for_env_window"
+    if candle_rows <= 0:
+        return "no_crypto_candlesticks_for_env_window"
+    if spot_rows <= 0:
+        return "no_crypto_spot_rows_for_env_window"
+    if settled_snapshot_rows <= 0:
+        return "no_settled_crypto_snapshots_for_env_window"
+    if decision_rows <= 0:
+        return "no_crypto_decision_rows_after_snapshot_candle_spot_join"
+    if labeled_rows <= 0:
+        return "no_labeled_crypto_rows_for_env_window"
+    return None
 
 
 def _runtime_crypto_policy_from_payload(payload: dict[str, Any], *, service: AgentPackService) -> RuntimeCryptoPolicy:

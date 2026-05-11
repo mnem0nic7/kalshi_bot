@@ -584,7 +584,10 @@ class CryptoMarketService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
-            snapshots = await repo.list_latest_crypto_market_snapshots(frequency=normalize_frequency(frequency) or "15m")
+            snapshots = await repo.list_latest_crypto_market_snapshots(
+                frequency=normalize_frequency(frequency) or "15m",
+                kalshi_env=self.settings.kalshi_env,
+            )
             model = await repo.get_latest_crypto_model_artifact(
                 frequency=normalize_frequency(frequency) or "15m",
                 artifact_type="model",
@@ -642,9 +645,19 @@ class CryptoMarketService:
             expected_assets=sorted({row.asset_symbol for row in all_snapshots} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS)),
             min_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
         )
+        latest_snapshot_at = max((row.observed_at for row in all_snapshots), default=None)
+        latest_candle_at = max((row.end_period_ts for row in candles), default=None)
+        latest_spot_at = max((_as_utc_datetime(row.end_ts) for row in spot_rows), default=None)
         return {
             "market_domain": "crypto",
+            "kalshi_env": self.settings.kalshi_env,
             "frequency": normalize_frequency(frequency) or "15m",
+            "app_color": self.settings.app_color,
+            "active_color": control.active_color,
+            "is_active_color": control.active_color == self.settings.app_color,
+            "app_shadow_mode": self.settings.app_shadow_mode,
+            "has_write_credentials": self.kalshi.write_credentials is not None,
+            "active_pack_version": active_pack.version,
             "crypto_enabled": self.settings.crypto_enabled,
             "crypto_15m_enabled": self.settings.crypto_15m_enabled,
             "crypto_trading_enabled": self.settings.crypto_trading_enabled,
@@ -666,6 +679,12 @@ class CryptoMarketService:
             "replay_gate": _artifact_summary(gate),
             "data_quality": data_quality,
             "spot_quality": spot_quality,
+            "data_freshness": {
+                "latest_snapshot_observed_at": latest_snapshot_at.isoformat() if latest_snapshot_at else None,
+                "latest_candle_at": latest_candle_at.isoformat() if latest_candle_at else None,
+                "latest_spot_end_ts": latest_spot_at.isoformat() if latest_spot_at else None,
+                "stale_spot_assets": spot_quality.get("stale_assets") or [],
+            },
             "shadow_evidence": shadow_evidence,
             "readiness_score": _crypto_readiness_score(
                 settings=self.settings,
@@ -786,6 +805,7 @@ class CryptoHistoryService:
             await session.commit()
         return {
             "status": "ok",
+            "kalshi_env": self.settings.kalshi_env,
             "frequency": normalize_frequency(frequency) or "15m",
             "lookback_days": lookback_days,
             "markets_stored": len(all_markets),
@@ -838,6 +858,7 @@ class CryptoHistoryService:
         asset_symbols = sorted({row.asset_symbol for row in snapshots} | {row.asset_symbol for row in candles} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS))
         return {
             "status": "ok",
+            "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "days": days,
             "data_quality": _crypto_data_quality(
@@ -1010,6 +1031,7 @@ class CryptoSpotService:
             await coingecko.aclose()
         return {
             "status": "ok",
+            "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "lookback_days": lookback_days,
             "asset_symbols": assets,
@@ -1043,6 +1065,7 @@ class CryptoSpotService:
             await session.commit()
         return {
             "status": "ok",
+            "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "days": days,
             "spot_quality": _crypto_spot_quality(
@@ -1187,7 +1210,13 @@ class CryptoForecastService:
                 trained_at=datetime.now(UTC),
             )
             await session.commit()
-        return {"status": status, "version": artifact.version, "metrics": metrics, "payload": artifact_payload}
+        return {
+            "status": status,
+            "kalshi_env": self.settings.kalshi_env,
+            "version": artifact.version,
+            "metrics": metrics,
+            "payload": artifact_payload,
+        }
 
     async def candidates(
         self,
@@ -1290,6 +1319,7 @@ class CryptoForecastService:
             crypto_policy=crypto_policy,
         )
         entry_policy = crypto_policy.entry_for_asset(market.asset_symbol)
+        runtime_trading_enabled = self.settings.crypto_trading_enabled or crypto_policy.trading_enabled
         confidence = min(0.95, max(float(entry_policy["min_confidence"]), 0.80 + abs(edge_bps) / 20000))
         eligibility = None
         stand_down_reason = None
@@ -1365,7 +1395,7 @@ class CryptoForecastService:
                     "bucket_key": trace.get("bucket_key"),
                     "decision": "selected" if side is not None else "stand_down",
                     "status": "shadow_only" if trace.get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW else trace.get("candidate_status"),
-                    "reason": trace.get("selection_reason") or ("crypto_live_trading_disabled" if not self.settings.crypto_trading_enabled else None),
+                    "reason": trace.get("selection_reason") or ("crypto_live_trading_disabled" if not runtime_trading_enabled else None),
                     "backtest_version": backtest.version if backtest is not None else None,
                     "replay_gate_status": gate.status if gate is not None else "missing",
                     "runtime_crypto_policy": _runtime_crypto_policy_payload(crypto_policy, asset_symbol=market.asset_symbol),
@@ -1534,7 +1564,7 @@ class CryptoReplayService:
             }
             control.notes = notes
             await session.commit()
-        return {"status": artifact.status, "version": artifact.version, **gate}
+        return {"status": artifact.status, "kalshi_env": self.settings.kalshi_env, "version": artifact.version, **gate}
 
     def evaluate_gate(
         self,
@@ -1629,9 +1659,9 @@ class CryptoReplayService:
         }
         gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
         issues: list[dict[str, Any]] = []
-        if not self.settings.crypto_trading_enabled:
+        if not (self.settings.crypto_trading_enabled or crypto_policy.trading_enabled):
             issues.append({"severity": "info", "code": "crypto_trading_disabled", "message": "Global crypto trading is disabled."})
-        if not self.settings.crypto_autonomy_enabled:
+        if not (self.settings.crypto_autonomy_enabled or crypto_policy.production_autonomy_enabled):
             issues.append({"severity": "info", "code": "crypto_autonomy_disabled", "message": "Crypto autonomy is disabled."})
         for reason in gate["reasons"]:
             severity = "fail" if command == "validate" else "warn"
@@ -2212,8 +2242,6 @@ class CryptoAutonomyService:
 
     async def run_once(self, *, frequency: str = "15m", force: bool = False) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
-        if not self.settings.crypto_autonomy_enabled and not force:
-            return {"status": "disabled", "frequency": freq, "reason": "crypto_autonomy_enabled is false"}
         production_mode = str(self.settings.kalshi_env or "").strip().lower() != "demo"
         try:
             async with self.session_factory() as session:
@@ -2231,22 +2259,31 @@ class CryptoAutonomyService:
             if production_mode and not self.settings.crypto_production_autonomy_enabled:
                 return {
                     "status": "production_blocked",
+                    "kalshi_env": self.settings.kalshi_env,
                     "frequency": freq,
                     "reason": "crypto production autonomy requires CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true or promoted runtime policy",
-                    "kalshi_env": self.settings.kalshi_env,
                 }
             raise
+        runtime_autonomy_enabled = bool(crypto_policy.production_autonomy_enabled)
+        if not self.settings.crypto_autonomy_enabled and not runtime_autonomy_enabled and not force:
+            return {
+                "status": "disabled",
+                "kalshi_env": self.settings.kalshi_env,
+                "frequency": freq,
+                "reason": "crypto_autonomy_enabled is false and active runtime crypto policy has production_autonomy_enabled=false",
+            }
         production_autonomy_enabled = self.settings.crypto_production_autonomy_enabled or crypto_policy.production_autonomy_enabled
         if production_mode and not production_autonomy_enabled:
             return {
                 "status": "production_blocked",
+                "kalshi_env": self.settings.kalshi_env,
                 "frequency": freq,
                 "reason": "crypto production autonomy requires CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true or promoted runtime policy",
-                "kalshi_env": self.settings.kalshi_env,
             }
         if control.active_color != self.settings.app_color:
             return {
                 "status": "inactive_color",
+                "kalshi_env": self.settings.kalshi_env,
                 "frequency": freq,
                 "active_color": control.active_color,
                 "app_color": self.settings.app_color,
@@ -2338,6 +2375,7 @@ class CryptoAutonomyService:
 
         return {
             "status": "ok",
+            "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "forced": force,
             "checked_markets": len(discovered),

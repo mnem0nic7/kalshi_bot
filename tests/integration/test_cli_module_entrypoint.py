@@ -122,21 +122,33 @@ def test_python_module_cli_exposes_decision_trace_show_and_replay() -> None:
 def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once() -> None:
     parser = cli_module.build_parser()
 
-    history_args = parser.parse_args(["crypto-history", "status", "--frequency", "15m", "--json"])
-    spot_args = parser.parse_args(["crypto-spot", "status", "--frequency", "15m", "--assets", "BTC", "--json"])
-    autonomy_args = parser.parse_args(["crypto-autonomy", "run-once", "--frequency", "15m", "--json"])
+    history_args = parser.parse_args(["crypto-history", "status", "--kalshi-env", "production", "--frequency", "15m", "--json"])
+    spot_args = parser.parse_args(["crypto-spot", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "--json"])
+    model_args = parser.parse_args(["crypto-model", "train", "--kalshi-env", "production", "--frequency", "15m"])
+    replay_args = parser.parse_args(["crypto-replay", "gate", "--kalshi-env", "production", "--frequency", "15m"])
+    status_args = parser.parse_args(["crypto-status", "--kalshi-env", "production"])
+    autonomy_args = parser.parse_args(["crypto-autonomy", "run-once", "--kalshi-env", "production", "--frequency", "15m", "--json"])
     model_quality_args = parser.parse_args(
         ["model-quality", "status", "--kalshi-env", "demo", "--domain", "all", "--json"]
     )
 
     assert history_args.command == "crypto-history"
     assert history_args.crypto_history_command == "status"
+    assert history_args.kalshi_env == "production"
     assert history_args.frequency == "15m"
     assert spot_args.command == "crypto-spot"
     assert spot_args.crypto_spot_command == "status"
+    assert spot_args.kalshi_env == "production"
     assert spot_args.assets == ["BTC"]
+    assert model_args.command == "crypto-model"
+    assert model_args.kalshi_env == "production"
+    assert replay_args.command == "crypto-replay"
+    assert replay_args.kalshi_env == "production"
+    assert status_args.command == "crypto-status"
+    assert status_args.kalshi_env == "production"
     assert autonomy_args.command == "crypto-autonomy"
     assert autonomy_args.crypto_autonomy_command == "run-once"
+    assert autonomy_args.kalshi_env == "production"
     assert model_quality_args.command == "model-quality"
     assert model_quality_args.model_quality_command == "status"
     assert model_quality_args.kalshi_env == "demo"
