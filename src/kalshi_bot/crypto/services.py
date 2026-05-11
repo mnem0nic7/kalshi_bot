@@ -732,7 +732,11 @@ class CryptoMarketService:
         )
         spot_quality = _crypto_spot_quality(
             spot_rows,
-            expected_assets=sorted({row.asset_symbol for row in all_snapshots} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS)),
+            expected_assets=(
+                requested_assets
+                if requested_assets
+                else sorted({row.asset_symbol for row in all_snapshots} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS))
+            ),
             min_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
         )
         latest_snapshot_at = max((row.observed_at for row in all_snapshots), default=None)
