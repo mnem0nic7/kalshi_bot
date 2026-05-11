@@ -166,6 +166,8 @@ class Settings(BaseSettings):
     crypto_history_auto_enabled: bool = True
     crypto_history_auto_interval_seconds: int = 3600
     crypto_history_auto_lookback_days: int = 2
+    crypto_quote_evidence_enabled: bool = True
+    crypto_quote_evidence_interval_seconds: int = 60
     crypto_spot_request_timeout_seconds: float = 30.0
     crypto_spot_history_auto_enabled: bool = True
     crypto_spot_history_auto_lookback_days: int = 2

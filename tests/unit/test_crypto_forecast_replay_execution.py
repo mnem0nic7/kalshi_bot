@@ -266,6 +266,65 @@ async def test_crypto_history_refetches_existing_historical_candles_to_fill_gaps
     assert fake_kalshi.calls == 1
 
 
+@pytest.mark.asyncio
+async def test_crypto_history_collect_open_stores_real_quote_snapshots_only(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    class _FakeMarketService:
+        def __init__(self) -> None:
+            self.markets = [
+                _market(market_ticker="KXBTC15M-REAL", asset_symbol="BTC"),
+                _market(market_ticker="KXETH15M-MISSING", asset_symbol="ETH", yes_bid_dollars=None),
+            ]
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            assert kwargs["status"] == "open"
+            assert kwargs["persist"] is False
+            return self.markets
+
+        async def record_market_snapshot(self, repo, market: CryptoMarket, *, source_kind: str, observed_at: datetime):
+            return await repo.record_crypto_market_snapshot(
+                kalshi_env=settings.kalshi_env,
+                series_ticker=market.series_ticker,
+                market_ticker=market.market_ticker,
+                asset_symbol=market.asset_symbol,
+                frequency=market.frequency,
+                status=market.status,
+                close_time=market.close_time,
+                target_price_dollars=market.target_price_dollars,
+                yes_bid_dollars=market.yes_bid_dollars,
+                yes_ask_dollars=market.yes_ask_dollars,
+                no_ask_dollars=market.no_ask_dollars,
+                last_price_dollars=market.last_price_dollars,
+                source_kind=source_kind,
+                observed_at=observed_at,
+                payload=market.to_payload(),
+            )
+
+    result = await CryptoHistoryService(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=object(),  # type: ignore[arg-type]
+        market_service=_FakeMarketService(),  # type: ignore[arg-type]
+    ).collect_open(frequency="15m")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        snapshots = await repo.list_crypto_market_snapshots(kalshi_env=settings.kalshi_env, limit=10)
+        await session.commit()
+
+    assert result["status"] == "ok"
+    assert result["stored_real_quote_snapshots"] == 1
+    assert result["skipped"][0]["reason"] == "missing_real_bid_ask"
+    assert len(snapshots) == 1
+    assert snapshots[0].source_kind == "live_quote_evidence"
+    assert snapshots[0].market_ticker == "KXBTC15M-REAL"
+    await engine.dispose()
+
+
 class _FakeBaseExecution:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -1682,6 +1741,87 @@ async def test_crypto_autonomy_requires_explicit_production_fuse(tmp_path) -> No
 
     assert result["status"] == "production_blocked"
     assert "CRYPTO_PRODUCTION_AUTONOMY_ENABLED" in result["reason"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_autonomy_production_shadow_evidence_runs_without_live_fuse(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        kalshi_env="production",
+        app_shadow_mode=True,
+        crypto_autonomy_enabled=False,
+        crypto_production_autonomy_enabled=False,
+        crypto_trading_enabled=False,
+        crypto_quote_evidence_enabled=True,
+        crypto_autonomy_min_seconds_to_close=120,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            kalshi_env=settings.kalshi_env,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await AgentPackService(settings).ensure_initialized(repo)
+        await session.commit()
+
+    class _FakeKalshi:
+        write_credentials = None
+
+    class _FakeMarketService:
+        kalshi = _FakeKalshi()
+
+        def __init__(self) -> None:
+            self.created: list[str] = []
+            self.markets = [
+                _market(
+                    market_ticker="KXBTC15M-SHADOW-EVIDENCE",
+                    asset_symbol="BTC",
+                    close_time=datetime.now(UTC) + timedelta(minutes=10),
+                )
+            ]
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            return self.markets
+
+        async def create_room_for_market(self, market_ticker: str, *, reason: str) -> dict[str, object]:
+            self.created.append(market_ticker)
+            return {
+                "room_id": "room-shadow-evidence",
+                "market_ticker": market_ticker,
+                "asset_symbol": "BTC",
+                "asset_mode": "shadow",
+                "live_eligible": False,
+                "live_blockers": ["shadow"],
+            }
+
+    class _FakeWorkflowService:
+        def __init__(self) -> None:
+            self.ran: list[str] = []
+
+        async def run_room(self, room_id: str, *, reason: str) -> None:
+            self.ran.append(room_id)
+
+    market_service = _FakeMarketService()
+    workflow_service = _FakeWorkflowService()
+    result = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=market_service,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=workflow_service,  # type: ignore[arg-type]
+    ).run_once()
+
+    assert result["status"] == "ok"
+    assert result["shadow_evidence_mode"] is True
+    assert market_service.created == ["KXBTC15M-SHADOW-EVIDENCE"]
+    assert workflow_service.ran == ["room-shadow-evidence"]
     await engine.dispose()
 
 

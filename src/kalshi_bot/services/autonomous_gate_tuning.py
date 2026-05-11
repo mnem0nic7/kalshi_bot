@@ -14,6 +14,7 @@ from kalshi_bot.core.schemas import AgentPack, AgentPackCryptoEntryPolicy, Agent
 from kalshi_bot.crypto.services import (
     _crypto_decision_rows,
     _crypto_walk_forward_folds,
+    _decimal,
     _fit_crypto_calibration,
     _predict_crypto_probability,
     _simulate_crypto_trade,
@@ -1259,6 +1260,24 @@ class AutonomousGateTuningService:
                 min_support=support,
                 now=now_utc,
             )
+            if recommendation.get("validation_short_circuit"):
+                validation = recommendation.get("validation") or {
+                    "passed": False,
+                    "failures": ["crypto_validation_short_circuit"],
+                    "row_counts": recommendation.get("row_counts") or {},
+                    "artifact_checks": recommendation.get("artifact_checks") or {},
+                    "data_gap_reason": recommendation.get("data_gap_reason"),
+                }
+                await session.commit()
+                return {
+                    "status": "validation_failed",
+                    "kalshi_env": env,
+                    "domain": "crypto",
+                    "dry_run": dry_run,
+                    "changes": {},
+                    "recommendation": recommendation,
+                    "validation": validation,
+                }
             candidate = _candidate_crypto_policy_values(recommendation, pack)
             if not candidate["changes"]:
                 await session.commit()
@@ -1346,6 +1365,123 @@ class AutonomousGateTuningService:
         now: datetime,
     ) -> dict[str, Any]:
         cutoff = now - timedelta(days=days)
+        model = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="model",
+            kalshi_env=kalshi_env,
+        )
+        backtest = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="backtest",
+            kalshi_env=kalshi_env,
+        )
+        replay_gate = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            kalshi_env=kalshi_env,
+        )
+        artifact_checks = {
+            "model_status": _crypto_artifact_status(model),
+            "model_version": getattr(model, "version", None),
+            "backtest_status": _crypto_artifact_status(backtest),
+            "backtest_version": getattr(backtest, "version", None),
+            "replay_gate_status": _crypto_artifact_status(replay_gate),
+            "replay_gate_version": getattr(replay_gate, "version", None),
+        }
+        validation_failures: list[str] = []
+        if artifact_checks["model_status"] != "trained":
+            validation_failures.append("crypto_model_not_trained")
+        if artifact_checks["backtest_status"] in {None, "missing"}:
+            validation_failures.append("crypto_backtest_missing")
+        if artifact_checks["replay_gate_status"] != "passed":
+            validation_failures.append("crypto_replay_gate_not_passed")
+        if validation_failures:
+            metrics = (
+                dict(getattr(replay_gate, "metrics", None) or {})
+                or dict(getattr(backtest, "metrics", None) or {})
+                or dict(getattr(model, "metrics", None) or {})
+            )
+            if metrics:
+                backtest_payload = dict(getattr(backtest, "payload", None) or {})
+                dataset = backtest_payload.get("dataset") if isinstance(backtest_payload.get("dataset"), dict) else None
+                row_counts = _crypto_row_counts_from_artifact_metrics(metrics, dataset=dataset)
+                data_gap_reason = _crypto_data_gap_reason(**{key: int(row_counts[key]) for key in (
+                    "snapshot_rows",
+                    "candle_rows",
+                    "spot_rows",
+                    "decision_rows",
+                    "labeled_rows",
+                    "settled_snapshot_rows",
+                )})
+                if data_gap_reason is None:
+                    return _crypto_validation_short_circuit_recommendation(
+                        kalshi_env=kalshi_env,
+                        days=days,
+                        min_support=min_support,
+                        row_counts=row_counts,
+                        artifact_checks=artifact_checks,
+                        validation_failures=validation_failures,
+                        crypto_policy=crypto_policy,
+                    )
+            else:
+                probe_snapshots = await repo.list_crypto_market_snapshots(
+                    frequency="15m",
+                    kalshi_env=kalshi_env,
+                    since=cutoff,
+                    limit=1,
+                )
+                probe_candles = await repo.list_crypto_market_candlesticks(
+                    frequency="15m",
+                    kalshi_env=kalshi_env,
+                    since=cutoff,
+                    limit=1,
+                )
+                probe_spot_rows = await repo.list_crypto_spot_ohlc(
+                    frequency="15m",
+                    kalshi_env=kalshi_env,
+                    since=cutoff,
+                    limit=1,
+                )
+                row_counts = {
+                    "snapshot_rows": len(probe_snapshots),
+                    "candle_rows": len(probe_candles),
+                    "spot_rows": len(probe_spot_rows),
+                    "settled_snapshot_rows": sum(1 for row in probe_snapshots if row.settlement_result in {"yes", "no"}),
+                    "decision_rows": 0,
+                    "labeled_rows": 0,
+                    "assets": [],
+                }
+                data_gap_reason = _crypto_data_gap_reason(
+                    snapshot_rows=row_counts["snapshot_rows"],
+                    candle_rows=row_counts["candle_rows"],
+                    spot_rows=row_counts["spot_rows"],
+                    decision_rows=row_counts["decision_rows"],
+                    labeled_rows=row_counts["labeled_rows"],
+                    settled_snapshot_rows=row_counts["settled_snapshot_rows"],
+                )
+                if data_gap_reason is None:
+                    return _crypto_validation_short_circuit_recommendation(
+                        kalshi_env=kalshi_env,
+                        days=days,
+                        min_support=min_support,
+                        row_counts=row_counts,
+                        artifact_checks=artifact_checks,
+                        validation_failures=validation_failures,
+                        crypto_policy=crypto_policy,
+                    )
+                return {
+                    "schema_version": "crypto-autonomous-gate-recommendations-v1",
+                    "kalshi_env": kalshi_env,
+                    "domain": "crypto",
+                    "window_days": days,
+                    "min_support": min_support,
+                    "row_counts": row_counts,
+                    "data_gap_reason": data_gap_reason,
+                    "artifact_checks": artifact_checks,
+                    "current_policy": _crypto_policy_values(crypto_policy),
+                    "asset_diagnostics": [],
+                    "promoted_assets": {},
+                }
         snapshots = await repo.list_crypto_market_snapshots(
             frequency="15m",
             kalshi_env=kalshi_env,
@@ -1364,25 +1500,19 @@ class AutonomousGateTuningService:
             since=cutoff,
             limit=500_000,
         )
-        model = await repo.get_latest_crypto_model_artifact(
-            frequency="15m",
-            artifact_type="model",
-            kalshi_env=kalshi_env,
-        )
-        backtest = await repo.get_latest_crypto_model_artifact(
-            frequency="15m",
-            artifact_type="backtest",
-            kalshi_env=kalshi_env,
-        )
-        replay_gate = await repo.get_latest_crypto_model_artifact(
-            frequency="15m",
-            artifact_type="replay_gate",
-            kalshi_env=kalshi_env,
-        )
         rows = _crypto_decision_rows(snapshots, candles, spot_rows)
         labeled = [row for row in rows if row.get("label_yes") in {0, 1}]
         assets = sorted({normalize_asset_symbol(str(row.get("asset_symbol") or "")) for row in labeled})
         settled_snapshot_rows = sum(1 for row in snapshots if row.settlement_result in {"yes", "no"})
+        row_counts = {
+            "snapshot_rows": len(snapshots),
+            "candle_rows": len(candles),
+            "spot_rows": len(spot_rows),
+            "settled_snapshot_rows": settled_snapshot_rows,
+            "decision_rows": len(rows),
+            "labeled_rows": len(labeled),
+            "assets": assets,
+        }
         data_gap_reason = _crypto_data_gap_reason(
             snapshot_rows=len(snapshots),
             candle_rows=len(candles),
@@ -1391,11 +1521,12 @@ class AutonomousGateTuningService:
             labeled_rows=len(labeled),
             settled_snapshot_rows=settled_snapshot_rows,
         )
+        scored_labeled = _crypto_rows_with_policy_predictions(labeled, settings=self.settings)
         current_scores: dict[str, Any] = {}
         promoted: dict[str, Any] = {}
         diagnostics: list[dict[str, Any]] = []
         for asset in assets:
-            asset_rows = [row for row in labeled if normalize_asset_symbol(str(row.get("asset_symbol") or "")) == asset]
+            asset_rows = [row for row in scored_labeled if normalize_asset_symbol(str(row.get("asset_symbol") or "")) == asset]
             current_score = _score_crypto_policy_rows(
                 asset_rows,
                 settings=self.settings,
@@ -1427,24 +1558,9 @@ class AutonomousGateTuningService:
             "domain": "crypto",
             "window_days": days,
             "min_support": min_support,
-            "row_counts": {
-                "snapshot_rows": len(snapshots),
-                "candle_rows": len(candles),
-                "spot_rows": len(spot_rows),
-                "settled_snapshot_rows": settled_snapshot_rows,
-                "decision_rows": len(rows),
-                "labeled_rows": len(labeled),
-                "assets": assets,
-            },
+            "row_counts": row_counts,
             "data_gap_reason": data_gap_reason,
-            "artifact_checks": {
-                "model_status": _crypto_artifact_status(model),
-                "model_version": getattr(model, "version", None),
-                "backtest_status": _crypto_artifact_status(backtest),
-                "backtest_version": getattr(backtest, "version", None),
-                "replay_gate_status": _crypto_artifact_status(replay_gate),
-                "replay_gate_version": getattr(replay_gate, "version", None),
-            },
+            "artifact_checks": artifact_checks,
             "current_policy": _crypto_policy_values(crypto_policy),
             "asset_diagnostics": diagnostics,
             "promoted_assets": promoted,
@@ -2474,6 +2590,58 @@ def _crypto_artifact_status(artifact: Any | None) -> str:
     return str(getattr(artifact, "status", None) or "missing")
 
 
+def _crypto_row_counts_from_artifact_metrics(
+    metrics: dict[str, Any],
+    *,
+    dataset: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    sample_count = int(metrics.get("sample_count") or metrics.get("resolved_sample_count") or 0)
+    resolved = int(metrics.get("resolved_sample_count") or sample_count)
+    dataset = dataset or {}
+    return {
+        "snapshot_rows": int(dataset.get("snapshot_count") or metrics.get("snapshot_count") or (1 if sample_count > 0 else 0)),
+        "candle_rows": int(metrics.get("candle_count") or dataset.get("candle_count") or 0),
+        "spot_rows": int(metrics.get("spot_row_count") or dataset.get("spot_row_count") or 0),
+        "settled_snapshot_rows": int(dataset.get("settled_snapshot_count") or resolved),
+        "decision_rows": sample_count,
+        "labeled_rows": resolved,
+        "assets": sorted(str(asset) for asset in (dataset.get("assets") or metrics.get("assets") or [])),
+    }
+
+
+def _crypto_validation_short_circuit_recommendation(
+    *,
+    kalshi_env: str,
+    days: int,
+    min_support: int,
+    row_counts: dict[str, Any],
+    artifact_checks: dict[str, Any],
+    validation_failures: list[str],
+    crypto_policy: RuntimeCryptoPolicy,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "crypto-autonomous-gate-recommendations-v1",
+        "kalshi_env": kalshi_env,
+        "domain": "crypto",
+        "window_days": days,
+        "min_support": min_support,
+        "row_counts": row_counts,
+        "data_gap_reason": None,
+        "artifact_checks": artifact_checks,
+        "current_policy": _crypto_policy_values(crypto_policy),
+        "asset_diagnostics": [],
+        "promoted_assets": {},
+        "validation_short_circuit": True,
+        "validation": {
+            "passed": False,
+            "failures": sorted(set(validation_failures)),
+            "row_counts": row_counts,
+            "artifact_checks": artifact_checks,
+            "data_gap_reason": None,
+        },
+    }
+
+
 def _crypto_data_gap_reason(
     *,
     snapshot_rows: int,
@@ -2987,6 +3155,26 @@ def _row_passes_thresholds(row: GateLearningRow, thresholds: dict[str, Any]) -> 
     )
 
 
+def _crypto_rows_with_policy_predictions(
+    rows: list[dict[str, Any]],
+    *,
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    """Attach deterministic walk-forward predictions once for threshold sweeps."""
+    if not rows:
+        return []
+    folds = _crypto_walk_forward_folds(rows, min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)))
+    scored: list[dict[str, Any]] = []
+    if folds:
+        for fold in folds:
+            model = _fit_crypto_calibration(fold["train_rows"], settings=settings, include_candidate_report=False)
+            for row in fold["test_rows"]:
+                scored.append({**row, "_autonomous_predicted_yes_dollars": _predict_crypto_probability(row, model)})
+        return scored
+    model = _fit_crypto_calibration(rows, settings=settings, include_candidate_report=False)
+    return [{**row, "_autonomous_predicted_yes_dollars": _predict_crypto_probability(row, model)} for row in rows]
+
+
 def _score_crypto_policy_rows(
     rows: list[dict[str, Any]],
     *,
@@ -2998,6 +3186,27 @@ def _score_crypto_policy_rows(
         row for row in rows
         if asset_symbol is None or normalize_asset_symbol(str(row.get("asset_symbol") or "")) == normalize_asset_symbol(asset_symbol)
     ]
+    if filtered and all("_autonomous_predicted_yes_dollars" in row for row in filtered):
+        selected_pnls: list[Decimal] = []
+        selected_rows = 0
+        for row in filtered:
+            fair = _decimal(row["_autonomous_predicted_yes_dollars"])
+            simulated = _simulate_crypto_trade(row, fair, settings=settings, crypto_policy=crypto_policy)
+            if simulated.get("status") == "fillable":
+                selected_rows += 1
+                selected_pnls.append(Decimal(str(simulated.get("net_pnl") or "0")))
+        net = sum(selected_pnls, Decimal("0"))
+        cumulative = Decimal("0")
+        min_cumulative = Decimal("0")
+        for pnl in selected_pnls:
+            cumulative += pnl
+            min_cumulative = min(min_cumulative, cumulative)
+        return {
+            "row_count": len(filtered),
+            "selected_count": selected_rows,
+            "net_pnl": net,
+            "drawdown_proxy": abs(min_cumulative),
+        }
     folds = _crypto_walk_forward_folds(filtered, min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)))
     selected_pnls: list[Decimal] = []
     selected_rows = 0

@@ -648,6 +648,8 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
         result = await container.crypto_history_service.bootstrap(days=args.days, frequency=args.frequency)
     elif args.crypto_history_command == "daily":
         result = await container.crypto_history_service.daily(frequency=args.frequency)
+    elif args.crypto_history_command == "collect-open":
+        result = await container.crypto_history_service.collect_open(frequency=args.frequency)
     elif args.crypto_history_command == "status":
         result = await container.crypto_history_service.status(
             frequency=args.frequency,
@@ -2551,6 +2553,10 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_history_daily = crypto_history_subparsers.add_parser("daily")
     add_kalshi_env_argument(crypto_history_daily)
     crypto_history_daily.add_argument("--frequency", default="15m")
+    crypto_history_collect_open = crypto_history_subparsers.add_parser("collect-open")
+    add_kalshi_env_argument(crypto_history_collect_open)
+    crypto_history_collect_open.add_argument("--frequency", default="15m")
+    crypto_history_collect_open.add_argument("--json", action="store_true")
     crypto_history_status = crypto_history_subparsers.add_parser("status")
     add_kalshi_env_argument(crypto_history_status)
     crypto_history_status.add_argument("--frequency", default="15m")

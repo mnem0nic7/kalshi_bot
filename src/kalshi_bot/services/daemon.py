@@ -181,6 +181,7 @@ class DaemonService:
             "auto_rooms_enabled": self.settings.trigger_enable_auto_rooms,
             "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
             "crypto_history_auto_enabled": self.settings.crypto_history_auto_enabled,
+            "crypto_quote_evidence_enabled": self.settings.crypto_quote_evidence_enabled,
             "crypto_spot_history_auto_enabled": self.settings.crypto_spot_history_auto_enabled,
             "heartbeat_at": self._now_iso(),
         }
@@ -275,6 +276,7 @@ class DaemonService:
                     "stop_loss": asyncio.create_task(self._periodic_stop_loss_loop()),
                     "strategy_c": asyncio.create_task(self._periodic_strategy_c_loop()),
                     "monotonicity_arb": asyncio.create_task(self._periodic_monotonicity_arb_loop()),
+                    "crypto_quote_evidence": asyncio.create_task(self._periodic_crypto_quote_evidence_loop()),
                     "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
                     "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
                     "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
@@ -457,6 +459,18 @@ class DaemonService:
                 )
             except Exception:
                 logger.warning("crypto history loop error", exc_info=True)
+
+    async def _periodic_crypto_quote_evidence_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.crypto_quote_evidence_interval_seconds)
+            if self.crypto_history_service is None or not self.settings.crypto_quote_evidence_enabled:
+                continue
+            if not await self._is_active_color():
+                continue
+            try:
+                await self.crypto_history_service.collect_open(frequency="15m")
+            except Exception:
+                logger.warning("crypto quote evidence loop error", exc_info=True)
 
     async def _periodic_crypto_spot_history_loop(self) -> None:
         while True:

@@ -83,6 +83,15 @@ CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
 CRYPTO_EXPLORATORY_SHADOW = "exploratory_shadow"
 CRYPTO_LIVE_QUALITY = "live_quality"
+CRYPTO_MODEL_CANDIDATE_NAMES = (
+    "market_mid_baseline",
+    "current_heuristic",
+    "sklearn_logistic",
+    "spot_distance_residual",
+    "asset_time_calibration",
+    "xgboost_classifier",
+    "lightgbm_classifier",
+)
 
 
 def _version(prefix: str, payload: dict[str, Any]) -> str:
@@ -618,6 +627,7 @@ class CryptoMarketService:
                 kalshi_env=self.settings.kalshi_env,
                 limit=500_000,
             )
+            quote_rows = _crypto_decision_rows(all_snapshots, candles, spot_rows)
             shadow_evidence = await _crypto_shadow_evidence_counts(
                 session,
                 kalshi_env=self.settings.kalshi_env,
@@ -648,6 +658,10 @@ class CryptoMarketService:
         latest_snapshot_at = max((row.observed_at for row in all_snapshots), default=None)
         latest_candle_at = max((row.end_period_ts for row in candles), default=None)
         latest_spot_at = max((_as_utc_datetime(row.end_ts) for row in spot_rows), default=None)
+        quote_evidence = _crypto_quote_evidence_summary(all_snapshots, quote_rows)
+        backtest_metrics = (backtest.metrics if backtest is not None else {}) or {}
+        quote_evidence["trade_candidate_count"] = int(backtest_metrics.get("trade_candidate_count") or 0)
+        quote_evidence["strict_trade_candidate_min_required"] = crypto_policy.replay_min_trade_candidates
         return {
             "market_domain": "crypto",
             "kalshi_env": self.settings.kalshi_env,
@@ -679,6 +693,7 @@ class CryptoMarketService:
             "replay_gate": _artifact_summary(gate),
             "data_quality": data_quality,
             "spot_quality": spot_quality,
+            "quote_evidence": quote_evidence,
             "data_freshness": {
                 "latest_snapshot_observed_at": latest_snapshot_at.isoformat() if latest_snapshot_at else None,
                 "latest_candle_at": latest_candle_at.isoformat() if latest_candle_at else None,
@@ -831,6 +846,59 @@ class CryptoHistoryService:
     async def daily(self, *, frequency: str = "15m") -> dict[str, Any]:
         return await self.bootstrap(days=2, frequency=frequency)
 
+    async def collect_open(self, *, frequency: str = "15m") -> dict[str, Any]:
+        """Collect lightweight executable quote evidence for currently open crypto markets.
+
+        This deliberately avoids historical pagination and candlestick capture. Strict
+        replay evidence needs real bid/ask rows; candles stay prediction-only.
+        """
+        freq = normalize_frequency(frequency) or "15m"
+        observed_at = datetime.now(UTC)
+        markets = await self.market_service.discover_markets(frequency=freq, status="open", persist=False)
+        stored = 0
+        skipped: list[dict[str, Any]] = []
+        asset_counts: Counter[str] = Counter()
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            for market in markets:
+                if market.yes_bid_dollars is None or market.yes_ask_dollars is None:
+                    skipped.append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "reason": "missing_real_bid_ask",
+                        }
+                    )
+                    continue
+                await self.market_service.record_market_snapshot(
+                    repo,
+                    market,
+                    source_kind="live_quote_evidence",
+                    observed_at=observed_at,
+                )
+                stored += 1
+                asset_counts[market.asset_symbol] += 1
+            await session.commit()
+            recent_snapshots = await repo.list_crypto_market_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                since=observed_at - timedelta(minutes=30),
+                limit=5000,
+            )
+            await session.commit()
+        return {
+            "status": "ok" if stored else "warn",
+            "kalshi_env": self.settings.kalshi_env,
+            "frequency": freq,
+            "observed_at": observed_at.isoformat(),
+            "checked_markets": len(markets),
+            "stored_real_quote_snapshots": stored,
+            "skipped_count": len(skipped),
+            "skipped": skipped[:20],
+            "asset_counts": dict(sorted(asset_counts.items())),
+            "recent_quote_evidence": _crypto_quote_evidence_summary(recent_snapshots, []),
+        }
+
     async def status(self, *, frequency: str = "15m", days: int | None = None) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
@@ -856,6 +924,7 @@ class CryptoHistoryService:
             )
             await session.commit()
         asset_symbols = sorted({row.asset_symbol for row in snapshots} | {row.asset_symbol for row in candles} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS))
+        quote_rows = _crypto_decision_rows(snapshots, candles, spot_rows)
         return {
             "status": "ok",
             "kalshi_env": self.settings.kalshi_env,
@@ -871,6 +940,7 @@ class CryptoHistoryService:
                 expected_assets=asset_symbols,
                 min_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
             ),
+            "quote_evidence": _crypto_quote_evidence_summary(snapshots, quote_rows),
         }
 
     async def _list_historical_markets(self, series_ticker: str) -> dict[str, Any]:
@@ -2265,15 +2335,20 @@ class CryptoAutonomyService:
                 }
             raise
         runtime_autonomy_enabled = bool(crypto_policy.production_autonomy_enabled)
-        if not self.settings.crypto_autonomy_enabled and not runtime_autonomy_enabled and not force:
+        production_autonomy_enabled = self.settings.crypto_production_autonomy_enabled or crypto_policy.production_autonomy_enabled
+        shadow_evidence_mode = bool(
+            production_mode
+            and self.settings.crypto_quote_evidence_enabled
+            and not production_autonomy_enabled
+        )
+        if not self.settings.crypto_autonomy_enabled and not runtime_autonomy_enabled and not force and not shadow_evidence_mode:
             return {
                 "status": "disabled",
                 "kalshi_env": self.settings.kalshi_env,
                 "frequency": freq,
                 "reason": "crypto_autonomy_enabled is false and active runtime crypto policy has production_autonomy_enabled=false",
             }
-        production_autonomy_enabled = self.settings.crypto_production_autonomy_enabled or crypto_policy.production_autonomy_enabled
-        if production_mode and not production_autonomy_enabled:
+        if production_mode and not production_autonomy_enabled and not shadow_evidence_mode:
             return {
                 "status": "production_blocked",
                 "kalshi_env": self.settings.kalshi_env,
@@ -2312,7 +2387,20 @@ class CryptoAutonomyService:
                     has_write_credentials=self.market_service.kalshi.write_credentials is not None,
                     crypto_policy=crypto_policy,
                 )
-                if production_mode and not live_status["live_eligible"]:
+                if live_status["asset_mode"] == CRYPTO_ASSET_MODE_OFF:
+                    skipped.append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "reason": "asset_mode_off",
+                        }
+                    )
+                    continue
+                shadow_evidence_allowed = (
+                    shadow_evidence_mode
+                    and live_status["asset_mode"] == CRYPTO_ASSET_MODE_SHADOW
+                )
+                if production_mode and not live_status["live_eligible"] and not shadow_evidence_allowed:
                     skipped.append(
                         {
                             "market_ticker": market.market_ticker,
@@ -2320,15 +2408,6 @@ class CryptoAutonomyService:
                             "reason": "not_live_eligible",
                             "asset_mode": live_status["asset_mode"],
                             "live_blockers": live_status["live_blockers"],
-                        }
-                    )
-                    continue
-                if live_status["asset_mode"] == CRYPTO_ASSET_MODE_OFF:
-                    skipped.append(
-                        {
-                            "market_ticker": market.market_ticker,
-                            "asset_symbol": market.asset_symbol,
-                            "reason": "asset_mode_off",
                         }
                     )
                     continue
@@ -2378,6 +2457,7 @@ class CryptoAutonomyService:
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "forced": force,
+            "shadow_evidence_mode": shadow_evidence_mode,
             "checked_markets": len(discovered),
             "eligible_markets": len(markets),
             "caps": {
@@ -2956,6 +3036,59 @@ async def _crypto_shadow_evidence_counts(
         "recent_shadow_skipped_receipts": await count(shadow_receipt_stmt),
         "live_order_count": await count(live_order_stmt),
         "recent_live_order_count": await count(recent_live_order_stmt),
+    }
+
+
+def _crypto_quote_evidence_summary(
+    snapshots: list[CryptoMarketSnapshotRecord],
+    decision_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    real_snapshots = [
+        row
+        for row in snapshots
+        if _snapshot_price(row, attr="yes_bid_dollars", dollar_keys=("yes_bid_dollars",), cent_keys=("yes_bid",)) is not None
+        and _snapshot_price(row, attr="yes_ask_dollars", dollar_keys=("yes_ask_dollars",), cent_keys=("yes_ask",)) is not None
+    ]
+    labeled_real_rows = [
+        row
+        for row in decision_rows
+        if row.get("strict_trade_eligible") and row.get("label_yes") in {0, 1}
+    ]
+    real_quote_rows = [row for row in decision_rows if row.get("quote_source") == "snapshot_quotes"]
+    strict_trade_rows = [row for row in decision_rows if row.get("strict_trade_eligible")]
+    proxy_rows = [row for row in decision_rows if row.get("quote_source") != "snapshot_quotes"]
+    candidates_by_asset: dict[str, dict[str, Any]] = {}
+    for row in decision_rows:
+        asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
+        summary = candidates_by_asset.setdefault(
+            asset,
+            {
+                "real_quote_rows": 0,
+                "labeled_real_quote_rows": 0,
+                "proxy_rows": 0,
+                "strict_trade_eligible_rows": 0,
+                "prediction_only_rows": 0,
+            },
+        )
+        if row.get("quote_source") == "snapshot_quotes":
+            summary["real_quote_rows"] += 1
+        else:
+            summary["proxy_rows"] += 1
+            summary["prediction_only_rows"] += 1
+        if row.get("strict_trade_eligible"):
+            summary["strict_trade_eligible_rows"] += 1
+            if row.get("label_yes") in {0, 1}:
+                summary["labeled_real_quote_rows"] += 1
+    return {
+        "real_quote_snapshot_count": len(real_snapshots),
+        "real_quote_decision_rows": len(real_quote_rows),
+        "labeled_real_quote_rows": len(labeled_real_rows),
+        "strict_trade_eligible_count": len(strict_trade_rows),
+        "proxy_row_count": len(proxy_rows),
+        "prediction_only_proxy_row_count": len(proxy_rows),
+        "trade_candidate_support_by_asset": dict(sorted(candidates_by_asset.items())),
+        "source_kind_counts": dict(Counter(row.source_kind for row in snapshots)),
+        "assets_with_real_quotes": sorted({row.asset_symbol for row in real_snapshots}),
     }
 
 
@@ -3556,6 +3689,25 @@ def _crypto_time_to_close_bucket(seconds: float) -> str:
     return "15m_plus"
 
 
+def _crypto_spot_distance_band(row: dict[str, Any]) -> str:
+    value = row.get("spot_target_distance_volatility")
+    if value is None:
+        pct = row.get("spot_moneyness_pct")
+        if pct is None:
+            return "missing"
+        value = Decimal(str(pct)) * Decimal("20")
+    score = float(_decimal(value))
+    if score <= -2.0:
+        return "far_below"
+    if score < -0.5:
+        return "below"
+    if score <= 0.5:
+        return "near"
+    if score < 2.0:
+        return "above"
+    return "far_above"
+
+
 def _crypto_market_age_seconds(decision_ts: datetime, open_time: datetime | None) -> int | None:
     if open_time is None:
         return None
@@ -3698,7 +3850,25 @@ def _fit_crypto_model_candidates(
             "status": "available",
             "model": _market_mid_crypto_model(schema=schema, defaults=defaults, fallback=fallback, rows=rows),
             "dependency_version": None,
-        }
+        },
+        "current_heuristic": {
+            "name": "current_heuristic",
+            "status": "available",
+            "model": {**fallback, "model_type": "current_heuristic", "training_cutoff": _crypto_training_cutoff(rows)},
+            "dependency_version": None,
+        },
+        "spot_distance_residual": {
+            "name": "spot_distance_residual",
+            "status": "available",
+            "model": _fit_crypto_spot_distance_residual_model(rows, fallback=fallback),
+            "dependency_version": None,
+        },
+        "asset_time_calibration": {
+            "name": "asset_time_calibration",
+            "status": "available",
+            "model": _fit_crypto_asset_time_calibration_model(rows, fallback=fallback),
+            "dependency_version": None,
+        },
     }
     if not rows or len(set(labels)) < 2:
         reason = "need_two_outcome_classes"
@@ -3726,6 +3896,43 @@ def _market_mid_crypto_model(
         "asset_categories": schema["asset_categories"],
         "positive_label": "yes",
         "feature_defaults": defaults,
+        "fallback_model": fallback,
+        "training_cutoff": _crypto_training_cutoff(rows),
+    }
+
+
+def _fit_crypto_spot_distance_residual_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:
+    grouped: dict[str, list[Decimal]] = defaultdict(list)
+    for row in rows:
+        key = "|".join([str(row.get("asset_symbol") or "unknown"), _crypto_spot_distance_band(row)])
+        grouped[key].append(Decimal(int(row["label_yes"])) - _decimal(row.get("mid_yes_dollars")))
+    adjustments = {
+        key: int(((sum(values, Decimal("0")) / Decimal(len(values))) * Decimal("10000")).to_integral_value())
+        for key, values in grouped.items()
+        if values
+    }
+    return {
+        "model_type": "spot_distance_residual",
+        "bucket_adjustments_bps": adjustments,
+        "fallback_model": fallback,
+        "training_cutoff": _crypto_training_cutoff(rows),
+    }
+
+
+def _fit_crypto_asset_time_calibration_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:
+    grouped: dict[str, list[Decimal]] = defaultdict(list)
+    for row in rows:
+        bucket = _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0))
+        key = "|".join([str(row.get("asset_symbol") or "unknown"), bucket])
+        grouped[key].append(Decimal(int(row["label_yes"])) - _decimal(row.get("mid_yes_dollars")))
+    adjustments = {
+        key: int(((sum(values, Decimal("0")) / Decimal(len(values))) * Decimal("10000")).to_integral_value())
+        for key, values in grouped.items()
+        if values
+    }
+    return {
+        "model_type": "asset_time_calibration",
+        "bucket_adjustments_bps": adjustments,
         "fallback_model": fallback,
         "training_cutoff": _crypto_training_cutoff(rows),
     }
@@ -3961,6 +4168,15 @@ def _predict_crypto_probability(
     model_type = model.get("model_type")
     if model_type == "market_mid_baseline":
         return _clamp_price(mid)
+    if model_type == "spot_distance_residual":
+        key = "|".join([str(row.get("asset_symbol") or "unknown"), _crypto_spot_distance_band(row)])
+        adjustment = Decimal(int((model.get("bucket_adjustments_bps") or {}).get(key, 0))) / Decimal("10000")
+        return _clamp_price(_predict_crypto_probability(row, model.get("fallback_model")) + adjustment)
+    if model_type == "asset_time_calibration":
+        bucket = _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0))
+        key = "|".join([str(row.get("asset_symbol") or "unknown"), bucket])
+        adjustment = Decimal(int((model.get("bucket_adjustments_bps") or {}).get(key, 0))) / Decimal("10000")
+        return _clamp_price(_predict_crypto_probability(row, model.get("fallback_model")) + adjustment)
     if model_type == "calibrated_weighted_ensemble":
         try:
             weights = {str(name): float(weight) for name, weight in (model.get("ensemble_weights") or {}).items()}
@@ -4156,7 +4372,7 @@ def _crypto_in_sample_candidate_report(
     entries: list[dict[str, Any]] = []
     market_metrics: dict[str, Any] | None = None
     logistic_metrics: dict[str, Any] | None = None
-    for name in ("market_mid_baseline", "sklearn_logistic", "xgboost_classifier", "lightgbm_classifier"):
+    for name in CRYPTO_MODEL_CANDIDATE_NAMES:
         status = candidate_status.get(name) or {"name": name, "status": "unavailable", "reason": "not_registered"}
         if status.get("status") == "available" and status.get("model") is not None:
             metrics = _probability_metrics_decimal(_crypto_predictions_for_model(rows, status["model"]))
@@ -4246,7 +4462,7 @@ def _crypto_model_candidate_report(
                 )
         else:
             unavailable_reasons.setdefault("calibrated_weighted_ensemble", "need_at_least_two_guardrail_clean_members")
-        for name in ("market_mid_baseline", "sklearn_logistic", "xgboost_classifier", "lightgbm_classifier"):
+        for name in CRYPTO_MODEL_CANDIDATE_NAMES:
             status = candidate_status.get(name) or {"status": "unavailable", "reason": "not_registered"}
             dependency_versions[name] = status.get("dependency_version")
             if status.get("status") != "available" or status.get("model") is None:
@@ -4268,7 +4484,7 @@ def _crypto_model_candidate_report(
     market_metrics = _probability_metrics_decimal(predictions_by_candidate.get("market_mid_baseline", []))
     logistic_metrics = _probability_metrics_decimal(predictions_by_candidate.get("sklearn_logistic", []))
     entries: list[dict[str, Any]] = []
-    for name in ("market_mid_baseline", "sklearn_logistic", "xgboost_classifier", "lightgbm_classifier", "calibrated_weighted_ensemble"):
+    for name in (*CRYPTO_MODEL_CANDIDATE_NAMES, "calibrated_weighted_ensemble"):
         predictions = predictions_by_candidate.get(name, [])
         if predictions:
             entries.append(
