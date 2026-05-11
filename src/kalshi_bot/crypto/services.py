@@ -1815,7 +1815,7 @@ class CryptoReplayService:
             )
             model = await repo.get_latest_crypto_model_artifact(
                 frequency=freq,
-                artifact_type="model",
+                artifact_type=_crypto_artifact_type("model", requested_assets),
                 kalshi_env=self.settings.kalshi_env,
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
@@ -2517,13 +2517,28 @@ class CryptoAutonomyService:
         skipped.extend(ineligible)
         skipped.extend(cap_skips)
 
+        replay_gates_by_asset: dict[str, Any] = {}
+        if markets:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                for asset_symbol in sorted({market.asset_symbol for market in markets}):
+                    replay_gates_by_asset[normalize_asset_symbol(asset_symbol)] = await _latest_crypto_artifact_for_asset(
+                        repo,
+                        frequency=freq,
+                        artifact_type="replay_gate",
+                        kalshi_env=self.settings.kalshi_env,
+                        asset_symbol=asset_symbol,
+                    )
+                await session.commit()
+
         for market in markets:
             try:
                 seconds_to_close = int((market.close_time - datetime.now(UTC)).total_seconds())
+                market_gate = replay_gates_by_asset.get(normalize_asset_symbol(market.asset_symbol), gate)
 
                 live_status = self.asset_control_service.market_live_status(
                     control=control,
-                    replay_gate=gate,
+                    replay_gate=market_gate,
                     market=market,
                     has_write_credentials=self.market_service.kalshi.write_credentials is not None,
                     crypto_policy=crypto_policy,
