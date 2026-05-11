@@ -130,6 +130,54 @@ def normalize_asset_mode(mode: str) -> str:
     return normalized
 
 
+def normalize_asset_symbols(asset_symbols: list[str] | None) -> list[str]:
+    return sorted({normalize_asset_symbol(symbol) for symbol in (asset_symbols or []) if str(symbol or "").strip()})
+
+
+def _crypto_artifact_type(base: str, asset_symbols: list[str] | None = None) -> str:
+    symbols = normalize_asset_symbols(asset_symbols)
+    if len(symbols) == 1:
+        return f"{base}:{symbols[0]}"
+    return base
+
+
+async def _latest_crypto_artifact_for_asset(
+    repo: PlatformRepository,
+    *,
+    frequency: str,
+    artifact_type: str,
+    kalshi_env: str,
+    asset_symbol: str | None = None,
+) -> Any | None:
+    if asset_symbol:
+        artifact = await repo.get_latest_crypto_model_artifact(
+            frequency=frequency,
+            artifact_type=_crypto_artifact_type(artifact_type, [asset_symbol]),
+            kalshi_env=kalshi_env,
+        )
+        if artifact is not None:
+            return artifact
+    return await repo.get_latest_crypto_model_artifact(
+        frequency=frequency,
+        artifact_type=artifact_type,
+        kalshi_env=kalshi_env,
+    )
+
+
+def _filter_crypto_snapshot_rows(rows: list[Any], asset_symbols: list[str] | None) -> list[Any]:
+    symbols = set(normalize_asset_symbols(asset_symbols))
+    if not symbols:
+        return rows
+    return [row for row in rows if normalize_asset_symbol(str(getattr(row, "asset_symbol", "") or "")) in symbols]
+
+
+def _filter_crypto_dict_rows(rows: list[dict[str, Any]], asset_symbols: list[str] | None) -> list[dict[str, Any]]:
+    symbols = set(normalize_asset_symbols(asset_symbols))
+    if not symbols:
+        return rows
+    return [row for row in rows if normalize_asset_symbol(str(row.get("asset_symbol") or "")) in symbols]
+
+
 class CryptoAssetControlService:
     def __init__(self, *, settings: Settings, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self.settings = settings
@@ -589,7 +637,8 @@ class CryptoMarketService:
             "live_blockers": live_status["live_blockers"],
         }
 
-    async def status(self, *, frequency: str = "15m") -> dict[str, Any]:
+    async def status(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
+        requested_assets = normalize_asset_symbols(asset_symbols)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
@@ -636,6 +685,35 @@ class CryptoMarketService:
             active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             await session.commit()
+        snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
+        all_snapshots = _filter_crypto_snapshot_rows(all_snapshots, requested_assets)
+        candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+        if len(requested_assets) == 1:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                model = await _latest_crypto_artifact_for_asset(
+                    repo,
+                    frequency=normalize_frequency(frequency) or "15m",
+                    artifact_type="model",
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbol=requested_assets[0],
+                )
+                gate = await _latest_crypto_artifact_for_asset(
+                    repo,
+                    frequency=normalize_frequency(frequency) or "15m",
+                    artifact_type="replay_gate",
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbol=requested_assets[0],
+                )
+                backtest = await _latest_crypto_artifact_for_asset(
+                    repo,
+                    frequency=normalize_frequency(frequency) or "15m",
+                    artifact_type="backtest",
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbol=requested_assets[0],
+                )
+                await session.commit()
         asset_symbols = sorted({snapshot.asset_symbol for snapshot in snapshots})
         mode_summary = self.asset_control_service.asset_mode_summary(
             asset_symbols=asset_symbols,
@@ -846,15 +924,18 @@ class CryptoHistoryService:
     async def daily(self, *, frequency: str = "15m") -> dict[str, Any]:
         return await self.bootstrap(days=2, frequency=frequency)
 
-    async def collect_open(self, *, frequency: str = "15m") -> dict[str, Any]:
+    async def collect_open(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
         """Collect lightweight executable quote evidence for currently open crypto markets.
 
         This deliberately avoids historical pagination and candlestick capture. Strict
         replay evidence needs real bid/ask rows; candles stay prediction-only.
         """
         freq = normalize_frequency(frequency) or "15m"
+        requested_assets = set(normalize_asset_symbols(asset_symbols))
         observed_at = datetime.now(UTC)
         markets = await self.market_service.discover_markets(frequency=freq, status="open", persist=False)
+        if requested_assets:
+            markets = [market for market in markets if normalize_asset_symbol(market.asset_symbol) in requested_assets]
         stored = 0
         skipped: list[dict[str, Any]] = []
         asset_counts: Counter[str] = Counter()
@@ -890,6 +971,7 @@ class CryptoHistoryService:
             "status": "ok" if stored else "warn",
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
+            "asset_symbols": sorted(requested_assets),
             "observed_at": observed_at.isoformat(),
             "checked_markets": len(markets),
             "stored_real_quote_snapshots": stored,
