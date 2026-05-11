@@ -169,6 +169,7 @@ class ReconciliationService:
             )
 
         await repo.settle_fills(settlements, kalshi_env=kalshi_env)
+        bootstrap_settlement_events = await repo.sync_weather_bootstrap_settlement_events(kalshi_env=kalshi_env)
         await refresh_stop_loss_checkpoints(
             repo,
             settings=self.settings,
@@ -186,6 +187,7 @@ class ReconciliationService:
                 "orders_count": len(orders),
                 "fills_count": len(fills),
                 "settlements_count": len(settlements),
+                "weather_bootstrap_settlement_events": bootstrap_settlement_events,
                 "live_tickers": sorted(live_tickers),
                 "reconciled_at": reconciled_at.isoformat(),
             },
@@ -216,6 +218,7 @@ class ReconciliationService:
                 "orders_count": len(orders),
                 "fills_count": len(fills),
                 "settlements_count": len(settlements),
+                "weather_bootstrap_settlement_events": bootstrap_settlement_events,
                 "live_tickers": sorted(live_tickers),
                 "reconciled_at": reconciled_at.isoformat(),
             },

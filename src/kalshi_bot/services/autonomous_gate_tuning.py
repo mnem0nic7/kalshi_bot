@@ -118,6 +118,7 @@ class AutonomousGateTuningService:
                 WeatherEmpiricalBootstrapService().shadow_gate_status(
                     policy=bootstrap_policy,
                     events=bootstrap_events,
+                    policy_key=weather_resolution.policy_key,
                     now=datetime.now(UTC),
                 ).to_payload()
                 if bootstrap_policy is not None
@@ -458,6 +459,7 @@ class AutonomousGateTuningService:
         shadow_gate = WeatherEmpiricalBootstrapService().shadow_gate_status(
             policy=bootstrap,
             events=events,
+            policy_key=weather_resolution.policy_key,
             now=now,
         ).to_payload()
         if bootstrap.rollout_state != "shadow":

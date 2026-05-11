@@ -3,17 +3,37 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Iterable
 
 from kalshi_bot.core.schemas import AgentPackWeatherBootstrapPolicy, AgentPackWeatherBootstrapTier
 from kalshi_bot.db.models import WeatherBootstrapEventRecord, WeatherBootstrapHistoricalEvidenceRecord
-from kalshi_bot.services.trade_behavior import series_from_ticker
 
 
 BOOTSTRAP_POLICY_VERSION = "weather-empirical-bootstrap-v1"
-BOOTSTRAP_ALLOWED_STATUSES = {"live_allowed", "approved", "ordered", "filled"}
+BOOTSTRAP_ACTIVE_STATUSES = {
+    "live_allowed",
+    "approved",
+    "ordered",
+    "submitted",
+    "resting",
+    "filled",
+    "executed",
+}
+BOOTSTRAP_TERMINAL_NON_POSITION_STATUSES = {
+    "blocked",
+    "risk_blocked",
+    "rejected",
+    "write_credentials_missing",
+    "kill_switch_blocked",
+    "inactive_color_skipped",
+    "shadow_skipped",
+    "lock_denied",
+    "canceled",
+    "cancelled",
+    "unfilled_cancelled",
+}
 BOOTSTRAP_SETTLED_STATUSES = {"settled_win", "settled_loss", "settled"}
 
 
@@ -308,6 +328,10 @@ class WeatherEmpiricalBootstrapService:
         mature_pnl = self._mature_net_pnl(context, recent_events, historical_evidence)
         kill_active, kill_reason = self._kill_switch(policy, recent_events)
         if tier_name == "mature":
+            mature_live = bool(
+                policy.evidence_ready
+                and rollout in {"live", "canary", "promoted", "promoted_normal", "expanded"}
+            )
             if context.actual_net_pnl is not None:
                 mature_pnl = context.actual_net_pnl
             if mature_pnl is not None and mature_pnl <= Decimal("0"):
@@ -317,16 +341,18 @@ class WeatherEmpiricalBootstrapService:
                 return replace(decision, kill_switch_active=True, kill_switch_reason=kill_reason)
             return WeatherEmpiricalBootstrapDecision(
                 matched=True,
-                applied=True,
+                applied=mature_live,
                 would_have_entered=True,
-                allowed_live=True,
-                outcome="allow",
-                reason="empirical_gate_mature_passed",
+                allowed_live=mature_live,
+                outcome="allow" if mature_live else "shadow_allow",
+                reason="empirical_gate_mature_passed" if mature_live else "empirical_gate_mature_shadow_matched",
                 tier=tier_name,
                 min_confidence_required=None,
                 edge_bps_after_buffer=self._edge_int(context.edge_bps_after_buffer),
                 min_edge_bps_required=None,
-                reason_codes=["mature_empirical_gate_passed"],
+                reason_codes=[
+                    "mature_empirical_gate_passed" if mature_live else "mature_requires_promoted_policy",
+                ],
                 **{**base_kwargs, "size_factor": 1.0},
             )
 
@@ -396,26 +422,45 @@ class WeatherEmpiricalBootstrapService:
         *,
         policy: AgentPackWeatherBootstrapPolicy,
         events: Iterable[WeatherBootstrapEventRecord],
+        policy_key: str | None = None,
         now: datetime | None = None,
     ) -> BootstrapShadowGateStatus:
-        event_list = list(events)
+        event_list = [
+            event for event in events
+            if policy_key is None or event.policy_key == policy_key
+        ]
         now_utc = _as_utc(now) or datetime.now(UTC)
         first_seen = min((_as_utc(event.occurred_at) for event in event_list if event.occurred_at is not None), default=None)
         observed_hours = (now_utc - first_seen).total_seconds() / 3600 if first_seen is not None else 0.0
-        episodes = {
-            (
+        cold_episodes: dict[tuple[str | None, str | None, str | None], list[WeatherBootstrapEventRecord]] = {}
+        for event in event_list:
+            if event.event_type != "decision" or event.tier != "cold":
+                continue
+            key = (
                 event.market_ticker,
                 event.local_market_day or market_day_from_ticker(event.market_ticker),
-                event.tier,
+                event.bucket_key,
             )
-            for event in event_list
-            if event.event_type == "decision"
-        }
-        intended = [event for event in event_list if event.event_type == "decision" and event.tier == "cold"]
-        actual = [
-            event for event in intended
-            if event.status in {"shadow_allow", "live_allowed", "approved", "ordered", "filled"}
-        ]
+            cold_episodes.setdefault(key, []).append(event)
+
+        intended: list[WeatherBootstrapEventRecord] = []
+        actual: list[WeatherBootstrapEventRecord] = []
+        for episode_events in cold_episodes.values():
+            latest = max(
+                episode_events,
+                key=lambda event: _as_utc(event.occurred_at) or datetime.min.replace(tzinfo=UTC),
+            )
+            matched = any(
+                bool((event.payload or {}).get("matched"))
+                or bool((event.payload or {}).get("would_have_entered"))
+                or event.status in {"shadow_allow", "live_allowed"}
+                for event in episode_events
+            )
+            if not matched:
+                continue
+            intended.append(latest)
+            if any(event.status in {"shadow_allow", "live_allowed"} for event in episode_events):
+                actual.append(latest)
         fallback = [
             event for event in actual
             if str((event.payload or {}).get("fair_value_source") or "").lower() in {"fallback", "unavailable"}
@@ -428,7 +473,7 @@ class WeatherEmpiricalBootstrapService:
         reason_codes: list[str] = []
         if observed_hours < policy.caps.shadow_min_hours:
             reason_codes.append("shadow_min_hours_not_met")
-        if len(episodes) < policy.caps.shadow_min_market_episodes:
+        if len(intended) < policy.caps.shadow_min_market_episodes:
             reason_codes.append("shadow_market_episode_support_not_met")
         if intended and match_rate < policy.caps.shadow_required_match_rate:
             reason_codes.append("shadow_match_rate_below_threshold")
@@ -441,7 +486,7 @@ class WeatherEmpiricalBootstrapService:
             status="eligible" if eligible else "pending",
             eligible_for_promotion=eligible,
             observed_hours=observed_hours,
-            market_episodes=len(episodes),
+            market_episodes=len(intended),
             intended_matches=len(intended),
             actual_matches=len(actual),
             match_rate=match_rate,
@@ -503,26 +548,41 @@ class WeatherEmpiricalBootstrapService:
         *,
         since: datetime,
     ) -> Decimal:
-        total = Decimal("0")
         since_utc = _as_utc(since) or since
-        for event in events:
+        active_by_key: dict[str, Decimal] = {}
+        for event in sorted(
+            events,
+            key=lambda item: _as_utc(item.occurred_at) or datetime.min.replace(tzinfo=UTC),
+        ):
             event_time = _as_utc(event.occurred_at)
             if event_time is None or event_time < since_utc:
                 continue
-            if event.status not in BOOTSTRAP_ALLOWED_STATUSES:
+            key = event.order_id or event.room_id or f"{event.market_ticker}:{event.bucket_key}"
+            status = str(event.status or "").lower()
+            if status in BOOTSTRAP_SETTLED_STATUSES or status in BOOTSTRAP_TERMINAL_NON_POSITION_STATUSES or status.startswith("rejected_"):
+                active_by_key.pop(key, None)
+                continue
+            if status not in BOOTSTRAP_ACTIVE_STATUSES:
                 continue
             if event.notional_dollars is not None:
-                total += Decimal(str(event.notional_dollars))
-        return total
+                active_by_key[key] = Decimal(str(event.notional_dollars))
+        return sum(active_by_key.values(), Decimal("0"))
 
     def _concurrent_positions(self, events: Iterable[WeatherBootstrapEventRecord]) -> int:
         active: set[str] = set()
         settled: set[str] = set()
-        for event in events:
+        for event in sorted(
+            events,
+            key=lambda item: _as_utc(item.occurred_at) or datetime.min.replace(tzinfo=UTC),
+        ):
             key = event.market_ticker
-            if event.status in BOOTSTRAP_SETTLED_STATUSES:
+            status = str(event.status or "").lower()
+            if status in BOOTSTRAP_SETTLED_STATUSES:
                 settled.add(key)
-            elif event.status in BOOTSTRAP_ALLOWED_STATUSES:
+                active.discard(key)
+            elif status in BOOTSTRAP_TERMINAL_NON_POSITION_STATUSES or status.startswith("rejected_"):
+                active.discard(key)
+            elif status in BOOTSTRAP_ACTIVE_STATUSES:
                 active.add(key)
         return len(active - settled)
 

@@ -83,6 +83,74 @@ EXTREME_EDGE_DAILY_HIGH_AGREEMENT_TOLERANCE_F = 3.0
 EXTREME_EDGE_CURRENT_TEMP_TOLERANCE_F = 1.0
 
 
+def _policy_side_for_signal(signal: StrategySignal) -> str | None:
+    if signal.recommended_side is not None:
+        return signal.recommended_side.value
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    candidates = [candidate for candidate in trace.get("candidates") or [] if isinstance(candidate, dict)]
+    if not candidates:
+        candidates = [
+            candidate
+            for candidate in (trace.get("yes"), trace.get("no"))
+            if isinstance(candidate, dict)
+        ]
+    candidates = [candidate for candidate in candidates if candidate.get("side") in {"yes", "no"}]
+    if not candidates:
+        return None
+    best = max(
+        candidates,
+        key=lambda candidate: (
+            int(candidate.get("quality_adjusted_edge_bps") or -1_000_000),
+            int(candidate.get("edge_bps") or -1_000_000),
+        ),
+    )
+    return str(best.get("side") or "") or None
+
+
+def _runtime_threshold_payload(thresholds: RuntimeThresholds) -> dict[str, Any]:
+    return {field: getattr(thresholds, field) for field in thresholds.__dataclass_fields__}
+
+
+def _resolution_changes_thresholds(left: Any, right: Any) -> bool:
+    return _runtime_threshold_payload(left.thresholds) != _runtime_threshold_payload(right.thresholds)
+
+
+def _apply_weather_policy_mode(signal: StrategySignal, weather_policy_resolution: Any) -> StrategySignal:
+    mode = str(getattr(weather_policy_resolution, "mode", "live") or "live").lower()
+    if mode == "live" or signal.eligibility is None:
+        return signal
+    if mode not in {"paused", "shadow_only", "research_only", "retired"}:
+        return signal
+    candidate_trace = dict(signal.eligibility.candidate_trace or signal.candidate_trace or {})
+    candidate_trace["weather_policy_mode_block"] = {
+        "mode": mode,
+        "policy_key": getattr(weather_policy_resolution, "policy_key", None),
+        "lane": getattr(weather_policy_resolution, "lane", "entry_gate"),
+        "reason": f"weather_policy_{mode}",
+    }
+    reason = (
+        f"Weather policy {getattr(weather_policy_resolution, 'policy_key', 'unknown')} "
+        f"is in {mode} mode for entry_gate, so live entry is blocked."
+    )
+    reasons = list(signal.eligibility.reasons or [])
+    if reason not in reasons:
+        reasons.append(reason)
+    signal.eligibility = signal.eligibility.model_copy(
+        update={
+            "eligible": False,
+            "stand_down_reason": StandDownReason.WEATHER_POLICY_PAUSED,
+            "evaluation_outcome": "pre_risk_filtered",
+            "candidate_trace": candidate_trace,
+            "reasons": reasons,
+            "blocked_upstream": True,
+        }
+    )
+    signal.stand_down_reason = StandDownReason.WEATHER_POLICY_PAUSED
+    signal.evaluation_outcome = "pre_risk_filtered"
+    signal.candidate_trace = candidate_trace
+    return signal
+
+
 def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
 
@@ -1620,6 +1688,38 @@ class WorkflowSupervisor:
                                     "external_order_id": receipt.external_order_id,
                                 },
                             )
+                    elif bootstrap_trace.get("applied") is True:
+                        await repo.save_weather_bootstrap_event(
+                            kalshi_env=room.kalshi_env,
+                            market_ticker=room.market_ticker,
+                            series_ticker=series_from_ticker(room.market_ticker),
+                            local_market_day=market_day_from_ticker(room.market_ticker),
+                            bucket_key=bootstrap_trace.get("bucket_id")
+                            or (candidate_trace.get("empirical_gate") or {}).get("bucket_key"),
+                            policy_key=bootstrap_trace.get("policy_key"),
+                            tier=bootstrap_trace.get("tier"),
+                            event_type="order",
+                            status=receipt.status,
+                            side=approved_ticket.side.value,
+                            confidence=signal.confidence,
+                            edge_bps=bootstrap_trace.get("edge_bps_after_buffer"),
+                            size_factor=bootstrap_trace.get("size_factor"),
+                            count_fp=approved_ticket.count_fp,
+                            notional_dollars=estimate_notional_dollars(
+                                approved_ticket.side,
+                                approved_ticket.yes_price_dollars,
+                                approved_ticket.count_fp,
+                            ),
+                            source="live_forward",
+                            occurred_at=datetime.now(UTC),
+                            room_id=room.id,
+                            payload={
+                                **bootstrap_trace,
+                                "receipt_status": receipt.status,
+                                "external_order_id": receipt.external_order_id,
+                                "terminal_without_order_record": True,
+                            },
+                        )
                     await repo.update_trade_ticket_status(ticket_record.id, receipt.status)
                 else:
                     await repo.update_trade_ticket_status(ticket_record.id, "blocked")
@@ -2034,6 +2134,67 @@ class WorkflowSupervisor:
                         market_response,
                         min_edge_bps=thresholds.risk_min_edge_bps,
                     )
+                def _resolve_policy_for_current_signal() -> Any:
+                    scoped_policy_context = weather_policy_context_from_market(
+                        market_ticker=room.market_ticker,
+                        strategy_code=StrategyCode.DIRECTIONAL.value,
+                        side=_policy_side_for_signal(signal),
+                        local_market_day=_ticker_local_market_day(room.market_ticker),
+                        trade_regime=signal.trade_regime,
+                        lane="entry_gate",
+                    )
+                    return self.agent_pack_service.resolve_weather_policy(
+                        pack,
+                        scoped_policy_context,
+                        fallback_thresholds=thresholds,
+                    )
+
+                for scoped_policy_attempt in range(3):
+                    scoped_policy_resolution = _resolve_policy_for_current_signal()
+                    scoped_policy_changed = (
+                        scoped_policy_resolution.policy_key != weather_policy_resolution.policy_key
+                        or scoped_policy_resolution.mode != weather_policy_resolution.mode
+                        or scoped_policy_resolution.action != weather_policy_resolution.action
+                    )
+                    thresholds_changed = _resolution_changes_thresholds(
+                        weather_policy_resolution,
+                        scoped_policy_resolution,
+                    )
+                    if not scoped_policy_changed and not thresholds_changed:
+                        break
+                    weather_policy_resolution = scoped_policy_resolution
+                    thresholds = thresholds_with_production_freeze_floor(
+                        settings=self.settings,
+                        kalshi_env=room.kalshi_env,
+                        thresholds=weather_policy_resolution.thresholds,
+                    )
+                    weather_policy_provenance = {
+                        **weather_policy_resolution.provenance(),
+                        "active_policy_pack_version": pack.version,
+                    }
+                    if not thresholds_changed:
+                        break
+                    if mapping is not None and mapping.supports_structured_weather and weather_bundle is not None:
+                        signal = self.signal_engine.evaluate(
+                            mapping,
+                            market_response,
+                            weather_bundle,
+                            min_edge_bps=thresholds.risk_min_edge_bps,
+                            thresholds=thresholds,
+                        )
+                        signal.candidate_trace = {
+                            **dict(signal.candidate_trace or {}),
+                            "fresh_weather_signal": True,
+                            "research_last_run_id": dossier.last_run_id,
+                            "scoped_weather_policy_reapplied": True,
+                            "scoped_weather_policy_attempt": scoped_policy_attempt + 1,
+                        }
+                    else:
+                        signal = self.research_coordinator.build_signal_from_dossier(
+                            dossier,
+                            market_response,
+                            min_edge_bps=thresholds.risk_min_edge_bps,
+                        )
                 if mapping is not None and mapping.supports_structured_weather and self.historical_heuristic_service is not None:
                     heuristic_application = self.historical_heuristic_service.apply_to_signal(
                         pack=heuristic_pack,
@@ -2094,6 +2255,8 @@ class WorkflowSupervisor:
                     "binding_policy_lane": weather_policy_provenance["binding_policy_lane"],
                     "policy_disagreement": weather_policy_provenance["policy_disagreement"],
                 }
+                signal.eligibility = signal.eligibility.model_copy(update={"candidate_trace": signal.candidate_trace})
+                signal = _apply_weather_policy_mode(signal, weather_policy_resolution)
                 signal = await self._apply_static_signal_guard(
                     session=session,
                     room=room,

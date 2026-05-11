@@ -70,6 +70,34 @@ def _quantize_money(value: Any) -> Decimal:
     return as_decimal(value).quantize(Decimal("0.0001"))
 
 
+def _fill_fee_dollars(fill: FillRecord) -> Decimal:
+    raw = fill.raw if isinstance(fill.raw, dict) else {}
+    for key in ("fee_cost", "fee_dollars", "fee"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            try:
+                return _quantize_money(value)
+            except Exception:
+                return Decimal("0")
+    return Decimal("0")
+
+
+def _settled_buy_fill_pnl(fill: FillRecord) -> Decimal | None:
+    if fill.action != "buy" or fill.settlement_result not in {"win", "loss"}:
+        return None
+    yes_price = _quantize_money(fill.yes_price_dollars)
+    count = as_decimal(fill.count_fp)
+    won = fill.settlement_result == "win"
+    if fill.side == "yes":
+        contract_price = yes_price
+    elif fill.side == "no":
+        contract_price = Decimal("1.0000") - yes_price
+    else:
+        return None
+    gross = ((Decimal("1.0000") if won else Decimal("0")) - contract_price) * count
+    return _quantize_money(gross - _fill_fee_dollars(fill))
+
+
 class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixin, StrategyRepositoryMixin, LearningRepositoryMixin):
     def __init__(self, session: AsyncSession, *, kalshi_env: str | None = None) -> None:
         self.session = session
@@ -2235,6 +2263,76 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if settled:
             await self.session.flush()
         return settled
+
+    async def sync_weather_bootstrap_settlement_events(self, *, kalshi_env: str | None = None) -> int:
+        """Mirror settled bootstrap-attributed fills into bootstrap evidence events."""
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = (
+            select(FillRecord, WeatherBootstrapEventRecord)
+            .join(OrderRecord, FillRecord.order_id == OrderRecord.id)
+            .join(WeatherBootstrapEventRecord, WeatherBootstrapEventRecord.order_id == OrderRecord.id)
+            .where(
+                FillRecord.kalshi_env == env,
+                FillRecord.settlement_result.is_not(None),
+                WeatherBootstrapEventRecord.kalshi_env == env,
+                WeatherBootstrapEventRecord.event_type == "order",
+            )
+            .order_by(FillRecord.created_at.asc(), WeatherBootstrapEventRecord.created_at.asc())
+        )
+        rows = list((await self.session.execute(stmt)).all())
+        created = 0
+        seen_fill_ids: set[str] = set()
+        for fill, event in rows:
+            if fill.id in seen_fill_ids:
+                continue
+            seen_fill_ids.add(fill.id)
+            existing_stmt = select(WeatherBootstrapEventRecord.id).where(
+                WeatherBootstrapEventRecord.kalshi_env == env,
+                WeatherBootstrapEventRecord.event_type == "settlement",
+                WeatherBootstrapEventRecord.fill_id == fill.id,
+            ).limit(1)
+            existing = (await self.session.execute(existing_stmt)).scalar_one_or_none()
+            if existing is not None:
+                continue
+            pnl = _settled_buy_fill_pnl(fill)
+            if pnl is None:
+                continue
+            status = "settled_win" if fill.settlement_result == "win" else "settled_loss"
+            await self.save_weather_bootstrap_event(
+                kalshi_env=env,
+                market_ticker=fill.market_ticker,
+                series_ticker=event.series_ticker,
+                local_market_day=event.local_market_day,
+                bucket_key=event.bucket_key,
+                policy_key=event.policy_key,
+                tier=event.tier,
+                event_type="settlement",
+                status=status,
+                side=fill.side,
+                confidence=event.confidence,
+                edge_bps=event.edge_bps,
+                size_factor=event.size_factor,
+                count_fp=fill.count_fp,
+                notional_dollars=event.notional_dollars,
+                pnl_dollars=pnl,
+                evidence_weight=1.0,
+                source="live_settlement",
+                occurred_at=datetime.now(UTC),
+                room_id=event.room_id,
+                order_id=event.order_id,
+                fill_id=fill.id,
+                payload={
+                    **dict(event.payload or {}),
+                    "settlement_result": fill.settlement_result,
+                    "fill_id": fill.id,
+                    "trade_id": fill.trade_id,
+                    "pnl_dollars": str(pnl) if pnl is not None else None,
+                },
+            )
+            created += 1
+        if created:
+            await self.session.flush()
+        return created
 
     async def get_fill_win_rate_30d(
         self,

@@ -192,6 +192,29 @@ def test_agent_pack_service_sanitizes_crypto_policy_bounds() -> None:
     assert sanitized.crypto_policy.asset_entry_overrides["BTC"].max_spread_bps == 2500
 
 
+def test_agent_pack_service_sanitizes_weather_bootstrap_bounds() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
+    service = AgentPackService(settings)
+    payload = service.default_pack().model_dump(mode="json")
+    payload["version"] = "candidate-bootstrap-test"
+    policy_key = next(iter(payload["weather_policy"]["policies"]))
+    bootstrap = payload["weather_policy"]["policies"][policy_key]["bootstrap"]
+    bootstrap["tiers"]["cold"]["min_confidence"] = 0.01
+    bootstrap["tiers"]["cold"]["min_edge_bps"] = 99999
+    bootstrap["tiers"]["cold"]["size_factor"] = 9.0
+    bootstrap["caps"]["initial_daily_notional_usd"] = 99999
+    bootstrap["caps"]["shadow_required_match_rate"] = 2.0
+
+    sanitized = service.sanitize_candidate_pack(AgentPack(**payload), parent_version="builtin")
+    sanitized_bootstrap = sanitized.weather_policy.policies[policy_key].bootstrap
+
+    assert sanitized_bootstrap.tiers["cold"].min_confidence == sanitized_bootstrap.grid_envelope.min_confidence
+    assert sanitized_bootstrap.tiers["cold"].min_edge_bps == sanitized_bootstrap.grid_envelope.max_edge_bps
+    assert sanitized_bootstrap.tiers["cold"].size_factor == sanitized_bootstrap.grid_envelope.max_size_factor
+    assert sanitized_bootstrap.caps.initial_daily_notional_usd == sanitized_bootstrap.grid_envelope.max_daily_notional_usd
+    assert sanitized_bootstrap.caps.shadow_required_match_rate == 1.0
+
+
 def test_agent_pack_service_clamps_role_temperature() -> None:
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
     service = AgentPackService(settings)

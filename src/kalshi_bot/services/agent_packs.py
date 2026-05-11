@@ -16,6 +16,10 @@ from kalshi_bot.core.schemas import (
     AgentPackResearchConfig,
     AgentPackRoleConfig,
     AgentPackThresholds,
+    AgentPackWeatherBootstrapCaps,
+    AgentPackWeatherBootstrapGridEnvelope,
+    AgentPackWeatherBootstrapPolicy,
+    AgentPackWeatherBootstrapTier,
     AgentPackWeatherPolicy,
     AgentPackWeatherPolicyBook,
 )
@@ -631,8 +635,87 @@ class AgentPackService:
                 500,
                 3500,
             )
-            sanitized[normalized.policy_key or str(key)] = normalized.model_copy(update={"thresholds": thresholds})
+            bootstrap = self._sanitize_weather_bootstrap(normalized.bootstrap)
+            sanitized[normalized.policy_key or str(key)] = normalized.model_copy(
+                update={"thresholds": thresholds, "bootstrap": bootstrap}
+            )
         return sanitized
+
+    def _sanitize_weather_bootstrap(self, policy: AgentPackWeatherBootstrapPolicy) -> AgentPackWeatherBootstrapPolicy:
+        envelope = policy.grid_envelope or AgentPackWeatherBootstrapGridEnvelope()
+        envelope = AgentPackWeatherBootstrapGridEnvelope(
+            min_confidence=self._clamp_float(envelope.min_confidence, 0.0, 0.99),
+            max_confidence=self._clamp_float(envelope.max_confidence, 0.01, 1.0),
+            min_edge_bps=self._clamp_int(envelope.min_edge_bps, 0, 10000),
+            max_edge_bps=self._clamp_int(envelope.max_edge_bps, 250, 20000),
+            min_size_factor=self._clamp_float(envelope.min_size_factor, 0.0, 1.0),
+            max_size_factor=self._clamp_float(envelope.max_size_factor, 0.01, 1.0),
+            min_daily_notional_usd=self._clamp_float(envelope.min_daily_notional_usd, 0.0, 1000.0),
+            max_daily_notional_usd=self._clamp_float(envelope.max_daily_notional_usd, 1.0, 5000.0),
+            min_entry_price_dollars=self._clamp_float(envelope.min_entry_price_dollars, 0.01, 0.99),
+            min_remaining_payout_bps=self._clamp_int(envelope.min_remaining_payout_bps, 100, 9900),
+        )
+        if envelope.max_confidence < envelope.min_confidence:
+            envelope.max_confidence = envelope.min_confidence
+        if envelope.max_edge_bps < envelope.min_edge_bps:
+            envelope.max_edge_bps = envelope.min_edge_bps
+        if envelope.max_size_factor < envelope.min_size_factor:
+            envelope.max_size_factor = envelope.min_size_factor
+        if envelope.max_daily_notional_usd < envelope.min_daily_notional_usd:
+            envelope.max_daily_notional_usd = envelope.min_daily_notional_usd
+
+        tiers: dict[str, AgentPackWeatherBootstrapTier] = {}
+        for name, tier in (policy.tiers or {}).items():
+            tiers[str(name)] = AgentPackWeatherBootstrapTier(
+                min_samples=max(0, int(tier.min_samples)),
+                max_samples=max(0, int(tier.max_samples)) if tier.max_samples is not None else None,
+                min_confidence=self._clamp_float(
+                    tier.min_confidence,
+                    float(envelope.min_confidence),
+                    float(envelope.max_confidence),
+                ),
+                min_edge_bps=self._clamp_int(
+                    tier.min_edge_bps,
+                    int(envelope.min_edge_bps),
+                    int(envelope.max_edge_bps),
+                ),
+                size_factor=self._clamp_float(
+                    tier.size_factor,
+                    float(envelope.min_size_factor),
+                    float(envelope.max_size_factor),
+                ),
+                live_enabled=bool(tier.live_enabled),
+            )
+        caps = policy.caps or AgentPackWeatherBootstrapCaps()
+        sanitized_caps = AgentPackWeatherBootstrapCaps(
+            shadow_min_hours=max(0, int(caps.shadow_min_hours)),
+            shadow_min_market_episodes=max(1, int(caps.shadow_min_market_episodes)),
+            shadow_required_match_rate=self._clamp_float(caps.shadow_required_match_rate, 0.0, 1.0),
+            initial_daily_notional_usd=self._clamp_float(
+                caps.initial_daily_notional_usd,
+                float(envelope.min_daily_notional_usd),
+                float(envelope.max_daily_notional_usd),
+            ),
+            initial_max_concurrent_positions=max(1, int(caps.initial_max_concurrent_positions)),
+            expanded_daily_notional_usd=self._clamp_float(
+                caps.expanded_daily_notional_usd,
+                float(envelope.min_daily_notional_usd),
+                float(envelope.max_daily_notional_usd),
+            ),
+            expanded_max_concurrent_positions=max(1, int(caps.expanded_max_concurrent_positions)),
+            kill_switch_lookback=max(1, int(caps.kill_switch_lookback)),
+            kill_switch_min_rows=max(1, int(caps.kill_switch_min_rows)),
+            kill_switch_min_win_rate=self._clamp_float(caps.kill_switch_min_win_rate, 0.0, 1.0),
+            kill_switch_drawdown_usd=max(0.0, float(caps.kill_switch_drawdown_usd)),
+        )
+        return policy.model_copy(
+            deep=True,
+            update={
+                "grid_envelope": envelope,
+                "tiers": tiers,
+                "caps": sanitized_caps,
+            },
+        )
 
     @staticmethod
     def _notes(control: DeploymentControl) -> dict[str, Any]:

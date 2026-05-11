@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from kalshi_bot.core.schemas import AgentPackWeatherBootstrapPolicy
+from kalshi_bot.db.models import WeatherBootstrapEventRecord
 from kalshi_bot.services.weather_empirical_bootstrap import (
     WeatherEmpiricalBootstrapContext,
     WeatherEmpiricalBootstrapService,
@@ -32,6 +33,24 @@ def _context(**overrides):
     }
     payload.update(overrides)
     return WeatherEmpiricalBootstrapContext(**payload)
+
+
+def _event(**overrides):
+    payload = {
+        "kalshi_env": "production",
+        "market_ticker": "KXHIGHTSFO-26MAY11-T70",
+        "series_ticker": "KXHIGHTSFO",
+        "local_market_day": "26MAY11",
+        "bucket_key": "bucket",
+        "policy_key": "policy-a",
+        "tier": "cold",
+        "event_type": "decision",
+        "status": "shadow_allow",
+        "occurred_at": NOW,
+        "payload": {"matched": True, "fair_value_source": "intraday_model", "data_stale": False},
+    }
+    payload.update(overrides)
+    return WeatherBootstrapEventRecord(**payload)
 
 
 def test_cold_tier_matches_shadow_without_live_application() -> None:
@@ -117,22 +136,90 @@ def test_live_enabled_cold_tier_applies_size_factor_and_caps() -> None:
     assert decision.max_concurrent_positions == 1
 
 
+def test_shadow_gate_counts_scoped_market_episodes_not_repeated_rows() -> None:
+    policy = AgentPackWeatherBootstrapPolicy()
+    events = [
+        _event(market_ticker="KXHIGHTSFO-26MAY11-T70", occurred_at=NOW),
+        _event(market_ticker="KXHIGHTSFO-26MAY11-T70", occurred_at=NOW.replace(minute=1)),
+        _event(market_ticker="KXHIGHTSFO-26MAY12-T70", local_market_day="26MAY12", occurred_at=NOW),
+        _event(market_ticker="KXHIGHTSFO-26MAY13-T70", local_market_day="26MAY13", occurred_at=NOW),
+        _event(market_ticker="KXHIGHTSFO-26MAY14-T70", local_market_day="26MAY14", occurred_at=NOW),
+        _event(market_ticker="KXHIGHTSFO-26MAY15-T70", local_market_day="26MAY15", occurred_at=NOW),
+        _event(policy_key="other-policy", market_ticker="KXHIGHTLAX-26MAY11-T72", occurred_at=NOW),
+    ]
+
+    status = WeatherEmpiricalBootstrapService().shadow_gate_status(
+        policy=policy,
+        events=events,
+        policy_key="policy-a",
+        now=NOW.replace(day=12, hour=17),
+    )
+
+    assert status.eligible_for_promotion is True
+    assert status.market_episodes == 5
+    assert status.intended_matches == 5
+    assert status.actual_matches == 5
+
+
+def test_terminal_order_event_releases_bootstrap_caps() -> None:
+    policy = AgentPackWeatherBootstrapPolicy(rollout_state="promoted_low")
+    policy.tiers["cold"] = policy.tiers["cold"].model_copy(update={"live_enabled": True})
+    events = [
+        _event(
+            event_type="risk",
+            status="approved",
+            room_id="room-1",
+            notional_dollars=Decimal("100.0000"),
+            occurred_at=NOW.replace(hour=10),
+        ),
+        _event(
+            event_type="order",
+            status="write_credentials_missing",
+            room_id="room-1",
+            notional_dollars=Decimal("100.0000"),
+            occurred_at=NOW.replace(hour=10, minute=1),
+        ),
+    ]
+
+    decision = WeatherEmpiricalBootstrapService().evaluate(
+        context=_context(),
+        policy=policy,
+        recent_events=events,
+        now=NOW,
+    )
+
+    assert decision.allowed_live is True
+    assert decision.daily_notional_used_dollars == 0.0
+    assert decision.concurrent_positions == 0
+
+
 def test_mature_bucket_requires_positive_net_pnl() -> None:
     service = WeatherEmpiricalBootstrapService()
     policy = AgentPackWeatherBootstrapPolicy()
+    promoted_policy = AgentPackWeatherBootstrapPolicy(
+        rollout_state="promoted_normal",
+        evidence_ready=True,
+    )
 
     blocked = service.evaluate(
         context=_context(actual_sample_count=20, actual_net_pnl=Decimal("-0.01")),
         policy=policy,
         now=NOW,
     )
-    allowed = service.evaluate(
+    shadow = service.evaluate(
         context=_context(actual_sample_count=20, actual_net_pnl=Decimal("1.00")),
         policy=policy,
         now=NOW,
     )
+    allowed = service.evaluate(
+        context=_context(actual_sample_count=20, actual_net_pnl=Decimal("1.00")),
+        policy=promoted_policy,
+        now=NOW,
+    )
 
     assert blocked.reason == "bootstrap_mature_negative_net_pnl"
+    assert shadow.allowed_live is False
+    assert shadow.reason == "empirical_gate_mature_shadow_matched"
     assert allowed.allowed_live is True
     assert allowed.size_factor == 1.0
 
