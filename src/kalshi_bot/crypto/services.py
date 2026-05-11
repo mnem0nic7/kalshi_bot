@@ -1299,8 +1299,9 @@ class CryptoForecastService:
         self.session_factory = session_factory
         self.agent_pack_service = agent_pack_service or AgentPackService(settings)
 
-    async def train(self, *, frequency: str = "15m") -> dict[str, Any]:
+    async def train(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
+        requested_assets = normalize_asset_symbols(asset_symbols)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             rows = await repo.list_crypto_market_snapshots(frequency=freq, kalshi_env=self.settings.kalshi_env, limit=100_000)
@@ -1314,6 +1315,9 @@ class CryptoForecastService:
                 kalshi_env=self.settings.kalshi_env,
                 limit=500_000,
             )
+            rows = _filter_crypto_snapshot_rows(rows, requested_assets)
+            candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+            spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
             decision_rows = _crypto_decision_rows(rows, candles, spot_rows)
             sample_count = len(decision_rows)
             payload = _fit_crypto_calibration(decision_rows, settings=self.settings)
@@ -1322,6 +1326,7 @@ class CryptoForecastService:
             artifact_payload = {
                 **payload,
                 "frequency": freq,
+                "asset_symbols": requested_assets,
                 "trained_from": "point_in_time_crypto_snapshots_and_candles",
                 "feature_set": [
                     "market_mid_logit",
@@ -1352,7 +1357,7 @@ class CryptoForecastService:
             }
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
-                artifact_type="model",
+                artifact_type=_crypto_artifact_type("model", requested_assets),
                 version=_version("crypto-15m-model", {"metrics": metrics, "payload": artifact_payload}),
                 status=status,
                 sample_count=sample_count,
@@ -1365,6 +1370,7 @@ class CryptoForecastService:
         return {
             "status": status,
             "kalshi_env": self.settings.kalshi_env,
+            "asset_symbols": requested_assets,
             "version": artifact.version,
             "metrics": metrics,
             "payload": artifact_payload,
@@ -1375,8 +1381,10 @@ class CryptoForecastService:
         *,
         frequency: str = "15m",
         days: int | None = None,
+        asset_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
+        requested_assets = normalize_asset_symbols(asset_symbols)
         cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -1400,10 +1408,13 @@ class CryptoForecastService:
             )
             artifact = await repo.get_latest_crypto_model_artifact(
                 frequency=freq,
-                artifact_type="model",
+                artifact_type=_crypto_artifact_type("model", requested_assets),
                 kalshi_env=self.settings.kalshi_env,
             )
             await session.commit()
+        rows = _filter_crypto_snapshot_rows(rows, requested_assets)
+        candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
         decision_rows = _crypto_decision_rows(rows, candles, spot_rows)
         model_payload = artifact.payload if artifact is not None else None
         candidate_report = _crypto_model_candidate_report(decision_rows, settings=self.settings)
@@ -1413,6 +1424,7 @@ class CryptoForecastService:
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "days": days,
+            "asset_symbols": requested_assets,
             "model": _artifact_summary(artifact),
             "primary_metric": "brier",
             "candidate_report": candidate_report,
@@ -1426,10 +1438,12 @@ class CryptoForecastService:
             return self._stand_down(market, StandDownReason.CRYPTO_DISABLED, "Crypto trading workflow is disabled.", features)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            artifact = await repo.get_latest_crypto_model_artifact(
+            artifact = await _latest_crypto_artifact_for_asset(
+                repo,
                 frequency=market.frequency,
                 artifact_type="model",
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbol=market.asset_symbol,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=market.frequency,
@@ -1438,15 +1452,19 @@ class CryptoForecastService:
                 until=datetime.now(UTC),
                 limit=12,
             )
-            backtest = await repo.get_latest_crypto_model_artifact(
+            backtest = await _latest_crypto_artifact_for_asset(
+                repo,
                 frequency=market.frequency,
                 artifact_type="backtest",
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbol=market.asset_symbol,
             )
-            gate = await repo.get_latest_crypto_model_artifact(
+            gate = await _latest_crypto_artifact_for_asset(
+                repo,
                 frequency=market.frequency,
                 artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbol=market.asset_symbol,
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
@@ -1634,19 +1652,21 @@ class CryptoReplayService:
         days: int | None = None,
         limit: int | None = None,
         persist: bool = True,
+        asset_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         report = await self._build_report(
             frequency=frequency,
             days=days,
             limit=limit,
             command="run",
+            asset_symbols=asset_symbols,
         )
         if persist:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session)
                 artifact = await repo.record_crypto_model_artifact(
                     frequency=report["frequency"],
-                    artifact_type="backtest",
+                    artifact_type=_crypto_artifact_type("backtest", report.get("asset_symbols") or []),
                     version=_version("crypto-15m-backtest", report),
                     status=report["status"],
                     sample_count=int((report.get("dataset") or {}).get("row_count") or 0),
@@ -1665,26 +1685,29 @@ class CryptoReplayService:
         frequency: str = "15m",
         days: int | None = None,
         limit: int | None = None,
+        asset_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         return await self._build_report(
             frequency=frequency,
             days=days,
             limit=limit,
             command="validate",
+            asset_symbols=asset_symbols,
         )
 
-    async def gate(self, *, frequency: str = "15m") -> dict[str, Any]:
+    async def gate(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
+        requested_assets = normalize_asset_symbols(asset_symbols)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             model = await repo.get_latest_crypto_model_artifact(
                 frequency=freq,
-                artifact_type="model",
+                artifact_type=_crypto_artifact_type("model", requested_assets),
                 kalshi_env=self.settings.kalshi_env,
             )
             backtest = await repo.get_latest_crypto_model_artifact(
                 frequency=freq,
-                artifact_type="backtest",
+                artifact_type=_crypto_artifact_type("backtest", requested_assets),
                 kalshi_env=self.settings.kalshi_env,
             )
             metrics = dict((backtest.metrics if backtest is not None else None) or (model.metrics if model is not None else {}) or {})
@@ -1697,7 +1720,7 @@ class CryptoReplayService:
             gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
-                artifact_type="replay_gate",
+                artifact_type=_crypto_artifact_type("replay_gate", requested_assets),
                 version=_version("crypto-15m-gate", gate),
                 status="passed" if gate["passed"] else "blocked",
                 sample_count=int(metrics.get("resolved_sample_count") or 0),
@@ -1714,9 +1737,22 @@ class CryptoReplayService:
                 "updated_at": datetime.now(UTC).isoformat(),
                 "reasons": gate["reasons"],
             }
+            if requested_assets:
+                notes[f"crypto_replay_gate:{','.join(requested_assets)}"] = {
+                    "status": artifact.status,
+                    "version": artifact.version,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                    "reasons": gate["reasons"],
+                }
             control.notes = notes
             await session.commit()
-        return {"status": artifact.status, "kalshi_env": self.settings.kalshi_env, "version": artifact.version, **gate}
+        return {
+            "status": artifact.status,
+            "kalshi_env": self.settings.kalshi_env,
+            "asset_symbols": requested_assets,
+            "version": artifact.version,
+            **gate,
+        }
 
     def evaluate_gate(
         self,
@@ -1750,8 +1786,10 @@ class CryptoReplayService:
         days: int | None,
         limit: int | None,
         command: str,
+        asset_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
+        requested_assets = normalize_asset_symbols(asset_symbols)
         cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
@@ -1781,6 +1819,9 @@ class CryptoReplayService:
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             await session.commit()
+        snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
+        candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
         rows = _crypto_decision_rows(snapshots, candles, spot_rows)
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
         if limit and limit > 0:
@@ -1830,6 +1871,7 @@ class CryptoReplayService:
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "days": days,
+            "asset_symbols": requested_assets,
             "dataset": {
                 "row_count": len(rows),
                 "snapshot_count": len(snapshots),
