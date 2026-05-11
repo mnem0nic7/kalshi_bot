@@ -647,6 +647,7 @@ class CryptoMarketService:
             snapshots = await repo.list_latest_crypto_market_snapshots(
                 frequency=normalize_frequency(frequency) or "15m",
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
             )
             model = await repo.get_latest_crypto_model_artifact(
                 frequency=normalize_frequency(frequency) or "15m",
@@ -666,16 +667,19 @@ class CryptoMarketService:
             all_snapshots = await repo.list_crypto_market_snapshots(
                 frequency=normalize_frequency(frequency) or "15m",
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 limit=100_000,
             )
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=normalize_frequency(frequency) or "15m",
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 limit=200_000,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=normalize_frequency(frequency) or "15m",
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 limit=500_000,
             )
             shadow_evidence = await _crypto_shadow_evidence_counts(
@@ -1331,15 +1335,22 @@ class CryptoForecastService:
         requested_assets = normalize_asset_symbols(asset_symbols)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            rows = await repo.list_crypto_market_snapshots(frequency=freq, kalshi_env=self.settings.kalshi_env, limit=100_000)
+            rows = await repo.list_crypto_market_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
+                limit=100_000,
+            )
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 limit=200_000,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 limit=500_000,
             )
             rows = _filter_crypto_snapshot_rows(rows, requested_assets)
@@ -1418,18 +1429,21 @@ class CryptoForecastService:
             rows = await repo.list_crypto_market_snapshots(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=100_000,
             )
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=200_000,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=500_000,
             )
@@ -1823,18 +1837,21 @@ class CryptoReplayService:
             snapshots = await repo.list_crypto_market_snapshots(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=200_000,
             )
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=500_000,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=1_000_000,
             )

@@ -877,6 +877,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         frequency: str | None = None,
         kalshi_env: str | None = None,
         status: str | None = None,
+        asset_symbol: str | None = None,
+        asset_symbols: list[str] | None = None,
         since: datetime | None = None,
         limit: int = 1000,
     ) -> list[CryptoMarketSnapshotRecord]:
@@ -887,6 +889,11 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
         if status is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.status == status)
+        if asset_symbol is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.asset_symbol == asset_symbol)
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        if symbols:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
         stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
@@ -897,11 +904,13 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         *,
         frequency: str = "15m",
         kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
         limit: int = 200,
     ) -> list[CryptoMarketSnapshotRecord]:
         rows = await self.list_crypto_market_snapshots(
             frequency=frequency,
             kalshi_env=kalshi_env,
+            asset_symbols=asset_symbols,
             limit=max(limit * 6, limit),
         )
         latest: list[CryptoMarketSnapshotRecord] = []
@@ -1010,6 +1019,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         frequency: str | None = None,
         kalshi_env: str | None = None,
         market_ticker: str | None = None,
+        asset_symbol: str | None = None,
+        asset_symbols: list[str] | None = None,
         since: datetime | None = None,
         limit: int = 1000,
     ) -> list[CryptoMarketCandlestickRecord]:
@@ -1020,6 +1031,11 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketCandlestickRecord.frequency == frequency)
         if market_ticker is not None:
             stmt = stmt.where(CryptoMarketCandlestickRecord.market_ticker == market_ticker)
+        if asset_symbol is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.asset_symbol == asset_symbol)
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        if symbols:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts >= since)
         stmt = stmt.order_by(CryptoMarketCandlestickRecord.end_period_ts.desc()).limit(limit)
@@ -1116,6 +1132,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         kalshi_env: str | None = None,
         provider: str | None = None,
         asset_symbol: str | None = None,
+        asset_symbols: list[str] | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
         limit: int = 1000,
@@ -1129,6 +1146,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoSpotOHLCRecord.provider == provider)
         if asset_symbol is not None:
             stmt = stmt.where(CryptoSpotOHLCRecord.asset_symbol == asset_symbol)
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        if symbols:
+            stmt = stmt.where(CryptoSpotOHLCRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoSpotOHLCRecord.end_ts >= since)
         if until is not None:
