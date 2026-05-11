@@ -368,6 +368,70 @@ class FillRecord(Base, IdMixin, TimestampMixin):
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class WeatherBootstrapEventRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "weather_bootstrap_events"
+
+    kalshi_env: Mapped[str] = mapped_column(String(16), default="demo", index=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    series_ticker: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    local_market_day: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    bucket_key: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    policy_key: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    tier: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    side: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    edge_bps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    size_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
+    count_fp: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    notional_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    pnl_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    evidence_weight: Mapped[float] = mapped_column(Float, default=1.0)
+    source: Mapped[str] = mapped_column(String(64), default="live", index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    room_id: Mapped[str | None] = mapped_column(ForeignKey("rooms.id", ondelete="SET NULL"), nullable=True, index=True)
+    decision_trace_id: Mapped[str | None] = mapped_column(ForeignKey("decision_traces.id", ondelete="SET NULL"), nullable=True, index=True)
+    order_id: Mapped[str | None] = mapped_column(ForeignKey("orders.id", ondelete="SET NULL"), nullable=True, index=True)
+    fill_id: Mapped[str | None] = mapped_column(ForeignKey("fills.id", ondelete="SET NULL"), nullable=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WeatherBootstrapHistoricalEvidenceRecord(Base, IdMixin, TimestampMixin):
+    __tablename__ = "weather_bootstrap_historical_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "kalshi_env",
+            "source_fingerprint",
+            "market_ticker",
+            "bucket_key",
+            "policy_key",
+            name="uq_weather_bootstrap_historical_source_market_bucket_policy",
+        ),
+    )
+
+    kalshi_env: Mapped[str] = mapped_column(String(16), default="demo", index=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    series_ticker: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    local_market_day: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    bucket_key: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    policy_key: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    tier: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    replay_version: Mapped[str] = mapped_column(String(128), index=True)
+    source_fingerprint: Mapped[str] = mapped_column(String(128), index=True)
+    strict_replay: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    side: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    edge_bps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    count_fp: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    notional_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    pnl_dollars: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    evidence_weight: Mapped[float] = mapped_column(Float, default=1.0)
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class PositionRecord(Base, IdMixin, TimestampMixin):
     __tablename__ = "positions"
     __table_args__ = (UniqueConstraint("kalshi_env", "market_ticker", "subaccount", name="uq_positions_env_market_subaccount"),)
@@ -984,6 +1048,24 @@ Index("ix_room_messages_room_created", RoomMessage.room_id, RoomMessage.created_
 Index("ix_raw_exchange_events_stream_created", RawExchangeEvent.stream_name, RawExchangeEvent.created_at)
 Index("ix_decision_traces_room_created", DecisionTraceRecord.room_id, DecisionTraceRecord.created_at)
 Index("ix_decision_traces_market_env_created", DecisionTraceRecord.market_ticker, DecisionTraceRecord.kalshi_env, DecisionTraceRecord.created_at)
+Index(
+    "ix_weather_bootstrap_events_env_bucket_time",
+    WeatherBootstrapEventRecord.kalshi_env,
+    WeatherBootstrapEventRecord.bucket_key,
+    WeatherBootstrapEventRecord.occurred_at,
+)
+Index(
+    "ix_weather_bootstrap_events_env_series_day",
+    WeatherBootstrapEventRecord.kalshi_env,
+    WeatherBootstrapEventRecord.series_ticker,
+    WeatherBootstrapEventRecord.local_market_day,
+)
+Index(
+    "ix_weather_bootstrap_hist_env_bucket_time",
+    WeatherBootstrapHistoricalEvidenceRecord.kalshi_env,
+    WeatherBootstrapHistoricalEvidenceRecord.bucket_key,
+    WeatherBootstrapHistoricalEvidenceRecord.observed_at,
+)
 Index("ix_forecast_snapshots_market_env_fetched", ForecastSnapshotRecord.market_ticker, ForecastSnapshotRecord.kalshi_env, ForecastSnapshotRecord.fetched_at)
 Index("ix_climatology_priors_station_day", ClimatologyPriorRecord.station_id, ClimatologyPriorRecord.day_of_year)
 Index("ix_climatology_priors_series_day", ClimatologyPriorRecord.series_ticker, ClimatologyPriorRecord.day_of_year)

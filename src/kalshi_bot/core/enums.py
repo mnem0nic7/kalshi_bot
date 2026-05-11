@@ -88,6 +88,7 @@ class StandDownReason(StrEnum):
     # Signal-level stand-downs (before risk engine)
     FORECAST_UNAVAILABLE = "forecast_unavailable"
     FORECAST_SOURCE_DISAGREEMENT = "forecast_source_disagreement"
+    FAIR_VALUE_SOURCE_DISQUALIFIED = "fair_value_source_disqualified"
     INSUFFICIENT_FORECAST_SEPARATION = "insufficient_forecast_separation"
     CONFIDENCE_TOO_LOW = "confidence_too_low"
     DOSSIER_STALE = "dossier_stale"

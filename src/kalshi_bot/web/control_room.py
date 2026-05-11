@@ -768,6 +768,11 @@ def _room_decision_from_row(row: Any, *, settings: Any | None = None) -> dict[st
         status_label = _clean_reason_label(ticket_status or "ticket generated")
         status_tone = "good" if ticket_status in {"approved", "submitted", "executed", "filled"} else "warning"
         reason = "Trade ticket generated"
+    elif str(stand_down_reason or "") == "fair_value_source_disqualified":
+        status = "no_signal"
+        status_label = "No signal"
+        reason = _display_stand_down_reason(stand_down_reason, trace)
+        status_tone = "neutral"
     elif stand_down_reason:
         status = "no_trade"
         status_label = "No trade"

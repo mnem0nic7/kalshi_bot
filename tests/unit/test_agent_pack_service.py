@@ -33,6 +33,15 @@ def test_agent_pack_service_builds_deterministic_default_pack() -> None:
     assert pack.crypto_policy.entry.min_fee_adjusted_edge_bps == settings.risk_min_edge_bps
     assert pack.crypto_policy.replay.min_resolved_markets == settings.crypto_replay_min_resolved_markets
     assert pack.crypto_policy.live.trading_enabled == settings.crypto_trading_enabled
+    assert pack.weather_policy is not None
+    policy = next(iter(pack.weather_policy.policies.values()))
+    assert policy.bootstrap.enabled is True
+    assert policy.bootstrap.rollout_state == "shadow"
+    assert policy.bootstrap.tiers["cold"].min_confidence == 0.90
+    assert policy.bootstrap.tiers["cold"].live_enabled is False
+    resolved = service.resolve_weather_policy(pack, WeatherPolicyContext(strategy_code="A", lane="entry_gate"))
+    assert resolved.policy is not None
+    assert resolved.policy.bootstrap.rollout_state == "shadow"
 
 
 def test_agent_pack_runtime_thresholds_override_all_tunable_gates() -> None:

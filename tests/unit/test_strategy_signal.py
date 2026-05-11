@@ -1054,3 +1054,28 @@ def test_intraday_separation_shadow_mode_preserves_forecast_block() -> None:
     assert verdict.eligible is False
     assert verdict.candidate_trace["policy_variant_applied"] is None
     assert verdict.candidate_trace["policy_variants"]["intraday_separation_override"]["would_have_entered"] is True
+
+
+def test_fallback_fair_value_routes_to_no_signal() -> None:
+    signal = _eligible_signal(forecast_delta_f=10.0)
+    signal.fair_yes_dollars = Decimal("0.5000")
+    signal.edge_bps = 4600
+    signal.prediction_provenance = {
+        "intraday_model": {
+            "status": "fallback",
+            "fallback_reason": "model_unavailable",
+        }
+    }
+
+    verdict = evaluate_trade_eligibility(
+        settings=Settings(database_url="sqlite+aiosqlite:///./test.db"),
+        signal=signal,
+        market_snapshot={"market": {"yes_bid_dollars": "0.0400", "yes_ask_dollars": "0.0500", "no_ask_dollars": "0.9500"}},
+        market_observed_at=datetime.now(UTC),
+        research_freshness=_freshness(stale=False),
+        thresholds=_thresholds(),
+    )
+
+    assert verdict.stand_down_reason == StandDownReason.FAIR_VALUE_SOURCE_DISQUALIFIED
+    assert verdict.evaluation_outcome == "no_signal"
+    assert verdict.candidate_trace["fair_value_source"] == "fallback"

@@ -94,6 +94,17 @@ class FakeGateLearningService:
         return {source: ["fixture.jsonl"]}
 
 
+class FakeNoChangeGateLearningService(FakeGateLearningService):
+    async def build_recommendation_report(self, **_kwargs: Any) -> dict[str, Any]:
+        report = _recommendation(self.settings)
+        for field, payload in report["recommended_settings"].items():
+            payload["recommended"] = payload["current"]
+            payload["changed"] = False
+            payload["candidate_policy"] = f"{field}={payload['current']}"
+            payload["reason"] = "holdout_net_pnl_not_improved"
+        return report
+
+
 async def _seed_live_canary_row(
     session_factory,
     *,
@@ -206,6 +217,54 @@ async def _service(tmp_path, *, modeling_builder=_passing_modeling):
         gate_learning_service_factory=FakeGateLearningService,
     )
     return settings, engine, session_factory, agent_pack_service, service
+
+
+@pytest.mark.asyncio
+async def test_autonomous_gate_tuning_promotes_weather_bootstrap_cold_after_shadow_gate(tmp_path) -> None:
+    settings, engine, session_factory, agent_pack_service, _service_instance = await _service(tmp_path)
+    service = AutonomousGateTuningService(
+        settings=settings,
+        session_factory=session_factory,
+        agent_pack_service=agent_pack_service,
+        decision_corpus_service=None,
+        trade_analysis_service=None,
+        trading_audit_service=None,
+        backtesting_builder=_passing_backtesting,
+        modeling_builder=_passing_modeling,
+        gate_learning_service_factory=FakeNoChangeGateLearningService,
+    )
+    now = datetime(2026, 5, 11, tzinfo=UTC)
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        for idx in range(5):
+            await repo.save_weather_bootstrap_event(
+                market_ticker=f"KXHIGHTSFO-26MAY1{idx}-T70",
+                series_ticker="KXHIGHTSFO",
+                local_market_day=f"2026-05-1{idx}",
+                bucket_key=f"bucket-{idx}",
+                policy_key="weather/a/global/any/any/all_season/all_month/any/any/entry_gate",
+                tier="cold",
+                event_type="decision",
+                status="shadow_allow",
+                side="no",
+                confidence=0.95,
+                edge_bps=4000,
+                size_factor=0.10,
+                occurred_at=now - timedelta(hours=25, minutes=idx),
+                payload={"fair_value_source": "intraday_model", "data_stale": False},
+            )
+        await session.commit()
+
+    result = await service.run(now=now, dry_run=False)
+    status = await service.status()
+
+    assert result["status"] == "no_candidate"
+    assert result["weather_bootstrap"]["status"] == "promoted"
+    assert status["active_pack_version"].startswith("weather-bootstrap-cold-")
+    assert status["weather_bootstrap"]["policy"]["rollout_state"] == "promoted_low"
+    assert status["weather_bootstrap"]["policy"]["tiers"]["cold"]["live_enabled"] is True
+
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

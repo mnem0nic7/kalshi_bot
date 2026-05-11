@@ -61,6 +61,8 @@ from kalshi_bot.db.models import (
     Signal,
     SourceHealthLogRecord,
     TradeTicketRecord,
+    WeatherBootstrapEventRecord,
+    WeatherBootstrapHistoricalEvidenceRecord,
 )
 
 
@@ -1468,6 +1470,165 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if source is not None:
             stmt = stmt.where(SourceHealthLogRecord.source == source)
         stmt = stmt.order_by(SourceHealthLogRecord.observed_at.desc(), SourceHealthLogRecord.created_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def save_weather_bootstrap_event(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        market_ticker: str,
+        event_type: str,
+        status: str,
+        series_ticker: str | None = None,
+        local_market_day: str | None = None,
+        bucket_key: str | None = None,
+        policy_key: str | None = None,
+        tier: str | None = None,
+        side: str | None = None,
+        confidence: float | None = None,
+        edge_bps: int | None = None,
+        size_factor: float | None = None,
+        count_fp: Decimal | None = None,
+        notional_dollars: Decimal | None = None,
+        pnl_dollars: Decimal | None = None,
+        evidence_weight: float = 1.0,
+        source: str = "live",
+        occurred_at: datetime | None = None,
+        room_id: str | None = None,
+        decision_trace_id: str | None = None,
+        order_id: str | None = None,
+        fill_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> WeatherBootstrapEventRecord:
+        record = WeatherBootstrapEventRecord(
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            market_ticker=market_ticker,
+            series_ticker=series_ticker,
+            local_market_day=local_market_day,
+            bucket_key=bucket_key,
+            policy_key=policy_key,
+            tier=tier,
+            event_type=event_type,
+            status=status,
+            side=side,
+            confidence=confidence,
+            edge_bps=edge_bps,
+            size_factor=size_factor,
+            count_fp=count_fp,
+            notional_dollars=notional_dollars,
+            pnl_dollars=pnl_dollars,
+            evidence_weight=evidence_weight,
+            source=source,
+            occurred_at=occurred_at or datetime.now(UTC),
+            room_id=room_id,
+            decision_trace_id=decision_trace_id,
+            order_id=order_id,
+            fill_id=fill_id,
+            payload=payload or {},
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def list_weather_bootstrap_events(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        bucket_key: str | None = None,
+        series_ticker: str | None = None,
+        since: datetime | None = None,
+        event_types: list[str] | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 1000,
+    ) -> list[WeatherBootstrapEventRecord]:
+        stmt = select(WeatherBootstrapEventRecord).where(
+            WeatherBootstrapEventRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+        )
+        if bucket_key:
+            stmt = stmt.where(WeatherBootstrapEventRecord.bucket_key == bucket_key)
+        if series_ticker:
+            stmt = stmt.where(WeatherBootstrapEventRecord.series_ticker == series_ticker)
+        if since is not None:
+            stmt = stmt.where(WeatherBootstrapEventRecord.occurred_at >= since)
+        if event_types:
+            stmt = stmt.where(WeatherBootstrapEventRecord.event_type.in_(event_types))
+        if statuses:
+            stmt = stmt.where(WeatherBootstrapEventRecord.status.in_(statuses))
+        stmt = stmt.order_by(WeatherBootstrapEventRecord.occurred_at.desc(), WeatherBootstrapEventRecord.created_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def save_weather_bootstrap_historical_evidence(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        market_ticker: str,
+        replay_version: str,
+        source_fingerprint: str,
+        series_ticker: str | None = None,
+        local_market_day: str | None = None,
+        bucket_key: str | None = None,
+        policy_key: str | None = None,
+        tier: str | None = None,
+        strict_replay: bool = True,
+        side: str | None = None,
+        confidence: float | None = None,
+        edge_bps: int | None = None,
+        count_fp: Decimal | None = None,
+        notional_dollars: Decimal | None = None,
+        pnl_dollars: Decimal | None = None,
+        evidence_weight: float = 1.0,
+        outcome: str | None = None,
+        observed_at: datetime | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> WeatherBootstrapHistoricalEvidenceRecord:
+        record = WeatherBootstrapHistoricalEvidenceRecord(
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            market_ticker=market_ticker,
+            series_ticker=series_ticker,
+            local_market_day=local_market_day,
+            bucket_key=bucket_key,
+            policy_key=policy_key,
+            tier=tier,
+            replay_version=replay_version,
+            source_fingerprint=source_fingerprint,
+            strict_replay=strict_replay,
+            side=side,
+            confidence=confidence,
+            edge_bps=edge_bps,
+            count_fp=count_fp,
+            notional_dollars=notional_dollars,
+            pnl_dollars=pnl_dollars,
+            evidence_weight=evidence_weight,
+            outcome=outcome,
+            observed_at=observed_at or datetime.now(UTC),
+            payload=payload or {},
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def list_weather_bootstrap_historical_evidence(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        bucket_key: str | None = None,
+        series_ticker: str | None = None,
+        strict_replay: bool | None = True,
+        limit: int = 1000,
+    ) -> list[WeatherBootstrapHistoricalEvidenceRecord]:
+        stmt = select(WeatherBootstrapHistoricalEvidenceRecord).where(
+            WeatherBootstrapHistoricalEvidenceRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+        )
+        if bucket_key:
+            stmt = stmt.where(WeatherBootstrapHistoricalEvidenceRecord.bucket_key == bucket_key)
+        if series_ticker:
+            stmt = stmt.where(WeatherBootstrapHistoricalEvidenceRecord.series_ticker == series_ticker)
+        if strict_replay is not None:
+            stmt = stmt.where(WeatherBootstrapHistoricalEvidenceRecord.strict_replay.is_(strict_replay))
+        stmt = stmt.order_by(
+            WeatherBootstrapHistoricalEvidenceRecord.observed_at.desc(),
+            WeatherBootstrapHistoricalEvidenceRecord.created_at.desc(),
+        ).limit(limit)
         return list((await self.session.execute(stmt)).scalars().all())
 
     async def get_latest_risk_verdict_for_room(self, room_id: str) -> RiskVerdictRecord | None:

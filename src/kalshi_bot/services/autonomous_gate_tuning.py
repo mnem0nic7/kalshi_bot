@@ -27,6 +27,7 @@ from kalshi_bot.services.gate_learning import (
     decision_corpus_row_to_gate_learning_row,
 )
 from kalshi_bot.services.modeling import build_modeling_report
+from kalshi_bot.services.weather_empirical_bootstrap import WeatherEmpiricalBootstrapService
 from kalshi_bot.services.weather_policy import WeatherPolicyContext, build_weather_policy_key
 
 
@@ -103,6 +104,25 @@ class AutonomousGateTuningService:
                 active_pack,
                 _weather_policy_context_from_scope(weather_scope),
             )
+            bootstrap_policy = (
+                weather_resolution.policy.bootstrap
+                if weather_resolution.policy is not None
+                else None
+            )
+            bootstrap_events = await repo.list_weather_bootstrap_events(
+                kalshi_env=env,
+                since=datetime.now(UTC) - timedelta(days=7),
+                limit=2000,
+            )
+            bootstrap_shadow = (
+                WeatherEmpiricalBootstrapService().shadow_gate_status(
+                    policy=bootstrap_policy,
+                    events=bootstrap_events,
+                    now=datetime.now(UTC),
+                ).to_payload()
+                if bootstrap_policy is not None
+                else None
+            )
             active_crypto_policy = _crypto_policy_values(self.agent_pack_service.runtime_crypto_policy(active_pack))
             await session.commit()
         settings_thresholds = _settings_threshold_values(self.settings)
@@ -117,6 +137,11 @@ class AutonomousGateTuningService:
             "active_pack_version": active_pack.version,
             "active_thresholds": active_thresholds,
             "active_weather_policy": weather_resolution.provenance(),
+            "weather_bootstrap": {
+                "policy": bootstrap_policy.model_dump(mode="json") if bootstrap_policy is not None else None,
+                "shadow_gate": bootstrap_shadow,
+                "recent_event_count": len(bootstrap_events),
+            },
             "active_crypto_policy": active_crypto_policy,
             "settings_thresholds": settings_thresholds,
             "threshold_drift": _threshold_drift(active_thresholds, settings_thresholds),
@@ -297,10 +322,20 @@ class AutonomousGateTuningService:
                 await session.commit()
                 return result
             pack = await self.agent_pack_service.get_pack_for_color(repo, self.settings.app_color)
-            runtime_thresholds = self.agent_pack_service.resolve_weather_policy(
+            weather_resolution = self.agent_pack_service.resolve_weather_policy(
                 pack,
                 _weather_policy_context_from_scope(weather_scope),
-            ).thresholds
+            )
+            runtime_thresholds = weather_resolution.thresholds
+            bootstrap_result = await self._maybe_promote_weather_bootstrap_shadow(
+                repo,
+                current_pack=pack,
+                weather_resolution=weather_resolution,
+                kalshi_env=env,
+                dry_run=dry_run,
+                triggered_by=triggered_by,
+                now=now_utc,
+            )
             await session.commit()
 
         active_settings = _settings_with_thresholds(self.settings, runtime_thresholds)
@@ -324,6 +359,7 @@ class AutonomousGateTuningService:
                 "status": "no_candidate",
                 "kalshi_env": env,
                 "reason": "no_gate_changes_promoted",
+                "weather_bootstrap": bootstrap_result,
                 "recommendation": recommendation,
             }
         evidence_fingerprint = _evidence_fingerprint(
@@ -336,6 +372,7 @@ class AutonomousGateTuningService:
                 "status": "duplicate_evidence",
                 "kalshi_env": env,
                 "evidence_fingerprint": evidence_fingerprint,
+                "weather_bootstrap": bootstrap_result,
                 "changes": candidate["changes"],
             }
 
@@ -354,6 +391,7 @@ class AutonomousGateTuningService:
                 "changes": candidate["changes"],
                 "candidate_thresholds": candidate["candidate_thresholds"],
                 "evidence_fingerprint": evidence_fingerprint,
+                "weather_bootstrap": bootstrap_result,
                 "recommendation": recommendation,
                 "validation": validation,
             }
@@ -396,6 +434,141 @@ class AutonomousGateTuningService:
                 return result
             await session.commit()
         return staged
+
+    async def _maybe_promote_weather_bootstrap_shadow(
+        self,
+        repo: PlatformRepository,
+        *,
+        current_pack: AgentPack,
+        weather_resolution: Any,
+        kalshi_env: str,
+        dry_run: bool,
+        triggered_by: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        policy: AgentPackWeatherPolicy | None = getattr(weather_resolution, "policy", None)
+        if policy is None:
+            return {"status": "no_policy", "reason": "weather_bootstrap_policy_not_resolved"}
+        bootstrap = policy.bootstrap
+        events = await repo.list_weather_bootstrap_events(
+            kalshi_env=kalshi_env,
+            since=now - timedelta(days=7),
+            limit=5000,
+        )
+        shadow_gate = WeatherEmpiricalBootstrapService().shadow_gate_status(
+            policy=bootstrap,
+            events=events,
+            now=now,
+        ).to_payload()
+        if bootstrap.rollout_state != "shadow":
+            return {
+                "status": "no_action",
+                "reason": "bootstrap_not_in_shadow_rollout",
+                "rollout_state": bootstrap.rollout_state,
+                "shadow_gate": shadow_gate,
+            }
+        if not shadow_gate["eligible_for_promotion"]:
+            return {
+                "status": "pending",
+                "reason": "shadow_evidence_gate_not_met",
+                "shadow_gate": shadow_gate,
+            }
+
+        cold = bootstrap.tiers["cold"].model_copy(update={"live_enabled": True})
+        promoted_bootstrap = bootstrap.model_copy(
+            deep=True,
+            update={
+                "rollout_state": "promoted_low",
+                "evidence_ready": True,
+                "tiers": {**bootstrap.tiers, "cold": cold},
+                "promotion": {
+                    **dict(bootstrap.promotion or {}),
+                    "cold_tier_promoted_at": now.isoformat(),
+                    "triggered_by": triggered_by,
+                    "shadow_gate": shadow_gate,
+                },
+            },
+        )
+        promoted_policy = policy.model_copy(
+            deep=True,
+            update={
+                "bootstrap": promoted_bootstrap,
+                "reason_codes": list(dict.fromkeys([*policy.reason_codes, "weather_bootstrap_cold_promoted"])),
+                "deterministic_summary": (
+                    "Weather empirical bootstrap cold tier promoted from shadow evidence. "
+                    "Cold tier is live at the initial $100/day, 1-position cap; other tiers remain shadow-only."
+                ),
+            },
+        )
+        fingerprint = _bootstrap_evidence_fingerprint(
+            pack_version=current_pack.version,
+            policy_key=policy.policy_key,
+            shadow_gate=shadow_gate,
+            target_rollout="promoted_low",
+        )
+        version = f"weather-bootstrap-cold-{fingerprint[:12]}"
+        if dry_run:
+            return {
+                "status": "would_promote",
+                "dry_run": True,
+                "candidate_version": version,
+                "evidence_fingerprint": fingerprint,
+                "shadow_gate": shadow_gate,
+            }
+
+        book = current_pack.weather_policy.model_copy(deep=True) if current_pack.weather_policy is not None else None
+        if book is None:
+            return {"status": "failed", "reason": "weather_policy_book_missing", "shadow_gate": shadow_gate}
+        book.policies[policy.policy_key] = promoted_policy
+        candidate_pack = current_pack.model_copy(
+            deep=True,
+            update={
+                "version": version,
+                "status": "champion",
+                "parent_version": current_pack.version,
+                "source": OPS_SOURCE,
+                "description": "Autonomous weather empirical bootstrap cold-tier promotion from deterministic shadow evidence.",
+                "weather_policy": book,
+                "metadata": {
+                    **dict(current_pack.metadata or {}),
+                    "weather_empirical_bootstrap": {
+                        "promoted_at": now.isoformat(),
+                        "triggered_by": triggered_by,
+                        "kalshi_env": kalshi_env,
+                        "policy_key": policy.policy_key,
+                        "evidence_fingerprint": fingerprint,
+                        "shadow_gate": shadow_gate,
+                    },
+                },
+            },
+        )
+        candidate_pack = self.agent_pack_service.sanitize_candidate_pack(candidate_pack, parent_version=current_pack.version)
+        await repo.update_agent_pack(candidate_pack)
+        promotion = await repo.create_promotion_event(
+            candidate_version=version,
+            previous_version=current_pack.version,
+            target_color=self.settings.app_color,
+            evaluation_run_id=None,
+            payload={
+                "kind": "weather_empirical_bootstrap_cold_promotion",
+                "policy_key": policy.policy_key,
+                "evidence_fingerprint": fingerprint,
+                "shadow_gate": shadow_gate,
+            },
+            status="promoted",
+        )
+        await self.agent_pack_service.assign_pack_to_color(
+            repo,
+            color=self.settings.app_color,
+            version=version,
+        )
+        return {
+            "status": "promoted",
+            "candidate_version": version,
+            "promotion_event_id": promotion.id,
+            "evidence_fingerprint": fingerprint,
+            "shadow_gate": shadow_gate,
+        }
 
     async def _run_crypto(
         self,
@@ -1710,6 +1883,24 @@ def _evidence_fingerprint(
         "current_thresholds": current_thresholds,
         "candidate_thresholds": candidate_thresholds,
         "recommended_settings": recommendation.get("recommended_settings"),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _bootstrap_evidence_fingerprint(
+    *,
+    pack_version: str,
+    policy_key: str,
+    shadow_gate: dict[str, Any],
+    target_rollout: str,
+) -> str:
+    payload = {
+        "schema_version": "weather-empirical-bootstrap-promotion-v1",
+        "pack_version": pack_version,
+        "policy_key": policy_key,
+        "shadow_gate": shadow_gate,
+        "target_rollout": target_rollout,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

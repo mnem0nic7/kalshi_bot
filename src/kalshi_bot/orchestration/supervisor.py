@@ -15,7 +15,15 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole, ContractSide, MessageKind, RiskStatus, RoomStage, StandDownReason, StrategyCode
 from kalshi_bot.core.fixed_point import as_decimal, make_client_order_id, quantize_count
 from kalshi_bot.core.metrics import ACTIVE_ROOMS, ORDERS_TOTAL, ROOM_RUNS_TOTAL
-from kalshi_bot.core.schemas import ExecReceiptPayload, RiskVerdictPayload, RoomMessageCreate, RoomMessageRead, TradeEligibilityVerdict, TradeTicket
+from kalshi_bot.core.schemas import (
+    AgentPackWeatherBootstrapPolicy,
+    ExecReceiptPayload,
+    RiskVerdictPayload,
+    RoomMessageCreate,
+    RoomMessageRead,
+    TradeEligibilityVerdict,
+    TradeTicket,
+)
 from kalshi_bot.db.models import Room
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
@@ -36,11 +44,15 @@ from kalshi_bot.services.decision_trace import (
     DETERMINISTIC_PATH_VERSION,
     build_deterministic_decision_trace,
 )
-from kalshi_bot.services.decision_policy_variants import (
-    EMPIRICAL_BOOTSTRAP,
-    DecisionPolicyVariantService,
-)
 from kalshi_bot.services.signal_attention import SignalAttentionService, extract_decision_fields
+from kalshi_bot.services.weather_empirical_bootstrap import (
+    WeatherEmpiricalBootstrapContext,
+    WeatherEmpiricalBootstrapService,
+    confidence_source_from_trace,
+    fair_value_source_from_provenance,
+    market_day_from_ticker,
+    stale_signal_evidence_from_trace,
+)
 from kalshi_bot.services.weather_policy import weather_policy_context_from_market
 
 from kalshi_bot.services.momentum_calibration import get_active_momentum_calibration_async
@@ -58,6 +70,7 @@ from kalshi_bot.services.risk import approved_ticket_for_verdict
 from kalshi_bot.services.trade_behavior import (
     apply_empirical_gate_to_eligibility,
     evaluate_empirical_gate,
+    series_from_ticker,
     thresholds_with_production_freeze_floor,
     trade_behavior_context_payload,
 )
@@ -969,42 +982,163 @@ class WorkflowSupervisor:
         session: Any,
         room: Room,
         signal: StrategySignal,
+        weather_policy_resolution: Any | None = None,
+        pre_empirical_stand_down_reason: StandDownReason | None = None,
     ) -> StrategySignal:
-        if (
-            signal.eligibility is None
-            or signal.eligibility.stand_down_reason != StandDownReason.EMPIRICAL_GATE_BLOCK
-        ):
+        if signal.eligibility is None:
             return signal
         empirical = signal.eligibility.empirical_gate or (signal.candidate_trace or {}).get("empirical_gate") or {}
-        if not isinstance(empirical, dict) or empirical.get("reason") != "empirical_gate_under_sampled":
+        if not isinstance(empirical, dict):
             return signal
-        service = SignalAttentionService(self.settings)
-        rows = await service.load_rows(
-            session,
-            kalshi_env=room.kalshi_env,
-            lookback_hours=self.settings.signals_attention_lookback_hours,
-            market_ticker=room.market_ticker,
-        )
-        rows.append(self._attention_row_for_signal(room=room, signal=signal))
-        override = service.empirical_bootstrap_override(rows)
-        policy_service = DecisionPolicyVariantService(self.settings)
-        decision = policy_service.empirical_bootstrap_decision(override)
-        if decision is None:
+        empirical_reason = str(empirical.get("underlying_reason") or empirical.get("reason") or "")
+        if empirical_reason != "empirical_gate_under_sampled":
             return signal
         candidate_trace = dict(signal.eligibility.candidate_trace or signal.candidate_trace or {})
-        candidate_trace = policy_service.merge_trace(
-            candidate_trace,
-            decisions={EMPIRICAL_BOOTSTRAP: decision.to_trace()},
-            applied_variant=EMPIRICAL_BOOTSTRAP if decision.live_enabled else None,
-            baseline_block_reason=StandDownReason.EMPIRICAL_GATE_BLOCK.value,
+        original_reason_value = (
+            pre_empirical_stand_down_reason.value
+            if pre_empirical_stand_down_reason is not None
+            else candidate_trace.get("pre_empirical_stand_down_reason")
         )
-        if not decision.live_enabled:
+        allowed_original_reasons = {None, StandDownReason.INSUFFICIENT_FORECAST_SEPARATION.value}
+        if original_reason_value not in allowed_original_reasons:
+            candidate_trace["weather_empirical_bootstrap"] = {
+                "matched": False,
+                "applied": False,
+                "reason": "bootstrap_does_not_bypass_original_gate",
+                "original_stand_down_reason": original_reason_value,
+            }
             signal.eligibility = signal.eligibility.model_copy(update={"candidate_trace": candidate_trace})
             signal.candidate_trace = candidate_trace
             return signal
-        candidate_trace["policy_variants"][EMPIRICAL_BOOTSTRAP]["applied"] = True
+
+        resolved_policy = getattr(weather_policy_resolution, "policy", None)
+        bootstrap_policy = (
+            resolved_policy.bootstrap
+            if resolved_policy is not None and getattr(resolved_policy, "bootstrap", None) is not None
+            else AgentPackWeatherBootstrapPolicy()
+        )
+        if (
+            original_reason_value == StandDownReason.INSUFFICIENT_FORECAST_SEPARATION.value
+            and not bootstrap_policy.allow_forecast_separation_bootstrap
+        ):
+            candidate_trace["weather_empirical_bootstrap"] = {
+                "matched": False,
+                "applied": False,
+                "reason": "forecast_separation_bootstrap_disabled",
+                "original_stand_down_reason": original_reason_value,
+            }
+            signal.eligibility = signal.eligibility.model_copy(update={"candidate_trace": candidate_trace})
+            signal.candidate_trace = candidate_trace
+            return signal
+
+        provenance = dict(signal.prediction_provenance or {})
+        if not provenance and signal.weather is not None and isinstance(signal.weather.prediction_provenance, dict):
+            provenance = dict(signal.weather.prediction_provenance or {})
+        fair_value_source = fair_value_source_from_provenance(
+            provenance,
+            fair_yes_dollars=signal.fair_yes_dollars,
+        )
+        confidence_source = confidence_source_from_trace(candidate_trace, provenance)
+        stale_evidence = stale_signal_evidence_from_trace(candidate_trace)
+        repo = PlatformRepository(session, kalshi_env=room.kalshi_env)
+        now = datetime.now(UTC)
+        since = now - timedelta(days=max(1, int(getattr(self.settings, "autonomous_gate_tuning_days", 3650))))
+        bucket_key = empirical.get("bucket_key")
+        recent_events = await repo.list_weather_bootstrap_events(
+            kalshi_env=room.kalshi_env,
+            bucket_key=bucket_key,
+            since=since,
+            limit=2000,
+        )
+        historical_evidence = await repo.list_weather_bootstrap_historical_evidence(
+            kalshi_env=room.kalshi_env,
+            bucket_key=bucket_key,
+            strict_replay=True,
+            limit=2000,
+        )
+        context = WeatherEmpiricalBootstrapContext(
+            kalshi_env=room.kalshi_env,
+            market_ticker=room.market_ticker,
+            side=signal.recommended_side.value if signal.recommended_side is not None else None,
+            confidence=signal.confidence,
+            edge_bps_after_buffer=signal.eligibility.edge_after_quality_buffer_bps,
+            fair_yes_dollars=signal.fair_yes_dollars,
+            fair_value_source=fair_value_source,
+            confidence_source=confidence_source,
+            bucket_key=bucket_key,
+            actual_sample_count=int(empirical.get("actual_sample_count") or 0),
+            actual_net_pnl=(
+                Decimal(str(empirical.get("actual_net_pnl")))
+                if empirical.get("actual_net_pnl") not in (None, "")
+                else None
+            ),
+            current_stand_down_reason=(
+                signal.eligibility.stand_down_reason.value
+                if signal.eligibility.stand_down_reason is not None
+                else None
+            ),
+            pre_empirical_stand_down_reason=original_reason_value,
+            policy_key=getattr(weather_policy_resolution, "policy_key", None),
+            fallback_policy_key=getattr(weather_policy_resolution, "fallback_policy_key_used", None),
+            market_observed_at=None,
+            data_stale=bool(
+                signal.eligibility.market_stale
+                or signal.eligibility.research_stale
+                or stale_evidence.get("stale")
+            ),
+            source_stale_reasons=tuple(stale_evidence.get("reason_codes") or ()),
+            room_id=room.id,
+            policy_pack_version=(
+                (signal.candidate_trace or {}).get("active_policy_pack_version")
+                or (signal.candidate_trace or {}).get("agent_pack_version")
+            ),
+        )
+        decision = WeatherEmpiricalBootstrapService().evaluate(
+            context=context,
+            policy=bootstrap_policy,
+            recent_events=recent_events,
+            historical_evidence=historical_evidence,
+            now=now,
+        )
+        trace = decision.to_trace()
+        trace["bucket_id"] = bucket_key
+        trace["original_stand_down_reason"] = original_reason_value
+        trace["empirical_reason"] = empirical_reason
+        trace["stale_signal_evidence"] = stale_evidence
+        candidate_trace["weather_empirical_bootstrap"] = trace
+        await repo.save_weather_bootstrap_event(
+            kalshi_env=room.kalshi_env,
+            market_ticker=room.market_ticker,
+            series_ticker=series_from_ticker(room.market_ticker),
+            local_market_day=market_day_from_ticker(room.market_ticker),
+            bucket_key=bucket_key,
+            policy_key=trace.get("policy_key"),
+            tier=trace.get("tier"),
+            event_type="decision",
+            status=trace.get("outcome") or "block",
+            side=signal.recommended_side.value if signal.recommended_side is not None else None,
+            confidence=signal.confidence,
+            edge_bps=trace.get("edge_bps_after_buffer"),
+            size_factor=trace.get("size_factor"),
+            source="live_forward",
+            occurred_at=now,
+            room_id=room.id,
+            payload={
+                **trace,
+                "fair_value_source": fair_value_source,
+                "data_stale": context.data_stale,
+            },
+        )
+        if not decision.allowed_live:
+            signal.eligibility = signal.eligibility.model_copy(update={"candidate_trace": candidate_trace})
+            signal.candidate_trace = candidate_trace
+            return signal
+
+        candidate_trace["policy_variant_applied"] = "weather_empirical_bootstrap"
+        candidate_trace["baseline_block_reason"] = signal.eligibility.stand_down_reason.value if signal.eligibility.stand_down_reason else None
         candidate_trace["eligibility_stand_down_reason"] = None
         candidate_trace["eligibility_outcome"] = "candidate_selected"
+        signal.size_factor = min(signal.size_factor, Decimal(str(max(0.0, decision.size_factor))))
         signal.eligibility = signal.eligibility.model_copy(
             update={
                 "eligible": True,
@@ -1012,7 +1146,7 @@ class WorkflowSupervisor:
                 "evaluation_outcome": "candidate_selected",
                 "candidate_trace": candidate_trace,
                 "reasons": [
-                    "Policy variant empirical_bootstrap bypassed empirical gate under-sampling."
+                    "Weather empirical bootstrap allowed an under-sampled high-edge entry to proceed to normal risk checks."
                 ],
                 "blocked_upstream": False,
             }
@@ -1106,6 +1240,42 @@ class WorkflowSupervisor:
                 sizing_trace["size_factor"] = signal.size_factor
                 sizing_trace["scaled_count_fp"] = scaled
                 ticket = ticket.model_copy(update={"count_fp": scaled}) if scaled > Decimal("0") else None
+            bootstrap_trace = (
+                candidate_trace.get("weather_empirical_bootstrap")
+                if isinstance(candidate_trace.get("weather_empirical_bootstrap"), dict)
+                else {}
+            )
+            if ticket is not None and bootstrap_trace.get("applied") is True:
+                cap_raw = bootstrap_trace.get("daily_notional_cap_dollars")
+                used_raw = bootstrap_trace.get("daily_notional_used_dollars") or 0
+                try:
+                    remaining_cap = Decimal(str(cap_raw)) - Decimal(str(used_raw))
+                except Exception:
+                    remaining_cap = Decimal("0")
+                unit_notional = estimate_notional_dollars(
+                    ticket.side,
+                    ticket.yes_price_dollars,
+                    Decimal("1.00"),
+                )
+                ticket_notional = estimate_notional_dollars(
+                    ticket.side,
+                    ticket.yes_price_dollars,
+                    ticket.count_fp,
+                )
+                sizing_trace["bootstrap_daily_notional_cap_dollars"] = cap_raw
+                sizing_trace["bootstrap_daily_notional_used_dollars"] = used_raw
+                sizing_trace["bootstrap_ticket_notional_dollars"] = ticket_notional
+                if remaining_cap <= Decimal("0") or unit_notional <= Decimal("0"):
+                    sizing_trace["stand_down_reason"] = "bootstrap_daily_notional_cap_reached"
+                    ticket = None
+                    eligible = False
+                elif ticket_notional > remaining_cap:
+                    capped_count = quantize_count(remaining_cap / unit_notional)
+                    sizing_trace["bootstrap_capped_count_fp"] = capped_count
+                    ticket = ticket.model_copy(update={"count_fp": capped_count}) if capped_count > Decimal("0") else None
+                    if ticket is None:
+                        sizing_trace["stand_down_reason"] = "bootstrap_daily_notional_cap_reached"
+                        eligible = False
 
             if ticket is not None:
                 duplicate_trace_id = await self._recent_duplicate_risk_block_trace_id(
@@ -1335,6 +1505,37 @@ class WorkflowSupervisor:
                     approved_count_fp=verdict.approved_count_fp,
                     payload=verdict.model_dump(mode="json"),
                 )
+                if bootstrap_trace.get("applied") is True:
+                    await repo.save_weather_bootstrap_event(
+                        kalshi_env=room.kalshi_env,
+                        market_ticker=room.market_ticker,
+                        series_ticker=series_from_ticker(room.market_ticker),
+                        local_market_day=market_day_from_ticker(room.market_ticker),
+                        bucket_key=bootstrap_trace.get("bucket_id")
+                        or (candidate_trace.get("empirical_gate") or {}).get("bucket_key"),
+                        policy_key=bootstrap_trace.get("policy_key"),
+                        tier=bootstrap_trace.get("tier"),
+                        event_type="risk",
+                        status=verdict.status.value,
+                        side=ticket.side.value,
+                        confidence=signal.confidence,
+                        edge_bps=bootstrap_trace.get("edge_bps_after_buffer"),
+                        size_factor=bootstrap_trace.get("size_factor"),
+                        count_fp=ticket.count_fp,
+                        notional_dollars=(
+                            verdict.approved_notional_dollars
+                            or estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, ticket.count_fp)
+                        ),
+                        source="live_forward",
+                        occurred_at=datetime.now(UTC),
+                        room_id=room.id,
+                        payload={
+                            **bootstrap_trace,
+                            "risk_verdict_id": risk_verdict_record.id,
+                            "risk_status": verdict.status.value,
+                            "risk_reasons": verdict.reasons,
+                        },
+                    )
                 if verdict.status == RiskStatus.APPROVED:
                     await repo.update_trade_ticket_status(ticket_record.id, "approved")
                     evaluation_outcome = "approved"
@@ -1373,7 +1574,7 @@ class WorkflowSupervisor:
                     ORDERS_TOTAL.labels(status=receipt.status).inc()
                     if receipt.external_order_id or receipt.status not in ("shadow_skipped", "inactive_color_skipped"):
                         order_raw = _payload_with_trade_behavior_context(receipt.details, trade_behavior_context)
-                        await repo.save_order(
+                        order_record = await repo.save_order(
                             ticket_id=ticket_record.id,
                             client_order_id=client_order_id,
                             market_ticker=approved_ticket.market_ticker,
@@ -1387,6 +1588,38 @@ class WorkflowSupervisor:
                             kalshi_env=room.kalshi_env,
                             strategy_code=StrategyCode.DIRECTIONAL.value,
                         )
+                        if bootstrap_trace.get("applied") is True:
+                            await repo.save_weather_bootstrap_event(
+                                kalshi_env=room.kalshi_env,
+                                market_ticker=room.market_ticker,
+                                series_ticker=series_from_ticker(room.market_ticker),
+                                local_market_day=market_day_from_ticker(room.market_ticker),
+                                bucket_key=bootstrap_trace.get("bucket_id")
+                                or (candidate_trace.get("empirical_gate") or {}).get("bucket_key"),
+                                policy_key=bootstrap_trace.get("policy_key"),
+                                tier=bootstrap_trace.get("tier"),
+                                event_type="order",
+                                status=receipt.status,
+                                side=approved_ticket.side.value,
+                                confidence=signal.confidence,
+                                edge_bps=bootstrap_trace.get("edge_bps_after_buffer"),
+                                size_factor=bootstrap_trace.get("size_factor"),
+                                count_fp=approved_ticket.count_fp,
+                                notional_dollars=estimate_notional_dollars(
+                                    approved_ticket.side,
+                                    approved_ticket.yes_price_dollars,
+                                    approved_ticket.count_fp,
+                                ),
+                                source="live_forward",
+                                occurred_at=datetime.now(UTC),
+                                room_id=room.id,
+                                order_id=order_record.id,
+                                payload={
+                                    **bootstrap_trace,
+                                    "receipt_status": receipt.status,
+                                    "external_order_id": receipt.external_order_id,
+                                },
+                            )
                     await repo.update_trade_ticket_status(ticket_record.id, receipt.status)
                 else:
                     await repo.update_trade_ticket_status(ticket_record.id, "blocked")
@@ -1511,6 +1744,7 @@ class WorkflowSupervisor:
         session: Any,
         room: Room,
         signal: StrategySignal,
+        weather_policy_resolution: Any | None = None,
     ) -> StrategySignal:
         if (
             signal.eligibility is None
@@ -1522,6 +1756,7 @@ class WorkflowSupervisor:
         if not hasattr(session, "execute"):
             return signal
 
+        pre_empirical_stand_down_reason = signal.eligibility.stand_down_reason
         decision = await evaluate_empirical_gate(
             session=session,
             settings=self.settings,
@@ -1537,8 +1772,51 @@ class WorkflowSupervisor:
             spread_bps=signal.eligibility.market_spread_bps if signal.eligibility is not None else None,
         )
         payload = decision.to_payload()
+        if decision.reason == self.settings.trade_behavior_entry_freeze_reason and hasattr(self.settings, "model_copy"):
+            no_freeze_settings = self.settings.model_copy(
+                update={"trade_behavior_production_entry_freeze_enabled": False}
+            )
+            underlying = await evaluate_empirical_gate(
+                session=session,
+                settings=no_freeze_settings,
+                kalshi_env=room.kalshi_env,
+                market_ticker=room.market_ticker,
+                side=signal.recommended_side.value,
+                action=signal.recommended_action.value,
+                strategy_code=StrategyCode.DIRECTIONAL.value,
+                shadow_mode=bool(getattr(room, "shadow_mode", self.settings.app_shadow_mode)),
+                yes_price_dollars=signal.target_yes_price_dollars,
+                forecast_delta_f=signal.forecast_delta_f,
+                confidence_band=signal.confidence_band,
+                spread_bps=signal.eligibility.market_spread_bps if signal.eligibility is not None else None,
+            )
+            payload.update(
+                {
+                    "underlying_status": underlying.status,
+                    "underlying_reason": underlying.reason,
+                    "underlying_actual_sample_count": underlying.actual_sample_count,
+                    "underlying_blocks_live_entries": underlying.blocks_live_entries,
+                }
+            )
         signal.candidate_trace = {**dict(signal.candidate_trace or {}), "empirical_gate": payload}
+        signal.candidate_trace["pre_empirical_stand_down_reason"] = (
+            pre_empirical_stand_down_reason.value if pre_empirical_stand_down_reason is not None else None
+        )
         signal.eligibility = apply_empirical_gate_to_eligibility(signal.eligibility, decision)
+        signal.eligibility = signal.eligibility.model_copy(
+            update={
+                "candidate_trace": {
+                    **dict(signal.eligibility.candidate_trace or {}),
+                    "empirical_gate": payload,
+                    "pre_empirical_stand_down_reason": (
+                        pre_empirical_stand_down_reason.value
+                        if pre_empirical_stand_down_reason is not None
+                        else None
+                    ),
+                },
+                "empirical_gate": payload,
+            }
+        )
         signal.stand_down_reason = signal.eligibility.stand_down_reason
         signal.evaluation_outcome = signal.eligibility.evaluation_outcome
         signal.candidate_trace = signal.eligibility.candidate_trace or signal.candidate_trace
@@ -1546,6 +1824,8 @@ class WorkflowSupervisor:
             session=session,
             room=room,
             signal=signal,
+            weather_policy_resolution=weather_policy_resolution,
+            pre_empirical_stand_down_reason=pre_empirical_stand_down_reason,
         )
         if decision.blocks_live_entries and signal.eligibility is not None and not signal.eligibility.eligible:
             signal.summary = f"{signal.summary} Stand down: empirical trade behavior gate blocked live entry ({decision.reason})."
@@ -1838,6 +2118,7 @@ class WorkflowSupervisor:
                     session=session,
                     room=room,
                     signal=signal,
+                    weather_policy_resolution=weather_policy_resolution,
                 )
                 signal_market_snapshot = _signal_market_snapshot_payload(
                     market_response,

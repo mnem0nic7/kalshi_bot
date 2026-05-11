@@ -16,6 +16,7 @@ from kalshi_bot.core.schemas import (
     AgentPackResearchConfig,
     AgentPackRoleConfig,
     AgentPackThresholds,
+    AgentPackWeatherPolicy,
     AgentPackWeatherPolicyBook,
 )
 from kalshi_bot.db.models import DeploymentControl
@@ -155,7 +156,50 @@ class AgentPackService:
                 strategy_min_abs_delta_f=self.settings.strategy_min_abs_delta_f,
                 strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
             ),
-            weather_policy=AgentPackWeatherPolicyBook(),
+            weather_policy=AgentPackWeatherPolicyBook(
+                policies={
+                    "weather/a/global/any/any/all_season/all_month/any/any/entry_gate": AgentPackWeatherPolicy(
+                        policy_key="weather/a/global/any/any/all_season/all_month/any/any/entry_gate",
+                        domain="weather",
+                        strategy_code="A",
+                        cohort_id="global",
+                        series_ticker="any",
+                        side="any",
+                        season="all_season",
+                        month="all_month",
+                        regime="any",
+                        threshold_band="any",
+                        lane="entry_gate",
+                        mode="live",
+                        action="keep_current",
+                        reason_codes=["builtin_weather_bootstrap_shadow_policy"],
+                        deterministic_summary=(
+                            "Built-in deterministic weather entry policy. Bootstrap starts shadow-only "
+                            "and can change live behavior only after evidence promotion."
+                        ),
+                    ),
+                    "weather/weather_baseline/global/any/any/all_season/all_month/any/any/entry_gate": AgentPackWeatherPolicy(
+                        policy_key="weather/weather_baseline/global/any/any/all_season/all_month/any/any/entry_gate",
+                        domain="weather",
+                        strategy_code="weather_baseline",
+                        cohort_id="global",
+                        series_ticker="any",
+                        side="any",
+                        season="all_season",
+                        month="all_month",
+                        regime="any",
+                        threshold_band="any",
+                        lane="entry_gate",
+                        mode="live",
+                        action="keep_current",
+                        reason_codes=["builtin_weather_bootstrap_shadow_policy"],
+                        deterministic_summary=(
+                            "Built-in deterministic weather entry policy. Bootstrap starts shadow-only "
+                            "and can change live behavior only after evidence promotion."
+                        ),
+                    )
+                }
+            ),
             crypto_policy=AgentPackCryptoPolicy(
                 entry=AgentPackCryptoEntryPolicy(
                     min_fee_adjusted_edge_bps=self.settings.risk_min_edge_bps,

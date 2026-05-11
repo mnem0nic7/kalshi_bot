@@ -143,7 +143,7 @@ class AppContainer:
         settings = get_settings()
         engine = create_engine(settings)
         session_factory = create_session_factory(engine)
-        if settings.app_auto_init_db:
+        if bootstrap_db or settings.app_auto_init_db:
             await init_models(engine)
         secondary_engine: AsyncEngine | None = None
         secondary_session_factory: async_sessionmaker[AsyncSession] | None = None

@@ -1117,6 +1117,7 @@ def test_recent_room_decisions_render_above_trading_activity(
                 assert "Room ID,Market,Origin,Stage,Status,Decision" in export_text
                 assert "gates_failed,gates_passed,primary_block_reason" in export_text
                 assert "policy_variants,policy_variant_applied,baseline_block_reason" in export_text
+                assert "bootstrap_tier,bootstrap_outcome,bootstrap_reason" in export_text
                 assert "room-sea,KXHIGHSEA-26MAY09-T67,live,complete,no_trade,No trade" in export_text
                 assert "Forecast high is 65.4F against a 67F threshold" in export_text
                 signals_export_button = decisions.locator('[data-testid="export-signals-attention"]')

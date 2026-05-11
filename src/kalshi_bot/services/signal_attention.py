@@ -186,6 +186,7 @@ _STAND_DOWN_TO_PRIMARY = {
     "confidence_too_low": "min_confidence",
     "market_stale": "market_stale",
     "research_stale": "research_stale",
+    "fair_value_source_disqualified": "fair_value_source_disqualified",
     "static_signal_stale": "static_signal_guard",
 }
 
@@ -253,6 +254,7 @@ def extract_decision_fields(
     if not isinstance(policy_variants, dict):
         policy_variants = {}
     weather_policy = trace.get("weather_policy") if isinstance(trace.get("weather_policy"), dict) else {}
+    bootstrap = trace.get("weather_empirical_bootstrap") if isinstance(trace.get("weather_empirical_bootstrap"), dict) else {}
 
     stand_down_reason = (
         payload.get("final_stand_down_reason")
@@ -344,9 +346,22 @@ def extract_decision_fields(
         "gates_failed": gates_failed,
         "gates_passed": gates_passed,
         "primary_block_reason": primary,
+        "market_stale": bool(eligibility.get("market_stale")),
+        "research_stale": bool(eligibility.get("research_stale")),
         "policy_variants": policy_variants,
         "policy_variant_applied": trace.get("policy_variant_applied"),
         "baseline_block_reason": trace.get("baseline_block_reason"),
+        "bootstrap_tier": bootstrap.get("tier"),
+        "bootstrap_outcome": bootstrap.get("outcome"),
+        "bootstrap_reason": bootstrap.get("reason"),
+        "bootstrap_size_factor": bootstrap.get("size_factor"),
+        "bootstrap_confidence_source": bootstrap.get("confidence_source"),
+        "bootstrap_fair_value_source": bootstrap.get("fair_value_source"),
+        "bootstrap_cap_applied": bootstrap.get("daily_notional_cap_dollars"),
+        "bootstrap_evidence_source": bootstrap.get("evidence_source"),
+        "bootstrap_lineage_id": bootstrap.get("lineage_id"),
+        "bootstrap_policy_key": bootstrap.get("policy_key"),
+        "bootstrap_rollout_state": bootstrap.get("rollout_state"),
         "active_policy_pack_version": trace.get("active_policy_pack_version") or weather_policy.get("active_policy_pack_version"),
         "policy_key": trace.get("policy_key") or weather_policy.get("policy_key"),
         "fallback_policy_key_used": trace.get("fallback_policy_key_used") or weather_policy.get("fallback_policy_key_used"),
@@ -580,11 +595,30 @@ class SignalAttentionService:
         return growing or None
 
     def static_signal_guard(self, rows: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
-        patterns = self.detect_patterns(rows)
-        return next(
+        row_list = list(rows)
+        rows_by_id = {row.get("room_id"): row for row in row_list if row.get("room_id")}
+        patterns = self.detect_patterns(row_list)
+        pattern = next(
             (row for row in patterns if row["pattern"] in {"static_edge", "static_fair_value"}),
             None,
         )
+        if pattern is None:
+            return None
+        pattern_rows = [rows_by_id.get(room_id) for room_id in pattern.get("room_ids") or []]
+        stale = [
+            row for row in pattern_rows
+            if isinstance(row, dict)
+            and (
+                row.get("market_stale") is True
+                or row.get("research_stale") is True
+                or row.get("primary_block_reason") in {"market_stale", "research_stale"}
+            )
+        ]
+        if not stale:
+            return None
+        pattern["stale"] = True
+        pattern["stale_room_ids"] = [row.get("room_id") for row in stale if row.get("room_id")]
+        return pattern
 
 
 def _time_span_minutes(rows: list[dict[str, Any]]) -> float | None:

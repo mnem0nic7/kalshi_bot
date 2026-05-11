@@ -397,6 +397,93 @@ class AgentPackThresholds(BaseModel):
     strategy_min_remaining_payout_bps: int | None = None
 
 
+class AgentPackWeatherBootstrapTier(BaseModel):
+    min_samples: int
+    max_samples: int | None = None
+    min_confidence: float
+    min_edge_bps: int
+    size_factor: float
+    live_enabled: bool = False
+
+
+class AgentPackWeatherBootstrapCaps(BaseModel):
+    shadow_min_hours: int = 24
+    shadow_min_market_episodes: int = 5
+    shadow_required_match_rate: float = 0.90
+    initial_daily_notional_usd: float = 100.0
+    initial_max_concurrent_positions: int = 1
+    expanded_daily_notional_usd: float = 500.0
+    expanded_max_concurrent_positions: int = 3
+    kill_switch_lookback: int = 10
+    kill_switch_min_rows: int = 5
+    kill_switch_min_win_rate: float = 0.30
+    kill_switch_drawdown_usd: float = 100.0
+
+
+class AgentPackWeatherBootstrapGridEnvelope(BaseModel):
+    min_confidence: float = 0.60
+    max_confidence: float = 0.99
+    min_edge_bps: int = 250
+    max_edge_bps: int = 10000
+    min_size_factor: float = 0.05
+    max_size_factor: float = 1.00
+    min_daily_notional_usd: float = 50.0
+    max_daily_notional_usd: float = 1000.0
+    min_entry_price_dollars: float = 0.05
+    min_remaining_payout_bps: int = 1000
+
+
+class AgentPackWeatherBootstrapPolicy(BaseModel):
+    enabled: bool = True
+    rollout_state: str = "shadow"
+    evidence_ready: bool = False
+    activation_boundary: str = "scan_generation"
+    count_market_episodes: bool = True
+    confidence_source_preference: str = "calibrated_first"
+    raw_confidence_cold_only: bool = True
+    raw_confidence_min_confidence_penalty: float = 0.05
+    raw_confidence_min_edge_bps_penalty: int = 1000
+    fair_value_fallback_disqualifies: bool = True
+    static_policy: str = "split_stale_persistent"
+    allow_forecast_separation_bootstrap: bool = True
+    bypass_legacy_trade_behavior_freeze: bool = True
+    live_shadow_weight: float = 0.25
+    tiers: dict[str, AgentPackWeatherBootstrapTier] = Field(
+        default_factory=lambda: {
+            "cold": AgentPackWeatherBootstrapTier(
+                min_samples=0,
+                max_samples=0,
+                min_confidence=0.90,
+                min_edge_bps=3000,
+                size_factor=0.10,
+                live_enabled=False,
+            ),
+            "warming": AgentPackWeatherBootstrapTier(
+                min_samples=1,
+                max_samples=9,
+                min_confidence=0.80,
+                min_edge_bps=1500,
+                size_factor=0.25,
+                live_enabled=False,
+            ),
+            "maturing": AgentPackWeatherBootstrapTier(
+                min_samples=10,
+                max_samples=19,
+                min_confidence=0.70,
+                min_edge_bps=800,
+                size_factor=0.50,
+                live_enabled=False,
+            ),
+        }
+    )
+    caps: AgentPackWeatherBootstrapCaps = Field(default_factory=AgentPackWeatherBootstrapCaps)
+    grid_envelope: AgentPackWeatherBootstrapGridEnvelope = Field(default_factory=AgentPackWeatherBootstrapGridEnvelope)
+    kill_switch_state: dict[str, Any] = Field(default_factory=dict)
+    evidence_fingerprints: list[str] = Field(default_factory=list)
+    local_overrides: dict[str, Any] = Field(default_factory=dict)
+    promotion: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentPackWeatherPolicy(BaseModel):
     policy_key: str
     domain: str = "weather"
@@ -412,6 +499,7 @@ class AgentPackWeatherPolicy(BaseModel):
     mode: str = "live"
     action: str = "keep_current"
     thresholds: AgentPackThresholds = Field(default_factory=AgentPackThresholds)
+    bootstrap: AgentPackWeatherBootstrapPolicy = Field(default_factory=AgentPackWeatherBootstrapPolicy)
     grid: dict[str, list[Any]] = Field(default_factory=dict)
     parent_policy_key: str | None = None
     evidence: dict[str, Any] = Field(default_factory=dict)

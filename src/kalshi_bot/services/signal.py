@@ -20,6 +20,7 @@ from kalshi_bot.services.decision_policy_variants import (
     DecisionPolicyVariantService,
     policy_variant_applied,
 )
+from kalshi_bot.services.weather_empirical_bootstrap import fair_value_source_from_provenance
 from kalshi_bot.weather.models import WeatherMarketMapping
 from kalshi_bot.weather.scoring import SigmaContext, WeatherSignalSnapshot, confidence_band_for, score_weather_market
 
@@ -1007,6 +1008,18 @@ def evaluate_trade_eligibility(
     elif signal.weather is not None and signal.weather.stand_down_reason is not None:
         stand_down_reason = signal.weather.stand_down_reason
         reasons.append(f"Weather signal stand-down: {signal.weather.stand_down_reason.value}.")
+    elif fair_value_source_from_provenance(
+        signal.prediction_provenance
+        or (
+            getattr(signal.weather, "prediction_provenance", {})
+            if signal.weather is not None and isinstance(getattr(signal.weather, "prediction_provenance", {}), dict)
+            else {}
+        ),
+        fair_yes_dollars=signal.fair_yes_dollars,
+    ) in {"fallback", "unavailable", "dark", "none"}:
+        candidate_trace["fair_value_source"] = "fallback"
+        reasons.append("Fair-value source is fallback or unavailable, so the signal is not eligible for trade selection.")
+        stand_down_reason = StandDownReason.FAIR_VALUE_SOURCE_DISQUALIFIED
     elif signal.trade_regime in {"longshot_yes", "longshot_no"}:
         reasons.append(f"Longshot bet blocked: trade regime is {signal.trade_regime}.")
         stand_down_reason = StandDownReason.LONGSHOT_BET
@@ -1107,6 +1120,8 @@ def evaluate_trade_eligibility(
         strategy_mode = StrategyMode.LATE_DAY_AVOID
     if stand_down_reason is None:
         evaluation_outcome = "candidate_selected"
+    elif stand_down_reason == StandDownReason.FAIR_VALUE_SOURCE_DISQUALIFIED:
+        evaluation_outcome = "no_signal"
     elif trace_outcome in {"no_candidate", "pre_risk_filtered"}:
         evaluation_outcome = trace_outcome
     elif signal.recommended_action is None or signal.recommended_side is None or signal.target_yes_price_dollars is None:

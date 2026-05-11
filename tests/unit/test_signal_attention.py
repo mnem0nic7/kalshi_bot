@@ -218,6 +218,9 @@ def test_static_signal_guard_requires_latest_consecutive_static_run() -> None:
 
     rows.append(_row("KXHIGHNOLA-26MAY11-T79", 5, edge=1200, fair="0.5100"))
     rows.append(_row("KXHIGHNOLA-26MAY11-T79", 6, edge=1200, fair="0.5100"))
+    assert service.static_signal_guard(rows) is None
+
+    rows[-1]["market_stale"] = True
 
     guard = service.static_signal_guard(rows)
 
