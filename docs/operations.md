@@ -80,15 +80,17 @@ kalshi-bot-cli crypto-live-path status \
 Evidence refresh loop:
 
 ```bash
-kalshi-bot-cli crypto-live-path refresh \
+scripts/crypto_live_path_refresh.sh \
   --kalshi-env production \
   --frequency 15m \
   --history-days 2 \
   --spot-days 2 \
   --replay-days 30 \
   --assets BTC ETH SOL XRP BNB DOGE HYPE \
-  --json
+  --docker-container infra-app_production_blue-1
 ```
+
+The script runs one CLI process per asset so model and replay memory is released between assets. It writes per-asset JSON reports and stderr logs under `reports/crypto_live_path/`.
 
 Per asset readiness requires at least 60 strict labeled real-quote rows, at least 50 replay trade candidates, a passing replay gate, positive simulated net P/L, calibration that beats the market-mid baseline, at least 80% spot coverage, and fresh spot data. Keep BNB and HYPE shadow until their Coingecko proxy spot data is fresh and stable.
 
