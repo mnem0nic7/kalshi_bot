@@ -828,16 +828,62 @@ def _crypto_live_path_assets(args: argparse.Namespace) -> list[str]:
 def _crypto_artifact_payload(record: Any | None) -> dict[str, Any] | None:
     if record is None:
         return None
+    artifact_type = getattr(record, "artifact_type", None)
+    raw_payload = getattr(record, "payload", None) or {}
     return {
-        "artifact_type": getattr(record, "artifact_type", None),
+        "artifact_type": artifact_type,
         "version": getattr(record, "version", None),
         "status": getattr(record, "status", None),
         "trained_at": getattr(record, "trained_at", None),
         "created_at": getattr(record, "created_at", None),
         "sample_count": getattr(record, "sample_count", None),
         "metrics": getattr(record, "metrics", None) or {},
-        "payload": getattr(record, "payload", None) or {},
+        "payload": _crypto_artifact_payload_summary(str(artifact_type or ""), raw_payload),
     }
+
+
+def _crypto_artifact_payload_summary(artifact_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if artifact_type.startswith("replay_gate"):
+        return {
+            "passed": payload.get("passed"),
+            "reasons": payload.get("reasons") or [],
+            "requirements": payload.get("requirements") or {},
+        }
+    if artifact_type.startswith("backtest"):
+        dataset = payload.get("dataset") or {}
+        data_quality = payload.get("data_quality") or {}
+        spot_quality = payload.get("spot_quality") or {}
+        return {
+            "schema_version": payload.get("schema_version"),
+            "status": payload.get("status"),
+            "days": payload.get("days"),
+            "dataset": {
+                "row_count": dataset.get("row_count"),
+                "asset_count": dataset.get("asset_count"),
+                "assets": dataset.get("assets") or [],
+            },
+            "data_quality": {
+                "status": data_quality.get("status"),
+                "snapshot_count": data_quality.get("snapshot_count"),
+                "settled_snapshot_count": data_quality.get("settled_snapshot_count"),
+                "candle_count": data_quality.get("candle_count"),
+            },
+            "spot_quality": {
+                "status": spot_quality.get("status"),
+                "row_count": spot_quality.get("row_count"),
+                "coverage_pct": spot_quality.get("coverage_pct"),
+                "stale_assets": spot_quality.get("stale_assets") or [],
+            },
+            "promotion_gate": payload.get("promotion_gate") or {},
+        }
+    if artifact_type.startswith("model"):
+        return {
+            "model_type": payload.get("model_type"),
+            "asset_symbols": payload.get("asset_symbols") or [],
+            "metrics_scope": payload.get("metrics_scope"),
+            "candidate_registry_version": payload.get("candidate_registry_version"),
+        }
+    return {}
 
 
 def _int_or_zero(value: object) -> int:
