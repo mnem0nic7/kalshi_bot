@@ -4,7 +4,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from kalshi_bot.core.schemas import AgentPackWeatherBootstrapPolicy
-from kalshi_bot.db.models import WeatherBootstrapEventRecord
+from kalshi_bot.db.models import WeatherBootstrapEventRecord, WeatherBootstrapHistoricalEvidenceRecord
+from kalshi_bot.services.trade_behavior import coarse_empirical_bucket_key_from_legacy
 from kalshi_bot.services.weather_empirical_bootstrap import (
     WeatherEmpiricalBootstrapContext,
     WeatherEmpiricalBootstrapService,
@@ -53,6 +54,32 @@ def _event(**overrides):
     return WeatherBootstrapEventRecord(**payload)
 
 
+def _historical(**overrides):
+    payload = {
+        "kalshi_env": "production",
+        "market_ticker": "KXHIGHTSFO-26MAY11-T70",
+        "series_ticker": "KXHIGHTSFO",
+        "local_market_day": "26MAY11",
+        "bucket_key": "KXHIGHTSFO|SFO|no|A|50-59c|delta:5|conf:high|spread:100-249bps",
+        "policy_key": "policy-a",
+        "tier": "cold",
+        "replay_version": "strict",
+        "source_fingerprint": "fingerprint",
+        "strict_replay": True,
+        "side": "no",
+        "confidence": 0.91,
+        "edge_bps": 3200,
+        "count_fp": Decimal("1.00"),
+        "pnl_dollars": Decimal("1.0000"),
+        "evidence_weight": 1.0,
+        "outcome": "win",
+        "observed_at": NOW,
+        "payload": {"fair_value_source": "intraday_model"},
+    }
+    payload.update(overrides)
+    return WeatherBootstrapHistoricalEvidenceRecord(**payload)
+
+
 def test_cold_tier_matches_shadow_without_live_application() -> None:
     decision = WeatherEmpiricalBootstrapService().evaluate(
         context=_context(),
@@ -66,6 +93,18 @@ def test_cold_tier_matches_shadow_without_live_application() -> None:
     assert decision.outcome == "shadow_allow"
     assert decision.tier == "cold"
     assert decision.to_trace()["size_factor"] == 0.10
+
+
+def test_coarse_bucket_key_maps_old_spread_and_price_bands_together() -> None:
+    first = coarse_empirical_bucket_key_from_legacy(
+        "KXHIGHTSFO|SFO|no|A|50-59c|delta:5|conf:high|spread:000-099bps"
+    )
+    second = coarse_empirical_bucket_key_from_legacy(
+        "KXHIGHTSFO|SFO|no|A|40-49c|delta:5|conf:high|spread:500bps+"
+    )
+
+    assert first == second
+    assert first == "KXHIGHTSFO|SFO|no|A|delta:5|quality:high"
 
 
 def test_raw_confidence_gets_cold_only_penalty() -> None:
@@ -193,6 +232,39 @@ def test_terminal_order_event_releases_bootstrap_caps() -> None:
     assert decision.concurrent_positions == 0
 
 
+def test_settled_trade_still_consumes_daily_bootstrap_cap() -> None:
+    policy = AgentPackWeatherBootstrapPolicy(rollout_state="promoted_low")
+    policy.tiers["cold"] = policy.tiers["cold"].model_copy(update={"live_enabled": True})
+    events = [
+        _event(
+            event_type="risk",
+            status="approved",
+            room_id="room-1",
+            order_id="order-1",
+            notional_dollars=Decimal("100.0000"),
+            occurred_at=NOW.replace(hour=10),
+        ),
+        _event(
+            event_type="settlement",
+            status="settled_win",
+            room_id="room-1",
+            order_id="order-1",
+            pnl_dollars=Decimal("20.0000"),
+            occurred_at=NOW.replace(hour=11),
+        ),
+    ]
+
+    decision = WeatherEmpiricalBootstrapService().evaluate(
+        context=_context(),
+        policy=policy,
+        recent_events=events,
+        now=NOW,
+    )
+
+    assert decision.allowed_live is False
+    assert decision.reason == "bootstrap_daily_notional_cap_reached"
+
+
 def test_mature_bucket_requires_positive_net_pnl() -> None:
     service = WeatherEmpiricalBootstrapService()
     policy = AgentPackWeatherBootstrapPolicy()
@@ -222,6 +294,160 @@ def test_mature_bucket_requires_positive_net_pnl() -> None:
     assert shadow.reason == "empirical_gate_mature_shadow_matched"
     assert allowed.allowed_live is True
     assert allowed.size_factor == 1.0
+
+
+def test_weighted_shadow_evidence_contributes_to_mature_graduation() -> None:
+    historical = [
+        _historical(
+            market_ticker=f"KXHIGHTSFO-26MAY{11 + idx}-T70",
+            local_market_day=f"26MAY{11 + idx}",
+            source_fingerprint=f"shadow-{idx}",
+            pnl_dollars=Decimal("1.0000"),
+        )
+        for idx in range(4)
+    ]
+
+    decision = WeatherEmpiricalBootstrapService().evaluate(
+        context=_context(actual_sample_count=19, actual_net_pnl=Decimal("0.0000")),
+        policy=AgentPackWeatherBootstrapPolicy(evidence_ready=True, rollout_state="promoted_normal"),
+        historical_evidence=historical,
+        now=NOW,
+    )
+
+    trace = decision.to_trace()
+    assert decision.tier == "mature"
+    assert decision.allowed_live is True
+    assert trace["raw_live_sample_count"] == 19
+    assert trace["shadow_weighted_sample_count"] == 1.0
+    assert trace["weighted_sample_count"] == 20.0
+    assert trace["weighted_net_pnl"] == 1.0
+
+
+def test_fallback_shadow_evidence_does_not_contribute_to_graduation() -> None:
+    historical = [
+        _historical(
+            market_ticker=f"KXHIGHTSFO-26MAY{11 + idx}-T70",
+            local_market_day=f"26MAY{11 + idx}",
+            source_fingerprint=f"fallback-{idx}",
+            payload={"fair_value_source": "fallback"},
+        )
+        for idx in range(4)
+    ]
+
+    decision = WeatherEmpiricalBootstrapService().evaluate(
+        context=_context(actual_sample_count=19, actual_net_pnl=Decimal("1.0000")),
+        policy=AgentPackWeatherBootstrapPolicy(evidence_ready=True, rollout_state="promoted_normal"),
+        historical_evidence=historical,
+        now=NOW,
+    )
+
+    trace = decision.to_trace()
+    assert decision.tier == "maturing"
+    assert trace["shadow_weighted_sample_count"] == 0.0
+    assert trace["weighted_sample_count"] == 19.0
+
+
+def test_live_bootstrap_evidence_uses_size_factor_for_weighted_graduation() -> None:
+    events = [
+        _event(
+            event_type="settlement",
+            status="settled_win",
+            source="live_settlement",
+            market_ticker=f"KXHIGHTSFO-26MAY{11 + idx}-T70",
+            local_market_day=f"26MAY{11 + idx}",
+            bucket_key="KXHIGHTSFO|SFO|no|A|50-59c|delta:5|conf:high|spread:100-249bps",
+            size_factor=0.5,
+            pnl_dollars=Decimal("1.0000"),
+        )
+        for idx in range(2)
+    ]
+
+    decision = WeatherEmpiricalBootstrapService().evaluate(
+        context=_context(actual_sample_count=19, actual_net_pnl=Decimal("0.0000")),
+        policy=AgentPackWeatherBootstrapPolicy(evidence_ready=True, rollout_state="promoted_normal"),
+        recent_events=events,
+        now=NOW,
+    )
+
+    trace = decision.to_trace()
+    assert decision.tier == "mature"
+    assert trace["bootstrap_weighted_sample_count"] == 1.0
+    assert trace["weighted_sample_count"] == 20.0
+    assert trace["weighted_net_pnl"] == 1.0
+
+
+def test_three_consecutive_bootstrap_losses_trip_kill_switch() -> None:
+    policy = AgentPackWeatherBootstrapPolicy(rollout_state="promoted_low")
+    policy.tiers["cold"] = policy.tiers["cold"].model_copy(update={"live_enabled": True})
+    events = [
+        _event(
+            event_type="settlement",
+            status="settled_loss",
+            source="live_settlement",
+            market_ticker=f"KXHIGHTSFO-26MAY{11 + idx}-T70",
+            local_market_day=f"26MAY{11 + idx}",
+            pnl_dollars=Decimal("-1.0000"),
+            occurred_at=NOW.replace(minute=idx),
+        )
+        for idx in range(3)
+    ]
+
+    decision = WeatherEmpiricalBootstrapService().evaluate(
+        context=_context(),
+        policy=policy,
+        recent_events=events,
+        now=NOW,
+    )
+
+    assert decision.allowed_live is False
+    assert decision.kill_switch_active is True
+    assert decision.reason == "bootstrap_kill_switch_consecutive_losses"
+
+
+def test_persisted_bootstrap_kill_switch_resets_only_after_operator_reset_or_policy_change() -> None:
+    service = WeatherEmpiricalBootstrapService()
+    policy = AgentPackWeatherBootstrapPolicy(
+        rollout_state="promoted_low",
+        kill_switch_state={
+            "active": True,
+            "reason": "bootstrap_kill_switch_consecutive_losses",
+            "tripped_at": NOW.isoformat(),
+            "policy_pack_version": "pack-v1",
+        },
+    )
+    policy.tiers["cold"] = policy.tiers["cold"].model_copy(update={"live_enabled": True})
+
+    blocked = service.evaluate(
+        context=_context(policy_pack_version="pack-v1"),
+        policy=policy,
+        now=NOW,
+    )
+    reset_policy = policy.model_copy(
+        update={
+            "kill_switch_state": {
+                **policy.kill_switch_state,
+                "operator_reset_at": NOW.replace(minute=1).isoformat(),
+            }
+        }
+    )
+    reset = service.evaluate(
+        context=_context(policy_pack_version="pack-v1"),
+        policy=reset_policy,
+        now=NOW,
+    )
+    changed_version = service.evaluate(
+        context=_context(policy_pack_version="pack-v2"),
+        policy=policy,
+        now=NOW,
+    )
+
+    assert blocked.allowed_live is False
+    assert blocked.kill_switch_active is True
+    assert blocked.reason == "bootstrap_kill_switch_consecutive_losses"
+    assert reset.allowed_live is True
+    assert reset.kill_switch_active is False
+    assert changed_version.allowed_live is True
+    assert changed_version.kill_switch_active is False
 
 
 def test_confidence_and_fair_value_source_helpers_are_deterministic() -> None:

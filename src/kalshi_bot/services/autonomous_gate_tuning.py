@@ -33,8 +33,9 @@ from kalshi_bot.services.gate_learning import (
     decision_corpus_row_to_gate_learning_row,
 )
 from kalshi_bot.services.modeling import build_modeling_report
-from kalshi_bot.services.trade_behavior import series_from_ticker
+from kalshi_bot.services.trade_behavior import coarse_empirical_bucket_key_from_legacy, series_from_ticker
 from kalshi_bot.services.weather_empirical_bootstrap import (
+    STRICT_REPLAY_SHADOW_WEIGHT,
     WeatherEmpiricalBootstrapContext,
     WeatherEmpiricalBootstrapService,
     confidence_source_from_trace,
@@ -301,6 +302,21 @@ class AutonomousGateTuningService:
             await session.commit()
         settings_thresholds = _settings_threshold_values(self.settings)
         checkpoint_payload = checkpoint.payload if checkpoint is not None else None
+        loosened_fields = _loosened_threshold_fields(active_thresholds, settings_thresholds)
+        bootstrap_blocks_live = False
+        bootstrap_block_reasons: list[str] = []
+        if bootstrap_policy is not None and loosened_fields:
+            rollout_state = str(bootstrap_policy.rollout_state or "shadow").lower()
+            if rollout_state == "shadow" or not bootstrap_policy.evidence_ready:
+                bootstrap_blocks_live = True
+                bootstrap_block_reasons.append("bootstrap_not_evidence_ready")
+            if bootstrap_shadow and not bootstrap_shadow.get("eligible_for_promotion"):
+                bootstrap_blocks_live = True
+                bootstrap_block_reasons.extend(str(code) for code in bootstrap_shadow.get("reason_codes") or [])
+            if bootstrap_historical and not bootstrap_historical.get("eligible_for_promotion"):
+                bootstrap_blocks_live = True
+                bootstrap_block_reasons.extend(str(code) for code in bootstrap_historical.get("reason_codes") or [])
+        active_weather_valid_until = getattr(weather_resolution.policy, "valid_until", None) if weather_resolution.policy is not None else None
         payload = {
             "status": ((checkpoint_payload or {}).get("status") if checkpoint_payload is not None else "not_started"),
             "kalshi_env": env,
@@ -317,6 +333,11 @@ class AutonomousGateTuningService:
                 "historical_gate": bootstrap_historical,
                 "recent_event_count": len(bootstrap_events),
                 "strict_historical_evidence_count": len(bootstrap_historical_evidence),
+                "active_policy_valid_until": active_weather_valid_until.isoformat() if active_weather_valid_until is not None else None,
+                "active_policy_expired": bool(active_weather_valid_until is not None and active_weather_valid_until < datetime.now(UTC)),
+                "active_threshold_relaxation_blocked": bootstrap_blocks_live,
+                "active_threshold_relaxation_block_reasons": list(dict.fromkeys(bootstrap_block_reasons)),
+                "loosened_threshold_fields": loosened_fields,
             },
             "active_crypto_policy": active_crypto_policy,
             "settings_thresholds": settings_thresholds,
@@ -740,7 +761,8 @@ class AutonomousGateTuningService:
                     skip("missing_bucket_key")
                     continue
 
-                bucket_key_text = str(bucket_key)
+                legacy_bucket_key_text = str(bucket_key)
+                bucket_key_text = coarse_empirical_bucket_key_from_legacy(legacy_bucket_key_text) or legacy_bucket_key_text
                 side = _trace_side(signal, candidate_trace, selected)
                 policy_resolution = self.agent_pack_service.resolve_weather_policy(
                     current_pack,
@@ -774,14 +796,14 @@ class AutonomousGateTuningService:
                 if bucket_key_text not in event_cache:
                     event_cache[bucket_key_text] = await repo.list_weather_bootstrap_events(
                         kalshi_env=kalshi_env,
-                        bucket_key=bucket_key_text,
+                        series_ticker=series_from_ticker(record.market_ticker),
                         since=since,
                         limit=2000,
                     )
                 if bucket_key_text not in historical_cache:
                     historical_cache[bucket_key_text] = await repo.list_weather_bootstrap_historical_evidence(
                         kalshi_env=kalshi_env,
-                        bucket_key=bucket_key_text,
+                        series_ticker=series_from_ticker(record.market_ticker),
                         strict_replay=True,
                         limit=2000,
                     )
@@ -799,6 +821,7 @@ class AutonomousGateTuningService:
                     fair_value_source=fair_value_source_from_provenance(provenance, fair_yes_dollars=fair_yes),
                     confidence_source=confidence_source_from_trace(candidate_trace, provenance),
                     bucket_key=bucket_key_text,
+                    legacy_bucket_key=legacy_bucket_key_text if legacy_bucket_key_text != bucket_key_text else None,
                     actual_sample_count=int(empirical.get("actual_sample_count") or 0),
                     actual_net_pnl=_decimal_or_none(empirical.get("actual_net_pnl")),
                     current_stand_down_reason=_str_or_none(
@@ -825,6 +848,7 @@ class AutonomousGateTuningService:
                 )
                 event_trace = decision.to_trace()
                 event_trace["bucket_id"] = bucket_key_text
+                event_trace["legacy_bucket_id"] = legacy_bucket_key_text
                 event_trace["original_stand_down_reason"] = original_reason
                 event_trace["empirical_reason"] = "empirical_gate_under_sampled"
                 event_trace["stale_signal_evidence"] = stale
@@ -855,6 +879,7 @@ class AutonomousGateTuningService:
                     decision_trace_id=record.id,
                     payload={
                         **event_trace,
+                        "legacy_bucket_key": legacy_bucket_key_text,
                         "fair_value_source": context.fair_value_source,
                         "data_stale": context.data_stale,
                     },
@@ -969,6 +994,8 @@ class AutonomousGateTuningService:
                 skip("bootstrap_policy_missing")
                 continue
 
+            legacy_bucket_key = str(row.bucket_key)
+            bucket_key = coarse_empirical_bucket_key_from_legacy(legacy_bucket_key) or legacy_bucket_key
             context = WeatherEmpiricalBootstrapContext(
                 kalshi_env=kalshi_env,
                 market_ticker=row.market_ticker,
@@ -978,7 +1005,8 @@ class AutonomousGateTuningService:
                 fair_yes_dollars=row.fair_yes_dollars,
                 fair_value_source=fair_value_source,
                 confidence_source=row.confidence_source or "raw",
-                bucket_key=str(row.bucket_key),
+                bucket_key=bucket_key,
+                legacy_bucket_key=legacy_bucket_key if legacy_bucket_key != bucket_key else None,
                 actual_sample_count=0,
                 actual_net_pnl=None,
                 current_stand_down_reason="empirical_gate_block"
@@ -1014,7 +1042,7 @@ class AutonomousGateTuningService:
                 WeatherBootstrapHistoricalEvidenceRecord.kalshi_env == kalshi_env,
                 WeatherBootstrapHistoricalEvidenceRecord.source_fingerprint == fingerprint,
                 WeatherBootstrapHistoricalEvidenceRecord.market_ticker == row.market_ticker,
-                WeatherBootstrapHistoricalEvidenceRecord.bucket_key == str(row.bucket_key),
+                WeatherBootstrapHistoricalEvidenceRecord.bucket_key == bucket_key,
                 WeatherBootstrapHistoricalEvidenceRecord.policy_key == policy_resolution.policy_key,
             )
             existing_id = (await repo.session.execute(existing_stmt)).scalar_one_or_none()
@@ -1027,12 +1055,14 @@ class AutonomousGateTuningService:
             trace_payload = decision.to_trace()
             trace_payload["source_files"] = source_files
             trace_payload["primary_block_reason"] = row.primary_block_reason
+            trace_payload["legacy_bucket_key"] = legacy_bucket_key
+            trace_payload["fair_value_source"] = fair_value_source
             await repo.save_weather_bootstrap_historical_evidence(
                 kalshi_env=kalshi_env,
                 market_ticker=row.market_ticker,
                 series_ticker=row.series_ticker or series_from_ticker(row.market_ticker),
                 local_market_day=row.market_day or market_day_from_ticker(row.market_ticker),
-                bucket_key=str(row.bucket_key),
+                bucket_key=bucket_key,
                 policy_key=policy_resolution.policy_key,
                 tier=decision.tier,
                 replay_version="gate-learning-strict-bootstrap-v1",
@@ -1043,7 +1073,7 @@ class AutonomousGateTuningService:
                 edge_bps=decision.edge_bps_after_buffer,
                 count_fp=Decimal("1.00"),
                 pnl_dollars=row.counterfactual_pnl_dollars,
-                evidence_weight=1.0,
+                evidence_weight=float(STRICT_REPLAY_SHADOW_WEIGHT),
                 outcome=_historical_outcome(row.counterfactual_pnl_dollars),
                 observed_at=row.settlement_ts or row.decision_time or now,
                 payload=trace_payload,
@@ -1121,6 +1151,7 @@ class AutonomousGateTuningService:
                 "historical_gate": historical_gate,
             }
 
+        valid_until = now + timedelta(days=7)
         cold = bootstrap.tiers["cold"].model_copy(update={"live_enabled": True})
         promoted_bootstrap = bootstrap.model_copy(
             deep=True,
@@ -1135,6 +1166,7 @@ class AutonomousGateTuningService:
                     "shadow_gate": shadow_gate,
                     "historical_gate": historical_gate,
                     "evidence_source": evidence_source,
+                    "valid_until": valid_until.isoformat(),
                 },
             },
         )
@@ -1143,6 +1175,7 @@ class AutonomousGateTuningService:
             update={
                 "bootstrap": promoted_bootstrap,
                 "reason_codes": list(dict.fromkeys([*policy.reason_codes, "weather_bootstrap_cold_promoted"])),
+                "valid_until": valid_until,
                 "deterministic_summary": (
                     "Weather empirical bootstrap cold tier promoted from shadow evidence. "
                     "Cold tier is live at the initial $100/day, 1-position cap; other tiers remain shadow-only."
@@ -1192,6 +1225,7 @@ class AutonomousGateTuningService:
                         "evidence_source": evidence_source,
                         "shadow_gate": shadow_gate,
                         "historical_gate": historical_gate,
+                        "valid_until": valid_until.isoformat(),
                     },
                 },
             },
@@ -1947,6 +1981,7 @@ class AutonomousGateTuningService:
         weather_scope: dict[str, Any],
     ) -> dict[str, Any]:
         version = f"gate-tuning-{now.strftime('%Y%m%dT%H%M%SZ')}"
+        valid_until = now + timedelta(hours=int(self.settings.autonomous_gate_tuning_canary_max_wait_hours))
         threshold_payload = current_pack.thresholds.model_dump(mode="json")
         if str(weather_scope.get("scope") or "global") == "global":
             threshold_payload.update(candidate_thresholds)
@@ -1988,7 +2023,12 @@ class AutonomousGateTuningService:
                 deterministic_summary=(
                     f"Scoped weather policy {policy_key} staged with {len(changes)} threshold change(s)."
                 ),
-                metadata={"triggered_by": triggered_by, "staged_at": now.isoformat()},
+                valid_until=valid_until,
+                metadata={
+                    "triggered_by": triggered_by,
+                    "staged_at": now.isoformat(),
+                    "valid_until": valid_until.isoformat(),
+                },
             )
         candidate_pack = current_pack.model_copy(
             update={
@@ -2011,6 +2051,7 @@ class AutonomousGateTuningService:
                         "evidence_fingerprint": evidence_fingerprint,
                         "changes": changes,
                         "weather_scope": weather_scope,
+                        "valid_until": valid_until.isoformat(),
                     },
                 },
             }
@@ -2047,6 +2088,7 @@ class AutonomousGateTuningService:
             "promotion_event_id": promotion.id,
             "evidence_fingerprint": evidence_fingerprint,
             "staged_at": now.isoformat(),
+            "valid_until": valid_until.isoformat(),
             "changes": changes,
         }
         await repo.update_deployment_notes(self.agent_pack_service._replace_notes(control.notes, notes))
@@ -2058,6 +2100,7 @@ class AutonomousGateTuningService:
             "previous_version": current_pack.version,
             "promotion_event_id": promotion.id,
             "staged_at": now.isoformat(),
+            "valid_until": valid_until.isoformat(),
             "source": source,
             "days": days,
             "min_support": min_support,
@@ -2090,6 +2133,7 @@ class AutonomousGateTuningService:
             "changes": changes,
             "weather_scope": weather_scope,
             "evidence_fingerprint": evidence_fingerprint,
+            "valid_until": valid_until.isoformat(),
             "validation": validation,
         }
 
@@ -2103,6 +2147,22 @@ class AutonomousGateTuningService:
         now: datetime,
     ) -> dict[str, Any]:
         staged_at = _as_utc(checkpoint_payload.get("staged_at")) or now
+        valid_until = _as_utc(checkpoint_payload.get("valid_until"))
+        if valid_until is not None and now > valid_until:
+            return await self._reject_candidate(
+                repo,
+                checkpoint_payload=checkpoint_payload,
+                kalshi_env=kalshi_env,
+                reason="candidate_validity_expired",
+                canary={
+                    "evidence_source": "live_decision_corpus",
+                    "staged_at": staged_at.isoformat(),
+                    "valid_until": valid_until.isoformat(),
+                    "evaluated_at": now.isoformat(),
+                    "expired": True,
+                },
+                now=now,
+            )
         records = await repo.list_current_decision_corpus_rows(kalshi_env=kalshi_env, limit=10000)
         rows = _canary_rows(
             [
@@ -2125,6 +2185,7 @@ class AutonomousGateTuningService:
             "candidate_drawdown_proxy": _money(candidate_score["drawdown_proxy"]),
             "current_drawdown_proxy": _money(current_score["drawdown_proxy"]),
             "staged_at": staged_at.isoformat(),
+            "valid_until": valid_until.isoformat() if valid_until is not None else None,
             "evaluated_at": now.isoformat(),
         }
         min_rows = int(self.settings.autonomous_gate_tuning_canary_min_settled_rows)
@@ -2189,7 +2250,11 @@ class AutonomousGateTuningService:
         dry_run: bool,
         now: datetime,
     ) -> dict[str, Any]:
-        allowed, block_reason = await self._historical_bootstrap_allowed(repo, checkpoint_payload=checkpoint_payload)
+        allowed, block_reason = await self._historical_bootstrap_allowed(
+            repo,
+            checkpoint_payload=checkpoint_payload,
+            now=now,
+        )
         if not allowed:
             return {
                 "status": "historical_bootstrap_rejected",
@@ -2298,9 +2363,13 @@ class AutonomousGateTuningService:
         repo: PlatformRepository,
         *,
         checkpoint_payload: dict[str, Any],
+        now: datetime,
     ) -> tuple[bool, str | None]:
         if checkpoint_payload.get("status") != "staged":
             return False, "historical_bootstrap_requires_staged_candidate"
+        valid_until = _as_utc(checkpoint_payload.get("valid_until"))
+        if valid_until is not None and now > valid_until:
+            return False, "historical_bootstrap_candidate_expired"
         candidate_version = str(checkpoint_payload.get("candidate_version") or "")
         if not candidate_version:
             return False, "historical_bootstrap_candidate_missing"
@@ -2707,6 +2776,33 @@ def _threshold_drift(active_thresholds: dict[str, Any], settings_thresholds: dic
     return drift
 
 
+def _loosened_threshold_fields(active_thresholds: dict[str, Any], settings_thresholds: dict[str, Any]) -> list[str]:
+    loosened: list[str] = []
+    lower_is_looser = {
+        "risk_min_contract_price_dollars",
+        "strategy_min_remaining_payout_bps",
+        "risk_min_confidence",
+        "risk_min_edge_bps",
+        "strategy_min_abs_delta_f",
+    }
+    higher_is_looser = {"trigger_max_spread_bps", "risk_max_credible_edge_bps"}
+    for field in TUNABLE_GATE_FIELDS:
+        active = active_thresholds.get(field)
+        baseline = settings_thresholds.get(field)
+        if active in (None, "") or baseline in (None, ""):
+            continue
+        try:
+            active_f = float(active)
+            baseline_f = float(baseline)
+        except (TypeError, ValueError):
+            continue
+        if field in lower_is_looser and active_f < baseline_f:
+            loosened.append(field)
+        if field in higher_is_looser and active_f > baseline_f:
+            loosened.append(field)
+    return loosened
+
+
 def _stage_summary(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     if not payload:
         return None
@@ -2839,7 +2935,8 @@ def _historical_bootstrap_source_fingerprint(
         "decision_time": row.decision_time.isoformat() if row.decision_time is not None else None,
         "market_day": row.market_day,
         "side": row.side,
-        "bucket_key": row.bucket_key,
+        "bucket_key": decision_trace.get("bucket_key") or row.bucket_key,
+        "legacy_bucket_key": row.bucket_key,
         "policy_key": policy_key,
         "quality_adjusted_edge_bps": row.quality_adjusted_edge_bps,
         "confidence": row.confidence,
@@ -2869,13 +2966,14 @@ def _historical_bootstrap_shadow_gate_status(
         and row.tier == "cold"
         and row.pnl_dollars is not None
         and (policy_key is None or row.policy_key == policy_key)
+        and str((row.payload or {}).get("fair_value_source") or "").lower() not in {"fallback", "unavailable", "dark", "none"}
     ]
     episodes: dict[tuple[str, str | None, str | None], WeatherBootstrapHistoricalEvidenceRecord] = {}
     for row in sorted(records, key=lambda item: _as_utc(item.observed_at) or datetime.min.replace(tzinfo=UTC)):
         key = (
             row.market_ticker,
             row.local_market_day or market_day_from_ticker(row.market_ticker),
-            row.bucket_key,
+            coarse_empirical_bucket_key_from_legacy(row.bucket_key) or row.bucket_key,
         )
         episodes.setdefault(key, row)
     episode_rows = list(episodes.values())

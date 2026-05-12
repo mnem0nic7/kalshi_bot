@@ -9,9 +9,14 @@ from typing import Any, Iterable
 
 from kalshi_bot.core.schemas import AgentPackWeatherBootstrapPolicy, AgentPackWeatherBootstrapTier
 from kalshi_bot.db.models import WeatherBootstrapEventRecord, WeatherBootstrapHistoricalEvidenceRecord
+from kalshi_bot.services.trade_behavior import (
+    EMPIRICAL_BUCKET_VERSION,
+    coarse_empirical_bucket_key_from_legacy,
+)
 
 
-BOOTSTRAP_POLICY_VERSION = "weather-empirical-bootstrap-v1"
+BOOTSTRAP_POLICY_VERSION = "weather-empirical-bootstrap-v2"
+STRICT_REPLAY_SHADOW_WEIGHT = Decimal("0.25")
 BOOTSTRAP_ACTIVE_STATUSES = {
     "live_allowed",
     "approved",
@@ -35,11 +40,17 @@ BOOTSTRAP_TERMINAL_NON_POSITION_STATUSES = {
     "unfilled_cancelled",
 }
 BOOTSTRAP_SETTLED_STATUSES = {"settled_win", "settled_loss", "settled"}
+DISQUALIFIED_FAIR_VALUE_SOURCES = {"fallback", "unavailable", "dark", "none"}
 
 
-def _as_utc(value: datetime | None) -> datetime | None:
-    if value is None:
+def _as_utc(value: Any) -> datetime | None:
+    if value in (None, ""):
         return None
+    if not isinstance(value, datetime):
+        try:
+            value = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
@@ -52,6 +63,24 @@ def _json_hash(payload: dict[str, Any]) -> str:
 def market_day_from_ticker(market_ticker: str | None) -> str | None:
     parts = str(market_ticker or "").split("-")
     return parts[1] if len(parts) > 1 else None
+
+
+def _bucket_identity(value: str | None) -> str | None:
+    return coarse_empirical_bucket_key_from_legacy(value)
+
+
+def _is_disqualified_fair_value_source(value: Any) -> bool:
+    return str(value or "").strip().lower() in DISQUALIFIED_FAIR_VALUE_SOURCES
+
+
+def _event_fair_value_source(event: WeatherBootstrapEventRecord) -> str | None:
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    return str(payload.get("fair_value_source") or "").strip().lower() or None
+
+
+def _historical_fair_value_source(row: WeatherBootstrapHistoricalEvidenceRecord) -> str | None:
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    return str(payload.get("fair_value_source") or "").strip().lower() or None
 
 
 def fair_value_source_from_provenance(
@@ -143,6 +172,7 @@ class WeatherEmpiricalBootstrapContext:
     fair_value_source: str
     confidence_source: str
     bucket_key: str | None
+    legacy_bucket_key: str | None = None
     actual_sample_count: int = 0
     actual_net_pnl: Decimal | None = None
     current_stand_down_reason: str | None = None
@@ -157,6 +187,18 @@ class WeatherEmpiricalBootstrapContext:
 
 
 @dataclass(frozen=True, slots=True)
+class BootstrapEvidenceStats:
+    bucket_key: str | None
+    legacy_bucket_key: str | None
+    raw_live_sample_count: int
+    live_weighted_sample_count: Decimal
+    bootstrap_weighted_sample_count: Decimal
+    shadow_weighted_sample_count: Decimal
+    weighted_sample_count: Decimal
+    weighted_net_pnl: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
 class WeatherEmpiricalBootstrapDecision:
     matched: bool
     applied: bool
@@ -165,7 +207,16 @@ class WeatherEmpiricalBootstrapDecision:
     outcome: str
     reason: str
     tier: str | None
-    sample_count: int
+    sample_count: float
+    bucket_key: str | None
+    legacy_bucket_key: str | None
+    bucket_key_version: str
+    raw_live_sample_count: int
+    live_weighted_sample_count: float
+    bootstrap_weighted_sample_count: float
+    shadow_weighted_sample_count: float
+    weighted_sample_count: float
+    weighted_net_pnl: float | None
     policy_key: str | None
     fallback_policy_key: str | None
     rollout_state: str
@@ -198,6 +249,16 @@ class WeatherEmpiricalBootstrapDecision:
             "reason": self.reason,
             "tier": self.tier,
             "sample_count": self.sample_count,
+            "bucket_key": self.bucket_key,
+            "coarse_bucket_key": self.bucket_key,
+            "legacy_bucket_key": self.legacy_bucket_key,
+            "bucket_key_version": self.bucket_key_version,
+            "raw_live_sample_count": self.raw_live_sample_count,
+            "live_weighted_sample_count": self.live_weighted_sample_count,
+            "bootstrap_weighted_sample_count": self.bootstrap_weighted_sample_count,
+            "shadow_weighted_sample_count": self.shadow_weighted_sample_count,
+            "weighted_sample_count": self.weighted_sample_count,
+            "weighted_net_pnl": self.weighted_net_pnl,
             "policy_key": self.policy_key,
             "fallback_policy_key_used": self.fallback_policy_key,
             "rollout_state": self.rollout_state,
@@ -264,7 +325,8 @@ class WeatherEmpiricalBootstrapService:
         now_utc = _as_utc(now) or datetime.now(UTC)
         rollout = str(policy.rollout_state or "shadow").strip().lower()
         policy_key = context.policy_key
-        sample_count = self._sample_count(context, recent_events, historical_evidence)
+        evidence_stats = self._evidence_stats(context, recent_events, historical_evidence)
+        sample_count = evidence_stats.weighted_sample_count
         tier_name, tier = self._tier_for(sample_count, policy)
         thresholds = self._threshold_payload(tier_name, tier, policy)
         lineage_id = _json_hash(
@@ -272,16 +334,26 @@ class WeatherEmpiricalBootstrapService:
                 "policy_version": BOOTSTRAP_POLICY_VERSION,
                 "policy_key": policy_key,
                 "market_ticker": context.market_ticker,
-                "bucket_key": context.bucket_key,
+                "bucket_key": evidence_stats.bucket_key,
+                "legacy_bucket_key": evidence_stats.legacy_bucket_key,
                 "tier": tier_name,
-                "sample_count": sample_count,
+                "weighted_sample_count": str(sample_count),
                 "rollout_state": rollout,
                 "thresholds": thresholds,
             }
         )
 
         base_kwargs = {
-            "sample_count": sample_count,
+            "sample_count": float(sample_count),
+            "bucket_key": evidence_stats.bucket_key,
+            "legacy_bucket_key": evidence_stats.legacy_bucket_key,
+            "bucket_key_version": EMPIRICAL_BUCKET_VERSION,
+            "raw_live_sample_count": evidence_stats.raw_live_sample_count,
+            "live_weighted_sample_count": float(evidence_stats.live_weighted_sample_count),
+            "bootstrap_weighted_sample_count": float(evidence_stats.bootstrap_weighted_sample_count),
+            "shadow_weighted_sample_count": float(evidence_stats.shadow_weighted_sample_count),
+            "weighted_sample_count": float(evidence_stats.weighted_sample_count),
+            "weighted_net_pnl": float(evidence_stats.weighted_net_pnl) if evidence_stats.weighted_net_pnl is not None else None,
             "policy_key": policy_key,
             "fallback_policy_key": context.fallback_policy_key,
             "rollout_state": rollout,
@@ -320,21 +392,19 @@ class WeatherEmpiricalBootstrapService:
             return blocked("weather_empirical_bootstrap_disabled", "policy_disabled")
         if tier_name is None or (tier is None and tier_name != "mature"):
             return blocked("weather_empirical_bootstrap_tier_unavailable", "tier_unavailable")
-        if policy.fair_value_fallback_disqualifies and context.fair_value_source in {"fallback", "unavailable", "dark", "none"}:
+        if policy.fair_value_fallback_disqualifies and context.fair_value_source in DISQUALIFIED_FAIR_VALUE_SOURCES:
             return blocked("fair_value_source_disqualified", "fair_value_source_disqualified")
         if context.data_stale:
             return blocked("bootstrap_stale_data_blocked", "stale_data", *context.source_stale_reasons)
 
-        mature_pnl = self._mature_net_pnl(context, recent_events, historical_evidence)
-        kill_active, kill_reason = self._kill_switch(policy, recent_events)
+        mature_pnl = evidence_stats.weighted_net_pnl
+        kill_active, kill_reason = self._kill_switch(policy, recent_events, policy_pack_version=context.policy_pack_version)
         if tier_name == "mature":
             mature_live = bool(
                 policy.evidence_ready
                 and rollout in {"live", "canary", "promoted", "promoted_normal", "expanded"}
             )
-            if context.actual_net_pnl is not None:
-                mature_pnl = context.actual_net_pnl
-            if mature_pnl is not None and mature_pnl <= Decimal("0"):
+            if mature_pnl is None or mature_pnl <= Decimal("0"):
                 return blocked("bootstrap_mature_negative_net_pnl", "mature_negative_net_pnl")
             if kill_active:
                 decision = blocked(kill_reason or "bootstrap_kill_switch_active", "kill_switch_active")
@@ -436,10 +506,11 @@ class WeatherEmpiricalBootstrapService:
         for event in event_list:
             if event.event_type != "decision" or event.tier != "cold":
                 continue
+            bucket_key = _bucket_identity(event.bucket_key)
             key = (
                 event.market_ticker,
                 event.local_market_day or market_day_from_ticker(event.market_ticker),
-                event.bucket_key,
+                bucket_key,
             )
             cold_episodes.setdefault(key, []).append(event)
 
@@ -463,7 +534,7 @@ class WeatherEmpiricalBootstrapService:
                 actual.append(latest)
         fallback = [
             event for event in actual
-            if str((event.payload or {}).get("fair_value_source") or "").lower() in {"fallback", "unavailable"}
+            if _is_disqualified_fair_value_source((event.payload or {}).get("fair_value_source"))
         ]
         stale = [
             event for event in actual
@@ -501,34 +572,111 @@ class WeatherEmpiricalBootstrapService:
         events: Iterable[WeatherBootstrapEventRecord],
         historical_evidence: Iterable[WeatherBootstrapHistoricalEvidenceRecord],
     ) -> int:
-        if context.actual_sample_count >= 20:
-            return context.actual_sample_count
-        episodes: set[tuple[str | None, str | None]] = set()
+        return int(self._evidence_stats(context, events, historical_evidence).weighted_sample_count)
+
+    def _evidence_stats(
+        self,
+        context: WeatherEmpiricalBootstrapContext,
+        events: Iterable[WeatherBootstrapEventRecord],
+        historical_evidence: Iterable[WeatherBootstrapHistoricalEvidenceRecord],
+    ) -> BootstrapEvidenceStats:
+        bucket_key = _bucket_identity(context.bucket_key)
+        legacy_bucket_key = context.legacy_bucket_key
+        if legacy_bucket_key is None and context.bucket_key != bucket_key:
+            legacy_bucket_key = context.bucket_key
+
+        live_count = max(0, int(context.actual_sample_count or 0))
+        live_weight = Decimal(live_count)
+        weighted_values: list[Decimal] = []
+        if context.actual_net_pnl is not None:
+            weighted_values.append(Decimal(str(context.actual_net_pnl)))
+
+        event_episodes: dict[tuple[str | None, str | None, str | None], WeatherBootstrapEventRecord] = {}
         for event in events:
-            if event.bucket_key != context.bucket_key:
+            event_bucket_key = _bucket_identity(event.bucket_key)
+            if bucket_key is not None and event_bucket_key != bucket_key:
                 continue
-            if event.status in BOOTSTRAP_SETTLED_STATUSES or event.pnl_dollars is not None:
-                episodes.add((event.market_ticker, event.local_market_day or market_day_from_ticker(event.market_ticker)))
+            status = str(event.status or "").lower()
+            if status not in BOOTSTRAP_SETTLED_STATUSES and event.pnl_dollars is None:
+                continue
+            if _is_disqualified_fair_value_source(_event_fair_value_source(event)):
+                continue
+            episode_key = (
+                event.market_ticker,
+                event.local_market_day or market_day_from_ticker(event.market_ticker),
+                event_bucket_key,
+            )
+            prior = event_episodes.get(episode_key)
+            if prior is None or (_as_utc(event.occurred_at) or datetime.min.replace(tzinfo=UTC)) >= (
+                _as_utc(prior.occurred_at) or datetime.min.replace(tzinfo=UTC)
+            ):
+                event_episodes[episode_key] = event
+
+        bootstrap_weight = Decimal("0")
+        shadow_weight = Decimal("0")
+        for event in event_episodes.values():
+            source = str(event.source or "").lower()
+            if source in {"shadow", "decision_trace_backfill", "strict_replay", "historical_replay"}:
+                weight = STRICT_REPLAY_SHADOW_WEIGHT
+                shadow_weight += weight
+            else:
+                weight = Decimal(str(event.size_factor if event.size_factor is not None else event.evidence_weight or 1.0))
+                bootstrap_weight += weight
+            if event.pnl_dollars is not None:
+                weighted_values.append(Decimal(str(event.pnl_dollars)) * weight)
+
+        historical_episodes: dict[tuple[str | None, str | None, str | None], WeatherBootstrapHistoricalEvidenceRecord] = {}
         for row in historical_evidence:
-            if row.bucket_key != context.bucket_key or not row.strict_replay:
+            if not row.strict_replay:
                 continue
-            if row.pnl_dollars is not None or row.outcome in {"win", "loss", "settled"}:
-                episodes.add((row.market_ticker, row.local_market_day or market_day_from_ticker(row.market_ticker)))
-        return max(context.actual_sample_count, len(episodes))
+            row_bucket_key = _bucket_identity(row.bucket_key)
+            if bucket_key is not None and row_bucket_key != bucket_key:
+                continue
+            if row.pnl_dollars is None and row.outcome not in {"win", "loss", "settled"}:
+                continue
+            if _is_disqualified_fair_value_source(_historical_fair_value_source(row)):
+                continue
+            episode_key = (
+                row.market_ticker,
+                row.local_market_day or market_day_from_ticker(row.market_ticker),
+                row_bucket_key,
+            )
+            prior = historical_episodes.get(episode_key)
+            if prior is None or (_as_utc(row.observed_at) or datetime.min.replace(tzinfo=UTC)) >= (
+                _as_utc(prior.observed_at) or datetime.min.replace(tzinfo=UTC)
+            ):
+                historical_episodes[episode_key] = row
+
+        for row in historical_episodes.values():
+            shadow_weight += STRICT_REPLAY_SHADOW_WEIGHT
+            if row.pnl_dollars is not None:
+                weighted_values.append(Decimal(str(row.pnl_dollars)) * STRICT_REPLAY_SHADOW_WEIGHT)
+
+        weighted_count = live_weight + bootstrap_weight + shadow_weight
+        return BootstrapEvidenceStats(
+            bucket_key=bucket_key,
+            legacy_bucket_key=legacy_bucket_key,
+            raw_live_sample_count=live_count,
+            live_weighted_sample_count=live_weight,
+            bootstrap_weighted_sample_count=bootstrap_weight,
+            shadow_weighted_sample_count=shadow_weight,
+            weighted_sample_count=weighted_count,
+            weighted_net_pnl=sum(weighted_values, Decimal("0")) if weighted_values else None,
+        )
 
     def _tier_for(
         self,
-        sample_count: int,
+        sample_count: Decimal,
         policy: AgentPackWeatherBootstrapPolicy,
     ) -> tuple[str | None, AgentPackWeatherBootstrapTier | None]:
-        if sample_count >= 20:
+        if sample_count >= Decimal("20"):
             return "mature", None
         for name in ("cold", "warming", "maturing"):
             tier = policy.tiers.get(name)
             if tier is None:
                 continue
-            high = tier.max_samples if tier.max_samples is not None else 10**9
-            if int(tier.min_samples) <= sample_count <= int(high):
+            high = Decimal(str(tier.max_samples)) if tier.max_samples is not None else Decimal("1000000000")
+            if Decimal(str(tier.min_samples)) <= sample_count <= high:
                 return name, tier
         return None, None
 
@@ -559,10 +707,10 @@ class WeatherEmpiricalBootstrapService:
                 continue
             key = event.order_id or event.room_id or f"{event.market_ticker}:{event.bucket_key}"
             status = str(event.status or "").lower()
-            if status in BOOTSTRAP_SETTLED_STATUSES or status in BOOTSTRAP_TERMINAL_NON_POSITION_STATUSES or status.startswith("rejected_"):
+            if status in BOOTSTRAP_TERMINAL_NON_POSITION_STATUSES or status.startswith("rejected_"):
                 active_by_key.pop(key, None)
                 continue
-            if status not in BOOTSTRAP_ACTIVE_STATUSES:
+            if status not in BOOTSTRAP_ACTIVE_STATUSES and status not in BOOTSTRAP_SETTLED_STATUSES:
                 continue
             if event.notional_dollars is not None:
                 active_by_key[key] = Decimal(str(event.notional_dollars))
@@ -590,13 +738,36 @@ class WeatherEmpiricalBootstrapService:
         self,
         policy: AgentPackWeatherBootstrapPolicy,
         events: Iterable[WeatherBootstrapEventRecord],
+        *,
+        policy_pack_version: str | None = None,
     ) -> tuple[bool, str | None]:
+        state = dict(policy.kill_switch_state or {})
+        if state.get("active") or state.get("tripped"):
+            tripped_at = _as_utc(state.get("tripped_at"))
+            reset_at = _as_utc(state.get("operator_reset_at") or state.get("reset_at"))
+            state_policy_version = str(state.get("policy_pack_version") or "")
+            policy_version_changed = bool(policy_pack_version and state_policy_version and state_policy_version != policy_pack_version)
+            operator_reset = reset_at is not None and (tripped_at is None or reset_at >= tripped_at)
+            if not operator_reset and not policy_version_changed:
+                return True, str(state.get("reason") or "bootstrap_kill_switch_active")
+
         resolved = [
             event
             for event in events
             if event.pnl_dollars is not None or event.status in BOOTSTRAP_SETTLED_STATUSES
         ]
         resolved = sorted(resolved, key=lambda event: _as_utc(event.occurred_at) or datetime.min.replace(tzinfo=UTC), reverse=True)
+        consecutive_loss_threshold = max(1, int(getattr(policy.caps, "consecutive_loss_kill_switch_threshold", 3)))
+        consecutive_losses = 0
+        for event in resolved:
+            pnl = Decimal(str(event.pnl_dollars or "0"))
+            if pnl < Decimal("0") or str(event.status or "").lower() == "settled_loss":
+                consecutive_losses += 1
+                if consecutive_losses >= consecutive_loss_threshold:
+                    return True, "bootstrap_kill_switch_consecutive_losses"
+                continue
+            if pnl > Decimal("0") or str(event.status or "").lower() == "settled_win":
+                break
         recent = resolved[: max(1, int(policy.caps.kill_switch_lookback))]
         if len(recent) < int(policy.caps.kill_switch_min_rows):
             return False, None
@@ -615,16 +786,7 @@ class WeatherEmpiricalBootstrapService:
         events: Iterable[WeatherBootstrapEventRecord],
         historical_evidence: Iterable[WeatherBootstrapHistoricalEvidenceRecord],
     ) -> Decimal | None:
-        values: list[Decimal] = []
-        for event in events:
-            if event.bucket_key == context.bucket_key and event.pnl_dollars is not None:
-                values.append(Decimal(str(event.pnl_dollars)))
-        for row in historical_evidence:
-            if row.bucket_key == context.bucket_key and row.strict_replay and row.pnl_dollars is not None:
-                values.append(Decimal(str(row.pnl_dollars)) * Decimal(str(row.evidence_weight or 1.0)))
-        if not values:
-            return None
-        return sum(values, Decimal("0"))
+        return self._evidence_stats(context, events, historical_evidence).weighted_net_pnl
 
     def _threshold_payload(
         self,

@@ -519,6 +519,23 @@ async def test_nightly_auto_promotion_rejects_non_full_replay_provenance(tmp_pat
     assert result["trigger"]["source_provenance"]["disallowed_by_source_provenance"] == {
         "historical_replay_partial_checkpoint": 50
     }
+    assert result["trigger"]["source_provenance"]["disallowed_groups"] == [
+        {
+            "source_provenance": "historical_replay_partial_checkpoint",
+            "coverage_class": "partial_checkpoint_coverage",
+            "market_source_kind": "checkpoint_archive",
+            "weather_source_kind": "checkpoint_archive",
+            "rows": 50,
+        }
+    ]
+    assert result["trigger"]["source_provenance"]["top_disallowed_reasons"] == [
+        {
+            "checkpoint_label": "1300",
+            "reason": "coverage_gap:partial_checkpoint_coverage",
+            "rows": 50,
+        }
+    ]
+    assert "Backfill missing checkpoint archive rows" in result["trigger"]["source_provenance"]["next_actions"][0]
     assert (await harness.service.current(kalshi_env="demo"))["status"] == "missing"
 
 

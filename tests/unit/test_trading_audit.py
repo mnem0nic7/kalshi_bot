@@ -1293,6 +1293,146 @@ async def test_trading_audit_classifies_duplicate_suppressed_selected_signal_as_
 
 
 @pytest.mark.asyncio
+async def test_daily_gate_funnel_reports_multiple_failures_and_single_gate_counterfactuals(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        multi_room = _room("room-multi-gate", "KXHIGHNY-26APR24-T67")
+        single_room = _room("room-single-gate", "KXHIGHNY-26APR24-T68")
+        session.add_all([
+            multi_room,
+            single_room,
+            TradeTicketRecord(
+                id="ticket-multi-gate",
+                room_id=multi_room.id,
+                market_ticker=multi_room.market_ticker,
+                action="buy",
+                side="yes",
+                yes_price_dollars=Decimal("0.0500"),
+                count_fp=Decimal("1.00"),
+                time_in_force="immediate_or_cancel",
+                client_order_id="ticket-multi-gate-client",
+                status="blocked",
+                created_at=NOW - timedelta(minutes=3),
+                updated_at=NOW - timedelta(minutes=3),
+            ),
+            Signal(
+                room_id=multi_room.id,
+                market_ticker=multi_room.market_ticker,
+                fair_yes_dollars=Decimal("0.5000"),
+                edge_bps=100,
+                confidence=0.10,
+                summary="Multiple gate failures",
+                payload={
+                    "evaluation_outcome": "pre_risk_filtered",
+                    "stand_down_reason": "insufficient_forecast_separation",
+                    "forecast_delta_f": 1.0,
+                    "fair_value_source": "fallback",
+                    "empirical_gate": {"reason": "empirical_gate_under_sampled", "status": "blocked"},
+                    "candidate_trace": {
+                        "outcome": "candidate_selected",
+                        "selected_side": "yes",
+                        "min_contract_price_dollars": "0.2500",
+                        "spread_limit_bps": 250,
+                        "minimum_remaining_payout_bps": 1000,
+                        "weather_empirical_bootstrap": {
+                            "reason": "bootstrap_daily_notional_cap_reached",
+                            "reason_codes": ["daily_notional_cap"],
+                        },
+                        "yes": {
+                            "status": "skipped",
+                            "side": "yes",
+                            "reason": "below_min_contract_price",
+                            "traded_price_dollars": "0.0500",
+                            "edge_bps": 100,
+                            "quality_adjusted_edge_bps": 50,
+                            "spread_bps": 800,
+                            "remaining_payout_bps": 500,
+                        },
+                    },
+                },
+                created_at=NOW - timedelta(minutes=4),
+                updated_at=NOW - timedelta(minutes=4),
+            ),
+            Signal(
+                room_id=single_room.id,
+                market_ticker=single_room.market_ticker,
+                fair_yes_dollars=Decimal("0.5000"),
+                edge_bps=100,
+                confidence=0.95,
+                summary="Single gate failure",
+                payload={
+                    "evaluation_outcome": "pre_risk_filtered",
+                    "stand_down_reason": "no_actionable_edge",
+                    "candidate_trace": {
+                        "outcome": "candidate_selected",
+                        "selected_side": "yes",
+                        "yes": {
+                            "status": "skipped",
+                            "side": "yes",
+                            "reason": "below_min_edge",
+                            "traded_price_dollars": "0.5000",
+                            "edge_bps": 100,
+                        },
+                    },
+                },
+                created_at=NOW - timedelta(minutes=3),
+                updated_at=NOW - timedelta(minutes=3),
+            ),
+            RiskVerdictRecord(
+                room_id=multi_room.id,
+                ticket_id="ticket-multi-gate",
+                status="blocked",
+                reasons=["Position cap would be exceeded."],
+                payload={"reason_codes": ["position_cap"]},
+                created_at=NOW - timedelta(minutes=2),
+                updated_at=NOW - timedelta(minutes=2),
+            ),
+        ])
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=1,
+        now=NOW,
+    )
+
+    funnel = report["daily_funnel_report"]
+    current = {row["gate"]: row["count"] for row in funnel["current_policy_rejections"]}
+    counterfactual = {
+        row["relaxed_gate"]: row["would_pass_count"]
+        for row in funnel["counterfactual_single_gate_relaxations"]
+    }
+    assert set(funnel["required_gates"]) == {
+        "min_entry_price",
+        "forecast_separation",
+        "remaining_payout",
+        "quality_buffer",
+        "min_edge",
+        "max_spread",
+        "confidence",
+        "fair_value_source",
+        "empirical_gate",
+        "bootstrap_caps",
+        "kill_switch",
+        "risk_caps",
+    }
+    assert current["min_entry_price"] == 1
+    assert current["forecast_separation"] == 1
+    assert current["remaining_payout"] == 1
+    assert current["quality_buffer"] == 1
+    assert current["min_edge"] == 2
+    assert current["max_spread"] == 1
+    assert current["confidence"] == 1
+    assert current["fair_value_source"] == 1
+    assert current["empirical_gate"] == 1
+    assert current["bootstrap_caps"] == 1
+    assert current["risk_caps"] == 1
+    assert counterfactual["min_edge"] == 1
+    assert funnel["multi_gate_rejected_candidate_count"] == 1
+    assert report["ops_event_summary"]["event_kind"] == "daily_gate_funnel_summary"
+
+
+@pytest.mark.asyncio
 async def test_trading_audit_tracks_pre_room_liquidity_misses_separately_from_no_edge(audit_harness) -> None:
     settings, session_factory = audit_harness
     async with session_factory() as session:

@@ -37,6 +37,22 @@ from kalshi_bot.services.market_snapshot_archive import (
 from kalshi_bot.services.trade_behavior import bucket_dimensions_from_key, bucket_key_for_fill
 
 
+DAILY_FUNNEL_GATES = (
+    "min_entry_price",
+    "forecast_separation",
+    "remaining_payout",
+    "quality_buffer",
+    "min_edge",
+    "max_spread",
+    "confidence",
+    "fair_value_source",
+    "empirical_gate",
+    "bootstrap_caps",
+    "kill_switch",
+    "risk_caps",
+)
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -313,6 +329,12 @@ class TradingAuditService:
             decision_traces=decision_traces,
             now=now,
         )
+        daily_funnel = self._daily_gate_funnel(
+            signals=signals,
+            risk_verdicts=risk_verdicts,
+            decision_traces=decision_traces,
+            now=now,
+        )
         stop_loss = self._stop_loss_clusters(ops_events, now=now)
         risk = self._risk_summary(risk_verdicts)
         ops = self._ops_summary(ops_events)
@@ -350,6 +372,8 @@ class TradingAuditService:
             "attribution": attribution,
             "execution_funnel": funnel,
             "signal_funnel": signal_funnel,
+            "daily_funnel_report": daily_funnel,
+            "ops_event_summary": daily_funnel["ops_event_summary"],
             "stop_loss": stop_loss,
             "risk": risk,
             "ops": ops,
@@ -1737,6 +1761,265 @@ class TradingAuditService:
             "recent_selected_without_ticket": recent_selected_without_ticket,
         }
 
+    def _daily_gate_funnel(
+        self,
+        *,
+        signals: list[Signal],
+        risk_verdicts: list[RiskVerdictRecord],
+        decision_traces: list[DecisionTraceRecord],
+        now: datetime,
+    ) -> dict[str, Any]:
+        traces_by_room: dict[str, DecisionTraceRecord] = {}
+        for trace in decision_traces:
+            if trace.room_id is None:
+                continue
+            prior = traces_by_room.get(trace.room_id)
+            if prior is None or (_as_utc(trace.decision_time) or datetime.min.replace(tzinfo=UTC)) >= (
+                _as_utc(prior.decision_time) or datetime.min.replace(tzinfo=UTC)
+            ):
+                traces_by_room[trace.room_id] = trace
+        verdicts_by_room: dict[str, RiskVerdictRecord] = {}
+        for verdict in risk_verdicts:
+            prior = verdicts_by_room.get(verdict.room_id)
+            if prior is None or (_as_utc(verdict.created_at) or datetime.min.replace(tzinfo=UTC)) >= (
+                _as_utc(prior.created_at) or datetime.min.replace(tzinfo=UTC)
+            ):
+                verdicts_by_room[verdict.room_id] = verdict
+
+        gate_counts: Counter[str] = Counter()
+        gate_sets: Counter[tuple[str, ...]] = Counter()
+        candidate_rows: list[dict[str, Any]] = []
+        for signal in signals:
+            payload = dict(signal.payload or {})
+            eligibility = payload.get("eligibility") if isinstance(payload.get("eligibility"), dict) else {}
+            candidate_trace = dict(payload.get("candidate_trace") or {})
+            if not candidate_trace and isinstance(eligibility.get("candidate_trace"), dict):
+                candidate_trace = dict(eligibility.get("candidate_trace") or {})
+            trace_record = traces_by_room.get(signal.room_id)
+            trace_payload = dict(trace_record.trace or {}) if trace_record is not None else {}
+            risk_verdict = verdicts_by_room.get(signal.room_id)
+            failed = self._candidate_failed_gates(
+                signal=signal,
+                payload=payload,
+                eligibility=dict(eligibility),
+                candidate_trace=candidate_trace,
+                trace_payload=trace_payload,
+                risk_verdict=risk_verdict,
+            )
+            failed_tuple = tuple(sorted(failed))
+            gate_sets[failed_tuple] += 1
+            for gate in failed:
+                gate_counts[gate] += 1
+            if failed:
+                candidate_rows.append(
+                    {
+                        "room_id": signal.room_id,
+                        "market_ticker": signal.market_ticker,
+                        "failed_gates": list(failed_tuple),
+                        "primary_reason": self._primary_gate_reason(payload, eligibility, candidate_trace),
+                        "edge_bps": int(signal.edge_bps),
+                        "confidence": float(signal.confidence),
+                        "created_at": _iso(signal.created_at),
+                    }
+                )
+
+        current_rejections = [
+            {"gate": gate, "count": int(gate_counts.get(gate, 0))}
+            for gate in DAILY_FUNNEL_GATES
+        ]
+        single_relaxations = [
+            {
+                "relaxed_gate": gate,
+                "would_pass_count": int(gate_sets.get((gate,), 0)),
+            }
+            for gate in DAILY_FUNNEL_GATES
+        ]
+        rejected_count = sum(count for gates, count in gate_sets.items() if gates)
+        multi_gate_rejected_count = sum(count for gates, count in gate_sets.items() if len(gates) > 1)
+        summary = {
+            "event_kind": "daily_gate_funnel_summary",
+            "evaluated_at": now.isoformat(),
+            "candidate_count": len(signals),
+            "rejected_candidate_count": rejected_count,
+            "multi_gate_rejected_candidate_count": multi_gate_rejected_count,
+            "top_rejection_gates": [
+                {"gate": gate, "count": count}
+                for gate, count in gate_counts.most_common(10)
+            ],
+            "single_gate_relaxation_pass_count": sum(item["would_pass_count"] for item in single_relaxations),
+        }
+        return {
+            "window": "recent_audit_window",
+            "required_gates": list(DAILY_FUNNEL_GATES),
+            "candidate_count": len(signals),
+            "rejected_candidate_count": rejected_count,
+            "multi_gate_rejected_candidate_count": multi_gate_rejected_count,
+            "current_policy_rejections": current_rejections,
+            "counterfactual_single_gate_relaxations": single_relaxations,
+            "failure_set_counts": [
+                {"failed_gates": list(gates), "count": count}
+                for gates, count in sorted(gate_sets.items(), key=lambda item: (-item[1], item[0]))
+                if gates
+            ],
+            "top_candidates": sorted(
+                candidate_rows,
+                key=lambda row: (len(row["failed_gates"]), row["edge_bps"], row["created_at"] or ""),
+                reverse=True,
+            )[:20],
+            "ops_event_summary": summary,
+        }
+
+    def _candidate_failed_gates(
+        self,
+        *,
+        signal: Signal,
+        payload: dict[str, Any],
+        eligibility: dict[str, Any],
+        candidate_trace: dict[str, Any],
+        trace_payload: dict[str, Any],
+        risk_verdict: RiskVerdictRecord | None,
+    ) -> set[str]:
+        failed: set[str] = set()
+        selected = self._selected_candidate_trace(candidate_trace)
+        empirical = payload.get("empirical_gate")
+        if not isinstance(empirical, dict):
+            empirical = eligibility.get("empirical_gate") if isinstance(eligibility.get("empirical_gate"), dict) else {}
+        if not empirical and isinstance(candidate_trace.get("empirical_gate"), dict):
+            empirical = dict(candidate_trace.get("empirical_gate") or {})
+        bootstrap = candidate_trace.get("weather_empirical_bootstrap")
+        if not isinstance(bootstrap, dict):
+            bootstrap = {}
+
+        reason_values = [
+            payload.get("stand_down_reason"),
+            payload.get("final_stand_down_reason"),
+            eligibility.get("stand_down_reason"),
+            candidate_trace.get("eligibility_stand_down_reason"),
+            candidate_trace.get("baseline_block_reason"),
+            selected.get("reason"),
+            empirical.get("reason"),
+            bootstrap.get("reason"),
+        ]
+        for candidate in candidate_trace.get("candidates") or []:
+            if isinstance(candidate, dict):
+                reason_values.append(candidate.get("reason"))
+        for reason in reason_values:
+            gate = self._reason_to_funnel_gate(reason)
+            if gate:
+                failed.add(gate)
+
+        entry_price = _decimal_or_none(selected.get("traded_price_dollars") or selected.get("entry_price_dollars"))
+        min_entry_price = _decimal_or_none(
+            candidate_trace.get("min_contract_price_dollars") or self.settings.risk_min_contract_price_dollars
+        )
+        if entry_price is not None and min_entry_price is not None and entry_price < min_entry_price:
+            failed.add("min_entry_price")
+
+        edge = self._int_or_none(selected.get("edge_bps") or candidate_trace.get("selected_edge_bps") or signal.edge_bps)
+        if edge is not None and edge < int(self.settings.risk_min_edge_bps):
+            failed.add("min_edge")
+        quality_edge = self._int_or_none(
+            eligibility.get("edge_after_quality_buffer_bps") or selected.get("quality_adjusted_edge_bps")
+        )
+        if quality_edge is not None and quality_edge < int(self.settings.risk_min_edge_bps):
+            failed.add("quality_buffer")
+
+        spread = self._int_or_none(selected.get("spread_bps") or candidate_trace.get("spread_bps") or eligibility.get("market_spread_bps"))
+        spread_limit = self._int_or_none(candidate_trace.get("spread_limit_bps") or self.settings.trigger_max_spread_bps)
+        if spread is not None and spread_limit is not None and spread > spread_limit:
+            failed.add("max_spread")
+
+        confidence = float(signal.confidence)
+        if confidence < float(self.settings.risk_min_confidence):
+            failed.add("confidence")
+
+        forecast_delta = _decimal_or_none(payload.get("forecast_delta_f") or eligibility.get("forecast_delta_f"))
+        if forecast_delta is not None and abs(forecast_delta) < Decimal(str(self.settings.strategy_min_abs_delta_f)):
+            failed.add("forecast_separation")
+
+        remaining_payout = self._int_or_none(selected.get("remaining_payout_bps") or eligibility.get("remaining_payout_bps"))
+        minimum_payout = self._int_or_none(
+            candidate_trace.get("minimum_remaining_payout_bps") or self.settings.strategy_min_remaining_payout_bps
+        )
+        if remaining_payout is not None and minimum_payout is not None and remaining_payout < minimum_payout:
+            failed.add("remaining_payout")
+
+        fair_value_source = str(
+            payload.get("fair_value_source")
+            or eligibility.get("fair_value_source")
+            or candidate_trace.get("fair_value_source")
+            or selected.get("fair_value_source")
+            or ""
+        ).lower()
+        if fair_value_source in {"fallback", "unavailable", "dark", "none"}:
+            failed.add("fair_value_source")
+
+        empirical_reason = str(empirical.get("reason") or "")
+        empirical_status = str(empirical.get("status") or "")
+        if empirical_reason and empirical_reason != "empirical_gate_passed" and empirical_status != "allowed":
+            failed.add("empirical_gate")
+        bootstrap_reason = str(bootstrap.get("reason") or "")
+        bootstrap_codes = {str(code) for code in bootstrap.get("reason_codes") or []}
+        if "daily_notional_cap" in bootstrap_codes or "concurrent_position_cap" in bootstrap_codes or "cap_reached" in bootstrap_reason:
+            failed.add("bootstrap_caps")
+        if bootstrap.get("kill_switch_active") or "kill_switch" in bootstrap_reason or "kill_switch_active" in bootstrap_codes:
+            failed.add("kill_switch")
+
+        if risk_verdict is not None and str(risk_verdict.status or "").lower() == "blocked":
+            risk_text = " ".join([
+                *(risk_verdict.reasons or []),
+                *(getattr(risk_verdict, "reason_codes", None) or []),
+                json.dumps(risk_verdict.payload or {}, sort_keys=True, default=str),
+            ]).lower()
+            if "kill switch" in risk_text or "kill_switch" in risk_text:
+                failed.add("kill_switch")
+            if any(token in risk_text for token in ("cap", "max_order", "max position", "position limit", "exposure", "drawdown", "daily loss")):
+                failed.add("risk_caps")
+
+        return failed
+
+    @staticmethod
+    def _reason_to_funnel_gate(reason: Any) -> str | None:
+        text = str(reason or "").strip().lower()
+        if not text or text in {"eligible", "selected_best_quality_adjusted_edge", "empirical_gate_passed"}:
+            return None
+        mapping = {
+            "below_min_contract_price": "min_entry_price",
+            "contract_price_too_low": "min_entry_price",
+            "price_below_minimum_entry": "min_entry_price",
+            "insufficient_forecast_separation": "forecast_separation",
+            "forecast_too_close_to_threshold": "forecast_separation",
+            "insufficient_remaining_payout": "remaining_payout",
+            "below_min_remaining_payout": "remaining_payout",
+            "below_quality_adjusted_edge": "quality_buffer",
+            "below_min_edge": "min_edge",
+            "no_actionable_edge": "min_edge",
+            "spread_too_wide": "max_spread",
+            "confidence_too_low": "confidence",
+            "fair_value_source_disqualified": "fair_value_source",
+            "empirical_gate_block": "empirical_gate",
+            "empirical_gate_under_sampled": "empirical_gate",
+            "bootstrap_daily_notional_cap_reached": "bootstrap_caps",
+            "bootstrap_concurrent_position_cap_reached": "bootstrap_caps",
+            "bootstrap_kill_switch_active": "kill_switch",
+            "bootstrap_kill_switch_consecutive_losses": "kill_switch",
+        }
+        return mapping.get(text)
+
+    @staticmethod
+    def _primary_gate_reason(
+        payload: dict[str, Any],
+        eligibility: dict[str, Any],
+        candidate_trace: dict[str, Any],
+    ) -> str | None:
+        return (
+            payload.get("stand_down_reason")
+            or payload.get("final_stand_down_reason")
+            or eligibility.get("stand_down_reason")
+            or candidate_trace.get("eligibility_stand_down_reason")
+            or candidate_trace.get("baseline_block_reason")
+        )
+
     @staticmethod
     def _final_stand_down_reason(payload: dict[str, Any], trace: dict[str, Any]) -> str | None:
         candidate_trace = dict(payload.get("candidate_trace") or {})
@@ -2247,6 +2530,7 @@ def format_trading_audit_text(report: dict[str, Any]) -> str:
     stop_loss = report["stop_loss"]
     risk = report["risk"]
     trigger = report.get("trigger_diagnostics", {})
+    daily_funnel = report.get("daily_funnel_report", {})
     lifecycle = report.get("lifecycle", {})
     issues = report["issues"]
 
@@ -2267,6 +2551,11 @@ def format_trading_audit_text(report: dict[str, Any]) -> str:
             f"{trigger.get('pre_room_miss_count', 0)} "
             f"(one-sided book: {trigger.get('one_sided_book_count', 0)}, "
             f"wide spread: {trigger.get('wide_spread_count', 0)})"
+        ),
+        (
+            "Daily gate funnel: "
+            f"{daily_funnel.get('rejected_candidate_count', 0)}/{daily_funnel.get('candidate_count', 0)} rejected, "
+            f"{daily_funnel.get('multi_gate_rejected_candidate_count', 0)} multi-gate"
         ),
     ]
     if lifecycle.get("worst_buckets"):

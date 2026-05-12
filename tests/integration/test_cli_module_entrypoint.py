@@ -526,7 +526,7 @@ def test_parameter_pack_gate_cli_returns_success_for_passing_reports(tmp_path) -
                 "brier": 0.19,
                 "ece": 0.04,
                 "sharpe": 0.98,
-                "max_drawdown": 0.09,
+                "max_drawdown": 0.04,
                 "resolved_trades": 100,
                 "city_win_rates": {"NY": 0.56},
                 "hard_cap_touches": 0,
@@ -560,7 +560,7 @@ def test_parameter_pack_gate_cli_returns_success_for_passing_reports(tmp_path) -
     assert payload["passed"] is True
     assert payload["failures"] == []
     assert len(payload["hard_caps"]["config_hash"]) == 64
-    assert payload["hard_caps"]["max_drawdown_pct"] == 0.20
+    assert payload["hard_caps"]["max_drawdown_pct"] == 0.05
 
 
 def test_parameter_pack_gate_cli_uses_sealed_hard_drawdown_cap(tmp_path) -> None:
@@ -622,7 +622,7 @@ def test_parameter_pack_gate_cli_uses_sealed_hard_drawdown_cap(tmp_path) -> None
     assert result.returncode == 1
     payload = json.loads(result.stdout)
     assert payload["failures"] == ["drawdown_regression"]
-    assert payload["comparisons"]["max_drawdown"]["maximum"] == 0.20
+    assert payload["comparisons"]["max_drawdown"]["maximum"] == 0.05
 
 
 def test_parameter_pack_drift_cli_reports_pause_decision(tmp_path) -> None:
@@ -693,7 +693,7 @@ def test_parameter_pack_select_cli_outputs_first_passing_candidate(tmp_path) -> 
                             "brier": 0.19,
                             "ece": 0.04,
                             "sharpe": 1.0,
-                            "max_drawdown": 0.09,
+                            "max_drawdown": 0.04,
                             "resolved_trades": 100,
                             "city_win_rates": {"NY": 0.58},
                             "hard_cap_touches": 0,
@@ -707,7 +707,7 @@ def test_parameter_pack_select_cli_outputs_first_passing_candidate(tmp_path) -> 
                             "brier": 0.19,
                             "ece": 0.04,
                             "sharpe": 1.0,
-                            "max_drawdown": 0.09,
+                            "max_drawdown": 0.04,
                             "resolved_trades": 100,
                             "city_win_rates": {"NY": 0.58},
                             "hard_cap_touches": 0,
@@ -966,7 +966,7 @@ def test_parameter_pack_stage_cli_records_staged_candidate(tmp_path) -> None:
                 "brier": 0.19,
                 "ece": 0.04,
                 "sharpe": 1.0,
-                "max_drawdown": 0.08,
+                "max_drawdown": 0.04,
                 "resolved_trades": 100,
                 "hard_cap_touches": 0,
                 "pack_hash": candidate.pack_hash,

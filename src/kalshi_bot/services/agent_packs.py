@@ -709,6 +709,10 @@ class AgentPackService:
             kill_switch_min_rows=max(1, int(caps.kill_switch_min_rows)),
             kill_switch_min_win_rate=self._clamp_float(caps.kill_switch_min_win_rate, 0.0, 1.0),
             kill_switch_drawdown_usd=max(0.0, float(caps.kill_switch_drawdown_usd)),
+            consecutive_loss_kill_switch_threshold=max(
+                1,
+                int(getattr(caps, "consecutive_loss_kill_switch_threshold", 3)),
+            ),
         )
         return policy.model_copy(
             deep=True,

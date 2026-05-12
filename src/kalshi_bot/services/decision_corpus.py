@@ -69,6 +69,29 @@ def _avg_float(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 2) if values else None
 
 
+def _source_provenance_next_actions(action_codes: set[str]) -> list[str]:
+    actions: list[str] = []
+    if "backfill_checkpoint_archive" in action_codes:
+        actions.append(
+            "Backfill missing checkpoint archive rows; partial/outcome-only rows remain blocked from auto-promotion."
+        )
+    if "fix_asof_alignment" in action_codes:
+        actions.append(
+            "Repair checkpoint as-of alignment so source_asof_ts is not later than the replay checkpoint."
+        )
+    if "restore_on_time_checkpoints" in action_codes:
+        actions.append(
+            "Restore on-time checkpoint snapshots; late-only replay rows are intentionally not promoted."
+        )
+    if "keep_degraded_evidence_descriptive" in action_codes:
+        actions.append(
+            "Keep external-repair rows as descriptive calibration evidence; promote only full checkpoint rows."
+        )
+    if "review_source_provenance" in action_codes:
+        actions.append("Review unknown source provenance before adding any promotion path.")
+    return actions
+
+
 def _as_datetime(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
@@ -655,6 +678,9 @@ class DecisionCorpusService:
                 "disallowed_rows": 0,
                 "by_source_provenance": {},
                 "disallowed_by_source_provenance": {},
+                "disallowed_groups": [],
+                "top_disallowed_reasons": [],
+                "next_actions": [],
                 "not_evaluated": True,
             }
         checks = {
@@ -749,8 +775,39 @@ class DecisionCorpusService:
     ) -> dict[str, Any]:
         rows = await self._build_candidate_rows(date_from=date_from, date_to=date_to, kalshi_env=kalshi_env)
         by_source: dict[str, int] = defaultdict(int)
+        disallowed_groups: dict[tuple[str, str, str, str], int] = defaultdict(int)
+        disallowed_reasons: dict[tuple[str, str], int] = defaultdict(int)
+        action_codes: set[str] = set()
         for row in rows:
-            by_source[str(row.get("source_provenance") or "unknown")] += 1
+            source = str(row.get("source_provenance") or "unknown")
+            by_source[source] += 1
+            if source in AUTO_PROMOTION_ALLOWED_SOURCE_PROVENANCE:
+                continue
+            details = row.get("source_details") if isinstance(row.get("source_details"), dict) else {}
+            diagnostics = row.get("diagnostics") if isinstance(row.get("diagnostics"), dict) else {}
+            coverage_class = str(details.get("coverage_class") or "unknown")
+            market_source_kind = str(details.get("market_source_kind") or "unknown")
+            weather_source_kind = str(details.get("weather_source_kind") or "unknown")
+            disallowed_groups[(source, coverage_class, market_source_kind, weather_source_kind)] += 1
+            checkpoint_label = str(details.get("checkpoint_label") or diagnostics.get("checkpoint_label") or "unknown_checkpoint")
+            checkpoint_ts = _as_datetime(row.get("checkpoint_ts"))
+            source_asof_ts = _as_datetime(row.get("source_asof_ts"))
+            if checkpoint_ts is not None and source_asof_ts is not None and source_asof_ts > checkpoint_ts:
+                reason = "source_asof_after_checkpoint"
+                action_codes.add("fix_asof_alignment")
+            elif coverage_class in {"partial_checkpoint_coverage", "outcome_only_coverage", "no_replayable_coverage", "unknown"}:
+                reason = f"coverage_gap:{coverage_class}"
+                action_codes.add("backfill_checkpoint_archive")
+            elif source == "historical_replay_late_only":
+                reason = "late_only_checkpoint"
+                action_codes.add("restore_on_time_checkpoints")
+            elif source == "historical_replay_external_forecast_repair":
+                reason = "external_forecast_repair_disallowed"
+                action_codes.add("keep_degraded_evidence_descriptive")
+            else:
+                reason = f"source_provenance_disallowed:{source}"
+                action_codes.add("review_source_provenance")
+            disallowed_reasons[(checkpoint_label, reason)] += 1
         disallowed = {
             source: count
             for source, count in sorted(by_source.items())
@@ -765,6 +822,31 @@ class DecisionCorpusService:
             "disallowed_rows": sum(disallowed.values()),
             "by_source_provenance": dict(sorted(by_source.items())),
             "disallowed_by_source_provenance": disallowed,
+            "disallowed_groups": [
+                {
+                    "source_provenance": source,
+                    "coverage_class": coverage,
+                    "market_source_kind": market_kind,
+                    "weather_source_kind": weather_kind,
+                    "rows": count,
+                }
+                for (source, coverage, market_kind, weather_kind), count in sorted(
+                    disallowed_groups.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            ],
+            "top_disallowed_reasons": [
+                {
+                    "checkpoint_label": checkpoint,
+                    "reason": reason,
+                    "rows": count,
+                }
+                for (checkpoint, reason), count in sorted(
+                    disallowed_reasons.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:10]
+            ],
+            "next_actions": _source_provenance_next_actions(action_codes),
         }
 
     async def _log_auto_promotion_event(self, *, severity: str, summary: str, payload: dict[str, Any]) -> None:

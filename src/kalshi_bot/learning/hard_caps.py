@@ -80,6 +80,10 @@ def validate_hard_caps(caps: HardCaps) -> None:
             raise ValueError(f"hard cap {name} must be numeric or null")
         if float(value) < 0:
             raise ValueError(f"hard cap {name} must be non-negative")
+    max_order_count = caps.hard_caps.get("max_order_count_fp")
+    max_position_count = caps.hard_caps.get("max_position_count_fp_per_ticker")
+    if max_order_count is not None and max_position_count is not None and float(max_order_count) > float(max_position_count):
+        raise ValueError("hard cap max_order_count_fp must be <= max_position_count_fp_per_ticker")
 
 
 def hard_caps_hash(caps: HardCaps) -> str:

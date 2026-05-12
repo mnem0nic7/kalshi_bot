@@ -358,7 +358,10 @@ def _fast_room(*, room_id: str = "fast-room", shadow_mode: bool = True) -> Room:
 
 @pytest.mark.asyncio
 async def test_trade_behavior_fast_validation_uses_indexed_rows_without_slow_services(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast.db",
+        trade_behavior_production_entry_freeze_enabled=True,
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)
@@ -409,7 +412,10 @@ async def test_trade_behavior_fast_validation_uses_indexed_rows_without_slow_ser
 
 @pytest.mark.asyncio
 async def test_trade_behavior_fast_validation_fails_live_buy_bypass_during_freeze(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-bypass.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-bypass.db",
+        trade_behavior_production_entry_freeze_enabled=True,
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)
@@ -458,7 +464,10 @@ async def test_trade_behavior_fast_validation_fails_live_buy_bypass_during_freez
 
 @pytest.mark.asyncio
 async def test_trade_behavior_fast_validation_fails_failed_orders_critical_ops_and_stale_reconcile(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-failures.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-failures.db",
+        trade_behavior_production_entry_freeze_enabled=True,
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)
@@ -518,7 +527,10 @@ async def test_trade_behavior_fast_validation_fails_failed_orders_critical_ops_a
 
 @pytest.mark.asyncio
 async def test_trade_behavior_fast_validation_warns_on_stale_ops_noise(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-warn.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-warn.db",
+        trade_behavior_production_entry_freeze_enabled=True,
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)
@@ -563,7 +575,10 @@ async def test_trade_behavior_fast_validation_warns_on_stale_ops_noise(tmp_path)
 
 @pytest.mark.asyncio
 async def test_trade_behavior_fast_validation_ignores_known_benign_ops_noise(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-benign.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-fast-benign.db",
+        trade_behavior_production_entry_freeze_enabled=True,
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)
@@ -679,7 +694,10 @@ async def test_trade_behavior_fast_validation_ignores_known_benign_ops_noise(tmp
 
 @pytest.mark.asyncio
 async def test_trade_behavior_validation_aggregates_runtime_audit_analysis_and_freeze(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation.db",
+        trade_behavior_production_entry_freeze_enabled=True,
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)
@@ -712,7 +730,10 @@ async def test_trade_behavior_validation_aggregates_runtime_audit_analysis_and_f
 
 @pytest.mark.asyncio
 async def test_trade_behavior_validation_does_not_fail_unobserved_production_runtime(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation-runtime.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation-runtime.db",
+        trade_behavior_production_entry_freeze_enabled=True,
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)
@@ -744,7 +765,10 @@ async def test_trade_behavior_validation_does_not_fail_unobserved_production_run
 
 @pytest.mark.asyncio
 async def test_trade_behavior_validation_treats_legacy_explained_exclusions_as_coverage_debt(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation-legacy.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/trade-behavior-validation-legacy.db",
+        trade_behavior_production_entry_freeze_enabled=True,
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)

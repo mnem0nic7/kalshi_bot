@@ -15,6 +15,9 @@ from kalshi_bot.db.models import FillRecord, OrderRecord
 from kalshi_bot.services.agent_packs import RuntimeThresholds
 
 
+EMPIRICAL_BUCKET_VERSION = "empirical_bucket_v2"
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -94,6 +97,62 @@ def confidence_bucket(value: Any) -> str:
     return "high"
 
 
+def _confidence_bucket_score(value: Any) -> float | None:
+    bucket = confidence_bucket(value)
+    if bucket == "high":
+        return 0.85
+    if bucket == "medium":
+        return 0.65
+    if bucket == "low":
+        return 0.40
+    return None
+
+
+def _price_from_band(value: str | None) -> Decimal | None:
+    text = str(value or "").strip().lower()
+    if not text or text == "unknown" or not text.endswith("c") or "-" not in text:
+        return None
+    lower, _, upper = text[:-1].partition("-")
+    try:
+        midpoint_cents = (Decimal(lower) + Decimal(upper)) / Decimal("2")
+    except Exception:
+        return None
+    return midpoint_cents / Decimal("100")
+
+
+def trade_quality_bucket(
+    *,
+    entry_price_dollars: Any = None,
+    entry_price_band: str | None = None,
+    confidence: Any = None,
+    confidence_band: Any = None,
+) -> str:
+    """Coarse empirical quality bucket combining price support and confidence."""
+    price: Decimal | None
+    try:
+        price = Decimal(str(entry_price_dollars)) if entry_price_dollars not in (None, "") else None
+    except Exception:
+        price = None
+    if price is None:
+        price = _price_from_band(entry_price_band)
+
+    confidence_value: float | None
+    try:
+        confidence_value = float(confidence) if confidence not in (None, "") else None
+    except (TypeError, ValueError):
+        confidence_value = None
+    if confidence_value is None:
+        confidence_value = _confidence_bucket_score(confidence_band)
+
+    if price is None or confidence_value is None:
+        return "low"
+    if price < Decimal("0.10") or confidence_value < 0.60:
+        return "low"
+    if price >= Decimal("0.25") and confidence_value >= 0.75:
+        return "high"
+    return "medium"
+
+
 def spread_band(value: Any) -> str:
     if value in (None, ""):
         return "unknown"
@@ -108,6 +167,58 @@ def spread_band(value: Any) -> str:
     if spread < 500:
         return "250-499bps"
     return "500bps+"
+
+
+def coarse_empirical_bucket_key(
+    *,
+    market_ticker: str | None,
+    side: str | None,
+    strategy_code: str | None,
+    yes_price_dollars: Any = None,
+    forecast_delta_f: Any = None,
+    confidence: Any = None,
+    confidence_band: Any = None,
+) -> str:
+    series = series_from_ticker(market_ticker)
+    station = station_from_series(series) or "unknown"
+    strategy = strategy_code or "<unknown>"
+    side_value = side if side in {"yes", "no"} else "unknown"
+    entry_price = side_price_from_yes_price(side, yes_price_dollars)
+    quality = trade_quality_bucket(
+        entry_price_dollars=entry_price,
+        confidence=confidence,
+        confidence_band=confidence_band,
+    )
+    return "|".join([
+        series or "unknown",
+        station,
+        side_value,
+        strategy,
+        f"delta:{forecast_delta_band(forecast_delta_f)}",
+        f"quality:{quality}",
+    ])
+
+
+def coarse_empirical_bucket_key_from_legacy(value: str | None) -> str | None:
+    if value in (None, ""):
+        return None
+    parts = str(value).split("|")
+    if len(parts) >= 6 and parts[4].startswith("delta:") and parts[5].startswith(("quality:", "trade_quality:")):
+        return str(value)
+    dimensions = bucket_dimensions_from_key(value)
+    delta_band = dimensions["forecast_delta_band"]
+    quality = trade_quality_bucket(
+        entry_price_band=dimensions["entry_price_band"],
+        confidence_band=dimensions["confidence_band"],
+    )
+    return "|".join([
+        dimensions["series_ticker"],
+        dimensions["station"],
+        dimensions["side"],
+        dimensions["strategy_code"],
+        f"delta:{delta_band}",
+        f"quality:{quality}",
+    ])
 
 
 def bucket_key(
@@ -191,8 +302,18 @@ def trade_behavior_context_payload(
     delta_band = forecast_delta_band(forecast_delta_f)
     confidence = confidence_bucket(confidence_band)
     spread = spread_band(spread_bps)
+    coarse_key = coarse_empirical_bucket_key(
+        market_ticker=market_ticker,
+        side=side,
+        strategy_code=strategy_code,
+        yes_price_dollars=yes_price_dollars,
+        forecast_delta_f=forecast_delta_f,
+        confidence_band=confidence_band,
+    )
     return {
-        "bucket_key": bucket_key(
+        "bucket_key": coarse_key,
+        "coarse_bucket_key": coarse_key,
+        "legacy_bucket_key": bucket_key(
             market_ticker=market_ticker,
             side=side,
             strategy_code=strategy_code,
@@ -203,6 +324,7 @@ def trade_behavior_context_payload(
             spread_bps=spread_bps,
             include_context_bands=True,
         ),
+        "bucket_key_version": EMPIRICAL_BUCKET_VERSION,
         "series_ticker": series_from_ticker(market_ticker),
         "station": station_from_series(series_from_ticker(market_ticker)) or "unknown",
         "side": side if side in {"yes", "no"} else "unknown",
@@ -228,6 +350,14 @@ def _context_from_raw(raw: Any) -> dict[str, Any]:
 
 def bucket_key_for_fill(fill: FillRecord, order: OrderRecord | None = None) -> str:
     context = _context_from_raw(fill.raw) or _context_from_raw(order.raw if order is not None else None)
+    legacy_key = context.get("legacy_bucket_key")
+    if legacy_key:
+        return str(legacy_key)
+    bucket_key_value = context.get("bucket_key")
+    if bucket_key_value:
+        parts = str(bucket_key_value).split("|")
+        if not (len(parts) >= 6 and parts[4].startswith("delta:") and parts[5].startswith(("quality:", "trade_quality:"))):
+            return str(bucket_key_value)
     return bucket_key(
         market_ticker=fill.market_ticker,
         side=fill.side,
@@ -238,6 +368,26 @@ def bucket_key_for_fill(fill: FillRecord, order: OrderRecord | None = None) -> s
         confidence_band=context.get("confidence_band"),
         spread_bps=context.get("market_spread_bps"),
         include_context_bands=True,
+    )
+
+
+def coarse_bucket_key_for_fill(fill: FillRecord, order: OrderRecord | None = None) -> str:
+    context = _context_from_raw(fill.raw) or _context_from_raw(order.raw if order is not None else None)
+    coarse_key = context.get("coarse_bucket_key")
+    if coarse_key:
+        return str(coarse_key)
+    legacy_key = context.get("legacy_bucket_key") or context.get("bucket_key")
+    if legacy_key:
+        coarse_from_legacy = coarse_empirical_bucket_key_from_legacy(str(legacy_key))
+        if coarse_from_legacy:
+            return coarse_from_legacy
+    return coarse_empirical_bucket_key(
+        market_ticker=fill.market_ticker,
+        side=fill.side,
+        strategy_code=fill.strategy_code,
+        yes_price_dollars=fill.yes_price_dollars,
+        forecast_delta_f=context.get("forecast_delta_f"),
+        confidence_band=context.get("confidence_band"),
     )
 
 
@@ -275,12 +425,17 @@ class EmpiricalGateDecision:
     actual_win_rate: float | None
     counterfactual_sample_count: int = 0
     blocks_live_entries: bool = False
+    bucket_key_version: str = EMPIRICAL_BUCKET_VERSION
+    legacy_bucket_key: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
             "status": self.status,
             "reason": self.reason,
             "bucket_key": self.bucket_key,
+            "coarse_bucket_key": self.bucket_key,
+            "legacy_bucket_key": self.legacy_bucket_key,
+            "bucket_key_version": self.bucket_key_version,
             "actual_sample_count": self.actual_sample_count,
             "actual_net_pnl": (
                 str(self.actual_net_pnl.quantize(Decimal("0.0001")))
@@ -355,7 +510,7 @@ async def evaluate_empirical_gate(
     spread_bps: Any = None,
     now: datetime | None = None,
 ) -> EmpiricalGateDecision:
-    gate_bucket_key = bucket_key(
+    legacy_bucket_key = bucket_key(
         market_ticker=market_ticker,
         side=side,
         strategy_code=strategy_code,
@@ -366,6 +521,14 @@ async def evaluate_empirical_gate(
         spread_bps=spread_bps,
         include_context_bands=True,
     )
+    gate_bucket_key = coarse_empirical_bucket_key(
+        market_ticker=market_ticker,
+        side=side,
+        strategy_code=strategy_code,
+        yes_price_dollars=yes_price_dollars,
+        forecast_delta_f=forecast_delta_f,
+        confidence_band=confidence_band,
+    )
     if not settings.trade_behavior_empirical_gate_enabled:
         return EmpiricalGateDecision(
             status="disabled",
@@ -374,6 +537,7 @@ async def evaluate_empirical_gate(
             actual_sample_count=0,
             actual_net_pnl=None,
             actual_win_rate=None,
+            legacy_bucket_key=legacy_bucket_key,
         )
     if action != "buy" or side not in {"yes", "no"}:
         return EmpiricalGateDecision(
@@ -383,6 +547,7 @@ async def evaluate_empirical_gate(
             actual_sample_count=0,
             actual_net_pnl=None,
             actual_win_rate=None,
+            legacy_bucket_key=legacy_bucket_key,
         )
 
     now_utc = _as_utc(now) or datetime.now(UTC)
@@ -412,7 +577,7 @@ async def evaluate_empirical_gate(
     fills = [
         fill
         for fill in candidate_fills
-        if bucket_key_for_fill(fill, orders_by_id.get(str(fill.order_id))) == gate_bucket_key
+        if coarse_bucket_key_for_fill(fill, orders_by_id.get(str(fill.order_id))) == gate_bucket_key
     ]
 
     sample_count = len(fills)
@@ -448,6 +613,7 @@ async def evaluate_empirical_gate(
             actual_net_pnl=net,
             actual_win_rate=win_rate,
             blocks_live_entries=True,
+            legacy_bucket_key=legacy_bucket_key,
         )
     if passes:
         return EmpiricalGateDecision(
@@ -457,6 +623,7 @@ async def evaluate_empirical_gate(
             actual_sample_count=sample_count,
             actual_net_pnl=net,
             actual_win_rate=win_rate,
+            legacy_bucket_key=legacy_bucket_key,
         )
     return EmpiricalGateDecision(
         status="blocked" if production_live_entry else "shadow_only",
@@ -466,6 +633,7 @@ async def evaluate_empirical_gate(
         actual_net_pnl=net,
         actual_win_rate=win_rate,
         blocks_live_entries=production_live_entry,
+        legacy_bucket_key=legacy_bucket_key,
     )
 
 

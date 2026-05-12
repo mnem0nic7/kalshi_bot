@@ -418,6 +418,7 @@ class AgentPackWeatherBootstrapCaps(BaseModel):
     kill_switch_min_rows: int = 5
     kill_switch_min_win_rate: float = 0.30
     kill_switch_drawdown_usd: float = 100.0
+    consecutive_loss_kill_switch_threshold: int = 3
 
 
 class AgentPackWeatherBootstrapGridEnvelope(BaseModel):

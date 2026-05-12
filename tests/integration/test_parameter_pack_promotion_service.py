@@ -13,7 +13,7 @@ from kalshi_bot.learning.parameter_pack import default_parameter_pack
 from kalshi_bot.services.parameter_packs import ParameterPackPromotionService
 
 
-def _holdout_report(pack_hash: str, *, max_drawdown: float = 0.08) -> dict:
+def _holdout_report(pack_hash: str, *, max_drawdown: float = 0.04) -> dict:
     return {
         "coverage": 0.98,
         "brier": 0.19,
@@ -62,7 +62,7 @@ async def test_parameter_pack_stage_records_gate_evidence_without_changing_activ
     assert control.active_color == "blue"
     assert control.notes["parameter_packs"]["candidate_version"] == candidate.version
     assert control.notes["parameter_packs"]["target_color"] == "green"
-    assert control.notes["parameter_packs"]["hard_caps"]["max_drawdown_pct"] == 0.20
+    assert control.notes["parameter_packs"]["hard_caps"]["max_drawdown_pct"] == 0.05
     assert promotion is not None
     assert promotion.payload["kind"] == "parameter_pack"
     assert promotion.payload["gate"]["passed"] is True
@@ -167,7 +167,7 @@ async def test_parameter_pack_canary_passes_without_activating_candidate(tmp_pat
         staged = await service.stage_candidate(
             repo,
             candidate_pack=candidate,
-            candidate_report=_holdout_report(candidate.pack_hash, max_drawdown=0.10),
+            candidate_report=_holdout_report(candidate.pack_hash, max_drawdown=0.04),
             current_report=_holdout_report(current.pack_hash, max_drawdown=0.10),
             hard_caps=load_hard_caps(),
         )
@@ -249,7 +249,7 @@ async def test_parameter_pack_canary_failure_rolls_back_candidate(tmp_path) -> N
         staged = await service.stage_candidate(
             repo,
             candidate_pack=candidate,
-            candidate_report=_holdout_report(candidate.pack_hash, max_drawdown=0.10),
+            candidate_report=_holdout_report(candidate.pack_hash, max_drawdown=0.04),
             current_report=_holdout_report(current.pack_hash, max_drawdown=0.10),
             hard_caps=load_hard_caps(),
         )
