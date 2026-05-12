@@ -2663,6 +2663,8 @@ def _crypto_policy_values(policy: RuntimeCryptoPolicy) -> dict[str, Any]:
             "max_hard_cap_breaches": policy.replay_max_hard_cap_breaches,
             "min_spot_coverage_pct": policy.replay_min_spot_coverage_pct,
             "require_calibration_better_than_mid": policy.replay_require_calibration_better_than_mid,
+            "require_pnl_beats_market_mid": policy.replay_require_pnl_beats_market_mid,
+            "min_pnl_advantage_dollars": policy.replay_min_pnl_advantage_dollars,
         },
         "live": {
             "trading_enabled": policy.trading_enabled,
@@ -3461,6 +3463,8 @@ def _crypto_policy_with_asset_entry(
         replay_max_hard_cap_breaches=crypto_policy.replay_max_hard_cap_breaches,
         replay_min_spot_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
         replay_require_calibration_better_than_mid=crypto_policy.replay_require_calibration_better_than_mid,
+        replay_require_pnl_beats_market_mid=crypto_policy.replay_require_pnl_beats_market_mid,
+        replay_min_pnl_advantage_dollars=crypto_policy.replay_min_pnl_advantage_dollars,
         trading_enabled=crypto_policy.trading_enabled,
         production_autonomy_enabled=crypto_policy.production_autonomy_enabled,
         asset_modes=dict(crypto_policy.asset_modes),

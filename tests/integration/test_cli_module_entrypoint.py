@@ -132,7 +132,7 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     status_args = parser.parse_args(["crypto-status", "--kalshi-env", "production"])
     autonomy_args = parser.parse_args(["crypto-autonomy", "run-once", "--kalshi-env", "production", "--frequency", "15m", "--json"])
     live_path_status_args = parser.parse_args(
-        ["crypto-live-path", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "ETH", "--json"]
+        ["crypto-live-path", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "ETH", "--baselines", "--json"]
     )
     live_path_refresh_args = parser.parse_args(
         [
@@ -150,9 +150,15 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
             "30",
             "--assets",
             "XRP",
+            "--until-ready",
+            "--max-iterations",
+            "3",
+            "--sleep-seconds",
+            "0",
             "--json",
         ]
     )
+    funnel_args = parser.parse_args(["funnel-report", "--kalshi-env", "production", "--domain", "crypto", "--assets", "BTC", "--json"])
     model_quality_args = parser.parse_args(
         ["model-quality", "status", "--kalshi-env", "demo", "--domain", "all", "--json"]
     )
@@ -179,11 +185,17 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert live_path_status_args.command == "crypto-live-path"
     assert live_path_status_args.crypto_live_path_command == "status"
     assert live_path_status_args.assets == ["BTC", "ETH"]
+    assert live_path_status_args.baselines is True
     assert live_path_refresh_args.crypto_live_path_command == "refresh"
     assert live_path_refresh_args.history_days == 2
     assert live_path_refresh_args.spot_days == 2
     assert live_path_refresh_args.replay_days == 30
     assert live_path_refresh_args.assets == ["XRP"]
+    assert live_path_refresh_args.until_ready is True
+    assert live_path_refresh_args.max_iterations == 3
+    assert funnel_args.command == "funnel-report"
+    assert funnel_args.domain == "crypto"
+    assert funnel_args.assets == ["BTC"]
     assert model_quality_args.command == "model-quality"
     assert model_quality_args.model_quality_command == "status"
     assert model_quality_args.kalshi_env == "demo"
@@ -252,6 +264,45 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
         "replay_run",
         "replay_gate",
     ]
+
+
+@pytest.mark.asyncio
+async def test_funnel_report_crypto_outputs_json(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    async def fake_status_payload(args: SimpleNamespace, container: SimpleNamespace) -> dict[str, object]:
+        del args, container
+        return {
+            "status": "collecting",
+            "summary": {"ready_count": 0},
+            "asset_reports": [
+                {
+                    "asset": "BTC",
+                    "mode": "shadow",
+                    "ready_for_live_mode": False,
+                    "blockers": ["spot data stale"],
+                    "quote_evidence": {},
+                    "replay": {},
+                    "spot": {},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(cli_module, "_crypto_live_path_status_payload", fake_status_payload)
+    args = SimpleNamespace(
+        domain="crypto",
+        kalshi_env="production",
+        days=7,
+        frequency="15m",
+        assets=["BTC"],
+        json=True,
+    )
+
+    exit_code = await cli_module._run_funnel_report_command(args, SimpleNamespace())
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert output["schema_version"] == "funnel-report-v1"
+    assert output["domain"] == "crypto"
+    assert output["gate_counts"] == [{"gate": "spot data stale", "count": 1}]
 
 
 def test_python_module_cli_exposes_weather_prediction_commands() -> None:

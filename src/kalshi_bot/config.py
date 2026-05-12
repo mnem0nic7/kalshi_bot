@@ -161,7 +161,9 @@ class Settings(BaseSettings):
     crypto_replay_min_trade_candidates: int = 50
     crypto_replay_min_net_pl_dollars: float = 0.0
     crypto_replay_max_hard_cap_breaches: int = 0
-    crypto_replay_require_calibration_better_than_mid: bool = True
+    crypto_replay_require_calibration_better_than_mid: bool = False
+    crypto_replay_require_pnl_beats_market_mid: bool = True
+    crypto_replay_min_pnl_advantage_dollars: float = 0.0
     crypto_default_order_count_fp: float = 1.0
     crypto_history_auto_enabled: bool = True
     crypto_history_auto_interval_seconds: int = 3600
@@ -169,6 +171,8 @@ class Settings(BaseSettings):
     crypto_quote_evidence_enabled: bool = True
     crypto_quote_evidence_interval_seconds: int = 60
     crypto_spot_request_timeout_seconds: float = 30.0
+    crypto_spot_coinbase_max_stale_seconds: int = 5
+    crypto_spot_coingecko_max_stale_seconds: int = 90
     crypto_spot_history_auto_enabled: bool = True
     crypto_spot_history_auto_lookback_days: int = 2
     crypto_replay_min_spot_coverage_pct: float = 0.80

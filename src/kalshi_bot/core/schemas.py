@@ -533,6 +533,8 @@ class AgentPackCryptoReplayPolicy(BaseModel):
     max_hard_cap_breaches: int | None = None
     min_spot_coverage_pct: float | None = None
     require_calibration_better_than_mid: bool | None = None
+    require_pnl_beats_market_mid: bool | None = None
+    min_pnl_advantage_dollars: float | None = None
 
 
 class AgentPackCryptoLivePolicy(BaseModel):

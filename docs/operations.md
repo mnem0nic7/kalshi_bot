@@ -74,6 +74,7 @@ kalshi-bot-cli crypto-live-path status \
   --kalshi-env production \
   --frequency 15m \
   --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --baselines \
   --json
 ```
 
@@ -92,7 +93,11 @@ scripts/crypto_live_path_refresh.sh \
 
 The script runs one CLI process per asset so model and replay memory is released between assets. On the host, set `POSTGRES_PORT=5433` for production because demo uses the default `5432` mapping. It writes per-asset JSON reports and stderr logs under `reports/crypto_live_path/`.
 
-Per asset readiness requires at least 60 strict labeled real-quote rows, at least 50 replay trade candidates, a passing replay gate, positive simulated net P/L, calibration that beats the market-mid baseline, at least 80% spot coverage, and fresh spot data. Keep BNB and HYPE shadow until their Coingecko proxy spot data is fresh and stable.
+Per asset readiness requires at least 60 strict labeled real-quote rows, at least 50 replay trade candidates, a passing replay gate, positive fee-adjusted simulated net P/L that beats the market-mid P/L baseline, at least 80% spot coverage, and fresh non-proxy spot data. Calibration versus market-mid remains a diagnostic, not a hard promotion gate. Keep BNB and HYPE shadow until their spot support is fresh and non-proxy.
+
+Use `crypto-live-path status --baselines --json` to inspect model P/L against
+market-mid, always-0.5, last-direction, naive-momentum, linear-on-returns, and
+the current heuristic.
 
 After an asset passes, promote one asset at a time:
 

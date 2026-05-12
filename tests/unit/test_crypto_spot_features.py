@@ -142,11 +142,11 @@ def test_decision_rows_join_only_prior_spot_candles() -> None:
         quote_currency="USD",
         frequency="15m",
         interval_seconds=900,
-        start_ts=decision_ts - timedelta(minutes=30),
-        end_ts=decision_ts - timedelta(minutes=15),
+        start_ts=decision_ts - timedelta(minutes=15),
+        end_ts=decision_ts,
         close_dollars=Decimal("99.00000000"),
         source_kind="spot_ohlc",
-        observed_at=decision_ts - timedelta(minutes=15),
+        observed_at=decision_ts,
         payload={},
     )
     future_spot = CryptoSpotOHLCRecord(
@@ -189,7 +189,7 @@ async def test_crypto_spot_service_status_reports_coverage(tmp_path) -> None:
             frequency="15m",
             interval_seconds=900,
             start_ts=now - timedelta(minutes=15),
-            end_ts=now - timedelta(minutes=1),
+            end_ts=now,
             close_dollars=Decimal("100.00000000"),
             observed_at=now,
             source_kind="spot_ohlc",

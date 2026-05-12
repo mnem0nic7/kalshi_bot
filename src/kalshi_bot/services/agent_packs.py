@@ -62,6 +62,8 @@ class RuntimeCryptoPolicy:
     replay_max_hard_cap_breaches: int
     replay_min_spot_coverage_pct: float
     replay_require_calibration_better_than_mid: bool
+    replay_require_pnl_beats_market_mid: bool
+    replay_min_pnl_advantage_dollars: float
     trading_enabled: bool
     production_autonomy_enabled: bool
     asset_modes: dict[str, str]
@@ -220,6 +222,8 @@ class AgentPackService:
                     max_hard_cap_breaches=self.settings.crypto_replay_max_hard_cap_breaches,
                     min_spot_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
                     require_calibration_better_than_mid=self.settings.crypto_replay_require_calibration_better_than_mid,
+                    require_pnl_beats_market_mid=self.settings.crypto_replay_require_pnl_beats_market_mid,
+                    min_pnl_advantage_dollars=self.settings.crypto_replay_min_pnl_advantage_dollars,
                 ),
                 live=AgentPackCryptoLivePolicy(
                     trading_enabled=self.settings.crypto_trading_enabled,
@@ -490,6 +494,18 @@ class AgentPackService:
                     self.settings.crypto_replay_require_calibration_better_than_mid,
                 )
             ),
+            replay_require_pnl_beats_market_mid=bool(
+                value_or_settings(
+                    replay.require_pnl_beats_market_mid,
+                    self.settings.crypto_replay_require_pnl_beats_market_mid,
+                )
+            ),
+            replay_min_pnl_advantage_dollars=float(
+                value_or_settings(
+                    replay.min_pnl_advantage_dollars,
+                    self.settings.crypto_replay_min_pnl_advantage_dollars,
+                )
+            ),
             trading_enabled=bool(value_or_settings(live.trading_enabled, self.settings.crypto_trading_enabled)),
             production_autonomy_enabled=bool(
                 value_or_settings(live.production_autonomy_enabled, self.settings.crypto_production_autonomy_enabled)
@@ -557,6 +573,8 @@ class AgentPackService:
             max_hard_cap_breaches=self._clamp_int(crypto_policy.replay.max_hard_cap_breaches, 0, 100),
             min_spot_coverage_pct=self._clamp_float(crypto_policy.replay.min_spot_coverage_pct, 0.50, 1.0),
             require_calibration_better_than_mid=crypto_policy.replay.require_calibration_better_than_mid,
+            require_pnl_beats_market_mid=crypto_policy.replay.require_pnl_beats_market_mid,
+            min_pnl_advantage_dollars=self._clamp_float(crypto_policy.replay.min_pnl_advantage_dollars, 0.0, 1000.0),
         )
         crypto_policy.live = AgentPackCryptoLivePolicy(
             trading_enabled=crypto_policy.live.trading_enabled,

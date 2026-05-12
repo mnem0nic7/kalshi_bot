@@ -92,6 +92,113 @@ def _signal() -> StrategySignal:
     )
 
 
+def test_crypto_replay_gate_passes_profitable_model_even_when_calibration_lags_market_mid(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=10,
+        crypto_replay_min_trade_candidates=2,
+        crypto_replay_require_calibration_better_than_mid=False,
+        crypto_replay_require_pnl_beats_market_mid=True,
+    )
+    service = CryptoReplayService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+
+    gate = service.evaluate_gate(
+        {
+            "resolved_sample_count": 20,
+            "trade_candidate_count": 3,
+            "strict_trade_eligible_count": 20,
+            "net_simulated_pl_dollars": 4.0,
+            "market_mid_net_simulated_pl_dollars": 1.0,
+            "pnl_advantage_vs_market_mid_dollars": 3.0,
+            "hard_cap_breaches": 0,
+            "candle_count": 20,
+            "spot_feature_coverage_pct": 1.0,
+            "calibration_brier": 0.30,
+            "market_mid_brier": 0.20,
+            "calibration_log_loss": 0.90,
+            "market_mid_log_loss": 0.70,
+            "calibration_ece": 0.15,
+            "market_mid_ece": 0.05,
+        }
+    )
+
+    assert gate["passed"] is True
+    assert gate["requirements"]["pnl_beats_market_mid"] is True
+    assert gate["requirements"]["calibration_better_than_mid"] is False
+
+
+def test_crypto_replay_gate_blocks_losing_model_even_with_good_calibration(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=10,
+        crypto_replay_min_trade_candidates=2,
+        crypto_replay_require_calibration_better_than_mid=False,
+        crypto_replay_require_pnl_beats_market_mid=True,
+    )
+    service = CryptoReplayService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+
+    gate = service.evaluate_gate(
+        {
+            "resolved_sample_count": 20,
+            "trade_candidate_count": 3,
+            "strict_trade_eligible_count": 20,
+            "net_simulated_pl_dollars": -1.0,
+            "market_mid_net_simulated_pl_dollars": -2.0,
+            "pnl_advantage_vs_market_mid_dollars": 1.0,
+            "hard_cap_breaches": 0,
+            "candle_count": 20,
+            "spot_feature_coverage_pct": 1.0,
+            "calibration_brier": 0.10,
+            "market_mid_brier": 0.20,
+            "calibration_log_loss": 0.50,
+            "market_mid_log_loss": 0.70,
+            "calibration_ece": 0.01,
+            "market_mid_ece": 0.05,
+        }
+    )
+
+    assert gate["passed"] is False
+    assert any("Net simulated P/L" in reason for reason in gate["reasons"])
+
+
+def test_crypto_candidate_demotes_stale_coinbase_spot(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    row = {
+        "strict_trade_eligible": True,
+        "spot_feature_status": "stale",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_ohlc",
+        "spot_stale_seconds": 30,
+        "yes_ask_dollars": Decimal("0.4000"),
+        "no_ask_dollars": Decimal("0.6000"),
+        "spread_bps": 100,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.7000"), settings=settings)
+
+    assert {candidate["candidate_status"] for candidate in candidates} == {"prediction_only_proxy_quote"}
+    assert {candidate["reason"] for candidate in candidates} == {"spot_data_stale"}
+
+
+def test_crypto_candidate_demotes_coingecko_proxy_spot(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    row = {
+        "strict_trade_eligible": True,
+        "spot_feature_status": "available",
+        "spot_provider": "coingecko",
+        "spot_source_kind": "spot_price_proxy",
+        "spot_stale_seconds": 30,
+        "yes_ask_dollars": Decimal("0.4000"),
+        "no_ask_dollars": Decimal("0.6000"),
+        "spread_bps": 100,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.7000"), settings=settings)
+
+    assert {candidate["candidate_status"] for candidate in candidates} == {"prediction_only_proxy_quote"}
+    assert {candidate["reason"] for candidate in candidates} == {"spot_source_proxy_only"}
+
+
 async def _seed_crypto_training_rows(session_factory, settings: Settings, *, days: int = 4) -> None:
     base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
     async with session_factory() as session:
@@ -135,6 +242,21 @@ async def _seed_crypto_training_rows(session_factory, settings: Settings, *, day
                     low_dollars=yes_bid - Decimal("0.0100"),
                     close_dollars=yes_bid + Decimal("0.0100"),
                     volume=20 + idx,
+                    payload={"unit": True},
+                )
+                await repo.upsert_crypto_spot_ohlc(
+                    kalshi_env=settings.kalshi_env,
+                    provider="coinbase",
+                    asset_symbol=asset,
+                    quote_currency="USD",
+                    frequency="15m",
+                    interval_seconds=900,
+                    start_ts=close_time - timedelta(minutes=16),
+                    end_ts=close_time - timedelta(minutes=1),
+                    close_dollars=Decimal("100.00000000") + Decimal(idx),
+                    observed_at=close_time - timedelta(minutes=1),
+                    source_kind="spot_ohlc",
+                    source_id=f"{asset}-USD",
                     payload={"unit": True},
                 )
         await session.commit()
@@ -506,6 +628,22 @@ async def test_crypto_forecast_uses_deterministic_model_artifact(tmp_path) -> No
             payload={"global_adjustment_bps": 800, "asset_adjustments_bps": {"BTC": 200}},
             kalshi_env=settings.kalshi_env,
             trained_at=datetime.now(UTC),
+        )
+        now = datetime.now(UTC)
+        await repo.upsert_crypto_spot_ohlc(
+            kalshi_env=settings.kalshi_env,
+            provider="coinbase",
+            asset_symbol="BTC",
+            quote_currency="USD",
+            frequency="15m",
+            interval_seconds=900,
+            start_ts=now - timedelta(minutes=15),
+            end_ts=now,
+            close_dollars=Decimal("76460.00000000"),
+            observed_at=now,
+            source_kind="spot_ohlc",
+            source_id="BTC-USD",
+            payload={"unit": True},
         )
         await session.commit()
 
@@ -995,6 +1133,9 @@ def test_crypto_candidate_quality_classifies_live_and_exploratory(tmp_path) -> N
         "yes_ask_dollars": Decimal("0.4900"),
         "no_ask_dollars": Decimal("0.5300"),
         "spread_bps": 200,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_ohlc",
     }
 
     live = _crypto_trade_candidates(row, Decimal("0.6000"), settings=settings)
@@ -1034,6 +1175,9 @@ def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
         "yes_ask_dollars": Decimal("0.4900"),
         "no_ask_dollars": Decimal("0.5300"),
         "spread_bps": 200,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_ohlc",
     }
 
     candidates = _crypto_trade_candidates(row, Decimal("0.6000"), settings=settings, crypto_policy=policy)
@@ -1068,6 +1212,9 @@ def test_crypto_candidate_quality_blocks_runtime_spread_over_asset_limit(tmp_pat
         "yes_ask_dollars": Decimal("0.4900"),
         "no_ask_dollars": Decimal("0.5300"),
         "spread_bps": 200,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_ohlc",
     }
 
     candidates = _crypto_trade_candidates(row, Decimal("0.6000"), settings=settings, crypto_policy=policy)
@@ -1162,6 +1309,12 @@ async def test_crypto_replay_run_validate_and_gate_use_backtest_metrics(tmp_path
     session_factory = create_session_factory(engine)
     await init_models(engine)
     await _seed_crypto_training_rows(session_factory, settings, days=5)
+    history_status = await CryptoHistoryService(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=None,  # type: ignore[arg-type]
+        market_service=None,  # type: ignore[arg-type]
+    ).status(frequency="15m", days=30)
     await CryptoForecastService(settings=settings, session_factory=session_factory).train(frequency="15m")
     replay = CryptoReplayService(settings=settings, session_factory=session_factory)
 
@@ -1170,8 +1323,24 @@ async def test_crypto_replay_run_validate_and_gate_use_backtest_metrics(tmp_path
     gate = await replay.gate(frequency="15m")
 
     assert run_report["schema_version"] == "crypto-backtest-report-v1"
+    btc_audit = history_status["quote_evidence"]["strict_quote_ingestion_audit_by_asset"]["BTC"]
+    assert btc_audit["snapshot_present"] == 5
+    assert btc_audit["real_bid_ask_present"] == 5
+    assert btc_audit["settled_label_joined"] == 5
+    assert btc_audit["point_in_time_rows"] == 5
+    assert btc_audit["spot_joined"] == 5
+    assert btc_audit["strict_trade_eligible"] == 5
+    assert btc_audit["candidate_generated"] == 5
     assert run_report["data_quality"]["candle_count"] == 10
     assert "baseline_policy" in run_report["walk_forward"]
+    assert {item["policy_name"] for item in run_report["walk_forward"]["baseline_policies"]} >= {
+        "market_mid_baseline",
+        "always_0_5",
+        "last_direction",
+        "naive_momentum",
+        "linear_on_returns",
+    }
+    assert "pnl_advantage_vs_market_mid_dollars" in run_report["metrics"]
     assert validate_report["status"] in {"pass", "warn", "fail"}
     assert gate["requirements"]["requires_candles"] is True
     await engine.dispose()
