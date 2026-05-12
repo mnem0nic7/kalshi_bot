@@ -921,6 +921,24 @@ def _crypto_live_path_calibration_status(metrics: dict[str, Any]) -> dict[str, A
     }
 
 
+def _crypto_live_path_artifact_statuses(artifacts: dict[str, Any]) -> dict[str, Any]:
+    return {
+        name: (
+            None
+            if artifact is None
+            else {
+                "artifact_type": artifact.get("artifact_type"),
+                "version": artifact.get("version"),
+                "status": artifact.get("status"),
+                "created_at": artifact.get("created_at"),
+                "sample_count": artifact.get("sample_count"),
+                "payload": artifact.get("payload") or {},
+            }
+        )
+        for name, artifact in artifacts.items()
+    }
+
+
 def _crypto_live_path_step_summary(result: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "status",
@@ -1163,7 +1181,7 @@ def _crypto_live_path_assess_asset(
             "provider_counts": provider_counts,
             "source_kind_counts": source_kind_counts,
         },
-        "artifacts": artifacts,
+        "artifacts": _crypto_live_path_artifact_statuses(artifacts),
     }
 
 
