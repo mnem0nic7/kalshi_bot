@@ -266,6 +266,23 @@ Replay blocks live mode when any of these are true:
 - hard-cap breaches are present
 - calibration diagnostics are missing from the replay report
 
+### Settlement Backfill
+
+Recent 15-minute crypto settlements are collected from the regular Kalshi
+markets endpoint with `status=settled`, not only from the historical markets
+endpoint. The historical endpoint can lag recent 15-minute markets; the settled
+markets endpoint supplies current finalized rows with `result=yes|no`.
+
+`crypto-history collect-settled` appends terminal label snapshots with
+`source_kind=settled_backfill`. It does not mutate pre-close
+`live_quote_evidence` rows. Replay joins the terminal label snapshot to earlier
+quote snapshots by `market_ticker`, preserving point-in-time quote evidence.
+
+Settled backfill also attempts candle capture for each settled market. It tries
+the regular market candlestick endpoint first and falls back to the historical
+candlestick endpoint. Candle failures are reported, but they do not block label
+storage.
+
 ### 5. Asset Mode And Live Switch Gates
 
 Per-asset mode can be:
@@ -461,11 +478,23 @@ Refresh production evidence:
 scripts/crypto_live_path_refresh.sh \
   --kalshi-env production \
   --frequency 15m \
+  --settled-days 2 \
   --history-days 2 \
   --spot-days 2 \
   --replay-days 30 \
   --assets BTC ETH SOL XRP BNB DOGE HYPE \
   --docker-container infra-app_production_blue-1
+```
+
+Repair recent settlement labels directly:
+
+```bash
+kalshi-bot-cli crypto-history collect-settled \
+  --kalshi-env production \
+  --frequency 15m \
+  --days 2 \
+  --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --json
 ```
 
 Set a single asset mode:

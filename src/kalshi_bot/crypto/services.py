@@ -35,6 +35,7 @@ from kalshi_bot.crypto.models import CryptoMarket, CryptoSeries
 from kalshi_bot.crypto.parsing import (
     normalize_candlestick,
     normalize_frequency,
+    parse_datetime,
     parse_crypto_market,
     parse_crypto_series,
     parse_price,
@@ -960,6 +961,123 @@ class CryptoHistoryService:
     async def daily(self, *, frequency: str = "15m") -> dict[str, Any]:
         return await self.bootstrap(days=2, frequency=frequency)
 
+    async def collect_settled(
+        self,
+        *,
+        days: int | None = 2,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Collect recently settled crypto markets as immutable label snapshots."""
+        freq = normalize_frequency(frequency) or "15m"
+        lookback_days = days if days and days > 0 else 2
+        cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
+        requested_assets = set(normalize_asset_symbols(asset_symbols))
+        series_rows = await self.market_service.discover_series(frequency=freq)
+        if requested_assets:
+            series_rows = [
+                series for series in series_rows if normalize_asset_symbol(series.asset_symbol) in requested_assets
+            ]
+
+        settled_markets: list[CryptoMarket] = []
+        errors: list[dict[str, str]] = []
+        series_stats: list[dict[str, Any]] = []
+        for series in series_rows:
+            result = await self._list_settled_markets(series, cutoff=cutoff, frequency=freq)
+            errors.extend({"series_ticker": series.series_ticker, "error": error} for error in result["errors"])
+            settled_markets.extend(result["markets"])
+            series_stats.append(
+                {
+                    "series_ticker": series.series_ticker,
+                    "asset_symbol": series.asset_symbol,
+                    "pages_fetched": result["pages_fetched"],
+                    "rows_seen": result["rows_seen"],
+                    "markets_in_window": len(result["markets"]),
+                    "errors": result["errors"],
+                }
+            )
+
+        candle_stats: dict[str, Any] = {
+            "stored": 0,
+            "markets_attempted": 0,
+            "markets_skipped_existing": 0,
+            "errors": [],
+            "source_counts": {},
+        }
+        asset_counts: Counter[str] = Counter()
+        commit_batch_size = 250
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            for index, market in enumerate(settled_markets, start=1):
+                await self.market_service.record_market_snapshot(
+                    repo,
+                    market,
+                    source_kind="settled_backfill",
+                    observed_at=_crypto_settlement_observed_at(market),
+                )
+                asset_counts[market.asset_symbol] += 1
+                capture = await self._capture_candles(repo, market, cutoff=cutoff)
+                candle_stats["stored"] += int(capture.get("stored") or 0)
+                if capture.get("status") == "skipped_existing":
+                    candle_stats["markets_skipped_existing"] += 1
+                else:
+                    candle_stats["markets_attempted"] += 1
+                source = str(capture.get("source") or "unknown")
+                candle_stats["source_counts"][source] = int(candle_stats["source_counts"].get(source, 0)) + 1
+                if capture.get("error"):
+                    candle_stats["errors"].append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "error": capture["error"],
+                            "attempted_sources": capture.get("attempted_sources") or [],
+                        }
+                    )
+                if index % commit_batch_size == 0:
+                    await session.commit()
+            await session.commit()
+            snapshots = await repo.list_crypto_market_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                since=cutoff,
+                limit=200_000,
+            )
+            candles = await repo.list_crypto_market_candlesticks(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                since=cutoff,
+                limit=500_000,
+            )
+            if requested_assets:
+                snapshots = [
+                    row for row in snapshots if normalize_asset_symbol(row.asset_symbol) in requested_assets
+                ]
+                candles = [row for row in candles if normalize_asset_symbol(row.asset_symbol) in requested_assets]
+            await session.commit()
+        return {
+            "status": "ok" if settled_markets else "warn",
+            "kalshi_env": self.settings.kalshi_env,
+            "frequency": freq,
+            "asset_symbols": sorted(requested_assets),
+            "lookback_days": lookback_days,
+            "settled_markets_stored": len(settled_markets),
+            "asset_counts": dict(sorted(asset_counts.items())),
+            "candles_stored": candle_stats["stored"],
+            "candle_capture": {
+                **candle_stats,
+                "errors": candle_stats["errors"][:10],
+                "error_count": len(candle_stats["errors"]),
+            },
+            "series": series_stats,
+            "pages_fetched": sum(int(item["pages_fetched"]) for item in series_stats),
+            "settled_rows_seen": sum(int(item["rows_seen"]) for item in series_stats),
+            "data_quality": _crypto_data_quality(
+                snapshots,
+                candles,
+                min_training_samples=self.settings.crypto_min_training_samples,
+            ),
+            "errors": errors[:10],
+        }
+
     async def collect_open(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
         """Collect lightweight executable quote evidence for currently open crypto markets.
 
@@ -1091,6 +1209,62 @@ class CryptoHistoryService:
             "errors": errors,
         }
 
+    async def _list_settled_markets(
+        self,
+        series: CryptoSeries,
+        *,
+        cutoff: datetime,
+        frequency: str,
+    ) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        markets: list[CryptoMarket] = []
+        errors: list[str] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        pages_fetched = 0
+        for _ in range(100):
+            params: dict[str, Any] = {
+                "series_ticker": series.series_ticker,
+                "status": "settled",
+                "limit": 1000,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                response = await self.kalshi.list_markets(**params)
+            except httpx.HTTPError as exc:
+                errors.append(str(exc))
+                break
+            page_rows = _rows_from_response(response, "markets")
+            rows.extend(page_rows)
+            pages_fetched += 1
+            parsed_page: list[CryptoMarket] = []
+            for row in page_rows:
+                parsed = parse_crypto_market(row, series=series, frequency=frequency)
+                if parsed is None:
+                    continue
+                parsed_page.append(parsed)
+                close_time = parsed.close_time or parsed.expected_expiration_time
+                if close_time is None or close_time >= cutoff:
+                    markets.append(parsed)
+            if parsed_page and all(
+                (market.close_time or market.expected_expiration_time) is not None
+                and (market.close_time or market.expected_expiration_time) < cutoff
+                for market in parsed_page
+            ):
+                break
+            cursor = response.get("cursor") or response.get("next_cursor")
+            if not cursor or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+        return {
+            "rows": rows,
+            "markets": markets,
+            "rows_seen": len(rows),
+            "pages_fetched": pages_fetched,
+            "errors": errors,
+        }
+
     async def _capture_candles(self, repo: PlatformRepository, market: CryptoMarket, *, cutoff: datetime) -> dict[str, Any]:
         now = datetime.now(UTC)
         end_time = min(now, market.close_time or market.expected_expiration_time or now)
@@ -1105,18 +1279,46 @@ class CryptoHistoryService:
             "start_ts": int(start_time.timestamp()),
             "end_ts": int(end_time.timestamp()),
         }
-        try:
-            if market.close_time is not None and market.close_time < now:
-                response = await self.kalshi.get_historical_market_candlesticks(
-                    market.series_ticker,
-                    market.market_ticker,
-                    **params,
-                )
-            else:
-                response = await self.kalshi.get_market_candlesticks(market.series_ticker, market.market_ticker, **params)
-        except httpx.HTTPError as exc:
-            logger.info("crypto candlestick capture skipped for %s", market.market_ticker, exc_info=True)
-            return {"status": "error", "stored": 0, "error": str(exc)}
+        closed = market.close_time is not None and market.close_time < now
+        sources = ("live", "historical") if closed else ("live",)
+        response: dict[str, Any] | None = None
+        selected_source = "unknown"
+        errors: list[dict[str, str]] = []
+        for source in sources:
+            try:
+                if source == "live":
+                    candidate_response = await self.kalshi.get_market_candlesticks(
+                        market.series_ticker,
+                        market.market_ticker,
+                        **params,
+                    )
+                else:
+                    candidate_response = await self.kalshi.get_historical_market_candlesticks(
+                        market.series_ticker,
+                        market.market_ticker,
+                        **params,
+                    )
+            except httpx.HTTPError as exc:
+                errors.append({"source": source, "error": str(exc)})
+                continue
+            candidate_rows = _rows_from_response(candidate_response, "candlesticks") or _rows_from_response(
+                candidate_response,
+                "candles",
+            )
+            response = candidate_response
+            selected_source = source
+            if candidate_rows or source == sources[-1]:
+                break
+            errors.append({"source": source, "error": "empty_candles"})
+        if response is None:
+            logger.info("crypto candlestick capture skipped for %s", market.market_ticker, extra={"errors": errors})
+            return {
+                "status": "error",
+                "stored": 0,
+                "source": selected_source,
+                "attempted_sources": list(sources),
+                "error": "; ".join(f"{item['source']}: {item['error']}" for item in errors),
+            }
         count = 0
         for row in _rows_from_response(response, "candlesticks") or _rows_from_response(response, "candles"):
             candle = normalize_candlestick(row)
@@ -1138,7 +1340,13 @@ class CryptoHistoryService:
                 payload=candle["payload"],
             )
             count += 1
-        return {"status": "ok", "stored": count}
+        return {
+            "status": "ok",
+            "stored": count,
+            "source": selected_source,
+            "attempted_sources": list(sources),
+            "errors": errors,
+        }
 
 
 class CryptoSpotService:
@@ -3667,6 +3875,15 @@ def _crypto_settlement_snapshots_by_market(
 
 def _crypto_sort_datetime(value: datetime | None) -> datetime:
     return _as_utc_datetime(value) if value is not None else datetime.min.replace(tzinfo=UTC)
+
+
+def _crypto_settlement_observed_at(market: CryptoMarket) -> datetime:
+    raw = market.raw or {}
+    for key in ("settlement_ts", "settlement_time", "settled_time", "finalized_time"):
+        parsed = parse_datetime(raw.get(key))
+        if parsed is not None:
+            return parsed
+    return market.expected_expiration_time or market.close_time or datetime.now(UTC)
 
 
 def _crypto_spot_max_stale_seconds(

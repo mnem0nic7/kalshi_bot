@@ -126,6 +126,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     history_bootstrap_args = parser.parse_args(
         ["crypto-history", "bootstrap", "--kalshi-env", "production", "--frequency", "15m", "--assets", "XRP"]
     )
+    history_settled_args = parser.parse_args(
+        ["crypto-history", "collect-settled", "--kalshi-env", "production", "--frequency", "15m", "--days", "2", "--assets", "BTC", "--json"]
+    )
     spot_args = parser.parse_args(["crypto-spot", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "--json"])
     model_args = parser.parse_args(["crypto-model", "train", "--kalshi-env", "production", "--frequency", "15m"])
     replay_args = parser.parse_args(["crypto-replay", "gate", "--kalshi-env", "production", "--frequency", "15m"])
@@ -143,6 +146,8 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
             "--frequency",
             "15m",
             "--history-days",
+            "2",
+            "--settled-days",
             "2",
             "--spot-days",
             "2",
@@ -169,6 +174,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert history_args.frequency == "15m"
     assert history_bootstrap_args.crypto_history_command == "bootstrap"
     assert history_bootstrap_args.assets == ["XRP"]
+    assert history_settled_args.crypto_history_command == "collect-settled"
+    assert history_settled_args.days == 2
+    assert history_settled_args.assets == ["BTC"]
     assert spot_args.command == "crypto-spot"
     assert spot_args.crypto_spot_command == "status"
     assert spot_args.kalshi_env == "production"
@@ -188,6 +196,7 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert live_path_status_args.baselines is True
     assert live_path_refresh_args.crypto_live_path_command == "refresh"
     assert live_path_refresh_args.history_days == 2
+    assert live_path_refresh_args.settled_days == 2
     assert live_path_refresh_args.spot_days == 2
     assert live_path_refresh_args.replay_days == 30
     assert live_path_refresh_args.assets == ["XRP"]
@@ -196,6 +205,17 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert funnel_args.command == "funnel-report"
     assert funnel_args.domain == "crypto"
     assert funnel_args.assets == ["BTC"]
+    settled_summary = cli_module._crypto_live_path_step_summary(
+        {
+            "status": "ok",
+            "settled_markets_stored": 4,
+            "settled_rows_seen": 6,
+            "pages_fetched": 1,
+            "candles_stored": 3,
+        }
+    )
+    assert settled_summary["settled_markets_stored"] == 4
+    assert settled_summary["settled_rows_seen"] == 6
     assert model_quality_args.command == "model-quality"
     assert model_quality_args.model_quality_command == "status"
     assert model_quality_args.kalshi_env == "demo"
@@ -211,6 +231,10 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
         async def collect_open(self, **kwargs: object) -> dict[str, object]:
             calls.append(("collect_open", kwargs))
             return {"status": "ok"}
+
+        async def collect_settled(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("collect_settled", kwargs))
+            return {"status": "ok", "settled_markets_stored": 1}
 
         async def bootstrap(self, **kwargs: object) -> dict[str, object]:
             calls.append(("bootstrap", kwargs))
@@ -241,6 +265,7 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
         crypto_live_path_command="refresh",
         assets=["XRP"],
         frequency="15m",
+        settled_days=2,
         history_days=2,
         spot_days=2,
         replay_days=30,
@@ -258,6 +283,7 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
     assert exit_code == 0
     assert [name for name, _kwargs in calls] == [
         "collect_open",
+        "collect_settled",
         "bootstrap",
         "spot_backfill",
         "forecast_train",

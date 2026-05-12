@@ -4,6 +4,7 @@ set -euo pipefail
 kalshi_env="production"
 frequency="15m"
 history_days="2"
+settled_days="2"
 spot_days="2"
 replay_days="30"
 out_dir="reports/crypto_live_path"
@@ -17,6 +18,7 @@ usage: scripts/crypto_live_path_refresh.sh [options]
 Options:
   --kalshi-env <demo|production>       Target Kalshi environment. Default: production.
   --frequency <frequency>              Crypto market frequency. Default: 15m.
+  --settled-days <days>                Settled market label backfill window. Default: 2.
   --history-days <days>                Kalshi history bootstrap window. Default: 2.
   --spot-days <days>                   Spot backfill window. Default: 2.
   --replay-days <days>                 Replay window. Default: 30.
@@ -41,6 +43,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --history-days)
       history_days="${2:?missing value for --history-days}"
+      shift 2
+      ;;
+    --settled-days)
+      settled_days="${2:?missing value for --settled-days}"
       shift 2
       ;;
     --spot-days)
@@ -100,6 +106,7 @@ for asset in "${assets[@]}"; do
   if "${cli[@]}" crypto-live-path refresh \
     --kalshi-env "${kalshi_env}" \
     --frequency "${frequency}" \
+    --settled-days "${settled_days}" \
     --history-days "${history_days}" \
     --spot-days "${spot_days}" \
     --replay-days "${replay_days}" \

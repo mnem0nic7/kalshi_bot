@@ -85,13 +85,27 @@ CLI="env PYTHONPATH=src POSTGRES_PORT=5433 APP_SHADOW_MODE=false .venv/bin/pytho
 scripts/crypto_live_path_refresh.sh \
   --kalshi-env production \
   --frequency 15m \
+  --settled-days 2 \
   --history-days 2 \
   --spot-days 2 \
   --replay-days 30 \
   --assets BTC ETH SOL XRP BNB DOGE HYPE
 ```
 
-The script runs one CLI process per asset so model and replay memory is released between assets. On the host, set `POSTGRES_PORT=5433` for production because demo uses the default `5432` mapping. It writes per-asset JSON reports and stderr logs under `reports/crypto_live_path/`.
+The script runs one CLI process per asset so model and replay memory is released between assets. Each refresh collects open real-quote snapshots, backfills recent settled labels with `crypto-history collect-settled`, refreshes historical/candle context, refreshes spot, trains, replays, and gates. On the host, set `POSTGRES_PORT=5433` for production because demo uses the default `5432` mapping. It writes per-asset JSON reports and stderr logs under `reports/crypto_live_path/`.
+
+Manual settled-label repair:
+
+```bash
+kalshi-bot-cli crypto-history collect-settled \
+  --kalshi-env production \
+  --frequency 15m \
+  --days 2 \
+  --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --json
+```
+
+Use `--days 14` or `--days 30` only for catch-up sweeps. The normal refresh loop intentionally keeps the settled backfill window small.
 
 Per asset readiness requires at least 60 strict labeled real-quote rows, at least 50 replay trade candidates, a passing replay gate, positive fee-adjusted simulated net P/L that beats the market-mid P/L baseline, at least 80% spot coverage, and fresh non-proxy spot data. Calibration versus market-mid remains a diagnostic, not a hard promotion gate. Keep BNB and HYPE shadow until their spot support is fresh and non-proxy.
 

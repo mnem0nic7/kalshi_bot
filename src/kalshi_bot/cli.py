@@ -666,6 +666,12 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
             frequency=args.frequency,
             asset_symbols=getattr(args, "assets", None),
         )
+    elif args.crypto_history_command == "collect-settled":
+        result = await container.crypto_history_service.collect_settled(
+            days=args.days,
+            frequency=args.frequency,
+            asset_symbols=getattr(args, "assets", None),
+        )
     elif args.crypto_history_command == "status":
         result = await container.crypto_history_service.status(
             frequency=args.frequency,
@@ -948,8 +954,11 @@ def _crypto_live_path_step_summary(result: dict[str, Any]) -> dict[str, Any]:
         "asset_symbols",
         "stored",
         "stored_real_quote_snapshots",
+        "settled_markets_stored",
         "markets_stored",
         "candles_stored",
+        "pages_fetched",
+        "settled_rows_seen",
         "models_trained",
         "version",
         "sample_count",
@@ -1319,6 +1328,17 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
                 result["steps"]["collect_open"] = _crypto_live_path_step_summary(collect_open)
             except Exception as exc:  # pragma: no cover - surfaced in CLI JSON for operator action.
                 error = {"asset": asset, "step": "collect_open", "error": str(exc), "iteration": iteration}
+                result["errors"].append(error)
+                operation_errors.append(error)
+            try:
+                collect_settled = await container.crypto_history_service.collect_settled(
+                    frequency=frequency,
+                    days=args.settled_days,
+                    asset_symbols=[asset],
+                )
+                result["steps"]["collect_settled"] = _crypto_live_path_step_summary(collect_settled)
+            except Exception as exc:  # pragma: no cover
+                error = {"asset": asset, "step": "collect_settled", "error": str(exc), "iteration": iteration}
                 result["errors"].append(error)
                 operation_errors.append(error)
             try:
@@ -3285,6 +3305,12 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_history_collect_open.add_argument("--frequency", default="15m")
     crypto_history_collect_open.add_argument("--assets", nargs="*", default=None)
     crypto_history_collect_open.add_argument("--json", action="store_true")
+    crypto_history_collect_settled = crypto_history_subparsers.add_parser("collect-settled")
+    add_kalshi_env_argument(crypto_history_collect_settled)
+    crypto_history_collect_settled.add_argument("--days", type=int, default=2)
+    crypto_history_collect_settled.add_argument("--frequency", default="15m")
+    crypto_history_collect_settled.add_argument("--assets", nargs="*", default=None)
+    crypto_history_collect_settled.add_argument("--json", action="store_true")
     crypto_history_status = crypto_history_subparsers.add_parser("status")
     add_kalshi_env_argument(crypto_history_status)
     crypto_history_status.add_argument("--frequency", default="15m")
@@ -3379,6 +3405,7 @@ def build_parser() -> argparse.ArgumentParser:
         live_path_command.add_argument("--baselines", action="store_true")
         live_path_command.add_argument("--json", action="store_true")
         if name == "refresh":
+            live_path_command.add_argument("--settled-days", type=int, default=2)
             live_path_command.add_argument("--history-days", type=int, default=2)
             live_path_command.add_argument("--spot-days", type=int, default=2)
             live_path_command.add_argument("--replay-days", type=int, default=30)
