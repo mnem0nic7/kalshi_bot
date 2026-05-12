@@ -131,6 +131,28 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     replay_args = parser.parse_args(["crypto-replay", "gate", "--kalshi-env", "production", "--frequency", "15m"])
     status_args = parser.parse_args(["crypto-status", "--kalshi-env", "production"])
     autonomy_args = parser.parse_args(["crypto-autonomy", "run-once", "--kalshi-env", "production", "--frequency", "15m", "--json"])
+    live_path_status_args = parser.parse_args(
+        ["crypto-live-path", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "ETH", "--json"]
+    )
+    live_path_refresh_args = parser.parse_args(
+        [
+            "crypto-live-path",
+            "refresh",
+            "--kalshi-env",
+            "production",
+            "--frequency",
+            "15m",
+            "--history-days",
+            "2",
+            "--spot-days",
+            "2",
+            "--replay-days",
+            "30",
+            "--assets",
+            "XRP",
+            "--json",
+        ]
+    )
     model_quality_args = parser.parse_args(
         ["model-quality", "status", "--kalshi-env", "demo", "--domain", "all", "--json"]
     )
@@ -154,6 +176,14 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert autonomy_args.command == "crypto-autonomy"
     assert autonomy_args.crypto_autonomy_command == "run-once"
     assert autonomy_args.kalshi_env == "production"
+    assert live_path_status_args.command == "crypto-live-path"
+    assert live_path_status_args.crypto_live_path_command == "status"
+    assert live_path_status_args.assets == ["BTC", "ETH"]
+    assert live_path_refresh_args.crypto_live_path_command == "refresh"
+    assert live_path_refresh_args.history_days == 2
+    assert live_path_refresh_args.spot_days == 2
+    assert live_path_refresh_args.replay_days == 30
+    assert live_path_refresh_args.assets == ["XRP"]
     assert model_quality_args.command == "model-quality"
     assert model_quality_args.model_quality_command == "status"
     assert model_quality_args.kalshi_env == "demo"

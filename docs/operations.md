@@ -63,6 +63,43 @@ kalshi-bot-cli autonomous-gates status --kalshi-env production --domain all --fo
 
 Crypto policy is separate from weather thresholds and promotes per asset. A BTC candidate can stage, canary, and promote without changing ETH. Deployment-note asset mode `off`, inactive color, app shadow mode, missing write credentials, kill switch, disabled `crypto_enabled`/`crypto_15m_enabled`, replay-gate failure, stale data, position caps, and risk caps remain hard blockers.
 
+## Crypto Live Path
+
+Use `crypto-live-path` to collect production evidence and show the exact blockers before any crypto asset is promoted out of shadow mode. The command does not relax replay gates, promote assets, or enable production crypto switches.
+
+Read-only status:
+
+```bash
+kalshi-bot-cli crypto-live-path status \
+  --kalshi-env production \
+  --frequency 15m \
+  --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --json
+```
+
+Evidence refresh loop:
+
+```bash
+kalshi-bot-cli crypto-live-path refresh \
+  --kalshi-env production \
+  --frequency 15m \
+  --history-days 2 \
+  --spot-days 2 \
+  --replay-days 30 \
+  --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --json
+```
+
+Per asset readiness requires at least 60 strict labeled real-quote rows, at least 50 replay trade candidates, a passing replay gate, positive simulated net P/L, calibration that beats the market-mid baseline, at least 80% spot coverage, and fresh spot data. Keep BNB and HYPE shadow until their Coingecko proxy spot data is fresh and stable.
+
+After an asset passes, promote one asset at a time:
+
+```bash
+kalshi-bot-cli crypto-asset-mode set --kalshi-env production <ASSET> live
+```
+
+Only after at least one asset passes and is intentionally promoted should the production switches be enabled: `CRYPTO_TRADING_ENABLED=true`, `CRYPTO_AUTONOMY_ENABLED=true`, and `CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true`.
+
 Deploy finding from April 12, 2026:
 
 - rebuilding `app_*` or `daemon_*` alone is not enough when a new Alembic revision has been added

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import Any
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,7 @@ from kalshi_bot.core.schemas import (
     ShadowCampaignRequest,
     TrainingBuildRequest,
 )
+from kalshi_bot.crypto.services import normalize_asset_symbols
 from kalshi_bot.db.models import Room, Signal, StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -112,7 +114,13 @@ CRYPTO_ENV_COMMANDS = {
     "crypto-status",
     "crypto-autonomy",
     "crypto-asset-mode",
+    "crypto-live-path",
 }
+
+
+CRYPTO_LIVE_PATH_DEFAULT_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE")
+CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET = 60
+CRYPTO_LIVE_PATH_TRADE_CANDIDATES_TARGET = 50
 
 
 def _float_or_none(value: object) -> float | None:
@@ -812,6 +820,482 @@ async def _run_crypto_asset_mode_command(args: argparse.Namespace, container: Ap
     return 0
 
 
+def _crypto_live_path_assets(args: argparse.Namespace) -> list[str]:
+    assets = normalize_asset_symbols(getattr(args, "assets", None))
+    return assets or list(CRYPTO_LIVE_PATH_DEFAULT_ASSETS)
+
+
+def _crypto_artifact_payload(record: Any | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    return {
+        "artifact_type": getattr(record, "artifact_type", None),
+        "version": getattr(record, "version", None),
+        "status": getattr(record, "status", None),
+        "trained_at": getattr(record, "trained_at", None),
+        "created_at": getattr(record, "created_at", None),
+        "sample_count": getattr(record, "sample_count", None),
+        "metrics": getattr(record, "metrics", None) or {},
+        "payload": getattr(record, "payload", None) or {},
+    }
+
+
+def _int_or_zero(value: object) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return int(float(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _metric_less_than(metrics: dict[str, Any], candidate_key: str, baseline_key: str) -> bool:
+    candidate = _float_or_none(metrics.get(candidate_key))
+    baseline = _float_or_none(metrics.get(baseline_key))
+    return candidate is not None and baseline is not None and candidate < baseline
+
+
+def _crypto_live_path_calibration_status(metrics: dict[str, Any]) -> dict[str, Any]:
+    comparisons = {
+        "brier": _metric_less_than(metrics, "calibration_brier", "market_mid_brier"),
+        "log_loss": _metric_less_than(metrics, "calibration_log_loss", "market_mid_log_loss"),
+        "ece": _metric_less_than(metrics, "calibration_ece", "market_mid_ece"),
+    }
+    return {
+        "beats_market_mid": all(comparisons.values()),
+        "comparisons": comparisons,
+        "values": {
+            "calibration_brier": metrics.get("calibration_brier"),
+            "market_mid_brier": metrics.get("market_mid_brier"),
+            "calibration_log_loss": metrics.get("calibration_log_loss"),
+            "market_mid_log_loss": metrics.get("market_mid_log_loss"),
+            "calibration_ece": metrics.get("calibration_ece"),
+            "market_mid_ece": metrics.get("market_mid_ece"),
+        },
+    }
+
+
+def _crypto_live_path_step_summary(result: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "status",
+        "kalshi_env",
+        "frequency",
+        "asset_symbols",
+        "stored",
+        "stored_real_quote_snapshots",
+        "markets_stored",
+        "candles_stored",
+        "models_trained",
+        "version",
+        "sample_count",
+        "reasons",
+        "requirements",
+        "gate",
+        "issues",
+        "asset_counts",
+        "metrics",
+    )
+    summary = {key: result[key] for key in keys if key in result}
+    if "metrics" in summary and isinstance(summary["metrics"], dict):
+        metrics = summary["metrics"]
+        summary["metrics"] = {
+            key: metrics.get(key)
+            for key in (
+                "trade_candidate_count",
+                "strict_trade_eligible_count",
+                "net_simulated_pl_dollars",
+                "calibration_brier",
+                "market_mid_brier",
+                "calibration_log_loss",
+                "market_mid_log_loss",
+                "calibration_ece",
+                "market_mid_ece",
+            )
+            if key in metrics
+        }
+    return summary
+
+
+async def _crypto_live_path_runtime_state(
+    container: AppContainer,
+    *,
+    assets: list[str],
+    frequency: str,
+) -> dict[str, Any]:
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
+        control = await repo.get_deployment_control(kalshi_env=container.settings.kalshi_env)
+        active_pack = await container.agent_pack_service.get_pack_for_color(repo, control.active_color)
+        crypto_policy = container.agent_pack_service.runtime_crypto_policy(active_pack)
+        artifacts: dict[str, dict[str, Any | None]] = {}
+        modes: dict[str, str] = {}
+        for asset in assets:
+            modes[asset] = container.crypto_asset_control_service.mode_for_control(
+                control,
+                asset,
+                crypto_policy=crypto_policy,
+            )
+            artifacts[asset] = {}
+            for artifact_type in ("model", "backtest", "replay_gate"):
+                record = await repo.get_latest_crypto_model_artifact(
+                    frequency=frequency,
+                    artifact_type=f"{artifact_type}:{asset}",
+                    kalshi_env=container.settings.kalshi_env,
+                )
+                artifacts[asset][artifact_type] = _crypto_artifact_payload(record)
+        deployment = {
+            "kalshi_env": container.settings.kalshi_env,
+            "app_color": container.settings.app_color,
+            "active_color": control.active_color,
+            "is_active_color": control.active_color == container.settings.app_color,
+            "kill_switch_enabled": control.kill_switch_enabled,
+            "app_shadow_mode": container.settings.app_shadow_mode,
+            "has_write_credentials": container.kalshi.write_credentials is not None,
+            "crypto_enabled": container.settings.crypto_enabled,
+            "crypto_15m_enabled": container.settings.crypto_15m_enabled,
+            "crypto_trading_enabled": container.settings.crypto_trading_enabled,
+            "crypto_autonomy_enabled": container.settings.crypto_autonomy_enabled,
+            "crypto_production_autonomy_enabled": container.settings.crypto_production_autonomy_enabled,
+            "runtime_crypto_trading_enabled": (
+                container.settings.crypto_trading_enabled or bool(crypto_policy.trading_enabled)
+            ),
+            "runtime_crypto_production_autonomy_enabled": (
+                container.settings.crypto_production_autonomy_enabled
+                or bool(crypto_policy.production_autonomy_enabled)
+            ),
+        }
+        await session.commit()
+
+    switch_blockers: list[str] = []
+    live_order_blockers: list[str] = []
+    if not bool(deployment["crypto_enabled"]):
+        live_order_blockers.append("CRYPTO_ENABLED=false")
+    if frequency == "15m" and not bool(deployment["crypto_15m_enabled"]):
+        live_order_blockers.append("CRYPTO_15M_ENABLED=false")
+    if not bool(deployment["runtime_crypto_trading_enabled"]):
+        switch_blockers.append("CRYPTO_TRADING_ENABLED=false")
+        live_order_blockers.append("CRYPTO_TRADING_ENABLED=false")
+    if not bool(container.settings.crypto_autonomy_enabled):
+        switch_blockers.append("CRYPTO_AUTONOMY_ENABLED=false")
+        live_order_blockers.append("CRYPTO_AUTONOMY_ENABLED=false")
+    if container.settings.kalshi_env == "production" and not bool(container.settings.crypto_production_autonomy_enabled):
+        switch_blockers.append("CRYPTO_PRODUCTION_AUTONOMY_ENABLED=false")
+        live_order_blockers.append("CRYPTO_PRODUCTION_AUTONOMY_ENABLED=false")
+    if bool(deployment["app_shadow_mode"]):
+        live_order_blockers.append("APP_SHADOW_MODE=true")
+    if bool(deployment["kill_switch_enabled"]):
+        live_order_blockers.append("kill switch enabled")
+    if not bool(deployment["is_active_color"]):
+        live_order_blockers.append(
+            f"active color is {deployment['active_color']}; app color is {deployment['app_color']}"
+        )
+    if not bool(deployment["has_write_credentials"]):
+        live_order_blockers.append("Kalshi write credentials missing")
+
+    return {
+        "deployment": {
+            **deployment,
+            "live_switch_blockers": switch_blockers,
+            "live_order_blockers": live_order_blockers,
+        },
+        "policy_requirements": {
+            "replay_min_resolved_markets": crypto_policy.replay_min_resolved_markets,
+            "replay_min_trade_candidates": crypto_policy.replay_min_trade_candidates,
+            "replay_min_net_pl_dollars": crypto_policy.replay_min_net_pl_dollars,
+            "replay_max_hard_cap_breaches": crypto_policy.replay_max_hard_cap_breaches,
+            "replay_min_spot_coverage_pct": crypto_policy.replay_min_spot_coverage_pct,
+            "replay_require_calibration_better_than_mid": crypto_policy.replay_require_calibration_better_than_mid,
+        },
+        "asset_modes": modes,
+        "artifacts": artifacts,
+    }
+
+
+def _crypto_live_path_assess_asset(
+    asset: str,
+    *,
+    history_status: dict[str, Any],
+    spot_status: dict[str, Any],
+    runtime_state: dict[str, Any],
+    strict_rows_target: int,
+    candidate_target: int,
+) -> dict[str, Any]:
+    quote_evidence = history_status.get("quote_evidence") or {}
+    support_by_asset = quote_evidence.get("trade_candidate_support_by_asset") or {}
+    support = support_by_asset.get(asset) or {}
+    spot_quality = spot_status.get("spot_quality") or {}
+    spot_assets = spot_quality.get("assets") or {}
+    spot_asset = spot_assets.get(asset) or {}
+    stale_assets = set(spot_quality.get("stale_assets") or [])
+    missing_assets = set(spot_quality.get("missing_assets") or [])
+    artifacts = (runtime_state.get("artifacts") or {}).get(asset) or {}
+    model_artifact = artifacts.get("model") or {}
+    backtest_artifact = artifacts.get("backtest") or {}
+    gate_artifact = artifacts.get("replay_gate") or {}
+    metrics = dict(backtest_artifact.get("metrics") or gate_artifact.get("metrics") or {})
+    gate_payload = gate_artifact.get("payload") or {}
+    gate_status = str(gate_artifact.get("status") or "missing")
+    model_status = str(model_artifact.get("status") or "missing")
+    backtest_status = str(backtest_artifact.get("status") or "missing")
+
+    strict_rows = max(
+        _int_or_zero(support.get("strict_trade_eligible_rows")),
+        _int_or_zero(metrics.get("strict_trade_eligible_count")),
+    )
+    trade_candidates = _int_or_zero(metrics.get("trade_candidate_count"))
+    net_pl = _float_or_none(metrics.get("net_simulated_pl_dollars"))
+    if net_pl is None:
+        net_pl = _float_or_none(metrics.get("net_pl_dollars"))
+    calibration = _crypto_live_path_calibration_status(metrics)
+    spot_coverage = _float_or_none(spot_quality.get("coverage_pct")) or 0.0
+    spot_rows = _int_or_zero(spot_asset.get("row_count"))
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if strict_rows < strict_rows_target:
+        blockers.append(f"strict_trade_eligible_count {strict_rows} < {strict_rows_target}")
+    if trade_candidates < candidate_target:
+        blockers.append(f"trade_candidate_count {trade_candidates} < {candidate_target}")
+    if gate_status != "passed":
+        blockers.append(f"replay gate status is {gate_status}")
+    if net_pl is None or net_pl <= 0:
+        blockers.append("net simulated P/L is not positive")
+    if not calibration["beats_market_mid"]:
+        blockers.append("calibration does not beat market-mid baseline")
+    if spot_coverage < 0.8:
+        blockers.append(f"spot coverage {spot_coverage:.2%} < 80.00%")
+    if asset in missing_assets or spot_rows <= 0:
+        blockers.append("spot data missing")
+    if asset in stale_assets:
+        blockers.append("spot data stale")
+    if model_status != "trained":
+        blockers.append(f"model status is {model_status}")
+    if backtest_status == "missing":
+        blockers.append("replay backtest artifact missing")
+
+    source_kind_counts = spot_asset.get("source_kind_counts") or {}
+    provider_counts = spot_asset.get("provider_counts") or {}
+    if asset in {"BNB", "HYPE"}:
+        warnings.append("special monitoring: spot support is expected to rely on a Coingecko proxy")
+    if source_kind_counts.get("spot_price_proxy") and not source_kind_counts.get("spot_ohlc"):
+        warnings.append("spot source is proxy-only")
+    if provider_counts and set(provider_counts.keys()) == {"coingecko"}:
+        warnings.append("spot provider is Coingecko-only")
+
+    ready = not blockers
+    mode = (runtime_state.get("asset_modes") or {}).get(asset, "shadow")
+    next_command = None
+    if ready and mode != "live":
+        next_command = f"crypto-asset-mode set --kalshi-env {_crypto_live_path_env(runtime_state)} {asset} live"
+
+    return {
+        "asset": asset,
+        "mode": mode,
+        "ready_for_live_mode": ready,
+        "blockers": blockers,
+        "warnings": warnings,
+        "next_command": next_command,
+        "quote_evidence": {
+            "strict_trade_eligible_count": strict_rows,
+            "trade_candidate_support": support,
+        },
+        "replay": {
+            "gate_status": gate_status,
+            "gate_reasons": gate_payload.get("reasons") or [],
+            "backtest_status": backtest_status,
+            "trade_candidate_count": trade_candidates,
+            "net_simulated_pl_dollars": net_pl,
+            "calibration": calibration,
+            "requirements": gate_payload.get("requirements") or {},
+        },
+        "spot": {
+            "coverage_pct": spot_coverage,
+            "row_count": spot_rows,
+            "latest_end_ts": spot_asset.get("latest_end_ts"),
+            "stale": asset in stale_assets,
+            "missing": asset in missing_assets,
+            "provider_counts": provider_counts,
+            "source_kind_counts": source_kind_counts,
+        },
+        "artifacts": artifacts,
+    }
+
+
+def _crypto_live_path_env(runtime_state: dict[str, Any]) -> str:
+    deployment = runtime_state.get("deployment") or {}
+    env = str(deployment.get("kalshi_env") or "production")
+    return env if env in {"demo", "production"} else "production"
+
+
+async def _crypto_live_path_status_payload(
+    args: argparse.Namespace,
+    container: AppContainer,
+) -> dict[str, Any]:
+    assets = _crypto_live_path_assets(args)
+    frequency = getattr(args, "frequency", "15m")
+    status_days = getattr(args, "status_days", 14)
+    history_status = await container.crypto_history_service.status(frequency=frequency, days=status_days)
+    spot_status = await container.crypto_spot_service.status(
+        frequency=frequency,
+        days=status_days,
+        asset_symbols=assets,
+    )
+    runtime_state = await _crypto_live_path_runtime_state(container, assets=assets, frequency=frequency)
+    asset_reports = [
+        _crypto_live_path_assess_asset(
+            asset,
+            history_status=history_status,
+            spot_status=spot_status,
+            runtime_state=runtime_state,
+            strict_rows_target=getattr(args, "strict_rows_target", CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET),
+            candidate_target=getattr(args, "candidate_target", CRYPTO_LIVE_PATH_TRADE_CANDIDATES_TARGET),
+        )
+        for asset in assets
+    ]
+    ready_assets = [report["asset"] for report in asset_reports if report["ready_for_live_mode"]]
+    switch_blockers = runtime_state["deployment"]["live_switch_blockers"]
+    live_order_blockers = runtime_state["deployment"]["live_order_blockers"]
+    live_order_ready_assets = ready_assets if not live_order_blockers else []
+    return {
+        "schema_version": "crypto-live-path-v1",
+        "status": "ready" if len(ready_assets) == len(assets) else "collecting",
+        "kalshi_env": container.settings.kalshi_env,
+        "frequency": frequency,
+        "assets": assets,
+        "targets": {
+            "strict_trade_eligible_count": getattr(
+                args,
+                "strict_rows_target",
+                CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET,
+            ),
+            "trade_candidate_count": getattr(
+                args,
+                "candidate_target",
+                CRYPTO_LIVE_PATH_TRADE_CANDIDATES_TARGET,
+            ),
+            "spot_coverage_pct": 0.8,
+        },
+        "deployment": runtime_state["deployment"],
+        "policy_requirements": runtime_state["policy_requirements"],
+        "ready_assets": ready_assets,
+        "live_order_ready_assets": live_order_ready_assets,
+        "asset_reports": asset_reports,
+        "summary": {
+            "ready_count": len(ready_assets),
+            "requested_count": len(assets),
+            "live_switches_enabled": not switch_blockers,
+            "live_switch_blockers": switch_blockers,
+            "live_order_blockers": live_order_blockers,
+            "bnb_and_hype_shadow_note": "BNB and HYPE must stay shadow while spot is stale or proxy-only.",
+        },
+    }
+
+
+async def _run_crypto_live_path_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.crypto_live_path_command == "status":
+        result = await _crypto_live_path_status_payload(args, container)
+        print(json.dumps(result, indent=2, default=str))
+        if getattr(args, "require_ready", False):
+            return 0 if result["status"] == "ready" else 1
+        return 0
+
+    if args.crypto_live_path_command != "refresh":
+        raise ValueError(f"unknown crypto-live-path command {args.crypto_live_path_command}")
+
+    assets = _crypto_live_path_assets(args)
+    frequency = getattr(args, "frequency", "15m")
+    pre_status = await _crypto_live_path_status_payload(args, container)
+    asset_results: list[dict[str, Any]] = []
+    operation_errors: list[dict[str, Any]] = []
+    for asset in assets:
+        result: dict[str, Any] = {"asset": asset, "steps": {}, "errors": []}
+        try:
+            collect_open = await container.crypto_history_service.collect_open(
+                frequency=frequency,
+                asset_symbols=[asset],
+            )
+            result["steps"]["collect_open"] = _crypto_live_path_step_summary(collect_open)
+        except Exception as exc:  # pragma: no cover - surfaced in CLI JSON for operator action.
+            error = {"asset": asset, "step": "collect_open", "error": str(exc)}
+            result["errors"].append(error)
+            operation_errors.append(error)
+        try:
+            bootstrap = await container.crypto_history_service.bootstrap(
+                frequency=frequency,
+                days=args.history_days,
+                asset_symbols=[asset],
+            )
+            result["steps"]["history_bootstrap"] = _crypto_live_path_step_summary(bootstrap)
+        except Exception as exc:  # pragma: no cover
+            error = {"asset": asset, "step": "history_bootstrap", "error": str(exc)}
+            result["errors"].append(error)
+            operation_errors.append(error)
+        try:
+            spot_backfill = await container.crypto_spot_service.backfill(
+                frequency=frequency,
+                days=args.spot_days,
+                asset_symbols=[asset],
+            )
+            result["steps"]["spot_backfill"] = _crypto_live_path_step_summary(spot_backfill)
+        except Exception as exc:  # pragma: no cover
+            error = {"asset": asset, "step": "spot_backfill", "error": str(exc)}
+            result["errors"].append(error)
+            operation_errors.append(error)
+        try:
+            train = await container.crypto_model_service.train(
+                frequency=frequency,
+                asset_symbols=[asset],
+            )
+            result["steps"]["model_train"] = _crypto_live_path_step_summary(train)
+        except Exception as exc:  # pragma: no cover
+            error = {"asset": asset, "step": "model_train", "error": str(exc)}
+            result["errors"].append(error)
+            operation_errors.append(error)
+        try:
+            replay_run = await container.crypto_replay_service.run(
+                frequency=frequency,
+                days=args.replay_days,
+                limit=None,
+                asset_symbols=[asset],
+            )
+            result["steps"]["replay_run"] = _crypto_live_path_step_summary(replay_run)
+        except Exception as exc:  # pragma: no cover
+            error = {"asset": asset, "step": "replay_run", "error": str(exc)}
+            result["errors"].append(error)
+            operation_errors.append(error)
+        try:
+            replay_gate = await container.crypto_replay_service.gate(
+                frequency=frequency,
+                asset_symbols=[asset],
+            )
+            result["steps"]["replay_gate"] = _crypto_live_path_step_summary(replay_gate)
+        except Exception as exc:  # pragma: no cover
+            error = {"asset": asset, "step": "replay_gate", "error": str(exc)}
+            result["errors"].append(error)
+            operation_errors.append(error)
+        asset_results.append(result)
+
+    post_status = await _crypto_live_path_status_payload(args, container)
+    output = {
+        "schema_version": "crypto-live-path-v1",
+        "status": "completed" if not operation_errors else "completed_with_errors",
+        "pre_status": {
+            "status": pre_status["status"],
+            "ready_assets": pre_status["ready_assets"],
+            "summary": pre_status["summary"],
+        },
+        "asset_results": asset_results,
+        "post_status": post_status,
+        "operation_errors": operation_errors,
+    }
+    print(json.dumps(output, indent=2, default=str))
+    if operation_errors:
+        return 1
+    if getattr(args, "require_ready", False):
+        return 0 if post_status["status"] == "ready" else 1
+    return 0
+
+
 async def _run_reconcile_command(
     container: AppContainer,
     repo: PlatformRepository,
@@ -1179,6 +1663,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "crypto-asset-mode":
             return await _run_crypto_asset_mode_command(args, container)
+
+        if args.command == "crypto-live-path":
+            return await _run_crypto_live_path_command(args, container)
 
         if args.command == "model-quality":
             report = await build_model_quality_report(
@@ -2655,6 +3142,31 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_asset_mode_set)
     crypto_asset_mode_set.add_argument("symbol")
     crypto_asset_mode_set.add_argument("mode", choices=["off", "shadow", "live"])
+
+    crypto_live_path = subparsers.add_parser("crypto-live-path")
+    crypto_live_path_subparsers = crypto_live_path.add_subparsers(dest="crypto_live_path_command", required=True)
+    for name in ("status", "refresh"):
+        live_path_command = crypto_live_path_subparsers.add_parser(name)
+        add_kalshi_env_argument(live_path_command)
+        live_path_command.add_argument("--frequency", default="15m")
+        live_path_command.add_argument("--assets", nargs="*", default=None)
+        live_path_command.add_argument("--status-days", type=int, default=14)
+        live_path_command.add_argument(
+            "--strict-rows-target",
+            type=int,
+            default=CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET,
+        )
+        live_path_command.add_argument(
+            "--candidate-target",
+            type=int,
+            default=CRYPTO_LIVE_PATH_TRADE_CANDIDATES_TARGET,
+        )
+        live_path_command.add_argument("--require-ready", action="store_true")
+        live_path_command.add_argument("--json", action="store_true")
+        if name == "refresh":
+            live_path_command.add_argument("--history-days", type=int, default=2)
+            live_path_command.add_argument("--spot-days", type=int, default=2)
+            live_path_command.add_argument("--replay-days", type=int, default=30)
 
     model_quality = subparsers.add_parser("model-quality")
     model_quality_subparsers = model_quality.add_subparsers(dest="model_quality_command", required=True)
