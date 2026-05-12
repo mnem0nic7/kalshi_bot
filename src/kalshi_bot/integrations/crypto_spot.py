@@ -82,6 +82,22 @@ def _floor_time(value: datetime, interval_seconds: int) -> datetime:
     return datetime.fromtimestamp(ts - (ts % interval_seconds), UTC)
 
 
+def _parse_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return _utc(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return _utc(datetime.fromisoformat(text))
+    except ValueError:
+        return None
+
+
 class CoinbaseSpotClient:
     base_url = "https://api.exchange.coinbase.com"
 
@@ -157,6 +173,36 @@ class CoinbaseSpotClient:
             cursor = chunk_end
         deduped = {(row.provider, row.asset_symbol, row.end_ts): row for row in rows}
         return sorted(deduped.values(), key=lambda row: row.end_ts)
+
+    async def fetch_current(self, asset_symbol: str) -> SpotOHLC | None:
+        symbol = normalize_spot_asset_symbol(asset_symbol)
+        product_id = COINBASE_PRODUCT_IDS.get(symbol)
+        if product_id is None:
+            raise KeyError(f"coinbase unsupported asset: {symbol}")
+        response = await self.client.get(f"/products/{product_id}/ticker")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None
+        price = _decimal(payload.get("price"))
+        if price is None:
+            return None
+        now = datetime.now(UTC)
+        observed = min(_parse_datetime(payload.get("time")) or now, now)
+        return SpotOHLC(
+            provider="coinbase",
+            asset_symbol=symbol,
+            start_ts=None,
+            end_ts=observed,
+            open_dollars=None,
+            high_dollars=None,
+            low_dollars=None,
+            close_dollars=price,
+            volume=_decimal(payload.get("volume")),
+            source_kind="spot_tick",
+            source_id=product_id,
+            payload={"raw": payload, "product_id": product_id},
+        )
 
 
 class CoinGeckoSpotClient:
@@ -248,3 +294,44 @@ class CoinGeckoSpotClient:
                 )
             )
         return rows
+
+    async def fetch_current(self, asset_symbol: str) -> SpotOHLC | None:
+        symbol = normalize_spot_asset_symbol(asset_symbol)
+        coin_id = COINGECKO_IDS.get(symbol)
+        if coin_id is None:
+            raise KeyError(f"coingecko unsupported asset: {symbol}")
+        response = await self.client.get(
+            "/simple/price",
+            params={
+                "ids": coin_id,
+                "vs_currencies": "usd",
+                "include_last_updated_at": "true",
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None
+        raw = payload.get(coin_id)
+        if not isinstance(raw, dict):
+            return None
+        price = _decimal(raw.get("usd"))
+        if price is None:
+            return None
+        updated_at = raw.get("last_updated_at")
+        now = datetime.now(UTC)
+        observed = min(datetime.fromtimestamp(int(updated_at), UTC), now) if updated_at is not None else now
+        return SpotOHLC(
+            provider="coingecko",
+            asset_symbol=symbol,
+            start_ts=None,
+            end_ts=observed,
+            open_dollars=None,
+            high_dollars=None,
+            low_dollars=None,
+            close_dollars=price,
+            volume=None,
+            source_kind="spot_price_proxy",
+            source_id=coin_id,
+            payload={"raw": raw, "coin_id": coin_id, "proxy_ohlc": True, "current_price": True},
+        )

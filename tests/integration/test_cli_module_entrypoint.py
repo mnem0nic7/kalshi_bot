@@ -129,6 +129,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     history_settled_args = parser.parse_args(
         ["crypto-history", "collect-settled", "--kalshi-env", "production", "--frequency", "15m", "--days", "2", "--assets", "BTC", "--json"]
     )
+    spot_current_args = parser.parse_args(
+        ["crypto-spot", "collect-current", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "--json"]
+    )
     spot_args = parser.parse_args(["crypto-spot", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "--json"])
     model_args = parser.parse_args(["crypto-model", "train", "--kalshi-env", "production", "--frequency", "15m"])
     replay_args = parser.parse_args(["crypto-replay", "gate", "--kalshi-env", "production", "--frequency", "15m"])
@@ -177,6 +180,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert history_settled_args.crypto_history_command == "collect-settled"
     assert history_settled_args.days == 2
     assert history_settled_args.assets == ["BTC"]
+    assert spot_current_args.command == "crypto-spot"
+    assert spot_current_args.crypto_spot_command == "collect-current"
+    assert spot_current_args.assets == ["BTC"]
     assert spot_args.command == "crypto-spot"
     assert spot_args.crypto_spot_command == "status"
     assert spot_args.kalshi_env == "production"
@@ -260,6 +266,45 @@ def test_crypto_live_path_recommends_settled_backfill_when_labels_missing() -> N
     assert report["quote_evidence"]["strict_quote_ingestion_audit"]["blocker_stage"] == "missing_settled_label"
 
 
+def test_crypto_live_path_recommends_current_spot_when_spot_is_stale() -> None:
+    report = cli_module._crypto_live_path_assess_asset(
+        "BTC",
+        history_status={
+            "quote_evidence": {
+                "trade_candidate_support_by_asset": {"BTC": {"strict_trade_eligible_rows": 20}},
+                "strict_quote_ingestion_audit_by_asset": {
+                    "BTC": {
+                        "snapshot_present": 20,
+                        "settled_label_joined": 20,
+                        "spot_joined": 20,
+                        "strict_trade_eligible": 20,
+                        "blocker_stage": "candidate_generation_blocked",
+                    }
+                },
+            }
+        },
+        spot_status={
+            "spot_quality": {
+                "coverage_pct": 1.0,
+                "assets": {"BTC": {"row_count": 20}},
+                "missing_assets": [],
+                "stale_assets": ["BTC"],
+            }
+        },
+        runtime_state={
+            "deployment": {"kalshi_env": "production"},
+            "asset_modes": {"BTC": "shadow"},
+            "artifacts": {"BTC": {"model": {"status": "trained"}, "backtest": {}, "replay_gate": {"status": "blocked"}}},
+        },
+        strict_rows_target=60,
+        candidate_target=50,
+    )
+
+    assert report["next_command"] == (
+        "crypto-spot collect-current --kalshi-env production --frequency 15m --assets BTC --json"
+    )
+
+
 @pytest.mark.asyncio
 async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_status_payload(args: SimpleNamespace, container: SimpleNamespace) -> dict[str, object]:
@@ -282,6 +327,10 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
         async def backfill(self, **kwargs: object) -> dict[str, object]:
             calls.append(("spot_backfill", kwargs))
             return {"status": "ok"}
+
+        async def collect_current(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("spot_current", kwargs))
+            return {"status": "ok", "stored": 1}
 
     class ForecastService:
         async def train(self, **kwargs: object) -> dict[str, object]:
@@ -324,10 +373,33 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
         "collect_settled",
         "bootstrap",
         "spot_backfill",
+        "spot_current",
         "forecast_train",
         "replay_run",
         "replay_gate",
     ]
+
+
+@pytest.mark.asyncio
+async def test_crypto_spot_collect_current_command_outputs_json(capsys) -> None:
+    class SpotService:
+        async def collect_current(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs == {"frequency": "15m", "asset_symbols": ["BTC"]}
+            return {"status": "ok", "stored": 1, "asset_symbols": ["BTC"]}
+
+    args = SimpleNamespace(
+        crypto_spot_command="collect-current",
+        frequency="15m",
+        assets=["BTC"],
+    )
+    container = SimpleNamespace(crypto_spot_service=SpotService())
+
+    exit_code = await cli_module._run_crypto_spot_command(args, container)
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert output["status"] == "ok"
+    assert output["stored"] == 1
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,8 @@ import httpx
 import pytest
 
 from kalshi_bot.config import Settings
-from kalshi_bot.crypto.services import CryptoSpotService, _crypto_decision_rows
+from kalshi_bot.crypto.models import CryptoMarket
+from kalshi_bot.crypto.services import CryptoSpotService, _crypto_decision_rows, _crypto_live_market_row, _crypto_trade_candidates
 from kalshi_bot.db.models import CryptoSpotOHLCRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -63,6 +64,34 @@ async def test_coinbase_spot_client_parses_candles_with_end_time() -> None:
 
 
 @pytest.mark.asyncio
+async def test_coinbase_spot_client_parses_current_tick() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/products/BTC-USD/ticker"
+        return httpx.Response(
+            200,
+            json={"price": "108.25", "volume": "12.5", "time": "2020-09-13T12:26:41Z"},
+        )
+
+    client = CoinbaseSpotClient()
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url=client.base_url,
+        headers={"Accept": "application/json"},
+    )
+    try:
+        row = await client.fetch_current("BTC")
+    finally:
+        await client.aclose()
+
+    assert row is not None
+    assert row.provider == "coinbase"
+    assert row.source_kind == "spot_tick"
+    assert row.end_ts == datetime(2020, 9, 13, 12, 26, 41, tzinfo=UTC)
+    assert row.close_dollars == Decimal("108.25")
+
+
+@pytest.mark.asyncio
 async def test_coingecko_spot_client_buckets_price_history_as_proxy_ohlc() -> None:
     base_ms = int(datetime(2026, 5, 3, 9, 15, tzinfo=UTC).timestamp() * 1000)
 
@@ -109,6 +138,34 @@ async def test_coingecko_spot_client_buckets_price_history_as_proxy_ohlc() -> No
     assert rows[0].low_dollars == Decimal("100.0")
     assert rows[0].close_dollars == Decimal("101.0")
     assert rows[0].volume == Decimal("18.0")
+
+
+@pytest.mark.asyncio
+async def test_coingecko_spot_client_parses_current_proxy_price() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v3/simple/price"
+        return httpx.Response(
+            200,
+            json={"hyperliquid": {"usd": 42.5, "last_updated_at": 1_600_000_001}},
+        )
+
+    client = CoinGeckoSpotClient()
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url=client.base_url,
+        headers={"Accept": "application/json"},
+    )
+    try:
+        row = await client.fetch_current("HYPE")
+    finally:
+        await client.aclose()
+
+    assert row is not None
+    assert row.provider == "coingecko"
+    assert row.source_kind == "spot_price_proxy"
+    assert row.end_ts == datetime.fromtimestamp(1_600_000_001, UTC)
+    assert row.close_dollars == Decimal("42.5")
 
 
 def test_decision_rows_join_only_prior_spot_candles() -> None:
@@ -170,6 +227,228 @@ def test_decision_rows_join_only_prior_spot_candles() -> None:
     assert rows[0]["spot_close_dollars"] == Decimal("99.00000000")
     assert rows[0]["spot_provider"] == "coinbase"
     assert rows[0]["strict_trade_eligible"] is True
+
+
+def test_historical_spot_ohlc_uses_alignment_window_not_live_freshness() -> None:
+    decision_ts = datetime(2026, 5, 12, 12, 11, tzinfo=UTC)
+    snapshot = type(
+        "_Snapshot",
+        (),
+        {
+            "market_ticker": "KXBTC15M-HISTORICAL-SPOT",
+            "series_ticker": "KXBTC15M",
+            "asset_symbol": "BTC",
+            "frequency": "15m",
+            "source_kind": "historical",
+            "settlement_result": "yes",
+            "observed_at": decision_ts,
+            "close_time": decision_ts + timedelta(minutes=4),
+            "expected_expiration_time": decision_ts + timedelta(minutes=4),
+            "target_price_dollars": Decimal("100.00000000"),
+            "yes_bid_dollars": Decimal("0.4500"),
+            "yes_ask_dollars": Decimal("0.4700"),
+            "no_ask_dollars": Decimal("0.5500"),
+            "last_price_dollars": Decimal("0.4600"),
+            "volume": 10,
+            "open_interest": 5,
+            "payload": {},
+        },
+    )()
+    spot = CryptoSpotOHLCRecord(
+        kalshi_env="demo",
+        provider="coinbase",
+        asset_symbol="BTC",
+        quote_currency="USD",
+        frequency="15m",
+        interval_seconds=900,
+        start_ts=datetime(2026, 5, 12, 11, 45, tzinfo=UTC),
+        end_ts=datetime(2026, 5, 12, 12, 0, tzinfo=UTC),
+        close_dollars=Decimal("99.00000000"),
+        source_kind="spot_ohlc",
+        observed_at=decision_ts,
+        payload={},
+    )
+
+    rows = _crypto_decision_rows([snapshot], [], [spot])  # type: ignore[list-item]
+
+    assert rows[0]["spot_context_mode"] == "historical"
+    assert rows[0]["spot_feature_status"] == "available"
+    assert rows[0]["spot_stale_seconds"] == 660
+    assert rows[0]["spot_max_stale_seconds"] == 905
+
+
+def test_historical_spot_ohlc_stales_after_alignment_window() -> None:
+    decision_ts = datetime(2026, 5, 12, 12, 15, 6, tzinfo=UTC)
+    snapshot = type(
+        "_Snapshot",
+        (),
+        {
+            "market_ticker": "KXBTC15M-HISTORICAL-STALE-SPOT",
+            "series_ticker": "KXBTC15M",
+            "asset_symbol": "BTC",
+            "frequency": "15m",
+            "source_kind": "historical",
+            "settlement_result": "yes",
+            "observed_at": decision_ts,
+            "close_time": decision_ts + timedelta(minutes=4),
+            "expected_expiration_time": decision_ts + timedelta(minutes=4),
+            "target_price_dollars": Decimal("100.00000000"),
+            "yes_bid_dollars": Decimal("0.4500"),
+            "yes_ask_dollars": Decimal("0.4700"),
+            "no_ask_dollars": Decimal("0.5500"),
+            "last_price_dollars": Decimal("0.4600"),
+            "volume": 10,
+            "open_interest": 5,
+            "payload": {},
+        },
+    )()
+    spot = CryptoSpotOHLCRecord(
+        kalshi_env="demo",
+        provider="coinbase",
+        asset_symbol="BTC",
+        quote_currency="USD",
+        frequency="15m",
+        interval_seconds=900,
+        start_ts=datetime(2026, 5, 12, 11, 45, tzinfo=UTC),
+        end_ts=datetime(2026, 5, 12, 12, 0, tzinfo=UTC),
+        close_dollars=Decimal("99.00000000"),
+        source_kind="spot_ohlc",
+        observed_at=decision_ts,
+        payload={},
+    )
+
+    rows = _crypto_decision_rows([snapshot], [], [spot])  # type: ignore[list-item]
+
+    assert rows[0]["spot_feature_status"] == "stale"
+    assert rows[0]["spot_stale_seconds"] == 906
+    assert rows[0]["spot_max_stale_seconds"] == 905
+
+
+def test_historical_coingecko_spot_is_available_but_proxy_only(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    decision_ts = datetime(2026, 5, 12, 12, 11, tzinfo=UTC)
+    snapshot = type(
+        "_Snapshot",
+        (),
+        {
+            "market_ticker": "KXHYPE15M-HISTORICAL-PROXY-SPOT",
+            "series_ticker": "KXHYPE15M",
+            "asset_symbol": "HYPE",
+            "frequency": "15m",
+            "source_kind": "historical",
+            "settlement_result": "yes",
+            "observed_at": decision_ts,
+            "close_time": decision_ts + timedelta(minutes=4),
+            "expected_expiration_time": decision_ts + timedelta(minutes=4),
+            "target_price_dollars": Decimal("40.00000000"),
+            "yes_bid_dollars": Decimal("0.4500"),
+            "yes_ask_dollars": Decimal("0.4700"),
+            "no_ask_dollars": Decimal("0.5500"),
+            "last_price_dollars": Decimal("0.4600"),
+            "volume": 10,
+            "open_interest": 5,
+            "payload": {},
+        },
+    )()
+    spot = CryptoSpotOHLCRecord(
+        kalshi_env="demo",
+        provider="coingecko",
+        asset_symbol="HYPE",
+        quote_currency="USD",
+        frequency="15m",
+        interval_seconds=900,
+        start_ts=datetime(2026, 5, 12, 11, 45, tzinfo=UTC),
+        end_ts=datetime(2026, 5, 12, 12, 0, tzinfo=UTC),
+        close_dollars=Decimal("41.00000000"),
+        source_kind="spot_price_proxy",
+        observed_at=decision_ts,
+        payload={},
+    )
+
+    row = _crypto_decision_rows([snapshot], [], [spot], settings=settings)[0]  # type: ignore[list-item]
+    candidates = _crypto_trade_candidates(row, Decimal("0.9000"), settings=settings)
+
+    assert row["spot_feature_status"] == "available"
+    assert row["spot_proxy_only"] is True
+    assert {candidate["candidate_status"] for candidate in candidates} == {"prediction_only_proxy_quote"}
+    assert {candidate["reason"] for candidate in candidates} == {"spot_source_proxy_only"}
+
+
+def test_live_spot_tick_allows_live_quality_candidate(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=50)
+    now = datetime.now(UTC)
+    market = CryptoMarket(
+        market_ticker="KXBTC15M-LIVE-TICK",
+        series_ticker="KXBTC15M",
+        asset_symbol="BTC",
+        frequency="15m",
+        target_price_dollars=Decimal("100.00000000"),
+        yes_bid_dollars=Decimal("0.4500"),
+        yes_ask_dollars=Decimal("0.4700"),
+        no_ask_dollars=Decimal("0.5500"),
+        last_price_dollars=Decimal("0.4600"),
+        close_time=now + timedelta(minutes=5),
+        status="open",
+    )
+    spot = CryptoSpotOHLCRecord(
+        kalshi_env="demo",
+        provider="coinbase",
+        asset_symbol="BTC",
+        quote_currency="USD",
+        frequency="15m",
+        interval_seconds=900,
+        start_ts=None,
+        end_ts=now - timedelta(seconds=1),
+        close_dollars=Decimal("99.00000000"),
+        source_kind="spot_tick",
+        observed_at=now,
+        payload={},
+    )
+
+    row = _crypto_live_market_row(market, spot_rows=[spot], settings=settings)
+    candidates = _crypto_trade_candidates(row, Decimal("0.9000"), settings=settings)
+
+    assert row["spot_context_mode"] == "live"
+    assert row["spot_feature_status"] == "available"
+    assert row["spot_proxy_only"] is False
+    assert any(candidate["candidate_status"] == "live_quality" for candidate in candidates)
+
+
+def test_live_ohlc_alone_uses_strict_live_freshness() -> None:
+    now = datetime.now(UTC)
+    market = CryptoMarket(
+        market_ticker="KXBTC15M-LIVE-OHLC",
+        series_ticker="KXBTC15M",
+        asset_symbol="BTC",
+        frequency="15m",
+        target_price_dollars=Decimal("100.00000000"),
+        yes_bid_dollars=Decimal("0.4500"),
+        yes_ask_dollars=Decimal("0.4700"),
+        no_ask_dollars=Decimal("0.5500"),
+        last_price_dollars=Decimal("0.4600"),
+        close_time=now + timedelta(minutes=5),
+        status="open",
+    )
+    spot = CryptoSpotOHLCRecord(
+        kalshi_env="demo",
+        provider="coinbase",
+        asset_symbol="BTC",
+        quote_currency="USD",
+        frequency="15m",
+        interval_seconds=900,
+        start_ts=now - timedelta(minutes=30),
+        end_ts=now - timedelta(minutes=15),
+        close_dollars=Decimal("99.00000000"),
+        source_kind="spot_ohlc",
+        observed_at=now,
+        payload={},
+    )
+
+    row = _crypto_live_market_row(market, spot_rows=[spot])
+
+    assert row["spot_context_mode"] == "live"
+    assert row["spot_feature_status"] == "stale"
+    assert row["spot_max_stale_seconds"] == 5
 
 
 @pytest.mark.asyncio

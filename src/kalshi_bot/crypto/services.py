@@ -88,6 +88,8 @@ CRYPTO_SPOT_MAX_STALE_SECONDS_BY_PROVIDER = {
     "coinbase": 5,
     "coingecko": 90,
 }
+CRYPTO_SPOT_CONTEXT_HISTORICAL = "historical"
+CRYPTO_SPOT_CONTEXT_LIVE = "live"
 CRYPTO_MODEL_CANDIDATE_NAMES = (
     "market_mid_baseline",
     "current_heuristic",
@@ -1363,6 +1365,77 @@ class CryptoSpotService:
         self.settings = settings
         self.session_factory = session_factory
 
+    async def collect_current(
+        self,
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        freq = normalize_frequency(frequency) or "15m"
+        assets = await self._asset_symbols(asset_symbols=asset_symbols, frequency=freq)
+        provider_stats: dict[str, dict[str, Any]] = defaultdict(lambda: {"stored": 0, "assets": [], "errors": []})
+        stored_total = 0
+        coinbase = CoinbaseSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
+        coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
+        try:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                for asset in assets:
+                    row: SpotOHLC | None = None
+                    attempted: list[str] = []
+                    if asset in COINBASE_PRODUCT_IDS:
+                        attempted.append("coinbase")
+                        try:
+                            row = await coinbase.fetch_current(asset)
+                        except Exception as exc:
+                            provider_stats["coinbase"]["errors"].append({"asset_symbol": asset, "error": str(exc)})
+                    if row is None and asset in COINGECKO_IDS:
+                        attempted.append("coingecko")
+                        try:
+                            row = await coingecko.fetch_current(asset)
+                        except Exception as exc:
+                            provider_stats["coingecko"]["errors"].append({"asset_symbol": asset, "error": str(exc)})
+                    if row is None:
+                        provider_stats["none"]["errors"].append(
+                            {
+                                "asset_symbol": asset,
+                                "error": "no_current_spot_returned",
+                                "attempted": attempted,
+                            }
+                        )
+                        continue
+                    stored = await self._store_rows(repo, [row], frequency=freq, interval_seconds=0)
+                    provider_stats[row.provider]["stored"] += stored
+                    provider_stats[row.provider]["assets"].append(asset)
+                    stored_total += stored
+                await session.commit()
+                since = datetime.now(UTC) - timedelta(days=1)
+                spot_rows = await repo.list_crypto_spot_ohlc(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=assets,
+                    since=since,
+                    limit=100_000,
+                )
+                await session.commit()
+        finally:
+            await coinbase.aclose()
+            await coingecko.aclose()
+        return {
+            "status": "ok",
+            "kalshi_env": self.settings.kalshi_env,
+            "frequency": freq,
+            "asset_symbols": assets,
+            "stored": stored_total,
+            "providers": {key: {**value, "error_count": len(value["errors"])} for key, value in provider_stats.items()},
+            "spot_quality": _crypto_spot_quality(
+                spot_rows,
+                expected_assets=assets,
+                min_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
+                settings=self.settings,
+            ),
+        }
+
     async def backfill(
         self,
         *,
@@ -1550,10 +1623,12 @@ class CryptoForecastService:
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
         agent_pack_service: AgentPackService | None = None,
+        spot_service: CryptoSpotService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.agent_pack_service = agent_pack_service or AgentPackService(settings)
+        self.spot_service = spot_service
 
     async def train(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
@@ -1702,6 +1777,19 @@ class CryptoForecastService:
         features = self.features(market)
         if not self.settings.crypto_enabled or not self.settings.crypto_15m_enabled:
             return self._stand_down(market, StandDownReason.CRYPTO_DISABLED, "Crypto trading workflow is disabled.", features)
+        if self.spot_service is not None:
+            try:
+                await self.spot_service.collect_current(
+                    frequency=market.frequency,
+                    asset_symbols=[market.asset_symbol],
+                )
+            except Exception:
+                logger.warning(
+                    "crypto current spot refresh failed asset=%s frequency=%s",
+                    market.asset_symbol,
+                    market.frequency,
+                    exc_info=True,
+                )
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             artifact = await _latest_crypto_artifact_for_asset(
@@ -3266,6 +3354,7 @@ def _crypto_live_market_row(
             target_price=market.target_price_dollars,
             mid_yes=_clamp_price(mid),
             settings=settings,
+            mode=CRYPTO_SPOT_CONTEXT_LIVE,
         )
     )
     return row
@@ -3570,6 +3659,7 @@ def _crypto_quote_evidence_summary(
         asset_snapshots = [row for row in snapshots if normalize_asset_symbol(row.asset_symbol) == normalize_asset_symbol(asset)]
         asset_decisions = [row for row in decision_rows if normalize_asset_symbol(str(row.get("asset_symbol") or "")) == normalize_asset_symbol(asset)]
         candidate_generated = 0
+        eligible_candidate_generated = 0
         if settings is not None:
             for row in asset_decisions:
                 if row.get("label_yes") not in {0, 1}:
@@ -3577,6 +3667,8 @@ def _crypto_quote_evidence_summary(
                 candidates = _crypto_trade_candidates(row, _decimal(row.get("mid_yes_dollars") or Decimal("0.5000")), settings=settings)
                 if candidates:
                     candidate_generated += 1
+                if any(candidate.get("status") == "eligible" for candidate in candidates):
+                    eligible_candidate_generated += 1
         counts = {
             "snapshot_present": len(asset_snapshots),
             "real_bid_ask_present": sum(
@@ -3588,8 +3680,16 @@ def _crypto_quote_evidence_summary(
             "settled_label_joined": sum(1 for row in asset_decisions if row.get("label_yes") in {0, 1}),
             "point_in_time_rows": sum(1 for row in asset_decisions if row.get("leakage_status") == "point_in_time"),
             "spot_joined": sum(1 for row in asset_decisions if row.get("spot_feature_status") == "available"),
+            "spot_stale_blocked": sum(1 for row in asset_decisions if row.get("spot_feature_status") == "stale"),
+            "spot_proxy_only": sum(
+                1
+                for row in asset_decisions
+                if bool(row.get("spot_proxy_only"))
+                or _crypto_spot_is_proxy(row.get("spot_provider"), row.get("spot_source_kind"))
+            ),
             "strict_trade_eligible": sum(1 for row in asset_decisions if row.get("strict_trade_eligible")),
             "candidate_generated": candidate_generated,
+            "eligible_candidate_generated": eligible_candidate_generated,
         }
         strict_quote_ingestion_audit[normalize_asset_symbol(asset)] = {
             **counts,
@@ -3639,7 +3739,9 @@ def _crypto_strict_quote_blocker_stage(counts: dict[str, Any]) -> str:
         return "missing_spot_join"
     if int(counts.get("strict_trade_eligible") or 0) <= 0:
         return "missing_strict_trade_eligible"
-    if int(counts.get("candidate_generated") or 0) <= 0:
+    if int(counts.get("eligible_candidate_generated") or 0) <= 0:
+        if int(counts.get("spot_proxy_only") or 0) >= int(counts.get("spot_joined") or 0):
+            return "spot_source_proxy_only"
         return "candidate_generation_blocked"
     return "candidate_generated"
 
@@ -3796,6 +3898,7 @@ def _crypto_decision_rows(
             target_price=snapshot.target_price_dollars or (settlement_snapshot.target_price_dollars if settlement_snapshot is not None else None),
             mid_yes=_clamp_price(mid),
             settings=settings,
+            mode=CRYPTO_SPOT_CONTEXT_HISTORICAL,
         )
         strict_trade_eligible = quote_source == "snapshot_quotes"
         market_age_seconds = _crypto_market_age_seconds(decision_ts, getattr(snapshot, "open_time", None))
@@ -3862,6 +3965,7 @@ def _crypto_decision_rows(
                 target_price=snapshot.target_price_dollars,
                 mid_yes=mid,
                 settings=settings,
+                mode=CRYPTO_SPOT_CONTEXT_HISTORICAL,
             )
             rows.append(
                 {
@@ -3954,11 +4058,29 @@ def _crypto_spot_max_stale_seconds(
     return CRYPTO_SPOT_MAX_STALE_SECONDS_BY_PROVIDER["coinbase"]
 
 
+def _crypto_spot_max_context_gap_seconds(
+    provider: str | None,
+    source_kind: str | None,
+    *,
+    mode: str,
+    interval_seconds: int | None,
+    settings: Settings | None = None,
+) -> int:
+    live_limit = _crypto_spot_max_stale_seconds(provider, source_kind, settings=settings)
+    if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
+        interval = 900 if interval_seconds is None else int(interval_seconds)
+        return max(0, interval) + live_limit
+    return live_limit
+
+
 def _crypto_spot_is_proxy(provider: str | None, source_kind: str | None) -> bool:
-    return (
-        str(source_kind or "").strip().lower() != "spot_ohlc"
-        or str(provider or "").strip().lower() == "coingecko"
-    )
+    provider_key = str(provider or "").strip().lower()
+    source_key = str(source_kind or "").strip().lower()
+    if not provider_key and not source_key:
+        return False
+    if provider_key == "coinbase" and source_key in {"spot_ohlc", "spot_tick"}:
+        return False
+    return source_key not in {"spot_ohlc", "spot_tick"} or provider_key == "coingecko"
 
 
 def _spot_context_for_decision(
@@ -3969,6 +4091,7 @@ def _spot_context_for_decision(
     target_price: Decimal | None,
     mid_yes: Decimal,
     settings: Settings | None = None,
+    mode: str = CRYPTO_SPOT_CONTEXT_HISTORICAL,
 ) -> dict[str, Any]:
     decision_utc = _as_utc_datetime(decision_ts)
     if spot_end_times is not None:
@@ -3985,6 +4108,7 @@ def _spot_context_for_decision(
             "spot_provider": None,
             "spot_source_kind": None,
             "spot_proxy_only": None,
+            "spot_context_mode": mode,
             "spot_observed_end_ts": None,
             "spot_stale_seconds": None,
             "spot_max_stale_seconds": None,
@@ -4002,7 +4126,13 @@ def _spot_context_for_decision(
     current = eligible[-1]
     close = _decimal(current.close_dollars)
     stale_seconds = int((decision_utc - _as_utc_datetime(current.end_ts)).total_seconds())
-    max_stale_seconds = _crypto_spot_max_stale_seconds(current.provider, current.source_kind, settings=settings)
+    max_stale_seconds = _crypto_spot_max_context_gap_seconds(
+        current.provider,
+        current.source_kind,
+        mode=mode,
+        interval_seconds=getattr(current, "interval_seconds", None),
+        settings=settings,
+    )
     proxy_source = _crypto_spot_is_proxy(current.provider, current.source_kind)
     stale = stale_seconds > max_stale_seconds
     prior = eligible[-2] if len(eligible) >= 2 else None
@@ -4041,6 +4171,7 @@ def _spot_context_for_decision(
         "spot_provider": current.provider,
         "spot_source_kind": current.source_kind,
         "spot_proxy_only": proxy_source,
+        "spot_context_mode": mode,
         "spot_observed_end_ts": _as_utc_datetime(current.end_ts),
         "spot_stale_seconds": stale_seconds,
         "spot_max_stale_seconds": max_stale_seconds,

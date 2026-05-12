@@ -685,7 +685,12 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
 
 async def _run_crypto_spot_command(args: argparse.Namespace, container: AppContainer) -> int:
     asset_symbols = args.assets if getattr(args, "assets", None) else None
-    if args.crypto_spot_command == "backfill":
+    if args.crypto_spot_command == "collect-current":
+        result = await container.crypto_spot_service.collect_current(
+            frequency=args.frequency,
+            asset_symbols=asset_symbols,
+        )
+    elif args.crypto_spot_command == "backfill":
         result = await container.crypto_spot_service.backfill(
             days=args.days,
             frequency=args.frequency,
@@ -1184,6 +1189,14 @@ def _crypto_live_path_assess_asset(
             f"--assets {asset} "
             "--json"
         )
+    elif not ready and (asset in missing_assets or asset in stale_assets):
+        next_command = (
+            "crypto-spot collect-current "
+            f"--kalshi-env {_crypto_live_path_env(runtime_state)} "
+            "--frequency 15m "
+            f"--assets {asset} "
+            "--json"
+        )
     elif ready and mode != "live":
         next_command = f"crypto-asset-mode set --kalshi-env {_crypto_live_path_env(runtime_state)} {asset} live"
 
@@ -1377,6 +1390,16 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
                 result["steps"]["spot_backfill"] = _crypto_live_path_step_summary(spot_backfill)
             except Exception as exc:  # pragma: no cover
                 error = {"asset": asset, "step": "spot_backfill", "error": str(exc), "iteration": iteration}
+                result["errors"].append(error)
+                operation_errors.append(error)
+            try:
+                spot_current = await container.crypto_spot_service.collect_current(
+                    frequency=frequency,
+                    asset_symbols=[asset],
+                )
+                result["steps"]["spot_current"] = _crypto_live_path_step_summary(spot_current)
+            except Exception as exc:  # pragma: no cover
+                error = {"asset": asset, "step": "spot_current", "error": str(exc), "iteration": iteration}
                 result["errors"].append(error)
                 operation_errors.append(error)
             try:
@@ -3335,6 +3358,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     crypto_spot = subparsers.add_parser("crypto-spot")
     crypto_spot_subparsers = crypto_spot.add_subparsers(dest="crypto_spot_command", required=True)
+    crypto_spot_current = crypto_spot_subparsers.add_parser("collect-current")
+    add_kalshi_env_argument(crypto_spot_current)
+    crypto_spot_current.add_argument("--frequency", default="15m")
+    crypto_spot_current.add_argument("--assets", nargs="*", default=None)
+    crypto_spot_current.add_argument("--json", action="store_true")
     crypto_spot_backfill = crypto_spot_subparsers.add_parser("backfill")
     add_kalshi_env_argument(crypto_spot_backfill)
     crypto_spot_backfill.add_argument("--days", type=int, default=180)

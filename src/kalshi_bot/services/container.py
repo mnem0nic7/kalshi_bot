@@ -211,14 +211,15 @@ class AppContainer:
             agent_pack_service=agent_pack_service,
             asset_control_service=crypto_asset_control_service,
         )
+        crypto_spot_service = CryptoSpotService(
+            settings=settings,
+            session_factory=session_factory,
+        )
         crypto_forecast_service = CryptoForecastService(
             settings=settings,
             session_factory=session_factory,
             agent_pack_service=agent_pack_service,
-        )
-        crypto_spot_service = CryptoSpotService(
-            settings=settings,
-            session_factory=session_factory,
+            spot_service=crypto_spot_service,
         )
         crypto_replay_service = CryptoReplayService(
             settings=settings,

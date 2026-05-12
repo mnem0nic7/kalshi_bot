@@ -982,6 +982,13 @@ async def test_crypto_forecast_uses_deterministic_model_artifact(tmp_path) -> No
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     await init_models(engine)
+    current_spot_calls: list[dict[str, object]] = []
+
+    class _SpotService:
+        async def collect_current(self, **kwargs: object) -> dict[str, object]:
+            current_spot_calls.append(kwargs)
+            return {"status": "ok", "stored": 1}
+
     async with session_factory() as session:
         repo = PlatformRepository(session)
         await repo.record_crypto_model_artifact(
@@ -1013,11 +1020,16 @@ async def test_crypto_forecast_uses_deterministic_model_artifact(tmp_path) -> No
         )
         await session.commit()
 
-    signal = await CryptoForecastService(settings=settings, session_factory=session_factory).forecast(_market())
+    signal = await CryptoForecastService(
+        settings=settings,
+        session_factory=session_factory,
+        spot_service=_SpotService(),  # type: ignore[arg-type]
+    ).forecast(_market())
 
     assert signal.recommended_side == ContractSide.YES
     assert signal.edge_bps > 50
     assert signal.candidate_trace["model_version"] == "test-model"
+    assert current_spot_calls == [{"frequency": "15m", "asset_symbols": ["BTC"]}]
     await engine.dispose()
 
 
