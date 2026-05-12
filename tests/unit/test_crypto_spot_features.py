@@ -8,13 +8,19 @@ from cryptography.hazmat.primitives.asymmetric import ec
 import httpx
 import pytest
 
+import kalshi_bot.crypto.services as crypto_services
 from kalshi_bot.config import Settings
 from kalshi_bot.crypto.models import CryptoMarket
 from kalshi_bot.crypto.services import CryptoSpotService, _crypto_decision_rows, _crypto_live_market_row, _crypto_trade_candidates
 from kalshi_bot.db.models import CryptoSpotOHLCRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
-from kalshi_bot.integrations.crypto_spot import CoinbaseCdpCredentials, CoinbaseSpotClient, CoinGeckoSpotClient
+from kalshi_bot.integrations.crypto_spot import (
+    CoinbaseCdpCredentials,
+    CoinbaseSpotClient,
+    CoinGeckoSpotClient,
+    SpotOHLC,
+)
 
 
 def _settings(tmp_path, **overrides) -> Settings:
@@ -650,3 +656,91 @@ async def test_crypto_spot_service_status_reports_coverage(tmp_path) -> None:
     assert status["spot_quality"]["coverage_pct"] == 1.0
     assert status["spot_quality"]["assets"]["BTC"]["provider_counts"] == {"coinbase": 1}
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_spot_service_does_not_use_proxy_fallback_by_default(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    class CoinbaseUnavailable:
+        async def fetch_current(self, asset_symbol: str) -> None:
+            del asset_symbol
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    class ProxyShouldNotBeCreated:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise AssertionError("proxy fallback should be disabled by default")
+
+    monkeypatch.setattr(crypto_services, "CoinbaseSpotClient", lambda **kwargs: CoinbaseUnavailable())
+    monkeypatch.setattr(crypto_services, "CoinGeckoSpotClient", ProxyShouldNotBeCreated)
+
+    try:
+        result = await CryptoSpotService(settings=settings, session_factory=session_factory).collect_current(
+            frequency="15m",
+            asset_symbols=["HYPE"],
+        )
+    finally:
+        await engine.dispose()
+
+    assert result["proxy_fallback_enabled"] is False
+    assert result["stored"] == 0
+    assert "coingecko" not in result["providers"]
+    assert result["providers"]["none"]["errors"][0]["attempted"] == ["coinbase"]
+
+
+@pytest.mark.asyncio
+async def test_crypto_spot_service_proxy_fallback_requires_explicit_opt_in(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path, crypto_spot_proxy_fallback_enabled=True)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    now = datetime.now(UTC)
+
+    class CoinbaseUnavailable:
+        async def fetch_current(self, asset_symbol: str) -> None:
+            del asset_symbol
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    class ExplicitProxyFallback:
+        async def fetch_current(self, asset_symbol: str) -> SpotOHLC:
+            return SpotOHLC(
+                provider="coingecko",
+                asset_symbol=asset_symbol,
+                start_ts=None,
+                end_ts=now - timedelta(seconds=1),
+                open_dollars=None,
+                high_dollars=None,
+                low_dollars=None,
+                close_dollars=Decimal("42.0"),
+                source_kind="spot_price_proxy",
+                source_id=asset_symbol,
+                payload={},
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(crypto_services, "CoinbaseSpotClient", lambda **kwargs: CoinbaseUnavailable())
+    monkeypatch.setattr(crypto_services, "CoinGeckoSpotClient", lambda **kwargs: ExplicitProxyFallback())
+
+    try:
+        result = await CryptoSpotService(settings=settings, session_factory=session_factory).collect_current(
+            frequency="15m",
+            asset_symbols=["HYPE"],
+        )
+    finally:
+        await engine.dispose()
+
+    assert result["proxy_fallback_enabled"] is True
+    assert result["stored"] == 1
+    assert result["providers"]["coingecko"]["stored"] == 1

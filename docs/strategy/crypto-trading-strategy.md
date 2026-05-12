@@ -65,7 +65,7 @@ In scope:
 - Kalshi 15-minute crypto markets
 - live Kalshi bid/ask quote snapshots
 - market candlesticks from Kalshi history
-- spot OHLC/price evidence from Coinbase and CoinGecko
+- spot OHLC/price evidence from Coinbase; proxy fallback is disabled by default
 - Coinbase current tick, best-bid/ask, and recent trade microstructure for supported assets
 - per-asset model, backtest, replay-gate, and live-path artifacts
 - per-asset live/shadow/off controls
@@ -191,7 +191,7 @@ Before a candidate can be trusted for live mode:
 - the replay gate must be evaluated against the active runtime crypto policy
 
 BNB and HYPE previously required special caution because spot support was
-CoinGecko/proxy-only. As of May 12, 2026, the Coinbase CDP-backed product check
+proxy-only. As of May 12, 2026, the Coinbase CDP-backed product check
 returns online `BNB-USD` and `HYPE-USD`, so they can collect non-proxy Coinbase
 spot ticks. They still remain shadow until their own strict-row, replay, P/L,
 and asset-mode gates pass.

@@ -549,7 +549,10 @@ class OvernightReadinessService:
             asset_symbols=asset_symbols,
             modes=self.crypto_asset_control_service.modes_from_notes(getattr(control_for_modes, "notes", None)),
         )
-        expected_assets = sorted(set(asset_symbols) | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS))
+        expected_assets_set = set(asset_symbols) | set(COINBASE_PRODUCT_IDS)
+        if self.settings.crypto_spot_proxy_fallback_enabled:
+            expected_assets_set.update(COINGECKO_IDS)
+        expected_assets = sorted(expected_assets_set)
         data_quality = _crypto_data_quality(
             snapshots,
             candles,

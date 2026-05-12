@@ -101,7 +101,7 @@ Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In test
 - `kalshi.py` — REST (RSA-signed) + WebSocket client
 - `weather.py` — NWS/NOAA ingestion
 - `forecast_archive.py` — Open-Meteo historical weather recovery
-- `crypto_spot.py` — Coinbase + CoinGecko OHLC spot feeds
+- `crypto_spot.py` — Coinbase OHLC/current spot feeds; proxy fallback is opt-in only
 
 ### Learning sub-package (`learning/`)
 Drift watcher and parameter-search utilities used by the self-improve and strategy-evolution pipelines.

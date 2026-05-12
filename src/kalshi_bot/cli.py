@@ -1170,12 +1170,10 @@ def _crypto_live_path_assess_asset(
 
     source_kind_counts = spot_asset.get("source_kind_counts") or {}
     provider_counts = spot_asset.get("provider_counts") or {}
-    if asset in {"BNB", "HYPE"}:
-        warnings.append("special monitoring: spot support is expected to rely on a Coingecko proxy")
     if source_kind_counts.get("spot_price_proxy") and not source_kind_counts.get("spot_ohlc"):
         warnings.append("spot source is proxy-only")
     if provider_counts and set(provider_counts.keys()) == {"coingecko"}:
-        warnings.append("spot provider is Coingecko-only")
+        warnings.append("spot provider is proxy-only; Coinbase source is required for live quality")
 
     ready = not blockers
     mode = (runtime_state.get("asset_modes") or {}).get(asset, "shadow")
@@ -1327,7 +1325,7 @@ async def _crypto_live_path_status_payload(
             "live_switches_enabled": not switch_blockers,
             "live_switch_blockers": switch_blockers,
             "live_order_blockers": live_order_blockers,
-            "bnb_and_hype_shadow_note": "BNB and HYPE must stay shadow while spot is stale or proxy-only.",
+            "bnb_and_hype_shadow_note": "BNB and HYPE use Coinbase spot, but must stay shadow until their own strict-row, replay, P/L, and asset-mode gates pass.",
         },
     }
 

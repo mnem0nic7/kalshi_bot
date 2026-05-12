@@ -747,7 +747,7 @@ class CryptoMarketService:
             expected_assets=(
                 requested_assets
                 if requested_assets
-                else sorted({row.asset_symbol for row in all_snapshots} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS))
+                else _crypto_expected_spot_assets(self.settings, observed_assets={row.asset_symbol for row in all_snapshots})
             ),
             min_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
             settings=self.settings,
@@ -1168,7 +1168,10 @@ class CryptoHistoryService:
                 limit=1_000_000,
             )
             await session.commit()
-        asset_symbols = sorted({row.asset_symbol for row in snapshots} | {row.asset_symbol for row in candles} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS))
+        asset_symbols = _crypto_expected_spot_assets(
+            self.settings,
+            observed_assets={row.asset_symbol for row in snapshots} | {row.asset_symbol for row in candles},
+        )
         quote_rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
         return {
             "status": "ok",
@@ -1384,7 +1387,7 @@ class CryptoSpotService:
         *,
         asset_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
-        assets = sorted({normalize_asset_symbol(symbol) for symbol in asset_symbols}) if asset_symbols else sorted(set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS))
+        assets = sorted({normalize_asset_symbol(symbol) for symbol in asset_symbols}) if asset_symbols else sorted(COINBASE_PRODUCT_IDS)
         coinbase = self._coinbase_client()
         products: dict[str, Any] = {}
         try:
@@ -1423,7 +1426,8 @@ class CryptoSpotService:
         provider_stats: dict[str, dict[str, Any]] = defaultdict(lambda: {"stored": 0, "assets": [], "errors": []})
         stored_total = 0
         coinbase = self._coinbase_client()
-        coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
+        proxy_fallback_enabled = bool(self.settings.crypto_spot_proxy_fallback_enabled)
+        coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds) if proxy_fallback_enabled else None
         try:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -1436,7 +1440,7 @@ class CryptoSpotService:
                             row = await coinbase.fetch_current(asset)
                         except Exception as exc:
                             provider_stats["coinbase"]["errors"].append({"asset_symbol": asset, "error": str(exc)})
-                    if row is None and asset in COINGECKO_IDS:
+                    if row is None and proxy_fallback_enabled and asset in COINGECKO_IDS and coingecko is not None:
                         attempted.append("coingecko")
                         try:
                             row = await coingecko.fetch_current(asset)
@@ -1467,13 +1471,15 @@ class CryptoSpotService:
                 await session.commit()
         finally:
             await coinbase.aclose()
-            await coingecko.aclose()
+            if coingecko is not None:
+                await coingecko.aclose()
         return {
             "status": "ok",
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "asset_symbols": assets,
             "stored": stored_total,
+            "proxy_fallback_enabled": proxy_fallback_enabled,
             "providers": {key: {**value, "error_count": len(value["errors"])} for key, value in provider_stats.items()},
             "spot_quality": _crypto_spot_quality(
                 spot_rows,
@@ -1499,7 +1505,8 @@ class CryptoSpotService:
         provider_stats: dict[str, dict[str, Any]] = defaultdict(lambda: {"stored": 0, "assets": [], "errors": []})
         stored_total = 0
         coinbase = self._coinbase_client()
-        coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
+        proxy_fallback_enabled = bool(self.settings.crypto_spot_proxy_fallback_enabled)
+        coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds) if proxy_fallback_enabled else None
         try:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -1517,7 +1524,7 @@ class CryptoSpotService:
                             )
                         except Exception as exc:
                             provider_stats["coinbase"]["errors"].append({"asset_symbol": asset, "error": str(exc)})
-                    if not rows and asset in COINGECKO_IDS:
+                    if not rows and proxy_fallback_enabled and asset in COINGECKO_IDS and coingecko is not None:
                         attempted.append("coingecko")
                         try:
                             rows = await coingecko.fetch_ohlc(
@@ -1554,7 +1561,8 @@ class CryptoSpotService:
                 await session.commit()
         finally:
             await coinbase.aclose()
-            await coingecko.aclose()
+            if coingecko is not None:
+                await coingecko.aclose()
         return {
             "status": "ok",
             "kalshi_env": self.settings.kalshi_env,
@@ -1562,6 +1570,7 @@ class CryptoSpotService:
             "lookback_days": lookback_days,
             "asset_symbols": assets,
             "stored": stored_total,
+            "proxy_fallback_enabled": proxy_fallback_enabled,
             "providers": {key: {**value, "error_count": len(value["errors"])} for key, value in provider_stats.items()},
             "spot_quality": _crypto_spot_quality(
                 spot_rows,
@@ -1616,7 +1625,8 @@ class CryptoSpotService:
             await session.commit()
         discovered = {row.asset_symbol for row in snapshots}
         discovered.update(COINBASE_PRODUCT_IDS)
-        discovered.update(COINGECKO_IDS)
+        if self.settings.crypto_spot_proxy_fallback_enabled:
+            discovered.update(COINGECKO_IDS)
         return sorted(discovered)
 
     async def _store_rows(
@@ -2244,7 +2254,7 @@ class CryptoReplayService:
             expected_assets=(
                 requested_assets
                 if requested_assets
-                else sorted({row.asset_symbol for row in snapshots} | set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS))
+                else _crypto_expected_spot_assets(self.settings, observed_assets={row.asset_symbol for row in snapshots})
             ),
             min_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
             settings=self.settings,
@@ -4128,6 +4138,14 @@ def _crypto_spot_is_proxy(provider: str | None, source_kind: str | None) -> bool
     if provider_key == "coinbase" and source_key in {"spot_ohlc", "spot_tick"}:
         return False
     return source_key not in {"spot_ohlc", "spot_tick"} or provider_key == "coingecko"
+
+
+def _crypto_expected_spot_assets(settings: Settings, *, observed_assets: set[str] | None = None) -> list[str]:
+    assets = {normalize_asset_symbol(asset) for asset in (observed_assets or set()) if str(asset or "").strip()}
+    assets.update(COINBASE_PRODUCT_IDS)
+    if settings.crypto_spot_proxy_fallback_enabled:
+        assets.update(COINGECKO_IDS)
+    return sorted(assets)
 
 
 def _spot_context_for_decision(
