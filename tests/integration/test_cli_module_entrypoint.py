@@ -190,6 +190,70 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert model_quality_args.domain == "all"
 
 
+@pytest.mark.asyncio
+async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_status_payload(args: SimpleNamespace, container: SimpleNamespace) -> dict[str, object]:
+        return {"status": "collecting", "ready_assets": [], "summary": {}}
+
+    class HistoryService:
+        async def collect_open(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("collect_open", kwargs))
+            return {"status": "ok"}
+
+        async def bootstrap(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("bootstrap", kwargs))
+            return {"status": "ok"}
+
+    class SpotService:
+        async def backfill(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("spot_backfill", kwargs))
+            return {"status": "ok"}
+
+    class ForecastService:
+        async def train(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("forecast_train", kwargs))
+            return {"status": "trained"}
+
+    class ReplayService:
+        async def run(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("replay_run", kwargs))
+            return {"status": "warn"}
+
+        async def gate(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("replay_gate", kwargs))
+            return {"status": "blocked"}
+
+    calls: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(cli_module, "_crypto_live_path_status_payload", fake_status_payload)
+    args = SimpleNamespace(
+        crypto_live_path_command="refresh",
+        assets=["XRP"],
+        frequency="15m",
+        history_days=2,
+        spot_days=2,
+        replay_days=30,
+        require_ready=False,
+    )
+    container = SimpleNamespace(
+        crypto_history_service=HistoryService(),
+        crypto_spot_service=SpotService(),
+        crypto_forecast_service=ForecastService(),
+        crypto_replay_service=ReplayService(),
+    )
+
+    exit_code = await cli_module._run_crypto_live_path_command(args, container)
+
+    assert exit_code == 0
+    assert [name for name, _kwargs in calls] == [
+        "collect_open",
+        "bootstrap",
+        "spot_backfill",
+        "forecast_train",
+        "replay_run",
+        "replay_gate",
+    ]
+
+
 def test_python_module_cli_exposes_weather_prediction_commands() -> None:
     parser = cli_module.build_parser()
 

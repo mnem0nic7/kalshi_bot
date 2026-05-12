@@ -1306,7 +1306,7 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
             result["errors"].append(error)
             operation_errors.append(error)
         try:
-            train = await container.crypto_model_service.train(
+            train = await container.crypto_forecast_service.train(
                 frequency=frequency,
                 asset_symbols=[asset],
             )
