@@ -171,6 +171,10 @@ class Settings(BaseSettings):
     crypto_quote_evidence_enabled: bool = True
     crypto_quote_evidence_interval_seconds: int = 60
     crypto_spot_request_timeout_seconds: float = 30.0
+    coinbase_cdp_api_key_file: str | None = "cdp_api_key.json"
+    coinbase_cdp_key_name: str | None = None
+    coinbase_cdp_private_key: str | None = None
+    coinbase_advanced_trade_authenticated_enabled: bool = True
     crypto_spot_coinbase_max_stale_seconds: int = 5
     crypto_spot_coingecko_max_stale_seconds: int = 90
     crypto_spot_history_auto_enabled: bool = True

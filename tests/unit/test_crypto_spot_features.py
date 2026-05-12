@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 import httpx
 import pytest
 
@@ -12,7 +14,7 @@ from kalshi_bot.crypto.services import CryptoSpotService, _crypto_decision_rows,
 from kalshi_bot.db.models import CryptoSpotOHLCRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
-from kalshi_bot.integrations.crypto_spot import CoinbaseSpotClient, CoinGeckoSpotClient
+from kalshi_bot.integrations.crypto_spot import CoinbaseCdpCredentials, CoinbaseSpotClient, CoinGeckoSpotClient
 
 
 def _settings(tmp_path, **overrides) -> Settings:
@@ -89,6 +91,47 @@ async def test_coinbase_spot_client_parses_current_tick() -> None:
     assert row.source_kind == "spot_tick"
     assert row.end_ts == datetime(2020, 9, 13, 12, 26, 41, tzinfo=UTC)
     assert row.close_dollars == Decimal("108.25")
+
+
+@pytest.mark.asyncio
+async def test_coinbase_spot_client_prefers_authenticated_current_tick() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    credentials = CoinbaseCdpCredentials(
+        name="organizations/test-org/apiKeys/test-key",
+        private_key=private_pem,
+    )
+    seen_authorization: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v3/brokerage/products/BTC-USD/ticker"
+        seen_authorization.append(request.headers["Authorization"])
+        return httpx.Response(
+            200,
+            json={"trades": [{"price": "109.25", "size": "1.5", "time": "2020-09-13T12:26:42Z"}]},
+        )
+
+    client = CoinbaseSpotClient(credentials=credentials)
+    await client.authenticated_client.aclose()
+    client.authenticated_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url=client.authenticated_base_url,
+        headers={"Accept": "application/json"},
+    )
+    try:
+        row = await client.fetch_current("BTC")
+    finally:
+        await client.aclose()
+
+    assert seen_authorization and seen_authorization[0].startswith("Bearer ")
+    assert row is not None
+    assert row.close_dollars == Decimal("109.25")
+    assert row.volume == Decimal("1.5")
+    assert row.payload["authenticated"] is True
 
 
 @pytest.mark.asyncio

@@ -59,6 +59,7 @@ from kalshi_bot.integrations.crypto_spot import (
     CoinGeckoSpotClient,
     SpotOHLC,
     interval_seconds_for_frequency,
+    load_coinbase_cdp_credentials,
 )
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeCryptoPolicy
@@ -1365,6 +1366,19 @@ class CryptoSpotService:
         self.settings = settings
         self.session_factory = session_factory
 
+    def _coinbase_client(self) -> CoinbaseSpotClient:
+        credentials = None
+        if self.settings.coinbase_advanced_trade_authenticated_enabled:
+            credentials = load_coinbase_cdp_credentials(
+                key_file=self.settings.coinbase_cdp_api_key_file,
+                key_name=self.settings.coinbase_cdp_key_name,
+                private_key=self.settings.coinbase_cdp_private_key,
+            )
+        return CoinbaseSpotClient(
+            timeout_seconds=self.settings.crypto_spot_request_timeout_seconds,
+            credentials=credentials,
+        )
+
     async def collect_current(
         self,
         *,
@@ -1375,7 +1389,7 @@ class CryptoSpotService:
         assets = await self._asset_symbols(asset_symbols=asset_symbols, frequency=freq)
         provider_stats: dict[str, dict[str, Any]] = defaultdict(lambda: {"stored": 0, "assets": [], "errors": []})
         stored_total = 0
-        coinbase = CoinbaseSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
+        coinbase = self._coinbase_client()
         coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
         try:
             async with self.session_factory() as session:
@@ -1451,7 +1465,7 @@ class CryptoSpotService:
         assets = await self._asset_symbols(asset_symbols=asset_symbols, frequency=freq)
         provider_stats: dict[str, dict[str, Any]] = defaultdict(lambda: {"stored": 0, "assets": [], "errors": []})
         stored_total = 0
-        coinbase = CoinbaseSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
+        coinbase = self._coinbase_client()
         coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
         try:
             async with self.session_factory() as session:
