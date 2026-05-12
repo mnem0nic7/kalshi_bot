@@ -31,6 +31,7 @@ from kalshi_bot.crypto.services import (
     CryptoReplayService,
     _crypto_data_quality,
     _crypto_decision_rows,
+    _evaluate_crypto_walk_forward,
     _crypto_feature_schema,
     _crypto_model_candidate_report,
     _crypto_raw_feature_vector,
@@ -77,6 +78,40 @@ def _market(**overrides) -> CryptoMarket:
     }
     values.update(overrides)
     return CryptoMarket(**values)
+
+
+def _replay_row(**overrides) -> dict[str, object]:
+    day = str(overrides.pop("market_day", "2026-05-01"))
+    values: dict[str, object] = {
+        "market_ticker": f"KXBTC15M-{day}",
+        "asset_symbol": "BTC",
+        "market_day": day,
+        "decision_ts": datetime.fromisoformat(f"{day}T12:00:00+00:00"),
+        "settlement_ts": datetime.fromisoformat(f"{day}T12:15:00+00:00"),
+        "label_yes": 1,
+        "mid_yes_dollars": Decimal("0.7000"),
+        "yes_bid_dollars": Decimal("0.4700"),
+        "yes_ask_dollars": Decimal("0.4900"),
+        "no_ask_dollars": Decimal("0.5300"),
+        "spread_bps": 200,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_ohlc",
+        "quote_source": "snapshot_quotes",
+        "strict_trade_eligible": True,
+        "prediction_eligible": True,
+        "leakage_status": "point_in_time",
+        "time_to_close_seconds": 60,
+        "volume": 100,
+        "open_interest": 50,
+        "target_price_dollars": Decimal("100.00000000"),
+        "candle_momentum_dollars": Decimal("0.0100"),
+        "spot_return_1_pct": Decimal("0.0100"),
+        "spot_return_3_pct": Decimal("0.0100"),
+        "spot_return_6_pct": Decimal("0.0100"),
+    }
+    values.update(overrides)
+    return values
 
 
 def _signal() -> StrategySignal:
@@ -1599,6 +1634,116 @@ def test_crypto_candidate_quality_blocks_runtime_spread_over_asset_limit(tmp_pat
 
     assert candidates[0]["candidate_status"] != CRYPTO_LIVE_QUALITY
     assert candidates[0]["reason"] == "spread_above_live_max"
+
+
+def test_crypto_replay_sparse_rows_keep_candidate_diagnostics_but_block_oos(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_min_training_samples=20, crypto_replay_min_resolved_markets=2)
+    rows = [
+        _replay_row(market_day="2026-05-01", market_ticker="KXBTC15M-SPARSE-1"),
+        _replay_row(market_day="2026-05-01", market_ticker="KXBTC15M-SPARSE-2"),
+    ]
+
+    report = _evaluate_crypto_walk_forward(
+        rows,  # type: ignore[arg-type]
+        settings=settings,
+        diagnostic_model={"model_type": "market_mid_baseline"},
+    )
+    gate = CryptoReplayService(settings=settings, session_factory=None).evaluate_gate(report["metrics"])  # type: ignore[arg-type]
+
+    assert report["status"] == "insufficient_data"
+    assert report["metrics"]["trade_candidate_count"] == 2
+    assert report["metrics"]["oos_fold_count"] == 0
+    assert report["metrics"]["oos_evaluation_status"] == "insufficient_data"
+    assert report["candidate_quality"]["live_quality_policy"]["selected_count"] == 2
+    assert gate["passed"] is False
+    assert any("Out-of-sample replay is unavailable" in reason for reason in gate["reasons"])
+
+
+def test_crypto_replay_candidate_selection_does_not_require_empirical_bucket_maturity(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_min_training_samples=2,
+        crypto_replay_min_resolved_markets=3,
+        crypto_replay_min_trade_candidates=1,
+    )
+    rows = [
+        _replay_row(market_day="2026-05-01", market_ticker="KXBTC15M-BUCKET-1"),
+        _replay_row(market_day="2026-05-02", market_ticker="KXBTC15M-BUCKET-2"),
+        _replay_row(market_day="2026-05-03", market_ticker="KXBTC15M-BUCKET-3"),
+    ]
+
+    report = _evaluate_crypto_walk_forward(
+        rows,  # type: ignore[arg-type]
+        settings=settings,
+        diagnostic_model={"model_type": "market_mid_baseline"},
+    )
+
+    assert report["status"] == "ok"
+    assert report["metrics"]["oos_fold_count"] == 1
+    assert report["metrics"]["trade_candidate_count"] == 3
+    assert report["metrics"]["oos_trade_candidate_count"] == 1
+    assert report["candidate_policies"][2]["policy_name"] == "candidate_quality_policy"
+    assert report["candidate_policies"][2]["selected_count"] == 1
+    assert report["bucket_matrix"]
+    assert all(bucket["sample_count"] < settings.trade_behavior_empirical_gate_min_settled_fills for bucket in report["bucket_matrix"])
+
+
+def test_crypto_replay_uses_runtime_asset_entry_overrides_for_candidate_support(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=50)
+    rows = [_replay_row(market_day="2026-05-01", mid_yes_dollars=Decimal("0.6000"))]
+    service = AgentPackService(settings)
+    policy = service.runtime_crypto_policy(
+        service.default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    asset_entry_overrides={
+                        "BTC": AgentPackCryptoEntryPolicy(min_fee_adjusted_edge_bps=3000),
+                    }
+                )
+            }
+        )
+    )
+
+    default_report = _evaluate_crypto_walk_forward(
+        rows,  # type: ignore[arg-type]
+        settings=settings,
+        diagnostic_model={"model_type": "market_mid_baseline"},
+    )
+    override_report = _evaluate_crypto_walk_forward(
+        rows,  # type: ignore[arg-type]
+        settings=settings,
+        crypto_policy=policy,
+        diagnostic_model={"model_type": "market_mid_baseline"},
+    )
+
+    assert default_report["metrics"]["trade_candidate_count"] == 1
+    assert override_report["metrics"]["trade_candidate_count"] == 0
+    assert override_report["metrics"]["candidate_rejection_reason_counts"] == {"fee_adjusted_edge_below_live_min": 1}
+
+
+def test_crypto_replay_gate_blocks_zero_oos_folds_even_with_strong_metrics(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_replay_min_resolved_markets=2, crypto_replay_min_trade_candidates=1)
+    metrics = {
+        "resolved_sample_count": 10,
+        "trade_candidate_count": 10,
+        "strict_trade_eligible_count": 10,
+        "net_simulated_pl_dollars": 10.0,
+        "market_mid_net_simulated_pl_dollars": 0.0,
+        "pnl_advantage_vs_market_mid_dollars": 10.0,
+        "oos_evaluation_status": "insufficient_data",
+        "oos_fold_count": 0,
+        "oos_net_simulated_pl_dollars": 10.0,
+        "oos_market_mid_net_simulated_pl_dollars": 0.0,
+        "oos_pnl_advantage_vs_market_mid_dollars": 10.0,
+        "hard_cap_breaches": 0,
+        "candle_count": 10,
+        "spot_feature_coverage_pct": 1.0,
+    }
+
+    gate = CryptoReplayService(settings=settings, session_factory=None).evaluate_gate(metrics)  # type: ignore[arg-type]
+
+    assert gate["passed"] is False
+    assert any("Out-of-sample replay is unavailable" in reason for reason in gate["reasons"])
 
 
 def test_crypto_proxy_quote_rows_are_prediction_only(tmp_path) -> None:

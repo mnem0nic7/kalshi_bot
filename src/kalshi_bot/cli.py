@@ -917,6 +917,21 @@ def _metric_less_than(metrics: dict[str, Any], candidate_key: str, baseline_key:
     return candidate is not None and baseline is not None and candidate < baseline
 
 
+def _dominant_crypto_candidate_blocker(reason_counts: dict[str, Any]) -> str | None:
+    if not reason_counts:
+        return None
+    ignored = {"positive_fee_adjusted_live_quality_edge", "broad_shadow_exploration"}
+    ranked = sorted(
+        (
+            (str(reason), _int_or_zero(count))
+            for reason, count in reason_counts.items()
+            if str(reason) not in ignored and _int_or_zero(count) > 0
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return ranked[0][0] if ranked else None
+
+
 def _crypto_live_path_calibration_status(metrics: dict[str, Any]) -> dict[str, Any]:
     comparisons = {
         "brier": _metric_less_than(metrics, "calibration_brier", "market_mid_brier"),
@@ -985,10 +1000,17 @@ def _crypto_live_path_step_summary(result: dict[str, Any]) -> dict[str, Any]:
             key: metrics.get(key)
             for key in (
                 "trade_candidate_count",
+                "oos_trade_candidate_count",
                 "strict_trade_eligible_count",
+                "oos_evaluation_status",
+                "oos_fold_count",
                 "net_simulated_pl_dollars",
+                "oos_net_simulated_pl_dollars",
                 "market_mid_net_simulated_pl_dollars",
+                "oos_market_mid_net_simulated_pl_dollars",
                 "pnl_advantage_vs_market_mid_dollars",
+                "oos_pnl_advantage_vs_market_mid_dollars",
+                "candidate_rejection_reason_counts",
                 "calibration_brier",
                 "market_mid_brier",
                 "calibration_log_loss",
@@ -1134,6 +1156,15 @@ def _crypto_live_path_assess_asset(
         _int_or_zero(metrics.get("strict_trade_eligible_count")),
     )
     trade_candidates = _int_or_zero(metrics.get("trade_candidate_count"))
+    oos_trade_candidates = _int_or_zero(metrics.get("oos_trade_candidate_count"))
+    oos_status = str(metrics.get("oos_evaluation_status") or "unknown")
+    oos_fold_count = _int_or_zero(metrics.get("oos_fold_count"))
+    candidate_status_counts = dict(metrics.get("candidate_status_counts") or {})
+    candidate_reason_counts = dict(metrics.get("candidate_reason_counts") or {})
+    top_candidate_status_counts = dict(metrics.get("top_candidate_status_counts") or {})
+    top_candidate_reason_counts = dict(metrics.get("top_candidate_reason_counts") or {})
+    candidate_rejection_reason_counts = dict(metrics.get("candidate_rejection_reason_counts") or {})
+    dominant_candidate_blocker = _dominant_crypto_candidate_blocker(candidate_rejection_reason_counts)
     net_pl = _float_or_none(metrics.get("net_simulated_pl_dollars"))
     if net_pl is None:
         net_pl = _float_or_none(metrics.get("net_pl_dollars"))
@@ -1149,6 +1180,8 @@ def _crypto_live_path_assess_asset(
         blockers.append(f"strict_trade_eligible_count {strict_rows} < {strict_rows_target}")
     if trade_candidates < candidate_target:
         blockers.append(f"trade_candidate_count {trade_candidates} < {candidate_target}")
+        if dominant_candidate_blocker:
+            blockers.append(f"dominant candidate blocker is {dominant_candidate_blocker}")
     if gate_status != "passed":
         blockers.append(f"replay gate status is {gate_status}")
     if net_pl is None or net_pl <= 0:
@@ -1219,9 +1252,21 @@ def _crypto_live_path_assess_asset(
             "gate_reasons": gate_payload.get("reasons") or [],
             "backtest_status": backtest_status,
             "trade_candidate_count": trade_candidates,
+            "oos_trade_candidate_count": oos_trade_candidates,
+            "oos_evaluation_status": oos_status,
+            "oos_fold_count": oos_fold_count,
             "net_simulated_pl_dollars": net_pl,
+            "oos_net_simulated_pl_dollars": _float_or_none(metrics.get("oos_net_simulated_pl_dollars")),
             "market_mid_net_simulated_pl_dollars": market_mid_net_pl,
+            "oos_market_mid_net_simulated_pl_dollars": _float_or_none(metrics.get("oos_market_mid_net_simulated_pl_dollars")),
             "pnl_advantage_vs_market_mid_dollars": pnl_advantage,
+            "oos_pnl_advantage_vs_market_mid_dollars": _float_or_none(metrics.get("oos_pnl_advantage_vs_market_mid_dollars")),
+            "candidate_status_counts": candidate_status_counts,
+            "candidate_reason_counts": candidate_reason_counts,
+            "top_candidate_status_counts": top_candidate_status_counts,
+            "top_candidate_reason_counts": top_candidate_reason_counts,
+            "candidate_rejection_reason_counts": candidate_rejection_reason_counts,
+            "dominant_candidate_blocker": dominant_candidate_blocker,
             "calibration": calibration,
             "baseline_policies": gate_payload.get("baseline_policies") or walk_forward_payload.get("baseline_policies") or [],
             "requirements": gate_payload.get("requirements") or {},

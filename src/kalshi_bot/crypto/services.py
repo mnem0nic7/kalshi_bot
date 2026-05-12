@@ -2186,6 +2186,7 @@ class CryptoReplayService:
                 "min_pnl_advantage_dollars": runtime_policy.replay_min_pnl_advantage_dollars,
                 "calibration_better_than_mid": runtime_policy.replay_require_calibration_better_than_mid,
                 "calibration_metrics_diagnostic": ["brier", "log_loss", "ece"],
+                "requires_out_of_sample_replay": True,
                 "requires_candles": True,
                 "requires_point_in_time_rows": True,
                 "min_spot_coverage_pct": runtime_policy.replay_min_spot_coverage_pct,
@@ -2243,7 +2244,13 @@ class CryptoReplayService:
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
         if limit and limit > 0:
             rows = rows[-limit:]
-        backtest = _evaluate_crypto_walk_forward(rows, settings=self.settings)
+        model_payload = model.payload if model is not None and isinstance(model.payload, dict) else None
+        backtest = _evaluate_crypto_walk_forward(
+            rows,
+            settings=self.settings,
+            crypto_policy=crypto_policy,
+            diagnostic_model=model_payload,
+        )
         data_quality = _crypto_data_quality(
             snapshots,
             candles,
@@ -3148,9 +3155,21 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
     reasons: list[str] = []
     resolved = int(metrics.get("resolved_sample_count") or metrics.get("sample_count") or 0)
     candidates = int(metrics.get("trade_candidate_count") or 0)
-    net_pl = float(metrics.get("net_simulated_pl_dollars") or 0.0)
-    market_mid_net_pl = float(metrics.get("market_mid_net_simulated_pl_dollars") or 0.0)
-    pnl_advantage = float(metrics.get("pnl_advantage_vs_market_mid_dollars") or (net_pl - market_mid_net_pl))
+    oos_fold_count = metrics.get("oos_fold_count")
+    oos_evaluation_status = str(metrics.get("oos_evaluation_status") or "").strip().lower()
+    has_oos_markers = oos_fold_count is not None or bool(oos_evaluation_status)
+    net_pl = float(metrics.get("oos_net_simulated_pl_dollars", metrics.get("net_simulated_pl_dollars") or 0.0) or 0.0)
+    market_mid_net_pl = float(
+        metrics.get("oos_market_mid_net_simulated_pl_dollars", metrics.get("market_mid_net_simulated_pl_dollars") or 0.0)
+        or 0.0
+    )
+    pnl_advantage = float(
+        metrics.get(
+            "oos_pnl_advantage_vs_market_mid_dollars",
+            metrics.get("pnl_advantage_vs_market_mid_dollars") or (net_pl - market_mid_net_pl),
+        )
+        or 0.0
+    )
     hard_cap_breaches = int(metrics.get("hard_cap_breaches") or 0)
     calibration = metrics.get("calibration_brier")
     market_mid = metrics.get("market_mid_brier")
@@ -3168,6 +3187,11 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
         reasons.append("Crypto backtest artifact is missing.")
     if candle_count <= 0:
         reasons.append("Crypto candlestick coverage is missing.")
+    if has_oos_markers and (int(oos_fold_count or 0) <= 0 or oos_evaluation_status not in {"", "ok"}):
+        reasons.append(
+            "Out-of-sample replay is unavailable "
+            f"(status={oos_evaluation_status or 'unknown'}, folds={int(oos_fold_count or 0)})."
+        )
     if leakage_rows > 0:
         reasons.append(f"Replay includes {leakage_rows} non-point-in-time rows.")
     if spot_coverage < crypto_policy.replay_min_spot_coverage_pct:
@@ -5438,6 +5462,7 @@ def _crypto_model_metrics(
     model: dict[str, Any],
     *,
     settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
 ) -> dict[str, Any]:
     baseline_predictions: list[tuple[Decimal, int]] = []
     calibrated_predictions: list[tuple[Decimal, int]] = []
@@ -5449,10 +5474,16 @@ def _crypto_model_metrics(
         predicted = _predict_crypto_probability(row, model)
         baseline_predictions.append((baseline, label))
         calibrated_predictions.append((predicted, label))
-        baseline_simulated.append(_simulate_crypto_trade(row, baseline, settings=settings))
-        simulated.append(_simulate_crypto_trade(row, predicted, settings=settings))
+        baseline_simulated.append(_simulate_crypto_trade(row, baseline, settings=settings, crypto_policy=crypto_policy))
+        simulated.append(_simulate_crypto_trade(row, predicted, settings=settings, crypto_policy=crypto_policy))
     exploratory = [
-        _simulate_crypto_trade(row, _predict_crypto_probability(row, model), settings=settings, policy=CRYPTO_EXPLORATORY_SHADOW)
+        _simulate_crypto_trade(
+            row,
+            _predict_crypto_probability(row, model),
+            settings=settings,
+            crypto_policy=crypto_policy,
+            policy=CRYPTO_EXPLORATORY_SHADOW,
+        )
         for row in rows
     ]
     fillable = [item for item in simulated if item["status"] == "fillable"]
@@ -5568,11 +5599,56 @@ def _crypto_baseline_probability(
     raise ValueError(f"unknown crypto baseline {name}")
 
 
-def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Settings) -> dict[str, Any]:
+def _evaluate_crypto_walk_forward(
+    rows: list[dict[str, Any]],
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+    diagnostic_model: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     baseline_names = ("market_mid_baseline", "always_0_5", "last_direction", "naive_momentum", "linear_on_returns")
+    support_model = diagnostic_model if isinstance(diagnostic_model, dict) and diagnostic_model else None
+    if support_model is None and rows:
+        support_model = _fit_crypto_calibration(rows, settings=settings, include_candidate_report=False)
+    diagnostic_quality = _crypto_candidate_quality_report(
+        rows,
+        support_model,
+        settings=settings,
+        crypto_policy=crypto_policy,
+    )
+    diagnostic_live_policy = diagnostic_quality["live_quality_policy"]
+    diagnostic_shadow_policy = diagnostic_quality["shadow_exploration_policy"]
     folds = _crypto_walk_forward_folds(rows, min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)))
     if not folds:
-        empty_metrics = _crypto_model_metrics([], {}, settings=settings)
+        empty_metrics = _crypto_model_metrics([], {}, settings=settings, crypto_policy=crypto_policy)
+        empty_metrics.update(
+            {
+                "oos_evaluation_status": "insufficient_data",
+                "oos_fold_count": 0,
+                "oos_trade_candidate_count": 0,
+                "oos_net_simulated_pl_dollars": 0.0,
+                "oos_market_mid_net_simulated_pl_dollars": 0.0,
+                "oos_pnl_advantage_vs_market_mid_dollars": 0.0,
+                "sample_count": len(rows),
+                "resolved_sample_count": len(rows),
+                "prediction_eligible_count": sum(1 for row in rows if row.get("prediction_eligible", True)),
+                "strict_trade_eligible_count": sum(1 for row in rows if row.get("strict_trade_eligible")),
+                "proxy_quote_row_count": sum(1 for row in rows if row.get("quote_source") != "snapshot_quotes"),
+                "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
+                "spot_feature_coverage_pct": _spot_feature_coverage(rows),
+                "trade_candidate_count": diagnostic_live_policy["selected_count"],
+                "live_quality_candidate_count": diagnostic_live_policy["selected_count"],
+                "exploratory_shadow_candidate_count": diagnostic_quality["exploratory_shadow_count"],
+                "diagnostic_net_simulated_pl_dollars": float(_decimal(diagnostic_live_policy["net_pnl"])),
+                "diagnostic_shadow_net_simulated_pl_dollars": float(_decimal(diagnostic_shadow_policy["net_pnl"])),
+                "candidate_status_counts": diagnostic_quality["candidate_status_counts"],
+                "candidate_reason_counts": diagnostic_quality["candidate_reason_counts"],
+                "top_candidate_status_counts": diagnostic_quality["top_candidate_status_counts"],
+                "top_candidate_reason_counts": diagnostic_quality["top_candidate_reason_counts"],
+                "candidate_rejection_reason_counts": diagnostic_quality["candidate_rejection_reason_counts"],
+                "candidate_counts_by_asset": diagnostic_quality["by_asset"],
+            }
+        )
         baseline_policies = [
             _crypto_policy_metrics(name, [], settings=settings)
             for name in baseline_names
@@ -5587,12 +5663,12 @@ def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Setti
             "candidate_policies": [
                 _crypto_policy_metrics("current_heuristic", [], settings=settings),
                 _crypto_policy_metrics("calibrated_prediction", [], settings=settings),
-                _crypto_policy_metrics("candidate_quality_policy", [], settings=settings),
-                _crypto_policy_metrics("live_review_candidate", [], settings=settings),
-                _crypto_policy_metrics("shadow_exploration_policy", [], settings=settings),
+                diagnostic_live_policy | {"policy_name": "candidate_quality_policy", "policy_family": "strict_candidate_quality"},
+                diagnostic_live_policy | {"policy_name": "live_review_candidate", "policy_family": "live_review_candidate"},
+                diagnostic_shadow_policy | {"policy_name": "shadow_exploration_policy", "policy_family": "shadow_exploration"},
             ],
             "bucket_matrix": [],
-            "candidate_quality": _crypto_candidate_quality_report([], {}, settings=settings),
+            "candidate_quality": diagnostic_quality,
             "metrics": empty_metrics,
         }
     baseline_trades_by_name: dict[str, list[dict[str, Any]]] = {name: [] for name in baseline_names}
@@ -5608,7 +5684,6 @@ def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Setti
         model = _fit_crypto_calibration(fold["train_rows"], settings=settings, include_candidate_report=False)
         heuristic_model = model.get("fallback_model") if isinstance(model.get("fallback_model"), dict) else _fit_crypto_heuristic_calibration(fold["train_rows"])
         linear_return_model = _fit_crypto_linear_return_baseline(fold["train_rows"])
-        eligible_buckets = _eligible_crypto_buckets(fold["train_rows"], settings=settings)
         fold_baselines: dict[str, list[dict[str, Any]]] = {name: [] for name in baseline_names}
         fold_heuristic: list[dict[str, Any]] = []
         fold_calibrated: list[dict[str, Any]] = []
@@ -5626,12 +5701,18 @@ def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Setti
             heuristic_predictions.append((heuristic, int(row["label_yes"])))
             calibrated_predictions.append((calibrated, int(row["label_yes"])))
             baseline_trade_by_name = {
-                name: _simulate_crypto_trade(row, prediction, settings=settings)
+                name: _simulate_crypto_trade(row, prediction, settings=settings, crypto_policy=crypto_policy)
                 for name, prediction in baseline_predictions.items()
             }
-            heuristic_trade = _simulate_crypto_trade(row, heuristic, settings=settings)
-            calibrated_trade = _simulate_crypto_trade(row, calibrated, settings=settings)
-            exploratory_trade = _simulate_crypto_trade(row, calibrated, settings=settings, policy=CRYPTO_EXPLORATORY_SHADOW)
+            heuristic_trade = _simulate_crypto_trade(row, heuristic, settings=settings, crypto_policy=crypto_policy)
+            calibrated_trade = _simulate_crypto_trade(row, calibrated, settings=settings, crypto_policy=crypto_policy)
+            exploratory_trade = _simulate_crypto_trade(
+                row,
+                calibrated,
+                settings=settings,
+                crypto_policy=crypto_policy,
+                policy=CRYPTO_EXPLORATORY_SHADOW,
+            )
             for name, trade in baseline_trade_by_name.items():
                 if trade["status"] == "fillable":
                     fold_baselines[name].append({**row, "simulation": trade})
@@ -5639,8 +5720,7 @@ def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Setti
                 fold_heuristic.append({**row, "simulation": heuristic_trade})
             if calibrated_trade["status"] == "fillable":
                 fold_calibrated.append({**row, "simulation": calibrated_trade})
-                if _crypto_bucket_key(row, calibrated_trade) in eligible_buckets:
-                    fold_selection.append({**row, "simulation": calibrated_trade})
+                fold_selection.append({**row, "simulation": calibrated_trade})
             if exploratory_trade["status"] == "fillable":
                 fold_exploratory.append({**row, "simulation": exploratory_trade})
         for name, trades in fold_baselines.items():
@@ -5694,7 +5774,7 @@ def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Setti
         "baseline_policies": baseline_policies,
         "candidate_policies": [heuristic_policy, calibrated_policy, selection_policy, live_review_policy, exploratory_policy],
         "bucket_matrix": _crypto_bucket_matrix(calibrated_trades, settings=settings),
-        "candidate_quality": _crypto_candidate_quality_report(rows, _fit_crypto_calibration(rows, settings=settings), settings=settings),
+        "candidate_quality": diagnostic_quality,
         "metrics": {
             "sample_count": len(rows),
             "resolved_sample_count": len(rows),
@@ -5703,11 +5783,19 @@ def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Setti
             "proxy_quote_row_count": sum(1 for row in rows if row.get("quote_source") != "snapshot_quotes"),
             "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
             "spot_feature_coverage_pct": _spot_feature_coverage(rows),
-            "trade_candidate_count": selection_policy["selected_count"],
-            "live_quality_candidate_count": selection_policy["selected_count"],
-            "exploratory_shadow_candidate_count": sum(
-                1 for row in exploratory_trades if (row.get("simulation") or {}).get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW
+            "trade_candidate_count": diagnostic_live_policy["selected_count"],
+            "live_quality_candidate_count": diagnostic_live_policy["selected_count"],
+            "exploratory_shadow_candidate_count": diagnostic_quality["exploratory_shadow_count"],
+            "oos_evaluation_status": "ok",
+            "oos_fold_count": len(folds),
+            "oos_trade_candidate_count": selection_policy["selected_count"],
+            "oos_net_simulated_pl_dollars": float(_decimal(selection_policy["net_pnl"])),
+            "oos_market_mid_net_simulated_pl_dollars": float(_decimal(baseline_policy["net_pnl"])),
+            "oos_pnl_advantage_vs_market_mid_dollars": float(
+                _decimal(selection_policy["net_pnl"]) - _decimal(baseline_policy["net_pnl"])
             ),
+            "diagnostic_net_simulated_pl_dollars": float(_decimal(diagnostic_live_policy["net_pnl"])),
+            "diagnostic_shadow_net_simulated_pl_dollars": float(_decimal(diagnostic_shadow_policy["net_pnl"])),
             "net_simulated_pl_dollars": float(_decimal(selection_policy["net_pnl"])),
             "market_mid_net_simulated_pl_dollars": float(_decimal(baseline_policy["net_pnl"])),
             "pnl_advantage_vs_market_mid_dollars": float(_decimal(selection_policy["net_pnl"]) - _decimal(baseline_policy["net_pnl"])),
@@ -5720,6 +5808,12 @@ def _evaluate_crypto_walk_forward(rows: list[dict[str, Any]], *, settings: Setti
             "calibration_ece": probability["calibrated"]["ece"],
             "market_mid_ece": probability["baseline"]["ece"],
             "fee_model_version": current_fee_model_version(),
+            "candidate_status_counts": diagnostic_quality["candidate_status_counts"],
+            "candidate_reason_counts": diagnostic_quality["candidate_reason_counts"],
+            "top_candidate_status_counts": diagnostic_quality["top_candidate_status_counts"],
+            "top_candidate_reason_counts": diagnostic_quality["top_candidate_reason_counts"],
+            "candidate_rejection_reason_counts": diagnostic_quality["candidate_rejection_reason_counts"],
+            "candidate_counts_by_asset": diagnostic_quality["by_asset"],
         },
     }
 
@@ -6038,19 +6132,70 @@ def _crypto_candidate_quality_report(
     model: dict[str, Any] | None,
     *,
     settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
 ) -> dict[str, Any]:
     scored: list[dict[str, Any]] = []
     status_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    top_status_counts: Counter[str] = Counter()
+    top_reason_counts: Counter[str] = Counter()
+    rejection_reason_counts: Counter[str] = Counter()
     side_counts: Counter[str] = Counter()
+    by_asset: dict[str, dict[str, Any]] = {}
     for row in rows:
         predicted = _predict_crypto_probability(row, model)
-        simulation = _simulate_crypto_trade(row, predicted, settings=settings, policy=CRYPTO_EXPLORATORY_SHADOW)
+        simulation = _simulate_crypto_trade(
+            row,
+            predicted,
+            settings=settings,
+            crypto_policy=crypto_policy,
+            policy=CRYPTO_EXPLORATORY_SHADOW,
+        )
         candidates = simulation.get("candidates") or []
+        asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
+        asset_summary = by_asset.setdefault(
+            asset,
+            {
+                "row_count": 0,
+                "strict_trade_eligible_count": 0,
+                "candidate_status_counts": Counter(),
+                "candidate_reason_counts": Counter(),
+                "top_candidate_status_counts": Counter(),
+                "top_candidate_reason_counts": Counter(),
+                "candidate_rejection_reason_counts": Counter(),
+                "live_quality_candidate_count": 0,
+                "exploratory_shadow_candidate_count": 0,
+            },
+        )
+        asset_summary["row_count"] += 1
+        if row.get("strict_trade_eligible"):
+            asset_summary["strict_trade_eligible_count"] += 1
         for candidate in candidates:
-            status_counts[str(candidate.get("candidate_status") or "unknown")] += 1
+            candidate_status = str(candidate.get("candidate_status") or "unknown")
+            candidate_reason = str(candidate.get("reason") or "unknown")
+            status_counts[candidate_status] += 1
+            reason_counts[candidate_reason] += 1
+            asset_summary["candidate_status_counts"][candidate_status] += 1
+            asset_summary["candidate_reason_counts"][candidate_reason] += 1
+        if candidates:
+            top_candidate = candidates[0]
+            top_status = str(top_candidate.get("candidate_status") or "unknown")
+            top_reason = str(top_candidate.get("reason") or "unknown")
+            top_status_counts[top_status] += 1
+            top_reason_counts[top_reason] += 1
+            asset_summary["top_candidate_status_counts"][top_status] += 1
+            asset_summary["top_candidate_reason_counts"][top_reason] += 1
+            rejection_reason = _crypto_live_rejection_reason(top_candidate)
+            if rejection_reason:
+                rejection_reason_counts[rejection_reason] += 1
+                asset_summary["candidate_rejection_reason_counts"][rejection_reason] += 1
         if simulation["status"] != "fillable":
             continue
         side_counts[str(simulation.get("side") or "unknown")] += 1
+        if simulation.get("candidate_status") == CRYPTO_LIVE_QUALITY:
+            asset_summary["live_quality_candidate_count"] += 1
+        if simulation.get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW:
+            asset_summary["exploratory_shadow_candidate_count"] += 1
         scored.append({**row, "simulation": simulation, "predicted_yes_dollars": predicted})
     live_quality = [row for row in scored if (row.get("simulation") or {}).get("candidate_status") == CRYPTO_LIVE_QUALITY]
     exploratory_scored = [row for row in scored if (row.get("simulation") or {}).get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW]
@@ -6067,6 +6212,32 @@ def _crypto_candidate_quality_report(
             "assets": sorted({str(row.get("asset_symbol")) for row in rows}),
         },
         "candidate_status_counts": dict(status_counts),
+        "candidate_reason_counts": dict(reason_counts),
+        "top_candidate_status_counts": dict(top_status_counts),
+        "top_candidate_reason_counts": dict(top_reason_counts),
+        "candidate_rejection_reason_counts": dict(rejection_reason_counts),
+        "by_asset": {
+            asset: {
+                **{
+                    key: value
+                    for key, value in summary.items()
+                    if key
+                    not in {
+                        "candidate_status_counts",
+                        "candidate_reason_counts",
+                        "top_candidate_status_counts",
+                        "top_candidate_reason_counts",
+                        "candidate_rejection_reason_counts",
+                    }
+                },
+                "candidate_status_counts": dict(summary["candidate_status_counts"]),
+                "candidate_reason_counts": dict(summary["candidate_reason_counts"]),
+                "top_candidate_status_counts": dict(summary["top_candidate_status_counts"]),
+                "top_candidate_reason_counts": dict(summary["top_candidate_reason_counts"]),
+                "candidate_rejection_reason_counts": dict(summary["candidate_rejection_reason_counts"]),
+            }
+            for asset, summary in sorted(by_asset.items())
+        },
         "selected_side_counts": dict(side_counts),
         "candidate_caps": {
             "max_candidates_per_run": settings.crypto_shadow_exploration_max_candidates_per_run,
@@ -6093,6 +6264,16 @@ def _crypto_candidate_quality_report(
         ],
         "bucket_matrix": _crypto_bucket_matrix(scored, settings=settings),
     }
+
+
+def _crypto_live_rejection_reason(candidate: dict[str, Any]) -> str | None:
+    status = str(candidate.get("candidate_status") or "")
+    reason = str(candidate.get("reason") or "unknown")
+    if status == CRYPTO_LIVE_QUALITY:
+        return None
+    if status == CRYPTO_EXPLORATORY_SHADOW:
+        return "fee_adjusted_edge_below_live_min"
+    return reason
 
 
 def _eligible_crypto_buckets(rows: list[dict[str, Any]], *, settings: Settings) -> set[str]:

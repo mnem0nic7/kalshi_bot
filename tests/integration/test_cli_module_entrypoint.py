@@ -310,6 +310,68 @@ def test_crypto_live_path_recommends_current_spot_when_spot_is_stale() -> None:
     )
 
 
+def test_crypto_live_path_surfaces_candidate_rejection_counts() -> None:
+    report = cli_module._crypto_live_path_assess_asset(
+        "BTC",
+        history_status={
+            "quote_evidence": {
+                "trade_candidate_support_by_asset": {"BTC": {"strict_trade_eligible_rows": 80}},
+                "strict_quote_ingestion_audit_by_asset": {
+                    "BTC": {
+                        "snapshot_present": 80,
+                        "settled_label_joined": 80,
+                        "spot_joined": 80,
+                        "strict_trade_eligible": 80,
+                        "blocker_stage": "candidate_generation_blocked",
+                    }
+                },
+            }
+        },
+        spot_status={
+            "spot_quality": {
+                "coverage_pct": 1.0,
+                "assets": {"BTC": {"row_count": 80}},
+                "missing_assets": [],
+                "stale_assets": [],
+            }
+        },
+        runtime_state={
+            "deployment": {"kalshi_env": "production"},
+            "asset_modes": {"BTC": "shadow"},
+            "artifacts": {
+                "BTC": {
+                    "model": {"status": "trained"},
+                    "backtest": {
+                        "status": "warn",
+                        "metrics": {
+                            "strict_trade_eligible_count": 80,
+                            "trade_candidate_count": 3,
+                            "oos_trade_candidate_count": 0,
+                            "oos_evaluation_status": "insufficient_data",
+                            "oos_fold_count": 0,
+                            "net_simulated_pl_dollars": 0.0,
+                            "candidate_rejection_reason_counts": {
+                                "fee_adjusted_edge_below_live_min": 77,
+                                "spread_above_live_max": 4,
+                            },
+                            "candidate_status_counts": {"blocked_fee_edge": 77},
+                            "top_candidate_reason_counts": {"fee_adjusted_edge_below_live_min": 77},
+                        },
+                    },
+                    "replay_gate": {"status": "blocked"},
+                }
+            },
+        },
+        strict_rows_target=60,
+        candidate_target=50,
+    )
+
+    assert "dominant candidate blocker is fee_adjusted_edge_below_live_min" in report["blockers"]
+    assert report["replay"]["dominant_candidate_blocker"] == "fee_adjusted_edge_below_live_min"
+    assert report["replay"]["candidate_rejection_reason_counts"]["fee_adjusted_edge_below_live_min"] == 77
+    assert report["replay"]["oos_evaluation_status"] == "insufficient_data"
+
+
 @pytest.mark.asyncio
 async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_status_payload(args: SimpleNamespace, container: SimpleNamespace) -> dict[str, object]:
