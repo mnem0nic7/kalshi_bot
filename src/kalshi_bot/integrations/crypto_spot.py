@@ -17,9 +17,11 @@ import httpx
 
 
 COINBASE_PRODUCT_IDS = {
+    "BNB": "BNB-USD",
     "BTC": "BTC-USD",
     "DOGE": "DOGE-USD",
     "ETH": "ETH-USD",
+    "HYPE": "HYPE-USD",
     "SOL": "SOL-USD",
     "XRP": "XRP-USD",
 }
@@ -259,6 +261,109 @@ def _normalize_coinbase_ticker_payload(payload: Any) -> dict[str, Any]:
     return payload
 
 
+def _normalize_coinbase_trade(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    price = raw.get("price") or raw.get("trade_price")
+    observed = raw.get("time") or raw.get("trade_time")
+    if price in (None, ""):
+        return None
+    return {
+        "trade_id": raw.get("trade_id"),
+        "product_id": raw.get("product_id"),
+        "price_dollars": str(price),
+        "size": str(raw.get("size") or raw.get("volume") or ""),
+        "side": raw.get("side"),
+        "time": str(observed or ""),
+        "bid_dollars": str(raw.get("bid") or ""),
+        "ask_dollars": str(raw.get("ask") or ""),
+    }
+
+
+def _normalize_coinbase_trades_payload(payload: Any, *, limit: int = 20) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        raw_trades = payload.get("trades")
+    else:
+        raw_trades = payload
+    if not isinstance(raw_trades, list):
+        return []
+    trades: list[dict[str, Any]] = []
+    for raw in raw_trades[: max(0, limit)]:
+        trade = _normalize_coinbase_trade(raw)
+        if trade is not None:
+            trades.append(trade)
+    return trades
+
+
+def _normalize_coinbase_best_bid_ask_payload(payload: Any, *, product_id: str) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_book: dict[str, Any] | None = None
+    books = payload.get("pricebooks")
+    if isinstance(books, list):
+        for candidate in books:
+            if isinstance(candidate, dict) and str(candidate.get("product_id") or "") == product_id:
+                raw_book = candidate
+                break
+        if raw_book is None and books and isinstance(books[0], dict):
+            raw_book = books[0]
+    else:
+        raw_book = payload
+    if not isinstance(raw_book, dict):
+        return None
+    bid_price = raw_book.get("best_bid") or raw_book.get("bid")
+    ask_price = raw_book.get("best_ask") or raw_book.get("ask")
+    bid_size = raw_book.get("best_bid_size") or raw_book.get("bid_size")
+    ask_size = raw_book.get("best_ask_size") or raw_book.get("ask_size")
+    bids = raw_book.get("bids")
+    asks = raw_book.get("asks")
+    if isinstance(bids, list) and bids and isinstance(bids[0], dict):
+        bid_price = bid_price or bids[0].get("price")
+        bid_size = bid_size or bids[0].get("size")
+    if isinstance(asks, list) and asks and isinstance(asks[0], dict):
+        ask_price = ask_price or asks[0].get("price")
+        ask_size = ask_size or asks[0].get("size")
+    bid = _decimal(bid_price)
+    ask = _decimal(ask_price)
+    spread_bps = None
+    mid = None
+    if bid is not None and ask is not None and bid > 0 and ask > 0:
+        mid = (bid + ask) / Decimal("2")
+        if mid > 0:
+            spread_bps = int(((ask - bid) / mid * Decimal("10000")).to_integral_value())
+    return {
+        "product_id": raw_book.get("product_id") or product_id,
+        "best_bid_dollars": str(bid) if bid is not None else "",
+        "best_ask_dollars": str(ask) if ask is not None else "",
+        "best_bid_size": str(bid_size or ""),
+        "best_ask_size": str(ask_size or ""),
+        "mid_dollars": str(mid) if mid is not None else "",
+        "spread_bps": spread_bps,
+        "time": str(raw_book.get("time") or ""),
+    }
+
+
+def _coinbase_market_microstructure(
+    *,
+    product_id: str,
+    ticker_payload: Any,
+    best_bid_ask: dict[str, Any] | None,
+    authenticated: bool,
+) -> dict[str, Any]:
+    ticker_book = _normalize_coinbase_best_bid_ask_payload(ticker_payload, product_id=product_id)
+    book = best_bid_ask or ticker_book or {}
+    trades = _normalize_coinbase_trades_payload(ticker_payload, limit=20)
+    latest_trade = trades[0] if trades else None
+    return {
+        "product_id": product_id,
+        "authenticated": authenticated,
+        "best_bid_ask": book,
+        "recent_trades": trades,
+        "recent_trade_count": len(trades),
+        "latest_trade": latest_trade,
+    }
+
+
 class CoinbaseSpotClient:
     base_url = "https://api.exchange.coinbase.com"
     authenticated_base_url = "https://api.coinbase.com"
@@ -348,6 +453,47 @@ class CoinbaseSpotClient:
         deduped = {(row.provider, row.asset_symbol, row.end_ts): row for row in rows}
         return sorted(deduped.values(), key=lambda row: row.end_ts)
 
+    async def fetch_best_bid_ask(self, asset_symbol: str) -> dict[str, Any] | None:
+        symbol = normalize_spot_asset_symbol(asset_symbol)
+        product_id = COINBASE_PRODUCT_IDS.get(symbol)
+        if product_id is None:
+            raise KeyError(f"coinbase unsupported asset: {symbol}")
+        request_path = "/api/v3/brokerage/best_bid_ask"
+        try:
+            response = await self._authenticated_get(request_path, params={"product_ids": product_id})
+            if response is not None:
+                return _normalize_coinbase_best_bid_ask_payload(response.json(), product_id=product_id)
+        except Exception:
+            pass
+        try:
+            response = await self.client.get(f"/products/{product_id}/book", params={"level": 1}, headers={"Cache-Control": "no-cache"})
+            response.raise_for_status()
+            return _normalize_coinbase_best_bid_ask_payload(response.json(), product_id=product_id)
+        except Exception:
+            return None
+
+    async def fetch_product(self, product_id: str) -> dict[str, Any] | None:
+        normalized = str(product_id or "").strip().upper()
+        if not normalized:
+            raise ValueError("product_id is required")
+        request_path = f"/api/v3/brokerage/products/{normalized}"
+        try:
+            response = await self._authenticated_get(request_path)
+            if response is not None:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    product = payload.get("product") if isinstance(payload.get("product"), dict) else payload
+                    return dict(product)
+        except Exception:
+            pass
+        try:
+            response = await self.client.get(f"/products/{normalized}")
+            response.raise_for_status()
+            payload = response.json()
+            return dict(payload) if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
     async def fetch_current(self, asset_symbol: str) -> SpotOHLC | None:
         symbol = normalize_spot_asset_symbol(asset_symbol)
         product_id = COINBASE_PRODUCT_IDS.get(symbol)
@@ -356,7 +502,7 @@ class CoinbaseSpotClient:
         request_path = f"/api/v3/brokerage/products/{product_id}/ticker"
         authenticated = False
         try:
-            response = await self._authenticated_get(request_path)
+            response = await self._authenticated_get(request_path, params={"limit": "20"})
             authenticated = response is not None
         except Exception:
             response = None
@@ -364,12 +510,33 @@ class CoinbaseSpotClient:
             response = await self.client.get(f"/products/{product_id}/ticker", headers={"Cache-Control": "no-cache"})
         response.raise_for_status()
         payload = response.json()
+        try:
+            best_bid_ask = await self.fetch_best_bid_ask(symbol)
+        except Exception:
+            best_bid_ask = None
+        microstructure = _coinbase_market_microstructure(
+            product_id=product_id,
+            ticker_payload=payload,
+            best_bid_ask=best_bid_ask,
+            authenticated=authenticated,
+        )
         raw = _normalize_coinbase_ticker_payload(payload)
-        price = _decimal(raw.get("price"))
+        book_price = _decimal((microstructure.get("best_bid_ask") or {}).get("mid_dollars") if isinstance(microstructure.get("best_bid_ask"), dict) else None)
+        price = book_price or _decimal(raw.get("price"))
         if price is None:
             return None
         now = datetime.now(UTC)
-        observed = min(_parse_datetime(raw.get("time") or raw.get("trade_time")) or now, now)
+        observed_candidates = [
+            value
+            for value in (
+                _parse_datetime(((microstructure.get("best_bid_ask") or {}).get("time")) if isinstance(microstructure.get("best_bid_ask"), dict) else None),
+                _parse_datetime(raw.get("time") or raw.get("trade_time")),
+            )
+            if value is not None
+        ]
+        if not observed_candidates and best_bid_ask is not None:
+            observed_candidates.append(now)
+        observed = min(max(observed_candidates) if observed_candidates else now, now)
         return SpotOHLC(
             provider="coinbase",
             asset_symbol=symbol,
@@ -386,6 +553,7 @@ class CoinbaseSpotClient:
                 "raw": payload,
                 "product_id": product_id,
                 "authenticated": authenticated,
+                "market_microstructure": microstructure,
             },
         )
 

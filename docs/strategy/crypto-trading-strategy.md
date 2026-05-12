@@ -57,8 +57,8 @@ Current tracked assets:
 | SOL | Standard tracked asset. |
 | XRP | Standard tracked asset. |
 | DOGE | Tracked, but requires enough labeled real-quote evidence. |
-| BNB | Keep shadow while spot support is proxy-only. |
-| HYPE | Keep shadow while spot support is proxy-only. |
+| BNB | Coinbase-supported tracked asset; keep shadow until its own data/replay gates pass. |
+| HYPE | Coinbase-supported tracked asset; keep shadow until its own data/replay gates pass. |
 
 In scope:
 
@@ -66,6 +66,7 @@ In scope:
 - live Kalshi bid/ask quote snapshots
 - market candlesticks from Kalshi history
 - spot OHLC/price evidence from Coinbase and CoinGecko
+- Coinbase current tick, best-bid/ask, and recent trade microstructure for supported assets
 - per-asset model, backtest, replay-gate, and live-path artifacts
 - per-asset live/shadow/off controls
 
@@ -189,9 +190,11 @@ Before a candidate can be trusted for live mode:
 - per-asset model/backtest/replay artifacts must exist
 - the replay gate must be evaluated against the active runtime crypto policy
 
-BNB and HYPE require special caution because current spot support is
-CoinGecko/proxy-only. They should remain shadow until spot evidence is fresh,
-stable, and not proxy-only.
+BNB and HYPE previously required special caution because spot support was
+CoinGecko/proxy-only. As of May 12, 2026, the Coinbase CDP-backed product check
+returns online `BNB-USD` and `HYPE-USD`, so they can collect non-proxy Coinbase
+spot ticks. They still remain shadow until their own strict-row, replay, P/L,
+and asset-mode gates pass.
 
 ### 3. Entry Candidate Gates
 
@@ -442,18 +445,19 @@ Latest live-path blockers by asset:
 
 | Asset | Strict labeled real-quote rows | Resolved sample | Trade candidates | Replay gate | Model status | Notes |
 |---|---:|---:|---:|---|---|---|
-| BNB | 3 | 3 | 0 | blocked | insufficient data | Proxy-only/CoinGecko-only spot. |
+| BNB | 3 | 3 | 0 | blocked | insufficient data | Coinbase spot now supported; needs fresh strict rows and replay candidates. |
 | BTC | 16 | 16 | 0 | blocked | trained | P/L and candidate support not ready. |
 | DOGE | 20 | 24 | 0 | blocked | insufficient data | Candidate support not ready. |
 | ETH | 19 | 23 | 0 | blocked | trained | P/L and candidate support not ready. |
-| HYPE | 27 | 37 | 0 | blocked | insufficient data | Proxy-only/CoinGecko-only spot. |
+| HYPE | 27 | 37 | 0 | blocked | insufficient data | Coinbase spot now supported; needs fresh strict rows and replay candidates. |
 | SOL | 27 | 37 | 0 | blocked | trained | P/L and candidate support not ready. |
 | XRP | 27 | 37 | 0 | blocked | trained | P/L and candidate support not ready. |
 
-Spot coverage was fresh and at 100% in the latest live-path report, but BNB and
-HYPE remained proxy-only. The dominant blockers were strict real-quote support,
-resolved-sample support, zero replay trade candidates, non-positive simulated
-P/L, and model P/L not beating market-mid P/L.
+Spot coverage was fresh and at 100% in the latest live-path report. BNB and HYPE
+were previously proxy-only, but Coinbase CDP now exposes online `BNB-USD` and
+`HYPE-USD` products and current non-proxy ticks. The dominant blockers remain
+strict real-quote support, resolved-sample support, zero replay trade candidates,
+non-positive simulated P/L, and model P/L not beating market-mid P/L.
 
 Important caveat: this is a point-in-time snapshot. Always rerun
 `crypto-live-path status` and check deployment health before changing live
@@ -567,7 +571,7 @@ Before enabling live crypto for any asset:
 - replay simulated net P/L beats market-mid P/L
 - calibration diagnostics are present for Brier, log-loss, and ECE
 - spot coverage is at least 80%, fresh, and not proxy-only
-- BNB/HYPE remain shadow until proxy-only spot support is resolved
+- BNB/HYPE remain shadow until their own strict-row, replay, P/L, and asset-mode gates pass
 - target asset mode is promoted one asset at a time
 - no `exploratory_shadow` candidate can reach live execution
 - order size, position caps, daily loss caps, and rollback path are accepted

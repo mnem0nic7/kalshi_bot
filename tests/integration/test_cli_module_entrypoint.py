@@ -132,6 +132,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     spot_current_args = parser.parse_args(
         ["crypto-spot", "collect-current", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "--json"]
     )
+    spot_products_args = parser.parse_args(
+        ["crypto-spot", "coinbase-products", "--kalshi-env", "production", "--assets", "BTC", "HYPE", "--json"]
+    )
     spot_args = parser.parse_args(["crypto-spot", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "--json"])
     model_args = parser.parse_args(["crypto-model", "train", "--kalshi-env", "production", "--frequency", "15m"])
     replay_args = parser.parse_args(["crypto-replay", "gate", "--kalshi-env", "production", "--frequency", "15m"])
@@ -183,6 +186,8 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert spot_current_args.command == "crypto-spot"
     assert spot_current_args.crypto_spot_command == "collect-current"
     assert spot_current_args.assets == ["BTC"]
+    assert spot_products_args.crypto_spot_command == "coinbase-products"
+    assert spot_products_args.assets == ["BTC", "HYPE"]
     assert spot_args.command == "crypto-spot"
     assert spot_args.crypto_spot_command == "status"
     assert spot_args.kalshi_env == "production"

@@ -135,6 +135,111 @@ async def test_coinbase_spot_client_prefers_authenticated_current_tick() -> None
 
 
 @pytest.mark.asyncio
+async def test_coinbase_spot_client_enriches_current_tick_with_microstructure() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    credentials = CoinbaseCdpCredentials(
+        name="organizations/test-org/apiKeys/test-key",
+        private_key=private_pem,
+    )
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.url.path == "/api/v3/brokerage/products/BTC-USD/ticker":
+            return httpx.Response(
+                200,
+                json={
+                    "trades": [
+                        {
+                            "trade_id": "1",
+                            "product_id": "BTC-USD",
+                            "price": "109.25",
+                            "size": "1.5",
+                            "time": "2020-09-13T12:26:42Z",
+                            "side": "BUY",
+                            "bid": "109.20",
+                            "ask": "109.30",
+                        }
+                    ],
+                    "best_bid": "109.20",
+                    "best_ask": "109.30",
+                },
+            )
+        if request.url.path == "/api/v3/brokerage/best_bid_ask":
+            return httpx.Response(
+                200,
+                json={
+                    "pricebooks": [
+                        {
+                            "product_id": "BTC-USD",
+                            "bids": [{"price": "109.19", "size": "2.0"}],
+                            "asks": [{"price": "109.31", "size": "3.0"}],
+                            "time": "2020-09-13T12:26:42Z",
+                        }
+                    ]
+                },
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    client = CoinbaseSpotClient(credentials=credentials)
+    await client.authenticated_client.aclose()
+    client.authenticated_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url=client.authenticated_base_url,
+        headers={"Accept": "application/json"},
+    )
+    try:
+        row = await client.fetch_current("BTC")
+    finally:
+        await client.aclose()
+
+    assert row is not None
+    assert seen_paths == ["/api/v3/brokerage/products/BTC-USD/ticker", "/api/v3/brokerage/best_bid_ask"]
+    microstructure = row.payload["market_microstructure"]
+    assert microstructure["recent_trade_count"] == 1
+    assert microstructure["latest_trade"]["price_dollars"] == "109.25"
+    assert microstructure["best_bid_ask"]["best_bid_dollars"] == "109.19"
+    assert microstructure["best_bid_ask"]["best_ask_dollars"] == "109.31"
+    assert microstructure["best_bid_ask"]["spread_bps"] == 11
+
+
+@pytest.mark.asyncio
+async def test_coinbase_spot_client_fetch_product_reports_support() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/products/BTC-USD"
+        return httpx.Response(
+            200,
+            json={
+                "id": "BTC-USD",
+                "base_currency": "BTC",
+                "quote_currency": "USD",
+                "status": "online",
+            },
+        )
+
+    client = CoinbaseSpotClient()
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url=client.base_url,
+        headers={"Accept": "application/json"},
+    )
+    try:
+        product = await client.fetch_product("BTC-USD")
+    finally:
+        await client.aclose()
+
+    assert product is not None
+    assert product["id"] == "BTC-USD"
+    assert product["base_currency"] == "BTC"
+
+
+@pytest.mark.asyncio
 async def test_coingecko_spot_client_buckets_price_history_as_proxy_ohlc() -> None:
     base_ms = int(datetime(2026, 5, 3, 9, 15, tzinfo=UTC).timestamp() * 1000)
 
@@ -445,7 +550,18 @@ def test_live_spot_tick_allows_live_quality_candidate(tmp_path) -> None:
         close_dollars=Decimal("99.00000000"),
         source_kind="spot_tick",
         observed_at=now,
-        payload={},
+        payload={
+            "market_microstructure": {
+                "best_bid_ask": {
+                    "best_bid_dollars": "98.9900",
+                    "best_ask_dollars": "99.0100",
+                    "mid_dollars": "99.0000",
+                    "spread_bps": 2,
+                },
+                "latest_trade": {"price_dollars": "99.0000", "size": "1.25"},
+                "recent_trade_count": 7,
+            }
+        },
     )
 
     row = _crypto_live_market_row(market, spot_rows=[spot], settings=settings)
@@ -454,6 +570,10 @@ def test_live_spot_tick_allows_live_quality_candidate(tmp_path) -> None:
     assert row["spot_context_mode"] == "live"
     assert row["spot_feature_status"] == "available"
     assert row["spot_proxy_only"] is False
+    assert row["spot_exchange_bid_dollars"] == Decimal("98.9900")
+    assert row["spot_exchange_ask_dollars"] == Decimal("99.0100")
+    assert row["spot_exchange_spread_bps"] == 2
+    assert row["spot_exchange_recent_trade_count"] == 7
     assert any(candidate["candidate_status"] == "live_quality" for candidate in candidates)
 
 

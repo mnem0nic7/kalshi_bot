@@ -1379,6 +1379,39 @@ class CryptoSpotService:
             credentials=credentials,
         )
 
+    async def coinbase_products(
+        self,
+        *,
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        assets = sorted({normalize_asset_symbol(symbol) for symbol in asset_symbols}) if asset_symbols else sorted(set(COINBASE_PRODUCT_IDS) | set(COINGECKO_IDS))
+        coinbase = self._coinbase_client()
+        products: dict[str, Any] = {}
+        try:
+            for asset in assets:
+                product_id = COINBASE_PRODUCT_IDS.get(asset) or f"{asset}-USD"
+                product = await coinbase.fetch_product(product_id)
+                products[asset] = {
+                    "asset_symbol": asset,
+                    "product_id": product_id,
+                    "configured_for_spot_collection": asset in COINBASE_PRODUCT_IDS,
+                    "coinbase_supported": product is not None,
+                    "base_currency_id": (product or {}).get("base_currency_id") or (product or {}).get("base_currency"),
+                    "quote_currency_id": (product or {}).get("quote_currency_id") or (product or {}).get("quote_currency"),
+                    "product_type": (product or {}).get("product_type"),
+                    "trading_disabled": bool((product or {}).get("trading_disabled")),
+                    "status": (product or {}).get("status") or ("available" if product is not None else "missing"),
+                }
+        finally:
+            await coinbase.aclose()
+        return {
+            "status": "ok",
+            "authenticated": bool(coinbase.credentials),
+            "assets": products,
+            "coinbase_live_quality_assets": sorted(asset for asset, payload in products.items() if payload["configured_for_spot_collection"] and payload["coinbase_supported"]),
+            "proxy_only_assets": sorted(asset for asset, payload in products.items() if not payload["configured_for_spot_collection"]),
+        }
+
     async def collect_current(
         self,
         *,
@@ -4136,6 +4169,12 @@ def _spot_context_for_decision(
             "spot_realized_volatility": None,
             "spot_target_distance_volatility": None,
             "kalshi_mid_spot_gap": None,
+            "spot_exchange_bid_dollars": None,
+            "spot_exchange_ask_dollars": None,
+            "spot_exchange_mid_dollars": None,
+            "spot_exchange_spread_bps": None,
+            "spot_exchange_latest_trade_size": None,
+            "spot_exchange_recent_trade_count": None,
         }
     current = eligible[-1]
     close = _decimal(current.close_dollars)
@@ -4180,6 +4219,16 @@ def _spot_context_for_decision(
     if moneyness_pct is not None and volatility is not None and volatility > 0:
         target_distance_volatility = moneyness_pct / volatility
     kalshi_gap = mid_yes - spot_probability_proxy if spot_probability_proxy is not None else None
+    payload = current.payload if isinstance(current.payload, dict) else {}
+    microstructure = payload.get("market_microstructure") if isinstance(payload.get("market_microstructure"), dict) else {}
+    best_bid_ask = microstructure.get("best_bid_ask") if isinstance(microstructure.get("best_bid_ask"), dict) else {}
+    latest_trade = microstructure.get("latest_trade") if isinstance(microstructure.get("latest_trade"), dict) else {}
+    spot_exchange_bid = _optional_decimal(best_bid_ask.get("best_bid_dollars"))
+    spot_exchange_ask = _optional_decimal(best_bid_ask.get("best_ask_dollars"))
+    spot_exchange_mid = _optional_decimal(best_bid_ask.get("mid_dollars"))
+    spot_exchange_spread = best_bid_ask.get("spread_bps")
+    spot_exchange_latest_trade_size = _optional_decimal(latest_trade.get("size"))
+    spot_exchange_recent_trade_count = microstructure.get("recent_trade_count")
     return {
         "spot_feature_status": "available" if not stale else "stale",
         "spot_provider": current.provider,
@@ -4199,6 +4248,12 @@ def _spot_context_for_decision(
         "spot_realized_volatility": volatility,
         "spot_target_distance_volatility": target_distance_volatility,
         "kalshi_mid_spot_gap": kalshi_gap,
+        "spot_exchange_bid_dollars": spot_exchange_bid,
+        "spot_exchange_ask_dollars": spot_exchange_ask,
+        "spot_exchange_mid_dollars": spot_exchange_mid,
+        "spot_exchange_spread_bps": int(spot_exchange_spread) if spot_exchange_spread not in (None, "") else None,
+        "spot_exchange_latest_trade_size": spot_exchange_latest_trade_size,
+        "spot_exchange_recent_trade_count": int(spot_exchange_recent_trade_count) if spot_exchange_recent_trade_count not in (None, "") else None,
     }
 
 
@@ -5738,6 +5793,8 @@ def _crypto_trade_candidates(
                 "spot_provider": row.get("spot_provider"),
                 "spot_source_kind": row.get("spot_source_kind"),
                 "spot_stale_seconds": row.get("spot_stale_seconds"),
+                "spot_exchange_spread_bps": row.get("spot_exchange_spread_bps"),
+                "spot_exchange_recent_trade_count": row.get("spot_exchange_recent_trade_count"),
                 "rank": rank,
                 "live_eligible": False,
             }
@@ -5816,6 +5873,8 @@ def _crypto_trade_candidates(
                 "remaining_payout_dollars": str(remaining_payout.quantize(Decimal("0.0001"))),
                 "bucket_key": _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(cost)}),
                 "spread_bps": spread_bps,
+                "spot_exchange_spread_bps": row.get("spot_exchange_spread_bps"),
+                "spot_exchange_recent_trade_count": row.get("spot_exchange_recent_trade_count"),
                 "runtime_thresholds": dict(entry_policy),
                 "rank": None,
                 "live_eligible": candidate_status == CRYPTO_LIVE_QUALITY,
@@ -6198,6 +6257,15 @@ def _decimal(value: Any) -> Decimal:
     if isinstance(value, Decimal):
         return value
     return Decimal(str(value))
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return _decimal(value)
+    except Exception:
+        return None
 
 
 def _issue_code(reason: str) -> str:
