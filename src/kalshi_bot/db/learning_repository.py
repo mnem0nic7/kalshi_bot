@@ -60,11 +60,23 @@ class LearningRepositoryMixin:
         record = await self.get_agent_pack(pack.version)
         if record is None:
             return await self.create_agent_pack(pack)
+        payload = pack.model_dump(mode="json")
+        existing_payload = dict(record.payload or {})
+        comparable_existing_payload = {key: value for key, value in existing_payload.items() if key != "created_at"}
+        comparable_payload = {key: value for key, value in payload.items() if key != "created_at"}
+        if (
+            record.status == pack.status
+            and record.parent_version == pack.parent_version
+            and record.source == pack.source
+            and record.description == pack.description
+            and comparable_existing_payload == comparable_payload
+        ):
+            return record
         record.status = pack.status
         record.parent_version = pack.parent_version
         record.source = pack.source
         record.description = pack.description
-        record.payload = pack.model_dump(mode="json")
+        record.payload = payload
         await self.session.flush()
         return record
 

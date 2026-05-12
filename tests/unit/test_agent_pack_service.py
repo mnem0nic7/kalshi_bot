@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import event
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import AgentRole
@@ -257,3 +258,35 @@ async def test_agent_pack_service_migrates_legacy_builtin_notes_to_deterministic
     assert notes["green_version"] == "autonomous-pack-v2"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_pack_service_repeated_initialization_is_read_only(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/agent-packs-readonly.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    service = AgentPackService(settings)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await service.ensure_initialized(repo)
+        await session.commit()
+
+    statements: list[str] = []
+
+    def record_statement(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        if "UPDATE agent_packs" in statement:
+            statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        async with session_factory() as session:
+            repo = PlatformRepository(session)
+            await service.ensure_initialized(repo)
+            await session.commit()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record_statement)
+        await engine.dispose()
+
+    assert statements == []

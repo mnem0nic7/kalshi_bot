@@ -244,8 +244,10 @@ class AgentPackService:
         for key in ("blue_version", "green_version", "champion_version", "active_version"):
             if notes.get(key) == LEGACY_BUILTIN_AGENT_PACK_VERSION:
                 notes[key] = builtin.version
-        control.notes = self._replace_notes(control.notes, notes)
-        await repo.update_deployment_notes(control.notes)
+        updated_notes = self._replace_notes(control.notes, notes)
+        if control.notes != updated_notes:
+            control.notes = updated_notes
+            await repo.update_deployment_notes(control.notes)
         return builtin
 
     async def get_pack(self, repo: PlatformRepository, version: str) -> AgentPack:
