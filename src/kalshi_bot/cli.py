@@ -1101,6 +1101,8 @@ def _crypto_live_path_assess_asset(
     quote_evidence = history_status.get("quote_evidence") or {}
     support_by_asset = quote_evidence.get("trade_candidate_support_by_asset") or {}
     support = support_by_asset.get(asset) or {}
+    strict_audit_by_asset = quote_evidence.get("strict_quote_ingestion_audit_by_asset") or {}
+    strict_audit = strict_audit_by_asset.get(asset) or {}
     spot_quality = spot_status.get("spot_quality") or {}
     spot_assets = spot_quality.get("assets") or {}
     spot_asset = spot_assets.get(asset) or {}
@@ -1169,7 +1171,20 @@ def _crypto_live_path_assess_asset(
     ready = not blockers
     mode = (runtime_state.get("asset_modes") or {}).get(asset, "shadow")
     next_command = None
-    if ready and mode != "live":
+    if (
+        not ready
+        and _int_or_zero(strict_audit.get("snapshot_present")) > 0
+        and _int_or_zero(strict_audit.get("settled_label_joined")) == 0
+    ):
+        next_command = (
+            "crypto-history collect-settled "
+            f"--kalshi-env {_crypto_live_path_env(runtime_state)} "
+            "--frequency 15m "
+            "--days 2 "
+            f"--assets {asset} "
+            "--json"
+        )
+    elif ready and mode != "live":
         next_command = f"crypto-asset-mode set --kalshi-env {_crypto_live_path_env(runtime_state)} {asset} live"
 
     return {
@@ -1182,6 +1197,7 @@ def _crypto_live_path_assess_asset(
         "quote_evidence": {
             "strict_trade_eligible_count": strict_rows,
             "trade_candidate_support": support,
+            "strict_quote_ingestion_audit": strict_audit,
         },
         "replay": {
             "gate_status": gate_status,

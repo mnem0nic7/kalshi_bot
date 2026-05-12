@@ -982,6 +982,7 @@ class CryptoHistoryService:
         settled_markets: list[CryptoMarket] = []
         errors: list[dict[str, str]] = []
         series_stats: list[dict[str, Any]] = []
+        expected_assets = sorted(requested_assets or {normalize_asset_symbol(series.asset_symbol) for series in series_rows})
         for series in series_rows:
             result = await self._list_settled_markets(series, cutoff=cutoff, frequency=freq)
             errors.extend({"series_ticker": series.series_ticker, "error": error} for error in result["errors"])
@@ -1004,7 +1005,7 @@ class CryptoHistoryService:
             "errors": [],
             "source_counts": {},
         }
-        asset_counts: Counter[str] = Counter()
+        asset_counts: Counter[str] = Counter({asset: 0 for asset in expected_assets})
         commit_batch_size = 250
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -1053,14 +1054,19 @@ class CryptoHistoryService:
                 ]
                 candles = [row for row in candles if normalize_asset_symbol(row.asset_symbol) in requested_assets]
             await session.commit()
+        assets_missing_settled = _crypto_assets_missing_settled_markets(
+            snapshots,
+            expected_assets=expected_assets,
+        )
         return {
             "status": "ok" if settled_markets else "warn",
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
-            "asset_symbols": sorted(requested_assets),
+            "asset_symbols": expected_assets,
             "lookback_days": lookback_days,
             "settled_markets_stored": len(settled_markets),
             "asset_counts": dict(sorted(asset_counts.items())),
+            "assets_missing_settled_markets": assets_missing_settled,
             "candles_stored": candle_stats["stored"],
             "candle_capture": {
                 **candle_stats,
@@ -1252,7 +1258,10 @@ class CryptoHistoryService:
                 and (market.close_time or market.expected_expiration_time) < cutoff
                 for market in parsed_page
             ):
-                break
+                logger.debug(
+                    "crypto settled page for %s is older than cutoff; continuing pagination because ordering is not guaranteed",
+                    series.series_ticker,
+                )
             cursor = response.get("cursor") or response.get("next_cursor")
             if not cursor or cursor in seen_cursors:
                 break
@@ -3556,7 +3565,7 @@ def _crypto_quote_evidence_summary(
             summary["strict_trade_eligible_rows"] += 1
             if row.get("label_yes") in {0, 1}:
                 summary["labeled_real_quote_rows"] += 1
-    strict_quote_ingestion_audit: dict[str, dict[str, int]] = {}
+    strict_quote_ingestion_audit: dict[str, dict[str, Any]] = {}
     for asset in sorted({row.asset_symbol for row in snapshots} | {str(row.get("asset_symbol") or "UNKNOWN") for row in decision_rows}):
         asset_snapshots = [row for row in snapshots if normalize_asset_symbol(row.asset_symbol) == normalize_asset_symbol(asset)]
         asset_decisions = [row for row in decision_rows if normalize_asset_symbol(str(row.get("asset_symbol") or "")) == normalize_asset_symbol(asset)]
@@ -3568,7 +3577,7 @@ def _crypto_quote_evidence_summary(
                 candidates = _crypto_trade_candidates(row, _decimal(row.get("mid_yes_dollars") or Decimal("0.5000")), settings=settings)
                 if candidates:
                     candidate_generated += 1
-        strict_quote_ingestion_audit[normalize_asset_symbol(asset)] = {
+        counts = {
             "snapshot_present": len(asset_snapshots),
             "real_bid_ask_present": sum(
                 1
@@ -3582,6 +3591,10 @@ def _crypto_quote_evidence_summary(
             "strict_trade_eligible": sum(1 for row in asset_decisions if row.get("strict_trade_eligible")),
             "candidate_generated": candidate_generated,
         }
+        strict_quote_ingestion_audit[normalize_asset_symbol(asset)] = {
+            **counts,
+            "blocker_stage": _crypto_strict_quote_blocker_stage(counts),
+        }
     return {
         "real_quote_snapshot_count": len(real_snapshots),
         "real_quote_decision_rows": len(real_quote_rows),
@@ -3591,9 +3604,44 @@ def _crypto_quote_evidence_summary(
         "prediction_only_proxy_row_count": len(proxy_rows),
         "trade_candidate_support_by_asset": dict(sorted(candidates_by_asset.items())),
         "strict_quote_ingestion_audit_by_asset": strict_quote_ingestion_audit,
+        "assets_missing_settled_markets": _crypto_assets_missing_settled_markets(snapshots),
         "source_kind_counts": dict(Counter(row.source_kind for row in snapshots)),
         "assets_with_real_quotes": sorted({row.asset_symbol for row in real_snapshots}),
     }
+
+
+def _crypto_assets_missing_settled_markets(
+    snapshots: list[CryptoMarketSnapshotRecord],
+    *,
+    expected_assets: list[str] | None = None,
+) -> list[str]:
+    assets = sorted({normalize_asset_symbol(asset) for asset in (expected_assets or [])} | {row.asset_symbol for row in snapshots})
+    missing: list[str] = []
+    for asset in assets:
+        asset_snapshots = [row for row in snapshots if normalize_asset_symbol(row.asset_symbol) == asset]
+        raw_snapshots = [row for row in asset_snapshots if row.source_kind != "settled_backfill"]
+        settled_snapshots = [row for row in asset_snapshots if row.settlement_result in {"yes", "no"}]
+        if raw_snapshots and not settled_snapshots:
+            missing.append(asset)
+    return missing
+
+
+def _crypto_strict_quote_blocker_stage(counts: dict[str, Any]) -> str:
+    if int(counts.get("snapshot_present") or 0) <= 0:
+        return "missing_snapshot"
+    if int(counts.get("real_bid_ask_present") or 0) <= 0:
+        return "missing_real_bid_ask"
+    if int(counts.get("settled_label_joined") or 0) <= 0:
+        return "missing_settled_label"
+    if int(counts.get("point_in_time_rows") or 0) <= 0:
+        return "missing_point_in_time_row"
+    if int(counts.get("spot_joined") or 0) <= 0:
+        return "missing_spot_join"
+    if int(counts.get("strict_trade_eligible") or 0) <= 0:
+        return "missing_strict_trade_eligible"
+    if int(counts.get("candidate_generated") or 0) <= 0:
+        return "candidate_generation_blocked"
+    return "candidate_generated"
 
 
 def _crypto_readiness_score(

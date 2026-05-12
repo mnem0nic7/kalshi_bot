@@ -448,17 +448,24 @@ class DaemonService:
     async def _periodic_crypto_history_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.crypto_history_auto_interval_seconds)
-            if self.crypto_history_service is None or not self.settings.crypto_history_auto_enabled:
-                continue
-            if not await self._is_active_color():
-                continue
             try:
-                await self.crypto_history_service.bootstrap(
-                    days=self.settings.crypto_history_auto_lookback_days,
-                    frequency="15m",
-                )
+                await self._run_crypto_history_cycle()
             except Exception:
                 logger.warning("crypto history loop error", exc_info=True)
+
+    async def _run_crypto_history_cycle(self) -> None:
+        if self.crypto_history_service is None or not self.settings.crypto_history_auto_enabled:
+            return
+        if not await self._is_active_color():
+            return
+        await self.crypto_history_service.collect_settled(
+            days=self.settings.crypto_history_auto_lookback_days,
+            frequency="15m",
+        )
+        await self.crypto_history_service.bootstrap(
+            days=self.settings.crypto_history_auto_lookback_days,
+            frequency="15m",
+        )
 
     async def _periodic_crypto_quote_evidence_loop(self) -> None:
         while True:

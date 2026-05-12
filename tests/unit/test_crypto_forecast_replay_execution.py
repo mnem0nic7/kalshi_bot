@@ -350,6 +350,56 @@ async def test_crypto_history_paginates_recent_settled_markets_until_lookback(tm
 
 
 @pytest.mark.asyncio
+async def test_crypto_history_settled_pagination_does_not_assume_ordering(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    now = datetime.now(UTC)
+    series = CryptoSeries(
+        series_ticker="KXETH15M",
+        title="ETH 15m",
+        category="Crypto",
+        frequency="15m",
+        asset_symbol="ETH",
+    )
+
+    class _FakeKalshi:
+        async def list_markets(self, **params):
+            if "cursor" not in params:
+                return {
+                    "markets": [
+                        {
+                            "ticker": "KXETH15M-OLD",
+                            "series_ticker": "KXETH15M",
+                            "close_time": (now - timedelta(days=5)).isoformat(),
+                            "result": "no",
+                            "status": "finalized",
+                        }
+                    ],
+                    "cursor": "recent",
+                }
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXETH15M-RECENT",
+                        "series_ticker": "KXETH15M",
+                        "close_time": (now - timedelta(hours=1)).isoformat(),
+                        "result": "yes",
+                        "status": "finalized",
+                    }
+                ]
+            }
+
+    result = await CryptoHistoryService(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        kalshi=_FakeKalshi(),  # type: ignore[arg-type]
+        market_service=None,  # type: ignore[arg-type]
+    )._list_settled_markets(series, cutoff=now - timedelta(days=2), frequency="15m")
+
+    assert result["pages_fetched"] == 2
+    assert [market.market_ticker for market in result["markets"]] == ["KXETH15M-RECENT"]
+
+
+@pytest.mark.asyncio
 async def test_crypto_history_captures_candles_with_market_local_window(tmp_path) -> None:
     settings = _settings(tmp_path)
     close_time = datetime.now(UTC) - timedelta(days=30)
@@ -569,6 +619,138 @@ async def test_crypto_history_collect_settled_appends_terminal_label_snapshot(tm
     assert len(rows) == 1
     assert rows[0]["strict_trade_eligible"] is True
     assert rows[0]["settlement_label_source"] == "joined_settled_snapshot"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_history_collect_settled_reports_zero_counts_for_requested_assets(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    close_time = datetime.now(UTC) - timedelta(minutes=15)
+    assets = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"]
+
+    class _FakeKalshi:
+        async def list_markets(self, **params):
+            if params["series_ticker"] != "KXBTC15M":
+                return {"markets": []}
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXBTC15M-JOIN",
+                        "series_ticker": "KXBTC15M",
+                        "close_time": close_time.isoformat(),
+                        "expected_expiration_time": (close_time + timedelta(minutes=5)).isoformat(),
+                        "result": "yes",
+                        "status": "finalized",
+                        "yes_sub_title": "Target Price: $100000",
+                    }
+                ]
+            }
+
+    class _FakeMarketService:
+        async def discover_series(self, **kwargs) -> list[CryptoSeries]:
+            assert kwargs["frequency"] == "15m"
+            return [
+                CryptoSeries(
+                    series_ticker=f"KX{asset}15M" if asset != "XRP" else "KXXRP15M",
+                    title=f"{asset} 15m",
+                    category="Crypto",
+                    frequency="15m",
+                    asset_symbol=asset,
+                )
+                for asset in assets
+            ]
+
+        async def record_market_snapshot(self, repo, market: CryptoMarket, *, source_kind: str, observed_at: datetime):
+            return await repo.record_crypto_market_snapshot(
+                kalshi_env=settings.kalshi_env,
+                series_ticker=market.series_ticker,
+                market_ticker=market.market_ticker,
+                asset_symbol=market.asset_symbol,
+                frequency=market.frequency,
+                status=market.status,
+                close_time=market.close_time,
+                expected_expiration_time=market.expected_expiration_time,
+                target_price_dollars=market.target_price_dollars,
+                settlement_result=market.settlement_result,
+                source_kind=source_kind,
+                observed_at=observed_at,
+                payload=market.to_payload(),
+            )
+
+    service = CryptoHistoryService(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=_FakeKalshi(),  # type: ignore[arg-type]
+        market_service=_FakeMarketService(),  # type: ignore[arg-type]
+    )
+
+    async def fake_capture_candles(repo, market: CryptoMarket, *, cutoff: datetime) -> dict[str, object]:
+        del repo, market, cutoff
+        return {"status": "ok", "stored": 0, "source": "live"}
+
+    service._capture_candles = fake_capture_candles  # type: ignore[method-assign]
+    result = await service.collect_settled(days=2, frequency="15m", asset_symbols=assets)
+
+    assert result["status"] == "ok"
+    assert result["settled_markets_stored"] == 1
+    assert result["asset_symbols"] == ["BNB", "BTC", "DOGE", "ETH", "HYPE", "SOL", "XRP"]
+    assert result["asset_counts"] == {
+        "BNB": 0,
+        "BTC": 1,
+        "DOGE": 0,
+        "ETH": 0,
+        "HYPE": 0,
+        "SOL": 0,
+        "XRP": 0,
+    }
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_history_status_reports_assets_missing_settled_labels(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    observed_at = datetime.now(UTC) - timedelta(minutes=10)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.record_crypto_market_snapshot(
+            kalshi_env=settings.kalshi_env,
+            series_ticker="KXETH15M",
+            market_ticker="KXETH15M-MISSING-LABEL",
+            asset_symbol="ETH",
+            frequency="15m",
+            status="active",
+            close_time=observed_at + timedelta(minutes=5),
+            target_price_dollars=Decimal("3000.00000000"),
+            yes_bid_dollars=Decimal("0.4200"),
+            yes_ask_dollars=Decimal("0.4500"),
+            no_ask_dollars=Decimal("0.5800"),
+            observed_at=observed_at,
+            source_kind="live_quote_evidence",
+            payload={"unit": True},
+        )
+        await session.commit()
+
+    history_status = await CryptoHistoryService(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=None,  # type: ignore[arg-type]
+        market_service=None,  # type: ignore[arg-type]
+    ).status(frequency="15m", days=1)
+
+    quote_evidence = history_status["quote_evidence"]
+    assert "ETH" in quote_evidence["assets_missing_settled_markets"]
+    eth_audit = quote_evidence["strict_quote_ingestion_audit_by_asset"]["ETH"]
+    assert eth_audit["snapshot_present"] == 1
+    assert eth_audit["real_bid_ask_present"] == 1
+    assert eth_audit["settled_label_joined"] == 0
+    assert eth_audit["blocker_stage"] == "missing_settled_label"
     await engine.dispose()
 
 

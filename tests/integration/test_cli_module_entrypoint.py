@@ -222,6 +222,44 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert model_quality_args.domain == "all"
 
 
+def test_crypto_live_path_recommends_settled_backfill_when_labels_missing() -> None:
+    report = cli_module._crypto_live_path_assess_asset(
+        "ETH",
+        history_status={
+            "quote_evidence": {
+                "trade_candidate_support_by_asset": {},
+                "strict_quote_ingestion_audit_by_asset": {
+                    "ETH": {
+                        "snapshot_present": 3,
+                        "settled_label_joined": 0,
+                        "blocker_stage": "missing_settled_label",
+                    }
+                },
+            }
+        },
+        spot_status={
+            "spot_quality": {
+                "coverage_pct": 0.0,
+                "assets": {"ETH": {"row_count": 0}},
+                "missing_assets": ["ETH"],
+                "stale_assets": [],
+            }
+        },
+        runtime_state={
+            "deployment": {"kalshi_env": "production"},
+            "asset_modes": {"ETH": "shadow"},
+            "artifacts": {"ETH": {"model": {}, "backtest": {}, "replay_gate": {"status": "blocked"}}},
+        },
+        strict_rows_target=60,
+        candidate_target=50,
+    )
+
+    assert report["next_command"] == (
+        "crypto-history collect-settled --kalshi-env production --frequency 15m --days 2 --assets ETH --json"
+    )
+    assert report["quote_evidence"]["strict_quote_ingestion_audit"]["blocker_stage"] == "missing_settled_label"
+
+
 @pytest.mark.asyncio
 async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_status_payload(args: SimpleNamespace, container: SimpleNamespace) -> dict[str, object]:
