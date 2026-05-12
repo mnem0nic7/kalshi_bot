@@ -6134,6 +6134,10 @@ def _crypto_candidate_quality_report(
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy | None = None,
 ) -> dict[str, Any]:
+    diagnostic_rows = [row for row in rows if _crypto_candidate_diagnostic_row(row)]
+    diagnostic_scope = "strict_point_in_time_rows" if diagnostic_rows else "all_rows_no_strict_point_in_time"
+    if not diagnostic_rows:
+        diagnostic_rows = rows
     scored: list[dict[str, Any]] = []
     status_counts: Counter[str] = Counter()
     reason_counts: Counter[str] = Counter()
@@ -6142,7 +6146,7 @@ def _crypto_candidate_quality_report(
     rejection_reason_counts: Counter[str] = Counter()
     side_counts: Counter[str] = Counter()
     by_asset: dict[str, dict[str, Any]] = {}
-    for row in rows:
+    for row in diagnostic_rows:
         predicted = _predict_crypto_probability(row, model)
         simulation = _simulate_crypto_trade(
             row,
@@ -6208,6 +6212,8 @@ def _crypto_candidate_quality_report(
     return {
         "dataset": {
             "row_count": len(rows),
+            "candidate_diagnostic_row_count": len(diagnostic_rows),
+            "candidate_diagnostic_scope": diagnostic_scope,
             "asset_count": len({row.get("asset_symbol") for row in rows}),
             "assets": sorted({str(row.get("asset_symbol")) for row in rows}),
         },
@@ -6264,6 +6270,18 @@ def _crypto_candidate_quality_report(
         ],
         "bucket_matrix": _crypto_bucket_matrix(scored, settings=settings),
     }
+
+
+def _crypto_candidate_diagnostic_row(row: dict[str, Any]) -> bool:
+    if row.get("strict_trade_eligible") is not True:
+        return False
+    if str(row.get("quote_source") or "") != "snapshot_quotes":
+        return False
+    if str(row.get("leakage_status") or "") != "point_in_time":
+        return False
+    if row.get("prediction_eligible") is False:
+        return False
+    return True
 
 
 def _crypto_live_rejection_reason(candidate: dict[str, Any]) -> str | None:

@@ -1721,6 +1721,33 @@ def test_crypto_replay_uses_runtime_asset_entry_overrides_for_candidate_support(
     assert override_report["metrics"]["candidate_rejection_reason_counts"] == {"fee_adjusted_edge_below_live_min": 1}
 
 
+def test_crypto_replay_candidate_blockers_prefer_strict_rows_over_proxy_rows(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_min_training_samples=20, risk_min_edge_bps=5000)
+    strict = _replay_row(market_ticker="KXBTC15M-STRICT", mid_yes_dollars=Decimal("0.5000"))
+    proxy_rows = [
+        _replay_row(
+            market_ticker=f"KXBTC15M-PROXY-{idx}",
+            row_id=f"proxy-{idx}",
+            quote_source="candlestick_close_proxy",
+            strict_trade_eligible=False,
+            execution_model_status="proxy_quote_prediction_only",
+        )
+        for idx in range(3)
+    ]
+
+    report = _evaluate_crypto_walk_forward(
+        [strict, *proxy_rows],  # type: ignore[list-item]
+        settings=settings,
+        diagnostic_model={"model_type": "market_mid_baseline"},
+    )
+
+    assert report["candidate_quality"]["dataset"]["row_count"] == 4
+    assert report["candidate_quality"]["dataset"]["candidate_diagnostic_row_count"] == 1
+    assert report["candidate_quality"]["dataset"]["candidate_diagnostic_scope"] == "strict_point_in_time_rows"
+    assert report["metrics"]["trade_candidate_count"] == 0
+    assert report["metrics"]["candidate_rejection_reason_counts"] == {"fee_adjusted_edge_below_live_min": 1}
+
+
 def test_crypto_replay_gate_blocks_zero_oos_folds_even_with_strong_metrics(tmp_path) -> None:
     settings = _settings(tmp_path, crypto_replay_min_resolved_markets=2, crypto_replay_min_trade_candidates=1)
     metrics = {
