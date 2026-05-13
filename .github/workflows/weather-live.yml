@@ -1,0 +1,135 @@
+name: Weather Live
+
+"on":
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Weather live action"
+        type: choice
+        options:
+          - status
+          - activate
+          - rollback
+        default: status
+      reason:
+        description: "Rollback reason, used only for rollback"
+        default: "github_actions_weather_live"
+
+permissions:
+  contents: read
+
+jobs:
+  weather-live:
+    name: Weather Live Operator Action
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
+      DEPLOY_SSH_ADDRESS_FAMILY: ${{ secrets.DEPLOY_SSH_ADDRESS_FAMILY || 'inet' }}
+      DEPLOY_APP_DIR: ${{ secrets.DEPLOY_APP_DIR }}
+      INPUT_ACTION: ${{ github.event.inputs.action }}
+      INPUT_REASON: ${{ github.event.inputs.reason }}
+
+    steps:
+      - name: Validate secrets
+        run: |
+          set -euo pipefail
+          for var in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_APP_DIR; do
+            test -n "${!var}" || { echo "Missing secret: ${var}"; exit 1; }
+          done
+          if ! [[ "${DEPLOY_SSH_PORT}" =~ ^[0-9]+$ ]] || (( DEPLOY_SSH_PORT < 1 || DEPLOY_SSH_PORT > 65535 )); then
+            echo "Invalid DEPLOY_SSH_PORT: ${DEPLOY_SSH_PORT}" >&2
+            exit 1
+          fi
+          case "${DEPLOY_SSH_ADDRESS_FAMILY}" in
+            any|inet|inet6) ;;
+            *) echo "Invalid DEPLOY_SSH_ADDRESS_FAMILY: ${DEPLOY_SSH_ADDRESS_FAMILY}" >&2; exit 1 ;;
+          esac
+          case "${INPUT_ACTION}" in
+            status|activate|rollback) ;;
+            *) echo "Invalid action: ${INPUT_ACTION}" >&2; exit 1 ;;
+          esac
+
+      - name: Prepare SSH
+        run: |
+          set -euo pipefail
+          keyscan_family_flag=()
+          case "${DEPLOY_SSH_ADDRESS_FAMILY}" in
+            inet) keyscan_family_flag=(-4) ;;
+            inet6) keyscan_family_flag=(-6) ;;
+          esac
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          if ! ssh-keyscan "${keyscan_family_flag[@]}" -p "${DEPLOY_SSH_PORT}" -T 15 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>ssh-keyscan.err; then
+            cat ssh-keyscan.err >&2 || true
+            echo "::warning::ssh-keyscan failed for ${DEPLOY_HOST}:${DEPLOY_SSH_PORT}; SSH will use StrictHostKeyChecking=accept-new"
+          fi
+
+      - name: Run weather live action
+        run: |
+          set -euo pipefail
+          ssh_cmd=(
+            ssh
+            -i ~/.ssh/id_ed25519
+            -p "${DEPLOY_SSH_PORT}"
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o "AddressFamily=${DEPLOY_SSH_ADDRESS_FAMILY}"
+            -o ConnectTimeout=20
+            -o ServerAliveInterval=30
+            -o ServerAliveCountMax=3
+            "${DEPLOY_USER}@${DEPLOY_HOST}"
+          )
+          app_dir_quoted="$(printf '%q' "${DEPLOY_APP_DIR}")"
+          reason_quoted="$(printf '%q' "${INPUT_REASON:-github_actions_weather_live}")"
+          remote_script=$(cat <<'REMOTE'
+          set -euo pipefail
+          action="$1"
+          reason="$2"
+          compose="docker compose -f infra/docker-compose.yml --env-file .env"
+          active_color="$(curl -fsS http://localhost/readyz | python3 -c 'import json,sys; print(json.load(sys.stdin).get("active_color") or "")')"
+          case "${active_color}" in
+            blue|green) ;;
+            *) echo "Unable to determine active color: ${active_color}" >&2; exit 1 ;;
+          esac
+          service="app_production_${active_color}"
+          if [[ "${action}" == "rollback" ]]; then
+            ${compose} exec -T "${service}" python -m kalshi_bot.cli weather-live rollback \
+              --kalshi-env production \
+              --actor github-actions \
+              --reason "${reason}" \
+              --json
+          elif [[ "${action}" == "activate" ]]; then
+            ${compose} exec -T "${service}" python -m kalshi_bot.cli weather-live status \
+              --kalshi-env production \
+              --json
+            ${compose} exec -T "${service}" python -m kalshi_bot.cli weather-live activate \
+              --kalshi-env production \
+              --actor github-actions \
+              --json
+          else
+            ${compose} exec -T "${service}" python -m kalshi_bot.cli weather-live status \
+              --kalshi-env production \
+              --json
+          fi
+REMOTE
+          )
+          "${ssh_cmd[@]}" "cd ${app_dir_quoted} && bash -s -- ${INPUT_ACTION} ${reason_quoted}" <<< "${remote_script}" | tee weather-live-output.json
+          {
+            echo "## Weather Live"
+            echo
+            echo "- Action: \`${INPUT_ACTION}\`"
+            echo "- Host: \`${DEPLOY_HOST}\`"
+            echo "- Ref: \`${GITHUB_SHA}\`"
+            echo
+            echo '```json'
+            cat weather-live-output.json
+            echo
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
