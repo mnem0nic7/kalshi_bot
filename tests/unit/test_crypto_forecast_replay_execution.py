@@ -2290,6 +2290,58 @@ def test_crypto_manual_off_note_overrides_runtime_live_policy(tmp_path) -> None:
     assert asset_control.mode_for_control(control, "BTC", crypto_policy=policy) == "off"
 
 
+def test_crypto_production_runtime_live_policy_requires_control_live_note(tmp_path) -> None:
+    settings = _settings(tmp_path, kalshi_env="production", app_shadow_mode=False, crypto_trading_enabled=False)
+    service = AgentPackService(settings)
+    policy = service.runtime_crypto_policy(
+        service.default_pack().model_copy(
+            update={"crypto_policy": AgentPackCryptoPolicy(live={"trading_enabled": True, "asset_modes": {"BTC": "live"}})}
+        )
+    )
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+    control = type("_Control", (), {"notes": {}, "kill_switch_enabled": False, "active_color": settings.app_color})()
+    gate = type("_Gate", (), {"status": "passed", "metrics": {
+        "resolved_sample_count": settings.crypto_replay_min_resolved_markets,
+        "trade_candidate_count": settings.crypto_replay_min_trade_candidates,
+        "strict_trade_eligible_count": settings.crypto_replay_min_trade_candidates,
+        "net_simulated_pl_dollars": 10.0,
+        "hard_cap_breaches": 0,
+        "candle_count": 1,
+        "spot_feature_coverage_pct": 1.0,
+    }})()
+
+    status = asset_control.market_live_status(
+        control=control,
+        replay_gate=gate,
+        market=_market(asset_symbol="BTC"),
+        has_write_credentials=True,
+        crypto_policy=policy,
+    )
+
+    assert status["asset_mode"] == "live"
+    assert status["control_asset_mode"] == "shadow"
+    assert status["live_eligible"] is False
+    assert "not explicitly live in deployment control" in status["live_blockers"][0]
+
+
+def test_crypto_production_explicit_shadow_note_overrides_runtime_live_policy(tmp_path) -> None:
+    settings = _settings(tmp_path, kalshi_env="production", app_shadow_mode=False, crypto_trading_enabled=False)
+    service = AgentPackService(settings)
+    policy = service.runtime_crypto_policy(
+        service.default_pack().model_copy(
+            update={"crypto_policy": AgentPackCryptoPolicy(live={"trading_enabled": True, "asset_modes": {"BTC": "live"}})}
+        )
+    )
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+    control = type(
+        "_Control",
+        (),
+        {"notes": {"crypto_asset_modes": {"BTC": "shadow"}}, "kill_switch_enabled": False, "active_color": settings.app_color},
+    )()
+
+    assert asset_control.mode_for_control(control, "BTC", crypto_policy=policy) == "shadow"
+
+
 @pytest.mark.asyncio
 async def test_crypto_execution_blocks_non_live_asset_before_base_execution(tmp_path) -> None:
     settings = _settings(tmp_path, app_shadow_mode=False, crypto_trading_enabled=True)
@@ -2350,6 +2402,87 @@ async def test_crypto_execution_blocks_non_live_asset_before_base_execution(tmp_
 
     assert receipt.status == "crypto_asset_live_disabled"
     assert receipt.details["asset_mode"] == "shadow"
+    assert fake_base.calls == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_execution_production_requires_explicit_control_live_mode(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        kalshi_env="production",
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeBaseExecution()
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    policy = AgentPackService(settings).runtime_crypto_policy(
+        AgentPackService(settings).default_pack().model_copy(
+            update={"crypto_policy": AgentPackCryptoPolicy(live={"trading_enabled": True, "asset_modes": {"XRP": "live"}})}
+        )
+    )
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    market = _market(
+        market_ticker="KXXRP15M-26MAY131630-30",
+        series_ticker="KXXRP15M",
+        asset_symbol="XRP",
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            kalshi_env=settings.kalshi_env,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="XRP crypto", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate:XRP",
+            version="passed-xrp-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.NO,
+            yes_price_dollars=Decimal("0.4900"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-xrp-test",
+        fair_yes_dollars=Decimal("0.3500"),
+        market=market,
+        signal=_signal(),
+        crypto_policy=policy,
+    )
+
+    assert receipt.status == "crypto_asset_live_disabled"
+    assert receipt.details["control_asset_mode"] == "shadow"
     assert fake_base.calls == []
     await engine.dispose()
 

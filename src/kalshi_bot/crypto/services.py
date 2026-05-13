@@ -220,6 +220,10 @@ class CryptoAssetControlService:
             modes[symbol] = mode
         return modes
 
+    def explicit_mode_for_control(self, control: Any, asset_symbol: str) -> str:
+        symbol = normalize_asset_symbol(asset_symbol)
+        return self.modes_from_notes(getattr(control, "notes", None)).get(symbol, CRYPTO_ASSET_MODE_SHADOW)
+
     def mode_for_control(
         self,
         control: Any,
@@ -231,6 +235,8 @@ class CryptoAssetControlService:
         note_mode = self.modes_from_notes(getattr(control, "notes", None)).get(symbol)
         if note_mode == CRYPTO_ASSET_MODE_OFF:
             return CRYPTO_ASSET_MODE_OFF
+        if str(self.settings.kalshi_env or "").strip().lower() != "demo" and note_mode in CRYPTO_ASSET_MODES:
+            return note_mode
         policy_mode = (crypto_policy.asset_modes if crypto_policy is not None else {}).get(symbol)
         if policy_mode in CRYPTO_ASSET_MODES:
             return policy_mode
@@ -294,6 +300,7 @@ class CryptoAssetControlService:
         crypto_policy: RuntimeCryptoPolicy | None = None,
     ) -> dict[str, Any]:
         mode = self.mode_for_control(control, market.asset_symbol, crypto_policy=crypto_policy)
+        explicit_mode = self.explicit_mode_for_control(control, market.asset_symbol)
         global_blockers = self.global_live_blockers(
             control=control,
             replay_gate=replay_gate,
@@ -301,12 +308,18 @@ class CryptoAssetControlService:
             frequency=market.frequency,
             crypto_policy=crypto_policy,
         )
-        blockers = list(global_blockers) if mode == CRYPTO_ASSET_MODE_LIVE else [
-            f"Asset {market.asset_symbol} mode is {mode}; set it to live to allow live orders."
-        ]
+        blockers = list(global_blockers)
+        if mode != CRYPTO_ASSET_MODE_LIVE:
+            blockers = [f"Asset {market.asset_symbol} mode is {mode}; set it to live to allow live orders."]
+        elif str(self.settings.kalshi_env or "").strip().lower() != "demo" and explicit_mode != CRYPTO_ASSET_MODE_LIVE:
+            blockers.append(
+                f"Asset {market.asset_symbol} is not explicitly live in deployment control "
+                f"(control mode {explicit_mode})."
+            )
         return {
             "asset_mode": mode,
-            "live_eligible": mode == CRYPTO_ASSET_MODE_LIVE and not global_blockers,
+            "control_asset_mode": explicit_mode,
+            "live_eligible": mode == CRYPTO_ASSET_MODE_LIVE and not blockers,
             "live_blockers": blockers,
             "global_live_blockers": global_blockers,
         }
@@ -616,6 +629,7 @@ class CryptoMarketService:
                         f"asset={market.asset_symbol} target={_money_text(market.target_price_dollars)} "
                         f"close_time={market.close_time.isoformat() if market.close_time else 'unknown'} "
                         f"asset_mode={live_status['asset_mode']} live_eligible={live_status['live_eligible']} "
+                        f"control_asset_mode={live_status['control_asset_mode']} "
                         f"reason={reason}"
                     ),
                 ),
@@ -636,6 +650,7 @@ class CryptoMarketService:
                     "frequency": market.frequency,
                     "strategy_code": StrategyCode.CRYPTO_15M.value,
                     "asset_mode": live_status["asset_mode"],
+                    "control_asset_mode": live_status["control_asset_mode"],
                     "live_eligible": live_status["live_eligible"],
                     "live_blockers": live_status["live_blockers"],
                     "global_live_blockers": live_status["global_live_blockers"],
@@ -2629,6 +2644,10 @@ class CryptoExecutionService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=room.kalshi_env)
             fresh_control = await repo.get_deployment_control(kalshi_env=room.kalshi_env)
+            explicit_asset_mode = self.asset_control_service.explicit_mode_for_control(
+                fresh_control,
+                market.asset_symbol,
+            )
             asset_mode = self.asset_control_service.mode_for_control(
                 fresh_control,
                 market.asset_symbol,
@@ -2660,6 +2679,17 @@ class CryptoExecutionService:
                     "reason": "crypto asset mode is not live",
                     "asset_symbol": market.asset_symbol,
                     "asset_mode": asset_mode,
+                },
+            )
+        if str(room.kalshi_env or "").strip().lower() != "demo" and explicit_asset_mode != CRYPTO_ASSET_MODE_LIVE:
+            return ExecReceiptPayload(
+                status="crypto_asset_live_disabled",
+                client_order_id=client_order_id,
+                details={
+                    "reason": "production crypto asset is not explicitly live in deployment control",
+                    "asset_symbol": market.asset_symbol,
+                    "asset_mode": asset_mode,
+                    "control_asset_mode": explicit_asset_mode,
                 },
             )
         selection = ((signal.candidate_trace or {}).get("trade_selection_model") or {}) if signal.candidate_trace else {}
@@ -2840,6 +2870,7 @@ class CryptoWorkflowService:
                         "frequency": market.frequency,
                         "strategy_code": StrategyCode.CRYPTO_15M.value,
                         "asset_mode": live_status["asset_mode"],
+                        "control_asset_mode": live_status["control_asset_mode"],
                         "live_eligible": live_status["live_eligible"],
                         "live_blockers": live_status["live_blockers"],
                         "global_live_blockers": live_status["global_live_blockers"],
@@ -2923,6 +2954,7 @@ class CryptoWorkflowService:
                     "frequency": market.frequency,
                     "asset_symbol": market.asset_symbol,
                     "asset_mode": live_status["asset_mode"],
+                    "control_asset_mode": live_status["control_asset_mode"],
                     "live_eligible": live_status["live_eligible"],
                     "crypto_modeling": (signal_record.payload or {}).get("crypto_modeling"),
                     "prediction_model": ((signal_record.payload or {}).get("crypto_modeling") or {}).get("prediction_model"),
