@@ -118,7 +118,7 @@ jobs:
               --kalshi-env production \
               --json
           fi
-REMOTE
+          REMOTE
           )
           "${ssh_cmd[@]}" "cd ${app_dir_quoted} && bash -s -- ${INPUT_ACTION} ${reason_quoted}" <<< "${remote_script}" | tee weather-live-output.json
           {
