@@ -63,7 +63,7 @@ from kalshi_bot.integrations.crypto_spot import (
 )
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeCryptoPolicy
-from kalshi_bot.services.execution import ExecutionService
+from kalshi_bot.services.execution import KALSHI_GTC_TIME_IN_FORCE, ExecutionService
 from kalshi_bot.services.fee_model import current_fee_model_version, estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext, approved_ticket_for_verdict
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
@@ -2731,7 +2731,7 @@ class CryptoExecutionService:
         passive_price = self.passive_yes_price(market, ticket.side)
         if self.settings.crypto_order_mode == "passive_then_taker" and passive_price is not None:
             passive_ticket = ticket.model_copy(
-                update={"yes_price_dollars": passive_price, "time_in_force": "gtc"}
+                update={"yes_price_dollars": passive_price, "time_in_force": KALSHI_GTC_TIME_IN_FORCE}
             )
             passive_receipt = await self.base_execution_service.execute(
                 room=room,

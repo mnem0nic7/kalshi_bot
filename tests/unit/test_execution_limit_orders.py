@@ -10,7 +10,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, TradeAction
 from kalshi_bot.core.schemas import TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
-from kalshi_bot.services.execution import ExecutionService
+from kalshi_bot.services.execution import KALSHI_GTC_TIME_IN_FORCE, ExecutionService
 
 
 def _settings(risk_min_edge_bps: int = 50) -> Settings:
@@ -75,7 +75,26 @@ async def test_limit_order_fills_on_first_attempt():
         )
 
     assert receipt.status == "filled"
+    assert kalshi.create_order.call_args.args[0]["time_in_force"] == KALSHI_GTC_TIME_IN_FORCE
     kalshi.cancel_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_limit_order_accepts_kalshi_good_till_canceled_value():
+    kalshi = _kalshi(order_statuses=["filled"])
+    svc = ExecutionService(_settings(), kalshi)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        receipt = await svc.execute(
+            room=_room(),
+            control=_control(),
+            ticket=_ticket(tif=KALSHI_GTC_TIME_IN_FORCE),
+            client_order_id="coid-1",
+            fair_yes_dollars=Decimal("0.64"),
+        )
+
+    assert receipt.status == "filled"
+    assert kalshi.create_order.call_args.args[0]["time_in_force"] == KALSHI_GTC_TIME_IN_FORCE
 
 
 @pytest.mark.asyncio

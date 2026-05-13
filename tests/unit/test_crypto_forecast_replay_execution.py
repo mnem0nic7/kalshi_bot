@@ -58,6 +58,9 @@ def _settings(tmp_path, **overrides) -> Settings:
         "crypto_min_training_samples": 2,
         "crypto_replay_min_resolved_markets": 2,
         "crypto_replay_min_trade_candidates": 1,
+        "crypto_autonomy_enabled": False,
+        "crypto_production_autonomy_enabled": False,
+        "crypto_trading_enabled": False,
     }
     values.update(overrides)
     return Settings(**values)

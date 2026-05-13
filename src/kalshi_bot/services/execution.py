@@ -17,10 +17,17 @@ logger = logging.getLogger(__name__)
 
 _FILL_TERMINAL = {"filled", "executed", "cancelled", "canceled", "expired"}
 _FILL_DONE = {"filled", "executed"}
-_LIMIT_TIF = "gtc"
+KALSHI_GTC_TIME_IN_FORCE = "good_till_canceled"
+_LIMIT_TIFS = {"gtc", KALSHI_GTC_TIME_IN_FORCE}
 _POLL_INTERVAL = 3
 _FILL_TIMEOUT = 30
 _MAX_REQUOTES = 3
+
+
+def _kalshi_time_in_force(time_in_force: str) -> str:
+    if str(time_in_force).strip().lower() == "gtc":
+        return KALSHI_GTC_TIME_IN_FORCE
+    return time_in_force
 
 
 def _fee_adjusted_edge_dollars(
@@ -87,7 +94,7 @@ class ExecutionService:
                 details={"reason": "write credentials were not configured"},
             )
 
-        if ticket.time_in_force == _LIMIT_TIF:
+        if str(ticket.time_in_force).strip().lower() in _LIMIT_TIFS:
             return await self._execute_limit(
                 ticket=ticket,
                 client_order_id=client_order_id,
@@ -105,7 +112,7 @@ class ExecutionService:
             "client_order_id": client_order_id,
             "count_fp": f"{ticket.count_fp:.2f}",
             "yes_price_dollars": f"{ticket.yes_price_dollars:.4f}",
-            "time_in_force": ticket.time_in_force,
+            "time_in_force": _kalshi_time_in_force(ticket.time_in_force),
             "self_trade_prevention_type": "taker_at_cross",
         }
         if self.settings.kalshi_subaccount:
