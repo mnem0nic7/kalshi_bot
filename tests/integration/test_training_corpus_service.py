@@ -65,18 +65,19 @@ class FakeKalshi:
 class FakeWeather:
     async def build_market_snapshot(self, mapping: WeatherMarketMapping) -> dict:
         temp = 88 if mapping.market_ticker == "WX-ONE" else 74
+        observed_at = datetime.now(UTC).isoformat()
         return {
             "mapping": mapping.model_dump(mode="json"),
             "forecast": {
                 "properties": {
-                    "updated": "2026-04-10T00:00:00+00:00",
+                    "updated": observed_at,
                     "periods": [{"isDaytime": True, "temperature": temp, "temperatureUnit": "F"}],
                 }
             },
             "observation": {
                 "properties": {
                     "temperature": {"value": (temp - 1 - 32) * 5 / 9},
-                    "timestamp": "2026-04-10T01:00:00+00:00",
+                    "timestamp": observed_at,
                 }
             },
             "points": {},
@@ -653,7 +654,10 @@ async def test_strategy_audit_classifies_correct_thesis_but_weak_trade(tmp_path)
 
 @pytest.mark.asyncio
 async def test_strategy_audit_marks_low_remaining_payout_trade_weak(tmp_path) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-audit-low-payout.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/strategy-audit-low-payout.db",
+        strategy_min_remaining_payout_bps=2500,
+    )
     corpus_service = TrainingCorpusService(
         settings,
         None,  # type: ignore[arg-type]

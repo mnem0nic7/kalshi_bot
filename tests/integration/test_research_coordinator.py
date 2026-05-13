@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -7,6 +8,7 @@ import pytest
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import ResearchSourceCard
+from kalshi_bot.db.models import ResearchDossierRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.integrations.weather import NWSWeatherClient, WeatherProviderError
@@ -102,6 +104,19 @@ class FakeProviders:
         return payload
 
 
+def _mapping(ticker: str) -> WeatherMarketMapping:
+    return WeatherMarketMapping(
+        market_ticker=ticker,
+        market_type="weather",
+        station_id="KNYC",
+        location_name="NYC",
+        latitude=40.0,
+        longitude=-73.0,
+        threshold_f=80,
+        settlement_source="NWS station observation",
+    )
+
+
 def _nws_transport(*, timeout_once: bool = False, always_503: bool = False) -> tuple[httpx.MockTransport, dict[str, int]]:
     calls = {"observation": 0}
 
@@ -147,6 +162,78 @@ def _nws_transport(*, timeout_once: bool = False, always_503: bool = False) -> t
         return httpx.Response(404, request=request, json={"title": "Not Found"})
 
     return httpx.MockTransport(handler), calls
+
+
+@pytest.mark.asyncio
+async def test_live_weather_refresh_dry_run_selects_missing_and_expiring_dossiers(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/research-live-refresh.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    now = datetime.now(UTC)
+    directory = WeatherMarketDirectory(
+        {
+            "KXHIGHA-TEST": _mapping("KXHIGHA-TEST"),
+            "KXHIGHB-TEST": _mapping("KXHIGHB-TEST"),
+            "KXHIGHC-TEST": _mapping("KXHIGHC-TEST"),
+        }
+    )
+    async with session_factory() as session:
+        session.add(
+            ResearchDossierRecord(
+                market_ticker="KXHIGHA-TEST",
+                status="ready",
+                mode="structured",
+                confidence=0.9,
+                source_count=2,
+                settlement_covered=True,
+                expires_at=now + timedelta(minutes=10),
+                payload={"freshness": {"stale": False, "expires_at": (now + timedelta(minutes=10)).isoformat()}},
+            )
+        )
+        session.add(
+            ResearchDossierRecord(
+                market_ticker="KXHIGHB-TEST",
+                status="ready",
+                mode="structured",
+                confidence=0.9,
+                source_count=2,
+                settlement_covered=True,
+                expires_at=now + timedelta(seconds=60),
+                payload={"freshness": {"stale": False, "expires_at": (now + timedelta(seconds=60)).isoformat()}},
+            )
+        )
+        await session.commit()
+
+    coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        FakeKalshi(),  # type: ignore[arg-type]
+        FakeWeather(),  # type: ignore[arg-type]
+        directory,
+        FakeProviders(),  # type: ignore[arg-type]
+        WeatherSignalEngine(settings),
+        AgentPackService(settings),
+    )
+
+    result = await coordinator.refresh_live_weather_dossiers(
+        ["KXHIGHA-TEST", "KXHIGHB-TEST", "KXHIGHC-TEST", "OTHER"],
+        dry_run=True,
+        refresh_margin_seconds=180,
+    )
+
+    assert result["considered"] == 3
+    assert result["selected"] == 2
+    assert {
+        (item["market_ticker"], item["reason"])
+        for item in result["results"]
+    } == {
+        ("KXHIGHB-TEST", "expires_soon"),
+        ("KXHIGHC-TEST", "missing_dossier"),
+    }
+    assert any(item["market_ticker"] == "KXHIGHA-TEST" and item["reason"] == "fresh" for item in result["skipped"])
+
+    await engine.dispose()
 
 
 def _miami_directory() -> WeatherMarketDirectory:

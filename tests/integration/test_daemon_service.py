@@ -67,6 +67,7 @@ class FakeAutoTriggerService:
 class FakeResearchCoordinator:
     def __init__(self) -> None:
         self.market_updates: list[str] = []
+        self.live_weather_refreshes: list[dict[str, object]] = []
 
     async def handle_market_update(self, market_ticker: str) -> None:
         self.market_updates.append(market_ticker)
@@ -74,6 +75,11 @@ class FakeResearchCoordinator:
 
     async def wait_for_tasks(self) -> None:
         return None
+
+    async def refresh_live_weather_dossiers(self, market_tickers, **kwargs):
+        tickers = list(market_tickers)
+        self.live_weather_refreshes.append({"market_tickers": tickers, **kwargs})
+        return {"status": "ok", "considered": len(tickers), "selected": 0, "refreshed": 0, "failed": 0}
 
 
 class FakeDiscoveryService:

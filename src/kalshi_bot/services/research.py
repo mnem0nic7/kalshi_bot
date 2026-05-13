@@ -123,6 +123,25 @@ def _to_iso(value: datetime | None) -> str | None:
     return value.astimezone(UTC).isoformat() if value is not None else None
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
 def _exception_payload(exc: Exception, *, market_ticker: str, trigger_reason: str) -> dict[str, Any]:
     error_type = str(getattr(exc, "error_type", "") or type(exc).__name__)
     response = getattr(exc, "response", None)
@@ -158,7 +177,12 @@ def _is_market_not_found_payload(payload: dict[str, Any]) -> bool:
 
 
 def _is_background_market_event_not_found(trigger_reason: str, payload: dict[str, Any]) -> bool:
-    return str(trigger_reason).lower() == "market_event" and _is_market_not_found_payload(payload)
+    return str(trigger_reason).lower() in {
+        "market_event",
+        "daemon_live_weather_refresh",
+        "live_weather_sweep",
+        "cli_live_weather_refresh",
+    } and _is_market_not_found_payload(payload)
 
 
 def _checkpoint_age_seconds(checkpoint_payload: dict[str, Any], key: str, *, now: datetime) -> float | None:
@@ -260,6 +284,184 @@ class ResearchCoordinator:
         if dossier is not None and not dossier.freshness.stale:
             return dossier
         return await self.refresh_market_dossier(market_ticker, trigger_reason=reason)
+
+    async def refresh_live_weather_dossiers(
+        self,
+        market_tickers: Sequence[str],
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+        concurrency: int | None = None,
+        refresh_margin_seconds: int | None = None,
+        trigger_reason: str = "live_weather_sweep",
+    ) -> dict[str, Any]:
+        """Refresh missing/stale/soon-expiring weather dossiers for live markets."""
+        now = datetime.now(UTC)
+        margin_seconds = (
+            self.settings.weather_research_refresh_margin_seconds
+            if refresh_margin_seconds is None
+            else max(0, int(refresh_margin_seconds))
+        )
+        max_concurrency = max(1, int(concurrency or self.settings.weather_research_refresh_concurrency))
+        seen: set[str] = set()
+        candidates = [
+            ticker
+            for ticker in market_tickers
+            if ticker
+            and not (ticker in seen or seen.add(ticker))
+            and str(ticker).upper().startswith("KXHIGH")
+            and self.weather_directory.supports_market_ticker(ticker)
+        ]
+        if limit is not None:
+            candidates = candidates[: max(0, int(limit))]
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            if control.active_color != self.settings.app_color:
+                await session.commit()
+                return {
+                    "dry_run": dry_run,
+                    "status": "inactive_color",
+                    "active_color": control.active_color,
+                    "app_color": self.settings.app_color,
+                    "considered": len(candidates),
+                    "selected": 0,
+                    "results": [],
+                }
+
+            selected: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            for ticker in candidates:
+                if ticker in self._inflight_markets:
+                    skipped.append({"market_ticker": ticker, "status": "skipped", "reason": "inflight"})
+                    continue
+                failed_checkpoint = await repo.get_checkpoint(
+                    f"research_refresh_failed:{self.settings.kalshi_env}:{ticker}"
+                )
+                if failed_checkpoint is not None:
+                    age_seconds = _checkpoint_age_seconds(failed_checkpoint.payload, "failed_at", now=now)
+                    if (
+                        age_seconds is not None
+                        and age_seconds < self.settings.research_refresh_failed_cooldown_seconds
+                    ):
+                        skipped.append(
+                            {
+                                "market_ticker": ticker,
+                                "status": "skipped",
+                                "reason": "failed_cooldown",
+                                "age_seconds": round(age_seconds, 2),
+                            }
+                        )
+                        continue
+
+                checkpoint = await repo.get_checkpoint(f"research_refresh:{ticker}")
+                if checkpoint is not None:
+                    age_seconds = _checkpoint_age_seconds(checkpoint.payload, "refreshed_at", now=now)
+                    if (
+                        age_seconds is not None
+                        and age_seconds < self.settings.research_refresh_cooldown_seconds
+                    ):
+                        skipped.append(
+                            {
+                                "market_ticker": ticker,
+                                "status": "skipped",
+                                "reason": "refresh_cooldown",
+                                "age_seconds": round(age_seconds, 2),
+                            }
+                        )
+                        continue
+
+                dossier_record = await repo.get_research_dossier(ticker)
+                due, reason, expires_at = self._research_refresh_due(
+                    dossier_record=dossier_record,
+                    now=now,
+                    refresh_margin_seconds=margin_seconds,
+                )
+                entry = {
+                    "market_ticker": ticker,
+                    "reason": reason,
+                    "expires_at": _to_iso(expires_at),
+                }
+                if due:
+                    selected.append(entry)
+                else:
+                    skipped.append({"status": "skipped", **entry})
+            await session.commit()
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "status": "ok",
+                "considered": len(candidates),
+                "selected": len(selected),
+                "skipped": skipped,
+                "results": [{"status": "would_refresh", **item} for item in selected],
+            }
+
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def refresh_one(item: dict[str, Any]) -> dict[str, Any]:
+            ticker = str(item["market_ticker"])
+            async with semaphore:
+                try:
+                    dossier = await self.refresh_market_dossier(ticker, trigger_reason=trigger_reason)
+                    return {
+                        **item,
+                        "status": "refreshed",
+                        "source_count": len(dossier.sources),
+                        "gate_passed": dossier.gate.passed,
+                        "new_expires_at": dossier.freshness.expires_at.isoformat(),
+                    }
+                except _NonActionableResearchRefresh:
+                    return {**item, "status": "skipped", "reason": "unavailable_market"}
+                except Exception as exc:
+                    logger.warning("Live weather research refresh failed for %s", ticker, exc_info=True)
+                    return {
+                        **item,
+                        "status": "failed",
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+
+        results = await asyncio.gather(*(refresh_one(item) for item in selected))
+        return {
+            "dry_run": False,
+            "status": "ok",
+            "considered": len(candidates),
+            "selected": len(selected),
+            "refreshed": sum(1 for item in results if item.get("status") == "refreshed"),
+            "failed": sum(1 for item in results if item.get("status") == "failed"),
+            "skipped": skipped,
+            "results": results,
+        }
+
+    def _research_refresh_due(
+        self,
+        *,
+        dossier_record: Any | None,
+        now: datetime,
+        refresh_margin_seconds: int,
+    ) -> tuple[bool, str, datetime | None]:
+        if dossier_record is None:
+            return True, "missing_dossier", None
+        payload = dossier_record.payload if isinstance(dossier_record.payload, dict) else {}
+        freshness = payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
+        expires_at = _as_utc(getattr(dossier_record, "expires_at", None)) or _parse_datetime(
+            freshness.get("expires_at")
+        )
+        if freshness.get("stale") is True:
+            return True, "stale_dossier", expires_at
+        if expires_at is None:
+            updated_at = _as_utc(getattr(dossier_record, "updated_at", None))
+            if updated_at is None:
+                return True, "missing_freshness", None
+            expires_at = updated_at + timedelta(seconds=self.settings.research_stale_seconds)
+        if expires_at <= now:
+            return True, "expired_dossier", expires_at
+        if expires_at - now <= timedelta(seconds=refresh_margin_seconds):
+            return True, "expires_soon", expires_at
+        return False, "fresh", expires_at
 
     async def refresh_market_dossier(self, market_ticker: str, *, trigger_reason: str, force: bool = True) -> ResearchDossier:
         async with self.session_factory() as session:

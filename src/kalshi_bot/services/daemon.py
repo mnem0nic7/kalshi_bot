@@ -279,6 +279,10 @@ class DaemonService:
                 "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
                 "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
             }
+            if self.settings.weather_research_refresh_interval_seconds > 0:
+                periodic_tasks["weather_research_refresh"] = asyncio.create_task(
+                    self._periodic_weather_research_refresh_loop()
+                )
             if self.settings.stop_loss_enabled:
                 periodic_tasks["stop_loss"] = asyncio.create_task(self._periodic_stop_loss_loop())
             tasks.update(periodic_tasks)
@@ -408,6 +412,32 @@ class DaemonService:
                     await self.auto_trigger_service.recheck_marketability_waitlist_once()
             except Exception:
                 logger.warning("market_history loop error", exc_info=True)
+
+    async def _periodic_weather_research_refresh_loop(self) -> None:
+        interval = max(0, int(self.settings.weather_research_refresh_interval_seconds))
+        if interval <= 0:
+            return
+        while True:
+            if await self._is_active_color():
+                try:
+                    market_tickers = await self.discovery_service.list_stream_markets()
+                    result = await self.research_coordinator.refresh_live_weather_dossiers(
+                        market_tickers,
+                        dry_run=False,
+                        concurrency=self.settings.weather_research_refresh_concurrency,
+                        refresh_margin_seconds=self.settings.weather_research_refresh_margin_seconds,
+                        trigger_reason="daemon_live_weather_refresh",
+                    )
+                    logger.info(
+                        "Live weather research refresh sweep considered=%s selected=%s refreshed=%s failed=%s",
+                        result.get("considered"),
+                        result.get("selected"),
+                        result.get("refreshed"),
+                        result.get("failed"),
+                    )
+                except Exception:
+                    logger.warning("weather research refresh loop error", exc_info=True)
+            await asyncio.sleep(interval)
 
     async def _periodic_strategy_c_loop(self) -> None:
         interval = self.settings.strategy_c_cadence_idle_seconds

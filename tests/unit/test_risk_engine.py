@@ -490,7 +490,7 @@ def test_risk_engine_blocks_risky_trade_when_bucket_has_no_room() -> None:
             yes_price_dollars=Decimal("0.5000"),
             count_fp=Decimal("10.00"),
         ),
-        signal=make_signal(capital_bucket="risky", trade_regime="near_threshold"),
+        signal=make_signal(capital_bucket="risky", trade_regime="standard"),
         context=RiskContext(
             market_observed_at=datetime.now(UTC),
             research_observed_at=datetime.now(UTC),
@@ -1388,3 +1388,41 @@ def test_guard_reads_position_side_for_queried_row() -> None:
     )
     assert verdict.status == RiskStatus.BLOCKED
     assert any("opposite-side" in r for r in verdict.reasons)
+
+
+def test_non_standard_regime_does_not_emit_zero_risky_bucket_noise() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_risky_capital_max_ratio=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=make_signal(edge_bps=6000, capital_bucket="risky", trade_regime="near_threshold"),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            portfolio_bucket_snapshot=PortfolioBucketSnapshot(
+                total_capital_dollars=Decimal("10.00"),
+                overall_remaining_dollars=Decimal("10.00"),
+                risky_limit_dollars=Decimal("0.00"),
+                risky_remaining_dollars=Decimal("0.00"),
+                risky_capital_max_ratio=0.0,
+            ),
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert "non_standard_regime" in verdict.reason_codes
+    assert not any("Risky capital bucket is full" in reason for reason in verdict.reasons)

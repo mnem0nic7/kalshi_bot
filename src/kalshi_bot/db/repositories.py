@@ -2546,6 +2546,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 else Decimal("1") - buy.yes_price_dollars
             )
             cost_total = cost_per_contract * buy.count_fp
+            buy_fee = _fill_fee_dollars(buy)
 
             key = (buy.market_ticker, buy.side)
             matched_sells = [s for s in sells_by_key.get(key, []) if s.id not in matched_sell_ids]
@@ -2559,11 +2560,11 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                     if sell.side == "yes"
                     else Decimal("1") - sell.yes_price_dollars
                 )
-                pnl += sell_per_contract * sell.count_fp - cost_total
+                pnl += sell_per_contract * sell.count_fp - _fill_fee_dollars(sell) - cost_total - buy_fee
             elif buy.settlement_result == "win":
-                pnl += buy.count_fp - cost_total
+                pnl += buy.count_fp - cost_total - buy_fee
             elif buy.settlement_result == "loss":
-                pnl -= cost_total
+                pnl -= cost_total + buy_fee
             # else: unsettled + unmatched buy → unrealized, contributes nothing
 
         # Standalone sells whose corresponding buy fell out of the 24h window
@@ -2577,7 +2578,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                     if sell.side == "yes"
                     else Decimal("1") - sell.yes_price_dollars
                 )
-                pnl += sell_per_contract * sell.count_fp
+                pnl += sell_per_contract * sell.count_fp - _fill_fee_dollars(sell)
 
         return pnl.quantize(Decimal("0.01"))
 

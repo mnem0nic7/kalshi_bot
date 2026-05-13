@@ -5,7 +5,7 @@ import asyncio
 from collections import Counter
 import csv
 from dataclasses import asdict
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 import io
 import json
 import os
@@ -2330,6 +2330,20 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "research-refresh":
+            if args.all_live_weather:
+                market_tickers = await container.discovery_service.list_stream_markets()
+                result = await container.research_coordinator.refresh_live_weather_dossiers(
+                    market_tickers,
+                    dry_run=args.dry_run,
+                    limit=args.limit,
+                    concurrency=args.concurrency,
+                    refresh_margin_seconds=args.refresh_margin_seconds,
+                    trigger_reason="cli_live_weather_refresh",
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            if not args.market_ticker:
+                raise ValueError("research-refresh requires MARKET_TICKER unless --all-live-weather is set")
             dossier = await container.research_coordinator.refresh_market_dossier(
                 args.market_ticker,
                 trigger_reason="cli_refresh",
@@ -3822,7 +3836,12 @@ def build_parser() -> argparse.ArgumentParser:
     create_room.add_argument("--prompt", default=None)
 
     research_refresh = subparsers.add_parser("research-refresh")
-    research_refresh.add_argument("market_ticker")
+    research_refresh.add_argument("market_ticker", nargs="?")
+    research_refresh.add_argument("--all-live-weather", action="store_true")
+    research_refresh.add_argument("--dry-run", action="store_true")
+    research_refresh.add_argument("--limit", type=int, default=None)
+    research_refresh.add_argument("--concurrency", type=int, default=None)
+    research_refresh.add_argument("--refresh-margin-seconds", type=int, default=None)
 
     research_show = subparsers.add_parser("research-show")
     research_show.add_argument("market_ticker")

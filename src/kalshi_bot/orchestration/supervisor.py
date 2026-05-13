@@ -7,6 +7,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -83,6 +84,7 @@ logger = logging.getLogger(__name__)
 
 EXTREME_EDGE_DAILY_HIGH_AGREEMENT_TOLERANCE_F = 3.0
 EXTREME_EDGE_CURRENT_TEMP_TOLERANCE_F = 1.0
+PACIFIC = ZoneInfo("America/Los_Angeles")
 
 
 def _policy_side_for_signal(signal: StrategySignal) -> str | None:
@@ -292,6 +294,86 @@ async def _pending_post_kill_switch_reconcile(
             f"{reconciled_at.isoformat()} — waiting for a post-clear reconcile before executing."
         )
     return None
+
+
+def _pacific_date(now: datetime | None = None) -> str:
+    value = now or datetime.now(UTC)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(PACIFIC).strftime("%Y-%m-%d")
+
+
+def _min_optional_cap(current: float | None, cap: float) -> float:
+    if current is None or current <= 0:
+        return cap
+    return min(current, cap)
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _decimal_payload(value: Any, default: str = "0") -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal(default)
+
+
+def _cap_ticket_notional(ticket: TradeTicket, *, max_notional_dollars: float) -> tuple[TradeTicket | None, dict[str, Any]]:
+    max_notional = Decimal(str(max_notional_dollars))
+    unit_notional = estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, Decimal("1.00"))
+    original_notional = estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, ticket.count_fp)
+    trace = {
+        "max_order_notional_dollars": str(max_notional),
+        "original_count_fp": str(ticket.count_fp),
+        "original_notional_dollars": str(original_notional),
+        "unit_notional_dollars": str(unit_notional),
+        "cap_applied": False,
+    }
+    if max_notional <= Decimal("0") or unit_notional <= Decimal("0"):
+        return None, {**trace, "reason": "non_positive_probe_cap"}
+    if original_notional <= max_notional:
+        return ticket, trace
+    capped_count = quantize_count(max_notional / unit_notional)
+    trace.update({"cap_applied": True, "capped_count_fp": str(capped_count)})
+    if capped_count <= Decimal("0"):
+        return None, {**trace, "reason": "non_positive_probe_count"}
+    return ticket.model_copy(update={"count_fp": capped_count}), trace
+
+
+def _weather_realized_loss_cap_dollars(
+    *,
+    total_capital: Decimal,
+    cap_pct: float,
+    min_loss_dollars: float,
+) -> Decimal:
+    pct_cap = (Decimal(str(total_capital)) * Decimal(str(cap_pct))).quantize(Decimal("0.0001"))
+    return max(pct_cap, Decimal(str(min_loss_dollars)))
+
+
+def _weather_balance_discontinuity(
+    *,
+    portfolio_loss_ratio: float,
+    realized_loss_dollars: Decimal,
+    realized_loss_cap_dollars: Decimal,
+    discontinuity_ratio: float,
+) -> bool:
+    return (
+        portfolio_loss_ratio >= max(0.0, discontinuity_ratio)
+        and realized_loss_dollars < realized_loss_cap_dollars
+    )
 
 
 def _research_ref_time(
@@ -1406,9 +1488,28 @@ class WorkflowSupervisor:
                 sizing_trace["position_cap_dollars"] = position_cap
                 sizing_trace["current_position_notional_dollars"] = current_position_notional
                 daily_pnl = await repo.get_daily_pnl_dollars(kalshi_env=room.kalshi_env)
+                strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                    kalshi_env=room.kalshi_env,
+                )
                 loss_sensitivity_active = False
                 daily_loss_hard_blocked = False
                 daily_loss_ratio = 0.0
+                realized_loss_ratio = 0.0
+                realized_loss_dollars = Decimal("0")
+                realized_loss_cap_dollars = Decimal("0")
+                weather_probe_active = False
+                weather_balance_discontinuity = False
+                weather_live_loss_guard = weather_live_entry_freeze_bypassed(
+                    control=control,
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                )
+                daily_loss_cap_pct = weather_live_daily_loss_cap_pct(
+                    control=control,
+                    strategy_code=StrategyCode.DIRECTIONAL.value,
+                    default_pct=float(self.settings.risk_daily_loss_pct),
+                )
+                sizing_trace["daily_loss_cap_pct"] = daily_loss_cap_pct
                 sensitivity_cp_key = f"loss_sensitivity_state:{room.kalshi_env}"
                 prior_sensitivity_cp = await repo.get_checkpoint(sensitivity_cp_key)
                 prior_sensitivity_active = (
@@ -1418,32 +1519,79 @@ class WorkflowSupervisor:
                 )
                 if daily_pnl is not None and float(total_capital) > 0:
                     daily_loss_ratio = float(-daily_pnl) / float(total_capital)
-                    daily_loss_cap_pct = weather_live_daily_loss_cap_pct(
-                        control=control,
-                        strategy_code=StrategyCode.DIRECTIONAL.value,
-                        default_pct=float(self.settings.risk_daily_loss_pct),
+                if weather_live_loss_guard:
+                    realized_loss_dollars = max(Decimal("0"), -Decimal(str(strategy_daily_pnl)))
+                    realized_loss_cap_dollars = _weather_realized_loss_cap_dollars(
+                        total_capital=total_capital,
+                        cap_pct=daily_loss_cap_pct,
+                        min_loss_dollars=self.settings.weather_live_probe_min_loss_dollars,
                     )
-                    sizing_trace["daily_loss_cap_pct"] = daily_loss_cap_pct
+                    if float(total_capital) > 0:
+                        realized_loss_ratio = float(realized_loss_dollars / Decimal(str(total_capital)))
+                    weather_probe_active = daily_loss_cap_pct > 0 and realized_loss_dollars >= realized_loss_cap_dollars
+                    weather_balance_discontinuity = _weather_balance_discontinuity(
+                        portfolio_loss_ratio=daily_loss_ratio,
+                        realized_loss_dollars=realized_loss_dollars,
+                        realized_loss_cap_dollars=realized_loss_cap_dollars,
+                        discontinuity_ratio=self.settings.weather_live_balance_discontinuity_ratio,
+                    )
+                    if weather_balance_discontinuity:
+                        discontinuity_key = f"balance_discontinuity:{room.kalshi_env}:{_pacific_date()}"
+                        if await repo.get_checkpoint(discontinuity_key) is None:
+                            await repo.log_ops_event(
+                                severity="warning",
+                                summary="Weather daily-loss guard ignored portfolio balance discontinuity",
+                                source="supervisor",
+                                room_id=room.id,
+                                kalshi_env=room.kalshi_env,
+                                payload={
+                                    "reason_code": "balance_discontinuity",
+                                    "daily_pnl_dollars": str(daily_pnl),
+                                    "portfolio_loss_ratio": round(daily_loss_ratio, 4),
+                                    "strategy_daily_realized_pnl_dollars": str(strategy_daily_pnl),
+                                    "realized_loss_dollars": str(realized_loss_dollars),
+                                    "realized_loss_cap_dollars": str(realized_loss_cap_dollars),
+                                    "market_ticker": room.market_ticker,
+                                },
+                            )
+                            await repo.set_checkpoint(
+                                discontinuity_key,
+                                cursor=None,
+                                payload={
+                                    "observed_at": datetime.now(UTC).isoformat(),
+                                    "reason_code": "balance_discontinuity",
+                                    "daily_pnl_dollars": str(daily_pnl),
+                                    "portfolio_loss_ratio": round(daily_loss_ratio, 4),
+                                    "strategy_daily_realized_pnl_dollars": str(strategy_daily_pnl),
+                                    "realized_loss_dollars": str(realized_loss_dollars),
+                                    "realized_loss_cap_dollars": str(realized_loss_cap_dollars),
+                                },
+                            )
+                    if self.settings.risk_daily_loss_sensitivity_pct > 0:
+                        loss_sensitivity_active = realized_loss_ratio >= self.settings.risk_daily_loss_sensitivity_pct
+                else:
                     if daily_loss_cap_pct > 0 and daily_loss_ratio >= daily_loss_cap_pct:
                         daily_loss_hard_blocked = True
                     elif self.settings.risk_daily_loss_sensitivity_pct > 0:
                         loss_sensitivity_active = daily_loss_ratio >= self.settings.risk_daily_loss_sensitivity_pct
 
                 if loss_sensitivity_active != prior_sensitivity_active:
+                    sensitivity_ratio = realized_loss_ratio if weather_live_loss_guard else daily_loss_ratio
                     await repo.log_ops_event(
                         severity="warning" if loss_sensitivity_active else "info",
                         summary=(
                             f"Loss sensitivity gate {'activated' if loss_sensitivity_active else 'deactivated'}: "
-                            f"{daily_loss_ratio:.1%} vs {self.settings.risk_daily_loss_sensitivity_pct:.0%} threshold"
+                            f"{sensitivity_ratio:.1%} vs {self.settings.risk_daily_loss_sensitivity_pct:.0%} threshold"
                         ),
                         source="supervisor",
                         room_id=room.id,
                         kalshi_env=room.kalshi_env,
                         payload={
-                            "daily_loss_ratio": round(daily_loss_ratio, 4),
+                            "daily_loss_ratio": round(sensitivity_ratio, 4),
                             "sensitivity_pct": self.settings.risk_daily_loss_sensitivity_pct,
                             "active": loss_sensitivity_active,
                             "market_ticker": room.market_ticker,
+                            "metric": "realized_strategy_loss" if weather_live_loss_guard else "portfolio_daily_pnl",
                         },
                     )
                     await repo.set_checkpoint(
@@ -1452,13 +1600,14 @@ class WorkflowSupervisor:
                         payload={
                             "active": loss_sensitivity_active,
                             "changed_at": datetime.now(UTC).isoformat(),
-                            "daily_loss_ratio": round(daily_loss_ratio, 4),
+                            "daily_loss_ratio": round(sensitivity_ratio, 4),
+                            "metric": "realized_strategy_loss" if weather_live_loss_guard else "portfolio_daily_pnl",
                         },
                     )
                     logger.warning(
                         "Loss sensitivity gate %s: %.1f%% daily loss vs %.0f%% threshold",
                         "activated" if loss_sensitivity_active else "deactivated",
-                        daily_loss_ratio * 100,
+                        sensitivity_ratio * 100,
                         self.settings.risk_daily_loss_sensitivity_pct * 100,
                     )
 
@@ -1474,11 +1623,21 @@ class WorkflowSupervisor:
                         "daily_pnl_dollars": daily_pnl,
                         "daily_loss_ratio": daily_loss_ratio,
                         "daily_loss_hard_blocked": daily_loss_hard_blocked,
+                        "weather_live_loss_guard": weather_live_loss_guard,
+                        "weather_probe_active": weather_probe_active,
+                        "weather_balance_discontinuity": weather_balance_discontinuity,
+                        "realized_loss_ratio": realized_loss_ratio,
+                        "realized_loss_dollars": str(realized_loss_dollars),
+                        "realized_loss_cap_dollars": str(realized_loss_cap_dollars),
                         "loss_sensitivity_active": loss_sensitivity_active,
                         "effective_edge_bps": effective_edge_bps,
                         "effective_order_cap_dollars": effective_order_cap,
                     }
                 )
+                if weather_probe_active:
+                    effective_edge_bps = max(effective_edge_bps, self.settings.weather_live_probe_min_net_edge_bps)
+                    effective_order_cap = min(effective_order_cap, self.settings.weather_live_probe_max_order_notional_dollars)
+                    position_cap = min(position_cap, self.settings.weather_live_probe_max_order_notional_dollars)
 
                 effective_thresholds = thresholds.__class__(
                     risk_min_edge_bps=effective_edge_bps,
@@ -1491,9 +1650,20 @@ class WorkflowSupervisor:
                     risk_safe_capital_reserve_ratio=thresholds.risk_safe_capital_reserve_ratio,
                     risk_risky_capital_max_ratio=thresholds.risk_risky_capital_max_ratio,
                     risk_max_credible_edge_bps=thresholds.risk_max_credible_edge_bps,
-                    risk_min_confidence=thresholds.risk_min_confidence,
+                    risk_min_confidence=(
+                        max(thresholds.risk_min_confidence, self.settings.weather_live_probe_min_confidence)
+                        if weather_probe_active
+                        else thresholds.risk_min_confidence
+                    ),
                     risk_min_contract_price_dollars=thresholds.risk_min_contract_price_dollars,
                     strategy_min_abs_delta_f=thresholds.strategy_min_abs_delta_f,
+                )
+                sizing_trace.update(
+                    {
+                        "effective_edge_bps": effective_edge_bps,
+                        "effective_order_cap_dollars": effective_order_cap,
+                        "position_cap_dollars": position_cap,
+                    }
                 )
                 trace_thresholds = effective_thresholds
                 portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
@@ -1504,14 +1674,12 @@ class WorkflowSupervisor:
                     risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
                 )
                 all_positions = await repo.list_positions(limit=500, kalshi_env=room.kalshi_env, subaccount=self.settings.kalshi_subaccount)
-                open_ticker_count = len({p.market_ticker for p in all_positions})
+                open_ticker_count = len(
+                    {p.market_ticker for p in all_positions if Decimal(str(p.count_fp)) > Decimal("0")}
+                )
                 pending_order_count_fp = await repo.get_pending_buy_count_fp(
                     room.market_ticker,
                     ticket.side.value,
-                    kalshi_env=room.kalshi_env,
-                )
-                strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
-                    strategy_code=StrategyCode.DIRECTIONAL.value,
                     kalshi_env=room.kalshi_env,
                 )
                 risk_context = RiskContext(
@@ -1534,6 +1702,89 @@ class WorkflowSupervisor:
                         "strategy_daily_realized_pnl_dollars": strategy_daily_pnl,
                     }
                 )
+                probe_checkpoint_key = f"weather_probe:{room.kalshi_env}:{StrategyCode.DIRECTIONAL.value}:{_pacific_date()}"
+                probe_checkpoint = await repo.get_checkpoint(probe_checkpoint_key) if weather_probe_active else None
+                probe_payload = dict(probe_checkpoint.payload or {}) if probe_checkpoint is not None else {}
+                probe_daily_used = _decimal_payload(probe_payload.get("daily_notional_dollars"))
+                probe_trace: dict[str, Any] = {}
+                if weather_probe_active:
+                    entered_pnl = _decimal_payload(probe_payload.get("entered_realized_pnl_dollars"), str(strategy_daily_pnl))
+                    approved_probe_count = int(probe_payload.get("approved_probe_count") or 0)
+                    if approved_probe_count > 0 and Decimal(str(strategy_daily_pnl)) < entered_pnl - Decimal("0.005"):
+                        probe_payload["frozen"] = True
+                        probe_payload["freeze_reason"] = "probe_realized_loss"
+                        probe_payload["frozen_at"] = datetime.now(UTC).isoformat()
+                    if not probe_payload:
+                        await repo.log_ops_event(
+                            severity="warning",
+                            summary="Weather realized-loss probe mode active",
+                            source="supervisor",
+                            room_id=room.id,
+                            kalshi_env=room.kalshi_env,
+                            payload={
+                                "reason_code": "realized_loss_probe_mode",
+                                "strategy_code": StrategyCode.DIRECTIONAL.value,
+                                "realized_loss_dollars": str(realized_loss_dollars),
+                                "realized_loss_cap_dollars": str(realized_loss_cap_dollars),
+                                "market_ticker": room.market_ticker,
+                            },
+                        )
+                        probe_payload = {
+                            "date": _pacific_date(),
+                            "entered_at": datetime.now(UTC).isoformat(),
+                            "entered_realized_pnl_dollars": str(strategy_daily_pnl),
+                            "daily_notional_dollars": "0",
+                            "approved_probe_count": 0,
+                        }
+                    last_probe_at = _parse_utc_datetime(probe_payload.get("last_probe_at"))
+                    cooldown_active = (
+                        last_probe_at is not None
+                        and (datetime.now(UTC) - last_probe_at).total_seconds()
+                        < self.settings.weather_live_probe_cooldown_seconds
+                    )
+                    probe_trace = {
+                        "active": True,
+                        "reason_code": "realized_loss_probe_mode",
+                        "realized_loss_dollars": str(realized_loss_dollars),
+                        "realized_loss_cap_dollars": str(realized_loss_cap_dollars),
+                        "daily_notional_used_dollars": str(probe_daily_used),
+                        "daily_notional_cap_dollars": str(self.settings.weather_live_probe_daily_notional_dollars),
+                        "cooldown_active": cooldown_active,
+                        "frozen": bool(probe_payload.get("frozen")),
+                    }
+                    sizing_trace["weather_live_probe"] = probe_trace
+
+                probe_block_reasons: list[str] = []
+                if weather_probe_active:
+                    if probe_payload.get("frozen"):
+                        probe_block_reasons.append("Weather probe mode is frozen until the next Pacific trading day.")
+                    if open_ticker_count >= 1:
+                        probe_block_reasons.append("Weather probe mode allows only one concurrent open position.")
+                    if probe_daily_used >= Decimal(str(self.settings.weather_live_probe_daily_notional_dollars)):
+                        probe_block_reasons.append("Weather probe daily notional cap is exhausted.")
+                    if probe_trace.get("cooldown_active"):
+                        probe_block_reasons.append("Weather probe cooldown is active.")
+                    if not probe_block_reasons:
+                        remaining_probe_notional = (
+                            Decimal(str(self.settings.weather_live_probe_daily_notional_dollars))
+                            - probe_daily_used
+                        )
+                        capped_ticket, cap_trace = _cap_ticket_notional(
+                            ticket,
+                            max_notional_dollars=float(
+                                min(
+                                    Decimal(str(self.settings.weather_live_probe_max_order_notional_dollars)),
+                                    remaining_probe_notional,
+                                )
+                            ),
+                        )
+                        probe_trace["sizing"] = cap_trace
+                        if capped_ticket is None:
+                            probe_block_reasons.append("Weather probe cap produced a non-positive order size.")
+                        else:
+                            ticket = capped_ticket
+                            sizing_trace["weather_live_probe"] = probe_trace
+
                 if daily_loss_hard_blocked:
                     await repo.log_ops_event(
                         severity="critical",
@@ -1562,6 +1813,14 @@ class WorkflowSupervisor:
                             f"Daily loss circuit breaker: {daily_loss_ratio:.1%} loss "
                             f">= {float(sizing_trace.get('daily_loss_cap_pct', self.settings.risk_daily_loss_pct)):.0%} hard limit."
                         ],
+                        reason_codes=["daily_loss_circuit_breaker"],
+                    )
+                elif probe_block_reasons:
+                    verdict = RiskVerdictPayload(
+                        status=RiskStatus.BLOCKED,
+                        reasons=probe_block_reasons,
+                        reason_codes=["realized_loss_probe_mode"],
+                        diagnostics={"weather_live_probe": probe_trace},
                     )
                 else:
                     verdict = self.risk_engine.evaluate(
@@ -1572,6 +1831,69 @@ class WorkflowSupervisor:
                         context=risk_context,
                         thresholds=effective_thresholds,
                     )
+                    if weather_probe_active:
+                        reason_codes = list(verdict.reason_codes)
+                        if "realized_loss_probe_mode" not in reason_codes:
+                            reason_codes.append("realized_loss_probe_mode")
+                        if (probe_trace.get("sizing") or {}).get("cap_applied") and "probe_cap_applied" not in reason_codes:
+                            reason_codes.append("probe_cap_applied")
+                        if weather_balance_discontinuity and "balance_discontinuity" not in reason_codes:
+                            reason_codes.append("balance_discontinuity")
+                        reasons = list(verdict.reasons)
+                        probe_reason = (
+                            "Weather realized-loss probe mode active; entry must satisfy tiny-probe limits."
+                        )
+                        if probe_reason not in reasons:
+                            reasons.insert(0, probe_reason)
+                        diagnostics = dict(verdict.diagnostics or {})
+                        diagnostics["weather_live_probe"] = probe_trace
+                        verdict = verdict.model_copy(
+                            update={
+                                "reasons": reasons,
+                                "reason_codes": reason_codes,
+                                "diagnostics": diagnostics,
+                            }
+                        )
+                        if verdict.status == RiskStatus.BLOCKED and "research_stale" in reason_codes:
+                            probe_payload["frozen"] = True
+                            probe_payload["freeze_reason"] = "probe_research_stale"
+                            probe_payload["frozen_at"] = datetime.now(UTC).isoformat()
+                if weather_balance_discontinuity and "balance_discontinuity" not in verdict.reason_codes:
+                    reasons = list(verdict.reasons)
+                    discontinuity_reason = (
+                        "Portfolio balance discontinuity ignored by weather realized-loss guard."
+                    )
+                    if discontinuity_reason not in reasons:
+                        reasons.append(discontinuity_reason)
+                    verdict = verdict.model_copy(
+                        update={
+                            "reasons": reasons,
+                            "reason_codes": [*verdict.reason_codes, "balance_discontinuity"],
+                        }
+                    )
+                if weather_probe_active:
+                    if verdict.status == RiskStatus.APPROVED:
+                        approved_notional = verdict.approved_notional_dollars or estimate_notional_dollars(
+                            ticket.side,
+                            ticket.yes_price_dollars,
+                            verdict.approved_count_fp or ticket.count_fp,
+                        )
+                        probe_payload.update(
+                            {
+                                "date": _pacific_date(),
+                                "daily_notional_dollars": str(probe_daily_used + approved_notional),
+                                "last_probe_at": datetime.now(UTC).isoformat(),
+                                "approved_probe_count": int(probe_payload.get("approved_probe_count") or 0) + 1,
+                                "entered_realized_pnl_dollars": probe_payload.get(
+                                    "entered_realized_pnl_dollars",
+                                    str(strategy_daily_pnl),
+                                ),
+                                "last_probe_notional_dollars": str(approved_notional),
+                                "last_market_ticker": room.market_ticker,
+                            }
+                        )
+                    if probe_payload:
+                        await repo.set_checkpoint(probe_checkpoint_key, cursor=None, payload=probe_payload)
                 risk_verdict_record = await repo.save_risk_verdict(
                     room_id=room.id,
                     ticket_id=ticket_record.id,
@@ -2748,7 +3070,9 @@ class WorkflowSupervisor:
                             risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
                         )
                         all_positions = await repo.list_positions(limit=500, kalshi_env=room.kalshi_env, subaccount=self.settings.kalshi_subaccount)
-                        open_ticker_count = len({p.market_ticker for p in all_positions})
+                        open_ticker_count = len(
+                            {p.market_ticker for p in all_positions if Decimal(str(p.count_fp)) > Decimal("0")}
+                        )
                         pending_order_count_fp = await repo.get_pending_buy_count_fp(
                             room.market_ticker,
                             ticket.side.value,
@@ -2778,9 +3102,57 @@ class WorkflowSupervisor:
                             strategy_code=StrategyCode.DIRECTIONAL.value,
                             default_pct=float(self.settings.risk_daily_loss_pct),
                         )
+                        weather_live_guard_llm = weather_live_entry_freeze_bypassed(
+                            control=control,
+                            strategy_code=StrategyCode.DIRECTIONAL.value,
+                        )
                         if daily_pnl_llm is not None and _cap > 0 and daily_loss_cap_pct_llm > 0:
                             _daily_loss_ratio_llm = float(-daily_pnl_llm) / _cap
-                            _daily_hard_blocked_llm = _daily_loss_ratio_llm >= daily_loss_cap_pct_llm
+                            _daily_hard_blocked_llm = (
+                                _daily_loss_ratio_llm >= daily_loss_cap_pct_llm
+                                and not weather_live_guard_llm
+                            )
+                        if weather_live_guard_llm:
+                            realized_loss_dollars_llm = max(Decimal("0"), -Decimal(str(strategy_daily_pnl)))
+                            realized_loss_cap_dollars_llm = _weather_realized_loss_cap_dollars(
+                                total_capital=total_capital or Decimal("0"),
+                                cap_pct=daily_loss_cap_pct_llm,
+                                min_loss_dollars=self.settings.weather_live_probe_min_loss_dollars,
+                            )
+                            if realized_loss_dollars_llm >= realized_loss_cap_dollars_llm:
+                                capped_ticket, _probe_cap_trace = _cap_ticket_notional(
+                                    ticket,
+                                    max_notional_dollars=self.settings.weather_live_probe_max_order_notional_dollars,
+                                )
+                                if capped_ticket is not None:
+                                    ticket = capped_ticket
+                                effective_thresholds = RuntimeThresholds(
+                                    risk_min_edge_bps=max(
+                                        effective_thresholds.risk_min_edge_bps,
+                                        self.settings.weather_live_probe_min_net_edge_bps,
+                                    ),
+                                    risk_max_order_notional_dollars=_min_optional_cap(
+                                        effective_thresholds.risk_max_order_notional_dollars,
+                                        self.settings.weather_live_probe_max_order_notional_dollars,
+                                    ),
+                                    risk_max_position_notional_dollars=_min_optional_cap(
+                                        effective_thresholds.risk_max_position_notional_dollars,
+                                        self.settings.weather_live_probe_max_order_notional_dollars,
+                                    ),
+                                    risk_safe_capital_reserve_ratio=effective_thresholds.risk_safe_capital_reserve_ratio,
+                                    risk_risky_capital_max_ratio=effective_thresholds.risk_risky_capital_max_ratio,
+                                    trigger_max_spread_bps=effective_thresholds.trigger_max_spread_bps,
+                                    trigger_cooldown_seconds=effective_thresholds.trigger_cooldown_seconds,
+                                    strategy_quality_edge_buffer_bps=effective_thresholds.strategy_quality_edge_buffer_bps,
+                                    strategy_min_remaining_payout_bps=effective_thresholds.strategy_min_remaining_payout_bps,
+                                    risk_max_credible_edge_bps=effective_thresholds.risk_max_credible_edge_bps,
+                                    risk_min_confidence=max(
+                                        effective_thresholds.risk_min_confidence,
+                                        self.settings.weather_live_probe_min_confidence,
+                                    ),
+                                    risk_min_contract_price_dollars=effective_thresholds.risk_min_contract_price_dollars,
+                                    strategy_min_abs_delta_f=effective_thresholds.strategy_min_abs_delta_f,
+                                )
                         if _daily_hard_blocked_llm:
                             verdict = RiskVerdictPayload(
                                 status=RiskStatus.BLOCKED,
@@ -2788,6 +3160,7 @@ class WorkflowSupervisor:
                                     f"Daily loss circuit breaker: {_daily_loss_ratio_llm:.1%} loss "
                                     f">= {daily_loss_cap_pct_llm:.0%} hard limit."
                                 ],
+                                reason_codes=["daily_loss_circuit_breaker"],
                             )
                         else:
                             verdict = self.risk_engine.evaluate(

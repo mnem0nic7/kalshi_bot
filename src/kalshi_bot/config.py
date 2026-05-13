@@ -148,6 +148,13 @@ class Settings(BaseSettings):
     risk_edge_scaled_sizing_enabled: bool = False
     risk_edge_scaled_kelly_multiplier: float = 0.25
     risk_daily_loss_dollars_by_strategy: dict[str, float] = Field(default_factory=dict)
+    weather_live_probe_min_loss_dollars: float = 1.0
+    weather_live_probe_min_confidence: float = 0.90
+    weather_live_probe_min_net_edge_bps: int = 5000
+    weather_live_probe_max_order_notional_dollars: float = 0.25
+    weather_live_probe_daily_notional_dollars: float = 1.0
+    weather_live_probe_cooldown_seconds: int = 3600
+    weather_live_balance_discontinuity_ratio: float = 0.50
 
     crypto_enabled: bool = True
     crypto_15m_enabled: bool = True
@@ -332,6 +339,9 @@ class Settings(BaseSettings):
     research_stale_grace_factor: float = 2.0  # dossier within stale_seconds * factor may still trade at reduced size
     research_stale_tolerance_notional_factor: float = 0.5  # notional cap multiplier when stale_tolerance_active
     research_refresh_cooldown_seconds: int = 120
+    weather_research_refresh_interval_seconds: int = 300
+    weather_research_refresh_margin_seconds: int = 180
+    weather_research_refresh_concurrency: int = 4
     research_web_max_results: int = 5
     research_web_max_queries: int = 2
     stream_error_log_cooldown_seconds: int = 900

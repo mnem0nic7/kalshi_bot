@@ -29,7 +29,6 @@ from kalshi_bot.weather.intraday import (
     intraday_feature_values,
     normalize_weather_operator,
     oriented_weather_delta,
-    threshold_bucket,
 )
 from kalshi_bot.weather.sigma_calibration import season_for_month
 from kalshi_bot.weather.sigma_calibration import (

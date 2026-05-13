@@ -396,8 +396,10 @@ class DeterministicRiskEngine:
 
         if market_observed_at is None or (now - market_observed_at).total_seconds() > self.settings.risk_stale_market_seconds:
             block("Kalshi market data is stale.")
+            code("market_stale")
         if research_observed_at is None or (now - research_observed_at).total_seconds() > self.settings.research_stale_seconds:
             block("Research data is stale.")
+            code("research_stale")
 
         max_order_count_fp = weather_live_max_order_count_fp(
             control=control,
@@ -473,6 +475,7 @@ class DeterministicRiskEngine:
             block(
                 f"Trade regime '{signal.trade_regime}' is not permitted; only standard-regime trades are allowed."
             )
+            code("non_standard_regime")
 
         if is_buy_entry and active_thresholds.risk_max_order_notional_dollars is not None and float(order_notional) > active_thresholds.risk_max_order_notional_dollars:
             block("Ticket notional exceeds max order notional.")
@@ -524,10 +527,12 @@ class DeterministicRiskEngine:
                     ticket=ticket,
                 )
                 if fitted_count is None:
-                    block(
-                        f"{capital_bucket.capitalize()} capital bucket is full: "
-                        f"used {bucket_used_dollars_before:.4f} of {bucket_limit_dollars:.4f}."
-                    )
+                    if not non_standard_regime:
+                        block(
+                            f"{capital_bucket.capitalize()} capital bucket is full: "
+                            f"used {bucket_used_dollars_before:.4f} of {bucket_limit_dollars:.4f}."
+                        )
+                        code(f"{capital_bucket}_capital_bucket_full")
                     bucket_used_dollars_after = bucket_used_dollars_before
                 else:
                     approved_count = fitted_count

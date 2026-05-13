@@ -35,6 +35,25 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             handle.write("\n")
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
 STRATEGY_AUDIT_VERSION = "weather-quality-v1"
 RECENT_QUALITY_WINDOW_HOURS = 24
 SETTLEMENT_NEAR_SECONDS = 6 * 60 * 60
@@ -470,17 +489,44 @@ class TrainingCorpusService:
                     )
                 )
             dossier_record = dossiers.get(mapping.market_ticker)
-            if dossier_record is not None:
+            if dossier_record is None:
+                issues.append(
+                    ResearchAuditIssue(
+                        market_ticker=mapping.market_ticker,
+                        severity="medium",
+                        code="missing_dossier",
+                        summary="No research dossier exists for this monitored market.",
+                        details={"market_ticker": mapping.market_ticker},
+                    )
+                )
+            else:
                 payload = dossier_record.payload
                 freshness = ((payload.get("freshness") or {}) if isinstance(payload, dict) else {})
-                if freshness.get("stale"):
+                expires_at = _as_utc(getattr(dossier_record, "expires_at", None)) or _parse_datetime(
+                    freshness.get("expires_at")
+                )
+                updated_at = _as_utc(getattr(dossier_record, "updated_at", None))
+                now = datetime.now(UTC)
+                computed_stale = bool(freshness.get("stale"))
+                if expires_at is not None:
+                    computed_stale = computed_stale or expires_at <= now
+                elif updated_at is not None:
+                    computed_stale = computed_stale or (
+                        now - updated_at
+                    ).total_seconds() > self.settings.research_stale_seconds
+                if computed_stale:
                     issues.append(
                         ResearchAuditIssue(
                             market_ticker=mapping.market_ticker,
                             severity="medium",
                             code="stale_dossier",
                             summary="Latest research dossier is stale.",
-                            details={"freshness": freshness},
+                            details={
+                                "freshness": freshness,
+                                "expires_at": expires_at.isoformat() if expires_at else None,
+                                "updated_at": updated_at.isoformat() if updated_at else None,
+                                "computed_at": now.isoformat(),
+                            },
                         )
                     )
                 if not bool(payload.get("settlement_covered")):
