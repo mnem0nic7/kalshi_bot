@@ -2223,14 +2223,26 @@ class CryptoReplayService:
                 artifact_type=_crypto_artifact_type("backtest", requested_assets),
                 kalshi_env=self.settings.kalshi_env,
             )
-            metrics = dict((backtest.metrics if backtest is not None else None) or (model.metrics if model is not None else {}) or {})
+            metrics = dict(
+                (backtest.metrics if backtest is not None else None)
+                or (model.metrics if model is not None else {})
+                or {}
+            )
             if model is None:
                 metrics["model_missing"] = True
             if backtest is None:
                 metrics["backtest_missing"] = True
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
-            gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
+            if len(requested_assets) > 1 and (model is None or backtest is None):
+                metrics, gate = await self._gate_from_per_asset_artifacts(
+                    repo,
+                    frequency=freq,
+                    asset_symbols=requested_assets,
+                    crypto_policy=crypto_policy,
+                )
+            else:
+                gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
                 artifact_type=_crypto_artifact_type("replay_gate", requested_assets),
@@ -2266,6 +2278,155 @@ class CryptoReplayService:
             "version": artifact.version,
             **gate,
         }
+
+    async def _gate_from_per_asset_artifacts(
+        self,
+        repo: PlatformRepository,
+        *,
+        frequency: str,
+        asset_symbols: list[str],
+        crypto_policy: RuntimeCryptoPolicy,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        asset_results: list[dict[str, Any]] = []
+        aggregate_metrics: dict[str, Any] = {
+            "asset_count": len(asset_symbols),
+            "aggregate_source": "per_asset_artifacts",
+            "asset_symbols": asset_symbols,
+        }
+        count_keys = (
+            "sample_count",
+            "resolved_sample_count",
+            "prediction_eligible_count",
+            "strict_trade_eligible_count",
+            "proxy_quote_row_count",
+            "real_quote_row_count",
+            "trade_candidate_count",
+            "current_model_live_quality_candidate_count",
+            "live_quality_candidate_count",
+            "exploratory_shadow_candidate_count",
+            "oos_trade_candidate_count",
+            "oos_fold_count",
+            "hard_cap_breaches",
+            "candle_count",
+            "leakage_row_count",
+        )
+        money_keys = (
+            "net_simulated_pl_dollars",
+            "market_mid_net_simulated_pl_dollars",
+            "pnl_advantage_vs_market_mid_dollars",
+            "oos_net_simulated_pl_dollars",
+            "oos_market_mid_net_simulated_pl_dollars",
+            "oos_pnl_advantage_vs_market_mid_dollars",
+            "fees_dollars",
+        )
+        counter_keys = (
+            "candidate_status_counts",
+            "candidate_reason_counts",
+            "top_candidate_status_counts",
+            "top_candidate_reason_counts",
+            "candidate_rejection_reason_counts",
+        )
+        weighted_keys = (
+            "spot_feature_coverage_pct",
+            "calibration_brier",
+            "market_mid_brier",
+            "calibration_log_loss",
+            "market_mid_log_loss",
+            "calibration_ece",
+            "market_mid_ece",
+        )
+        weighted_totals: dict[str, float] = {key: 0.0 for key in weighted_keys}
+        weighted_counts: dict[str, int] = {key: 0 for key in weighted_keys}
+        aggregate_reasons: list[str] = []
+        oos_statuses: set[str] = set()
+        missing_model_assets: list[str] = []
+        missing_backtest_assets: list[str] = []
+
+        for asset in asset_symbols:
+            model = await repo.get_latest_crypto_model_artifact(
+                frequency=frequency,
+                artifact_type=_crypto_artifact_type("model", [asset]),
+                kalshi_env=self.settings.kalshi_env,
+            )
+            backtest = await repo.get_latest_crypto_model_artifact(
+                frequency=frequency,
+                artifact_type=_crypto_artifact_type("backtest", [asset]),
+                kalshi_env=self.settings.kalshi_env,
+            )
+            metrics = dict(
+                (backtest.metrics if backtest is not None else None)
+                or (model.metrics if model is not None else {})
+                or {}
+            )
+            if model is None:
+                metrics["model_missing"] = True
+                missing_model_assets.append(asset)
+            if backtest is None:
+                metrics["backtest_missing"] = True
+                missing_backtest_assets.append(asset)
+            gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
+            if not gate["passed"]:
+                aggregate_reasons.extend(f"{asset}: {reason}" for reason in gate["reasons"])
+            asset_results.append(
+                {
+                    "asset": asset,
+                    "status": "passed" if gate["passed"] else "blocked",
+                    "reasons": gate["reasons"],
+                    "model": _artifact_summary(model),
+                    "backtest": _artifact_summary(backtest),
+                    "metrics": {
+                        key: metrics.get(key)
+                        for key in (
+                            "resolved_sample_count",
+                            "strict_trade_eligible_count",
+                            "current_model_live_quality_candidate_count",
+                            "oos_trade_candidate_count",
+                            "oos_net_simulated_pl_dollars",
+                            "oos_pnl_advantage_vs_market_mid_dollars",
+                            "spot_feature_coverage_pct",
+                        )
+                    },
+                }
+            )
+            for key in count_keys:
+                aggregate_metrics[key] = int(aggregate_metrics.get(key) or 0) + int(metrics.get(key) or 0)
+            for key in money_keys:
+                aggregate_metrics[key] = float(aggregate_metrics.get(key) or 0.0) + float(metrics.get(key) or 0.0)
+            for key in counter_keys:
+                counter = Counter(aggregate_metrics.get(key) or {})
+                counter.update(metrics.get(key) or {})
+                aggregate_metrics[key] = dict(counter)
+            weight = int(metrics.get("resolved_sample_count") or metrics.get("sample_count") or 0)
+            for key in weighted_keys:
+                value = metrics.get(key)
+                if value is None or weight <= 0:
+                    continue
+                weighted_totals[key] += float(value) * weight
+                weighted_counts[key] += weight
+            oos_statuses.add(str(metrics.get("oos_evaluation_status") or "").strip().lower())
+
+        for key in weighted_keys:
+            if weighted_counts[key] > 0:
+                aggregate_metrics[key] = weighted_totals[key] / weighted_counts[key]
+        aggregate_metrics["missing_model_assets"] = missing_model_assets
+        aggregate_metrics["missing_backtest_assets"] = missing_backtest_assets
+        aggregate_metrics["model_missing"] = bool(missing_model_assets)
+        aggregate_metrics["backtest_missing"] = bool(missing_backtest_assets)
+        aggregate_metrics["oos_evaluation_status"] = (
+            "ok"
+            if oos_statuses <= {"", "ok"} and int(aggregate_metrics.get("oos_fold_count") or 0) > 0
+            else "partial"
+        )
+        aggregate_metrics["asset_gate_results"] = asset_results
+        aggregate_gate = self.evaluate_gate(aggregate_metrics, crypto_policy=crypto_policy)
+        gate = {
+            **aggregate_gate,
+            "passed": not aggregate_reasons and aggregate_gate["passed"],
+            "reasons": aggregate_reasons or aggregate_gate["reasons"],
+            "aggregate_source": "per_asset_artifacts",
+            "asset_gate_results": asset_results,
+        }
+        return aggregate_metrics, gate
 
     def evaluate_gate(
         self,
@@ -4332,6 +4493,14 @@ def _spot_context_for_decision(
             "spot_exchange_latest_trade_size": None,
             "spot_exchange_recent_trade_count": None,
         }
+    if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
+        historical_eligible = [
+            row
+            for row in eligible
+            if str(row.source_kind or "").strip().lower() != "spot_tick"
+        ]
+        if historical_eligible:
+            eligible = historical_eligible
     current = eligible[-1]
     close = _decimal(current.close_dollars)
     stale_seconds = int((decision_utc - _as_utc_datetime(current.end_ts)).total_seconds())

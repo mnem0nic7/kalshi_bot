@@ -198,6 +198,99 @@ def test_crypto_replay_gate_blocks_losing_model_even_with_good_calibration(tmp_p
     assert any("Net simulated P/L" in reason for reason in gate["reasons"])
 
 
+@pytest.mark.asyncio
+async def test_crypto_replay_gate_falls_back_to_per_asset_artifacts_for_multi_asset_request(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=5,
+        crypto_replay_min_trade_candidates=2,
+        crypto_replay_require_calibration_better_than_mid=False,
+        crypto_replay_require_pnl_beats_market_mid=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    def metrics(candidate_count: int, net_pnl: float) -> dict[str, object]:
+        return {
+            "sample_count": 10,
+            "resolved_sample_count": 10,
+            "strict_trade_eligible_count": 10,
+            "trade_candidate_count": candidate_count,
+            "current_model_live_quality_candidate_count": candidate_count,
+            "oos_trade_candidate_count": candidate_count,
+            "oos_fold_count": 1,
+            "oos_evaluation_status": "ok",
+            "net_simulated_pl_dollars": net_pnl,
+            "market_mid_net_simulated_pl_dollars": 0.0,
+            "pnl_advantage_vs_market_mid_dollars": net_pnl,
+            "oos_net_simulated_pl_dollars": net_pnl,
+            "oos_market_mid_net_simulated_pl_dollars": 0.0,
+            "oos_pnl_advantage_vs_market_mid_dollars": net_pnl,
+            "hard_cap_breaches": 0,
+            "candle_count": 10,
+            "spot_feature_coverage_pct": 1.0,
+            "calibration_brier": 0.10,
+            "market_mid_brier": 0.20,
+            "calibration_log_loss": 0.40,
+            "market_mid_log_loss": 0.50,
+            "calibration_ece": 0.01,
+            "market_mid_ece": 0.02,
+        }
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        for asset, candidate_count, net_pnl in (("BTC", 2, 3.0), ("ETH", 0, 0.0)):
+            await repo.record_crypto_model_artifact(
+                frequency="15m",
+                artifact_type=f"model:{asset}",
+                version=f"model-{asset}",
+                status="trained",
+                sample_count=10,
+                metrics=metrics(candidate_count, net_pnl),
+                payload={"asset_symbols": [asset]},
+                kalshi_env=settings.kalshi_env,
+                trained_at=datetime.now(UTC),
+            )
+            await repo.record_crypto_model_artifact(
+                frequency="15m",
+                artifact_type=f"backtest:{asset}",
+                version=f"backtest-{asset}",
+                status="pass",
+                sample_count=10,
+                metrics=metrics(candidate_count, net_pnl),
+                payload={"asset_symbols": [asset]},
+                kalshi_env=settings.kalshi_env,
+                trained_at=datetime.now(UTC),
+            )
+        await session.commit()
+
+    service = CryptoReplayService(settings=settings, session_factory=session_factory)
+    result = await service.gate(frequency="15m", asset_symbols=["BTC", "ETH"])
+
+    assert result["status"] == "blocked"
+    assert result["aggregate_source"] == "per_asset_artifacts"
+    assert not any(reason == "Crypto model artifact is missing." for reason in result["reasons"])
+    assert any(
+        reason.startswith("ETH: Out-of-sample trade candidate count 0 below minimum 2.")
+        for reason in result["reasons"]
+    )
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        aggregate_gate = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            kalshi_env=settings.kalshi_env,
+        )
+        await session.commit()
+
+    assert aggregate_gate is not None
+    assert aggregate_gate.status == "blocked"
+    assert aggregate_gate.metrics["aggregate_source"] == "per_asset_artifacts"
+    await engine.dispose()
+
+
 def test_crypto_candidate_demotes_stale_coinbase_spot(tmp_path) -> None:
     settings = _settings(tmp_path)
     row = {

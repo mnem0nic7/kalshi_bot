@@ -431,6 +431,69 @@ def test_historical_spot_ohlc_uses_alignment_window_not_live_freshness() -> None
     assert rows[0]["spot_max_stale_seconds"] == 905
 
 
+def test_historical_spot_context_prefers_ohlc_over_stale_tick() -> None:
+    decision_ts = datetime(2026, 5, 12, 12, 11, tzinfo=UTC)
+    snapshot = type(
+        "_Snapshot",
+        (),
+        {
+            "market_ticker": "KXBTC15M-HISTORICAL-SPOT-TICK",
+            "series_ticker": "KXBTC15M",
+            "asset_symbol": "BTC",
+            "frequency": "15m",
+            "source_kind": "historical",
+            "settlement_result": "yes",
+            "observed_at": decision_ts,
+            "close_time": decision_ts + timedelta(minutes=4),
+            "expected_expiration_time": decision_ts + timedelta(minutes=4),
+            "target_price_dollars": Decimal("100.00000000"),
+            "yes_bid_dollars": Decimal("0.4500"),
+            "yes_ask_dollars": Decimal("0.4700"),
+            "no_ask_dollars": Decimal("0.5500"),
+            "last_price_dollars": Decimal("0.4600"),
+            "volume": 10,
+            "open_interest": 5,
+            "payload": {},
+        },
+    )()
+    ohlc = CryptoSpotOHLCRecord(
+        kalshi_env="demo",
+        provider="coinbase",
+        asset_symbol="BTC",
+        quote_currency="USD",
+        frequency="15m",
+        interval_seconds=900,
+        start_ts=datetime(2026, 5, 12, 11, 45, tzinfo=UTC),
+        end_ts=datetime(2026, 5, 12, 12, 0, tzinfo=UTC),
+        close_dollars=Decimal("99.00000000"),
+        source_kind="spot_ohlc",
+        observed_at=decision_ts,
+        payload={},
+    )
+    tick = CryptoSpotOHLCRecord(
+        kalshi_env="demo",
+        provider="coinbase",
+        asset_symbol="BTC",
+        quote_currency="USD",
+        frequency="15m",
+        interval_seconds=0,
+        start_ts=None,
+        end_ts=datetime(2026, 5, 12, 12, 10, tzinfo=UTC),
+        close_dollars=Decimal("101.00000000"),
+        source_kind="spot_tick",
+        observed_at=decision_ts,
+        payload={},
+    )
+
+    rows = _crypto_decision_rows([snapshot], [], [ohlc, tick])  # type: ignore[list-item]
+
+    assert rows[0]["spot_context_mode"] == "historical"
+    assert rows[0]["spot_feature_status"] == "available"
+    assert rows[0]["spot_source_kind"] == "spot_ohlc"
+    assert rows[0]["spot_close_dollars"] == Decimal("99.00000000")
+    assert rows[0]["spot_max_stale_seconds"] == 905
+
+
 def test_historical_spot_ohlc_stales_after_alignment_window() -> None:
     decision_ts = datetime(2026, 5, 12, 12, 15, 6, tzinfo=UTC)
     snapshot = type(
