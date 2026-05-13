@@ -87,6 +87,72 @@
     return colors[symbol] || "#d8dee7";
   }
 
+  function numberOrNull(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function signedBps(value) {
+    const number = numberOrNull(value);
+    if (number === null) return "n/a";
+    const rounded = Math.round(number);
+    if (rounded > 0) return `+${rounded}bps`;
+    return `${rounded}bps`;
+  }
+
+  function signalTrace(signal) {
+    return signal && typeof signal.candidate_trace === "object" && signal.candidate_trace !== null
+      ? signal.candidate_trace
+      : {};
+  }
+
+  function visibleCandidate(signal) {
+    const trace = signalTrace(signal);
+    const candidates = Array.isArray(trace.candidates) ? trace.candidates : [];
+    const side = String(signal.recommended_side || trace.selected_side || "").toLowerCase();
+    if (side) {
+      const sideCandidate = candidates.find((candidate) => String(candidate.side || "").toLowerCase() === side);
+      if (sideCandidate) return sideCandidate;
+    }
+    return candidates.find((candidate) => Number(candidate.rank) === 1) || candidates[0] || null;
+  }
+
+  function edgeMetrics(signal) {
+    const trace = signalTrace(signal);
+    const candidate = visibleCandidate(signal) || {};
+    const rawBps = numberOrNull(
+      candidate.edge_bps ?? trace.selected_edge_bps ?? signal.edge_bps,
+    );
+    const expectedNetEdge = numberOrNull(candidate.expected_net_edge ?? trace.expected_net_edge);
+    const netBps = expectedNetEdge === null ? null : Math.round(expectedNetEdge * 10000);
+    const runtimeThresholds =
+      candidate.runtime_thresholds && typeof candidate.runtime_thresholds === "object"
+        ? candidate.runtime_thresholds
+        : {};
+    const neededBps = numberOrNull(runtimeThresholds.min_fee_adjusted_edge_bps ?? trace.min_edge_bps);
+    return {
+      rawBps,
+      netBps,
+      neededBps,
+      sortBps: netBps === null ? rawBps : netBps,
+    };
+  }
+
+  function edgeSummary(signal) {
+    const metrics = edgeMetrics(signal || {});
+    const parts = [];
+    if (metrics.rawBps !== null) parts.push(`raw ${signedBps(metrics.rawBps)}`);
+    if (metrics.netBps !== null) parts.push(`net ${signedBps(metrics.netBps)}`);
+    if (metrics.neededBps !== null) parts.push(`need ${signedBps(metrics.neededBps)}`);
+    return parts.length ? parts.join(" / ") : "edge n/a";
+  }
+
+  function trendScore(market) {
+    const metrics = edgeMetrics((market || {}).signal || {});
+    return Math.abs(Number(metrics.sortBps || 0));
+  }
+
   function sortedMarkets() {
     const markets = [...((state.payload || {}).markets || [])];
     const mode = sortEl ? sortEl.value : "trending";
@@ -97,7 +163,7 @@
     } else if (mode === "asset") {
       markets.sort((a, b) => String(a.asset_symbol || "").localeCompare(String(b.asset_symbol || "")));
     } else {
-      markets.sort((a, b) => Math.abs(Number((b.signal || {}).edge_bps || 0)) - Math.abs(Number((a.signal || {}).edge_bps || 0)));
+      markets.sort((a, b) => trendScore(b) - trendScore(a));
     }
     return markets;
   }
@@ -179,7 +245,7 @@
         <div class="crypto-card-footer">
           <span>${escapeHtml(formatVolume(market.volume))}</span>
           <span class="crypto-gate crypto-gate-${escapeHtml(gateStatus)}">${escapeHtml(gateStatus)}</span>
-          <span>${Math.abs(Number(signal.edge_bps || 0))} bps</span>
+          <span class="crypto-edge-summary">${escapeHtml(edgeSummary(signal))}</span>
         </div>
       </article>
     `;

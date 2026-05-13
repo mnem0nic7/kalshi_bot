@@ -269,11 +269,21 @@
 
 .crypto-card-footer {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 0.75rem;
   color: #d8dee7;
   font-size: 0.78rem;
   font-weight: 700;
+}
+
+.crypto-edge-summary {
+  margin-left: auto;
+  color: #ffde99;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+  text-align: right;
 }
 
 .crypto-gate {
@@ -320,5 +330,11 @@
   .crypto-status-strip,
   .crypto-grid {
     grid-template-columns: 1fr;
+  }
+
+  .crypto-edge-summary {
+    flex-basis: 100%;
+    margin-left: 0;
+    text-align: left;
   }
 }

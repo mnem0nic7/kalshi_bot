@@ -39,7 +39,30 @@ def _crypto_payload() -> dict[str, object]:
                 "asset_mode": "shadow",
                 "live_eligible": False,
                 "live_blockers": ["Asset BTC mode is shadow; set it to live to allow live orders."],
-                "signal": {"recommended_side": "yes", "edge_bps": 120},
+                "signal": {
+                    "recommended_side": "yes",
+                    "edge_bps": 55,
+                    "candidate_trace": {
+                        "selected_side": "yes",
+                        "min_edge_bps": 500,
+                        "candidates": [
+                            {
+                                "side": "yes",
+                                "rank": 1,
+                                "edge_bps": 55,
+                                "expected_net_edge": "-0.0145",
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
+                            },
+                            {
+                                "side": "no",
+                                "rank": 2,
+                                "edge_bps": -122,
+                                "expected_net_edge": "-0.0422",
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
+                            },
+                        ],
+                    },
+                },
             },
             {
                 "market_ticker": "KXETH15M-TEST",
@@ -54,7 +77,30 @@ def _crypto_payload() -> dict[str, object]:
                 "asset_mode": "live",
                 "live_eligible": False,
                 "live_blockers": ["crypto_trading_enabled is false"],
-                "signal": {"recommended_side": "no", "edge_bps": 95},
+                "signal": {
+                    "recommended_side": "no",
+                    "edge_bps": 420,
+                    "candidate_trace": {
+                        "selected_side": "no",
+                        "min_edge_bps": 500,
+                        "candidates": [
+                            {
+                                "side": "no",
+                                "rank": 1,
+                                "edge_bps": 420,
+                                "expected_net_edge": "-0.0050",
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
+                            },
+                            {
+                                "side": "yes",
+                                "rank": 2,
+                                "edge_bps": -177,
+                                "expected_net_edge": "-0.0388",
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
+                            },
+                        ],
+                    },
+                },
             },
         ],
     }
@@ -135,6 +181,15 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
 
             assert page.locator(".crypto-card").count() == 2
             assert page.locator(".crypto-live-blockers").count() == 1
+            assert page.locator(".crypto-card").first.get_attribute("data-market") == "KXBTC15M-TEST"
+            assert (
+                page.locator('[data-market="KXBTC15M-TEST"] .crypto-edge-summary').inner_text()
+                == "raw +55bps / net -145bps / need +500bps"
+            )
+            assert (
+                page.locator('[data-market="KXETH15M-TEST"] .crypto-edge-summary').inner_text()
+                == "raw +420bps / net -50bps / need +500bps"
+            )
             btc_select = page.locator('[data-asset-mode="BTC"]')
             assert btc_select.input_value() == "shadow"
 
@@ -147,7 +202,7 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
                 """
                 () => [...document.querySelectorAll('.crypto-card')].every((card) => {
                   const bounds = card.getBoundingClientRect();
-                  return [...card.querySelectorAll('select, button, a, h2, .crypto-live-blockers')]
+                  return [...card.querySelectorAll('select, button, a, h2, .crypto-live-blockers, .crypto-edge-summary')]
                     .every((element) => {
                       const rect = element.getBoundingClientRect();
                       return rect.left >= bounds.left - 1 && rect.right <= bounds.right + 1;
