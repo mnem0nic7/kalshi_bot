@@ -5,7 +5,7 @@ import asyncio
 from collections import Counter
 import csv
 from dataclasses import asdict
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import io
 import json
 import os
@@ -115,6 +115,7 @@ CRYPTO_ENV_COMMANDS = {
     "crypto-status",
     "crypto-autonomy",
     "crypto-asset-mode",
+    "crypto-policy",
     "crypto-live-path",
     "weather-live",
 }
@@ -1025,6 +1026,83 @@ def _crypto_live_path_step_summary(result: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _projection_hours(current: int, target: int, gain_24h: int, *, ratio: float = 1.0) -> float | None:
+    if current >= target:
+        return 0.0
+    hourly_rate = (float(gain_24h) * max(0.0, ratio)) / 24.0
+    if hourly_rate <= 0:
+        return None
+    return round((target - current) / hourly_rate, 2)
+
+
+async def _crypto_live_path_strict_row_growth(
+    container: AppContainer,
+    *,
+    assets: list[str],
+    frequency: str,
+    asset_reports: list[dict[str, Any]],
+    strict_rows_target: int,
+    candidate_target: int,
+) -> dict[str, Any]:
+    windows = {"1h": 1 / 24, "6h": 6 / 24, "24h": 1}
+    counts_by_window: dict[str, dict[str, int]] = {}
+    for label, days in windows.items():
+        status = await container.crypto_history_service.status(frequency=frequency, days=days)
+        support = ((status.get("quote_evidence") or {}).get("trade_candidate_support_by_asset") or {})
+        counts_by_window[label] = {
+            asset: _int_or_zero((support.get(asset) or {}).get("strict_trade_eligible_rows"))
+            for asset in assets
+        }
+    by_asset: dict[str, Any] = {}
+    report_by_asset = {report["asset"]: report for report in asset_reports}
+    for asset in assets:
+        report = report_by_asset.get(asset) or {}
+        strict_rows = _int_or_zero(((report.get("quote_evidence") or {}).get("strict_trade_eligible_count")))
+        replay = report.get("replay") or {}
+        oos_candidates = _int_or_zero(replay.get("oos_trade_candidate_count"))
+        gain_24h = counts_by_window["24h"].get(asset, 0)
+        candidate_ratio = (oos_candidates / strict_rows) if strict_rows > 0 else 0.0
+        by_asset[asset] = {
+            "current_strict_trade_eligible_count": strict_rows,
+            "current_oos_trade_candidate_count": oos_candidates,
+            "strict_rows_added_1h": counts_by_window["1h"].get(asset, 0),
+            "strict_rows_added_6h": counts_by_window["6h"].get(asset, 0),
+            "strict_rows_added_24h": gain_24h,
+            "oos_candidate_per_strict_row_ratio": round(candidate_ratio, 6),
+            "projected_hours_to_strict_target": _projection_hours(strict_rows, strict_rows_target, gain_24h),
+            "projected_hours_to_oos_candidate_target": _projection_hours(
+                oos_candidates,
+                candidate_target,
+                gain_24h,
+                ratio=candidate_ratio,
+            ),
+        }
+    return {
+        "windows": sorted(windows),
+        "targets": {
+            "strict_trade_eligible_count": strict_rows_target,
+            "oos_trade_candidate_count": candidate_target,
+        },
+        "by_asset": by_asset,
+    }
+
+
+def _crypto_status_strict_counts(status: dict[str, Any]) -> dict[str, int]:
+    return {
+        report["asset"]: _int_or_zero((report.get("quote_evidence") or {}).get("strict_trade_eligible_count"))
+        for report in status.get("asset_reports") or []
+    }
+
+
+def _crypto_status_snapshot_counts(status: dict[str, Any]) -> dict[str, int]:
+    return {
+        report["asset"]: _int_or_zero(
+            ((report.get("quote_evidence") or {}).get("strict_quote_ingestion_audit") or {}).get("snapshot_present")
+        )
+        for report in status.get("asset_reports") or []
+    }
+
+
 async def _crypto_live_path_runtime_state(
     container: AppContainer,
     *,
@@ -1118,6 +1196,10 @@ async def _crypto_live_path_runtime_state(
             "replay_min_pnl_advantage_dollars": crypto_policy.replay_min_pnl_advantage_dollars,
         },
         "asset_modes": modes,
+        "asset_entry_thresholds": {
+            asset: crypto_policy.entry_for_asset(asset)
+            for asset in assets
+        },
         "artifacts": artifacts,
     }
 
@@ -1152,6 +1234,8 @@ def _crypto_live_path_assess_asset(
     gate_status = str(gate_artifact.get("status") or "missing")
     model_status = str(model_artifact.get("status") or "missing")
     backtest_status = str(backtest_artifact.get("status") or "missing")
+    model_payload = model_artifact.get("payload") if isinstance(model_artifact.get("payload"), dict) else {}
+    candidate_report = model_payload.get("candidate_report") if isinstance(model_payload.get("candidate_report"), dict) else {}
 
     strict_rows = max(
         _int_or_zero(support.get("strict_trade_eligible_rows")),
@@ -1200,7 +1284,7 @@ def _crypto_live_path_assess_asset(
     if asset in missing_assets or spot_rows <= 0:
         blockers.append("spot data missing")
     if asset in stale_assets:
-        blockers.append("spot data stale")
+        warnings.append("current spot is stale; live forecast refreshes Coinbase current spot before evaluation")
     if spot_asset.get("proxy_only"):
         blockers.append("spot source is proxy-only")
     if model_status != "trained":
@@ -1275,9 +1359,17 @@ def _crypto_live_path_assess_asset(
             "top_candidate_reason_counts": top_candidate_reason_counts,
             "candidate_rejection_reason_counts": candidate_rejection_reason_counts,
             "dominant_candidate_blocker": dominant_candidate_blocker,
+            "champion_model": candidate_report.get("champion_name") or model_payload.get("model_type"),
+            "champion_status": candidate_report.get("champion_status"),
+            "champion_selection_reason": candidate_report.get("champion_selection_reason"),
+            "champion_policy_metrics": candidate_report.get("champion_policy_metrics"),
             "calibration": calibration,
             "baseline_policies": gate_payload.get("baseline_policies") or walk_forward_payload.get("baseline_policies") or [],
             "requirements": gate_payload.get("requirements") or {},
+        },
+        "policy": {
+            "current_entry_thresholds": (runtime_state.get("asset_entry_thresholds") or {}).get(asset) or {},
+            "optimized_candidate": None,
         },
         "spot": {
             "coverage_pct": spot_coverage,
@@ -1325,8 +1417,36 @@ async def _crypto_live_path_status_payload(
         )
         for asset in assets
     ]
+    strict_row_growth = await _crypto_live_path_strict_row_growth(
+        container,
+        assets=assets,
+        frequency=frequency,
+        asset_reports=asset_reports,
+        strict_rows_target=getattr(args, "strict_rows_target", CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET),
+        candidate_target=getattr(args, "candidate_target", CRYPTO_LIVE_PATH_TRADE_CANDIDATES_TARGET),
+    )
+    optimization_by_asset: dict[str, Any] = {}
     baseline_comparison = None
     if getattr(args, "baselines", False):
+        optimization = await container.crypto_replay_service.optimize_entry_policy(
+            frequency=frequency,
+            days=30,
+            asset_symbols=assets,
+        )
+        optimization_by_asset = {
+            report["asset"]: report
+            for report in optimization.get("asset_reports") or []
+        }
+        for report in asset_reports:
+            optimized = optimization_by_asset.get(report["asset"])
+            if optimized is not None:
+                report.setdefault("policy", {})["optimized_candidate"] = {
+                    "status": optimized.get("status"),
+                    "winner": optimized.get("winner"),
+                    "best_policy": optimized.get("best_policy"),
+                    "blockers": optimized.get("blockers"),
+                    "evaluated_policy_count": optimized.get("evaluated_policy_count"),
+                }
         baseline_comparison = {
             report["asset"]: {
                 "model": {
@@ -1344,6 +1464,13 @@ async def _crypto_live_path_status_payload(
                 },
                 "baselines": report["replay"].get("baseline_policies") or [],
                 "calibration_diagnostics": report["replay"]["calibration"],
+                "champion": {
+                    "model": report["replay"].get("champion_model"),
+                    "status": report["replay"].get("champion_status"),
+                    "selection_reason": report["replay"].get("champion_selection_reason"),
+                    "policy_metrics": report["replay"].get("champion_policy_metrics"),
+                },
+                "entry_policy_optimizer": optimization_by_asset.get(report["asset"]),
             }
             for report in asset_reports
         }
@@ -1374,6 +1501,7 @@ async def _crypto_live_path_status_payload(
         "policy_requirements": runtime_state["policy_requirements"],
         "ready_assets": ready_assets,
         "live_order_ready_assets": live_order_ready_assets,
+        "strict_row_growth": strict_row_growth,
         "asset_reports": asset_reports,
         "baseline_comparison": baseline_comparison,
         "summary": {
@@ -1404,6 +1532,8 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
     iteration_results: list[dict[str, Any]] = []
     operation_errors: list[dict[str, Any]] = []
     max_iterations = max(1, int(getattr(args, "max_iterations", 1) or 1))
+    previous_strict_counts = _crypto_status_strict_counts(pre_status)
+    no_growth_streak: Counter[str] = Counter()
     for iteration in range(1, max_iterations + 1):
         asset_results: list[dict[str, Any]] = []
         for asset in assets:
@@ -1495,6 +1625,31 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
                 operation_errors.append(error)
             asset_results.append(result)
         iteration_status = await _crypto_live_path_status_payload(args, container)
+        if getattr(args, "until_ready", False):
+            current_strict_counts = _crypto_status_strict_counts(iteration_status)
+            snapshot_counts = _crypto_status_snapshot_counts(iteration_status)
+            for asset in assets:
+                if snapshot_counts.get(asset, 0) <= 0:
+                    no_growth_streak[asset] = 0
+                    continue
+                if current_strict_counts.get(asset, 0) <= previous_strict_counts.get(asset, 0):
+                    no_growth_streak[asset] += 1
+                else:
+                    no_growth_streak[asset] = 0
+                if no_growth_streak[asset] >= 2:
+                    operation_errors.append(
+                        {
+                            "asset": asset,
+                            "step": "strict_row_growth_guard",
+                            "error": (
+                                "strict rows did not increase for 2 consecutive refresh iterations "
+                                "despite raw snapshots being present"
+                            ),
+                            "iteration": iteration,
+                            "strict_trade_eligible_count": current_strict_counts.get(asset, 0),
+                        }
+                    )
+            previous_strict_counts = current_strict_counts
         iteration_results.append(
             {
                 "iteration": iteration,
@@ -1526,6 +1681,18 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
         return 1
     if getattr(args, "require_ready", False):
         return 0 if post_status["status"] == "ready" else 1
+    return 0
+
+
+async def _run_crypto_policy_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.crypto_policy_command != "optimize":
+        raise ValueError(f"unknown crypto-policy command {args.crypto_policy_command}")
+    result = await container.crypto_replay_service.optimize_entry_policy(
+        frequency=args.frequency,
+        days=args.days,
+        asset_symbols=args.assets,
+    )
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 
@@ -1586,13 +1753,20 @@ async def _run_funnel_report_command(args: argparse.Namespace, container: AppCon
             failure_sets[blockers] += 1
             for blocker in blockers:
                 gate_counter[blocker] += 1
+            replay = report.get("replay") or {}
+            if replay.get("champion_selection_reason"):
+                gate_counter[f"model_selection:{replay['champion_selection_reason']}"] += 1
+            optimized = ((report.get("policy") or {}).get("optimized_candidate") or {})
+            for blocker in optimized.get("blockers") or []:
+                gate_counter[f"threshold_sweep:{blocker}"] += 1
             by_asset[report["asset"]] = {
                 "mode": report.get("mode"),
                 "ready_for_live_mode": report.get("ready_for_live_mode"),
                 "blockers": list(blockers),
                 "quote_evidence": report.get("quote_evidence"),
-                "replay": report.get("replay"),
+                "replay": replay,
                 "spot": report.get("spot"),
+                "policy": report.get("policy"),
             }
         payload = {
             "schema_version": "funnel-report-v1",
@@ -1617,6 +1791,7 @@ async def _run_funnel_report_command(args: argparse.Namespace, container: AppCon
             ],
             "by_asset": by_asset,
             "live_path_summary": status.get("summary"),
+            "strict_row_growth": status.get("strict_row_growth"),
         }
     if args.json:
         print(json.dumps(payload, indent=2, default=str))
@@ -2022,6 +2197,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "crypto-live-path":
             return await _run_crypto_live_path_command(args, container)
+
+        if args.command == "crypto-policy":
+            return await _run_crypto_policy_command(args, container)
 
         if args.command == "funnel-report":
             return await _run_funnel_report_command(args, container)
@@ -3519,6 +3697,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_asset_mode_set)
     crypto_asset_mode_set.add_argument("symbol")
     crypto_asset_mode_set.add_argument("mode", choices=["off", "shadow", "live"])
+
+    crypto_policy = subparsers.add_parser("crypto-policy")
+    crypto_policy_subparsers = crypto_policy.add_subparsers(dest="crypto_policy_command", required=True)
+    crypto_policy_optimize = crypto_policy_subparsers.add_parser("optimize")
+    add_kalshi_env_argument(crypto_policy_optimize)
+    crypto_policy_optimize.add_argument("--frequency", default="15m")
+    crypto_policy_optimize.add_argument("--days", type=int, default=30)
+    crypto_policy_optimize.add_argument("--assets", nargs="*", default=None)
+    crypto_policy_optimize.add_argument("--json", action="store_true")
 
     crypto_live_path = subparsers.add_parser("crypto-live-path")
     crypto_live_path_subparsers = crypto_live_path.add_subparsers(dest="crypto_live_path_command", required=True)

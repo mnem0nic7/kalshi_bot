@@ -34,6 +34,7 @@ from kalshi_bot.crypto.services import (
     _evaluate_crypto_walk_forward,
     _crypto_feature_schema,
     _crypto_model_candidate_report,
+    _crypto_optimize_asset_entry_policy,
     _crypto_raw_feature_vector,
     _crypto_select_champion,
     _crypto_trade_candidates,
@@ -1441,7 +1442,7 @@ def test_crypto_serialized_logistic_prediction_is_stable(tmp_path) -> None:
         "market_mid_baseline",
     }
     assert model["feature_schema_version"] == "crypto-rich-v3"
-    assert model["candidate_report"]["primary_metric"] == "brier"
+    assert model["candidate_report"]["primary_metric"] == "oos_candidate_net_pnl"
     assert first == second
     assert Decimal("0.0100") <= first <= Decimal("0.9900")
 
@@ -1484,7 +1485,7 @@ def test_crypto_candidate_registry_reports_optional_rich_models(tmp_path) -> Non
     report = _crypto_model_candidate_report(rows, settings=settings)
     names = {candidate["name"]: candidate for candidate in report["candidates"]}
 
-    assert report["primary_metric"] == "brier"
+    assert report["primary_metric"] == "oos_candidate_net_pnl"
     assert report["selection_scope"] == "walk_forward_time_ordered"
     assert report["champion_name"] in names
     assert names["market_mid_baseline"]["metrics"]["brier"] is not None
@@ -1535,6 +1536,102 @@ def test_crypto_model_selection_falls_back_to_market_mid_when_no_trade_model_is_
     )
 
     assert champion == "market_mid_baseline"
+
+
+def test_crypto_model_selection_prefers_positive_oos_pnl_over_brier() -> None:
+    champion = _crypto_select_champion(
+        [
+            {
+                "name": "market_mid_baseline",
+                "status": "available",
+                "metrics": {"brier": 0.0300},
+                "policy_metrics": {
+                    "selected_count": 8,
+                    "net_pnl": "0.0000",
+                    "pnl_advantage_vs_market_mid_dollars": "0.0000",
+                },
+            },
+            {
+                "name": "spot_distance_residual",
+                "status": "available",
+                "metrics": {"brier": 0.0900},
+                "policy_metrics": {
+                    "selected_count": 3,
+                    "net_pnl": "2.0000",
+                    "pnl_advantage_vs_market_mid_dollars": "2.0000",
+                },
+            },
+            {
+                "name": "sklearn_logistic",
+                "status": "available",
+                "metrics": {"brier": 0.0400},
+                "policy_metrics": {
+                    "selected_count": 3,
+                    "net_pnl": "-1.0000",
+                    "pnl_advantage_vs_market_mid_dollars": "-1.0000",
+                },
+            },
+        ]
+    )
+
+    assert champion == "spot_distance_residual"
+
+
+def test_crypto_entry_optimizer_stages_only_passing_policy(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_min_training_samples=2,
+        crypto_replay_min_trade_candidates=1,
+        risk_min_edge_bps=5000,
+    )
+    policy = AgentPackService(settings).runtime_crypto_policy()
+    rows = [
+        _replay_row(
+            market_day=f"2026-05-0{day}",
+            market_ticker=f"KXBTC15M-OPT-{day}",
+            mid_yes_dollars=Decimal("0.3000"),
+            yes_bid_dollars=Decimal("0.2900"),
+            yes_ask_dollars=Decimal("0.3000"),
+            no_ask_dollars=Decimal("0.7100"),
+            spread_bps=100,
+            label_yes=1,
+        )
+        for day in range(1, 5)
+    ]
+
+    result = _crypto_optimize_asset_entry_policy("BTC", rows, settings=settings, crypto_policy=policy)
+
+    assert result["status"] == "stageable"
+    assert result["winner"]["entry_policy"]["min_fee_adjusted_edge_bps"] in {250, 500, 750, 1000, 1500}
+    assert result["staged_override_payload"]["crypto_policy"]["asset_entry_overrides"]["BTC"]
+
+
+def test_crypto_entry_optimizer_leaves_policy_unchanged_when_no_policy_passes(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_min_training_samples=2,
+        crypto_replay_min_trade_candidates=50,
+    )
+    policy = AgentPackService(settings).runtime_crypto_policy()
+    rows = [
+        _replay_row(
+            market_day=f"2026-05-0{day}",
+            market_ticker=f"KXBTC15M-OPT-BLOCK-{day}",
+            mid_yes_dollars=Decimal("0.3000"),
+            yes_bid_dollars=Decimal("0.2900"),
+            yes_ask_dollars=Decimal("0.3000"),
+            no_ask_dollars=Decimal("0.7100"),
+            spread_bps=100,
+            label_yes=1,
+        )
+        for day in range(1, 5)
+    ]
+
+    result = _crypto_optimize_asset_entry_policy("BTC", rows, settings=settings, crypto_policy=policy)
+
+    assert result["status"] == "blocked"
+    assert result["staged_override_payload"] is None
+    assert "oos_trade_candidate_count" in result["blockers"][0]
 
 
 def test_crypto_ensemble_prediction_is_deterministic(tmp_path) -> None:
@@ -1727,7 +1824,7 @@ def test_crypto_replay_candidate_selection_does_not_require_empirical_bucket_mat
     assert report["metrics"]["oos_fold_count"] == 1
     assert report["metrics"]["trade_candidate_count"] == 3
     assert report["metrics"]["oos_trade_candidate_count"] == 1
-    assert report["candidate_policies"][2]["policy_name"] == "candidate_quality_policy"
+    assert any(policy["policy_name"] == "candidate_quality_policy" for policy in report["candidate_policies"])
     assert report["candidate_policies"][2]["selected_count"] == 1
     assert report["bucket_matrix"]
     assert all(bucket["sample_count"] < settings.trade_behavior_empirical_gate_min_settled_fills for bucket in report["bucket_matrix"])
@@ -1911,17 +2008,19 @@ async def test_crypto_train_stores_model_with_fee_aware_metrics(tmp_path) -> Non
         "lightgbm_classifier",
         "calibrated_weighted_ensemble",
     }
-    assert result["payload"]["candidate_report"]["primary_metric"] == "brier"
-    assert result["payload"]["candidate_report"]["selection_policy"] == "prefer_non_market_candidate_then_brier"
+    assert result["payload"]["candidate_report"]["primary_metric"] == "oos_candidate_net_pnl"
+    assert result["payload"]["candidate_report"]["selection_policy"] == "prefer_positive_oos_pnl_non_market_candidate_then_pnl_advantage"
     assert result["metrics"]["champion_selection_reason"] in {
         "fallback_market_mid_no_non_market_candidate",
+        "diagnostic_only_best_non_market_oos_pnl",
+        "selected_positive_oos_pnl_non_market_candidate",
         "selected_non_market_candidate",
         "selected_non_market_candidate_with_diagnostic_guardrail_warnings",
     }
     assert result["payload"]["candidate_registry_version"] == "crypto-candidate-registry-v1"
     assert "candlestick_momentum" in result["payload"]["feature_set"]
     assert candidates["schema_version"] == "crypto-model-candidates-v2"
-    assert candidates["primary_metric"] == "brier"
+    assert candidates["primary_metric"] == "oos_candidate_net_pnl"
     assert candidates["ranked_candidates"]
     assert candidates["candidate_report"]["champion_name"]
     await engine.dispose()

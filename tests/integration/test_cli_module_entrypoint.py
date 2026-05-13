@@ -140,6 +140,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     replay_args = parser.parse_args(["crypto-replay", "gate", "--kalshi-env", "production", "--frequency", "15m"])
     status_args = parser.parse_args(["crypto-status", "--kalshi-env", "production"])
     autonomy_args = parser.parse_args(["crypto-autonomy", "run-once", "--kalshi-env", "production", "--frequency", "15m", "--json"])
+    policy_optimize_args = parser.parse_args(
+        ["crypto-policy", "optimize", "--kalshi-env", "production", "--frequency", "15m", "--days", "30", "--assets", "BTC", "ETH", "--json"]
+    )
     live_path_status_args = parser.parse_args(
         ["crypto-live-path", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "ETH", "--baselines", "--json"]
     )
@@ -218,6 +221,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert autonomy_args.command == "crypto-autonomy"
     assert autonomy_args.crypto_autonomy_command == "run-once"
     assert autonomy_args.kalshi_env == "production"
+    assert policy_optimize_args.command == "crypto-policy"
+    assert policy_optimize_args.crypto_policy_command == "optimize"
+    assert policy_optimize_args.assets == ["BTC", "ETH"]
     assert live_path_status_args.command == "crypto-live-path"
     assert live_path_status_args.crypto_live_path_command == "status"
     assert live_path_status_args.assets == ["BTC", "ETH"]
@@ -551,6 +557,80 @@ async def test_crypto_spot_collect_current_command_outputs_json(capsys) -> None:
     assert exit_code == 0
     assert output["status"] == "ok"
     assert output["stored"] == 1
+
+
+@pytest.mark.asyncio
+async def test_crypto_policy_optimize_command_outputs_json(capsys) -> None:
+    class ReplayService:
+        async def optimize_entry_policy(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs == {"frequency": "15m", "days": 30, "asset_symbols": ["BTC"]}
+            return {
+                "schema_version": "crypto-entry-policy-optimizer-v1",
+                "status": "ok",
+                "stageable_assets": [],
+                "staged_override_payload": None,
+            }
+
+    args = SimpleNamespace(
+        crypto_policy_command="optimize",
+        frequency="15m",
+        days=30,
+        assets=["BTC"],
+        json=True,
+    )
+    container = SimpleNamespace(crypto_replay_service=ReplayService())
+
+    exit_code = await cli_module._run_crypto_policy_command(args, container)
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert output["schema_version"] == "crypto-entry-policy-optimizer-v1"
+
+
+def test_crypto_live_path_stale_spot_is_advisory_not_readiness_blocker() -> None:
+    report = cli_module._crypto_live_path_assess_asset(
+        "BTC",
+        history_status={
+            "quote_evidence": {
+                "trade_candidate_support_by_asset": {"BTC": {"strict_trade_eligible_rows": 60}},
+                "strict_quote_ingestion_audit_by_asset": {"BTC": {"snapshot_present": 60}},
+            }
+        },
+        spot_status={
+            "spot_quality": {
+                "coverage_pct": 1.0,
+                "stale_assets": ["BTC"],
+                "missing_assets": [],
+                "assets": {"BTC": {"row_count": 1, "source_kind_counts": {"spot_tick": 1}, "provider_counts": {"coinbase": 1}}},
+            }
+        },
+        runtime_state={
+            "artifacts": {
+                "BTC": {
+                    "model": {"status": "trained", "payload": {"candidate_report": {"champion_name": "current_heuristic"}}},
+                    "backtest": {
+                        "status": "pass",
+                        "metrics": {
+                            "strict_trade_eligible_count": 60,
+                            "current_model_live_quality_candidate_count": 50,
+                            "oos_trade_candidate_count": 50,
+                            "net_simulated_pl_dollars": 1.0,
+                            "pnl_advantage_vs_market_mid_dollars": 1.0,
+                        },
+                    },
+                    "replay_gate": {"status": "passed", "payload": {}},
+                }
+            },
+            "asset_modes": {"BTC": "shadow"},
+            "asset_entry_thresholds": {"BTC": {"min_fee_adjusted_edge_bps": 750}},
+        },
+        strict_rows_target=60,
+        candidate_target=50,
+    )
+
+    assert report["ready_for_live_mode"] is True
+    assert "current spot is stale" in report["warnings"][0]
+    assert "spot data stale" not in report["blockers"]
 
 
 @pytest.mark.asyncio
