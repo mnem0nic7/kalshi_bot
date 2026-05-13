@@ -241,7 +241,8 @@ Runtime replay requirements:
 | Gate | Requirement |
 |---|---:|
 | Minimum resolved markets | 500 |
-| Minimum trade candidates | 50 |
+| Minimum out-of-sample trade candidates | 50 |
+| Minimum current-model live-quality candidates | 50 |
 | Minimum net simulated P/L | greater than $0.00 |
 | P/L versus market-mid | model selected-candidate P/L must beat market-mid P/L |
 | Maximum hard-cap breaches | 0 |
@@ -263,7 +264,8 @@ Replay blocks live mode when any of these are true:
 - spot coverage is below 80%
 - strict real-quote row count is below the trade-candidate target
 - resolved sample count is below 500
-- trade candidate count is below 50
+- out-of-sample trade candidate count is below 50
+- current-model live-quality candidate count is below 50
 - simulated net P/L is not positive
 - simulated net P/L does not beat market-mid P/L
 - hard-cap breaches are present
@@ -566,7 +568,8 @@ Before enabling live crypto for any asset:
 - target asset replay gate is passed
 - target asset model is trained
 - target asset has at least 60 strict labeled real-quote rows
-- target asset has at least 50 replay trade candidates
+- target asset has at least 50 out-of-sample replay trade candidates
+- target asset has at least 50 current-model live-quality candidates
 - replay simulated net P/L is positive
 - replay simulated net P/L beats market-mid P/L
 - calibration diagnostics are present for Brier, log-loss, and ECE

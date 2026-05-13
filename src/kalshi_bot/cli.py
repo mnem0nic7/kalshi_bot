@@ -1001,6 +1001,7 @@ def _crypto_live_path_step_summary(result: dict[str, Any]) -> dict[str, Any]:
             key: metrics.get(key)
             for key in (
                 "trade_candidate_count",
+                "current_model_live_quality_candidate_count",
                 "oos_trade_candidate_count",
                 "strict_trade_eligible_count",
                 "oos_evaluation_status",
@@ -1156,10 +1157,13 @@ def _crypto_live_path_assess_asset(
         _int_or_zero(support.get("strict_trade_eligible_rows")),
         _int_or_zero(metrics.get("strict_trade_eligible_count")),
     )
-    trade_candidates = _int_or_zero(metrics.get("trade_candidate_count"))
+    current_model_live_candidates = _int_or_zero(
+        metrics.get("current_model_live_quality_candidate_count", metrics.get("trade_candidate_count"))
+    )
     oos_trade_candidates = _int_or_zero(metrics.get("oos_trade_candidate_count"))
     oos_status = str(metrics.get("oos_evaluation_status") or "unknown")
     oos_fold_count = _int_or_zero(metrics.get("oos_fold_count"))
+    has_usable_oos = oos_fold_count > 0 and oos_status in {"", "ok"}
     candidate_status_counts = dict(metrics.get("candidate_status_counts") or {})
     candidate_reason_counts = dict(metrics.get("candidate_reason_counts") or {})
     top_candidate_status_counts = dict(metrics.get("top_candidate_status_counts") or {})
@@ -1179,8 +1183,10 @@ def _crypto_live_path_assess_asset(
     warnings: list[str] = []
     if strict_rows < strict_rows_target:
         blockers.append(f"strict_trade_eligible_count {strict_rows} < {strict_rows_target}")
-    if trade_candidates < candidate_target:
-        blockers.append(f"trade_candidate_count {trade_candidates} < {candidate_target}")
+    if has_usable_oos and oos_trade_candidates < candidate_target:
+        blockers.append(f"oos_trade_candidate_count {oos_trade_candidates} < {candidate_target}")
+    if current_model_live_candidates < candidate_target:
+        blockers.append(f"current_model_live_quality_candidate_count {current_model_live_candidates} < {candidate_target}")
         if dominant_candidate_blocker:
             blockers.append(f"dominant candidate blocker is {dominant_candidate_blocker}")
     if gate_status != "passed":
@@ -1252,7 +1258,8 @@ def _crypto_live_path_assess_asset(
             "gate_status": gate_status,
             "gate_reasons": gate_payload.get("reasons") or [],
             "backtest_status": backtest_status,
-            "trade_candidate_count": trade_candidates,
+            "trade_candidate_count": current_model_live_candidates,
+            "current_model_live_quality_candidate_count": current_model_live_candidates,
             "oos_trade_candidate_count": oos_trade_candidates,
             "oos_evaluation_status": oos_status,
             "oos_fold_count": oos_fold_count,
@@ -1325,7 +1332,11 @@ async def _crypto_live_path_status_payload(
                 "model": {
                     "policy_name": "candidate_quality_policy",
                     "net_pnl": report["replay"]["net_simulated_pl_dollars"],
-                    "selected_count": report["replay"]["trade_candidate_count"],
+                    "selected_count": report["replay"]["oos_trade_candidate_count"],
+                    "oos_selected_count": report["replay"]["oos_trade_candidate_count"],
+                    "current_model_live_quality_selected_count": report["replay"][
+                        "current_model_live_quality_candidate_count"
+                    ],
                 },
                 "market_mid": {
                     "net_pnl": report["replay"].get("market_mid_net_simulated_pl_dollars"),

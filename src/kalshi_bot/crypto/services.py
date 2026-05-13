@@ -757,7 +757,11 @@ class CryptoMarketService:
         latest_spot_at = max((_as_utc_datetime(row.end_ts) for row in spot_rows), default=None)
         quote_evidence = _crypto_quote_evidence_summary(all_snapshots, quote_rows, settings=self.settings)
         backtest_metrics = (backtest.metrics if backtest is not None else {}) or {}
-        quote_evidence["trade_candidate_count"] = int(backtest_metrics.get("trade_candidate_count") or 0)
+        current_model_candidates = int(
+            backtest_metrics.get("current_model_live_quality_candidate_count", backtest_metrics.get("trade_candidate_count")) or 0
+        )
+        quote_evidence["trade_candidate_count"] = current_model_candidates
+        quote_evidence["current_model_live_quality_candidate_count"] = current_model_candidates
         quote_evidence["strict_trade_candidate_min_required"] = crypto_policy.replay_min_trade_candidates
         return {
             "market_domain": "crypto",
@@ -3154,10 +3158,15 @@ def _runtime_replay_gate_passed(replay_gate: Any | None, crypto_policy: RuntimeC
 def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: RuntimeCryptoPolicy) -> list[str]:
     reasons: list[str] = []
     resolved = int(metrics.get("resolved_sample_count") or metrics.get("sample_count") or 0)
-    candidates = int(metrics.get("trade_candidate_count") or 0)
+    current_model_candidates = int(
+        metrics.get("current_model_live_quality_candidate_count", metrics.get("trade_candidate_count")) or 0
+    )
+    raw_oos_candidates = metrics.get("oos_trade_candidate_count")
+    oos_candidates = int(raw_oos_candidates or 0)
     oos_fold_count = metrics.get("oos_fold_count")
     oos_evaluation_status = str(metrics.get("oos_evaluation_status") or "").strip().lower()
     has_oos_markers = oos_fold_count is not None or bool(oos_evaluation_status)
+    has_usable_oos = has_oos_markers and int(oos_fold_count or 0) > 0 and oos_evaluation_status in {"", "ok"}
     net_pl = float(metrics.get("oos_net_simulated_pl_dollars", metrics.get("net_simulated_pl_dollars") or 0.0) or 0.0)
     market_mid_net_pl = float(
         metrics.get("oos_market_mid_net_simulated_pl_dollars", metrics.get("market_mid_net_simulated_pl_dollars") or 0.0)
@@ -3208,9 +3217,15 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
         reasons.append(
             f"Resolved sample coverage {resolved} below minimum {crypto_policy.replay_min_resolved_markets}."
         )
-    if candidates < crypto_policy.replay_min_trade_candidates:
+    if has_usable_oos and oos_candidates < crypto_policy.replay_min_trade_candidates:
         reasons.append(
-            f"Trade candidate count {candidates} below minimum {crypto_policy.replay_min_trade_candidates}."
+            f"Out-of-sample trade candidate count {oos_candidates} below minimum "
+            f"{crypto_policy.replay_min_trade_candidates}."
+        )
+    if current_model_candidates < crypto_policy.replay_min_trade_candidates:
+        reasons.append(
+            f"Current model live-quality candidate count {current_model_candidates} below minimum "
+            f"{crypto_policy.replay_min_trade_candidates}."
         )
     if net_pl <= crypto_policy.replay_min_net_pl_dollars:
         reasons.append(f"Net simulated P/L ${net_pl:.2f} does not clear required positive threshold.")
@@ -3869,7 +3884,9 @@ def _crypto_readiness_score(
             improved += 1
     model_oos = int(round((improved / comparable) * 10)) if comparable else (5 if model.get("status") == "trained" else 2)
     net_pnl = float(backtest_metrics.get("net_simulated_pl_dollars") or 0.0)
-    strict_candidates = int(backtest_metrics.get("trade_candidate_count") or 0)
+    strict_candidates = int(
+        backtest_metrics.get("current_model_live_quality_candidate_count", backtest_metrics.get("trade_candidate_count")) or 0
+    )
     replay_pnl = 10 if net_pnl > 0 and strict_candidates >= settings.crypto_replay_min_trade_candidates else (6 if net_pnl > 0 else 3)
     gates = 10 if gate.get("status") == "passed" else (5 if gate.get("status") == "blocked" else 2)
     components = {
@@ -5504,6 +5521,7 @@ def _crypto_model_metrics(
         "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
         "spot_feature_coverage_pct": _spot_feature_coverage(rows),
         "trade_candidate_count": len(fillable),
+        "current_model_live_quality_candidate_count": len(fillable),
         "live_quality_candidate_count": len(fillable),
         "exploratory_shadow_candidate_count": sum(1 for item in exploratory_fillable if item.get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW),
         "net_simulated_pl_dollars": float(net),
@@ -5637,6 +5655,7 @@ def _evaluate_crypto_walk_forward(
                 "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
                 "spot_feature_coverage_pct": _spot_feature_coverage(rows),
                 "trade_candidate_count": diagnostic_live_policy["selected_count"],
+                "current_model_live_quality_candidate_count": diagnostic_live_policy["selected_count"],
                 "live_quality_candidate_count": diagnostic_live_policy["selected_count"],
                 "exploratory_shadow_candidate_count": diagnostic_quality["exploratory_shadow_count"],
                 "diagnostic_net_simulated_pl_dollars": float(_decimal(diagnostic_live_policy["net_pnl"])),
@@ -5784,6 +5803,7 @@ def _evaluate_crypto_walk_forward(
             "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
             "spot_feature_coverage_pct": _spot_feature_coverage(rows),
             "trade_candidate_count": diagnostic_live_policy["selected_count"],
+            "current_model_live_quality_candidate_count": diagnostic_live_policy["selected_count"],
             "live_quality_candidate_count": diagnostic_live_policy["selected_count"],
             "exploratory_shadow_candidate_count": diagnostic_quality["exploratory_shadow_count"],
             "oos_evaluation_status": "ok",

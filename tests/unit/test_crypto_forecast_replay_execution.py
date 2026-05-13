@@ -1773,6 +1773,33 @@ def test_crypto_replay_gate_blocks_zero_oos_folds_even_with_strong_metrics(tmp_p
     assert any("Out-of-sample replay is unavailable" in reason for reason in gate["reasons"])
 
 
+def test_crypto_replay_gate_separates_oos_candidates_from_current_model_candidates(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_replay_min_resolved_markets=500, crypto_replay_min_trade_candidates=50)
+    metrics = {
+        "resolved_sample_count": 500,
+        "trade_candidate_count": 0,
+        "oos_trade_candidate_count": 106,
+        "strict_trade_eligible_count": 365,
+        "net_simulated_pl_dollars": 9.68,
+        "market_mid_net_simulated_pl_dollars": 0.0,
+        "pnl_advantage_vs_market_mid_dollars": 9.68,
+        "oos_evaluation_status": "ok",
+        "oos_fold_count": 1,
+        "oos_net_simulated_pl_dollars": 9.68,
+        "oos_market_mid_net_simulated_pl_dollars": 0.0,
+        "oos_pnl_advantage_vs_market_mid_dollars": 9.68,
+        "hard_cap_breaches": 0,
+        "candle_count": 10,
+        "spot_feature_coverage_pct": 1.0,
+    }
+
+    gate = CryptoReplayService(settings=settings, session_factory=None).evaluate_gate(metrics)  # type: ignore[arg-type]
+
+    assert gate["passed"] is False
+    assert "Current model live-quality candidate count 0 below minimum 50." in gate["reasons"]
+    assert not any("Out-of-sample trade candidate count" in reason for reason in gate["reasons"])
+
+
 def test_crypto_proxy_quote_rows_are_prediction_only(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=50)
     row = {

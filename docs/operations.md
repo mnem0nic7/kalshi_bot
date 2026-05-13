@@ -107,7 +107,7 @@ kalshi-bot-cli crypto-history collect-settled \
 
 Use `--days 14` or `--days 30` only for catch-up sweeps. The normal refresh loop intentionally keeps the settled backfill window small.
 
-Per asset readiness requires at least 60 strict labeled real-quote rows, at least 50 replay trade candidates, a passing replay gate, positive fee-adjusted simulated net P/L that beats the market-mid P/L baseline, at least 80% spot coverage, and fresh non-proxy spot data. Calibration versus market-mid remains a diagnostic, not a hard promotion gate. Keep BNB and HYPE shadow until their spot support is fresh and non-proxy.
+Per asset readiness requires at least 60 strict labeled real-quote rows, at least 50 out-of-sample replay trade candidates, at least 50 current-model live-quality candidates, a passing replay gate, positive fee-adjusted simulated net P/L that beats the market-mid P/L baseline, at least 80% spot coverage, and fresh non-proxy spot data. Calibration versus market-mid remains a diagnostic, not a hard promotion gate. Keep BNB and HYPE shadow until their spot support is fresh and non-proxy.
 
 Use `crypto-live-path status --baselines --json` to inspect model P/L against
 market-mid, always-0.5, last-direction, naive-momentum, linear-on-returns, and
