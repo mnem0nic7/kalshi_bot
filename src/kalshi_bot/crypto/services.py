@@ -100,6 +100,7 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
     "xgboost_classifier",
     "lightgbm_classifier",
 )
+CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
 
 
 def _version(prefix: str, payload: dict[str, Any]) -> str:
@@ -5171,17 +5172,26 @@ def _crypto_candidate_guardrail_failures(
 
 
 def _crypto_select_champion(candidates: list[dict[str, Any]]) -> str:
-    eligible = [
+    deployable = [
         candidate
         for candidate in candidates
-        if candidate.get("status") == "available"
+        if _crypto_model_selection_usable(candidate)
+    ]
+    if deployable:
+        deployable.sort(key=lambda item: (float((item.get("metrics") or {})["brier"]), str(item.get("name"))))
+        return str(deployable[0]["name"])
+    baseline = [
+        candidate
+        for candidate in candidates
+        if candidate.get("name") in CRYPTO_MODEL_BASELINE_CANDIDATES
+        and candidate.get("status") == "available"
         and isinstance(candidate.get("metrics"), dict)
         and (candidate.get("metrics") or {}).get("brier") is not None
     ]
-    if not eligible:
-        return "sklearn_logistic"
-    eligible.sort(key=lambda item: (float((item.get("metrics") or {})["brier"]), str(item.get("name"))))
-    return str(eligible[0]["name"])
+    if baseline:
+        baseline.sort(key=lambda item: (float((item.get("metrics") or {})["brier"]), str(item.get("name"))))
+        return str(baseline[0]["name"])
+    return "sklearn_logistic"
 
 
 def _crypto_ensemble_weights_from_metrics(candidates: list[dict[str, Any]]) -> dict[str, float]:
@@ -5267,18 +5277,24 @@ def _crypto_in_sample_candidate_report(
     }
     guarded_entries, ensemble_weights = _crypto_add_ensemble_candidate(rows, guarded_entries, model_map)
     champion = _crypto_select_champion(guarded_entries)
+    champion_entry = _crypto_candidate_entry_by_name(guarded_entries, champion)
     return {
         "schema_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
         "status": "ok",
         "selection_scope": "in_sample_training_fallback",
         "primary_metric": "brier",
+        "selection_policy": "prefer_non_market_candidate_then_brier",
+        "selection_baselines": sorted(CRYPTO_MODEL_BASELINE_CANDIDATES),
         "guardrails": {
             "log_loss_ece_max_regression_pct": CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE,
             "references": ["market_mid_baseline", "sklearn_logistic"],
+            "mode": "diagnostic_for_non_market_selection",
         },
         "fold_count": 0,
         "candidates": sorted(guarded_entries, key=_crypto_candidate_sort_key),
         "champion_name": champion,
+        "champion_status": champion_entry.get("status") if champion_entry else None,
+        "champion_selection_reason": _crypto_champion_selection_reason(champion_entry),
         "champion_validation_metrics": _metrics_for_candidate(guarded_entries, champion),
         "ensemble_weights": ensemble_weights,
         "dependency_versions": _crypto_dependency_versions(),
@@ -5373,19 +5389,25 @@ def _crypto_model_candidate_report(
     entries = _crypto_apply_candidate_guardrails(entries, market_metrics=market_metrics, logistic_metrics=logistic_metrics)
     ensemble_entry = next((entry for entry in entries if entry["name"] == "calibrated_weighted_ensemble"), None)
     champion = _crypto_select_champion(entries)
+    champion_entry = _crypto_candidate_entry_by_name(entries, champion)
     return {
         "schema_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
         "status": "ok",
         "selection_scope": "walk_forward_time_ordered",
         "primary_metric": "brier",
+        "selection_policy": "prefer_non_market_candidate_then_brier",
+        "selection_baselines": sorted(CRYPTO_MODEL_BASELINE_CANDIDATES),
         "guardrails": {
             "log_loss_ece_max_regression_pct": CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE,
             "references": ["market_mid_baseline", "sklearn_logistic"],
+            "mode": "diagnostic_for_non_market_selection",
         },
         "fold_count": len(folds),
         "folds": fold_summaries,
         "candidates": sorted(entries, key=_crypto_candidate_sort_key),
         "champion_name": champion,
+        "champion_status": champion_entry.get("status") if champion_entry else None,
+        "champion_selection_reason": _crypto_champion_selection_reason(champion_entry),
         "champion_validation_metrics": _metrics_for_candidate(entries, champion),
         "ensemble_weights": _crypto_ensemble_weights_from_metrics(entries) if ensemble_entry and ensemble_entry.get("status") == "available" else {},
         "dependency_versions": _crypto_dependency_versions(),
@@ -5452,6 +5474,13 @@ def _crypto_apply_candidate_guardrails(
     return guarded
 
 
+def _crypto_candidate_entry_by_name(entries: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    for entry in entries:
+        if entry.get("name") == name:
+            return entry
+    return None
+
+
 def _crypto_candidate_sort_key(entry: dict[str, Any]) -> tuple[int, float, str]:
     metrics = entry.get("metrics") if isinstance(entry.get("metrics"), dict) else {}
     brier = metrics.get("brier") if isinstance(metrics, dict) else None
@@ -5464,6 +5493,25 @@ def _metrics_for_candidate(entries: list[dict[str, Any]], name: str) -> dict[str
         if entry.get("name") == name and isinstance(entry.get("metrics"), dict):
             return entry["metrics"]
     return None
+
+
+def _crypto_model_selection_usable(entry: dict[str, Any]) -> bool:
+    if entry.get("name") in CRYPTO_MODEL_BASELINE_CANDIDATES:
+        return False
+    if entry.get("status") not in {"available", "guardrail_failed"}:
+        return False
+    metrics = entry.get("metrics")
+    return isinstance(metrics, dict) and metrics.get("brier") is not None
+
+
+def _crypto_champion_selection_reason(entry: dict[str, Any] | None) -> str:
+    if not entry:
+        return "no_candidate_entry"
+    if entry.get("name") in CRYPTO_MODEL_BASELINE_CANDIDATES:
+        return "fallback_market_mid_no_non_market_candidate"
+    if entry.get("status") == "guardrail_failed":
+        return "selected_non_market_candidate_with_diagnostic_guardrail_warnings"
+    return "selected_non_market_candidate"
 
 
 def _crypto_dependency_versions() -> dict[str, str | None]:
@@ -5544,6 +5592,9 @@ def _crypto_model_metrics(
         metrics.update(
             {
                 "champion_model": candidate_report.get("champion_name") or model.get("model_type"),
+                "champion_status": candidate_report.get("champion_status"),
+                "champion_selection_reason": candidate_report.get("champion_selection_reason"),
+                "champion_selection_policy": candidate_report.get("selection_policy"),
                 "validation_brier": champion_metrics.get("brier"),
                 "validation_log_loss": champion_metrics.get("log_loss"),
                 "validation_ece": champion_metrics.get("ece"),

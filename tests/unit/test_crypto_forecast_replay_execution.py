@@ -35,6 +35,7 @@ from kalshi_bot.crypto.services import (
     _crypto_feature_schema,
     _crypto_model_candidate_report,
     _crypto_raw_feature_vector,
+    _crypto_select_champion,
     _crypto_trade_candidates,
     _fit_crypto_calibration,
     _predict_crypto_probability,
@@ -1492,6 +1493,50 @@ def test_crypto_candidate_registry_reports_optional_rich_models(tmp_path) -> Non
     assert names["lightgbm_classifier"]["status"] in {"available", "unavailable", "guardrail_failed"}
 
 
+def test_crypto_model_selection_prefers_non_market_candidate_over_market_mid_baseline() -> None:
+    champion = _crypto_select_champion(
+        [
+            {
+                "name": "market_mid_baseline",
+                "status": "available",
+                "metrics": {"brier": 0.0500},
+            },
+            {
+                "name": "spot_distance_residual",
+                "status": "guardrail_failed",
+                "metrics": {"brier": 0.0600},
+                "reason": "log_loss_regressed_vs_market_mid",
+            },
+            {
+                "name": "sklearn_logistic",
+                "status": "unavailable",
+                "metrics": None,
+            },
+        ]
+    )
+
+    assert champion == "spot_distance_residual"
+
+
+def test_crypto_model_selection_falls_back_to_market_mid_when_no_trade_model_is_usable() -> None:
+    champion = _crypto_select_champion(
+        [
+            {
+                "name": "market_mid_baseline",
+                "status": "available",
+                "metrics": {"brier": 0.0500},
+            },
+            {
+                "name": "sklearn_logistic",
+                "status": "unavailable",
+                "metrics": None,
+            },
+        ]
+    )
+
+    assert champion == "market_mid_baseline"
+
+
 def test_crypto_ensemble_prediction_is_deterministic(tmp_path) -> None:
     del tmp_path
     row = {
@@ -1857,13 +1902,22 @@ async def test_crypto_train_stores_model_with_fee_aware_metrics(tmp_path) -> Non
     assert result["metrics"]["resolved_sample_count"] == 8
     assert result["metrics"]["fees_dollars"] >= 0
     assert result["metrics"]["champion_model"] in {
+        "asset_time_calibration",
+        "current_heuristic",
         "market_mid_baseline",
         "sklearn_logistic",
+        "spot_distance_residual",
         "xgboost_classifier",
         "lightgbm_classifier",
         "calibrated_weighted_ensemble",
     }
     assert result["payload"]["candidate_report"]["primary_metric"] == "brier"
+    assert result["payload"]["candidate_report"]["selection_policy"] == "prefer_non_market_candidate_then_brier"
+    assert result["metrics"]["champion_selection_reason"] in {
+        "fallback_market_mid_no_non_market_candidate",
+        "selected_non_market_candidate",
+        "selected_non_market_candidate_with_diagnostic_guardrail_warnings",
+    }
     assert result["payload"]["candidate_registry_version"] == "crypto-candidate-registry-v1"
     assert "candlestick_momentum" in result["payload"]["feature_set"]
     assert candidates["schema_version"] == "crypto-model-candidates-v2"
