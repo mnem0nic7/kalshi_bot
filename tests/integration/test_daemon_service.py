@@ -974,6 +974,59 @@ async def test_daemon_heartbeat_checkpoint_stays_fresh_while_follow_up_is_runnin
 
 
 @pytest.mark.asyncio
+async def test_daemon_lightweight_heartbeat_updates_checkpoint_without_follow_up(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-lightweight-heartbeat.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        training_campaign_enabled=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    shadow_campaign = BlockingShadowCampaignService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        shadow_campaign,  # type: ignore[arg-type]
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+    )
+
+    payload = await daemon.heartbeat_liveness_tick(
+        reason="unit_test",
+        details={"phase": "before_batch", "batch_index": 1},
+    )
+
+    async with session_factory() as session:
+        checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:demo:blue"))
+        ).scalar_one()
+        heartbeat_events = (
+            await session.execute(select(OpsEvent).where(OpsEvent.source == "daemon", OpsEvent.summary == "Daemon heartbeat"))
+        ).scalars().all()
+
+    assert payload["lightweight"] is True
+    assert payload["reason"] == "unit_test"
+    assert checkpoint.payload["lightweight"] is True
+    assert checkpoint.payload["reason"] == "unit_test"
+    assert checkpoint.payload["details"]["phase"] == "before_batch"
+    assert "heartbeat_at" in checkpoint.payload
+    assert heartbeat_events == []
+    assert shadow_campaign.calls == 0
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_daemon_settlement_follow_up_reconcile_failure_logs_specific_warning(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-follow-up-error.db",

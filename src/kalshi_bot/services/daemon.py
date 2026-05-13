@@ -230,6 +230,47 @@ class DaemonService:
             await self._run_heartbeat_follow_up(payload)
         return payload
 
+    async def heartbeat_liveness_tick(
+        self,
+        *,
+        reason: str = "liveness",
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Refresh the daemon heartbeat checkpoint without expensive follow-up work."""
+        payload: dict[str, Any] = {
+            "app_color": self.settings.app_color,
+            "kalshi_env": self.settings.kalshi_env,
+            "heartbeat_at": self._now_iso(),
+            "lightweight": True,
+            "reason": reason,
+        }
+        if details is not None:
+            payload["details"] = details
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            last_reconcile = await repo.get_checkpoint(
+                f"daemon_reconcile:{self.settings.kalshi_env}:{self.settings.app_color}"
+            )
+            payload.update(
+                {
+                    "active_color": control.active_color,
+                    "kill_switch_enabled": control.kill_switch_enabled,
+                    "last_reconcile_at": (
+                        last_reconcile.payload.get("reconciled_at")
+                        if last_reconcile is not None and isinstance(last_reconcile.payload, dict)
+                        else None
+                    ),
+                }
+            )
+            await repo.set_checkpoint(
+                f"daemon_heartbeat:{self.settings.kalshi_env}:{self.settings.app_color}",
+                None,
+                payload,
+            )
+            await session.commit()
+        return payload
+
     async def run(
         self,
         *,
@@ -424,12 +465,40 @@ class DaemonService:
             if await self._is_active_color():
                 try:
                     market_tickers = await self.discovery_service.list_stream_markets()
+
+                    async def refresh_heartbeat(progress: dict[str, Any]) -> None:
+                        try:
+                            await self.heartbeat_liveness_tick(
+                                reason="weather_research_refresh",
+                                details=progress,
+                            )
+                        except Exception:
+                            logger.warning("weather refresh heartbeat tick failed", exc_info=True)
+
+                    await refresh_heartbeat(
+                        {
+                            "phase": "before_sweep",
+                            "market_count": len(market_tickers),
+                        }
+                    )
                     result = await self.research_coordinator.refresh_live_weather_dossiers(
                         market_tickers,
                         dry_run=False,
                         concurrency=self.settings.weather_research_refresh_concurrency,
+                        batch_size=self.settings.weather_research_refresh_concurrency,
+                        progress_callback=refresh_heartbeat,
                         refresh_margin_seconds=self.settings.weather_research_refresh_margin_seconds,
                         trigger_reason="daemon_live_weather_refresh",
+                    )
+                    await refresh_heartbeat(
+                        {
+                            "phase": "after_sweep",
+                            "market_count": len(market_tickers),
+                            "considered": result.get("considered"),
+                            "selected": result.get("selected"),
+                            "refreshed": result.get("refreshed"),
+                            "failed": result.get("failed"),
+                        }
                     )
                     logger.info(
                         "Live weather research refresh sweep considered=%s selected=%s refreshed=%s failed=%s",

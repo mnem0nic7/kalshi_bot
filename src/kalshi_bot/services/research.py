@@ -7,7 +7,7 @@ import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -292,6 +292,8 @@ class ResearchCoordinator:
         dry_run: bool = False,
         limit: int | None = None,
         concurrency: int | None = None,
+        batch_size: int | None = None,
+        progress_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         refresh_margin_seconds: int | None = None,
         trigger_reason: str = "live_weather_sweep",
     ) -> dict[str, Any]:
@@ -327,6 +329,8 @@ class ResearchCoordinator:
                     "app_color": self.settings.app_color,
                     "considered": len(candidates),
                     "selected": 0,
+                    "batch_size": 0,
+                    "batch_count": 0,
                     "results": [],
                 }
 
@@ -395,6 +399,8 @@ class ResearchCoordinator:
                 "status": "ok",
                 "considered": len(candidates),
                 "selected": len(selected),
+                "batch_size": 0,
+                "batch_count": 0,
                 "skipped": skipped,
                 "results": [{"status": "would_refresh", **item} for item in selected],
             }
@@ -424,7 +430,40 @@ class ResearchCoordinator:
                         "error_type": type(exc).__name__,
                     }
 
-        results = await asyncio.gather(*(refresh_one(item) for item in selected))
+        effective_batch_size = max(1, int(batch_size or max_concurrency))
+        batches = [
+            selected[index : index + effective_batch_size]
+            for index in range(0, len(selected), effective_batch_size)
+        ]
+        results: list[dict[str, Any]] = []
+        batch_count = len(batches)
+        for batch_index, batch in enumerate(batches, start=1):
+            if progress_callback is not None:
+                await progress_callback(
+                    {
+                        "phase": "before_batch",
+                        "batch_index": batch_index,
+                        "batch_count": batch_count,
+                        "batch_size": len(batch),
+                        "selected": len(selected),
+                        "completed": len(results),
+                    }
+                )
+            batch_results = await asyncio.gather(*(refresh_one(item) for item in batch))
+            results.extend(batch_results)
+            if progress_callback is not None:
+                await progress_callback(
+                    {
+                        "phase": "after_batch",
+                        "batch_index": batch_index,
+                        "batch_count": batch_count,
+                        "batch_size": len(batch),
+                        "selected": len(selected),
+                        "completed": len(results),
+                        "refreshed": sum(1 for item in results if item.get("status") == "refreshed"),
+                        "failed": sum(1 for item in results if item.get("status") == "failed"),
+                    }
+                )
         return {
             "dry_run": False,
             "status": "ok",
@@ -432,6 +471,8 @@ class ResearchCoordinator:
             "selected": len(selected),
             "refreshed": sum(1 for item in results if item.get("status") == "refreshed"),
             "failed": sum(1 for item in results if item.get("status") == "failed"),
+            "batch_size": effective_batch_size if selected else 0,
+            "batch_count": batch_count,
             "skipped": skipped,
             "results": results,
         }

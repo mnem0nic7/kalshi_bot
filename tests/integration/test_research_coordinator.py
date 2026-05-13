@@ -236,6 +236,63 @@ async def test_live_weather_refresh_dry_run_selects_missing_and_expiring_dossier
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_live_weather_refresh_batches_call_progress_callback(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/research-live-refresh-batch.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    tickers = [f"KXHIGHBATCH-{index}" for index in range(5)]
+    directory = WeatherMarketDirectory({ticker: _mapping(ticker) for ticker in tickers})
+    agent_pack_service = AgentPackService(settings)
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await agent_pack_service.ensure_initialized(repo)
+        await session.commit()
+    coordinator = ResearchCoordinator(
+        settings,
+        session_factory,
+        FakeKalshi(),  # type: ignore[arg-type]
+        FakeWeather(),  # type: ignore[arg-type]
+        directory,
+        FakeProviders(),  # type: ignore[arg-type]
+        WeatherSignalEngine(settings),
+        agent_pack_service,
+    )
+    progress: list[dict[str, object]] = []
+
+    async def progress_callback(payload: dict[str, object]) -> None:
+        progress.append(payload)
+
+    result = await coordinator.refresh_live_weather_dossiers(
+        tickers,
+        dry_run=False,
+        concurrency=2,
+        batch_size=2,
+        progress_callback=progress_callback,
+        trigger_reason="test_live_weather_batch",
+    )
+
+    assert result["considered"] == 5
+    assert result["selected"] == 5
+    assert result["refreshed"] == 5
+    assert result["failed"] == 0
+    assert result["batch_size"] == 2
+    assert result["batch_count"] == 3
+    assert [(item["phase"], item["batch_index"]) for item in progress] == [
+        ("before_batch", 1),
+        ("after_batch", 1),
+        ("before_batch", 2),
+        ("after_batch", 2),
+        ("before_batch", 3),
+        ("after_batch", 3),
+    ]
+    assert progress[-1]["completed"] == 5
+    assert progress[-1]["refreshed"] == 5
+
+    await engine.dispose()
+
+
 def _miami_directory() -> WeatherMarketDirectory:
     return WeatherMarketDirectory(
         {

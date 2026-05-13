@@ -18,6 +18,18 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def daemon_threshold_components() -> dict[str, int]:
+    heartbeat_interval_seconds = _env_int("DAEMON_HEARTBEAT_INTERVAL_SECONDS", 60)
+    grace_seconds = max(0, _env_int("DAEMON_HEARTBEAT_UNHEALTHY_GRACE_SECONDS", 45))
+    base_seconds = (heartbeat_interval_seconds * 2) + 15
+    return {
+        "heartbeat_interval_seconds": heartbeat_interval_seconds,
+        "base_seconds": base_seconds,
+        "grace_seconds": grace_seconds,
+        "threshold_seconds": base_seconds + grace_seconds,
+    }
+
+
 def parse_heartbeat_at(payload: Any) -> datetime | None:
     if isinstance(payload, str):
         try:
@@ -46,8 +58,8 @@ async def _daemon_health() -> int:
 
     kalshi_env = os.getenv("KALSHI_ENV", "demo")
     color = os.getenv("APP_COLOR", "blue")
-    heartbeat_interval_seconds = _env_int("DAEMON_HEARTBEAT_INTERVAL_SECONDS", 60)
-    threshold_seconds = (heartbeat_interval_seconds * 2) + 15
+    threshold_components = daemon_threshold_components()
+    threshold_seconds = threshold_components["threshold_seconds"]
     stream_name = f"daemon_heartbeat:{kalshi_env}:{color}"
 
     conn = await asyncpg.connect(
@@ -84,6 +96,11 @@ async def _daemon_health() -> int:
         "heartbeat_at": heartbeat_at.isoformat() if heartbeat_at is not None else None,
         "heartbeat_age_seconds": heartbeat_age_seconds,
         "threshold_seconds": threshold_seconds,
+        "threshold_components": {
+            key: value
+            for key, value in threshold_components.items()
+            if key != "threshold_seconds"
+        },
     }
     print(json.dumps(result, separators=(",", ":")))
     return 0 if healthy else 1
