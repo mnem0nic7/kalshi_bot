@@ -149,6 +149,59 @@ async def test_auto_trigger_creates_one_room_for_actionable_market(tmp_path) -> 
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_production_auto_trigger_creates_live_room_when_app_shadow_is_false(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_live.db",
+        kalshi_env="production",
+        app_shadow_mode=False,
+        trigger_enable_auto_rooms=True,
+        trigger_cooldown_seconds=600,
+        trigger_max_spread_bps=1200,
+        trigger_max_concurrent_rooms=4,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
+    service = AutoTriggerService(settings, session_factory, _directory(), agent_pack_service, supervisor)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        await repo.ensure_deployment_control("blue", kalshi_env="production")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            kalshi_env="production",
+            snapshot=_GOOD_SNAPSHOT,
+            yes_bid_dollars=Decimal("0.4400"),
+            yes_ask_dollars=Decimal("0.4800"),
+            last_trade_dollars=None,
+        )
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        rooms = await repo.list_rooms(limit=10)
+        ops_events = await repo.list_ops_events(limit=10, kalshi_env="production")
+        await session.commit()
+
+    assert len(rooms) == 1
+    assert rooms[0].shadow_mode is False
+    assert rooms[0].room_origin == "live"
+    launch_events = [event for event in ops_events if event.summary.startswith("Auto-trigger launched room")]
+    assert len(launch_events) == 1
+    assert launch_events[0].payload["app_shadow_mode"] is False
+    assert launch_events[0].payload["room_shadow_mode"] is False
+    assert launch_events[0].payload["room_origin"] == "live"
+    assert supervisor.calls[0][1] == "auto_trigger"
+
+    await engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("yes_bid", "yes_ask", "expected_tradeable_sides", "expected_missing_quotes"),
     [
@@ -527,6 +580,7 @@ async def test_auto_trigger_uses_settings_kalshi_env_for_control_state(tmp_path)
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_prod_env.db",
         kalshi_env="production",
         trigger_enable_auto_rooms=True,
+        trigger_max_spread_bps=1200,
         app_color="blue",
     )
     engine = create_engine(settings)
@@ -584,6 +638,7 @@ async def test_auto_trigger_blocks_when_live_position_exists(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_position_block.db",
         trigger_enable_auto_rooms=True,
+        trigger_max_spread_bps=1200,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -647,6 +702,7 @@ async def test_auto_trigger_throttles_repeated_live_position_block_logs(tmp_path
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_position_block_throttle.db",
         trigger_enable_auto_rooms=True,
         trigger_cooldown_seconds=600,
+        trigger_max_spread_bps=1200,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -884,6 +940,7 @@ async def test_auto_trigger_blocks_when_stop_loss_is_unresolved(tmp_path) -> Non
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_stop_loss_block.db",
         trigger_enable_auto_rooms=True,
+        trigger_max_spread_bps=1200,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -958,6 +1015,7 @@ async def test_auto_trigger_blocks_filled_stop_loss_reentry_during_cooldown(tmp_
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_stop_loss_reentry_cooldown.db",
         trigger_enable_auto_rooms=True,
+        trigger_max_spread_bps=1200,
         stop_loss_reentry_cooldown_seconds=4 * 60 * 60,
     )
     engine = create_engine(settings)

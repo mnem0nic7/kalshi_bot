@@ -136,6 +136,10 @@ def _is_strategy_auto_evolve_stale_diagnostic(event: OpsEvent) -> bool:
     return "stale" in _ops_text(event)
 
 
+def _is_weather_ticker(ticker: Any) -> bool:
+    return str(ticker or "").upper().startswith("KXHIGH")
+
+
 def _ignored_money_safety_ops_category(event: OpsEvent) -> str | None:
     if str(event.severity or "").lower() == "critical":
         return None
@@ -344,6 +348,20 @@ class TradingAuditService:
             market_states=market_states,
             now=now,
         )
+        domains = {
+            "weather": self._domain_report(
+                domain="weather",
+                fills=fills,
+                orders=orders,
+                tickets=tickets,
+                risk_verdicts=risk_verdicts,
+                signals=signals,
+                decision_traces=decision_traces,
+                positions=positions,
+                market_states=market_states,
+                now=now,
+            )
+        }
         issues = self._issues(
             fill_summary=fill_summary,
             attribution=attribution,
@@ -379,7 +397,105 @@ class TradingAuditService:
             "ops": ops,
             "trigger_diagnostics": trigger_diagnostics,
             "open_positions": exposure,
+            "domains": domains,
             "issues": issues,
+        }
+
+    def _domain_report(
+        self,
+        *,
+        domain: str,
+        fills: list[FillRecord],
+        orders: list[OrderRecord],
+        tickets: list[TradeTicketRecord],
+        risk_verdicts: list[RiskVerdictRecord],
+        signals: list[Signal],
+        decision_traces: list[DecisionTraceRecord],
+        positions: list[PositionRecord],
+        market_states: dict[str, MarketState],
+        now: datetime,
+    ) -> dict[str, Any]:
+        if domain != "weather":
+            raise ValueError(f"unknown audit domain {domain}")
+
+        weather_tickets = [ticket for ticket in tickets if _is_weather_ticker(ticket.market_ticker)]
+        weather_ticket_ids = {ticket.id for ticket in weather_tickets}
+        weather_room_ids = {ticket.room_id for ticket in weather_tickets}
+        weather_orders = [order for order in orders if _is_weather_ticker(order.market_ticker)]
+        weather_order_ids = {order.id for order in weather_orders}
+        weather_fills = [fill for fill in fills if _is_weather_ticker(fill.market_ticker)]
+        attributed_weather_fills = [
+            fill
+            for fill in weather_fills
+            if fill.strategy_code == StrategyCode.DIRECTIONAL.value or fill.order_id in weather_order_ids
+        ]
+        unknown_weather_like_fills = [
+            fill
+            for fill in weather_fills
+            if fill.strategy_code is None and fill.order_id not in weather_order_ids
+        ]
+        weather_risk = [
+            verdict
+            for verdict in risk_verdicts
+            if verdict.ticket_id in weather_ticket_ids or verdict.room_id in weather_room_ids
+        ]
+        weather_signals = [signal for signal in signals if _is_weather_ticker(signal.market_ticker)]
+        weather_decision_traces = [
+            trace for trace in decision_traces if _is_weather_ticker(trace.market_ticker)
+        ]
+        weather_positions = [position for position in positions if _is_weather_ticker(position.market_ticker)]
+        weather_market_states = {
+            ticker: state for ticker, state in market_states.items() if _is_weather_ticker(ticker)
+        }
+        risk = self._risk_summary(weather_risk)
+        daily_funnel = self._daily_gate_funnel(
+            signals=weather_signals,
+            risk_verdicts=weather_risk,
+            decision_traces=weather_decision_traces,
+            now=now,
+        )
+        top_blockers: list[dict[str, Any]] = []
+        for row in daily_funnel.get("current_policy_rejections") or []:
+            top_blockers.append({"source": "daily_gate_funnel", **row})
+        for row in risk.get("top_reasons") or []:
+            top_blockers.append({"source": "risk", "gate": row.get("reason"), "count": row.get("count")})
+
+        return {
+            "domain": "weather",
+            "ticker_prefix": "KXHIGH",
+            "tickets": len(weather_tickets),
+            "orders": len(weather_orders),
+            "fills": len(weather_fills),
+            "attributed_fills": len(attributed_weather_fills),
+            "unknown_weather_like_fills": len(unknown_weather_like_fills),
+            "positions": len(weather_positions),
+            "fill_summary": self._fill_summary(weather_fills),
+            "pnl": self._gross_pnl(attributed_weather_fills),
+            "execution_funnel": self._execution_funnel(
+                tickets=weather_tickets,
+                risk_verdicts=weather_risk,
+                orders=weather_orders,
+                fills=weather_fills,
+                now=now,
+            ),
+            "signal_funnel": self._signal_funnel(
+                signals=weather_signals,
+                tickets=weather_tickets,
+                decision_traces=weather_decision_traces,
+                now=now,
+            ),
+            "daily_funnel_report": daily_funnel,
+            "risk": risk,
+            "open_positions": self._position_exposure(
+                positions=weather_positions,
+                market_states=weather_market_states,
+                now=now,
+            ),
+            "attribution": self._attribution_gaps(
+                fills=attributed_weather_fills,
+                orders=weather_orders,
+            ),
+            "top_blockers": top_blockers[:20],
         }
 
     async def repair_attribution(
@@ -2532,6 +2648,7 @@ def format_trading_audit_text(report: dict[str, Any]) -> str:
     trigger = report.get("trigger_diagnostics", {})
     daily_funnel = report.get("daily_funnel_report", {})
     lifecycle = report.get("lifecycle", {})
+    weather = dict((report.get("domains") or {}).get("weather") or {})
     issues = report["issues"]
 
     lines = [
@@ -2543,6 +2660,11 @@ def format_trading_audit_text(report: dict[str, Any]) -> str:
         f"Fees: {pnl['fee_total_dollars'] or 'n/a'} ({pnl['fee_coverage']['fills_with_fee']}/{pnl['fee_coverage']['total_fills']} fills)",
         f"Missing fill strategy: {attribution['missing_fill_strategy_count']} fills",
         f"Execution funnel: {funnel['approved_tickets']} approved tickets, {funnel['orders']} orders, {funnel['fills']} fills",
+        (
+            "Weather-only: "
+            f"{weather.get('orders', 0)} orders, {weather.get('fills', 0)} fills, "
+            f"{weather.get('positions', 0)} positions"
+        ),
         f"Approved without order: {funnel['approved_without_order_count']}  Failed orders: {funnel['failed_order_count']}",
         f"Open positions: {exposure['position_count']}  stale/missing marks: {exposure['stale_or_missing_mark_count']}",
         f"Stop-loss events: {stop_loss['event_count']}",

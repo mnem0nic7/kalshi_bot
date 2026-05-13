@@ -10,13 +10,18 @@ from kalshi_bot.db.models import FillRecord, OpsEvent, OrderRecord, Room, Signal
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.trade_analysis import TradeAnalysisDataset
-from kalshi_bot.services.trade_behavior import evaluate_empirical_gate
+from kalshi_bot.services.trade_behavior import entry_pause_reason, evaluate_empirical_gate
 from kalshi_bot.services.trade_behavior_quality import build_trade_behavior_quality_report
 from kalshi_bot.services.trade_behavior_validation import build_trade_behavior_validation_report
 
 
 NOW = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
 TICKER = "KXHIGHNY-26APR24-T67"
+
+
+class FakeControl:
+    def __init__(self, *, notes: dict | None = None) -> None:
+        self.notes = notes or {}
 
 
 @pytest.fixture
@@ -72,6 +77,57 @@ async def test_empirical_gate_blocks_under_sampled_production_live_entries(trade
     assert decision.status == "blocked"
     assert decision.reason == "empirical_gate_under_sampled"
     assert decision.blocks_live_entries is True
+
+
+def test_weather_live_entry_pause_bypasses_production_freeze_for_strategy_a_only() -> None:
+    settings = Settings(trade_behavior_production_entry_freeze_enabled=True)
+    control = FakeControl(
+        notes={
+            "weather_live": {
+                "enabled": True,
+                "policy_state": "live",
+            }
+        }
+    )
+
+    assert (
+        entry_pause_reason(
+            settings=settings,
+            control=control,
+            kalshi_env="production",
+            strategy_code="A",
+        )
+        is None
+    )
+    assert entry_pause_reason(
+        settings=settings,
+        control=control,
+        kalshi_env="production",
+        strategy_code="CRYPTO_15M",
+    ) == f"Entry pause is active: {settings.trade_behavior_entry_freeze_reason}."
+
+
+@pytest.mark.asyncio
+async def test_empirical_gate_respects_weather_live_production_freeze_bypass(trade_behavior_harness) -> None:
+    settings, session_factory = trade_behavior_harness
+    settings = settings.model_copy(update={"trade_behavior_production_entry_freeze_enabled": True})
+    async with session_factory() as session:
+        decision = await evaluate_empirical_gate(
+            session=session,
+            settings=settings,
+            kalshi_env="production",
+            market_ticker=TICKER,
+            side="yes",
+            action="buy",
+            strategy_code="A",
+            shadow_mode=False,
+            yes_price_dollars=Decimal("0.5000"),
+            production_freeze_bypass=True,
+            now=NOW,
+        )
+
+    assert decision.status == "blocked"
+    assert decision.reason == "empirical_gate_under_sampled"
 
 
 @pytest.mark.asyncio

@@ -324,10 +324,36 @@ class AutoTriggerService:
                     "room_id": room.id,
                     "spread_bps": spread_bps,
                     "agent_pack_version": pack.version,
+                    "app_shadow_mode": self.settings.app_shadow_mode,
+                    "room_shadow_mode": bool(room.shadow_mode),
+                    "room_origin": room.room_origin,
                     "one_sided_tradeable_probe": one_sided_probe,
                 },
                 room_id=room.id,
+                kalshi_env=self.settings.kalshi_env,
             )
+            if (
+                self.settings.kalshi_env == "production"
+                and not self.settings.app_shadow_mode
+                and bool(room.shadow_mode)
+            ):
+                await repo.log_ops_event(
+                    severity="warning",
+                    summary=(
+                        f"Weather auto-trigger launched unexpected shadow room for {market_ticker} "
+                        "while production app shadow mode is false"
+                    ),
+                    source="auto_trigger",
+                    payload={
+                        "market_ticker": market_ticker,
+                        "room_id": room.id,
+                        "app_shadow_mode": self.settings.app_shadow_mode,
+                        "room_shadow_mode": bool(room.shadow_mode),
+                        "room_origin": room.room_origin,
+                    },
+                    room_id=room.id,
+                    kalshi_env=self.settings.kalshi_env,
+                )
             await session.commit()
 
         self._inflight_markets.add(market_ticker)

@@ -21,7 +21,7 @@ from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.risk_policy import probability_midband_block_reason
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars, remaining_payout_dollars
 from kalshi_bot.services.strategy_cleanup import CleanupSignal
-from kalshi_bot.services.trade_behavior import entry_pause_reason
+from kalshi_bot.services.trade_behavior import entry_pause_reason, weather_live_max_order_count_fp
 
 
 @dataclass(slots=True)
@@ -234,6 +234,17 @@ class DeterministicRiskEngine:
             "policy_variant_applied": applied_policy_variant,
             "variants": candidate_trace.get("policy_variants") if isinstance(candidate_trace.get("policy_variants"), dict) else {},
         }
+        diagnostics["active_thresholds"] = {
+            "risk_min_edge_bps": active_thresholds.risk_min_edge_bps,
+            "risk_max_credible_edge_bps": active_thresholds.risk_max_credible_edge_bps,
+            "risk_min_confidence": active_thresholds.risk_min_confidence,
+            "risk_min_contract_price_dollars": active_thresholds.risk_min_contract_price_dollars,
+            "risk_max_order_notional_dollars": active_thresholds.risk_max_order_notional_dollars,
+            "risk_max_position_notional_dollars": active_thresholds.risk_max_position_notional_dollars,
+            "trigger_max_spread_bps": active_thresholds.trigger_max_spread_bps,
+            "strategy_min_abs_delta_f": active_thresholds.strategy_min_abs_delta_f,
+            "strategy_min_remaining_payout_bps": active_thresholds.strategy_min_remaining_payout_bps,
+        }
 
         if is_sell_exit and not risk_reducing_exit:
             block("Sell ticket does not match an existing same-side position.")
@@ -244,7 +255,12 @@ class DeterministicRiskEngine:
             else:
                 block("Global kill switch is enabled.")
         pause_reason = (
-            entry_pause_reason(settings=self.settings, control=control, kalshi_env=room.kalshi_env)
+            entry_pause_reason(
+                settings=self.settings,
+                control=control,
+                kalshi_env=room.kalshi_env,
+                strategy_code=context.strategy_code,
+            )
             if is_buy_entry
             else None
         )
@@ -383,7 +399,16 @@ class DeterministicRiskEngine:
         if research_observed_at is None or (now - research_observed_at).total_seconds() > self.settings.research_stale_seconds:
             block("Research data is stale.")
 
-        if float(ticket.count_fp) > self.settings.risk_max_order_count_fp:
+        max_order_count_fp = weather_live_max_order_count_fp(
+            control=control,
+            strategy_code=context.strategy_code,
+            default_count=float(self.settings.risk_max_order_count_fp),
+        )
+        diagnostics["max_order_count_fp"] = {
+            "configured": float(self.settings.risk_max_order_count_fp),
+            "effective": max_order_count_fp,
+        }
+        if float(ticket.count_fp) > max_order_count_fp:
             block("Ticket size exceeds max order count.")
 
         effective_position_count_fp = context.current_position_count_fp + context.pending_order_count_fp

@@ -156,6 +156,55 @@ def test_risk_engine_blocks_production_entries_during_trade_behavior_freeze() ->
     assert any("trade_behavior_retraining_freeze" in reason for reason in verdict.reasons)
 
 
+def test_risk_engine_applies_weather_live_order_count_cap() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=1000,
+        risk_max_position_notional_dollars=1000,
+        risk_max_order_count_fp=500,
+        risk_max_position_count_fp_per_ticker=1000,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        trade_behavior_production_entry_freeze_enabled=True,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_production_room(),
+        control=DeploymentControl(
+            id="default",
+            active_color="blue",
+            kill_switch_enabled=False,
+            notes={
+                "weather_live": {
+                    "enabled": True,
+                    "policy_state": "live",
+                    "max_order_count_fp": 200,
+                }
+            },
+        ),
+        ticket=TradeTicket(
+            market_ticker="WX-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("250.00"),
+        ),
+        signal=make_signal(),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            strategy_code="A",
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("Ticket size exceeds max order count" in reason for reason in verdict.reasons)
+    assert verdict.diagnostics["max_order_count_fp"]["configured"] == 500.0
+    assert verdict.diagnostics["max_order_count_fp"]["effective"] == 200.0
+    assert not any("trade_behavior_retraining_freeze" in reason for reason in verdict.reasons)
+
+
 def test_risk_engine_allows_risk_reducing_sell_during_freeze_and_kill_switch() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",

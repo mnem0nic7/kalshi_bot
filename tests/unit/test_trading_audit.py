@@ -159,6 +159,58 @@ async def test_trading_audit_scores_settled_and_exit_pnl(audit_harness) -> None:
 
 
 @pytest.mark.asyncio
+async def test_trading_audit_reports_weather_domain_without_crypto_pollution(audit_harness) -> None:
+    settings, session_factory = audit_harness
+    async with session_factory() as session:
+        session.add_all([
+            _room("weather-room", ticker="KXHIGHNY-26MAY13-T70"),
+            _room("crypto-room", ticker="KXBTC-26MAY13-B50000"),
+            _fill(
+                "weather-fill",
+                ticker="KXHIGHNY-26MAY13-T70",
+                side="yes",
+                action="buy",
+                yes_price="0.4000",
+                count="1.00",
+                strategy_code=StrategyCode.DIRECTIONAL.value,
+            ),
+            _fill(
+                "weather-unknown",
+                ticker="KXHIGHSEA-26MAY13-T60",
+                side="yes",
+                action="buy",
+                yes_price="0.5000",
+                count="1.00",
+                strategy_code=None,
+            ),
+            _fill(
+                "crypto-fill",
+                ticker="KXBTC-26MAY13-B50000",
+                side="yes",
+                action="buy",
+                yes_price="0.6000",
+                count="3.00",
+                strategy_code="CRYPTO_15M",
+            ),
+        ])
+        await session.commit()
+
+    report = await TradingAuditService(settings, session_factory).build_report(
+        kalshi_env="production",
+        days=7,
+        now=NOW,
+    )
+
+    weather = report["domains"]["weather"]
+    assert report["fill_summary"]["total_fills"] == 3
+    assert weather["fill_summary"]["total_fills"] == 2
+    assert weather["fills"] == 2
+    assert weather["unknown_weather_like_fills"] == 1
+    assert weather["pnl"]["open_lot_count"] == 1
+    assert "crypto" not in report["domains"]
+
+
+@pytest.mark.asyncio
 async def test_trading_audit_scores_no_partial_exit_without_false_open_contracts(audit_harness) -> None:
     settings, session_factory = audit_harness
     async with session_factory() as session:

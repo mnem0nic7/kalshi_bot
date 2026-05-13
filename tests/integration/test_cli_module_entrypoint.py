@@ -170,6 +170,23 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
         ]
     )
     funnel_args = parser.parse_args(["funnel-report", "--kalshi-env", "production", "--domain", "crypto", "--assets", "BTC", "--json"])
+    weather_live_status_args = parser.parse_args(["weather-live", "status", "--kalshi-env", "production", "--json"])
+    weather_live_activate_args = parser.parse_args(
+        ["weather-live", "activate", "--kalshi-env", "production", "--actor", "pytest", "--json"]
+    )
+    weather_live_rollback_args = parser.parse_args(
+        [
+            "weather-live",
+            "rollback",
+            "--kalshi-env",
+            "production",
+            "--actor",
+            "pytest",
+            "--reason",
+            "unit",
+            "--json",
+        ]
+    )
     model_quality_args = parser.parse_args(
         ["model-quality", "status", "--kalshi-env", "demo", "--domain", "all", "--json"]
     )
@@ -216,6 +233,13 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert funnel_args.command == "funnel-report"
     assert funnel_args.domain == "crypto"
     assert funnel_args.assets == ["BTC"]
+    assert weather_live_status_args.command == "weather-live"
+    assert weather_live_status_args.weather_live_command == "status"
+    assert weather_live_status_args.kalshi_env == "production"
+    assert weather_live_activate_args.weather_live_command == "activate"
+    assert weather_live_activate_args.actor == "pytest"
+    assert weather_live_rollback_args.weather_live_command == "rollback"
+    assert weather_live_rollback_args.reason == "unit"
     settled_summary = cli_module._crypto_live_path_step_summary(
         {
             "status": "ok",

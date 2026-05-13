@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import StandDownReason
+from kalshi_bot.core.enums import StandDownReason, StrategyCode
 from kalshi_bot.core.schemas import TradeEligibilityVerdict
 from kalshi_bot.db.models import FillRecord, OrderRecord
 from kalshi_bot.services.agent_packs import RuntimeThresholds
@@ -455,11 +455,64 @@ def production_entry_freeze_enabled(settings: Settings, kalshi_env: str | None) 
     )
 
 
+def weather_live_entry_freeze_bypassed(*, control: Any, strategy_code: str | None) -> bool:
+    notes = dict(getattr(control, "notes", None) or {})
+    weather_live = dict(notes.get("weather_live") or {})
+    return (
+        strategy_code == StrategyCode.DIRECTIONAL.value
+        and bool(weather_live.get("enabled"))
+        and str(weather_live.get("policy_state") or "").lower() == "live"
+    )
+
+
+def weather_live_daily_loss_cap_pct(
+    *,
+    control: Any,
+    strategy_code: str | None,
+    default_pct: float,
+) -> float:
+    if not weather_live_entry_freeze_bypassed(control=control, strategy_code=strategy_code):
+        return default_pct
+    weather_live = dict((getattr(control, "notes", None) or {}).get("weather_live") or {})
+    raw = weather_live.get("daily_realized_loss_cap_pct")
+    if raw in (None, ""):
+        return default_pct
+    try:
+        cap = float(raw)
+    except (TypeError, ValueError):
+        return default_pct
+    if cap <= 0:
+        return default_pct
+    return min(default_pct, cap) if default_pct > 0 else cap
+
+
+def weather_live_max_order_count_fp(
+    *,
+    control: Any,
+    strategy_code: str | None,
+    default_count: float,
+) -> float:
+    if not weather_live_entry_freeze_bypassed(control=control, strategy_code=strategy_code):
+        return default_count
+    weather_live = dict((getattr(control, "notes", None) or {}).get("weather_live") or {})
+    raw = weather_live.get("max_order_count_fp")
+    if raw in (None, ""):
+        return default_count
+    try:
+        cap = float(raw)
+    except (TypeError, ValueError):
+        return default_count
+    if cap <= 0:
+        return default_count
+    return min(default_count, cap)
+
+
 def entry_pause_reason(
     *,
     settings: Settings,
     control: Any,
     kalshi_env: str | None,
+    strategy_code: str | None = None,
 ) -> str | None:
     notes = dict(getattr(control, "notes", None) or {})
     source_health = dict(notes.get("source_health") or {})
@@ -475,7 +528,10 @@ def entry_pause_reason(
         reason = entry_pause.get("pause_reason") or entry_pause.get("reason") or settings.trade_behavior_entry_freeze_reason
         return f"Entry pause is active: {reason}."
 
-    if production_entry_freeze_enabled(settings, kalshi_env):
+    if production_entry_freeze_enabled(settings, kalshi_env) and not weather_live_entry_freeze_bypassed(
+        control=control,
+        strategy_code=strategy_code,
+    ):
         return f"Entry pause is active: {settings.trade_behavior_entry_freeze_reason}."
     return None
 
@@ -509,6 +565,7 @@ async def evaluate_empirical_gate(
     confidence_band: Any = None,
     spread_bps: Any = None,
     now: datetime | None = None,
+    production_freeze_bypass: bool = False,
 ) -> EmpiricalGateDecision:
     legacy_bucket_key = bucket_key(
         market_ticker=market_ticker,
@@ -604,7 +661,11 @@ async def evaluate_empirical_gate(
         reason = "empirical_gate_negative_actual_net_pnl"
 
     production_live_entry = str(kalshi_env).lower() == "production" and not shadow_mode
-    if production_live_entry and production_entry_freeze_enabled(settings, kalshi_env):
+    if (
+        production_live_entry
+        and production_entry_freeze_enabled(settings, kalshi_env)
+        and not production_freeze_bypass
+    ):
         return EmpiricalGateDecision(
             status="blocked",
             reason=settings.trade_behavior_entry_freeze_reason,

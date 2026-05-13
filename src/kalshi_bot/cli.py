@@ -116,6 +116,7 @@ CRYPTO_ENV_COMMANDS = {
     "crypto-autonomy",
     "crypto-asset-mode",
     "crypto-live-path",
+    "weather-live",
 }
 
 
@@ -1613,6 +1614,33 @@ async def _run_funnel_report_command(args: argparse.Namespace, container: AppCon
     return 0
 
 
+async def _run_weather_live_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.weather_live_command == "status":
+        result = await container.weather_live_service.status(
+            kalshi_env=args.kalshi_env,
+            days=args.days,
+        )
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    if args.weather_live_command == "activate":
+        result = await container.weather_live_service.activate(
+            kalshi_env=args.kalshi_env,
+            days=args.days,
+            actor=args.actor,
+        )
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if result.get("activated") and result.get("live_capable") else 1
+    if args.weather_live_command == "rollback":
+        result = await container.weather_live_service.rollback(
+            kalshi_env=args.kalshi_env,
+            actor=args.actor,
+            reason=args.reason,
+        )
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    raise ValueError(f"unknown weather-live command {args.weather_live_command}")
+
+
 async def _run_reconcile_command(
     container: AppContainer,
     repo: PlatformRepository,
@@ -1986,6 +2014,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "funnel-report":
             return await _run_funnel_report_command(args, container)
+
+        if args.command == "weather-live":
+            return await _run_weather_live_command(args, container)
 
         if args.command == "model-quality":
             report = await build_model_quality_report(
@@ -3515,6 +3546,18 @@ def build_parser() -> argparse.ArgumentParser:
     funnel_report.add_argument("--frequency", default="15m")
     funnel_report.add_argument("--assets", nargs="*", default=None)
     funnel_report.add_argument("--json", action="store_true")
+
+    weather_live = subparsers.add_parser("weather-live")
+    weather_live_subparsers = weather_live.add_subparsers(dest="weather_live_command", required=True)
+    for name in ("status", "activate", "rollback"):
+        weather_live_command = weather_live_subparsers.add_parser(name)
+        weather_live_command.add_argument("--kalshi-env", choices=["demo", "production"], default="production")
+        weather_live_command.add_argument("--days", type=int, default=1)
+        weather_live_command.add_argument("--json", action="store_true")
+        if name in {"activate", "rollback"}:
+            weather_live_command.add_argument("--actor", default="cli")
+        if name == "rollback":
+            weather_live_command.add_argument("--reason", default="manual_weather_live_rollback")
 
     model_quality = subparsers.add_parser("model-quality")
     model_quality_subparsers = model_quality.add_subparsers(dest="model_quality_command", required=True)

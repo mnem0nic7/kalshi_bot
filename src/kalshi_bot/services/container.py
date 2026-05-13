@@ -63,6 +63,7 @@ from kalshi_bot.services.training import TrainingExportService
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.services.market_history import MarketHistoryService
 from kalshi_bot.services.watchdog import WatchdogService
+from kalshi_bot.services.weather_live import WeatherLiveService
 from kalshi_bot.services.weather_prediction import WeatherPredictionService
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.strategy_cleanup_service import StrategyCleanupService
@@ -124,6 +125,7 @@ class AppContainer:
     strategy_auto_evolve_service: StrategyAutoEvolveService
     trade_analysis_service: TradeAnalysisService
     trading_audit_service: TradingAuditService
+    weather_live_service: WeatherLiveService
     market_history_service: MarketHistoryService
     crypto_asset_control_service: CryptoAssetControlService
     crypto_autonomy_service: CryptoAutonomyService
@@ -410,6 +412,15 @@ class AppContainer:
             session_factory,
         )
         trading_audit_service = TradingAuditService(settings, session_factory, kalshi=kalshi)
+        weather_live_service = WeatherLiveService(
+            settings=settings,
+            session_factory=session_factory,
+            agent_pack_service=agent_pack_service,
+            watchdog_service=watchdog_service,
+            weather_prediction_service=weather_prediction_service,
+            trading_audit_service=trading_audit_service,
+            has_write_credentials=kalshi.write_credentials is not None,
+        )
         trade_analysis_service = TradeAnalysisService(
             settings,
             session_factory,
@@ -520,6 +531,7 @@ class AppContainer:
             strategy_auto_evolve_service=strategy_auto_evolve_service,
             trade_analysis_service=trade_analysis_service,
             trading_audit_service=trading_audit_service,
+            weather_live_service=weather_live_service,
             market_history_service=market_history_service,
             crypto_asset_control_service=crypto_asset_control_service,
             crypto_autonomy_service=crypto_autonomy_service,

@@ -73,6 +73,8 @@ from kalshi_bot.services.trade_behavior import (
     series_from_ticker,
     thresholds_with_production_freeze_floor,
     trade_behavior_context_payload,
+    weather_live_daily_loss_cap_pct,
+    weather_live_entry_freeze_bypassed,
 )
 from kalshi_bot.services.training_corpus import TrainingCorpusService
 from kalshi_bot.weather.mapping import WeatherMarketDirectory
@@ -1416,7 +1418,13 @@ class WorkflowSupervisor:
                 )
                 if daily_pnl is not None and float(total_capital) > 0:
                     daily_loss_ratio = float(-daily_pnl) / float(total_capital)
-                    if self.settings.risk_daily_loss_pct > 0 and daily_loss_ratio >= self.settings.risk_daily_loss_pct:
+                    daily_loss_cap_pct = weather_live_daily_loss_cap_pct(
+                        control=control,
+                        strategy_code=StrategyCode.DIRECTIONAL.value,
+                        default_pct=float(self.settings.risk_daily_loss_pct),
+                    )
+                    sizing_trace["daily_loss_cap_pct"] = daily_loss_cap_pct
+                    if daily_loss_cap_pct > 0 and daily_loss_ratio >= daily_loss_cap_pct:
                         daily_loss_hard_blocked = True
                     elif self.settings.risk_daily_loss_sensitivity_pct > 0:
                         loss_sensitivity_active = daily_loss_ratio >= self.settings.risk_daily_loss_sensitivity_pct
@@ -1531,28 +1539,28 @@ class WorkflowSupervisor:
                         severity="critical",
                         summary=(
                             f"Daily loss circuit breaker tripped: {daily_loss_ratio:.1%} loss "
-                            f">= {self.settings.risk_daily_loss_pct:.0%} hard limit"
+                            f">= {float(sizing_trace.get('daily_loss_cap_pct', self.settings.risk_daily_loss_pct)):.0%} hard limit"
                         ),
                         source="supervisor",
                         room_id=room.id,
                         kalshi_env=room.kalshi_env,
                         payload={
                             "daily_loss_ratio": round(daily_loss_ratio, 4),
-                            "hard_limit_pct": self.settings.risk_daily_loss_pct,
+                            "hard_limit_pct": sizing_trace.get("daily_loss_cap_pct", self.settings.risk_daily_loss_pct),
                             "market_ticker": room.market_ticker,
                         },
                     )
                     logger.critical(
                         "Daily loss circuit breaker tripped: %.1f%% loss >= %.0f%% hard limit (ticker=%s)",
                         daily_loss_ratio * 100,
-                        self.settings.risk_daily_loss_pct * 100,
+                        float(sizing_trace.get("daily_loss_cap_pct", self.settings.risk_daily_loss_pct)) * 100,
                         room.market_ticker,
                     )
                     verdict = RiskVerdictPayload(
                         status=RiskStatus.BLOCKED,
                         reasons=[
                             f"Daily loss circuit breaker: {daily_loss_ratio:.1%} loss "
-                            f">= {self.settings.risk_daily_loss_pct:.0%} hard limit."
+                            f">= {float(sizing_trace.get('daily_loss_cap_pct', self.settings.risk_daily_loss_pct)):.0%} hard limit."
                         ],
                     )
                 else:
@@ -1857,6 +1865,12 @@ class WorkflowSupervisor:
             return signal
 
         pre_empirical_stand_down_reason = signal.eligibility.stand_down_reason
+        repo = PlatformRepository(session, kalshi_env=room.kalshi_env)
+        control = await repo.get_deployment_control(kalshi_env=room.kalshi_env)
+        production_freeze_bypass = weather_live_entry_freeze_bypassed(
+            control=control,
+            strategy_code=StrategyCode.DIRECTIONAL.value,
+        )
         decision = await evaluate_empirical_gate(
             session=session,
             settings=self.settings,
@@ -1870,6 +1884,7 @@ class WorkflowSupervisor:
             forecast_delta_f=signal.forecast_delta_f,
             confidence_band=signal.confidence_band,
             spread_bps=signal.eligibility.market_spread_bps if signal.eligibility is not None else None,
+            production_freeze_bypass=production_freeze_bypass,
         )
         payload = decision.to_payload()
         if decision.reason == self.settings.trade_behavior_entry_freeze_reason and hasattr(self.settings, "model_copy"):
@@ -2758,15 +2773,20 @@ class WorkflowSupervisor:
                         daily_pnl_llm = await repo.get_daily_pnl_dollars(kalshi_env=room.kalshi_env)
                         _daily_loss_ratio_llm = 0.0
                         _daily_hard_blocked_llm = False
-                        if daily_pnl_llm is not None and _cap > 0 and self.settings.risk_daily_loss_pct > 0:
+                        daily_loss_cap_pct_llm = weather_live_daily_loss_cap_pct(
+                            control=control,
+                            strategy_code=StrategyCode.DIRECTIONAL.value,
+                            default_pct=float(self.settings.risk_daily_loss_pct),
+                        )
+                        if daily_pnl_llm is not None and _cap > 0 and daily_loss_cap_pct_llm > 0:
                             _daily_loss_ratio_llm = float(-daily_pnl_llm) / _cap
-                            _daily_hard_blocked_llm = _daily_loss_ratio_llm >= self.settings.risk_daily_loss_pct
+                            _daily_hard_blocked_llm = _daily_loss_ratio_llm >= daily_loss_cap_pct_llm
                         if _daily_hard_blocked_llm:
                             verdict = RiskVerdictPayload(
                                 status=RiskStatus.BLOCKED,
                                 reasons=[
                                     f"Daily loss circuit breaker: {_daily_loss_ratio_llm:.1%} loss "
-                                    f">= {self.settings.risk_daily_loss_pct:.0%} hard limit."
+                                    f">= {daily_loss_cap_pct_llm:.0%} hard limit."
                                 ],
                             )
                         else:
