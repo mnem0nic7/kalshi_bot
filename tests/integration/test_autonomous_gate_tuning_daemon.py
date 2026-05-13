@@ -118,6 +118,39 @@ async def test_inactive_color_reconcile_skips_autonomous_gate_tuning(tmp_path) -
 
 
 @pytest.mark.asyncio
+async def test_daemon_reconcile_can_defer_settlement_gate_tuning_for_liveness(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-autonomous-gates-deferred.db",
+        autonomous_gate_tuning_enabled=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    autonomous = FakeAutonomousGateTuningService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        weather_directory=None,
+        discovery_service=None,
+        stream_service=None,
+        reconciliation_service=FakeReconciliationService(),
+        research_coordinator=None,
+        auto_trigger_service=None,
+        shadow_training_service=None,
+        shadow_campaign_service=None,
+        self_improve_service=None,
+        autonomous_gate_tuning_service=autonomous,
+    )
+
+    result = await daemon.reconcile_once(run_settlement_gate_tuning=False)
+
+    assert result["autonomous_gate_tuning"] == {"status": "deferred", "reason": "daemon_liveness"}
+    assert autonomous.calls == 0
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_daemon_heartbeat_triggers_autonomous_gate_tuning_periodically(tmp_path) -> None:
     """_maybe_run_autonomous_gate_tuning fires on first call and is debounced on second."""
     settings = Settings(

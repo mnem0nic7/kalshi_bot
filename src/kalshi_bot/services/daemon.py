@@ -140,7 +140,7 @@ class DaemonService:
                 logger.warning("Reaped %d orphaned room(s) on startup: %s", len(reaped_ids), reaped_ids)
             await session.commit()
 
-    async def reconcile_once(self) -> dict[str, Any]:
+    async def reconcile_once(self, *, run_settlement_gate_tuning: bool = True) -> dict[str, Any]:
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             summary = await self.reconciliation_service.reconcile(
@@ -164,7 +164,9 @@ class DaemonService:
         result = asdict(summary)
         if summary.settlements_count > 0:
             if self.settings.autonomous_gate_tuning_enabled and self.autonomous_gate_tuning_service is not None:
-                if await self._is_active_color():
+                if not run_settlement_gate_tuning:
+                    result["autonomous_gate_tuning"] = {"status": "deferred", "reason": "daemon_liveness"}
+                elif await self._is_active_color():
                     result["autonomous_gate_tuning"] = await self.autonomous_gate_tuning_service.run(
                         kalshi_env=self.settings.kalshi_env,
                         source=self.settings.autonomous_gate_tuning_source,
@@ -306,7 +308,7 @@ class DaemonService:
             await self.self_improve_service.apply_pending_pack_promotion(app_color=self.settings.app_color)
             await self._recover_orphaned_rooms()
             if self.settings.daemon_start_with_reconcile:
-                await self.reconcile_once()
+                await self.reconcile_once(run_settlement_gate_tuning=False)
             await self.heartbeat_once(run_follow_up=False)
             selected_markets = await self._select_stream_markets(markets)
 
@@ -562,7 +564,7 @@ class DaemonService:
     async def _periodic_reconcile_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.daemon_reconcile_interval_seconds)
-            await self.reconcile_once()
+            await self.reconcile_once(run_settlement_gate_tuning=False)
 
     async def _periodic_heartbeat_loop(self) -> None:
         while True:
