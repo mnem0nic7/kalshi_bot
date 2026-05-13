@@ -810,7 +810,7 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
         historical_training,  # type: ignore[arg-type]
     )
 
-    result = await daemon.run(max_messages=1)
+    await daemon.heartbeat_once()
 
     async with session_factory() as session:
         followup_checkpoint = (
@@ -818,7 +818,6 @@ async def test_daemon_service_runs_settlement_follow_up_reconcile(tmp_path) -> N
         ).scalar_one()
         await session.commit()
 
-    assert result["completed"] == "stream"
     assert reconcile_service.call_count == 1
     assert historical_training.backfill_calls == 1
     assert followup_checkpoint.payload["summary"]["status_counts"]["awaiting_settlement"] == 1

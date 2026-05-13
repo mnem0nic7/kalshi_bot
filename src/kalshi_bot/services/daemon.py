@@ -302,7 +302,7 @@ class DaemonService:
             await self._recover_orphaned_rooms()
             if self.settings.daemon_start_with_reconcile:
                 await self.reconcile_once()
-            self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
+            await self.heartbeat_once(run_follow_up=False)
             selected_markets = await self._select_stream_markets(markets)
 
             stream_coro = (
@@ -475,7 +475,7 @@ class DaemonService:
     async def _periodic_heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.daemon_heartbeat_interval_seconds)
-            self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
+            await self.heartbeat_once(run_follow_up=False)
 
     async def _periodic_stop_loss_loop(self) -> None:
         while True:
