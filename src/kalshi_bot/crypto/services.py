@@ -122,6 +122,13 @@ def _clamp_price(value: Decimal) -> Decimal:
     return quantize_price(min(Decimal("0.9900"), max(Decimal("0.0100"), value)))
 
 
+CRYPTO_PASSIVE_PRICE_TICK = Decimal("0.01")
+
+
+def _clamp_cent_price(value: Decimal) -> Decimal:
+    return min(Decimal("0.99"), max(Decimal("0.01"), value)).quantize(CRYPTO_PASSIVE_PRICE_TICK)
+
+
 def _rows_from_response(response: dict[str, Any], key: str) -> list[dict[str, Any]]:
     if isinstance(response, list):
         return [row for row in response if isinstance(row, dict)]
@@ -2611,23 +2618,23 @@ class CryptoExecutionService:
 
     @staticmethod
     def passive_yes_price(market: CryptoMarket, side: ContractSide) -> Decimal | None:
-        tick = Decimal("0.0001")
+        tick = CRYPTO_PASSIVE_PRICE_TICK
+        yes_bid = market.yes_bid_dollars
+        yes_ask = market.yes_ask_dollars
+        if yes_bid is None and yes_ask is None:
+            return None
         if side == ContractSide.YES:
-            if market.yes_ask_dollars is not None:
-                ceiling = market.yes_ask_dollars - tick
-            else:
-                ceiling = Decimal("0.9900")
-            base = (market.yes_bid_dollars or Decimal("0.0000")) + tick
-            return _clamp_price(min(base, ceiling))
-        if market.yes_bid_dollars is not None:
-            floor = market.yes_bid_dollars + tick
-        else:
-            floor = Decimal("0.0100")
-        if market.yes_ask_dollars is not None:
-            base = market.yes_ask_dollars - tick
-        else:
-            base = floor
-        return _clamp_price(max(base, floor))
+            ceiling = yes_ask - tick if yes_ask is not None else Decimal("0.99")
+            if ceiling < Decimal("0.01"):
+                return None
+            base = yes_bid + tick if yes_bid is not None else Decimal("0.01")
+            return _clamp_cent_price(min(base, ceiling))
+        floor = yes_bid + tick if yes_bid is not None else Decimal("0.01")
+        ceiling = yes_ask if yes_ask is not None else Decimal("0.99")
+        if floor > ceiling or floor > Decimal("0.99"):
+            return None
+        base = yes_ask - tick if yes_ask is not None else floor
+        return _clamp_cent_price(max(base, floor))
 
     async def execute(
         self,

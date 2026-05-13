@@ -2185,8 +2185,25 @@ def test_passive_prices_do_not_cross_crypto_touch(tmp_path) -> None:
     yes_price = service.passive_yes_price(market, ContractSide.YES)
     no_price = service.passive_yes_price(market, ContractSide.NO)
 
-    assert yes_price == Decimal("0.4701")
-    assert no_price == Decimal("0.4899")
+    assert yes_price == Decimal("0.48")
+    assert no_price == Decimal("0.48")
+
+
+def test_passive_prices_use_valid_cent_ticks_for_one_cent_spread(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        base_execution_service=None,  # type: ignore[arg-type]
+        asset_control_service=CryptoAssetControlService(settings=settings, session_factory=None),  # type: ignore[arg-type]
+    )
+    market = _market(yes_bid_dollars=Decimal("0.6500"), yes_ask_dollars=Decimal("0.6600"))
+
+    yes_price = service.passive_yes_price(market, ContractSide.YES)
+    no_price = service.passive_yes_price(market, ContractSide.NO)
+
+    assert yes_price == Decimal("0.65")
+    assert no_price == Decimal("0.66")
 
 
 @pytest.mark.asyncio
@@ -2604,6 +2621,7 @@ async def test_crypto_execution_live_asset_reaches_base_execution(tmp_path) -> N
 
     assert receipt.status == "submitted"
     assert fake_base.calls[0]["client_order_id"] == "crypto-test:maker"
+    assert fake_base.calls[0]["ticket"].yes_price_dollars == Decimal("0.48")
     await engine.dispose()
 
 
