@@ -941,6 +941,7 @@ async def test_auto_trigger_blocks_when_stop_loss_is_unresolved(tmp_path) -> Non
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_stop_loss_block.db",
         trigger_enable_auto_rooms=True,
         trigger_max_spread_bps=1200,
+        stop_loss_enabled=True,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -1011,11 +1012,76 @@ async def test_auto_trigger_blocks_when_stop_loss_is_unresolved(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_auto_trigger_ignores_stop_loss_checkpoints_when_stop_loss_is_disabled(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_stop_loss_disabled.db",
+        trigger_enable_auto_rooms=True,
+        trigger_max_spread_bps=1200,
+        stop_loss_enabled=False,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    supervisor = FakeSupervisor()
+    agent_pack_service = AgentPackService(settings)
+    service = AutoTriggerService(settings, session_factory, _directory(), agent_pack_service, supervisor)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control("blue")
+        await repo.upsert_market_state(
+            "WX-TEST",
+            snapshot=_GOOD_SNAPSHOT,
+            yes_bid_dollars="0.4400",  # type: ignore[arg-type]
+            yes_ask_dollars="0.4800",  # type: ignore[arg-type]
+            last_trade_dollars=None,
+        )
+        await repo.set_checkpoint(
+            "stop_loss_submit:demo:WX-TEST",
+            cursor=None,
+            payload={
+                "submitted_at": "2026-04-22T21:00:00+00:00",
+                "stopped_at": "2026-04-22T21:00:00+00:00",
+                "stopped_side": "yes",
+                "submit_error": "submit failed",
+                "outcome_status": "submit_failed",
+            },
+        )
+        await repo.set_checkpoint(
+            "stop_loss_reentry:demo:WX-TEST",
+            cursor=None,
+            payload={
+                "stopped_at": "2026-04-22T21:00:00+00:00",
+                "stopped_side": "yes",
+                "outcome_status": "submit_failed",
+                "reverse_evaluated": False,
+            },
+        )
+        await session.commit()
+
+    await service.handle_market_update("WX-TEST")
+    await service.wait_for_tasks()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        rooms = await repo.list_rooms(limit=10)
+        ops_events = await repo.list_ops_events(limit=10, kalshi_env=settings.kalshi_env)
+        await session.commit()
+
+    assert len(rooms) == 1
+    assert len(supervisor.calls) == 1
+    assert not any("stop-loss still unresolved" in event.summary for event in ops_events)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_auto_trigger_blocks_filled_stop_loss_reentry_during_cooldown(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/auto_trigger_stop_loss_reentry_cooldown.db",
         trigger_enable_auto_rooms=True,
         trigger_max_spread_bps=1200,
+        stop_loss_enabled=True,
         stop_loss_reentry_cooldown_seconds=4 * 60 * 60,
     )
     engine = create_engine(settings)

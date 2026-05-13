@@ -175,79 +175,82 @@ class AutoTriggerService:
                 await session.commit()
                 return
 
-            await refresh_stop_loss_checkpoints(
-                repo,
-                settings=self.settings,
-                kalshi_env=self.settings.kalshi_env,
-                subaccount=self.settings.kalshi_subaccount,
-                market_tickers=[market_ticker],
-                log_repairs=True,
-            )
-            submit_cp = await repo.get_checkpoint(f"stop_loss_submit:{self.settings.kalshi_env}:{market_ticker}")
-
-            reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}")
-            if reentry_cp is not None:
-                submit_payload = dict(getattr(submit_cp, "payload", {}) or {})
-                reentry_payload = dict(reentry_cp.payload or {})
-                reentry_status = stop_loss_outcome_from_payloads(
-                    submit_payload,
-                    reentry_payload,
+            if self.settings.stop_loss_enabled:
+                await refresh_stop_loss_checkpoints(
+                    repo,
+                    settings=self.settings,
+                    kalshi_env=self.settings.kalshi_env,
+                    subaccount=self.settings.kalshi_subaccount,
+                    market_tickers=[market_ticker],
+                    log_repairs=True,
                 )
-                if reentry_status in {
-                    STOP_LOSS_OUTCOME_SUBMIT_FAILED,
-                    STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
-                }:
-                    await self._log_block_once_per_cooldown(
-                        repo,
-                        checkpoint_key=(
-                            f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
-                            "stop_loss_unresolved"
-                        ),
-                        cooldown_seconds=thresholds.trigger_cooldown_seconds,
-                        severity="warning",
-                        summary=f"Auto-trigger blocked for {market_ticker}: stop-loss still unresolved",
-                        payload={"market_ticker": market_ticker, "stop_loss_outcome_status": reentry_status},
-                        kalshi_env=self.settings.kalshi_env,
+                submit_cp = await repo.get_checkpoint(f"stop_loss_submit:{self.settings.kalshi_env}:{market_ticker}")
+
+                reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}")
+                if reentry_cp is not None:
+                    submit_payload = dict(getattr(submit_cp, "payload", {}) or {})
+                    reentry_payload = dict(reentry_cp.payload or {})
+                    reentry_status = stop_loss_outcome_from_payloads(
+                        submit_payload,
+                        reentry_payload,
                     )
-                    await session.commit()
-                    return
-                if reentry_status not in {None, STOP_LOSS_OUTCOME_FILLED_EXIT}:
-                    await session.commit()
-                    return
-                stopped_at = stop_loss_stopped_at_from_payloads(submit_payload, reentry_payload)
-                if stop_loss_reentry_blocked(
-                    reentry_status,
-                    stopped_at=stopped_at,
-                    cooldown_seconds=self.settings.stop_loss_reentry_cooldown_seconds,
-                ):
-                    cooldown_expires_at = (
-                        stopped_at + timedelta(seconds=self.settings.stop_loss_reentry_cooldown_seconds)
-                        if stopped_at is not None
-                        else None
-                    )
-                    await self._log_block_once_per_cooldown(
-                        repo,
-                        checkpoint_key=(
-                            f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
-                            "stop_loss_reentry_cooldown"
-                        ),
-                        cooldown_seconds=max(thresholds.trigger_cooldown_seconds, 1800),
-                        severity="info",
-                        summary=f"Auto-trigger blocked for {market_ticker}: stop-loss re-entry cooldown active",
-                        payload={
-                            "market_ticker": market_ticker,
-                            "reason": "stop_loss_reentry_cooldown",
-                            "stop_loss_outcome_status": reentry_status,
-                            "stopped_at": stopped_at.isoformat() if stopped_at is not None else None,
-                            "cooldown_expires_at": (
-                                cooldown_expires_at.isoformat() if cooldown_expires_at is not None else None
+                    if reentry_status in {
+                        STOP_LOSS_OUTCOME_SUBMIT_FAILED,
+                        STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
+                    }:
+                        await self._log_block_once_per_cooldown(
+                            repo,
+                            checkpoint_key=(
+                                f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
+                                "stop_loss_unresolved"
                             ),
-                            "stopped_side": reentry_payload.get("stopped_side") or submit_payload.get("stopped_side"),
-                        },
-                        kalshi_env=self.settings.kalshi_env,
-                    )
-                    await session.commit()
-                    return
+                            cooldown_seconds=thresholds.trigger_cooldown_seconds,
+                            severity="warning",
+                            summary=f"Auto-trigger blocked for {market_ticker}: stop-loss still unresolved",
+                            payload={"market_ticker": market_ticker, "stop_loss_outcome_status": reentry_status},
+                            kalshi_env=self.settings.kalshi_env,
+                        )
+                        await session.commit()
+                        return
+                    if reentry_status not in {None, STOP_LOSS_OUTCOME_FILLED_EXIT}:
+                        await session.commit()
+                        return
+                    stopped_at = stop_loss_stopped_at_from_payloads(submit_payload, reentry_payload)
+                    if stop_loss_reentry_blocked(
+                        reentry_status,
+                        stopped_at=stopped_at,
+                        cooldown_seconds=self.settings.stop_loss_reentry_cooldown_seconds,
+                    ):
+                        cooldown_expires_at = (
+                            stopped_at + timedelta(seconds=self.settings.stop_loss_reentry_cooldown_seconds)
+                            if stopped_at is not None
+                            else None
+                        )
+                        await self._log_block_once_per_cooldown(
+                            repo,
+                            checkpoint_key=(
+                                f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:"
+                                "stop_loss_reentry_cooldown"
+                            ),
+                            cooldown_seconds=max(thresholds.trigger_cooldown_seconds, 1800),
+                            severity="info",
+                            summary=f"Auto-trigger blocked for {market_ticker}: stop-loss re-entry cooldown active",
+                            payload={
+                                "market_ticker": market_ticker,
+                                "reason": "stop_loss_reentry_cooldown",
+                                "stop_loss_outcome_status": reentry_status,
+                                "stopped_at": stopped_at.isoformat() if stopped_at is not None else None,
+                                "cooldown_expires_at": (
+                                    cooldown_expires_at.isoformat() if cooldown_expires_at is not None else None
+                                ),
+                                "stopped_side": (
+                                    reentry_payload.get("stopped_side") or submit_payload.get("stopped_side")
+                                ),
+                            },
+                            kalshi_env=self.settings.kalshi_env,
+                        )
+                        await session.commit()
+                        return
 
             checkpoint = await repo.get_checkpoint(f"auto_trigger:{self.settings.kalshi_env}:{market_ticker}")
             if checkpoint is not None:

@@ -637,6 +637,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 
 | Parameter | Default | Notes |
 |---|---|---|
+| `STOP_LOSS_ENABLED` | false | Enables stop-loss exits and stop-loss re-entry gating |
 | `STOP_LOSS_THRESHOLD_PCT` | 0.10 | Exit when price drops ≥ 10% from today's intraday peak |
 | `STOP_LOSS_PROFIT_PROTECTION_THRESHOLD_PCT` | 0.15 | Exit profitable positions on adverse momentum |
 | `STOP_LOSS_MOMENTUM_SLOPE_THRESHOLD_CENTS_PER_MIN` | −0.2 | Adverse momentum sensitivity |

@@ -117,6 +117,8 @@ class StopLossService:
 
     async def check_once(self) -> list[dict[str, Any]]:
         triggered: list[dict[str, Any]] = []
+        if not self.settings.stop_loss_enabled:
+            return triggered
 
         # Load positions and market states in one read session
         async with self.session_factory() as session:

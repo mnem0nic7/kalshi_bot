@@ -261,27 +261,27 @@ class DaemonService:
             self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
             selected_markets = await self._select_stream_markets(markets)
 
-            tasks.update(
-                {
-                    "stream": asyncio.create_task(
-                        self.stream_service.stream(
-                            market_tickers=selected_markets,
-                            include_private=not public_only,
-                            max_messages=max_messages,
-                            on_market_update=self._handle_market_update,
-                        )
-                    ),
-                    "reconcile": asyncio.create_task(self._periodic_reconcile_loop()),
-                    "market_history": asyncio.create_task(self._periodic_market_history_loop()),
-                    "stop_loss": asyncio.create_task(self._periodic_stop_loss_loop()),
-                    "strategy_c": asyncio.create_task(self._periodic_strategy_c_loop()),
-                    "monotonicity_arb": asyncio.create_task(self._periodic_monotonicity_arb_loop()),
-                    "crypto_quote_evidence": asyncio.create_task(self._periodic_crypto_quote_evidence_loop()),
-                    "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
-                    "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
-                    "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
-                }
-            )
+            periodic_tasks = {
+                "stream": asyncio.create_task(
+                    self.stream_service.stream(
+                        market_tickers=selected_markets,
+                        include_private=not public_only,
+                        max_messages=max_messages,
+                        on_market_update=self._handle_market_update,
+                    )
+                ),
+                "reconcile": asyncio.create_task(self._periodic_reconcile_loop()),
+                "market_history": asyncio.create_task(self._periodic_market_history_loop()),
+                "strategy_c": asyncio.create_task(self._periodic_strategy_c_loop()),
+                "monotonicity_arb": asyncio.create_task(self._periodic_monotonicity_arb_loop()),
+                "crypto_quote_evidence": asyncio.create_task(self._periodic_crypto_quote_evidence_loop()),
+                "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
+                "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
+                "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
+            }
+            if self.settings.stop_loss_enabled:
+                periodic_tasks["stop_loss"] = asyncio.create_task(self._periodic_stop_loss_loop())
+            tasks.update(periodic_tasks)
             if run_seconds is not None:
                 tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
 
@@ -385,6 +385,8 @@ class DaemonService:
     async def _periodic_stop_loss_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.stop_loss_check_interval_seconds)
+            if not self.settings.stop_loss_enabled:
+                continue
             if self.stop_loss_service is None:
                 continue
             try:

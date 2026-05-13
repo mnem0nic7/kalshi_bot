@@ -192,6 +192,7 @@ class Settings(BaseSettings):
     crypto_shadow_exploration_min_expected_net_edge_dollars: float = -0.03
     crypto_shadow_exploration_max_spread_bps: int = 500
 
+    stop_loss_enabled: bool = False
     stop_loss_threshold_pct: float = 0.10
     stop_loss_profit_protection_threshold_pct: float = 0.15
     stop_loss_reentry_cooldown_seconds: int = 14400
