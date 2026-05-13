@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -35,6 +36,7 @@ from kalshi_bot.crypto.services import (
     _crypto_feature_schema,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
+    _crypto_replay_gate_dashboard_summary,
     _crypto_raw_feature_vector,
     _crypto_select_champion,
     _crypto_trade_candidates,
@@ -2308,6 +2310,47 @@ def test_crypto_manual_off_note_overrides_runtime_live_policy(tmp_path) -> None:
     )()
 
     assert asset_control.mode_for_control(control, "BTC", crypto_policy=policy) == "off"
+
+
+def test_crypto_dashboard_replay_gate_summary_prefers_live_asset_gates() -> None:
+    blocked_generic = SimpleNamespace(
+        status="blocked",
+        version="generic-blocked",
+        sample_count=100,
+        metrics={"reason": "aggregate includes shadow assets"},
+        payload={},
+        updated_at=None,
+    )
+    passed_btc = SimpleNamespace(
+        status="passed",
+        version="btc-passed",
+        sample_count=100,
+        metrics={"asset": "BTC"},
+        payload={},
+        updated_at=None,
+    )
+    blocked_eth = SimpleNamespace(
+        status="blocked",
+        version="eth-blocked",
+        sample_count=100,
+        metrics={"asset": "ETH"},
+        payload={},
+        updated_at=None,
+    )
+
+    summary = _crypto_replay_gate_dashboard_summary(
+        gates_by_asset={"BTC": passed_btc, "ETH": blocked_eth},
+        generic_gate=blocked_generic,
+        live_asset_symbols=["BTC"],
+        displayed_asset_symbols=["BTC", "ETH"],
+    )
+
+    assert summary["status"] == "passed"
+    assert summary["version"] == "btc-passed"
+    assert summary["scope"] == "live_assets"
+    assert summary["generic_status"] == "blocked"
+    assert summary["asset_statuses"]["BTC"]["status"] == "passed"
+    assert summary["asset_statuses"]["ETH"]["status"] == "blocked"
 
 
 def test_crypto_production_runtime_live_policy_requires_control_live_note(tmp_path) -> None:

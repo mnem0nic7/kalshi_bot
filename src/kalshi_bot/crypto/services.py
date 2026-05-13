@@ -509,20 +509,22 @@ class CryptoMarketService:
         )
 
     async def dashboard_payload(self, *, frequency: str = "15m", current_only: bool = True) -> dict[str, Any]:
+        dashboard_frequency = normalize_frequency(frequency) or "15m"
         try:
-            markets = await self.discover_markets(frequency=frequency, status="open", persist=True)
+            markets = await self.discover_markets(frequency=dashboard_frequency, status="open", persist=True)
             source = "kalshi_live"
         except Exception:
             logger.warning("crypto market discovery failed; using stored snapshots", exc_info=True)
             async with self.session_factory() as session:
                 repo = PlatformRepository(session)
-                rows = await repo.list_latest_crypto_market_snapshots(frequency=normalize_frequency(frequency) or "15m")
+                rows = await repo.list_latest_crypto_market_snapshots(frequency=dashboard_frequency)
                 await session.commit()
             markets = [_market_from_snapshot(row) for row in rows]
             source = "stored_snapshots"
         total_open_markets = len(markets)
         if current_only:
             markets = _nearest_market_per_asset(markets)
+        asset_symbols = sorted({normalize_asset_symbol(market.asset_symbol) for market in markets})
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
@@ -530,11 +532,20 @@ class CryptoMarketService:
                 market_tickers=[market.market_ticker for market in markets],
                 kalshi_env=self.settings.kalshi_env,
             )
-            gate = await repo.get_latest_crypto_model_artifact(
-                frequency=normalize_frequency(frequency) or "15m",
+            generic_gate = await repo.get_latest_crypto_model_artifact(
+                frequency=dashboard_frequency,
                 artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
             )
+            replay_gates_by_asset: dict[str, Any | None] = {}
+            for asset_symbol in asset_symbols:
+                replay_gates_by_asset[asset_symbol] = await _latest_crypto_artifact_for_asset(
+                    repo,
+                    frequency=dashboard_frequency,
+                    artifact_type="replay_gate",
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbol=asset_symbol,
+                )
             active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             active_rooms: dict[str, dict[str, str]] = {}
@@ -546,8 +557,6 @@ class CryptoMarketService:
                 if room is not None:
                     active_rooms[market.market_ticker] = {"id": room.id, "stage": room.stage}
             await session.commit()
-        gate_payload = gate.payload if gate is not None else {}
-        asset_symbols = sorted({market.asset_symbol for market in markets})
         mode_summary = self.asset_control_service.asset_mode_summary(
             asset_symbols=asset_symbols,
             modes=_resolved_crypto_asset_modes(
@@ -556,16 +565,47 @@ class CryptoMarketService:
                 crypto_policy=crypto_policy,
             ),
         )
-        global_live_blockers = self.asset_control_service.global_live_blockers(
-            control=control,
-            replay_gate=gate,
-            has_write_credentials=self.kalshi.write_credentials is not None,
-            frequency=frequency,
-            crypto_policy=crypto_policy,
+        replay_gate_summary = _crypto_replay_gate_dashboard_summary(
+            gates_by_asset=replay_gates_by_asset,
+            generic_gate=generic_gate,
+            live_asset_symbols=[
+                asset_symbol
+                for asset_symbol, mode in mode_summary["modes"].items()
+                if mode == CRYPTO_ASSET_MODE_LIVE
+            ],
+            displayed_asset_symbols=asset_symbols,
+        )
+        market_payloads: list[dict[str, Any]] = []
+        for market in markets:
+            asset_symbol = normalize_asset_symbol(market.asset_symbol)
+            market_gate = replay_gates_by_asset.get(asset_symbol, generic_gate)
+            live_status = self.asset_control_service.market_live_status(
+                control=control,
+                replay_gate=market_gate,
+                market=market,
+                has_write_credentials=self.kalshi.write_credentials is not None,
+                crypto_policy=crypto_policy,
+            )
+            market_payloads.append(
+                {
+                    **market.to_payload(),
+                    **live_status,
+                    "replay_gate": _artifact_summary(market_gate),
+                    "signal": signal_payloads.get(market.market_ticker),
+                    "active_room": active_rooms.get(market.market_ticker),
+                }
+            )
+        global_live_blockers = sorted(
+            {
+                blocker
+                for market_payload in market_payloads
+                if market_payload.get("asset_mode") == CRYPTO_ASSET_MODE_LIVE
+                for blocker in (market_payload.get("global_live_blockers") or [])
+            }
         )
         return {
             "market_domain": "crypto",
-            "frequency": normalize_frequency(frequency) or "15m",
+            "frequency": dashboard_frequency,
             "source": source,
             "total_open_markets": total_open_markets,
             "current_only": current_only,
@@ -581,27 +621,9 @@ class CryptoMarketService:
             "asset_modes": mode_summary["modes"],
             "asset_mode_counts": mode_summary["counts"],
             "global_live_blockers": global_live_blockers,
-            "replay_gate": {
-                "status": gate.status if gate is not None else "missing",
-                "version": gate.version if gate is not None else None,
-                "metrics": gate.metrics if gate is not None else {},
-                "payload": gate_payload,
-            },
-            "markets": [
-                {
-                    **market.to_payload(),
-                    **self.asset_control_service.market_live_status(
-                        control=control,
-                        replay_gate=gate,
-                        market=market,
-                        has_write_credentials=self.kalshi.write_credentials is not None,
-                        crypto_policy=crypto_policy,
-                    ),
-                    "signal": signal_payloads.get(market.market_ticker),
-                    "active_room": active_rooms.get(market.market_ticker),
-                }
-                for market in markets
-            ],
+            "replay_gate": replay_gate_summary,
+            "generic_replay_gate": _artifact_summary(generic_gate),
+            "markets": market_payloads,
             "updated_at": datetime.now(UTC).isoformat(),
         }
 
@@ -3392,6 +3414,54 @@ def _artifact_summary(artifact: Any | None) -> dict[str, Any]:
         "metrics": artifact.metrics,
         "payload": artifact.payload,
         "updated_at": artifact.updated_at.isoformat() if artifact.updated_at else None,
+    }
+
+
+def _crypto_replay_gate_dashboard_summary(
+    *,
+    gates_by_asset: dict[str, Any | None],
+    generic_gate: Any | None,
+    live_asset_symbols: list[str],
+    displayed_asset_symbols: list[str],
+) -> dict[str, Any]:
+    generic_summary = _artifact_summary(generic_gate)
+    asset_statuses = {
+        normalize_asset_symbol(asset_symbol): _artifact_summary(
+            gates_by_asset.get(normalize_asset_symbol(asset_symbol), generic_gate)
+        )
+        for asset_symbol in sorted(set(live_asset_symbols + displayed_asset_symbols))
+    }
+    live_assets = [normalize_asset_symbol(asset_symbol) for asset_symbol in live_asset_symbols]
+    displayed_assets = [normalize_asset_symbol(asset_symbol) for asset_symbol in displayed_asset_symbols]
+    scoped_assets = live_assets or displayed_assets
+    scoped_statuses = [
+        asset_statuses.get(asset_symbol, generic_summary).get("status") or "missing"
+        for asset_symbol in scoped_assets
+    ]
+    if not scoped_statuses:
+        status = generic_summary["status"]
+        scope = "generic"
+    elif all(status == "passed" for status in scoped_statuses):
+        status = "passed"
+        scope = "live_assets" if live_assets else "displayed_assets"
+    elif len(set(scoped_statuses)) > 1:
+        status = "mixed"
+        scope = "live_assets" if live_assets else "displayed_assets"
+    else:
+        status = scoped_statuses[0]
+        scope = "live_assets" if live_assets else "displayed_assets"
+    base_summary = (
+        asset_statuses.get(scoped_assets[0], generic_summary)
+        if len(scoped_assets) == 1
+        else generic_summary
+    )
+    return {
+        **base_summary,
+        "status": status,
+        "scope": scope,
+        "asset_statuses": asset_statuses,
+        "generic_status": generic_summary["status"],
+        "generic": generic_summary,
     }
 
 

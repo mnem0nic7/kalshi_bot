@@ -41,6 +41,9 @@ def test_crypto_static_asset_mode_controls_are_present() -> None:
     crypto_css = Path("src/kalshi_bot/web/static/crypto.css").read_text(
         encoding="utf-8"
     )
+    crypto_template = Path("src/kalshi_bot/web/templates/crypto.html").read_text(
+        encoding="utf-8"
+    )
 
     assert "crypto-mode-select" in crypto_js
     assert "data-current-mode" in crypto_js
@@ -49,3 +52,5 @@ def test_crypto_static_asset_mode_controls_are_present() -> None:
     assert "Could not set" in crypto_js
     assert "crypto-alert" in crypto_css
     assert "crypto-live-blockers" in crypto_css
+    assert "/static/crypto.js?v={{ static_asset_version }}" in crypto_template
+    assert "/static/crypto.css?v={{ static_asset_version }}" in crypto_template

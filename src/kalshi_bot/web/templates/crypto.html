@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block extra_head %}
-  <link rel="stylesheet" href="/static/crypto.css" />
+  <link rel="stylesheet" href="/static/crypto.css?v={{ static_asset_version }}" />
 {% endblock %}
 {% block main_class %}shell-main-wide crypto-main{% endblock %}
 {% block content %}
@@ -28,5 +28,5 @@
 {% endblock %}
 
 {% block extra_scripts %}
-  <script src="/static/crypto.js"></script>
+  <script src="/static/crypto.js?v={{ static_asset_version }}"></script>
 {% endblock %}

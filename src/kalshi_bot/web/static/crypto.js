@@ -188,7 +188,7 @@
 
   function card(market) {
     const signal = market.signal || {};
-    const gateStatus = ((state.payload || {}).replay_gate || {}).status || "missing";
+    const gateStatus = (market.replay_gate || {}).status || ((state.payload || {}).replay_gate || {}).status || "missing";
     const room = market.active_room;
     const side = signal.recommended_side;
     const target = market.target_price_dollars ? money(market.target_price_dollars, 4) : "target n/a";

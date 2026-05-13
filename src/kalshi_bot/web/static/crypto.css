@@ -295,7 +295,8 @@
 }
 
 .crypto-gate-blocked,
-.crypto-gate-missing {
+.crypto-gate-missing,
+.crypto-gate-mixed {
   color: #ffcc66;
 }
 

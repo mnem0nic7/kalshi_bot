@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
@@ -22,7 +23,7 @@ def _crypto_payload() -> dict[str, object]:
             "crypto_trading_enabled": False,
             "crypto_autonomy_enabled": True,
         },
-        "replay_gate": {"status": "missing"},
+        "replay_gate": {"status": "passed", "scope": "live_assets"},
         "asset_modes": {"BTC": "shadow", "ETH": "live"},
         "asset_mode_counts": {"off": 0, "shadow": 1, "live": 1},
         "markets": [
@@ -37,6 +38,7 @@ def _crypto_payload() -> dict[str, object]:
                 "no_ask_dollars": "0.5300",
                 "volume": 105941,
                 "asset_mode": "shadow",
+                "replay_gate": {"status": "passed"},
                 "live_eligible": False,
                 "live_blockers": ["Asset BTC mode is shadow; set it to live to allow live orders."],
                 "signal": {
@@ -75,6 +77,7 @@ def _crypto_payload() -> dict[str, object]:
                 "no_ask_dollars": "0.5800",
                 "volume": 5293,
                 "asset_mode": "live",
+                "replay_gate": {"status": "blocked"},
                 "live_eligible": False,
                 "live_blockers": ["crypto_trading_enabled is false"],
                 "signal": {
@@ -112,7 +115,7 @@ def _crypto_html(payload: dict[str, object]) -> str:
     <html lang="en">
       <head>
         <meta charset="utf-8" />
-        <link rel="stylesheet" href="/static/crypto.css" />
+        <link rel="stylesheet" href="/static/crypto.css?v=test" />
       </head>
       <body>
         <main class="crypto-main">
@@ -136,7 +139,7 @@ def _crypto_html(payload: dict[str, object]) -> str:
           <section class="crypto-status-strip" id="crypto-status-strip" aria-label="Crypto status"></section>
           <section class="crypto-grid" id="crypto-grid" aria-label="15 minute crypto markets"></section>
         </main>
-        <script src="/static/crypto.js"></script>
+        <script src="/static/crypto.js?v=test"></script>
       </body>
     </html>
     """
@@ -148,11 +151,12 @@ def _install_crypto_routes(page, payload: dict[str, object]) -> None:
 
     def route_handler(route) -> None:
         url = route.request.url
-        if url.endswith("/crypto"):
+        path = urlparse(url).path
+        if path == "/crypto":
             route.fulfill(status=200, content_type="text/html", body=_crypto_html(payload))
-        elif url.endswith("/static/crypto.js"):
+        elif path == "/static/crypto.js":
             route.fulfill(status=200, content_type="application/javascript", body=crypto_js)
-        elif url.endswith("/static/crypto.css"):
+        elif path == "/static/crypto.css":
             route.fulfill(status=200, content_type="text/css", body=crypto_css)
         elif "/api/crypto/assets/BTC/mode" in url:
             route.fulfill(
@@ -181,7 +185,10 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
 
             assert page.locator(".crypto-card").count() == 2
             assert page.locator(".crypto-live-blockers").count() == 1
+            assert "passed" in page.locator(".crypto-status-pill", has_text="Replay Gate").inner_text()
             assert page.locator(".crypto-card").first.get_attribute("data-market") == "KXBTC15M-TEST"
+            assert page.locator('[data-market="KXBTC15M-TEST"] .crypto-gate').inner_text() == "passed"
+            assert page.locator('[data-market="KXETH15M-TEST"] .crypto-gate').inner_text() == "blocked"
             assert (
                 page.locator('[data-market="KXBTC15M-TEST"] .crypto-edge-summary').inner_text()
                 == "raw +55bps / net -145bps / need +500bps"
