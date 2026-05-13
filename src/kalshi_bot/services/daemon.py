@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import threading
 import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import HistoricalIntelligenceRunRequest, ShadowCampaignRequest
@@ -115,6 +116,8 @@ class DaemonService:
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
         self._active_color_cache: tuple[float, bool] | None = None
         self._last_market_update_dispatched_at: dict[str, float] = {}
+        self._threaded_liveness_stop: threading.Event | None = None
+        self._threaded_liveness_thread: threading.Thread | None = None
 
     async def _recover_orphaned_rooms(self) -> None:
         async with self.session_factory() as session:
@@ -286,6 +289,8 @@ class DaemonService:
         tasks: dict[str, asyncio.Task] = {}
         try:
             await self.heartbeat_once(run_follow_up=False)
+            if max_messages is None and run_seconds is None:
+                self._start_threaded_liveness_heartbeat()
             tasks["heartbeat"] = asyncio.create_task(self._periodic_heartbeat_loop())
 
             startup_delay = self._startup_delay_seconds()
@@ -373,6 +378,93 @@ class DaemonService:
             if follow_up_task is not None and not follow_up_task.done():
                 follow_up_task.cancel()
                 await asyncio.gather(follow_up_task, return_exceptions=True)
+            self._stop_threaded_liveness_heartbeat()
+
+    def _start_threaded_liveness_heartbeat(self) -> None:
+        if self._threaded_liveness_thread is not None and self._threaded_liveness_thread.is_alive():
+            return
+        if self.settings.daemon_heartbeat_interval_seconds <= 0:
+            return
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._threaded_liveness_heartbeat_loop,
+            args=(stop_event,),
+            name=f"daemon-liveness-{self.settings.kalshi_env}-{self.settings.app_color}",
+            daemon=True,
+        )
+        self._threaded_liveness_stop = stop_event
+        self._threaded_liveness_thread = thread
+        thread.start()
+
+    def _stop_threaded_liveness_heartbeat(self) -> None:
+        stop_event = self._threaded_liveness_stop
+        thread = self._threaded_liveness_thread
+        self._threaded_liveness_stop = None
+        self._threaded_liveness_thread = None
+        if stop_event is None or thread is None:
+            return
+        stop_event.set()
+        thread.join(timeout=5)
+
+    def _threaded_liveness_heartbeat_loop(self, stop_event: threading.Event) -> None:
+        interval = max(1.0, float(self.settings.daemon_heartbeat_interval_seconds))
+        while not stop_event.wait(interval):
+            try:
+                asyncio.run(
+                    self._write_threaded_liveness_checkpoint(
+                        reason="threaded_liveness",
+                        details={"interval_seconds": interval},
+                    )
+                )
+            except Exception:
+                logger.warning("threaded daemon liveness heartbeat failed", exc_info=True)
+
+    async def _write_threaded_liveness_checkpoint(
+        self,
+        *,
+        reason: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "app_color": self.settings.app_color,
+            "kalshi_env": self.settings.kalshi_env,
+            "heartbeat_at": self._now_iso(),
+            "lightweight": True,
+            "threaded": True,
+            "reason": reason,
+        }
+        if details is not None:
+            payload["details"] = details
+
+        engine = create_async_engine(self.settings.database_url, pool_pre_ping=True)
+        try:
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            async with session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+                last_reconcile = await repo.get_checkpoint(
+                    f"daemon_reconcile:{self.settings.kalshi_env}:{self.settings.app_color}"
+                )
+                payload.update(
+                    {
+                        "active_color": control.active_color,
+                        "kill_switch_enabled": control.kill_switch_enabled,
+                        "last_reconcile_at": (
+                            last_reconcile.payload.get("reconciled_at")
+                            if last_reconcile is not None and isinstance(last_reconcile.payload, dict)
+                            else None
+                        ),
+                    }
+                )
+                await repo.set_checkpoint(
+                    f"daemon_heartbeat:{self.settings.kalshi_env}:{self.settings.app_color}",
+                    None,
+                    payload,
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+        return payload
 
     async def _stream_forever(
         self,
