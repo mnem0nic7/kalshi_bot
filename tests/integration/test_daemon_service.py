@@ -290,6 +290,7 @@ async def test_daemon_service_runs_startup_reconcile_and_heartbeat(tmp_path) -> 
         daemon_heartbeat_interval_seconds=60,
         daemon_startup_grace_seconds=0,
         daemon_startup_jitter_seconds=0,
+        weather_research_refresh_interval_seconds=0,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -400,6 +401,51 @@ async def test_daemon_run_writes_heartbeat_before_startup_warmup(tmp_path) -> No
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_restarts_unbounded_stream_instead_of_stopping_heartbeat(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-stream-supervision.db",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
+        weather_research_refresh_interval_seconds=0,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    stream_service = FakeStreamService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        stream_service,  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+    )
+
+    result = await daemon.run(run_seconds=0.1)
+
+    async with session_factory() as session:
+        checkpoint = (
+            await session.execute(select(Checkpoint).where(Checkpoint.stream_name == "daemon_heartbeat:demo:blue"))
+        ).scalar_one()
+
+    assert result["completed"] == "timer"
+    assert stream_service.calls == [["WX-DISCOVERED"]]
+    assert checkpoint.payload["reason"] == "market_stream_restart"
+    assert checkpoint.payload["details"]["restart_count"] == 1
+
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

@@ -305,15 +305,22 @@ class DaemonService:
             self._schedule_heartbeat_follow_up(await self.heartbeat_once(run_follow_up=False))
             selected_markets = await self._select_stream_markets(markets)
 
+            stream_coro = (
+                self.stream_service.stream(
+                    market_tickers=selected_markets,
+                    include_private=not public_only,
+                    max_messages=max_messages,
+                    on_market_update=self._handle_market_update,
+                )
+                if max_messages is not None
+                else self._stream_forever(
+                    market_tickers=selected_markets,
+                    include_private=not public_only,
+                    on_market_update=self._handle_market_update,
+                )
+            )
             periodic_tasks = {
-                "stream": asyncio.create_task(
-                    self.stream_service.stream(
-                        market_tickers=selected_markets,
-                        include_private=not public_only,
-                        max_messages=max_messages,
-                        on_market_update=self._handle_market_update,
-                    )
-                ),
+                "stream": asyncio.create_task(stream_coro),
                 "reconcile": asyncio.create_task(self._periodic_reconcile_loop()),
                 "market_history": asyncio.create_task(self._periodic_market_history_loop()),
                 "strategy_c": asyncio.create_task(self._periodic_strategy_c_loop()),
@@ -366,6 +373,46 @@ class DaemonService:
             if follow_up_task is not None and not follow_up_task.done():
                 follow_up_task.cancel()
                 await asyncio.gather(follow_up_task, return_exceptions=True)
+
+    async def _stream_forever(
+        self,
+        *,
+        market_tickers: list[str],
+        include_private: bool,
+        on_market_update: Any,
+    ) -> None:
+        restart_count = 0
+        while True:
+            processed_messages: Any = None
+            try:
+                processed_messages = await self.stream_service.stream(
+                    market_tickers=market_tickers,
+                    include_private=include_private,
+                    max_messages=None,
+                    on_market_update=on_market_update,
+                )
+                logger.warning(
+                    "Market stream ended unexpectedly; restarting env=%s color=%s processed_messages=%s",
+                    self.settings.kalshi_env,
+                    self.settings.app_color,
+                    processed_messages,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("market stream crashed; restarting", exc_info=True)
+            restart_count += 1
+            try:
+                await self.heartbeat_liveness_tick(
+                    reason="market_stream_restart",
+                    details={
+                        "restart_count": restart_count,
+                        "processed_messages": processed_messages,
+                    },
+                )
+            except Exception:
+                logger.warning("stream restart heartbeat tick failed", exc_info=True)
+            await asyncio.sleep(5)
 
     async def _select_stream_markets(self, markets: list[str] | None) -> list[str]:
         selected_markets = list(dict.fromkeys(markets or await self.discovery_service.list_stream_markets()))
