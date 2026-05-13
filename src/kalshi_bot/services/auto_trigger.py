@@ -13,6 +13,7 @@ from kalshi_bot.core.schemas import RoomCreate
 from kalshi_bot.db.models import MarketState, ResearchDossierRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeThresholds
+from kalshi_bot.services.signal_attention import SignalAttentionService
 from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_FILLED_EXIT,
     STOP_LOSS_OUTCOME_SUBMIT_FAILED,
@@ -81,7 +82,12 @@ class AutoTriggerService:
                     cooldown_seconds=thresholds.trigger_cooldown_seconds,
                     severity="info",
                     summary=f"Auto-trigger skipped for {market_ticker}: market lifecycle is terminal",
-                    payload={"market_ticker": market_ticker, "reason": "terminal_market", **terminal_market},
+                    payload={
+                        "market_ticker": market_ticker,
+                        "reason": "terminal_market",
+                        "reason_code": "resolved_contract_pre_room_filter",
+                        **terminal_market,
+                    },
                     kalshi_env=self.settings.kalshi_env,
                 )
                 await session.commit()
@@ -115,7 +121,12 @@ class AutoTriggerService:
                     cooldown_seconds=thresholds.trigger_cooldown_seconds,
                     severity="info",
                     summary=f"Auto-trigger skipped for {market_ticker}: latest research says contract is resolved",
-                    payload={"market_ticker": market_ticker, "reason": "resolved_contract", **resolved_research},
+                    payload={
+                        "market_ticker": market_ticker,
+                        "reason": "resolved_contract",
+                        "reason_code": "resolved_contract_pre_room_filter",
+                        **resolved_research,
+                    },
                     kalshi_env=self.settings.kalshi_env,
                 )
                 await session.commit()
@@ -147,6 +158,20 @@ class AutoTriggerService:
                 kalshi_env=self.settings.kalshi_env,
             )
             if existing_room is not None:
+                await session.commit()
+                return
+
+            backoff = await self._signal_backoff(repo, market_ticker, market_state, thresholds)
+            if backoff is not None:
+                await self._log_block_once_per_cooldown(
+                    repo,
+                    checkpoint_key=f"auto_trigger_block:{self.settings.kalshi_env}:{market_ticker}:{backoff['reason']}",
+                    cooldown_seconds=max(thresholds.trigger_cooldown_seconds, int(backoff.get("cooldown_seconds") or 1800)),
+                    severity="warning" if backoff["reason"] == "edge_growing_cooloff" else "info",
+                    summary=f"Auto-trigger suppressed for {market_ticker}: {backoff['reason']}",
+                    payload={"market_ticker": market_ticker, **backoff},
+                    kalshi_env=self.settings.kalshi_env,
+                )
                 await session.commit()
                 return
 
@@ -428,6 +453,30 @@ class AutoTriggerService:
             kalshi_env=self.settings.kalshi_env,
         )
         return True
+
+    async def _signal_backoff(
+        self,
+        repo: PlatformRepository,
+        market_ticker: str,
+        market_state: MarketState,
+        thresholds: RuntimeThresholds,
+    ) -> dict[str, Any] | None:
+        del thresholds
+        if not bool(getattr(self.settings, "weather_static_signal_backoff_enabled", True)):
+            return None
+        service = SignalAttentionService(self.settings)
+        rows = await service.load_rows(
+            repo.session,
+            kalshi_env=self.settings.kalshi_env,
+            market_ticker=market_ticker,
+            lookback_hours=1,
+            limit=20,
+        )
+        return service.room_creation_backoff(
+            rows,
+            current_mid_dollars=self._mid_dollars(market_state),
+            now=datetime.now(UTC),
+        )
 
     async def _run_room(self, market_ticker: str, room_id: str) -> None:
         try:
@@ -819,13 +868,10 @@ class AutoTriggerService:
     ) -> dict[str, Any] | None:
         if dossier_record is None:
             return None
-        if self._record_is_expired(dossier_record, now=now):
-            return None
 
         payload = dict(dossier_record.payload or {})
         freshness = payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
-        if bool(freshness.get("stale")):
-            return None
+        expired = self._record_is_expired(dossier_record, now=now)
 
         trader_context = payload.get("trader_context") if isinstance(payload.get("trader_context"), dict) else {}
         summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
@@ -848,6 +894,8 @@ class AutoTriggerService:
             "resolution_state": str(resolution_state),
             "last_run_id": getattr(dossier_record, "last_run_id", None),
             "expires_at": self._iso_or_none(getattr(dossier_record, "expires_at", None)),
+            "stale": bool(freshness.get("stale")),
+            "expired": expired,
             "current_temp_f": numeric_facts.get("current_temp_f"),
             "threshold_f": numeric_facts.get("threshold_f"),
         }

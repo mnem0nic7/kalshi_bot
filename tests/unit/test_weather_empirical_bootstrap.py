@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from kalshi_bot.core.schemas import AgentPackWeatherBootstrapPolicy
@@ -173,6 +173,99 @@ def test_live_enabled_cold_tier_applies_size_factor_and_caps() -> None:
     assert decision.size_factor == 0.10
     assert decision.daily_notional_cap_dollars == 100.0
     assert decision.max_concurrent_positions == 1
+
+
+def test_close_strike_probe_unlocks_low_confidence_delta_two_with_tiny_cap() -> None:
+    policy = AgentPackWeatherBootstrapPolicy(
+        rollout_state="promoted_low",
+        local_overrides={
+            "close_strike_probe": {
+                "enabled": True,
+                "max_order_notional_dollars": 0.25,
+                "tiers": [
+                    {"name": "conf60_delta2_edge3500", "min_confidence": 0.60, "min_abs_delta_f": 2.0, "min_edge_bps": 3500}
+                ],
+            }
+        },
+    )
+    policy.tiers["cold"] = policy.tiers["cold"].model_copy(update={"live_enabled": True})
+
+    decision = WeatherEmpiricalBootstrapService().evaluate(
+        context=_context(
+            confidence=0.64,
+            edge_bps_after_buffer=3600,
+            forecast_delta_f=2.0,
+            trade_regime="near_threshold",
+            pre_empirical_stand_down_reason="insufficient_forecast_separation",
+        ),
+        policy=policy,
+        now=NOW,
+    )
+
+    assert decision.allowed_live is True
+    assert decision.max_order_notional_dollars == 0.25
+    assert "close_strike_probe_unlocked" in decision.reason_codes
+    assert decision.thresholds["close_strike_probe"]["tier"] == "conf60_delta2_edge3500"
+
+
+def test_close_strike_probe_blocks_below_confidence_floor() -> None:
+    policy = AgentPackWeatherBootstrapPolicy(
+        rollout_state="promoted_low",
+        local_overrides={"close_strike_probe": {"enabled": True}},
+    )
+    policy.tiers["cold"] = policy.tiers["cold"].model_copy(update={"live_enabled": True})
+
+    decision = WeatherEmpiricalBootstrapService().evaluate(
+        context=_context(
+            confidence=0.59,
+            edge_bps_after_buffer=8000,
+            forecast_delta_f=5.0,
+            pre_empirical_stand_down_reason="insufficient_forecast_separation",
+        ),
+        policy=policy,
+        now=NOW,
+    )
+
+    assert decision.allowed_live is False
+    assert decision.reason == "close_strike_probe_tier_not_matched"
+    assert "close_strike_probe_evidence_failed" in decision.reason_codes
+
+
+def test_close_strike_probe_respects_cooldown() -> None:
+    policy = AgentPackWeatherBootstrapPolicy(
+        rollout_state="promoted_low",
+        local_overrides={
+            "close_strike_probe": {
+                "enabled": True,
+                "max_order_notional_dollars": 0.25,
+                "cooldown_seconds": 3600,
+            }
+        },
+    )
+    policy.tiers["cold"] = policy.tiers["cold"].model_copy(update={"live_enabled": True})
+    recent_probe = _event(
+        event_type="risk",
+        status="approved",
+        occurred_at=NOW - timedelta(minutes=30),
+        payload={"reason_codes": ["close_strike_probe_unlocked"]},
+    )
+
+    decision = WeatherEmpiricalBootstrapService().evaluate(
+        context=_context(
+            confidence=0.94,
+            edge_bps_after_buffer=6000,
+            forecast_delta_f=4.0,
+            pre_empirical_stand_down_reason="insufficient_forecast_separation",
+        ),
+        policy=policy,
+        recent_events=[recent_probe],
+        now=NOW,
+    )
+
+    assert decision.allowed_live is False
+    assert decision.reason == "close_strike_probe_cooldown_active"
+    assert "probe_cooldown_active" in decision.reason_codes
+    assert decision.thresholds["close_strike_probe"]["cooldown"]["active"] is True
 
 
 def test_shadow_gate_counts_scoped_market_episodes_not_repeated_rows() -> None:

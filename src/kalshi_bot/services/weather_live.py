@@ -151,7 +151,7 @@ class WeatherLiveService:
                 color=control.active_color,
                 version=staged_pack.version,
             )
-
+            control = await repo.get_deployment_control(kalshi_env=kalshi_env)
             notes = dict(control.notes or {})
             notes["weather_live"] = {
                 "enabled": True,
@@ -194,6 +194,140 @@ class WeatherLiveService:
             "action": "activate",
             "activated": bool(post.get("live_capable")),
             "policy_pack_version": post.get("active_weather_policy", {}).get("pack_version"),
+        }
+
+    async def auto_enable_close_strike_probes(
+        self,
+        *,
+        kalshi_env: str = "production",
+        actor: str = "rejected_weather_scorer",
+        evidence_report: dict[str, Any],
+        dry_run: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        now = _as_utc(now) or _utc_now()
+        unlock = dict(evidence_report.get("unlock") or {})
+        if not bool(unlock.get("passed")):
+            return {
+                "action": "auto_enable_close_strike_probes",
+                "enabled": False,
+                "reason": "evidence_failed",
+                "reason_codes": unlock.get("reason_codes") or ["close_strike_probe_evidence_failed"],
+                "dry_run": dry_run,
+            }
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=kalshi_env)
+            preflight = await self._status(repo, kalshi_env=kalshi_env, days=1, now=now)
+            health_blockers = [
+                blocker
+                for blocker in preflight.blockers
+                if blocker["code"]
+                not in {"weather_policy_expired", "weather_policy_missing", "weather_policy_threshold_drift"}
+            ]
+            if health_blockers:
+                return {
+                    **preflight.result,
+                    "action": "auto_enable_close_strike_probes",
+                    "enabled": False,
+                    "reason": "preflight_blocked",
+                    "blockers": health_blockers,
+                    "dry_run": dry_run,
+                }
+
+            control = await repo.get_deployment_control(kalshi_env=kalshi_env)
+            notes = dict(control.notes or {})
+            weather_live = dict(notes.get("weather_live") or {})
+            existing_version = str(weather_live.get("active_policy_pack_version") or "")
+            if (
+                weather_live.get("enabled") is True
+                and weather_live.get("policy_state") == "live"
+                and existing_version.startswith("weather-close-strike-probe-")
+            ):
+                return {
+                    "action": "auto_enable_close_strike_probes",
+                    "enabled": False,
+                    "reason": "already_enabled",
+                    "policy_pack_version": existing_version,
+                    "dry_run": dry_run,
+                }
+
+            active_pack = await self.agent_pack_service.get_active_pack(repo)
+            staged_pack = self._close_strike_probe_pack(
+                active_pack,
+                now=now,
+                actor=actor,
+                kalshi_env=kalshi_env,
+                evidence_report=evidence_report,
+            )
+            payload = {
+                "actor": actor,
+                "policy_pack_version": staged_pack.version,
+                "policy_key": WEATHER_LIVE_POLICY_KEY,
+                "evidence": {
+                    "candidate_count": evidence_report.get("candidate_count"),
+                    "settled_count": evidence_report.get("settled_count"),
+                    "directional_accuracy": evidence_report.get("directional_accuracy"),
+                    "ask_net_pnl_dollars": evidence_report.get("ask_net_pnl_dollars"),
+                    "reason_codes": unlock.get("reason_codes") or [],
+                },
+                "max_order_notional_dollars": self.settings.weather_live_probe_max_order_notional_dollars,
+                "daily_notional_dollars": self.settings.weather_live_probe_daily_notional_dollars,
+            }
+            if dry_run:
+                return {
+                    "action": "auto_enable_close_strike_probes",
+                    "enabled": False,
+                    "would_enable": True,
+                    "policy_pack_version": staged_pack.version,
+                    "payload": payload,
+                    "dry_run": True,
+                }
+
+            await repo.update_agent_pack(staged_pack)
+            await self.agent_pack_service.assign_pack_to_color(
+                repo,
+                color=control.active_color,
+                version=staged_pack.version,
+            )
+            control = await repo.get_deployment_control(kalshi_env=kalshi_env)
+            notes = dict(control.notes or {})
+            weather_live = dict(notes.get("weather_live") or {})
+            notes["weather_live"] = {
+                **weather_live,
+                "enabled": True,
+                "policy_state": "live",
+                "strategy_code": StrategyCode.DIRECTIONAL.value,
+                "activated_at": now.isoformat(),
+                "activated_by": actor,
+                "activation_source": "rejected_weather_opportunity_score",
+                "active_policy_pack_version": staged_pack.version,
+                "previous_agent_pack_version": active_pack.version,
+                "valid_until": (now + timedelta(days=WEATHER_LIVE_POLICY_VALID_DAYS)).isoformat(),
+                "daily_realized_loss_cap_pct": 0.02,
+                "max_order_count_fp": 200,
+                "bootstrap": {
+                    "live_tiers": ["cold"],
+                    "max_concurrent_positions": 1,
+                    "max_daily_notional_usd": self.settings.weather_live_probe_daily_notional_dollars,
+                    "max_order_notional_usd": self.settings.weather_live_probe_max_order_notional_dollars,
+                    "cooldown_seconds": self.settings.weather_live_probe_cooldown_seconds,
+                    "close_strike_probe": True,
+                },
+            }
+            await repo.update_deployment_notes(notes, kalshi_env=kalshi_env)
+            await repo.log_ops_event(
+                severity="warning",
+                summary="weather_close_strike_probe_auto_enabled",
+                source="weather_live",
+                kalshi_env=kalshi_env,
+                payload=payload,
+            )
+            await session.commit()
+        return {
+            "action": "auto_enable_close_strike_probes",
+            "enabled": True,
+            "policy_pack_version": staged_pack.version,
+            "dry_run": False,
         }
 
     async def rollback(
@@ -545,6 +679,162 @@ class WeatherLiveService:
                 "parent_version": active_pack.version,
                 "source": "operator_weather_live",
                 "description": "Weather full-live policy: mature deterministic + cold bootstrap only.",
+                "weather_policy": AgentPackWeatherPolicyBook(
+                    policies=weather_policy.policies,
+                    cohort_memberships=weather_policy.cohort_memberships,
+                    grid_versions=weather_policy.grid_versions,
+                ),
+                "metadata": metadata,
+                "created_at": now,
+            },
+        )
+
+    def _close_strike_probe_pack(
+        self,
+        active_pack: Any,
+        *,
+        now: datetime,
+        actor: str,
+        kalshi_env: str,
+        evidence_report: dict[str, Any],
+    ) -> Any:
+        valid_until = now + timedelta(days=WEATHER_LIVE_POLICY_VALID_DAYS)
+        version = f"weather-close-strike-probe-{now:%Y%m%dT%H%M%SZ}"
+        thresholds = AgentPackThresholds(
+            risk_min_edge_bps=self.settings.risk_min_edge_bps,
+            risk_max_credible_edge_bps=self.settings.risk_max_credible_edge_bps,
+            risk_min_confidence=self.settings.risk_min_confidence,
+            risk_min_contract_price_dollars=self.settings.risk_min_contract_price_dollars,
+            risk_max_order_notional_dollars=self.settings.risk_max_order_notional_dollars,
+            risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
+            risk_safe_capital_reserve_ratio=self.settings.risk_safe_capital_reserve_ratio,
+            risk_risky_capital_max_ratio=self.settings.risk_risky_capital_max_ratio,
+            trigger_max_spread_bps=self.settings.trigger_max_spread_bps,
+            trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
+            strategy_min_abs_delta_f=self.settings.strategy_min_abs_delta_f,
+            strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
+        )
+        close_strike_config = {
+            "enabled": True,
+            "max_order_notional_dollars": self.settings.weather_live_probe_max_order_notional_dollars,
+            "cooldown_seconds": self.settings.weather_live_probe_cooldown_seconds,
+            "tiers": [
+                {"name": "conf90_delta2_edge3000", "min_confidence": 0.90, "min_abs_delta_f": 2.0, "min_edge_bps": 3000},
+                {"name": "conf75_delta3_edge4000", "min_confidence": 0.75, "min_abs_delta_f": 3.0, "min_edge_bps": 4000},
+                {"name": "conf60_delta2_edge3500", "min_confidence": 0.60, "min_abs_delta_f": 2.0, "min_edge_bps": 3500},
+            ],
+            "unlock_report": {
+                "generated_at": evidence_report.get("generated_at"),
+                "candidate_count": evidence_report.get("candidate_count"),
+                "settled_count": evidence_report.get("settled_count"),
+                "directional_accuracy": evidence_report.get("directional_accuracy"),
+                "ask_net_pnl_dollars": evidence_report.get("ask_net_pnl_dollars"),
+            },
+        }
+        bootstrap = AgentPackWeatherBootstrapPolicy(
+            enabled=True,
+            rollout_state="promoted_low",
+            evidence_ready=True,
+            allow_forecast_separation_bootstrap=True,
+            fair_value_fallback_disqualifies=True,
+            local_overrides={"close_strike_probe": close_strike_config},
+            tiers={
+                "cold": AgentPackWeatherBootstrapTier(
+                    min_samples=0,
+                    max_samples=0,
+                    min_confidence=0.90,
+                    min_edge_bps=3000,
+                    size_factor=1.0,
+                    live_enabled=True,
+                ),
+                "warming": AgentPackWeatherBootstrapTier(
+                    min_samples=1,
+                    max_samples=9,
+                    min_confidence=0.80,
+                    min_edge_bps=1500,
+                    size_factor=0.25,
+                    live_enabled=False,
+                ),
+                "maturing": AgentPackWeatherBootstrapTier(
+                    min_samples=10,
+                    max_samples=19,
+                    min_confidence=0.70,
+                    min_edge_bps=800,
+                    size_factor=0.50,
+                    live_enabled=False,
+                ),
+            },
+            caps=AgentPackWeatherBootstrapCaps(
+                initial_daily_notional_usd=self.settings.weather_live_probe_daily_notional_dollars,
+                initial_max_concurrent_positions=1,
+                expanded_daily_notional_usd=self.settings.weather_live_probe_daily_notional_dollars,
+                expanded_max_concurrent_positions=1,
+                kill_switch_lookback=10,
+                kill_switch_min_rows=5,
+                kill_switch_min_win_rate=0.30,
+                kill_switch_drawdown_usd=1.0,
+                consecutive_loss_kill_switch_threshold=1,
+            ),
+            promotion={
+                "activated_by": actor,
+                "activated_at": now.isoformat(),
+                "kalshi_env": kalshi_env,
+                "source": "rejected_weather_opportunity_score",
+                "live_tiers": ["cold"],
+            },
+        )
+        policy = AgentPackWeatherPolicy(
+            policy_key=WEATHER_LIVE_POLICY_KEY,
+            domain="weather",
+            strategy_code=StrategyCode.DIRECTIONAL.value,
+            cohort_id="global",
+            series_ticker="any",
+            side="any",
+            season="all_season",
+            month="all_month",
+            regime="any",
+            threshold_band="any",
+            lane="entry_gate",
+            mode="live",
+            action="keep_current",
+            thresholds=thresholds,
+            bootstrap=bootstrap,
+            reason_codes=["close_strike_probe_unlocked"],
+            deterministic_summary=(
+                "Weather close-strike probe policy auto-enabled from rejected-opportunity evidence. "
+                "Normal 8F separation stays in place; only evidence-gated bootstrap entries can use tiny close-strike probes."
+            ),
+            valid_until=valid_until,
+            metadata={
+                "daily_realized_loss_cap_pct": 0.02,
+                "max_order_count_fp": 200,
+                "max_order_notional_dollars": self.settings.weather_live_probe_max_order_notional_dollars,
+                "daily_notional_dollars": self.settings.weather_live_probe_daily_notional_dollars,
+                "evidence_report": {
+                    "candidate_count": evidence_report.get("candidate_count"),
+                    "settled_count": evidence_report.get("settled_count"),
+                    "directional_accuracy": evidence_report.get("directional_accuracy"),
+                    "ask_net_pnl_dollars": evidence_report.get("ask_net_pnl_dollars"),
+                },
+            },
+        )
+        weather_policy = active_pack.weather_policy.model_copy(deep=True)
+        weather_policy.policies[WEATHER_LIVE_POLICY_KEY] = policy
+        metadata = dict(active_pack.metadata or {})
+        metadata["weather_close_strike_probe"] = {
+            "activated_by": actor,
+            "activated_at": now.isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "policy_key": WEATHER_LIVE_POLICY_KEY,
+        }
+        return active_pack.model_copy(
+            deep=True,
+            update={
+                "version": version,
+                "status": "active",
+                "parent_version": active_pack.version,
+                "source": "rejected_weather_opportunity_score",
+                "description": "Weather close-strike tiny-probe policy auto-enabled from rejected-opportunity evidence.",
                 "weather_policy": AgentPackWeatherPolicyBook(
                     policies=weather_policy.policies,
                     cohort_memberships=weather_policy.cohort_memberships,

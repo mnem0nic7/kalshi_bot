@@ -117,6 +117,42 @@ async def test_weather_live_activate_stages_cold_bootstrap_policy(weather_live_h
 
 
 @pytest.mark.asyncio
+async def test_weather_live_auto_enables_close_strike_probe_policy(weather_live_harness) -> None:
+    _settings, session_factory, _agent_pack_service, service = weather_live_harness
+    report = {
+        "unlock": {"passed": True, "reason_codes": ["close_strike_probe_unlocked"]},
+        "candidate_count": 5,
+        "settled_count": 5,
+        "directional_accuracy": 0.80,
+        "ask_net_pnl_dollars": "2.5000",
+        "generated_at": NOW.isoformat(),
+    }
+
+    result = await service.auto_enable_close_strike_probes(
+        kalshi_env="production",
+        actor="pytest",
+        evidence_report=report,
+        now=NOW,
+    )
+
+    assert result["enabled"] is True
+    assert result["policy_pack_version"].startswith("weather-close-strike-probe-")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        control = await repo.get_deployment_control(kalshi_env="production")
+        active_pack = await _agent_pack_service.get_active_pack(repo)
+        await session.commit()
+
+    assert control.notes["weather_live"]["bootstrap"]["max_order_notional_usd"] == 0.25
+    assert control.notes["weather_live"]["bootstrap"]["cooldown_seconds"] == 3600
+    policy = active_pack.weather_policy.policies["weather/a/global/any/any/all_season/all_month/any/any/entry_gate"]
+    close_strike = policy.bootstrap.local_overrides["close_strike_probe"]
+    assert close_strike["enabled"] is True
+    assert close_strike["tiers"][2]["min_confidence"] == 0.60
+
+
+@pytest.mark.asyncio
 async def test_weather_live_status_blocks_on_kill_switch(weather_live_harness) -> None:
     _settings, session_factory, _agent_pack_service, service = weather_live_harness
     async with session_factory() as session:

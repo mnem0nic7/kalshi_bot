@@ -468,6 +468,7 @@ async def test_auto_trigger_skips_fresh_resolved_research_before_room_creation(t
     assert supervisor.calls == []
     assert checkpoint is not None
     assert checkpoint.payload["reason"] == "resolved_contract"
+    assert checkpoint.payload["reason_code"] == "resolved_contract_pre_room_filter"
     assert checkpoint.payload["resolution_state"] == "locked_yes"
     assert any("latest research says contract is resolved" in event.summary for event in ops_events)
 

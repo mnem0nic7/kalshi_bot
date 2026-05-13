@@ -78,6 +78,22 @@ def _fee_adjusted_edge_for_count(
     return fee_estimate_dollars_per_contract, fee_edge_bps, gross_edge_bps - fee_edge_bps
 
 
+def _close_strike_probe_unlocked(signal: StrategySignal) -> bool:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    bootstrap = trace.get("weather_empirical_bootstrap")
+    if not isinstance(bootstrap, dict):
+        bootstrap = (
+            (signal.eligibility.candidate_trace or {}).get("weather_empirical_bootstrap")
+            if signal.eligibility is not None and isinstance(signal.eligibility.candidate_trace, dict)
+            else {}
+        )
+    if not isinstance(bootstrap, dict):
+        return False
+    return bool(bootstrap.get("applied")) and "close_strike_probe_unlocked" in {
+        str(code) for code in bootstrap.get("reason_codes") or []
+    }
+
+
 def _bucket_fit_count(*, available_notional_dollars: Decimal, ticket: TradeTicket) -> Decimal | None:
     unit_notional = _ticket_unit_notional(ticket)
     if unit_notional <= Decimal("0"):
@@ -470,12 +486,18 @@ class DeterministicRiskEngine:
                 f"(max {self.settings.risk_max_concurrent_tickers})."
             )
 
-        non_standard_regime = signal.trade_regime in ("near_threshold", "longshot_yes", "longshot_no")
+        close_strike_probe = _close_strike_probe_unlocked(signal)
+        non_standard_regime = signal.trade_regime in ("longshot_yes", "longshot_no") or (
+            signal.trade_regime == "near_threshold" and not close_strike_probe
+        )
         if is_buy_entry and non_standard_regime:
             block(
                 f"Trade regime '{signal.trade_regime}' is not permitted; only standard-regime trades are allowed."
             )
             code("non_standard_regime")
+        elif is_buy_entry and signal.trade_regime == "near_threshold" and close_strike_probe:
+            note("Close-strike probe evidence permits this near-threshold entry under tiny-probe caps.")
+            code("close_strike_probe_unlocked")
 
         if is_buy_entry and active_thresholds.risk_max_order_notional_dollars is not None and float(order_notional) > active_thresholds.risk_max_order_notional_dollars:
             block("Ticket notional exceeds max order notional.")

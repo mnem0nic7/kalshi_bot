@@ -25,6 +25,7 @@ from kalshi_bot.services.decision_corpus import DecisionCorpusService
 from kalshi_bot.services.market_history import MarketHistoryService
 from kalshi_bot.services.reconcile import ReconciliationService
 from kalshi_bot.services.research import ResearchCoordinator
+from kalshi_bot.services.signal_attention import SignalAttentionService
 from kalshi_bot.services.shadow_campaign import ShadowCampaignService
 from kalshi_bot.services.self_improve import SelfImproveService
 from kalshi_bot.services.shadow import ShadowTrainingService
@@ -77,6 +78,7 @@ class DaemonService:
         crypto_history_service: CryptoHistoryService | None = None,
         crypto_spot_service: CryptoSpotService | None = None,
         crypto_autonomy_service: CryptoAutonomyService | None = None,
+        weather_live_service: Any | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -107,6 +109,7 @@ class DaemonService:
         self.crypto_history_service = crypto_history_service
         self.crypto_spot_service = crypto_spot_service
         self.crypto_autonomy_service = crypto_autonomy_service
+        self.weather_live_service = weather_live_service
         self.stop_loss_service = stop_loss_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
@@ -435,9 +438,63 @@ class DaemonService:
                         result.get("refreshed"),
                         result.get("failed"),
                     )
+                    scorer = await self._maybe_run_rejected_weather_scorer_daily()
+                    if scorer is not None:
+                        logger.info(
+                            "Rejected weather opportunity scorer status=%s settled=%s unlock=%s",
+                            scorer.get("status"),
+                            scorer.get("settled_count"),
+                            ((scorer.get("unlock") or {}).get("passed") if isinstance(scorer.get("unlock"), dict) else None),
+                        )
                 except Exception:
                     logger.warning("weather research refresh loop error", exc_info=True)
             await asyncio.sleep(interval)
+
+    async def _maybe_run_rejected_weather_scorer_daily(self) -> dict[str, Any] | None:
+        if not bool(getattr(self.settings, "weather_rejected_opportunity_scorer_enabled", True)):
+            return None
+        if self.weather_live_service is None:
+            return {"status": "skipped", "reason": "weather_live_service_missing"}
+        today = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+        checkpoint_name = f"daemon_rejected_weather_scorer:{self.settings.kalshi_env}:{self.settings.app_color}:{today}"
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            checkpoint = await repo.get_checkpoint(checkpoint_name)
+            if checkpoint is not None:
+                await session.commit()
+                return None
+            service = SignalAttentionService(self.settings)
+            report = await service.score_rejected_weather_opportunities(
+                session,
+                kalshi_env=self.settings.kalshi_env,
+                lookback_hours=self.settings.weather_rejected_opportunity_lookback_hours,
+                dedupe="first-qualifying",
+                persist_bootstrap_evidence=True,
+                dry_run=False,
+            )
+            await session.commit()
+            activation = None
+            if (
+                bool(getattr(self.settings, "weather_rejected_opportunity_auto_enable", True))
+                and bool((report.get("unlock") or {}).get("passed"))
+            ):
+                activation = await self.weather_live_service.auto_enable_close_strike_probes(
+                    kalshi_env=self.settings.kalshi_env,
+                    actor=f"daemon:{self.settings.app_color}",
+                    evidence_report=report,
+                    dry_run=False,
+                )
+            payload = {
+                "ran_at": datetime.now(UTC).isoformat(),
+                "status": "ok",
+                "candidate_count": report.get("candidate_count"),
+                "settled_count": report.get("settled_count"),
+                "unlock": report.get("unlock"),
+                "activation": activation,
+            }
+            await repo.set_checkpoint(checkpoint_name, cursor=None, payload=payload)
+            await session.commit()
+            return payload
 
     async def _periodic_strategy_c_loop(self) -> None:
         interval = self.settings.strategy_c_cadence_idle_seconds

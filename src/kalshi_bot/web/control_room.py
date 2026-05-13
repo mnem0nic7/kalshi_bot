@@ -1848,10 +1848,24 @@ def _active_room_view(room: Any) -> dict[str, Any]:
 
 def _ops_event_view(event: Any) -> dict[str, Any]:
     payload = dict(event.payload or {})
+    summary = event.summary
+    is_watchdog_recovery = (
+        payload.get("event_category") == "watchdog_self_recovery"
+        or (str(event.source or "").lower() == "watchdog" and str(event.summary or "") == "Watchdog requested recovery action")
+    )
+    if is_watchdog_recovery:
+        action = str(payload.get("action") or "recovery")
+        reason = str(payload.get("reason") or "runtime health")
+        health = (
+            "current runtime healthy"
+            if payload.get("current_runtime_healthy") is True
+            else "runtime health needs follow-up"
+        )
+        summary = f"Watchdog self-recovery: {action} for {reason} ({health})"
     return {
         "id": event.id,
         "severity": event.severity,
-        "summary": event.summary,
+        "summary": summary,
         "source": event.source,
         "created_at": _iso_or_none(event.created_at),
         "updated_at": _iso_or_none(event.updated_at),

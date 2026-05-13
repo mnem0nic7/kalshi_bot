@@ -155,6 +155,18 @@ class Settings(BaseSettings):
     weather_live_probe_daily_notional_dollars: float = 1.0
     weather_live_probe_cooldown_seconds: int = 3600
     weather_live_balance_discontinuity_ratio: float = 0.50
+    weather_rejected_opportunity_scorer_enabled: bool = True
+    weather_rejected_opportunity_lookback_hours: int = 168
+    weather_rejected_opportunity_min_settled: int = 5
+    weather_rejected_opportunity_min_accuracy: float = 0.60
+    weather_rejected_opportunity_auto_enable: bool = True
+    weather_static_signal_backoff_enabled: bool = True
+    weather_static_signal_backoff_min_evaluations: int = 3
+    weather_static_signal_backoff_window_minutes: int = 30
+    weather_static_signal_backoff_cooldown_seconds: int = 1800
+    weather_static_signal_backoff_price_move_dollars: float = 0.05
+    weather_static_signal_backoff_edge_move_bps: int = 500
+    weather_static_signal_backoff_final_minutes: int = 90
 
     crypto_enabled: bool = True
     crypto_15m_enabled: bool = True
@@ -358,6 +370,7 @@ class Settings(BaseSettings):
     daemon_reconcile_interval_seconds: int = 60
     daemon_reconcile_stale_kill_switch_seconds: int = 300
     daemon_heartbeat_interval_seconds: int = 60
+    daemon_heartbeat_unhealthy_grace_seconds: int = 45
     daemon_active_color_cache_seconds: float = 0.0
     daemon_market_update_throttle_seconds: float = 0.0
     daemon_market_history_interval_seconds: int = 60

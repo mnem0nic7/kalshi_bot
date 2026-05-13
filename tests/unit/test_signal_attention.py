@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import pytest
 
 from kalshi_bot.config import Settings
+from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.decision_policy_variants import DecisionPolicyVariantService
 from kalshi_bot.services.signal_attention import (
     SignalAttentionService,
@@ -231,3 +236,197 @@ def test_static_signal_guard_requires_latest_consecutive_static_run() -> None:
         "KXHIGHNOLA-26MAY11-T79-room-5",
         "KXHIGHNOLA-26MAY11-T79-room-6",
     ]
+
+
+def _score_row(market: str, idx: int, *, side: str = "yes", confidence: float = 0.94, edge: int = 5200) -> dict:
+    return {
+        "room_id": f"room-{idx}",
+        "market_ticker": market,
+        "updated_at": (NOW + timedelta(minutes=idx)).isoformat(),
+        "recommended_side": side.upper(),
+        "confidence": confidence,
+        "quality_adjusted_edge_bps": edge,
+        "edge_bps": edge + 250,
+        "forecast_threshold_delta_f": 4.0 if confidence >= 0.75 else 2.0,
+        "primary_block_reason": "forecast_too_close_to_threshold",
+        "gates_failed": ["forecast_too_close_to_threshold"],
+        "yes_bid": "0.3000",
+        "yes_ask": "0.3500",
+        "yes_mid": "0.3250",
+        "no_bid": "0.6500",
+        "no_ask": "0.7000",
+        "no_mid": "0.6750",
+        "bucket_id": "score-bucket",
+    }
+
+
+@pytest.mark.asyncio
+async def test_rejected_weather_scorer_dedupes_scores_ask_and_persists_evidence(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/score.db",
+        weather_rejected_opportunity_min_settled=5,
+        weather_rejected_opportunity_min_accuracy=0.60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    markets = [f"KXHIGHNY-26MAY1{idx}-T66" for idx in range(5)]
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        for market in markets:
+            await repo.upsert_historical_settlement_label(
+                market_ticker=market,
+                series_ticker="KXHIGHNY",
+                local_market_day="26MAY10",
+                source_kind="test",
+                kalshi_result="yes",
+                settlement_value_dollars=Decimal("1.0000"),
+                settlement_ts=NOW,
+                crosscheck_status="match",
+                crosscheck_high_f=Decimal("70"),
+                crosscheck_result="yes",
+                payload={},
+            )
+        await session.commit()
+
+    rows = [_score_row(market, idx) for idx, market in enumerate(markets)]
+    rows.append(_score_row(markets[0], 99, edge=9000))
+
+    async def fake_load_rows(*args, **kwargs):
+        return rows
+
+    monkeypatch.setattr(SignalAttentionService, "load_rows", fake_load_rows)
+
+    async with session_factory() as session:
+        service = SignalAttentionService(settings)
+        report = await service.score_rejected_weather_opportunities(
+            session,
+            kalshi_env="production",
+            lookback_hours=168,
+            persist_bootstrap_evidence=True,
+            dry_run=False,
+        )
+        await session.commit()
+
+    assert report["candidate_count"] == 5
+    assert report["settled_count"] == 5
+    assert report["unlock"]["passed"] is True
+    assert Decimal(report["ask_net_pnl_dollars"]) > Decimal("0")
+    assert report["persistence"]["created"] == 5
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        evidence = await repo.list_weather_bootstrap_historical_evidence(kalshi_env="production", limit=10)
+        await session.commit()
+
+    assert len(evidence) == 5
+    assert all(row.payload["source"] == "rejected_weather_opportunity_score" for row in evidence)
+
+    async with session_factory() as session:
+        service = SignalAttentionService(settings)
+        second = await service.score_rejected_weather_opportunities(
+            session,
+            kalshi_env="production",
+            lookback_hours=168,
+            persist_bootstrap_evidence=True,
+            dry_run=False,
+        )
+        await session.commit()
+
+    assert second["persistence"]["existing"] == 5
+    assert second["persistence"]["created"] == 0
+    await engine.dispose()
+
+
+def test_room_creation_backoff_blocks_static_and_releases_on_price_move() -> None:
+    service = SignalAttentionService(
+        Settings(
+            database_url="sqlite+aiosqlite:///./test.db",
+            weather_static_signal_backoff_cooldown_seconds=1800,
+        )
+    )
+    rows = [
+        {
+            **_row("KXHIGHBOS-26MAY11-T61", idx, edge=1200, fair="0.5100"),
+            "yes_mid": "0.5000",
+            "market_close_time": (NOW + timedelta(hours=6)).isoformat(),
+            "time_to_close_minutes": 360,
+        }
+        for idx in range(1, 4)
+    ]
+
+    backoff = service.room_creation_backoff(rows, current_mid_dollars=Decimal("0.5000"), now=NOW + timedelta(minutes=31))
+
+    assert backoff is not None
+    assert backoff["reason"] == "static_signal_backoff"
+
+    released = service.room_creation_backoff(rows, current_mid_dollars=Decimal("0.5600"), now=NOW + timedelta(minutes=31))
+
+    assert released is None
+
+    edge_released = service.room_creation_backoff(
+        rows,
+        current_mid_dollars=Decimal("0.5000"),
+        current_edge_bps=1800,
+        now=NOW + timedelta(minutes=31),
+    )
+
+    assert edge_released is None
+
+
+@pytest.mark.asyncio
+async def test_rejected_weather_scorer_persists_evidence_even_when_unlock_fails(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/score_failed_unlock.db",
+        weather_rejected_opportunity_min_settled=6,
+        weather_rejected_opportunity_min_accuracy=0.60,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    markets = [f"KXHIGHNY-26MAY2{idx}-T66" for idx in range(5)]
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        for market in markets:
+            await repo.upsert_historical_settlement_label(
+                market_ticker=market,
+                series_ticker="KXHIGHNY",
+                local_market_day="26MAY20",
+                source_kind="test",
+                kalshi_result="yes",
+                settlement_value_dollars=Decimal("1.0000"),
+                settlement_ts=NOW,
+                crosscheck_status="match",
+                crosscheck_high_f=Decimal("70"),
+                crosscheck_result="yes",
+                payload={},
+            )
+        await session.commit()
+
+    async def fake_load_rows(*args, **kwargs):
+        return [_score_row(market, idx) for idx, market in enumerate(markets)]
+
+    monkeypatch.setattr(SignalAttentionService, "load_rows", fake_load_rows)
+
+    async with session_factory() as session:
+        report = await SignalAttentionService(settings).score_rejected_weather_opportunities(
+            session,
+            kalshi_env="production",
+            lookback_hours=168,
+            persist_bootstrap_evidence=True,
+            dry_run=False,
+        )
+        await session.commit()
+
+    assert report["unlock"]["passed"] is False
+    assert report["persistence"]["created"] == 5
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        evidence = await repo.list_weather_bootstrap_historical_evidence(kalshi_env="production", limit=10)
+        await session.commit()
+
+    assert len(evidence) == 5
+    await engine.dispose()

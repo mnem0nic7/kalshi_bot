@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 from collections import defaultdict
@@ -14,6 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from kalshi_bot.config import Settings
 from kalshi_bot.db.models import Room, Signal
+from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.services.fee_model import current_fee_model_version, estimate_kalshi_taker_fee_dollars
+from kalshi_bot.services.trade_behavior import series_from_ticker
+from kalshi_bot.services.weather_empirical_bootstrap import market_day_from_ticker
 
 
 ATTENTION_EXPORT_COLUMNS = [
@@ -39,6 +44,29 @@ ATTENTION_EXPORT_COLUMNS = [
     "edge_trajectory",
     "room_ids",
 ]
+
+REJECTED_WEATHER_SCORE_COLUMNS = [
+    "market_ticker",
+    "room_id",
+    "updated_at",
+    "recommended_side",
+    "confidence",
+    "quality_adjusted_edge_bps",
+    "edge_bps",
+    "forecast_threshold_delta_f",
+    "settlement_result",
+    "directional_win",
+    "mid_price",
+    "ask_price",
+    "mid_net_pnl_dollars",
+    "ask_net_pnl_dollars",
+    "fee_dollars",
+    "unlock_tier",
+    "bucket_id",
+]
+
+WEATHER_POLICY_A_KEY = "weather/a/global/any/any/all_season/all_month/any/any/entry_gate"
+REJECTED_WEATHER_REPLAY_VERSION = "rejected-weather-opportunity-v1"
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -70,6 +98,19 @@ def _decimal_text(value: Any) -> str | None:
         return f"{Decimal(str(value)):.4f}"
     except Exception:
         return str(value)
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.0001"))
+    except Exception:
+        return None
+
+
+def _money(value: Decimal | None) -> str | None:
+    return f"{value.quantize(Decimal('0.0001'))}" if value is not None else None
 
 
 def _iso_or_none(value: datetime | str | None) -> str | None:
@@ -392,6 +433,7 @@ def extract_decision_fields(
         "recommended_size": recommended_size,
         "recommended_size_cap": _decimal_text(recommended_size_cap),
         "recommended_size_cap_reason": "; ".join(str(item) for item in model_quality_reasons) if model_quality_reasons else None,
+        "trade_regime": str(payload.get("trade_regime") or trace.get("trade_regime") or "") or None,
         "market_close_time": str(market_close_time) if market_close_time not in (None, "") else None,
         "time_to_close_minutes": time_to_close_minutes,
         "evaluation_n": None,
@@ -620,6 +662,354 @@ class SignalAttentionService:
         pattern["stale_room_ids"] = [row.get("room_id") for row in stale if row.get("room_id")]
         return pattern
 
+    def room_creation_backoff(
+        self,
+        rows: Iterable[dict[str, Any]],
+        *,
+        current_mid_dollars: Decimal | None = None,
+        current_edge_bps: int | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        if not bool(getattr(self.settings, "weather_static_signal_backoff_enabled", True)):
+            return None
+        row_list = sorted(list(rows), key=lambda item: str(item.get("updated_at") or ""))
+        if not row_list:
+            return None
+        now_utc = _as_utc(now) or datetime.now(UTC)
+        latest = row_list[-1]
+        final_minutes = max(0, int(getattr(self.settings, "weather_static_signal_backoff_final_minutes", 90)))
+        time_to_close = _float_or_none(latest.get("time_to_close_minutes"))
+        if time_to_close is not None and 0 <= time_to_close <= final_minutes:
+            return None
+
+        patterns = [
+            pattern for pattern in self.detect_patterns(row_list)
+            if pattern.get("pattern") in {"static_edge", "static_fair_value", "edge_growing"}
+        ]
+        if not patterns:
+            return None
+
+        min_evals = max(1, int(getattr(self.settings, "weather_static_signal_backoff_min_evaluations", 3)))
+        window_minutes = max(1, int(getattr(self.settings, "weather_static_signal_backoff_window_minutes", 30)))
+        cooldown_seconds = max(1, int(getattr(self.settings, "weather_static_signal_backoff_cooldown_seconds", 1800)))
+        price_move = Decimal(str(getattr(self.settings, "weather_static_signal_backoff_price_move_dollars", 0.05)))
+        edge_move = int(getattr(self.settings, "weather_static_signal_backoff_edge_move_bps", 500))
+        rows_by_id = {row.get("room_id"): row for row in row_list if row.get("room_id")}
+
+        for pattern in sorted(patterns, key=lambda item: str(item.get("last_seen") or ""), reverse=True):
+            pattern_name = str(pattern.get("pattern") or "")
+            if int(pattern.get("n_evaluations") or 0) < min_evals:
+                continue
+            span = _float_or_none(pattern.get("time_span_minutes"))
+            if span is not None and span > window_minutes:
+                continue
+            last_seen = _parse_datetime(pattern.get("last_seen"))
+            if last_seen is None or now_utc - last_seen >= timedelta(seconds=cooldown_seconds):
+                continue
+            pattern_rows = [rows_by_id.get(room_id) for room_id in pattern.get("room_ids") or []]
+            pattern_rows = [row for row in pattern_rows if isinstance(row, dict)]
+            latest_pattern_row = pattern_rows[-1] if pattern_rows else latest
+            last_mid = _decimal_or_none(latest_pattern_row.get("yes_mid"))
+            if current_mid_dollars is not None and last_mid is not None and abs(current_mid_dollars - last_mid) >= price_move:
+                continue
+            last_edge = _int_or_none(latest_pattern_row.get("edge_bps"))
+            if current_edge_bps is not None and last_edge is not None and abs(int(current_edge_bps) - last_edge) >= edge_move:
+                continue
+            return {
+                "reason": "edge_growing_cooloff" if pattern_name == "edge_growing" else "static_signal_backoff",
+                "pattern": pattern_name,
+                "market_ticker": latest.get("market_ticker"),
+                "n_evaluations": pattern.get("n_evaluations"),
+                "first_seen": pattern.get("first_seen"),
+                "last_seen": pattern.get("last_seen"),
+                "cooldown_seconds": cooldown_seconds,
+                "cooldown_expires_at": (last_seen + timedelta(seconds=cooldown_seconds)).isoformat(),
+                "release_conditions": [
+                    f"price_move_gte_{price_move}",
+                    f"edge_move_gte_{edge_move}bps",
+                    f"final_{final_minutes}_minutes",
+                ],
+            }
+        return None
+
+    async def score_rejected_weather_opportunities(
+        self,
+        session: AsyncSession,
+        *,
+        kalshi_env: str,
+        lookback_hours: int | None = None,
+        dedupe: str = "first-qualifying",
+        persist_bootstrap_evidence: bool = False,
+        dry_run: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        if dedupe != "first-qualifying":
+            raise ValueError("Only dedupe='first-qualifying' is supported")
+        now_utc = _as_utc(now) or datetime.now(UTC)
+        repo = PlatformRepository(session, kalshi_env=kalshi_env)
+        rows = await self.load_rows(
+            session,
+            kalshi_env=kalshi_env,
+            lookback_hours=lookback_hours,
+        )
+        qualifying: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        skipped_reasons: defaultdict[str, int] = defaultdict(int)
+        for row in sorted(rows, key=lambda item: str(item.get("updated_at") or "")):
+            tier = self._close_strike_score_tier(row)
+            if tier is None:
+                skipped_reasons["not_close_strike_candidate"] += 1
+                continue
+            market = str(row.get("market_ticker") or "")
+            side = str(row.get("recommended_side") or "").lower()
+            key = (market, side)
+            if key in seen:
+                skipped_reasons["duplicate_market_side"] += 1
+                continue
+            seen.add(key)
+            qualifying.append(await self._score_rejected_weather_row(repo, row, tier=tier))
+
+        settled = [row for row in qualifying if row.get("settlement_result") in {"yes", "no"}]
+        ask_scored = [row for row in settled if row.get("ask_net_pnl_dollars") is not None]
+        wins = [row for row in ask_scored if row.get("directional_win") is True]
+        ask_net = sum(
+            ((_decimal_or_none(row.get("ask_net_pnl_dollars")) or Decimal("0")) for row in ask_scored),
+            Decimal("0"),
+        )
+        mid_net = sum(
+            ((_decimal_or_none(row.get("mid_net_pnl_dollars")) or Decimal("0")) for row in settled),
+            Decimal("0"),
+        )
+        fees = sum(
+            ((_decimal_or_none(row.get("fee_dollars")) or Decimal("0")) for row in ask_scored),
+            Decimal("0"),
+        )
+        settled_count = len(ask_scored)
+        accuracy = (len(wins) / settled_count) if settled_count else 0.0
+        min_settled = max(1, int(getattr(self.settings, "weather_rejected_opportunity_min_settled", 5)))
+        min_accuracy = float(getattr(self.settings, "weather_rejected_opportunity_min_accuracy", 0.60))
+        unlock_passed = settled_count >= min_settled and ask_net > Decimal("0") and accuracy >= min_accuracy
+        unlock_reasons: list[str] = []
+        if settled_count < min_settled:
+            unlock_reasons.append("close_strike_probe_evidence_missing")
+        if ask_net <= Decimal("0"):
+            unlock_reasons.append("ask_net_pnl_not_positive")
+        if accuracy < min_accuracy:
+            unlock_reasons.append("directional_accuracy_below_min")
+        unlock_reasons.append("close_strike_probe_unlocked" if unlock_passed else "close_strike_probe_evidence_failed")
+
+        persistence = {"requested": persist_bootstrap_evidence, "dry_run": dry_run, "created": 0, "existing": 0, "would_create": 0}
+        if persist_bootstrap_evidence:
+            for row in ask_scored:
+                created = await self._persist_rejected_weather_evidence(repo, row, dry_run=dry_run)
+                if dry_run and created:
+                    persistence["would_create"] += 1
+                elif created:
+                    persistence["created"] += 1
+                else:
+                    persistence["existing"] += 1
+
+        report = {
+            "schema": "rejected-weather-opportunity-score-v1",
+            "kalshi_env": kalshi_env,
+            "lookback_hours": lookback_hours if lookback_hours is not None else self.settings.signals_attention_lookback_hours,
+            "dedupe": dedupe,
+            "generated_at": now_utc.isoformat(),
+            "candidate_count": len(qualifying),
+            "settled_count": settled_count,
+            "missing_label_count": sum(1 for row in qualifying if row.get("settlement_result") is None),
+            "missing_ask_price_count": sum(1 for row in settled if row.get("ask_net_pnl_dollars") is None),
+            "directional_win_count": len(wins),
+            "directional_accuracy": round(accuracy, 6),
+            "ask_net_pnl_dollars": _money(ask_net),
+            "mid_net_pnl_dollars": _money(mid_net),
+            "fee_dollars": _money(fees),
+            "unlock": {
+                "passed": unlock_passed,
+                "reason_codes": list(dict.fromkeys(unlock_reasons)),
+                "min_settled": min_settled,
+                "min_accuracy": min_accuracy,
+                "requires_ask_net_pnl_positive": True,
+            },
+            "persistence": persistence,
+            "skipped_reasons": dict(skipped_reasons),
+            "opportunities": qualifying,
+        }
+        if not dry_run:
+            await repo.log_ops_event(
+                severity="info" if unlock_passed else "warning",
+                summary="weather_rejected_opportunity_score",
+                source="signals-worth-attention",
+                kalshi_env=kalshi_env,
+                payload={key: value for key, value in report.items() if key != "opportunities"},
+            )
+        return report
+
+    def _close_strike_score_tier(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        market = str(row.get("market_ticker") or "").upper()
+        if not market.startswith("KXHIGH"):
+            return None
+        side = str(row.get("recommended_side") or "").lower()
+        if side not in {"yes", "no"}:
+            return None
+        primary = str(row.get("primary_block_reason") or "")
+        failed = {str(item) for item in row.get("gates_failed") or []}
+        if primary not in {"forecast_too_close_to_threshold", "empirical_gate_under_sampled"} and not (
+            {"forecast_too_close_to_threshold", "empirical_gate_under_sampled"} & failed
+        ):
+            return None
+        if bool(row.get("market_stale")) or bool(row.get("research_stale")):
+            return None
+        confidence = _float_or_none(row.get("confidence"))
+        edge = _int_or_none(row.get("quality_adjusted_edge_bps")) or _int_or_none(row.get("edge_bps"))
+        delta = _float_or_none(row.get("forecast_threshold_delta_f"))
+        if confidence is None or edge is None or delta is None:
+            return None
+        abs_delta = abs(delta)
+        tiers = (
+            {"name": "conf90_delta2_edge3000", "min_confidence": 0.90, "min_abs_delta_f": 2.0, "min_edge_bps": 3000},
+            {"name": "conf75_delta3_edge4000", "min_confidence": 0.75, "min_abs_delta_f": 3.0, "min_edge_bps": 4000},
+            {"name": "conf60_delta2_edge3500", "min_confidence": 0.60, "min_abs_delta_f": 2.0, "min_edge_bps": 3500},
+        )
+        for tier in tiers:
+            if confidence >= tier["min_confidence"] and abs_delta >= tier["min_abs_delta_f"] and edge >= tier["min_edge_bps"]:
+                return tier
+        return None
+
+    async def _score_rejected_weather_row(
+        self,
+        repo: PlatformRepository,
+        row: dict[str, Any],
+        *,
+        tier: dict[str, Any],
+    ) -> dict[str, Any]:
+        market = str(row.get("market_ticker") or "")
+        side = str(row.get("recommended_side") or "").lower()
+        label = await repo.get_historical_settlement_label(market)
+        settlement_result = None
+        settlement_ts = None
+        if label is not None:
+            result = str(label.kalshi_result or label.crosscheck_result or "").lower()
+            settlement_result = result if result in {"yes", "no"} else None
+            settlement_ts = label.settlement_ts.isoformat() if label.settlement_ts is not None else None
+        mid_price = _side_price(row, side, kind="mid")
+        ask_price = _side_price(row, side, kind="ask")
+        mid_sim = self._simulate_binary_pnl(side=side, price=mid_price, settlement_result=settlement_result)
+        ask_sim = self._simulate_binary_pnl(side=side, price=ask_price, settlement_result=settlement_result)
+        return {
+            "market_ticker": market,
+            "room_id": row.get("room_id"),
+            "updated_at": row.get("updated_at"),
+            "recommended_side": side.upper() if side else None,
+            "confidence": row.get("confidence"),
+            "quality_adjusted_edge_bps": row.get("quality_adjusted_edge_bps"),
+            "edge_bps": row.get("edge_bps"),
+            "forecast_threshold_delta_f": row.get("forecast_threshold_delta_f"),
+            "primary_block_reason": row.get("primary_block_reason"),
+            "gates_failed": row.get("gates_failed") or [],
+            "settlement_result": settlement_result,
+            "settlement_ts": settlement_ts,
+            "directional_win": (side == settlement_result) if settlement_result in {"yes", "no"} and side in {"yes", "no"} else None,
+            "mid_price": _money(mid_price),
+            "ask_price": _money(ask_price),
+            "mid_gross_pnl_dollars": _money(mid_sim["gross"]),
+            "mid_net_pnl_dollars": _money(mid_sim["net"]),
+            "ask_gross_pnl_dollars": _money(ask_sim["gross"]),
+            "ask_net_pnl_dollars": _money(ask_sim["net"]),
+            "fee_dollars": _money(ask_sim["fee"]),
+            "fee_model_version": current_fee_model_version() if ask_sim["fee"] is not None else None,
+            "unlock_tier": tier["name"],
+            "bucket_id": row.get("bucket_id"),
+            "policy_key": WEATHER_POLICY_A_KEY,
+            "source_fingerprint": self._evidence_fingerprint(row, side=side, policy_key=WEATHER_POLICY_A_KEY),
+            "trade_regime": row.get("trade_regime"),
+        }
+
+    def _simulate_binary_pnl(
+        self,
+        *,
+        side: str,
+        price: Decimal | None,
+        settlement_result: str | None,
+    ) -> dict[str, Decimal | None]:
+        if price is None or settlement_result not in {"yes", "no"} or side not in {"yes", "no"}:
+            return {"gross": None, "fee": None, "net": None}
+        payout = Decimal("1.0000") if side == settlement_result else Decimal("0.0000")
+        gross = (payout - price).quantize(Decimal("0.0001"))
+        fee = estimate_kalshi_taker_fee_dollars(
+            price_dollars=price,
+            count=Decimal("1.00"),
+            fee_rate=Decimal(str(self.settings.kalshi_taker_fee_rate)),
+        ).quantize(Decimal("0.0001"))
+        return {"gross": gross, "fee": fee, "net": (gross - fee).quantize(Decimal("0.0001"))}
+
+    async def _persist_rejected_weather_evidence(
+        self,
+        repo: PlatformRepository,
+        row: dict[str, Any],
+        *,
+        dry_run: bool,
+    ) -> bool:
+        pnl = _decimal_or_none(row.get("ask_net_pnl_dollars"))
+        if pnl is None:
+            return False
+        existing = await repo.get_weather_bootstrap_historical_evidence(
+            kalshi_env=repo.kalshi_env,
+            source_fingerprint=str(row["source_fingerprint"]),
+            market_ticker=str(row["market_ticker"]),
+            bucket_key=row.get("bucket_id"),
+            policy_key=row.get("policy_key"),
+        )
+        if existing is not None:
+            return False
+        if dry_run:
+            return True
+        await repo.save_weather_bootstrap_historical_evidence(
+            kalshi_env=repo.kalshi_env,
+            market_ticker=str(row["market_ticker"]),
+            replay_version=REJECTED_WEATHER_REPLAY_VERSION,
+            source_fingerprint=str(row["source_fingerprint"]),
+            series_ticker=series_from_ticker(str(row["market_ticker"])),
+            local_market_day=market_day_from_ticker(str(row["market_ticker"])),
+            bucket_key=row.get("bucket_id"),
+            policy_key=row.get("policy_key"),
+            tier="cold",
+            strict_replay=True,
+            side=str(row.get("recommended_side") or "").lower() or None,
+            confidence=_float_or_none(row.get("confidence")),
+            edge_bps=_int_or_none(row.get("quality_adjusted_edge_bps")) or _int_or_none(row.get("edge_bps")),
+            count_fp=Decimal("1.00"),
+            notional_dollars=_decimal_or_none(row.get("ask_price")),
+            pnl_dollars=pnl,
+            evidence_weight=1.0,
+            outcome="win" if row.get("directional_win") is True else "loss",
+            observed_at=_parse_datetime(row.get("updated_at")) or datetime.now(UTC),
+            payload={
+                "source": "rejected_weather_opportunity_score",
+                "room_id": row.get("room_id"),
+                "settlement_result": row.get("settlement_result"),
+                "ask_price": row.get("ask_price"),
+                "mid_price": row.get("mid_price"),
+                "fee_dollars": row.get("fee_dollars"),
+                "fee_model_version": row.get("fee_model_version"),
+                "unlock_tier": row.get("unlock_tier"),
+                "fair_value_source": "intraday_model",
+            },
+        )
+        return True
+
+    @staticmethod
+    def _evidence_fingerprint(row: dict[str, Any], *, side: str, policy_key: str) -> str:
+        payload = {
+            "schema": REJECTED_WEATHER_REPLAY_VERSION,
+            "market_ticker": row.get("market_ticker"),
+            "room_id": row.get("room_id"),
+            "updated_at": row.get("updated_at"),
+            "side": side,
+            "policy_key": policy_key,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:32]
+
 
 def _time_span_minutes(rows: list[dict[str, Any]]) -> float | None:
     if len(rows) < 2:
@@ -634,6 +1024,29 @@ def _time_span_minutes(rows: list[dict[str, Any]]) -> float | None:
         return round((last.astimezone(UTC) - first.astimezone(UTC)).total_seconds() / 60, 2)
     except Exception:
         return None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _side_price(row: dict[str, Any], side: str, *, kind: str) -> Decimal | None:
+    if side == "yes":
+        return _decimal_or_none(row.get(f"yes_{kind}"))
+    if side == "no":
+        return _decimal_or_none(row.get(f"no_{kind}"))
+    return None
 
 
 def _latest_static_run(
@@ -660,6 +1073,15 @@ def attention_rows_to_csv(rows: Iterable[dict[str, Any]]) -> str:
     writer.writeheader()
     for row in rows:
         writer.writerow({key: _csv_value(row.get(key)) for key in ATTENTION_EXPORT_COLUMNS})
+    return output.getvalue()
+
+
+def rejected_weather_score_rows_to_csv(rows: Iterable[dict[str, Any]]) -> str:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=REJECTED_WEATHER_SCORE_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: _csv_value(row.get(key)) for key in REJECTED_WEATHER_SCORE_COLUMNS})
     return output.getvalue()
 
 

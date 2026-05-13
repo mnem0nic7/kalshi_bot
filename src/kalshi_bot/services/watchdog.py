@@ -20,7 +20,11 @@ class WatchdogService:
 
     @property
     def daemon_unhealthy_after_seconds(self) -> int:
-        return (self.settings.daemon_heartbeat_interval_seconds * 2) + 15
+        return (
+            (self.settings.daemon_heartbeat_interval_seconds * 2)
+            + 15
+            + max(0, int(getattr(self.settings, "daemon_heartbeat_unhealthy_grace_seconds", 0)))
+        )
 
     @property
     def active_restart_wait_seconds(self) -> int:
@@ -90,6 +94,11 @@ class WatchdogService:
             "last_reconcile_at": reconcile_at.isoformat() if reconcile_at is not None else None,
             "last_reconcile_age_seconds": reconcile_age,
             "threshold_seconds": self.daemon_unhealthy_after_seconds,
+            "threshold_components": {
+                "heartbeat_interval_seconds": self.settings.daemon_heartbeat_interval_seconds,
+                "base_seconds": (self.settings.daemon_heartbeat_interval_seconds * 2) + 15,
+                "grace_seconds": max(0, int(getattr(self.settings, "daemon_heartbeat_unhealthy_grace_seconds", 0))),
+            },
         }
 
     async def get_status(self, repo: PlatformRepository, *, kalshi_env: str | None = None) -> dict[str, Any]:
@@ -320,7 +329,11 @@ class WatchdogService:
                 severity="critical" if action == "restart_stack" else "warning",
                 summary="Watchdog requested recovery action",
                 source="watchdog",
-                payload=action_payload,
+                payload={
+                    **action_payload,
+                    "event_category": "watchdog_self_recovery",
+                    "current_runtime_healthy": bool(colors.get(active_color, {}).get("combined_healthy")),
+                },
             )
         return action_payload
 

@@ -73,7 +73,11 @@ from kalshi_bot.services.decision_trace import decision_trace_record_to_dict, re
 from kalshi_bot.services.decision_policy_variants import DecisionPolicyVariantService
 from kalshi_bot.services.parameter_packs import ParameterPackCanaryConfig, ParameterPackPromotionService
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
-from kalshi_bot.services.signal_attention import SignalAttentionService, attention_rows_to_csv
+from kalshi_bot.services.signal_attention import (
+    SignalAttentionService,
+    attention_rows_to_csv,
+    rejected_weather_score_rows_to_csv,
+)
 from kalshi_bot.services.trade_analysis import format_trade_analysis_report
 from kalshi_bot.services.backtesting import (
     build_backtesting_report,
@@ -2415,6 +2419,31 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if args.command == "signals-worth-attention":
             async with container.session_factory() as session:
                 service = SignalAttentionService(container.settings)
+                if args.score_rejected_weather:
+                    report = await service.score_rejected_weather_opportunities(
+                        session,
+                        kalshi_env=args.kalshi_env,
+                        lookback_hours=args.lookback_hours,
+                        dedupe=args.dedupe,
+                        persist_bootstrap_evidence=args.persist_bootstrap_evidence,
+                        dry_run=args.dry_run,
+                    )
+                    await session.commit()
+                    activation = None
+                    if args.auto_enable_probes and bool((report.get("unlock") or {}).get("passed")):
+                        activation = await container.weather_live_service.auto_enable_close_strike_probes(
+                            kalshi_env=args.kalshi_env,
+                            actor="signals-worth-attention",
+                            evidence_report=report,
+                            dry_run=args.dry_run,
+                        )
+                    if activation is not None:
+                        report["activation"] = activation
+                    if args.format == "csv":
+                        print(rejected_weather_score_rows_to_csv(report.get("opportunities") or []), end="")
+                    else:
+                        print(json.dumps(report, indent=2))
+                    return 0
                 rows = service.detect_patterns(
                     await service.load_rows(
                         session,
@@ -3542,6 +3571,11 @@ def build_parser() -> argparse.ArgumentParser:
     signals_attention.add_argument("--kalshi-env", default="production")
     signals_attention.add_argument("--lookback-hours", type=int, default=24)
     signals_attention.add_argument("--format", choices=["csv", "json"], default="json")
+    signals_attention.add_argument("--score-rejected-weather", action="store_true")
+    signals_attention.add_argument("--dedupe", choices=["first-qualifying"], default="first-qualifying")
+    signals_attention.add_argument("--persist-bootstrap-evidence", action="store_true")
+    signals_attention.add_argument("--auto-enable-probes", action="store_true")
+    signals_attention.add_argument("--dry-run", action="store_true")
 
     policy_audit = subparsers.add_parser("decision-policy-variants-audit")
     policy_audit.add_argument("--kalshi-env", default="production")

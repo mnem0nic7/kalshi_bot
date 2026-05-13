@@ -1244,6 +1244,8 @@ class WorkflowSupervisor:
                 (signal.candidate_trace or {}).get("active_policy_pack_version")
                 or (signal.candidate_trace or {}).get("agent_pack_version")
             ),
+            forecast_delta_f=signal.forecast_delta_f,
+            trade_regime=signal.trade_regime,
         )
         decision = WeatherEmpiricalBootstrapService().evaluate(
             context=context,
@@ -1427,6 +1429,23 @@ class WorkflowSupervisor:
                     ticket = ticket.model_copy(update={"count_fp": capped_count}) if capped_count > Decimal("0") else None
                     if ticket is None:
                         sizing_trace["stand_down_reason"] = "bootstrap_daily_notional_cap_reached"
+                        eligible = False
+                max_order_cap_raw = bootstrap_trace.get("max_order_notional_dollars")
+                if ticket is not None and max_order_cap_raw not in (None, ""):
+                    try:
+                        max_order_cap = float(max_order_cap_raw)
+                    except (TypeError, ValueError):
+                        max_order_cap = 0.0
+                    capped_ticket, cap_trace = _cap_ticket_notional(
+                        ticket,
+                        max_notional_dollars=max_order_cap,
+                    )
+                    sizing_trace["bootstrap_max_order_cap"] = cap_trace
+                    if (bootstrap_trace.get("reason_codes") or []) and "close_strike_probe_unlocked" in bootstrap_trace.get("reason_codes", []):
+                        cap_trace["reason_code"] = "close_strike_probe_unlocked"
+                    ticket = capped_ticket
+                    if ticket is None:
+                        sizing_trace["stand_down_reason"] = cap_trace.get("reason") or "bootstrap_max_order_cap_non_positive"
                         eligible = False
 
             if ticket is not None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable
 
@@ -184,6 +184,8 @@ class WeatherEmpiricalBootstrapContext:
     source_stale_reasons: tuple[str, ...] = ()
     room_id: str | None = None
     policy_pack_version: str | None = None
+    forecast_delta_f: float | None = None
+    trade_regime: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +230,7 @@ class WeatherEmpiricalBootstrapDecision:
     fair_value_source: str
     size_factor: float
     daily_notional_cap_dollars: float | None
+    max_order_notional_dollars: float | None
     max_concurrent_positions: int | None
     daily_notional_used_dollars: float
     concurrent_positions: int
@@ -270,6 +273,7 @@ class WeatherEmpiricalBootstrapDecision:
             "fair_value_source": self.fair_value_source,
             "size_factor": self.size_factor,
             "daily_notional_cap_dollars": self.daily_notional_cap_dollars,
+            "max_order_notional_dollars": self.max_order_notional_dollars,
             "max_concurrent_positions": self.max_concurrent_positions,
             "daily_notional_used_dollars": self.daily_notional_used_dollars,
             "concurrent_positions": self.concurrent_positions,
@@ -362,6 +366,7 @@ class WeatherEmpiricalBootstrapService:
             "fair_value_source": context.fair_value_source,
             "size_factor": 0.0,
             "daily_notional_cap_dollars": None,
+            "max_order_notional_dollars": None,
             "max_concurrent_positions": None,
             "daily_notional_used_dollars": 0.0,
             "concurrent_positions": 0,
@@ -428,6 +433,15 @@ class WeatherEmpiricalBootstrapService:
 
         confidence_required = float(tier.min_confidence)
         edge_required = int(tier.min_edge_bps)
+        close_strike = self._close_strike_probe_override(context, policy)
+        if close_strike.get("enabled") and context.pre_empirical_stand_down_reason == "insufficient_forecast_separation":
+            if not close_strike.get("matched"):
+                return blocked(
+                    str(close_strike.get("reason") or "close_strike_probe_evidence_failed"),
+                    *(close_strike.get("reason_codes") or ["close_strike_probe_evidence_failed"]),
+                )
+            confidence_required = float(close_strike["min_confidence"])
+            edge_required = int(close_strike["min_edge_bps"])
         if context.confidence_source != "calibrated":
             if policy.raw_confidence_cold_only and tier_name != "cold":
                 return blocked("raw_confidence_only_allowed_for_cold_tier", "raw_confidence_non_cold")
@@ -446,6 +460,32 @@ class WeatherEmpiricalBootstrapService:
             return replace(decision, kill_switch_active=True, kill_switch_reason=kill_reason)
 
         cap_dollars, concurrent_cap = self._caps(policy, rollout=rollout)
+        max_order_notional = (
+            float(close_strike["max_order_notional_dollars"])
+            if close_strike.get("matched") and close_strike.get("max_order_notional_dollars") is not None
+            else None
+        )
+        close_strike_cooldown = (
+            self._close_strike_probe_cooldown(recent_events, close_strike, now=now_utc)
+            if close_strike.get("matched")
+            else {"active": False}
+        )
+        if close_strike_cooldown.get("active"):
+            decision = blocked(
+                "close_strike_probe_cooldown_active",
+                "close_strike_probe_unlocked",
+                "probe_cooldown_active",
+            )
+            return replace(
+                decision,
+                thresholds={
+                    **decision.thresholds,
+                    "close_strike_probe": {
+                        **close_strike,
+                        "cooldown": close_strike_cooldown,
+                    },
+                },
+            )
         day_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
         daily_used = self._daily_notional_used(recent_events, since=day_start)
         concurrent = self._concurrent_positions(recent_events)
@@ -469,11 +509,13 @@ class WeatherEmpiricalBootstrapService:
             reason_codes=[
                 f"{tier_name}_tier_matched",
                 "live_enabled" if live_enabled else "shadow_only",
+                *(["close_strike_probe_unlocked"] if close_strike.get("matched") else []),
             ],
             **{
                 **base_kwargs,
                 "size_factor": float(tier.size_factor),
                 "daily_notional_cap_dollars": cap_dollars,
+                "max_order_notional_dollars": max_order_notional,
                 "max_concurrent_positions": concurrent_cap,
                 "daily_notional_used_dollars": float(daily_used),
                 "concurrent_positions": concurrent,
@@ -483,9 +525,119 @@ class WeatherEmpiricalBootstrapService:
                     **thresholds,
                     "min_confidence": confidence_required,
                     "min_edge_bps": edge_required,
+                    **(
+                        {"close_strike_probe": {**close_strike, "cooldown": close_strike_cooldown}}
+                        if close_strike.get("matched")
+                        else {}
+                    ),
                 },
             },
         )
+
+    def _close_strike_probe_override(
+        self,
+        context: WeatherEmpiricalBootstrapContext,
+        policy: AgentPackWeatherBootstrapPolicy,
+    ) -> dict[str, Any]:
+        config = dict((policy.local_overrides or {}).get("close_strike_probe") or {})
+        if not bool(config.get("enabled")):
+            return {"enabled": False, "matched": False}
+        if context.confidence is None:
+            return {
+                "enabled": True,
+                "matched": False,
+                "reason": "close_strike_probe_confidence_missing",
+                "reason_codes": ["close_strike_probe_evidence_failed"],
+            }
+        if context.forecast_delta_f is None:
+            return {
+                "enabled": True,
+                "matched": False,
+                "reason": "close_strike_probe_delta_missing",
+                "reason_codes": ["close_strike_probe_evidence_failed"],
+            }
+        edge = self._edge_int(context.edge_bps_after_buffer)
+        if edge is None:
+            return {
+                "enabled": True,
+                "matched": False,
+                "reason": "close_strike_probe_edge_missing",
+                "reason_codes": ["close_strike_probe_evidence_failed"],
+            }
+        tiers = list(config.get("tiers") or [])
+        if not tiers:
+            tiers = [
+                {"name": "conf90_delta2_edge3000", "min_confidence": 0.90, "min_abs_delta_f": 2.0, "min_edge_bps": 3000},
+                {"name": "conf75_delta3_edge4000", "min_confidence": 0.75, "min_abs_delta_f": 3.0, "min_edge_bps": 4000},
+                {"name": "conf60_delta2_edge3500", "min_confidence": 0.60, "min_abs_delta_f": 2.0, "min_edge_bps": 3500},
+            ]
+        abs_delta = abs(float(context.forecast_delta_f))
+        confidence = float(context.confidence)
+        for tier in tiers:
+            min_confidence = float(tier.get("min_confidence") or 0)
+            min_delta = float(tier.get("min_abs_delta_f") or 0)
+            min_edge = int(tier.get("min_edge_bps") or 0)
+            if confidence >= min_confidence and abs_delta >= min_delta and edge >= min_edge:
+                return {
+                    "enabled": True,
+                    "matched": True,
+                    "tier": tier.get("name"),
+                    "min_confidence": min_confidence,
+                    "min_abs_delta_f": min_delta,
+                    "min_edge_bps": min_edge,
+                    "forecast_delta_f": context.forecast_delta_f,
+                    "abs_forecast_delta_f": abs_delta,
+                    "max_order_notional_dollars": config.get("max_order_notional_dollars"),
+                    "cooldown_seconds": config.get("cooldown_seconds"),
+                    "reason_codes": ["close_strike_probe_unlocked"],
+                }
+        return {
+            "enabled": True,
+            "matched": False,
+            "reason": "close_strike_probe_tier_not_matched",
+            "forecast_delta_f": context.forecast_delta_f,
+            "abs_forecast_delta_f": abs_delta,
+            "edge_bps_after_buffer": edge,
+            "confidence": context.confidence,
+            "reason_codes": ["close_strike_probe_evidence_failed"],
+        }
+
+    def _close_strike_probe_cooldown(
+        self,
+        events: Iterable[WeatherBootstrapEventRecord],
+        config: dict[str, Any],
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        cooldown_seconds = int(config.get("cooldown_seconds") or 0)
+        if cooldown_seconds <= 0:
+            return {"active": False, "cooldown_seconds": cooldown_seconds}
+        now_utc = _as_utc(now) or datetime.now(UTC)
+        latest: datetime | None = None
+        for event in events:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            reason_codes = {str(code) for code in payload.get("reason_codes") or []}
+            if "close_strike_probe_unlocked" not in reason_codes:
+                continue
+            status = str(event.status or "").lower()
+            if status not in BOOTSTRAP_ACTIVE_STATUSES and status not in BOOTSTRAP_SETTLED_STATUSES:
+                continue
+            occurred_at = _as_utc(event.occurred_at)
+            if occurred_at is None or occurred_at > now_utc:
+                continue
+            if latest is None or occurred_at > latest:
+                latest = occurred_at
+        if latest is None:
+            return {"active": False, "cooldown_seconds": cooldown_seconds}
+        expires_at = latest + timedelta(seconds=cooldown_seconds)
+        remaining_seconds = max(0, int((expires_at - now_utc).total_seconds()))
+        return {
+            "active": now_utc < expires_at,
+            "cooldown_seconds": cooldown_seconds,
+            "last_probe_at": latest.isoformat(),
+            "cooldown_expires_at": expires_at.isoformat(),
+            "remaining_seconds": remaining_seconds,
+        }
 
     def shadow_gate_status(
         self,

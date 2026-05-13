@@ -1655,6 +1655,27 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         await self.session.flush()
         return record
 
+    async def get_weather_bootstrap_historical_evidence(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        source_fingerprint: str,
+        market_ticker: str,
+        bucket_key: str | None = None,
+        policy_key: str | None = None,
+    ) -> WeatherBootstrapHistoricalEvidenceRecord | None:
+        stmt = select(WeatherBootstrapHistoricalEvidenceRecord).where(
+            WeatherBootstrapHistoricalEvidenceRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+            WeatherBootstrapHistoricalEvidenceRecord.source_fingerprint == source_fingerprint,
+            WeatherBootstrapHistoricalEvidenceRecord.market_ticker == market_ticker,
+            WeatherBootstrapHistoricalEvidenceRecord.policy_key == policy_key,
+        )
+        if bucket_key is None:
+            stmt = stmt.where(WeatherBootstrapHistoricalEvidenceRecord.bucket_key.is_(None))
+        else:
+            stmt = stmt.where(WeatherBootstrapHistoricalEvidenceRecord.bucket_key == bucket_key)
+        return (await self.session.execute(stmt.limit(1))).scalar_one_or_none()
+
     async def list_weather_bootstrap_historical_evidence(
         self,
         *,
