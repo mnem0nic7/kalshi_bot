@@ -259,7 +259,7 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             )
             assert (
                 page.locator('[data-market="KXBTC15M-TEST"] .crypto-signal-blocker').inner_text()
-                == "Model blocked on Down: contract price below crypto min"
+                == "Signal blocked on Down: contract price below crypto min"
             )
             assert page.locator('[data-market="KXBTC15M-TEST"] .crypto-side-selected').count() == 0
             btc_side_details = page.locator('[data-market="KXBTC15M-TEST"] .crypto-side-detail').all_inner_texts()
@@ -271,7 +271,7 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             )
             assert (
                 page.locator('[data-market="KXSOL15M-TEST"] .crypto-signal-blocker').inner_text()
-                == "Model blocked on Down: net edge below live min; shadow only"
+                == "Signal blocked on Down: net edge below live min; shadow only"
             )
             assert page.locator('[data-market="KXSOL15M-TEST"] .crypto-side-selected').count() == 0
             assert (

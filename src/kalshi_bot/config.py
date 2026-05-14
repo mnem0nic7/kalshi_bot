@@ -210,6 +210,8 @@ class Settings(BaseSettings):
     crypto_late_sure_thing_enabled: bool = True
     crypto_late_sure_thing_max_seconds_to_close: int = 120
     crypto_late_sure_thing_min_probability: float = 0.90
+    crypto_market_price_anchor_enabled: bool = True
+    crypto_market_price_anchor_weight: float = 0.75
     crypto_autonomy_max_rooms_per_run: int = 7
     crypto_autonomy_max_per_asset_per_run: int = 1
     crypto_shadow_exploration_max_candidates_per_run: int = 12

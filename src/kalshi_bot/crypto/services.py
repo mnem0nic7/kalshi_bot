@@ -2019,6 +2019,7 @@ class CryptoForecastService:
         )
         entry_policy = crypto_policy.entry_for_asset(market.asset_symbol)
         runtime_trading_enabled = self.settings.crypto_trading_enabled or crypto_policy.trading_enabled
+        trade_fair = _decimal(trace.get("fair_yes_dollars") or fair)
         confidence = min(0.95, max(float(entry_policy["min_confidence"]), 0.80 + abs(edge_bps) / 20000))
         eligibility = None
         stand_down_reason = None
@@ -2030,7 +2031,8 @@ class CryptoForecastService:
             else f"predict {str(display_side).upper()}" if display_side else "no trade"
         )
         summary = (
-            f"{market.asset_symbol} 15m fair yes {fair}; "
+            f"{market.asset_symbol} 15m market-anchored fair yes {trade_fair} "
+            f"(model {fair}); "
             f"{display_decision} edge {edge_bps}bps."
         )
         if side is None:
@@ -2050,7 +2052,7 @@ class CryptoForecastService:
                 candidate_trace=trace,
             )
         return StrategySignal(
-            fair_yes_dollars=fair,
+            fair_yes_dollars=trade_fair,
             confidence=confidence,
             edge_bps=edge_bps,
             recommended_action=action,
@@ -2073,6 +2075,8 @@ class CryptoForecastService:
                 "prediction_model": {
                     "baseline_probability": _money_text(mid),
                     "calibrated_probability": _money_text(fair),
+                    "market_anchored_probability": _money_text(trade_fair),
+                    "market_price_anchor": trace.get("market_price_anchor"),
                     "calibration_version": artifact.version,
                     "model_version": artifact.version,
                     "feature_schema_version": payload.get("feature_schema_version"),
@@ -2089,7 +2093,7 @@ class CryptoForecastService:
                         _expected_crypto_net_pnl(
                             market,
                             side,
-                            fair,
+                            trade_fair,
                             fee_rate=Decimal(str(self.settings.kalshi_taker_fee_rate)),
                         )
                         if side is not None
@@ -3594,10 +3598,15 @@ def _crypto_signal_fair_yes_from_payload(signal_payload: dict[str, Any] | None) 
             if isinstance(crypto_modeling.get("prediction_model"), dict)
             else {}
         )
+    anchor = trace.get("market_price_anchor") if isinstance(trace.get("market_price_anchor"), dict) else {}
     for value in (
+        signal_payload.get("raw_fair_yes_dollars"),
+        trace.get("raw_fair_yes_dollars"),
+        anchor.get("raw_fair_yes_dollars") if isinstance(anchor, dict) else None,
+        anchor.get("input_fair_yes_dollars") if isinstance(anchor, dict) else None,
+        prediction_model.get("calibrated_probability") if isinstance(prediction_model, dict) else None,
         signal_payload.get("fair_yes_dollars"),
         trace.get("fair_yes_dollars"),
-        prediction_model.get("calibrated_probability") if isinstance(prediction_model, dict) else None,
     ):
         if value in (None, ""):
             continue
@@ -3672,6 +3681,8 @@ def _crypto_signal_payload_with_current_quote_metrics(
         "quote_metrics_source": "current_market_quote_cached_prediction",
     }
     refreshed["edge_bps"] = edge_bps
+    refreshed["fair_yes_dollars"] = trace.get("fair_yes_dollars")
+    refreshed["raw_fair_yes_dollars"] = trace.get("raw_fair_yes_dollars")
     refreshed["recommended_action"] = action.value if action is not None else None
     refreshed["recommended_side"] = side.value if side is not None else None
     refreshed["target_yes_price_dollars"] = (
@@ -4226,9 +4237,17 @@ def _crypto_recommendation(
     enforce_empirical_bucket_gate: bool = False,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
     row = row or _crypto_live_market_row(market, settings=settings)
+    raw_fair_yes = _clamp_price(fair_yes)
+    trade_fair_yes = _crypto_market_anchored_probability(row, raw_fair_yes, settings=settings)
+    market_price_anchor = _crypto_market_price_anchor_trace(
+        row,
+        raw_fair_yes,
+        trade_fair_yes,
+        settings=settings,
+    )
     candidates = _crypto_trade_candidates(
         row,
-        fair_yes,
+        raw_fair_yes,
         settings=settings,
         crypto_policy=crypto_policy,
         require_spot_features=require_spot_features,
@@ -4237,13 +4256,18 @@ def _crypto_recommendation(
     )
     entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
-    prediction_side = "yes" if fair_yes >= Decimal("0.5000") else "no"
+    raw_prediction_side = "yes" if raw_fair_yes >= Decimal("0.5000") else "no"
+    prediction_side = "yes" if trade_fair_yes >= Decimal("0.5000") else "no"
     selected = next((candidate for candidate in candidates if candidate.get("side") == prediction_side), None)
     if selected is None:
         edge_bps = max([int(candidate["edge_bps"]) for candidate in candidates if candidate["edge_bps"] is not None] or [0])
         return None, None, None, edge_bps, {
             "outcome": "no_candidate",
-            "fair_yes_dollars": _money_text(fair_yes),
+            "fair_yes_dollars": _money_text(trade_fair_yes),
+            "raw_fair_yes_dollars": _money_text(raw_fair_yes),
+            "market_anchored_fair_yes_dollars": _money_text(trade_fair_yes),
+            "market_price_anchor": market_price_anchor,
+            "raw_predicted_winner_side": raw_prediction_side,
             "predicted_winner_side": prediction_side,
             "min_edge_bps": entry_policy["min_fee_adjusted_edge_bps"],
             "max_spread_bps": entry_policy["max_spread_bps"],
@@ -4260,7 +4284,11 @@ def _crypto_recommendation(
     live_quality = selected_status == CRYPTO_LIVE_QUALITY and target_yes is not None
     return (TradeAction.BUY if live_quality else None), (side if live_quality else None), (target_yes if live_quality else None), edge_bps, {
         "outcome": "candidate_selected" if live_quality else "predicted_winner_blocked",
-        "fair_yes_dollars": _money_text(fair_yes),
+        "fair_yes_dollars": _money_text(trade_fair_yes),
+        "raw_fair_yes_dollars": _money_text(raw_fair_yes),
+        "market_anchored_fair_yes_dollars": _money_text(trade_fair_yes),
+        "market_price_anchor": market_price_anchor,
+        "raw_predicted_winner_side": raw_prediction_side,
         "predicted_winner_side": prediction_side,
         "selected_side": side.value,
         "selected_edge_bps": edge_bps,
@@ -7272,6 +7300,73 @@ def crypto_late_sure_thing_trace(candidate_trace: dict[str, Any] | None) -> bool
     )
 
 
+def _crypto_configured_market_price_anchor_weight(settings: Settings) -> Decimal:
+    if not bool(settings.crypto_market_price_anchor_enabled):
+        return Decimal("0")
+    raw_weight = Decimal(str(settings.crypto_market_price_anchor_weight))
+    return max(Decimal("0"), min(Decimal("1"), raw_weight))
+
+
+def _crypto_market_price_anchor_weight(row: dict[str, Any], *, settings: Settings) -> Decimal:
+    configured_weight = _crypto_configured_market_price_anchor_weight(settings)
+    if configured_weight <= Decimal("0"):
+        return Decimal("0")
+    market_mid = row.get("mid_yes_dollars")
+    if market_mid in (None, ""):
+        return Decimal("0")
+    try:
+        market_probability = _clamp_price(_decimal(market_mid))
+    except Exception:
+        return Decimal("0")
+    # Near 50/50 the market has little directional information; at 75/25 and
+    # beyond, treat price as a strong prior against cheap contrarian buys.
+    extremity = min(Decimal("1"), abs(market_probability - Decimal("0.5000")) / Decimal("0.2500"))
+    return configured_weight * extremity
+
+
+def _crypto_market_anchored_probability(
+    row: dict[str, Any],
+    predicted_yes: Decimal,
+    *,
+    settings: Settings,
+) -> Decimal:
+    weight = _crypto_market_price_anchor_weight(row, settings=settings)
+    model_probability = _clamp_price(predicted_yes)
+    if weight <= Decimal("0"):
+        return model_probability
+    market_mid = row.get("mid_yes_dollars")
+    if market_mid in (None, ""):
+        return model_probability
+    try:
+        market_probability = _clamp_price(_decimal(market_mid))
+    except Exception:
+        return model_probability
+    return _clamp_price((market_probability * weight) + (model_probability * (Decimal("1") - weight)))
+
+
+def _crypto_market_price_anchor_trace(row: dict[str, Any], raw_fair_yes: Decimal, anchored_fair_yes: Decimal, *, settings: Settings) -> dict[str, Any]:
+    configured_weight = _crypto_configured_market_price_anchor_weight(settings)
+    effective_weight = _crypto_market_price_anchor_weight(row, settings=settings)
+    return {
+        "enabled": bool(settings.crypto_market_price_anchor_enabled),
+        "configured_weight": float(configured_weight),
+        "effective_weight": float(effective_weight),
+        "market_mid_yes_dollars": _crypto_market_mid_probability_text(row),
+        "raw_fair_yes_dollars": _money_text(_clamp_price(raw_fair_yes)),
+        "anchored_fair_yes_dollars": _money_text(_clamp_price(anchored_fair_yes)),
+    }
+
+
+def _crypto_market_mid_probability_text(row: dict[str, Any]) -> str | None:
+    mid = row.get("mid_yes_dollars")
+    if mid in (None, ""):
+        return None
+    try:
+        return _money_text(_clamp_price(_decimal(mid)))
+    except Exception:
+        return None
+
+
 def _crypto_settlement_diagnostics(row: dict[str, Any]) -> dict[str, Any]:
     provider = row.get("spot_provider")
     source_kind = row.get("spot_source_kind")
@@ -7300,7 +7395,12 @@ def _crypto_trade_candidates(
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
-    predicted_winner_side = "yes" if predicted_yes >= Decimal("0.5000") else "no"
+    raw_predicted_yes = _clamp_price(predicted_yes)
+    anchored_predicted_yes = _crypto_market_anchored_probability(row, raw_predicted_yes, settings=settings)
+    predicted_winner_side = "yes" if anchored_predicted_yes >= Decimal("0.5000") else "no"
+    raw_predicted_winner_side = "yes" if raw_predicted_yes >= Decimal("0.5000") else "no"
+    anchor_weight = _crypto_market_price_anchor_weight(row, settings=settings)
+    market_mid_probability = _crypto_market_mid_probability_text(row)
     if row.get("strict_trade_eligible") is False:
         return [
             {
@@ -7311,6 +7411,11 @@ def _crypto_trade_candidates(
                 "edge_bps": None,
                 "expected_net_edge": None,
                 "model_probability": None,
+                "raw_model_probability": None,
+                "market_anchored_probability": None,
+                "market_mid_probability": market_mid_probability,
+                "market_price_anchor_weight": float(anchor_weight),
+                "raw_model_winner": side == raw_predicted_winner_side,
                 "model_winner": side == predicted_winner_side,
                 "target_yes_price_dollars": None,
                 "spread_bps": row.get("spread_bps"),
@@ -7340,6 +7445,11 @@ def _crypto_trade_candidates(
                 "edge_bps": None,
                 "expected_net_edge": None,
                 "model_probability": None,
+                "raw_model_probability": None,
+                "market_anchored_probability": None,
+                "market_mid_probability": market_mid_probability,
+                "market_price_anchor_weight": float(anchor_weight),
+                "raw_model_winner": side == raw_predicted_winner_side,
                 "model_winner": side == predicted_winner_side,
                 "target_yes_price_dollars": None,
                 "spread_bps": row.get("spread_bps"),
@@ -7380,13 +7490,19 @@ def _crypto_trade_candidates(
                     "edge_bps": None,
                     "expected_net_edge": None,
                     "model_probability": None,
+                    "raw_model_probability": None,
+                    "market_anchored_probability": None,
+                    "market_mid_probability": market_mid_probability,
+                    "market_price_anchor_weight": float(anchor_weight),
                     "model_winner": side == predicted_winner_side,
+                    "raw_model_winner": side == raw_predicted_winner_side,
                     "target_yes_price_dollars": None,
                     **settlement_diagnostics,
                 }
             )
             continue
-        probability = predicted_yes if side == "yes" else Decimal("1.0000") - predicted_yes
+        probability = anchored_predicted_yes if side == "yes" else Decimal("1.0000") - anchored_predicted_yes
+        raw_probability = raw_predicted_yes if side == "yes" else Decimal("1.0000") - raw_predicted_yes
         raw_edge = probability - cost
         fee = estimate_kalshi_taker_fee_dollars(
             price_dollars=cost,
@@ -7398,6 +7514,7 @@ def _crypto_trade_candidates(
         remaining_payout = Decimal("1.0000") - cost
         raw_edge_bps = int((raw_edge * Decimal("10000")).to_integral_value())
         model_winner = side == predicted_winner_side
+        raw_model_winner = side == raw_predicted_winner_side
         late_sure_thing = _crypto_late_sure_thing_candidate(
             model_winner=model_winner,
             probability=probability,
@@ -7464,7 +7581,12 @@ def _crypto_trade_candidates(
                 "edge_bps": raw_edge_bps,
                 "expected_net_edge": str(expected_net_edge.quantize(Decimal("0.0001"))),
                 "model_probability": str(probability.quantize(Decimal("0.0001"))),
+                "raw_model_probability": str(raw_probability.quantize(Decimal("0.0001"))),
+                "market_anchored_probability": str(probability.quantize(Decimal("0.0001"))),
+                "market_mid_probability": market_mid_probability,
+                "market_price_anchor_weight": float(anchor_weight),
                 "model_winner": model_winner,
+                "raw_model_winner": raw_model_winner,
                 "expected_fee": str(fee.quantize(Decimal("0.0001"))),
                 "remaining_payout_dollars": str(remaining_payout.quantize(Decimal("0.0001"))),
                 "bucket_key": bucket_key,

@@ -2319,7 +2319,7 @@ def test_crypto_candidate_quality_allows_mid_window_with_750bps_edge(tmp_path) -
 
 
 def test_crypto_candidate_quality_allows_high_cost_down_when_net_edge_positive(tmp_path) -> None:
-    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    settings = _settings(tmp_path, risk_min_edge_bps=100)
     row = {
         "market_ticker": "KXBTC15M-HIGH-COST-DOWN",
         "asset_symbol": "BTC",
@@ -2385,15 +2385,19 @@ def test_crypto_dashboard_signal_metrics_follow_current_quote(tmp_path) -> None:
     assert refreshed is not None
     trace = refreshed["candidate_trace"]
     no_candidate = next(candidate for candidate in trace["candidates"] if candidate["side"] == "no")
-    assert refreshed["edge_bps"] == 1500
-    assert trace["selected_edge_bps"] == 1500
+    assert refreshed["edge_bps"] == 412
+    assert trace["selected_edge_bps"] == 412
+    assert refreshed["raw_fair_yes_dollars"] == "0.0500"
+    assert refreshed["fair_yes_dollars"] == "0.1588"
+    assert trace["raw_fair_yes_dollars"] == "0.0500"
+    assert trace["market_anchored_fair_yes_dollars"] == "0.1588"
     assert no_candidate["execution_price_dollars"] == "0.8000"
-    assert no_candidate["edge_bps"] == 1500
+    assert no_candidate["edge_bps"] == 412
     assert no_candidate["expected_net_edge"] != "0.1000"
     assert trace["quote_metrics_source"] == "current_market_quote_cached_prediction"
 
 
-def test_crypto_dashboard_quote_refresh_does_not_recommend_blocked_prediction(tmp_path) -> None:
+def test_crypto_dashboard_quote_refresh_anchors_contrarian_low_price_prediction_to_market(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=500)
     market = _market(
         close_time=datetime.now(UTC) + timedelta(minutes=10),
@@ -2426,14 +2430,21 @@ def test_crypto_dashboard_quote_refresh_does_not_recommend_blocked_prediction(tm
     assert refreshed["target_yes_price_dollars"] is None
     trace = refreshed["candidate_trace"]
     assert trace["outcome"] == "predicted_winner_blocked"
-    assert trace["selected_side"] == "no"
-    assert trace["selection_reason"] == "contract_price_below_crypto_min"
+    assert trace["raw_predicted_winner_side"] == "no"
+    assert trace["predicted_winner_side"] == "yes"
+    assert trace["selected_side"] == "yes"
+    assert trace["selection_reason"] == "fee_adjusted_edge_below_live_min"
+    assert trace["raw_fair_yes_dollars"] == "0.3664"
+    assert trace["market_anchored_fair_yes_dollars"] == "0.8229"
     no_candidate = next(candidate for candidate in trace["candidates"] if candidate["side"] == "no")
+    yes_candidate = next(candidate for candidate in trace["candidates"] if candidate["side"] == "yes")
     assert no_candidate["candidate_status"] == "blocked_fee_edge"
     assert no_candidate["reason"] == "contract_price_below_crypto_min"
+    assert yes_candidate["model_winner"] is True
+    assert yes_candidate["raw_model_winner"] is False
 
 
-def test_crypto_recommendation_selects_model_winner_not_low_price_value_side(tmp_path) -> None:
+def test_crypto_recommendation_selects_market_anchored_winner_not_low_price_value_side(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=500)
     market = _market(
         yes_bid_dollars=Decimal("0.8900"),
@@ -2466,11 +2477,13 @@ def test_crypto_recommendation_selects_model_winner_not_low_price_value_side(tmp
     assert action is None
     assert side is None
     assert target_yes is None
-    assert edge_bps == -333
+    assert edge_bps == -121
     assert trace["outcome"] == "predicted_winner_blocked"
     assert trace["predicted_winner_side"] == "yes"
     assert trace["selected_side"] == "yes"
-    assert trace["selection_reason"] == "fee_adjusted_edge_below_live_min"
+    assert trace["selection_reason"] == "broad_shadow_exploration"
+    assert trace["raw_fair_yes_dollars"] == "0.8667"
+    assert trace["market_anchored_fair_yes_dollars"] == "0.8879"
     assert trace["candidates"][0]["side"] == "yes"
     assert trace["candidates"][0]["model_winner"] is True
     assert trace["candidates"][1]["side"] == "no"

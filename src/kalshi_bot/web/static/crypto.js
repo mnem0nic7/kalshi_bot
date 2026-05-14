@@ -244,7 +244,7 @@
       crypto_market_too_early_for_live_entry: "market too early for live entry",
       crypto_market_too_late_for_live_entry: "market too late for live entry",
       positive_fee_adjusted_live_quality_edge: "normal fee-adjusted edge",
-      late_high_confidence_directional_entry: "late high-confidence model choice",
+      late_high_confidence_directional_entry: "late high-confidence market-anchored choice",
       empirical_bucket_not_allowed: "empirical bucket not allowed",
       empirical_bucket_missing: "empirical bucket unknown",
       empirical_bucket_under_sampled: "empirical bucket under-sampled",
@@ -399,7 +399,7 @@
     const signalBlocker = candidateBlocker(signal);
     const selectedSideLabel = blockedSide ? sideLabel(blockedSide) : "Candidate";
     const signalBlockerHtml = signalBlocker
-      ? `<div class="crypto-signal-blocker">Model blocked on ${escapeHtml(selectedSideLabel)}: ${escapeHtml(signalBlocker)}</div>`
+      ? `<div class="crypto-signal-blocker">Signal blocked on ${escapeHtml(selectedSideLabel)}: ${escapeHtml(signalBlocker)}</div>`
       : "";
     const addOn = addOnLabel(market);
     const addOnHtml = addOn ? `<div class="crypto-signal-blocker">${escapeHtml(addOn)}</div>` : "";
