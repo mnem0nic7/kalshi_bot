@@ -573,7 +573,7 @@ class AutonomousGateTuningService:
             lane=lane,
             episode_level=True,
         )
-        candidate = _candidate_threshold_values(recommendation, runtime_thresholds)
+        candidate = _candidate_threshold_values(recommendation, runtime_thresholds, settings=self.settings)
         if not candidate["changes"]:
             return {
                 "status": "no_candidate",
@@ -2833,6 +2833,8 @@ def _promotion_summary(payload: dict[str, Any] | None) -> dict[str, Any] | None:
 def _candidate_threshold_values(
     recommendation: dict[str, Any],
     runtime_thresholds: RuntimeThresholds,
+    *,
+    settings: Settings,
 ) -> dict[str, Any]:
     current = _threshold_values(runtime_thresholds)
     candidate = dict(current)
@@ -2840,7 +2842,10 @@ def _candidate_threshold_values(
     for field, details in dict(recommendation.get("recommended_settings") or {}).items():
         if field not in TUNABLE_GATE_FIELDS or not bool(details.get("changed")):
             continue
-        recommended = details.get("recommended")
+        original_recommended = details.get("recommended")
+        recommended, floor_applied = _apply_operator_threshold_floor(field, original_recommended, settings=settings)
+        if recommended == current.get(field):
+            continue
         candidate[field] = recommended
         changes[field] = {
             "current": current[field],
@@ -2848,11 +2853,24 @@ def _candidate_threshold_values(
             "candidate_policy": details.get("candidate_policy"),
             "reason": details.get("reason"),
         }
+        if floor_applied:
+            changes[field]["operator_floor_applied"] = True
+            changes[field]["original_recommended"] = original_recommended
     return {
         "current_thresholds": current,
         "candidate_thresholds": candidate,
         "changes": changes,
     }
+
+
+def _apply_operator_threshold_floor(field: str, value: Any, *, settings: Settings) -> tuple[Any, bool]:
+    if field != "risk_min_contract_price_dollars":
+        return value, False
+    recommended = _decimal_or_none(value)
+    floor = _decimal_or_none(settings.risk_min_contract_price_dollars)
+    if recommended is None or floor is None or recommended >= floor:
+        return value, False
+    return float(floor), True
 
 
 def _candidate_crypto_policy_values(recommendation: dict[str, Any], current_pack: AgentPack) -> dict[str, Any]:
@@ -3383,7 +3401,7 @@ def _best_crypto_asset_candidate(
     current_entry = crypto_policy.entry_for_asset(asset_symbol)
     candidates: list[dict[str, Any]] = []
     for field, values in {
-        "min_fee_adjusted_edge_bps": (250, 500, 750, 1000, 1500, 2500, 5000),
+        "min_fee_adjusted_edge_bps": (750, 1000, 1500, 2500, 5000),
         "max_spread_bps": (100, 250, 500, 800, 1000, 1500, 2500),
         "min_confidence": (0.60, 0.70, 0.75, 0.80, 0.85, 0.90),
         "min_contract_price_dollars": (0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.25),

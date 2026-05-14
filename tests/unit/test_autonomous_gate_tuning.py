@@ -16,16 +16,9 @@ from kalshi_bot.services.gate_learning import GateLearningRow
 
 
 def _recommendation(settings: Settings) -> dict[str, Any]:
-    recommended_settings = {
-        "risk_min_contract_price_dollars": {
-            "current": settings.risk_min_contract_price_dollars,
-            "recommended": 0.05,
-            "changed": True,
-            "candidate_policy": "risk_min_contract_price_dollars=0.05",
-            "reason": "promoted_by_walk_forward_pnl_and_drawdown",
-        }
-    }
+    recommended_settings: dict[str, dict[str, Any]] = {}
     for field in (
+        "risk_min_contract_price_dollars",
         "strategy_min_remaining_payout_bps",
         "trigger_max_spread_bps",
         "risk_min_confidence",
@@ -40,6 +33,13 @@ def _recommendation(settings: Settings) -> dict[str, Any]:
             "candidate_policy": None,
             "reason": "holdout_net_pnl_not_improved",
         }
+    recommended_settings["risk_min_edge_bps"] = {
+        "current": settings.risk_min_edge_bps,
+        "recommended": 500,
+        "changed": True,
+        "candidate_policy": "risk_min_edge_bps=500",
+        "reason": "promoted_by_walk_forward_pnl_and_drawdown",
+    }
     return {
         "schema_version": "gate-learning-recommendations-v1",
         "source": "combined",
@@ -52,7 +52,7 @@ def _recommendation(settings: Settings) -> dict[str, Any]:
 
 def _bootstrap_rows(
     *,
-    pnl: Decimal = Decimal("0.9000"),
+    pnl: Decimal = Decimal("0.5000"),
     count: int = 40,
     strict_bootstrap: bool = False,
 ) -> list[GateLearningRow]:
@@ -70,12 +70,12 @@ def _bootstrap_rows(
                 settlement_ts=day + timedelta(hours=8),
                 series_ticker="KXHIGHNY",
                 side="yes",
-                entry_price=Decimal("0.1000"),
-                remaining_payout_bps=9000,
+                entry_price=Decimal("0.5000"),
+                remaining_payout_bps=5000,
                 spread_bps=100,
                 confidence=0.90,
-                edge_bps=4000 if strict_bootstrap else 2000,
-                quality_adjusted_edge_bps=4000 if strict_bootstrap else 2000,
+                edge_bps=4000 if strict_bootstrap else 600,
+                quality_adjusted_edge_bps=4000 if strict_bootstrap else 600,
                 forecast_delta_f=9.0,
                 primary_block_reason="empirical_gate_under_sampled" if strict_bootstrap else None,
                 bucket_key=f"bootstrap-bucket-{idx}" if strict_bootstrap else None,
@@ -142,11 +142,11 @@ async def _seed_live_canary_row(
             deployment_color=settings.app_color,
             model_version="unit",
             policy_version="unit",
-            fair_yes_dollars=Decimal("0.3000"),
+            fair_yes_dollars=Decimal("0.5600"),
             confidence=0.90,
-            edge_bps=2000,
+            edge_bps=600,
             recommended_side="yes",
-            target_yes_price_dollars=Decimal("0.1000"),
+            target_yes_price_dollars=Decimal("0.5000"),
             eligibility_status="eligible",
             support_status="supported",
             support_level="L5_global",
@@ -154,8 +154,8 @@ async def _seed_live_canary_row(
             support_market_days=40,
             settlement_result="yes",
             settlement_value_dollars=Decimal("1.0000"),
-            pnl_counterfactual_target_frictionless=Decimal("0.9000"),
-            pnl_counterfactual_target_with_fees=Decimal("0.9000"),
+            pnl_counterfactual_target_frictionless=Decimal("0.5000"),
+            pnl_counterfactual_target_with_fees=Decimal("0.5000"),
             source_provenance="historical_replay_full_checkpoint",
             signal_payload={
                 "forecast_delta_f": 9.0,
@@ -164,15 +164,15 @@ async def _seed_live_canary_row(
                     "selected_side": "yes",
                     "selected_candidate": {
                         "side": "yes",
-                        "target_yes_price_dollars": "0.1000",
-                        "quality_adjusted_edge_bps": 2000,
-                        "edge_bps": 2000,
-                        "remaining_payout_dollars": "0.9000",
+                        "target_yes_price_dollars": "0.5000",
+                        "quality_adjusted_edge_bps": 600,
+                        "edge_bps": 600,
+                        "remaining_payout_dollars": "0.5000",
                         "spread_bps": 100,
                     },
                 },
             },
-            quote_snapshot={"yes_bid_dollars": "0.09", "yes_ask_dollars": "0.10"},
+            quote_snapshot={"yes_bid_dollars": "0.49", "yes_ask_dollars": "0.50"},
             diagnostics={"forecast_delta_f": 9.0},
             created_at=observed_at,
         )
@@ -705,7 +705,7 @@ async def test_autonomous_gate_tuning_dry_run_does_not_stage(tmp_path) -> None:
     status = await service.status()
 
     assert result["status"] == "dry_run"
-    assert result["changes"]["risk_min_contract_price_dollars"]["recommended"] == 0.05
+    assert result["changes"]["risk_min_edge_bps"]["recommended"] == 500
     assert status["status"] == "not_started"
     assert status["llm_calls_enabled"] is False
     assert status["deterministic_runtime"] is True
@@ -717,7 +717,7 @@ async def test_autonomous_gate_tuning_dry_run_does_not_stage(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_autonomous_gate_tuning_stages_candidate_pack(tmp_path) -> None:
-    _settings, engine, session_factory, _agent_pack_service, service = await _service(tmp_path)
+    settings, engine, session_factory, _agent_pack_service, service = await _service(tmp_path)
 
     result = await service.run(now=datetime(2026, 5, 10, tzinfo=UTC))
 
@@ -730,7 +730,8 @@ async def test_autonomous_gate_tuning_stages_candidate_pack(tmp_path) -> None:
     assert result["status"] == "staged"
     assert candidate is not None
     assert candidate.status == "staged"
-    assert candidate.payload["thresholds"]["risk_min_contract_price_dollars"] == 0.05
+    assert candidate.payload["thresholds"]["risk_min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
+    assert candidate.payload["thresholds"]["risk_min_edge_bps"] == 500
     assert checkpoint is not None
     assert checkpoint.payload["status"] == "staged"
 
@@ -760,7 +761,8 @@ async def test_autonomous_gate_tuning_stages_scoped_weather_policy_without_globa
     assert candidate.payload["thresholds"]["risk_min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
     policy_key = result["weather_scope"]["policy_key"]
     policy = candidate.payload["weather_policy"]["policies"][policy_key]
-    assert policy["thresholds"]["risk_min_contract_price_dollars"] == 0.05
+    assert policy["thresholds"]["risk_min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
+    assert policy["thresholds"]["risk_min_edge_bps"] == 500
     assert policy["mode"] == "live"
     assert policy["lane"] == "entry_gate"
 
@@ -785,7 +787,8 @@ async def test_autonomous_gate_tuning_promotes_after_canary_passes(tmp_path) -> 
     assert promoted["status"] == "promoted"
     assert promoted["canary"]["evidence_source"] == "live_decision_corpus"
     assert active_pack.version == staged["candidate_version"]
-    assert active_pack.thresholds.risk_min_contract_price_dollars == 0.05
+    assert active_pack.thresholds.risk_min_contract_price_dollars == settings.risk_min_contract_price_dollars
+    assert active_pack.thresholds.risk_min_edge_bps == 500
     assert candidate is not None
     assert candidate.status == "champion"
 
@@ -818,7 +821,8 @@ async def test_autonomous_gate_tuning_bootstrap_promotes_from_historical_holdout
     assert promoted["canary"]["evidence_source"] == "historical_bootstrap_holdout"
     assert promoted["canary"]["candidate_selected_rows"] >= 10
     assert active_pack.version == staged["candidate_version"]
-    assert active_pack.thresholds.risk_min_contract_price_dollars == 0.05
+    assert active_pack.thresholds.risk_min_contract_price_dollars == settings.risk_min_contract_price_dollars
+    assert active_pack.thresholds.risk_min_edge_bps == 500
     assert checkpoint is not None
     assert checkpoint.payload["status"] == "champion"
     assert checkpoint.payload["canary"]["promotion_source"] == "historical_bootstrap"
@@ -1093,10 +1097,9 @@ async def test_autonomous_gate_tuning_canary_rejects_on_pnl_regression(tmp_path)
     staged = await service.run(now=staged_at)
     assert staged["status"] == "staged"
 
-    # Seed a corpus row that passes all gates EXCEPT the current pack's entry-price floor.
-    # Current: risk_min_contract_price_dollars=0.25 → skips this row (price 0.10 < 0.25).
-    # Candidate: risk_min_contract_price_dollars=0.05 → selects this row (0.10 ≥ 0.05).
-    # The trade settles as a loss → candidate.net_pnl < current.net_pnl → canary rejects.
+    # Seed a corpus row that passes all gates except the current pack's edge floor.
+    # Current: risk_min_edge_bps=750 skips this row. Candidate: risk_min_edge_bps=500 selects it.
+    # The trade settles as a loss, so candidate.net_pnl < current.net_pnl and canary rejects.
     async with session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
         build = await repo.create_decision_corpus_build(
@@ -1117,11 +1120,11 @@ async def test_autonomous_gate_tuning_canary_rejects_on_pnl_regression(tmp_path)
             deployment_color=settings.app_color,
             model_version="unit",
             policy_version="unit",
-            fair_yes_dollars=Decimal("0.10"),
+            fair_yes_dollars=Decimal("0.5600"),
             confidence=0.90,
             edge_bps=600,
             recommended_side="yes",
-            target_yes_price_dollars=Decimal("0.10"),
+            target_yes_price_dollars=Decimal("0.5000"),
             eligibility_status="eligible",
             support_status="supported",
             support_level="L5_global",
@@ -1129,8 +1132,8 @@ async def test_autonomous_gate_tuning_canary_rejects_on_pnl_regression(tmp_path)
             support_market_days=40,
             settlement_result="no",
             settlement_value_dollars=Decimal("0.0000"),
-            pnl_counterfactual_target_frictionless=Decimal("-0.1000"),
-            pnl_counterfactual_target_with_fees=Decimal("-0.1000"),
+            pnl_counterfactual_target_frictionless=Decimal("-0.5000"),
+            pnl_counterfactual_target_with_fees=Decimal("-0.5000"),
             source_provenance="historical_replay_full_checkpoint",
             signal_payload={
                 "forecast_delta_f": 9.0,
@@ -1139,15 +1142,15 @@ async def test_autonomous_gate_tuning_canary_rejects_on_pnl_regression(tmp_path)
                     "selected_side": "yes",
                     "selected_candidate": {
                         "side": "yes",
-                        "target_yes_price_dollars": "0.10",
+                        "target_yes_price_dollars": "0.50",
                         "quality_adjusted_edge_bps": 600,
                         "edge_bps": 600,
-                        "remaining_payout_dollars": "0.90",
+                        "remaining_payout_dollars": "0.50",
                         "spread_bps": 100,
                     },
                 },
             },
-            quote_snapshot={"yes_bid_dollars": "0.09", "yes_ask_dollars": "0.10"},
+            quote_snapshot={"yes_bid_dollars": "0.49", "yes_ask_dollars": "0.50"},
             diagnostics={"forecast_delta_f": 9.0},
             created_at=staged_at + timedelta(hours=1),
         )

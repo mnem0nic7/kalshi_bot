@@ -896,6 +896,12 @@ def _crypto_artifact_payload_summary(artifact_type: str, payload: dict[str, Any]
                 "coverage_pct": spot_quality.get("coverage_pct"),
                 "stale_assets": spot_quality.get("stale_assets") or [],
             },
+            "bucket_diagnostics": payload.get("bucket_diagnostics") or {},
+            "candidate_quality_bucket_diagnostics": (
+                (payload.get("candidate_quality") or {}).get("bucket_diagnostics")
+                if isinstance(payload.get("candidate_quality"), dict)
+                else {}
+            ),
             "promotion_gate": payload.get("promotion_gate") or {},
         }
     if artifact_type.startswith("model"):
@@ -1368,6 +1374,8 @@ def _crypto_live_path_assess_asset(
             "champion_selection_reason": candidate_report.get("champion_selection_reason"),
             "champion_policy_metrics": candidate_report.get("champion_policy_metrics"),
             "calibration": calibration,
+            "bucket_diagnostics": backtest_payload.get("bucket_diagnostics") or {},
+            "candidate_quality_bucket_diagnostics": backtest_payload.get("candidate_quality_bucket_diagnostics") or {},
             "baseline_policies": gate_payload.get("baseline_policies") or walk_forward_payload.get("baseline_policies") or [],
             "requirements": gate_payload.get("requirements") or {},
         },

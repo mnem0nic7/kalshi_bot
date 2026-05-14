@@ -10,7 +10,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from sqlalchemy import func, select
@@ -85,6 +85,10 @@ CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
 CRYPTO_EXPLORATORY_SHADOW = "exploratory_shadow"
 CRYPTO_LIVE_QUALITY = "live_quality"
+CRYPTO_SETTLEMENT_BENCHMARK_SOURCE = "cfb_rti_60s_average"
+CRYPTO_SETTLEMENT_PROXY_REASON_CODE = "crypto_settlement_proxy_for_cfb_rti"
+CRYPTO_ORDER_MODE_PASSIVE_ONLY = "passive_only"
+CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER = "passive_then_taker"
 CRYPTO_SPOT_MAX_STALE_SECONDS_BY_PROVIDER = {
     "coinbase": 5,
     "coingecko": 90,
@@ -102,7 +106,7 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
 )
 CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
 CRYPTO_ENTRY_OPTIMIZER_GRID = {
-    "min_fee_adjusted_edge_bps": (250, 500, 750, 1000, 1500),
+    "min_fee_adjusted_edge_bps": (750, 1000, 1500, 2500, 5000),
     "max_spread_bps": (80, 150, 250, 400, 600, 1000),
     "min_contract_price_dollars": (0.50, 0.60, 0.70),
     "min_remaining_payout_bps": (1000, 1500, 2000, 3000),
@@ -2757,32 +2761,66 @@ class CryptoExecutionService:
                     else None,
                 },
             )
+        order_mode = str(self.settings.crypto_order_mode or CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER).strip().lower()
         passive_price = self.passive_yes_price(market, ticket.side)
-        if self.settings.crypto_order_mode == "passive_then_taker" and passive_price is not None:
-            passive_ticket = ticket.model_copy(
-                update={"yes_price_dollars": passive_price, "time_in_force": KALSHI_GTC_TIME_IN_FORCE}
-            )
-            passive_receipt = await self.base_execution_service.execute(
-                room=room,
-                control=fresh_control,
-                ticket=passive_ticket,
-                client_order_id=f"{client_order_id}:maker",
-                fair_yes_dollars=fair_yes_dollars,
-                min_edge_bps=(
-                    int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
-                    if crypto_policy is not None
-                    else None
-                ),
-            )
-            if passive_receipt.status not in {"unfilled_cancelled", "requote_edge_lost"}:
-                passive_receipt.details = {**passive_receipt.details, "crypto_order_mode": "passive_then_taker"}
-                return passive_receipt
-            if not self._allow_taker_fallback(market, signal, crypto_policy=crypto_policy):
-                return ExecReceiptPayload(
-                    status="passive_unfilled_taker_blocked",
-                    client_order_id=client_order_id,
-                    details={"passive_receipt": passive_receipt.model_dump(mode="json")},
+        if order_mode in {CRYPTO_ORDER_MODE_PASSIVE_ONLY, CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER}:
+            if passive_price is None:
+                if order_mode == CRYPTO_ORDER_MODE_PASSIVE_ONLY:
+                    return ExecReceiptPayload(
+                        status="passive_unfilled_no_taker",
+                        client_order_id=client_order_id,
+                        details={
+                            "reason": "passive_price_unavailable",
+                            "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_ONLY,
+                            "no_order_submitted": True,
+                        },
+                    )
+            else:
+                passive_ticket = ticket.model_copy(
+                    update={"yes_price_dollars": passive_price, "time_in_force": KALSHI_GTC_TIME_IN_FORCE}
                 )
+                passive_receipt = await self.base_execution_service.execute(
+                    room=room,
+                    control=fresh_control,
+                    ticket=passive_ticket,
+                    client_order_id=f"{client_order_id}:maker",
+                    fair_yes_dollars=fair_yes_dollars,
+                    min_edge_bps=(
+                        int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+                        if crypto_policy is not None
+                        else None
+                    ),
+                )
+                if passive_receipt.status not in {"unfilled_cancelled", "requote_edge_lost"}:
+                    passive_receipt.details = {**passive_receipt.details, "crypto_order_mode": order_mode}
+                    return passive_receipt
+                if order_mode == CRYPTO_ORDER_MODE_PASSIVE_ONLY:
+                    return ExecReceiptPayload(
+                        status="passive_unfilled_no_taker",
+                        client_order_id=client_order_id,
+                        details={
+                            "reason": "passive_order_unfilled_or_edge_lost",
+                            "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_ONLY,
+                            "passive_receipt": passive_receipt.model_dump(mode="json"),
+                            "no_taker_fallback": True,
+                        },
+                    )
+                if not self._allow_taker_fallback(market, signal, crypto_policy=crypto_policy):
+                    return ExecReceiptPayload(
+                        status="passive_unfilled_taker_blocked",
+                        client_order_id=client_order_id,
+                        details={"passive_receipt": passive_receipt.model_dump(mode="json")},
+                    )
+        if order_mode == CRYPTO_ORDER_MODE_PASSIVE_ONLY:
+            return ExecReceiptPayload(
+                status="passive_unfilled_no_taker",
+                client_order_id=client_order_id,
+                details={
+                    "reason": "passive_only_no_taker_fallback",
+                    "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_ONLY,
+                    "no_order_submitted": True,
+                },
+            )
         return await self.base_execution_service.execute(
             room=room,
             control=fresh_control,
@@ -2811,7 +2849,12 @@ class CryptoExecutionService:
             if crypto_policy is not None
             else self.settings.risk_min_edge_bps
         )
-        return seconds_to_close <= self.settings.crypto_taker_fallback_close_seconds and signal.edge_bps >= min_edge_bps
+        expected_net_edge = _crypto_signal_expected_net_edge_bps(signal)
+        return (
+            seconds_to_close <= self.settings.crypto_taker_fallback_close_seconds
+            and expected_net_edge is not None
+            and expected_net_edge >= min_edge_bps
+        )
 
 
 class CryptoWorkflowService:
@@ -3842,6 +3885,7 @@ def _crypto_recommendation(
     row = row or _crypto_live_market_row(market, settings=settings)
     candidates = _crypto_trade_candidates(row, fair_yes, settings=settings, crypto_policy=crypto_policy)
     entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
+    settlement_diagnostics = _crypto_settlement_diagnostics(row)
     eligible = [
         candidate
         for candidate in candidates
@@ -3861,6 +3905,7 @@ def _crypto_recommendation(
             "spread_bps": market.spread_bps,
             "candidates": candidates,
             "gate_cascade": _crypto_candidate_gate_cascade(candidates),
+            **settlement_diagnostics,
         }
     selected = max(eligible, key=lambda candidate: (candidate["candidate_status"] == CRYPTO_LIVE_QUALITY, _decimal(candidate.get("expected_net_edge") or 0)))
     side = ContractSide(selected["side"])
@@ -3882,6 +3927,7 @@ def _crypto_recommendation(
         "spread_bps": market.spread_bps,
         "candidates": candidates,
         "gate_cascade": _crypto_candidate_gate_cascade(candidates, selected=selected),
+        **settlement_diagnostics,
     }
 
 
@@ -6503,6 +6549,7 @@ def _evaluate_crypto_walk_forward(
                 diagnostic_shadow_policy | {"policy_name": "shadow_exploration_policy", "policy_family": "shadow_exploration"},
             ],
             "bucket_matrix": [],
+            "bucket_diagnostics": _crypto_bucket_diagnostics([]),
             "candidate_quality": diagnostic_quality,
             "metrics": empty_metrics,
         }
@@ -6661,6 +6708,7 @@ def _evaluate_crypto_walk_forward(
             exploratory_policy,
         ],
         "bucket_matrix": _crypto_bucket_matrix(calibrated_trades, settings=settings),
+        "bucket_diagnostics": _crypto_bucket_diagnostics(selection_trades),
         "candidate_quality": diagnostic_quality,
         "metrics": {
             "sample_count": len(rows),
@@ -6734,6 +6782,10 @@ def _crypto_entry_policy_for_row(
 ) -> dict[str, Any]:
     if crypto_policy is not None:
         entry = dict(crypto_policy.entry_for_asset(str(row.get("asset_symbol") or "")))
+        entry["min_fee_adjusted_edge_bps"] = max(
+            int(entry["min_fee_adjusted_edge_bps"]),
+            int(settings.risk_min_edge_bps),
+        )
         entry["min_contract_price_dollars"] = max(
             float(entry["min_contract_price_dollars"]),
             float(settings.risk_min_contract_price_dollars),
@@ -6749,6 +6801,45 @@ def _crypto_entry_policy_for_row(
     }
 
 
+def _optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _crypto_live_entry_window_reason(row: dict[str, Any], *, settings: Settings) -> str | None:
+    market_age = _optional_int(row.get("market_age_seconds"))
+    time_to_close = _optional_int(row.get("time_to_close_seconds"))
+    if market_age is None and time_to_close is not None and time_to_close <= 900:
+        market_age = max(0, 900 - time_to_close)
+    if time_to_close is None and market_age is not None and market_age <= 900:
+        time_to_close = max(0, 900 - market_age)
+    if market_age is None or time_to_close is None:
+        return "crypto_entry_window_unknown"
+    if market_age < max(0, int(settings.crypto_live_min_market_age_seconds)):
+        return "crypto_market_too_early_for_live_entry"
+    if time_to_close < max(0, int(settings.crypto_autonomy_min_seconds_to_close)):
+        return "crypto_market_too_late_for_live_entry"
+    return None
+
+
+def _crypto_settlement_diagnostics(row: dict[str, Any]) -> dict[str, Any]:
+    provider = row.get("spot_provider")
+    source_kind = row.get("spot_source_kind")
+    provider_text = str(provider or "").strip().lower()
+    settlement_proxy = bool(provider_text == "coinbase" and not _crypto_spot_is_proxy(provider, source_kind))
+    return {
+        "settlement_benchmark_source": CRYPTO_SETTLEMENT_BENCHMARK_SOURCE,
+        "model_input_spot_provider": provider,
+        "model_input_spot_source_kind": source_kind,
+        "settlement_proxy_for_cfb_rti": settlement_proxy,
+        "settlement_diagnostic_codes": [CRYPTO_SETTLEMENT_PROXY_REASON_CODE] if settlement_proxy else [],
+    }
+
+
 def _crypto_trade_candidates(
     row: dict[str, Any],
     predicted_yes: Decimal,
@@ -6757,6 +6848,7 @@ def _crypto_trade_candidates(
     crypto_policy: RuntimeCryptoPolicy | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
+    settlement_diagnostics = _crypto_settlement_diagnostics(row)
     if row.get("strict_trade_eligible") is False:
         return [
             {
@@ -6770,6 +6862,7 @@ def _crypto_trade_candidates(
                 "spread_bps": row.get("spread_bps"),
                 "rank": rank,
                 "live_eligible": False,
+                **settlement_diagnostics,
             }
             for rank, side in enumerate(("yes", "no"), start=1)
         ]
@@ -6802,6 +6895,7 @@ def _crypto_trade_candidates(
                 "spot_exchange_recent_trade_count": row.get("spot_exchange_recent_trade_count"),
                 "rank": rank,
                 "live_eligible": False,
+                **settlement_diagnostics,
             }
             for rank, side in enumerate(("yes", "no"), start=1)
         ]
@@ -6818,6 +6912,7 @@ def _crypto_trade_candidates(
     min_shadow_edge = Decimal(str(settings.crypto_shadow_exploration_min_expected_net_edge_dollars))
     max_shadow_spread = int(settings.crypto_shadow_exploration_max_spread_bps)
     spread_bps = int(row.get("spread_bps") or 0)
+    live_entry_window_reason = _crypto_live_entry_window_reason(row, settings=settings)
     for side, cost in quote_inputs:
         if cost is None:
             candidates.append(
@@ -6829,6 +6924,7 @@ def _crypto_trade_candidates(
                     "edge_bps": None,
                     "expected_net_edge": None,
                     "target_yes_price_dollars": None,
+                    **settlement_diagnostics,
                 }
             )
             continue
@@ -6854,14 +6950,14 @@ def _crypto_trade_candidates(
             reason = "remaining_payout_below_crypto_min"
         elif raw_edge_bps > max_credible_edge_bps:
             reason = "edge_above_crypto_credible_max"
-        elif expected_net_edge >= min_live_edge:
+        elif expected_net_edge >= min_live_edge and live_entry_window_reason is None:
             status = "eligible"
             candidate_status = CRYPTO_LIVE_QUALITY
             reason = "positive_fee_adjusted_live_quality_edge"
         elif expected_net_edge >= min_shadow_edge and spread_bps <= max_shadow_spread:
             status = "eligible"
             candidate_status = CRYPTO_EXPLORATORY_SHADOW
-            reason = "broad_shadow_exploration"
+            reason = live_entry_window_reason or "broad_shadow_exploration"
         elif spread_bps > max_shadow_spread:
             reason = "spread_above_shadow_exploration_max"
         candidates.append(
@@ -6881,8 +6977,12 @@ def _crypto_trade_candidates(
                 "spot_exchange_spread_bps": row.get("spot_exchange_spread_bps"),
                 "spot_exchange_recent_trade_count": row.get("spot_exchange_recent_trade_count"),
                 "runtime_thresholds": dict(entry_policy),
+                "market_age_seconds": row.get("market_age_seconds"),
+                "time_to_close_seconds": row.get("time_to_close_seconds"),
+                "live_entry_window_reason": live_entry_window_reason,
                 "rank": None,
                 "live_eligible": candidate_status == CRYPTO_LIVE_QUALITY,
+                **settlement_diagnostics,
             }
         )
     candidates.sort(key=lambda item: (_decimal(item.get("expected_net_edge") or Decimal("-999")), item["side"]), reverse=True)
@@ -7196,6 +7296,7 @@ def _crypto_candidate_quality_report(
             for row in top_candidates[:50]
         ],
         "bucket_matrix": _crypto_bucket_matrix(scored, settings=settings),
+        "bucket_diagnostics": _crypto_bucket_diagnostics(scored),
     }
 
 
@@ -7217,6 +7318,12 @@ def _crypto_live_rejection_reason(candidate: dict[str, Any]) -> str | None:
     if status == CRYPTO_LIVE_QUALITY:
         return None
     if status == CRYPTO_EXPLORATORY_SHADOW:
+        if reason in {
+            "crypto_market_too_early_for_live_entry",
+            "crypto_market_too_late_for_live_entry",
+            "crypto_entry_window_unknown",
+        }:
+            return reason
         return "fee_adjusted_edge_below_live_min"
     return reason
 
@@ -7263,6 +7370,65 @@ def _crypto_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Setting
     return matrix
 
 
+def _crypto_bucket_diagnostics(trade_rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    return {
+        "by_price_bucket": _crypto_dimension_bucket_diagnostics(
+            trade_rows,
+            lambda row: _price_band(
+                _decimal((row.get("simulation") or {}).get("execution_price_dollars") or row.get("mid_yes_dollars"))
+            ),
+        ),
+        "by_time_to_close_bucket": _crypto_dimension_bucket_diagnostics(
+            trade_rows,
+            lambda row: _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0)),
+        ),
+        "by_spread_bucket": _crypto_dimension_bucket_diagnostics(
+            trade_rows,
+            lambda row: _spread_band(row.get("spread_bps")),
+        ),
+    }
+
+
+def _crypto_dimension_bucket_diagnostics(
+    trade_rows: list[dict[str, Any]],
+    bucket_fn: Callable[[dict[str, Any]], str],
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in trade_rows:
+        grouped[bucket_fn(row)].append(row)
+    diagnostics: list[dict[str, Any]] = []
+    for bucket, rows in grouped.items():
+        values = [_decimal((row.get("simulation") or {}).get("net_pnl")) for row in rows]
+        edges = [
+            _decimal((row.get("simulation") or {}).get("expected_net_edge"))
+            for row in rows
+            if (row.get("simulation") or {}).get("expected_net_edge") not in (None, "")
+        ]
+        wins = sum(1 for value in values if value > 0)
+        prediction_pairs = [
+            (_decimal(row.get("predicted_yes_dollars")), int(row.get("label_yes")))
+            for row in rows
+            if row.get("predicted_yes_dollars") not in (None, "") and row.get("label_yes") is not None
+        ]
+        calibration = _probability_metrics_decimal(prediction_pairs)
+        diagnostics.append(
+            {
+                "bucket": bucket,
+                "selected_count": len(rows),
+                "win_rate": _ratio(wins / len(values)) if values else None,
+                "net_pnl": str(sum(values, Decimal("0")).quantize(Decimal("0.0001"))),
+                "mean_expected_net_edge": (
+                    str((sum(edges, Decimal("0")) / Decimal(len(edges))).quantize(Decimal("0.0001")))
+                    if edges
+                    else None
+                ),
+                "calibration_ece": calibration.get("ece"),
+            }
+        )
+    diagnostics.sort(key=lambda item: str(item["bucket"]))
+    return diagnostics
+
+
 def _crypto_bucket_key(row: dict[str, Any], simulation: dict[str, Any]) -> str:
     side = simulation.get("side") or "unknown"
     price = _decimal(simulation.get("execution_price_dollars") or row.get("mid_yes_dollars"))
@@ -7293,6 +7459,20 @@ def _expected_crypto_net_pnl(
         return None
     fee = estimate_kalshi_taker_fee_dollars(price_dollars=cost, count=Decimal("1.00"), fee_rate=fee_rate)
     return (probability - cost - fee).quantize(Decimal("0.0001"))
+
+
+def _crypto_signal_expected_net_edge_bps(signal: StrategySignal) -> int | None:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    selection = trace.get("trade_selection_model") if isinstance(trace.get("trade_selection_model"), dict) else {}
+    raw_value = selection.get("expected_net_edge") if isinstance(selection, dict) else None
+    if raw_value in (None, ""):
+        raw_value = trace.get("expected_net_edge")
+    if raw_value in (None, ""):
+        return None
+    try:
+        return int((_decimal(raw_value) * Decimal("10000")).to_integral_value())
+    except Exception:
+        return None
 
 
 def _crypto_metric_deltas(metrics: dict[str, Any]) -> dict[str, Any]:

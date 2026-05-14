@@ -464,10 +464,18 @@ class AgentPackService:
                 override["min_contract_price_dollars"] = self._contract_price_floor(
                     override["min_contract_price_dollars"]
                 )
+            if override["min_fee_adjusted_edge_bps"] is not None:
+                override["min_fee_adjusted_edge_bps"] = max(
+                    int(override["min_fee_adjusted_edge_bps"]),
+                    int(self.settings.risk_min_edge_bps),
+                )
             overrides[_normalize_crypto_asset_symbol(raw_symbol)] = override
 
         return RuntimeCryptoPolicy(
-            min_fee_adjusted_edge_bps=int(value_or_settings(entry.min_fee_adjusted_edge_bps, self.settings.risk_min_edge_bps)),
+            min_fee_adjusted_edge_bps=max(
+                int(value_or_settings(entry.min_fee_adjusted_edge_bps, self.settings.risk_min_edge_bps)),
+                int(self.settings.risk_min_edge_bps),
+            ),
             max_spread_bps=int(value_or_settings(entry.max_spread_bps, self.settings.trigger_max_spread_bps)),
             min_confidence=float(value_or_settings(entry.min_confidence, self.settings.risk_min_confidence)),
             min_contract_price_dollars=self._contract_price_floor(

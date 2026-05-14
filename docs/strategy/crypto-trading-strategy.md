@@ -1,6 +1,6 @@
 # Crypto Trading Strategy
 
-Last updated: 2026-05-12
+Last updated: 2026-05-14
 
 This document is the operator-facing summary of the crypto trading system: what
 we trade, which strategy is active, which gates must pass before an order can go
@@ -17,11 +17,9 @@ Crypto is not a single global live switch. It is promoted per asset. BTC can be
 approved without approving ETH, and deployment-note asset mode `off` wins over
 any agent-pack live mode.
 
-The current production posture is shadow evidence collection, not live trading.
-As of the 2026-05-12 production check, no requested crypto asset was ready for
-live mode, all replay gates were blocked, and the live switches
-`CRYPTO_TRADING_ENABLED`, `CRYPTO_AUTONOMY_ENABLED`, and
-`CRYPTO_PRODUCTION_AUTONOMY_ENABLED` were off.
+The current production posture is BTC-only live eligibility with conservative
+entry gates. Other crypto assets remain shadow evidence collection until their
+own replay, P/L, and asset-mode gates pass.
 
 ## Strategy Inventory
 
@@ -207,17 +205,20 @@ The live-quality candidate path blocks when:
 - remaining payout is below the minimum
 - raw edge exceeds the maximum credible edge
 - fee-adjusted expected net edge is below the active minimum
+- market age is below 180 seconds or time-to-close is below 120 seconds
 
-Current runtime entry thresholds observed in production on 2026-05-12:
+Current runtime entry thresholds observed in production on 2026-05-14:
 
 | Gate | Active value |
 |---|---:|
-| Minimum fee-adjusted edge | 500 bps |
+| Minimum fee-adjusted edge | 750 bps |
 | Max spread | 250 bps |
 | Minimum confidence | 0.80 |
 | Minimum contract price | $0.50 |
 | Minimum remaining payout | 2000 bps ($0.20) |
 | Maximum credible edge | 10000 bps |
+| Minimum market age | 180 seconds |
+| Minimum seconds to close | 120 seconds |
 
 Shadow exploration controls:
 
@@ -282,6 +283,11 @@ markets endpoint supplies current finalized rows with `result=yes|no`.
 `source_kind=settled_backfill`. It does not mutate pre-close
 `live_quote_evidence` rows. Replay joins the terminal label snapshot to earlier
 quote snapshots by `market_ticker`, preserving point-in-time quote evidence.
+
+Live decision traces record Kalshi crypto settlement as the CFB RTI 60-second
+average benchmark. Coinbase-derived rows are marked as a proxy for that
+benchmark, so readiness and replay reports can separate model input quality from
+the actual settlement source.
 
 Settled backfill also attempts candle capture for each settled market. It tries
 the regular market candlestick endpoint first and falls back to the historical
@@ -359,14 +365,16 @@ Portfolio defaults:
 
 ### 7. Execution Gates
 
-Crypto execution is `passive_then_taker` by default:
+Crypto execution supports `passive_only` and `passive_then_taker`. Production
+BTC uses `passive_only` while settlement-proxy evidence is still being measured:
 
 1. Submit a passive maker-style order one tick inside the quoted spread.
 2. If the passive order fills or receives a terminal non-retry status, stop.
-3. If the passive order is unfilled/cancelled or loses edge on requote, consider
-   taker fallback.
-4. Taker fallback is allowed only when the market is within 90 seconds of close
-   and the signal edge still clears the active minimum.
+3. In `passive_only`, if the passive order is unfilled/cancelled or loses edge
+   on requote, emit `passive_unfilled_no_taker`.
+4. In `passive_then_taker`, taker fallback is allowed only when the market is
+   within 90 seconds of close and fee-adjusted net edge still clears the active
+   minimum.
 
 Execution blocks live orders when:
 

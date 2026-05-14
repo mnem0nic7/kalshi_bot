@@ -112,6 +112,26 @@ def test_agent_pack_runtime_crypto_policy_overrides_per_asset() -> None:
     assert thresholds.strategy_min_remaining_payout_bps == 1500
 
 
+def test_agent_pack_runtime_crypto_policy_cannot_lower_operator_edge_floor() -> None:
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_edge_bps=750)
+    service = AgentPackService(settings)
+    pack = service.default_pack().model_copy(
+        update={
+            "crypto_policy": AgentPackCryptoPolicy(
+                entry=AgentPackCryptoEntryPolicy(min_fee_adjusted_edge_bps=500),
+                asset_entry_overrides={
+                    "BTC": AgentPackCryptoEntryPolicy(min_fee_adjusted_edge_bps=500),
+                },
+            )
+        }
+    )
+
+    policy = service.runtime_crypto_policy(pack)
+
+    assert policy.entry_for_asset("ETH")["min_fee_adjusted_edge_bps"] == 750
+    assert policy.entry_for_asset("BTC")["min_fee_adjusted_edge_bps"] == 750
+
+
 def test_agent_pack_resolves_scoped_weather_policy_with_flat_threshold_fallback() -> None:
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
     service = AgentPackService(settings)

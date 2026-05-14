@@ -108,7 +108,8 @@ def _replay_row(**overrides) -> dict[str, object]:
         "strict_trade_eligible": True,
         "prediction_eligible": True,
         "leakage_status": "point_in_time",
-        "time_to_close_seconds": 60,
+        "time_to_close_seconds": 300,
+        "market_age_seconds": 600,
         "volume": 100,
         "open_interest": 50,
         "target_price_dollars": Decimal("100.00000000"),
@@ -1060,6 +1061,21 @@ class _FakeBaseExecution:
         )
 
 
+class _FakeBaseExecutionStatus:
+    def __init__(self, statuses: list[str]) -> None:
+        self.statuses = list(statuses)
+        self.calls: list[dict[str, object]] = []
+
+    async def execute(self, **kwargs) -> ExecReceiptPayload:
+        self.calls.append(kwargs)
+        status = self.statuses.pop(0)
+        return ExecReceiptPayload(
+            status=status,
+            client_order_id=kwargs["client_order_id"],
+            details={"called": True},
+        )
+
+
 class _FakeWorkflowMarketService:
     def __init__(self, market: CryptoMarket) -> None:
         self.market = market
@@ -1681,7 +1697,7 @@ def test_crypto_entry_optimizer_stages_only_passing_policy(tmp_path) -> None:
         crypto_min_training_samples=2,
         crypto_replay_min_trade_candidates=1,
         crypto_replay_require_pnl_beats_market_mid=False,
-        risk_min_edge_bps=5000,
+        risk_min_edge_bps=750,
     )
     policy = AgentPackService(settings).runtime_crypto_policy()
     rows = [
@@ -1701,7 +1717,7 @@ def test_crypto_entry_optimizer_stages_only_passing_policy(tmp_path) -> None:
     result = _crypto_optimize_asset_entry_policy("BTC", rows, settings=settings, crypto_policy=policy)
 
     assert result["status"] == "stageable"
-    assert result["winner"]["entry_policy"]["min_fee_adjusted_edge_bps"] in {250, 500, 750, 1000, 1500}
+    assert result["winner"]["entry_policy"]["min_fee_adjusted_edge_bps"] in {750, 1000, 1500, 2500, 5000}
     assert result["staged_override_payload"]["crypto_policy"]["asset_entry_overrides"]["BTC"]
 
 
@@ -1790,6 +1806,8 @@ def test_crypto_candidate_quality_classifies_live_and_exploratory(tmp_path) -> N
         "spot_feature_status": "available",
         "spot_provider": "coinbase",
         "spot_source_kind": "spot_ohlc",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
     }
 
     live = _crypto_trade_candidates(row, Decimal("0.6000"), settings=settings)
@@ -1798,6 +1816,80 @@ def test_crypto_candidate_quality_classifies_live_and_exploratory(tmp_path) -> N
     assert live[0]["candidate_status"] == CRYPTO_LIVE_QUALITY
     assert exploratory[0]["candidate_status"] == CRYPTO_EXPLORATORY_SHADOW
     assert exploratory[0]["live_eligible"] is False
+
+
+def test_crypto_candidate_quality_blocks_live_before_entry_window(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=750, crypto_live_min_market_age_seconds=180)
+    row = {
+        "market_ticker": "KXBTC15M-EARLY",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 0,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 780,
+        "market_age_seconds": 120,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.9000"), settings=settings)
+
+    assert candidates[0]["candidate_status"] == CRYPTO_EXPLORATORY_SHADOW
+    assert candidates[0]["reason"] == "crypto_market_too_early_for_live_entry"
+    assert candidates[0]["live_eligible"] is False
+
+
+def test_crypto_candidate_quality_blocks_live_inside_final_window(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=750, crypto_autonomy_min_seconds_to_close=120)
+    row = {
+        "market_ticker": "KXBTC15M-LATE",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 0,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 60,
+        "market_age_seconds": 840,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.9000"), settings=settings)
+
+    assert candidates[0]["candidate_status"] == CRYPTO_EXPLORATORY_SHADOW
+    assert candidates[0]["reason"] == "crypto_market_too_late_for_live_entry"
+    assert candidates[0]["live_eligible"] is False
+
+
+def test_crypto_candidate_quality_allows_mid_window_with_750bps_edge(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=750)
+    row = {
+        "market_ticker": "KXBTC15M-MID",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 0,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.9000"), settings=settings)
+
+    assert candidates[0]["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert candidates[0]["runtime_thresholds"]["min_fee_adjusted_edge_bps"] == 750
+    assert candidates[0]["settlement_benchmark_source"] == "cfb_rti_60s_average"
+    assert candidates[0]["settlement_proxy_for_cfb_rti"] is True
+    assert candidates[0]["settlement_diagnostic_codes"] == ["crypto_settlement_proxy_for_cfb_rti"]
 
 
 def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
@@ -1832,6 +1924,8 @@ def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
         "spot_feature_status": "available",
         "spot_provider": "coinbase",
         "spot_source_kind": "spot_ohlc",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
     }
 
     candidates = _crypto_trade_candidates(row, Decimal("0.6000"), settings=settings, crypto_policy=policy)
@@ -1870,6 +1964,8 @@ def test_crypto_candidate_quality_blocks_runtime_spread_over_asset_limit(tmp_pat
         "spot_feature_status": "available",
         "spot_provider": "coinbase",
         "spot_source_kind": "spot_ohlc",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
     }
 
     candidates = _crypto_trade_candidates(row, Decimal("0.6000"), settings=settings, crypto_policy=policy)
@@ -2667,6 +2763,158 @@ async def test_crypto_execution_live_asset_reaches_base_execution(tmp_path) -> N
     assert receipt.status == "submitted"
     assert fake_base.calls[0]["client_order_id"] == "crypto-test:maker"
     assert fake_base.calls[0]["ticket"].yes_price_dollars == Decimal("0.48")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_execution_passive_only_never_falls_back_to_taker(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        crypto_order_mode="passive_only",
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeBaseExecutionStatus(["unfilled_cancelled"])
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    market = _market()
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC passive only", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.4900"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-passive-only",
+        fair_yes_dollars=Decimal("0.6500"),
+        market=market,
+        signal=_signal(),
+    )
+
+    assert receipt.status == "passive_unfilled_no_taker"
+    assert receipt.details["no_taker_fallback"] is True
+    assert len(fake_base.calls) == 1
+    assert fake_base.calls[0]["client_order_id"] == "crypto-passive-only:maker"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_taker_fallback_requires_fee_adjusted_net_edge(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        crypto_order_mode="passive_then_taker",
+        crypto_taker_fallback_close_seconds=90,
+        risk_min_edge_bps=750,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeBaseExecutionStatus(["unfilled_cancelled"])
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    market = _market(close_time=datetime.now(UTC) + timedelta(seconds=60))
+    signal = _signal()
+    signal.candidate_trace = {
+        "trade_selection_model": {
+            "candidate_status": CRYPTO_LIVE_QUALITY,
+            "expected_net_edge": "0.0500",
+        }
+    }
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC net edge taker", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.4900"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-net-edge-taker",
+        fair_yes_dollars=Decimal("0.6500"),
+        market=market,
+        signal=signal,
+    )
+
+    assert receipt.status == "passive_unfilled_taker_blocked"
+    assert len(fake_base.calls) == 1
+    assert fake_base.calls[0]["client_order_id"] == "crypto-net-edge-taker:maker"
     await engine.dispose()
 
 
