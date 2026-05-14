@@ -94,6 +94,12 @@ def _close_strike_probe_unlocked(signal: StrategySignal) -> bool:
     }
 
 
+def _crypto_late_sure_thing_edge_bypass(signal: StrategySignal, context: RiskContext) -> bool:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    strategy_code = str(context.strategy_code or trace.get("strategy_code") or "")
+    return strategy_code == "CRYPTO_15M" and trace.get("late_high_confidence_directional_entry") is True
+
+
 def _bucket_fit_count(*, available_notional_dollars: Decimal, ticket: TradeTicket) -> Decimal | None:
     unit_notional = _ticket_unit_notional(ticket)
     if unit_notional <= Decimal("0"):
@@ -225,6 +231,7 @@ class DeterministicRiskEngine:
         approved_notional = order_notional
         gross_edge_bps = signal.edge_bps
         candidate_trace = dict(signal.candidate_trace or {})
+        late_sure_thing_edge_bypass = _crypto_late_sure_thing_edge_bypass(signal, context)
         policy_service = DecisionPolicyVariantService(self.settings)
         applied_policy_variant = candidate_trace.get("policy_variant_applied")
         fee_estimate_dollars_per_contract: Decimal | None = None
@@ -289,8 +296,14 @@ class DeterministicRiskEngine:
         if signal.eligibility is not None and not signal.eligibility.eligible:
             for reason in signal.eligibility.reasons:
                 block(reason)
-        if signal.edge_bps < active_thresholds.risk_min_edge_bps:
+        if signal.edge_bps < active_thresholds.risk_min_edge_bps and not late_sure_thing_edge_bypass:
             block(f"Edge {signal.edge_bps}bps is below configured minimum of {active_thresholds.risk_min_edge_bps}bps.")
+        elif signal.edge_bps < active_thresholds.risk_min_edge_bps:
+            note(
+                f"Late high-confidence crypto model choice bypassed the edge floor "
+                f"({signal.edge_bps}bps versus {active_thresholds.risk_min_edge_bps}bps)."
+            )
+            code("late_high_confidence_edge_bypass")
         if signal.edge_bps > active_thresholds.risk_max_credible_edge_bps:
             extreme_diag = candidate_trace.get("extreme_edge_diagnostic")
             validated_extreme_edge = (
@@ -579,13 +592,19 @@ class DeterministicRiskEngine:
                 count_fp=approved_count,
                 gross_edge_bps=gross_edge_bps,
             )
-            if net_edge_bps < active_thresholds.risk_min_edge_bps:
+            if net_edge_bps < active_thresholds.risk_min_edge_bps and not late_sure_thing_edge_bypass:
                 block(
                     f"Fee-adjusted edge {net_edge_bps}bps is below configured minimum of "
                     f"{active_thresholds.risk_min_edge_bps}bps "
                     f"(gross {gross_edge_bps}bps, estimated taker fee {fee_edge_bps}bps)."
                 )
                 code("fee_adjusted_edge_below_min")
+            elif net_edge_bps < active_thresholds.risk_min_edge_bps:
+                note(
+                    f"Late high-confidence crypto model choice bypassed the fee-adjusted edge floor "
+                    f"({net_edge_bps}bps versus {active_thresholds.risk_min_edge_bps}bps)."
+                )
+                code("late_high_confidence_fee_adjusted_edge_bypass")
             else:
                 note(
                     f"Fee-adjusted edge {net_edge_bps}bps clears the configured minimum "

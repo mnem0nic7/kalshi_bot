@@ -2863,6 +2863,8 @@ class CryptoExecutionService:
             else self.settings.risk_min_edge_bps
         )
         expected_net_edge = _crypto_signal_expected_net_edge_bps(signal)
+        if crypto_late_sure_thing_trace(signal.candidate_trace):
+            return seconds_to_close <= self.settings.crypto_late_sure_thing_max_seconds_to_close
         return (
             seconds_to_close <= self.settings.crypto_taker_fallback_close_seconds
             and expected_net_edge is not None
@@ -4083,6 +4085,7 @@ def _crypto_recommendation(
         "candidate_status": selected_status,
         "selection_reason": selected.get("reason"),
         "expected_net_edge": selected.get("expected_net_edge"),
+        "late_high_confidence_directional_entry": selected.get("late_high_confidence_directional_entry") is True,
         "rank": selected.get("rank"),
         "bucket_key": selected.get("bucket_key"),
         "target_yes_price_dollars": _money_text(target_yes) if target_yes is not None else None,
@@ -6994,6 +6997,36 @@ def _crypto_live_entry_window_reason(row: dict[str, Any], *, settings: Settings)
     return None
 
 
+def _crypto_late_sure_thing_candidate(
+    *,
+    model_winner: bool,
+    probability: Decimal,
+    live_entry_window_reason: str | None,
+    row: dict[str, Any],
+    settings: Settings,
+) -> bool:
+    if not bool(settings.crypto_late_sure_thing_enabled):
+        return False
+    if live_entry_window_reason != "crypto_market_too_late_for_live_entry":
+        return False
+    if not model_winner:
+        return False
+    time_to_close = _optional_int(row.get("time_to_close_seconds"))
+    if time_to_close is None:
+        return False
+    if time_to_close > max(0, int(settings.crypto_late_sure_thing_max_seconds_to_close)):
+        return False
+    min_probability = Decimal(str(settings.crypto_late_sure_thing_min_probability))
+    return probability >= min_probability
+
+
+def crypto_late_sure_thing_trace(candidate_trace: dict[str, Any] | None) -> bool:
+    return bool(
+        isinstance(candidate_trace, dict)
+        and candidate_trace.get("late_high_confidence_directional_entry") is True
+    )
+
+
 def _crypto_settlement_diagnostics(row: dict[str, Any]) -> dict[str, Any]:
     provider = row.get("spot_provider")
     source_kind = row.get("spot_source_kind")
@@ -7115,6 +7148,14 @@ def _crypto_trade_candidates(
         target_yes = cost if side == "yes" else Decimal("1.0000") - cost
         remaining_payout = Decimal("1.0000") - cost
         raw_edge_bps = int((raw_edge * Decimal("10000")).to_integral_value())
+        model_winner = side == predicted_winner_side
+        late_sure_thing = _crypto_late_sure_thing_candidate(
+            model_winner=model_winner,
+            probability=probability,
+            live_entry_window_reason=live_entry_window_reason,
+            row=row,
+            settings=settings,
+        )
         candidate_status = "blocked_fee_edge"
         status = "blocked"
         reason = "fee_adjusted_edge_below_live_min"
@@ -7126,6 +7167,10 @@ def _crypto_trade_candidates(
             reason = "remaining_payout_below_crypto_min"
         elif raw_edge_bps > max_credible_edge_bps:
             reason = "edge_above_crypto_credible_max"
+        elif late_sure_thing:
+            status = "eligible"
+            candidate_status = CRYPTO_LIVE_QUALITY
+            reason = "late_high_confidence_directional_entry"
         elif expected_net_edge >= min_live_edge and live_entry_window_reason is None:
             status = "eligible"
             candidate_status = CRYPTO_LIVE_QUALITY
@@ -7147,7 +7192,7 @@ def _crypto_trade_candidates(
                 "edge_bps": raw_edge_bps,
                 "expected_net_edge": str(expected_net_edge.quantize(Decimal("0.0001"))),
                 "model_probability": str(probability.quantize(Decimal("0.0001"))),
-                "model_winner": side == predicted_winner_side,
+                "model_winner": model_winner,
                 "expected_fee": str(fee.quantize(Decimal("0.0001"))),
                 "remaining_payout_dollars": str(remaining_payout.quantize(Decimal("0.0001"))),
                 "bucket_key": _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(cost)}),
@@ -7158,6 +7203,7 @@ def _crypto_trade_candidates(
                 "market_age_seconds": row.get("market_age_seconds"),
                 "time_to_close_seconds": row.get("time_to_close_seconds"),
                 "live_entry_window_reason": live_entry_window_reason,
+                "late_high_confidence_directional_entry": late_sure_thing,
                 "rank": None,
                 "live_eligible": candidate_status == CRYPTO_LIVE_QUALITY,
                 **settlement_diagnostics,

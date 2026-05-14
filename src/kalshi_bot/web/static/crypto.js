@@ -185,6 +185,7 @@
       spread_above_live_max: "spread above live max",
       crypto_market_too_early_for_live_entry: "market too early for live entry",
       crypto_market_too_late_for_live_entry: "market too late for live entry",
+      late_high_confidence_directional_entry: "late high-confidence model choice",
       crypto_entry_window_unknown: "entry window unknown",
     };
     return labels[code] || code.replace(/_/g, " ");

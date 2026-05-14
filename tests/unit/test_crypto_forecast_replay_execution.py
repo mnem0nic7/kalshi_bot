@@ -1868,11 +1868,44 @@ def test_crypto_candidate_quality_blocks_live_inside_final_window(tmp_path) -> N
         "market_age_seconds": 840,
     }
 
-    candidates = _crypto_trade_candidates(row, Decimal("0.9000"), settings=settings)
+    candidates = _crypto_trade_candidates(row, Decimal("0.8000"), settings=settings)
 
     assert candidates[0]["candidate_status"] == CRYPTO_EXPLORATORY_SHADOW
     assert candidates[0]["reason"] == "crypto_market_too_late_for_live_entry"
     assert candidates[0]["live_eligible"] is False
+
+
+def test_crypto_candidate_quality_allows_late_high_confidence_directional_entry(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_late_sure_thing_min_probability=0.90,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-SURE",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.0350"),
+        "yes_bid_dollars": Decimal("0.0300"),
+        "yes_ask_dollars": Decimal("0.0400"),
+        "no_ask_dollars": Decimal("0.9700"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 60,
+        "market_age_seconds": 840,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.0500"), settings=settings)
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert no_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert no_candidate["edge_bps"] < 0
+    assert no_candidate["expected_net_edge"].startswith("-")
+    assert no_candidate["live_entry_window_reason"] == "crypto_market_too_late_for_live_entry"
+    assert no_candidate["late_high_confidence_directional_entry"] is True
 
 
 def test_crypto_candidate_quality_allows_mid_window_with_750bps_edge(tmp_path) -> None:

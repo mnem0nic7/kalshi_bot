@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import ContractSide, DeploymentColor, RiskStatus, TradeAction, WeatherResolutionState
+from kalshi_bot.core.enums import ContractSide, DeploymentColor, RiskStatus, StrategyCode, TradeAction, WeatherResolutionState
 from kalshi_bot.core.schemas import PortfolioBucketSnapshot, TradeTicket
 from kalshi_bot.db.models import DeploymentControl, Room
 from kalshi_bot.services.agent_packs import RuntimeThresholds
@@ -87,6 +87,57 @@ def test_risk_engine_approves_fresh_small_trade() -> None:
         context=RiskContext(market_observed_at=datetime.now(UTC), research_observed_at=datetime.now(UTC)),
     )
     assert verdict.status == RiskStatus.APPROVED
+
+
+def test_risk_engine_allows_late_high_confidence_crypto_edge_bypass() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=500,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    signal = make_signal(edge_bps=-200)
+    signal.recommended_side = ContractSide.NO
+    signal.target_yes_price_dollars = Decimal("0.0300")
+    signal.fair_yes_dollars = Decimal("0.0500")
+    signal.confidence = 0.95
+    signal.candidate_trace = {
+        "strategy_code": StrategyCode.CRYPTO_15M.value,
+        "late_high_confidence_directional_entry": True,
+    }
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-LATE-SURE",
+            action=TradeAction.BUY,
+            side=ContractSide.NO,
+            yes_price_dollars=Decimal("0.0300"),
+            count_fp=Decimal("1.00"),
+        ),
+        signal=signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+        thresholds=RuntimeThresholds(
+            risk_min_edge_bps=500,
+            risk_max_order_notional_dollars=100,
+            risk_max_position_notional_dollars=300,
+            trigger_max_spread_bps=250,
+            trigger_cooldown_seconds=300,
+            strategy_quality_edge_buffer_bps=25,
+            strategy_min_remaining_payout_bps=0,
+            risk_min_confidence=0.80,
+            risk_min_contract_price_dollars=0.50,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert "late_high_confidence_edge_bypass" in verdict.reason_codes
+    assert "late_high_confidence_fee_adjusted_edge_bypass" in verdict.reason_codes
 
 
 def test_risk_engine_blocks_new_entries_when_source_health_pause_is_active() -> None:
