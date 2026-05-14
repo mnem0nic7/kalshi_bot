@@ -35,6 +35,7 @@ from kalshi_bot.crypto.services import (
     _crypto_data_quality,
     _crypto_decision_rows,
     _crypto_bucket_key,
+    _crypto_bucket_matrix,
     _evaluate_crypto_walk_forward,
     _crypto_feature_schema,
     _crypto_model_candidate_report,
@@ -1936,14 +1937,59 @@ def test_crypto_candidate_quality_allows_late_high_confidence_directional_entry(
     assert no_candidate["late_high_confidence_directional_entry"] is True
 
 
-def _empirical_bucket(bucket_key: str, *, sample_count: int = 20, net_pnl: str = "1.0000", win_rate: float = 0.60) -> dict[str, object]:
-    return {
+def _empirical_bucket(
+    bucket_key: str,
+    *,
+    sample_count: int = 20,
+    net_pnl: str = "1.0000",
+    win_rate: float = 0.60,
+    outcome_win_rate: float | None = None,
+    net_positive_rate: float | None = None,
+) -> dict[str, object]:
+    bucket: dict[str, object] = {
         "bucket_key": bucket_key,
         "asset_symbol": bucket_key.split("|", 1)[0],
         "sample_count": sample_count,
         "net_pnl": net_pnl,
         "win_rate": win_rate,
     }
+    if outcome_win_rate is not None:
+        bucket["outcome_win_rate"] = outcome_win_rate
+        bucket["win_rate_basis"] = "settlement_outcome"
+    if net_positive_rate is not None:
+        bucket["net_positive_rate"] = net_positive_rate
+    return bucket
+
+
+def test_crypto_bucket_matrix_win_rate_tracks_outcome_not_net_positive(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    rows = [
+        {
+            **_replay_row(
+                market_day=f"2026-05-0{idx + 1}",
+                label_yes=1 if idx < 2 else 0,
+                yes_ask_dollars=Decimal("0.9900"),
+                spread_bps=0,
+                time_to_close_seconds=60,
+            ),
+            "simulation": {
+                "side": "yes",
+                "execution_price_dollars": "0.9900",
+                "gross_pnl": "0.0100" if idx < 2 else "-0.9900",
+                "fees": "0.0100",
+                "net_pnl": "0.0000" if idx < 2 else "-1.0000",
+            },
+        }
+        for idx in range(3)
+    ]
+
+    bucket = _crypto_bucket_matrix(rows, settings=settings)[0]
+
+    assert bucket["bucket_key"] == "BTC|yes|0.75-1.00|tight|0_5m"
+    assert bucket["win_rate"] == pytest.approx(2 / 3)
+    assert bucket["outcome_win_rate"] == pytest.approx(2 / 3)
+    assert bucket["net_positive_rate"] == pytest.approx(0.0)
+    assert bucket["win_rate_basis"] == "settlement_outcome"
 
 
 def test_crypto_bucket_key_includes_time_to_close_bucket(tmp_path) -> None:
@@ -1992,6 +2038,47 @@ def test_crypto_empirical_bucket_gate_blocks_missing_or_bad_buckets(tmp_path) ->
         assert yes_candidate["reason"] == "empirical_bucket_not_allowed"
         assert yes_candidate["empirical_bucket_gate"]["reason"] == reason
         assert yes_candidate["live_eligible"] is False
+
+
+def test_crypto_empirical_bucket_gate_uses_outcome_win_rate_when_present(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500, crypto_empirical_bucket_gate_assets="BTC")
+    row = {
+        "market_ticker": "KXBTC15M-BUCKET-GATE-OUTCOME",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.9900"),
+        "yes_bid_dollars": Decimal("0.9900"),
+        "yes_ask_dollars": Decimal("0.9900"),
+        "no_ask_dollars": Decimal("0.0100"),
+        "spread_bps": 0,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 60,
+        "market_age_seconds": 840,
+    }
+    bucket_key = _crypto_bucket_key(row, {"side": "yes", "execution_price_dollars": "0.9900"})
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.9990"),
+        settings=settings,
+        empirical_bucket_matrix=[
+            _empirical_bucket(
+                bucket_key,
+                net_pnl="0.0100",
+                win_rate=0.0,
+                outcome_win_rate=0.95,
+                net_positive_rate=0.0,
+            )
+        ],
+        enforce_empirical_bucket_gate=True,
+    )
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert yes_candidate["empirical_bucket_gate"]["reason"] == "empirical_bucket_allowed"
+    assert yes_candidate["empirical_bucket_gate"]["win_rate"] == pytest.approx(0.95)
+    assert yes_candidate["empirical_bucket_gate"]["net_positive_rate"] == pytest.approx(0.0)
 
 
 def test_crypto_empirical_bucket_gate_defaults_to_dynamic_live_assets(tmp_path) -> None:

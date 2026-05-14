@@ -7969,9 +7969,11 @@ def _crypto_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Setting
         values = [_decimal((row.get("simulation") or {}).get("net_pnl")) for row in rows]
         fees = [_decimal((row.get("simulation") or {}).get("fees")) for row in rows]
         gross = [_decimal((row.get("simulation") or {}).get("gross_pnl")) for row in rows]
-        wins = sum(1 for value in values if value > 0)
+        net_positive = sum(1 for value in values if value > 0)
+        outcome_wins = sum(1 for row in rows if _crypto_trade_outcome_won(row))
         first = rows[0]
         net = sum(values, Decimal("0"))
+        outcome_win_rate = _ratio(outcome_wins / len(values)) if values else None
         matrix.append(
             {
                 "bucket_key": key,
@@ -7981,7 +7983,10 @@ def _crypto_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Setting
                 "spread_band": _spread_band(first.get("spread_bps")),
                 "time_to_close_bucket": _crypto_time_to_close_bucket(float(first.get("time_to_close_seconds") or 0)),
                 "sample_count": len(values),
-                "win_rate": _ratio(wins / len(values)) if values else None,
+                "win_rate": outcome_win_rate,
+                "outcome_win_rate": outcome_win_rate,
+                "net_positive_rate": _ratio(net_positive / len(values)) if values else None,
+                "win_rate_basis": "settlement_outcome",
                 "gross_pnl": str(sum(gross, Decimal("0")).quantize(Decimal("0.0001"))),
                 "fees": str(sum(fees, Decimal("0")).quantize(Decimal("0.0001"))),
                 "net_pnl": str(net.quantize(Decimal("0.0001"))),
@@ -8008,6 +8013,22 @@ def _crypto_bucket_diagnostics(trade_rows: list[dict[str, Any]]) -> dict[str, li
             lambda row: _spread_band(row.get("spread_bps")),
         ),
     }
+
+
+def _crypto_trade_outcome_won(row: dict[str, Any]) -> bool:
+    label = row.get("label_yes")
+    if label is None:
+        return False
+    side = str((row.get("simulation") or {}).get("side") or "").lower()
+    try:
+        label_yes = int(label)
+    except (TypeError, ValueError):
+        return False
+    if side == "yes":
+        return label_yes == 1
+    if side == "no":
+        return label_yes == 0
+    return False
 
 
 def _crypto_dimension_bucket_diagnostics(
@@ -8118,8 +8139,14 @@ def _crypto_empirical_bucket_review(bucket: dict[str, Any] | None, *, settings: 
         }
     sample_count = int(bucket.get("sample_count") or 0)
     net_pnl = _decimal(bucket.get("net_pnl") or Decimal("0"))
-    win_rate_raw = bucket.get("win_rate")
+    win_rate_raw = bucket.get("outcome_win_rate", bucket.get("win_rate"))
     win_rate = float(win_rate_raw) if win_rate_raw not in (None, "") else None
+    net_positive_rate_raw = bucket.get("net_positive_rate")
+    net_positive_rate = (
+        float(net_positive_rate_raw)
+        if net_positive_rate_raw not in (None, "")
+        else None
+    )
     if sample_count < min_samples:
         reason = "empirical_bucket_under_sampled"
     elif net_pnl < min_net_pnl:
@@ -8136,6 +8163,9 @@ def _crypto_empirical_bucket_review(bucket: dict[str, Any] | None, *, settings: 
         "sample_count": sample_count,
         "net_pnl": str(net_pnl.quantize(Decimal("0.0001"))),
         "win_rate": win_rate,
+        "outcome_win_rate": win_rate,
+        "net_positive_rate": net_positive_rate,
+        "win_rate_basis": str(bucket.get("win_rate_basis") or "settlement_outcome"),
         "min_samples": min_samples,
         "min_net_pnl_dollars": str(min_net_pnl.quantize(Decimal("0.0001"))),
         "min_win_rate": min_win_rate,
