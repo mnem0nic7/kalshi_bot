@@ -32,6 +32,7 @@ def test_agent_pack_service_builds_deterministic_default_pack() -> None:
     assert pack.thresholds.strategy_min_abs_delta_f == settings.strategy_min_abs_delta_f
     assert pack.thresholds.risk_max_credible_edge_bps == settings.risk_max_credible_edge_bps
     assert pack.crypto_policy.entry.min_fee_adjusted_edge_bps == settings.risk_min_edge_bps
+    assert pack.crypto_policy.entry.min_remaining_payout_bps == 0
     assert pack.crypto_policy.replay.min_resolved_markets == settings.crypto_replay_min_resolved_markets
     assert pack.crypto_policy.live.trading_enabled == settings.crypto_trading_enabled
     assert pack.weather_policy is not None
@@ -106,10 +107,12 @@ def test_agent_pack_runtime_crypto_policy_overrides_per_asset() -> None:
     assert policy.entry_for_asset("BTC")["max_spread_bps"] == 250
     assert policy.entry_for_asset("BTC")["min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
     assert policy.entry_for_asset("ETH")["min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
+    assert policy.entry_for_asset("BTC")["min_remaining_payout_bps"] == 0
+    assert policy.entry_for_asset("ETH")["min_remaining_payout_bps"] == 0
     assert thresholds.risk_min_edge_bps == 1500
     assert thresholds.trigger_max_spread_bps == 250
     assert thresholds.risk_min_contract_price_dollars == settings.risk_min_contract_price_dollars
-    assert thresholds.strategy_min_remaining_payout_bps == 1500
+    assert thresholds.strategy_min_remaining_payout_bps == 0
 
 
 def test_agent_pack_runtime_crypto_policy_cannot_lower_operator_edge_floor() -> None:
@@ -211,7 +214,7 @@ def test_agent_pack_service_sanitizes_crypto_policy_bounds() -> None:
     assert sanitized.crypto_policy.entry.max_spread_bps == 50
     assert sanitized.crypto_policy.entry.min_confidence == 0.50
     assert sanitized.crypto_policy.entry.min_contract_price_dollars == settings.risk_min_contract_price_dollars
-    assert sanitized.crypto_policy.entry.min_remaining_payout_bps == 100
+    assert sanitized.crypto_policy.entry.min_remaining_payout_bps == 0
     assert sanitized.crypto_policy.entry.max_credible_edge_bps == 10000
     assert sanitized.crypto_policy.live.asset_modes == {"BTC": "live", "ETH": "shadow"}
     assert sanitized.crypto_policy.asset_entry_overrides["BTC"].max_spread_bps == 2500

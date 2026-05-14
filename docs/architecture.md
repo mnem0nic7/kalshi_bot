@@ -116,6 +116,6 @@ The deterministic `autonomous-gates` loop is the only runtime authority for chan
 Weather and crypto have separate policy surfaces:
 
 - Weather uses flat `AgentPackThresholds` as the global fallback and `AgentPackWeatherPolicyBook` for deterministic scoped overrides. Scoped weather policy keys follow `weather/{strategy}/{cohort}/{series}/{side}/{season}/{month}/{regime}/{threshold_band}/{lane}` and currently resolve at room-scan time for entry gates.
-- Crypto uses `AgentPackCryptoPolicy` for fee-adjusted edge, spread, confidence, contract price, remaining payout, max credible edge, replay support gates, runtime live flags, and per-asset overrides.
+- Crypto uses `AgentPackCryptoPolicy` for fee-adjusted edge, spread, confidence, contract price, max credible edge, replay support gates, runtime live flags, and per-asset overrides. Crypto does not enforce a remaining-payout floor; a high-cost side can trade when the fee-adjusted edge gate passes.
 
 Weather promotions may be global or scoped to a city/month/side CLI scope. City-scoped candidates are stored in the weather-policy book and do not mutate the flat global thresholds. Crypto promotions are per asset. The daemon runs `autonomous-gates --domain all` after settlement reconciliation and from the active-color heartbeat. A staged crypto candidate can promote BTC without changing ETH, and manual asset mode `off` remains a hard override over any promoted live mode.

@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.constants import CRYPTO_MIN_REMAINING_PAYOUT_BPS
 from kalshi_bot.core.enums import AgentRole, DeploymentColor
 from kalshi_bot.core.schemas import (
     AgentPack,
@@ -212,7 +213,7 @@ class AgentPackService:
                     max_spread_bps=self.settings.trigger_max_spread_bps,
                     min_confidence=self.settings.risk_min_confidence,
                     min_contract_price_dollars=self.settings.risk_min_contract_price_dollars,
-                    min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
+                    min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
                     max_credible_edge_bps=self.settings.risk_max_credible_edge_bps,
                 ),
                 replay=AgentPackCryptoReplayPolicy(
@@ -457,7 +458,7 @@ class AgentPackService:
                 "max_spread_bps": raw_entry.max_spread_bps,
                 "min_confidence": raw_entry.min_confidence,
                 "min_contract_price_dollars": raw_entry.min_contract_price_dollars,
-                "min_remaining_payout_bps": raw_entry.min_remaining_payout_bps,
+                "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
                 "max_credible_edge_bps": raw_entry.max_credible_edge_bps,
             }
             if override["min_contract_price_dollars"] is not None:
@@ -481,9 +482,7 @@ class AgentPackService:
             min_contract_price_dollars=self._contract_price_floor(
                 value_or_settings(entry.min_contract_price_dollars, self.settings.risk_min_contract_price_dollars)
             ),
-            min_remaining_payout_bps=int(
-                value_or_settings(entry.min_remaining_payout_bps, self.settings.strategy_min_remaining_payout_bps)
-            ),
+            min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
             max_credible_edge_bps=int(
                 value_or_settings(entry.max_credible_edge_bps, self.settings.risk_max_credible_edge_bps)
             ),
@@ -546,7 +545,7 @@ class AgentPackService:
             trigger_cooldown_seconds=self.settings.trigger_cooldown_seconds,
             strategy_quality_edge_buffer_bps=self.settings.strategy_quality_edge_buffer_bps,
             strategy_min_abs_delta_f=self.settings.strategy_min_abs_delta_f,
-            strategy_min_remaining_payout_bps=int(entry["min_remaining_payout_bps"]),
+            strategy_min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
         )
 
     def sanitize_candidate_pack(self, candidate: AgentPack, *, parent_version: str) -> AgentPack:
@@ -646,7 +645,7 @@ class AgentPackService:
                 self.settings.risk_min_contract_price_dollars,
                 0.99,
             ),
-            min_remaining_payout_bps=self._clamp_int(entry.min_remaining_payout_bps, 100, 9900),
+            min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
             max_credible_edge_bps=self._clamp_int(entry.max_credible_edge_bps, 2500, 10000),
         )
 

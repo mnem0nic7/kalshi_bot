@@ -1892,6 +1892,32 @@ def test_crypto_candidate_quality_allows_mid_window_with_750bps_edge(tmp_path) -
     assert candidates[0]["settlement_diagnostic_codes"] == ["crypto_settlement_proxy_for_cfb_rti"]
 
 
+def test_crypto_candidate_quality_allows_high_cost_down_when_net_edge_positive(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    row = {
+        "market_ticker": "KXBTC15M-HIGH-COST-DOWN",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.1500"),
+        "yes_bid_dollars": Decimal("0.1500"),
+        "yes_ask_dollars": Decimal("0.1500"),
+        "no_ask_dollars": Decimal("0.8500"),
+        "spread_bps": 0,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.0000"), settings=settings)
+
+    assert candidates[0]["side"] == "no"
+    assert candidates[0]["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert candidates[0]["reason"] == "positive_fee_adjusted_live_quality_edge"
+    assert candidates[0]["remaining_payout_dollars"] == "0.1500"
+    assert candidates[0]["runtime_thresholds"]["min_remaining_payout_bps"] == 0
+
+
 def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=50, trigger_max_spread_bps=1000)
     service = AgentPackService(settings)

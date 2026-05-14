@@ -202,7 +202,6 @@ The live-quality candidate path blocks when:
 - selected side has no fillable ask quote
 - spread exceeds the active max spread
 - contract price is below the minimum
-- remaining payout is below the minimum
 - raw edge exceeds the maximum credible edge
 - fee-adjusted expected net edge is below the active minimum
 - market age is below 180 seconds or time-to-close is below 120 seconds
@@ -215,7 +214,7 @@ Current runtime entry thresholds observed in production on 2026-05-14:
 | Max spread | 250 bps |
 | Minimum confidence | 0.80 |
 | Minimum contract price | $0.50 |
-| Minimum remaining payout | 2000 bps ($0.20) |
+| Minimum remaining payout | disabled (0 bps) |
 | Maximum credible edge | 10000 bps |
 | Minimum market age | 180 seconds |
 | Minimum seconds to close | 120 seconds |
@@ -334,7 +333,6 @@ Risk blocks:
 - candidate edge above active credibility ceiling
 - confidence below minimum
 - contract price below minimum
-- remaining payout below minimum
 - spread above active maximum
 - stale market data
 - kill switch for non-risk-reducing entries

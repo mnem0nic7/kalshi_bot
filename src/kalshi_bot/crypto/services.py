@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kalshi_bot.config import Settings
+from kalshi_bot.core.constants import CRYPTO_MIN_REMAINING_PAYOUT_BPS
 from kalshi_bot.core.enums import (
     AgentRole,
     ContractSide,
@@ -109,7 +110,7 @@ CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_fee_adjusted_edge_bps": (750, 1000, 1500, 2500, 5000),
     "max_spread_bps": (80, 150, 250, 400, 600, 1000),
     "min_contract_price_dollars": (0.50, 0.60, 0.70),
-    "min_remaining_payout_bps": (1000, 1500, 2000, 3000),
+    "min_remaining_payout_bps": (0,),
 }
 
 
@@ -6303,13 +6304,16 @@ def _runtime_crypto_policy_with_asset_entry(
         symbol: dict(values)
         for symbol, values in (crypto_policy.asset_entry_overrides or {}).items()
     }
-    overrides[normalize_asset_symbol(asset_symbol)] = dict(entry_policy)
+    overrides[normalize_asset_symbol(asset_symbol)] = {
+        **dict(entry_policy),
+        "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
+    }
     return RuntimeCryptoPolicy(
         min_fee_adjusted_edge_bps=crypto_policy.min_fee_adjusted_edge_bps,
         max_spread_bps=crypto_policy.max_spread_bps,
         min_confidence=crypto_policy.min_confidence,
         min_contract_price_dollars=crypto_policy.min_contract_price_dollars,
-        min_remaining_payout_bps=crypto_policy.min_remaining_payout_bps,
+        min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
         max_credible_edge_bps=crypto_policy.max_credible_edge_bps,
         replay_min_resolved_markets=crypto_policy.replay_min_resolved_markets,
         replay_min_trade_candidates=crypto_policy.replay_min_trade_candidates,
@@ -6834,13 +6838,14 @@ def _crypto_entry_policy_for_row(
             float(entry["min_contract_price_dollars"]),
             float(settings.risk_min_contract_price_dollars),
         )
+        entry["min_remaining_payout_bps"] = CRYPTO_MIN_REMAINING_PAYOUT_BPS
         return entry
     return {
         "min_fee_adjusted_edge_bps": int(settings.risk_min_edge_bps),
         "max_spread_bps": int(settings.trigger_max_spread_bps),
         "min_confidence": float(settings.risk_min_confidence),
         "min_contract_price_dollars": float(settings.risk_min_contract_price_dollars),
-        "min_remaining_payout_bps": int(settings.strategy_min_remaining_payout_bps),
+        "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
         "max_credible_edge_bps": int(settings.risk_max_credible_edge_bps),
     }
 
@@ -6990,7 +6995,7 @@ def _crypto_trade_candidates(
             reason = "spread_above_live_max"
         elif cost < min_contract_price:
             reason = "contract_price_below_crypto_min"
-        elif remaining_payout < min_remaining_payout:
+        elif min_remaining_payout > 0 and remaining_payout < min_remaining_payout:
             reason = "remaining_payout_below_crypto_min"
         elif raw_edge_bps > max_credible_edge_bps:
             reason = "edge_above_crypto_credible_max"
