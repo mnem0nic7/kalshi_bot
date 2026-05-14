@@ -584,6 +584,12 @@ class CryptoMarketService:
         for market in markets:
             asset_symbol = normalize_asset_symbol(market.asset_symbol)
             market_gate = replay_gates_by_asset.get(asset_symbol, generic_gate)
+            signal_payload = _crypto_signal_payload_with_current_quote_metrics(
+                signal_payloads.get(market.market_ticker),
+                market=market,
+                settings=self.settings,
+                crypto_policy=crypto_policy,
+            )
             live_status = self.asset_control_service.market_live_status(
                 control=control,
                 replay_gate=market_gate,
@@ -596,7 +602,7 @@ class CryptoMarketService:
                     **market.to_payload(),
                     **live_status,
                     "replay_gate": _artifact_summary(market_gate),
-                    "signal": signal_payloads.get(market.market_ticker),
+                    "signal": signal_payload,
                     "active_room": active_rooms.get(market.market_ticker),
                 }
             )
@@ -3485,6 +3491,109 @@ def _artifact_summary(artifact: Any | None) -> dict[str, Any]:
     }
 
 
+def _crypto_signal_fair_yes_from_payload(signal_payload: dict[str, Any] | None) -> Decimal | None:
+    if not isinstance(signal_payload, dict):
+        return None
+    trace = signal_payload.get("candidate_trace") if isinstance(signal_payload.get("candidate_trace"), dict) else {}
+    crypto_modeling = signal_payload.get("crypto_modeling") if isinstance(signal_payload.get("crypto_modeling"), dict) else {}
+    prediction_model = trace.get("prediction_model") if isinstance(trace.get("prediction_model"), dict) else {}
+    if not prediction_model and isinstance(crypto_modeling, dict):
+        prediction_model = (
+            crypto_modeling.get("prediction_model")
+            if isinstance(crypto_modeling.get("prediction_model"), dict)
+            else {}
+        )
+    for value in (
+        signal_payload.get("fair_yes_dollars"),
+        trace.get("fair_yes_dollars"),
+        prediction_model.get("calibrated_probability") if isinstance(prediction_model, dict) else None,
+    ):
+        if value in (None, ""):
+            continue
+        try:
+            return _clamp_price(_decimal(value))
+        except Exception:
+            continue
+    return None
+
+
+def _crypto_signal_payload_with_current_quote_metrics(
+    signal_payload: dict[str, Any] | None,
+    *,
+    market: CryptoMarket,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(signal_payload, dict):
+        return signal_payload
+    fair_yes = _crypto_signal_fair_yes_from_payload(signal_payload)
+    if fair_yes is None:
+        return signal_payload
+    try:
+        row = _crypto_live_market_row(market, settings=settings)
+        action, side, target_yes, edge_bps, trace = _crypto_recommendation(
+            market=market,
+            fair_yes=fair_yes,
+            settings=settings,
+            crypto_policy=crypto_policy,
+            row=row,
+            require_spot_features=False,
+        )
+    except Exception:
+        logger.debug("failed to refresh crypto signal quote metrics", exc_info=True)
+        return signal_payload
+
+    refreshed = dict(signal_payload)
+    existing_trace = (
+        dict(refreshed.get("candidate_trace"))
+        if isinstance(refreshed.get("candidate_trace"), dict)
+        else {}
+    )
+    refreshed_trace = {
+        **existing_trace,
+        **trace,
+        "quote_metrics_refreshed_at": datetime.now(UTC).isoformat(),
+        "quote_metrics_source": "current_market_quote_cached_prediction",
+    }
+    refreshed["edge_bps"] = edge_bps
+    refreshed["recommended_action"] = action.value if action is not None else None
+    refreshed["recommended_side"] = side.value if side is not None else trace.get("selected_side")
+    refreshed["target_yes_price_dollars"] = (
+        _money_text(target_yes)
+        if target_yes is not None
+        else trace.get("target_yes_price_dollars")
+    )
+    refreshed["candidate_trace"] = refreshed_trace
+
+    crypto_modeling = refreshed.get("crypto_modeling")
+    if isinstance(crypto_modeling, dict):
+        trade_selection_model = (
+            dict(crypto_modeling.get("trade_selection_model"))
+            if isinstance(crypto_modeling.get("trade_selection_model"), dict)
+            else {}
+        )
+        trade_selection_model.update(
+            {
+                "candidate_status": trace.get("candidate_status"),
+                "expected_net_edge": trace.get("expected_net_edge"),
+                "rank": trace.get("rank"),
+                "bucket_key": trace.get("bucket_key"),
+                "decision": "selected" if action is not None else "stand_down",
+                "status": (
+                    "shadow_only"
+                    if trace.get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW
+                    else trace.get("candidate_status")
+                ),
+                "reason": trace.get("selection_reason"),
+            }
+        )
+        refreshed["crypto_modeling"] = {
+            **crypto_modeling,
+            "trade_selection_model": trade_selection_model,
+        }
+    return refreshed
+
+
 def _crypto_replay_gate_dashboard_summary(
     *,
     gates_by_asset: dict[str, Any | None],
@@ -3932,9 +4041,16 @@ def _crypto_recommendation(
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy | None = None,
     row: dict[str, Any] | None = None,
+    require_spot_features: bool = True,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
     row = row or _crypto_live_market_row(market, settings=settings)
-    candidates = _crypto_trade_candidates(row, fair_yes, settings=settings, crypto_policy=crypto_policy)
+    candidates = _crypto_trade_candidates(
+        row,
+        fair_yes,
+        settings=settings,
+        crypto_policy=crypto_policy,
+        require_spot_features=require_spot_features,
+    )
     entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
     prediction_side = "yes" if fair_yes >= Decimal("0.5000") else "no"
@@ -6898,6 +7014,7 @@ def _crypto_trade_candidates(
     *,
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy | None = None,
+    require_spot_features: bool = True,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
@@ -6926,7 +7043,7 @@ def _crypto_trade_candidates(
         row.get("spot_provider"),
         row.get("spot_source_kind"),
     )
-    if spot_status != "available" or spot_proxy_only:
+    if require_spot_features and (spot_status != "available" or spot_proxy_only):
         reason = "spot_data_missing_or_stale"
         if spot_proxy_only:
             reason = "spot_source_proxy_only"

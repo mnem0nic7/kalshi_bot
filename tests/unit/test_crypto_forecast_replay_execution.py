@@ -40,6 +40,7 @@ from kalshi_bot.crypto.services import (
     _crypto_replay_gate_dashboard_summary,
     _crypto_raw_feature_vector,
     _crypto_select_champion,
+    _crypto_signal_payload_with_current_quote_metrics,
     _crypto_trade_candidates,
     _fit_crypto_calibration,
     _predict_crypto_probability,
@@ -1176,7 +1177,14 @@ async def test_crypto_forecast_uses_deterministic_model_artifact(tmp_path) -> No
         settings=settings,
         session_factory=session_factory,
         spot_service=_SpotService(),  # type: ignore[arg-type]
-    ).forecast(_market())
+    ).forecast(
+        _market(
+            yes_bid_dollars=Decimal("0.5000"),
+            yes_ask_dollars=Decimal("0.5000"),
+            no_ask_dollars=Decimal("0.5000"),
+            last_price_dollars=Decimal("0.5000"),
+        )
+    )
 
     assert signal.recommended_side == ContractSide.YES
     assert signal.edge_bps > 50
@@ -1917,6 +1925,55 @@ def test_crypto_candidate_quality_allows_high_cost_down_when_net_edge_positive(t
     assert candidates[0]["reason"] == "positive_fee_adjusted_live_quality_edge"
     assert candidates[0]["remaining_payout_dollars"] == "0.1500"
     assert candidates[0]["runtime_thresholds"]["min_remaining_payout_bps"] == 0
+
+
+def test_crypto_dashboard_signal_metrics_follow_current_quote(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    market = CryptoMarket(
+        market_ticker="KXBTC15M-QUOTE-MOVE",
+        series_ticker="KXBTC15M",
+        asset_symbol="BTC",
+        status="open",
+        close_time=datetime.now(UTC) + timedelta(minutes=10),
+        target_price_dollars=Decimal("75000.0000"),
+        yes_bid_dollars=Decimal("0.1900"),
+        yes_ask_dollars=Decimal("0.2000"),
+        no_ask_dollars=Decimal("0.8000"),
+    )
+    signal_payload = {
+        "fair_yes_dollars": "0.0500",
+        "edge_bps": 1000,
+        "recommended_side": "no",
+        "candidate_trace": {
+            "selected_side": "no",
+            "selected_edge_bps": 1000,
+            "expected_net_edge": "0.1000",
+            "candidates": [
+                {
+                    "side": "no",
+                    "edge_bps": 1000,
+                    "expected_net_edge": "0.1000",
+                    "execution_price_dollars": "0.8500",
+                }
+            ],
+        },
+    }
+
+    refreshed = _crypto_signal_payload_with_current_quote_metrics(
+        signal_payload,
+        market=market,
+        settings=settings,
+    )
+
+    assert refreshed is not None
+    trace = refreshed["candidate_trace"]
+    no_candidate = next(candidate for candidate in trace["candidates"] if candidate["side"] == "no")
+    assert refreshed["edge_bps"] == 1500
+    assert trace["selected_edge_bps"] == 1500
+    assert no_candidate["execution_price_dollars"] == "0.8000"
+    assert no_candidate["edge_bps"] == 1500
+    assert no_candidate["expected_net_edge"] != "0.1000"
+    assert trace["quote_metrics_source"] == "current_market_quote_cached_prediction"
 
 
 def test_crypto_recommendation_selects_model_winner_not_low_price_value_side(tmp_path) -> None:
