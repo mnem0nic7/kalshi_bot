@@ -281,8 +281,9 @@
 
   function card(market) {
     const signal = market.signal || {};
+    const trace = signalTrace(signal);
     const room = market.active_room;
-    const side = signal.recommended_side;
+    const side = String(signal.recommended_side || trace.selected_side || "").toLowerCase() || null;
     const target = market.target_price_dollars ? money(market.target_price_dollars, 4) : "target n/a";
     const title = `${market.asset_symbol || "CRYPTO"} 15 min · ${target} target`;
     const iconText = String(market.asset_symbol || "?").slice(0, 2);

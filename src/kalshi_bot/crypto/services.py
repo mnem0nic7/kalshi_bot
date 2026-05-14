@@ -1974,15 +1974,21 @@ class CryptoForecastService:
         eligibility = None
         stand_down_reason = None
         outcome = trace["outcome"]
+        display_side = side.value if side is not None else trace.get("selected_side")
+        display_decision = (
+            f"recommend {display_side.upper()}"
+            if side is not None and display_side
+            else f"predict {str(display_side).upper()}" if display_side else "no trade"
+        )
         summary = (
             f"{market.asset_symbol} 15m fair yes {fair}; "
-            f"{'recommend ' + side.value.upper() if side is not None else 'no trade'} edge {edge_bps}bps."
+            f"{display_decision} edge {edge_bps}bps."
         )
         if side is None:
             stand_down_reason = StandDownReason.NO_ACTIONABLE_EDGE
             eligibility = TradeEligibilityVerdict(
                 eligible=False,
-                reasons=["No crypto edge clears the configured minimum."],
+                reasons=["Predicted crypto winner does not clear live trading gates."],
                 stand_down_reason=stand_down_reason,
                 evaluation_outcome=outcome,
                 candidate_trace=trace,
@@ -3931,20 +3937,14 @@ def _crypto_recommendation(
     candidates = _crypto_trade_candidates(row, fair_yes, settings=settings, crypto_policy=crypto_policy)
     entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
-    eligible = [
-        candidate
-        for candidate in candidates
-        if candidate["candidate_status"] in {CRYPTO_LIVE_QUALITY, CRYPTO_EXPLORATORY_SHADOW}
-    ]
-    if not eligible:
-        fallback = _crypto_shadow_ranked_fallback(candidates, settings=settings)
-        if fallback is not None:
-            eligible.append(fallback)
-    if not eligible:
+    prediction_side = "yes" if fair_yes >= Decimal("0.5000") else "no"
+    selected = next((candidate for candidate in candidates if candidate.get("side") == prediction_side), None)
+    if selected is None:
         edge_bps = max([int(candidate["edge_bps"]) for candidate in candidates if candidate["edge_bps"] is not None] or [0])
         return None, None, None, edge_bps, {
             "outcome": "no_candidate",
             "fair_yes_dollars": _money_text(fair_yes),
+            "predicted_winner_side": prediction_side,
             "min_edge_bps": entry_policy["min_fee_adjusted_edge_bps"],
             "max_spread_bps": entry_policy["max_spread_bps"],
             "spread_bps": market.spread_bps,
@@ -3952,26 +3952,29 @@ def _crypto_recommendation(
             "gate_cascade": _crypto_candidate_gate_cascade(candidates),
             **settlement_diagnostics,
         }
-    selected = max(eligible, key=lambda candidate: (candidate["candidate_status"] == CRYPTO_LIVE_QUALITY, _decimal(candidate.get("expected_net_edge") or 0)))
-    side = ContractSide(selected["side"])
-    target_yes = quantize_price(selected["target_yes_price_dollars"])
+    selected_status = str(selected.get("candidate_status") or "")
+    side = ContractSide(prediction_side)
+    target_raw = selected.get("target_yes_price_dollars")
+    target_yes = quantize_price(target_raw) if target_raw is not None else None
     edge_bps = int(selected["edge_bps"] or 0)
-    return TradeAction.BUY, side, target_yes, edge_bps, {
-        "outcome": "candidate_selected",
+    live_quality = selected_status == CRYPTO_LIVE_QUALITY and target_yes is not None
+    return (TradeAction.BUY if live_quality else None), (side if live_quality else None), (target_yes if live_quality else None), edge_bps, {
+        "outcome": "candidate_selected" if live_quality else "predicted_winner_blocked",
         "fair_yes_dollars": _money_text(fair_yes),
+        "predicted_winner_side": prediction_side,
         "selected_side": side.value,
         "selected_edge_bps": edge_bps,
-        "candidate_status": selected["candidate_status"],
+        "candidate_status": selected_status,
         "selection_reason": selected.get("reason"),
         "expected_net_edge": selected.get("expected_net_edge"),
         "rank": selected.get("rank"),
         "bucket_key": selected.get("bucket_key"),
-        "target_yes_price_dollars": _money_text(target_yes),
+        "target_yes_price_dollars": _money_text(target_yes) if target_yes is not None else None,
         "min_edge_bps": entry_policy["min_fee_adjusted_edge_bps"],
         "max_spread_bps": entry_policy["max_spread_bps"],
         "spread_bps": market.spread_bps,
         "candidates": candidates,
-        "gate_cascade": _crypto_candidate_gate_cascade(candidates, selected=selected),
+        "gate_cascade": _crypto_candidate_gate_cascade(candidates, selected=selected if live_quality else None),
         **settlement_diagnostics,
     }
 
@@ -6898,6 +6901,7 @@ def _crypto_trade_candidates(
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
+    predicted_winner_side = "yes" if predicted_yes >= Decimal("0.5000") else "no"
     if row.get("strict_trade_eligible") is False:
         return [
             {
@@ -6907,6 +6911,8 @@ def _crypto_trade_candidates(
                 "reason": row.get("execution_model_status") or "row_has_no_real_bid_ask_quotes",
                 "edge_bps": None,
                 "expected_net_edge": None,
+                "model_probability": None,
+                "model_winner": side == predicted_winner_side,
                 "target_yes_price_dollars": None,
                 "spread_bps": row.get("spread_bps"),
                 "rank": rank,
@@ -6934,6 +6940,8 @@ def _crypto_trade_candidates(
                 "reason": reason,
                 "edge_bps": None,
                 "expected_net_edge": None,
+                "model_probability": None,
+                "model_winner": side == predicted_winner_side,
                 "target_yes_price_dollars": None,
                 "spread_bps": row.get("spread_bps"),
                 "spot_feature_status": row.get("spot_feature_status"),
@@ -6972,6 +6980,8 @@ def _crypto_trade_candidates(
                     "reason": "missing_quote",
                     "edge_bps": None,
                     "expected_net_edge": None,
+                    "model_probability": None,
+                    "model_winner": side == predicted_winner_side,
                     "target_yes_price_dollars": None,
                     **settlement_diagnostics,
                 }
@@ -7019,6 +7029,8 @@ def _crypto_trade_candidates(
                 "execution_price_dollars": _money_text(_clamp_price(cost)),
                 "edge_bps": raw_edge_bps,
                 "expected_net_edge": str(expected_net_edge.quantize(Decimal("0.0001"))),
+                "model_probability": str(probability.quantize(Decimal("0.0001"))),
+                "model_winner": side == predicted_winner_side,
                 "expected_fee": str(fee.quantize(Decimal("0.0001"))),
                 "remaining_payout_dollars": str(remaining_payout.quantize(Decimal("0.0001"))),
                 "bucket_key": _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(cost)}),
@@ -7034,7 +7046,15 @@ def _crypto_trade_candidates(
                 **settlement_diagnostics,
             }
         )
-    candidates.sort(key=lambda item: (_decimal(item.get("expected_net_edge") or Decimal("-999")), item["side"]), reverse=True)
+    candidates.sort(
+        key=lambda item: (
+            item.get("model_winner") is True,
+            _decimal(item.get("model_probability") or Decimal("-1")),
+            _decimal(item.get("expected_net_edge") or Decimal("-999")),
+            item["side"],
+        ),
+        reverse=True,
+    )
     for idx, candidate in enumerate(candidates, start=1):
         candidate["rank"] = idx
     return candidates
@@ -7070,13 +7090,13 @@ def _simulate_crypto_trade(
     allowed_statuses = {CRYPTO_LIVE_QUALITY}
     if policy == CRYPTO_EXPLORATORY_SHADOW:
         allowed_statuses = {CRYPTO_LIVE_QUALITY, CRYPTO_EXPLORATORY_SHADOW}
-    eligible = [candidate for candidate in candidates if candidate["candidate_status"] in allowed_statuses]
-    if not eligible and policy == CRYPTO_EXPLORATORY_SHADOW:
-        fallback = _crypto_shadow_ranked_fallback(candidates, settings=settings)
+    selected = candidates[0] if candidates else {}
+    if selected and selected.get("candidate_status") not in allowed_statuses and policy == CRYPTO_EXPLORATORY_SHADOW:
+        fallback = _crypto_shadow_ranked_fallback(candidates[:1], settings=settings)
         if fallback is not None:
-            eligible.append(fallback)
-    if not eligible:
-        best = candidates[0] if candidates else {}
+            selected = fallback
+    if not selected or selected.get("candidate_status") not in allowed_statuses:
+        best = selected or {}
         return {
             "status": "not_selected",
             "side": best.get("side"),
@@ -7085,7 +7105,6 @@ def _simulate_crypto_trade(
             "expected_net_edge": best.get("expected_net_edge"),
             "candidates": candidates,
         }
-    selected = eligible[0]
     side = str(selected["side"])
     cost = _decimal(selected["execution_price_dollars"])
     fee = _decimal(selected["expected_fee"])

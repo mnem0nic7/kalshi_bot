@@ -36,6 +36,7 @@ from kalshi_bot.crypto.services import (
     _crypto_feature_schema,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
+    _crypto_recommendation,
     _crypto_replay_gate_dashboard_summary,
     _crypto_raw_feature_vector,
     _crypto_select_champion,
@@ -1916,6 +1917,49 @@ def test_crypto_candidate_quality_allows_high_cost_down_when_net_edge_positive(t
     assert candidates[0]["reason"] == "positive_fee_adjusted_live_quality_edge"
     assert candidates[0]["remaining_payout_dollars"] == "0.1500"
     assert candidates[0]["runtime_thresholds"]["min_remaining_payout_bps"] == 0
+
+
+def test_crypto_recommendation_selects_model_winner_not_low_price_value_side(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    market = _market(
+        yes_bid_dollars=Decimal("0.8900"),
+        yes_ask_dollars=Decimal("0.9000"),
+        no_ask_dollars=Decimal("0.1100"),
+        last_price_dollars=Decimal("0.8900"),
+    )
+    row = {
+        "market_ticker": market.market_ticker,
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.8950"),
+        "yes_bid_dollars": Decimal("0.8900"),
+        "yes_ask_dollars": Decimal("0.9000"),
+        "no_ask_dollars": Decimal("0.1100"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
+    }
+
+    action, side, target_yes, edge_bps, trace = _crypto_recommendation(
+        market=market,
+        fair_yes=Decimal("0.8667"),
+        settings=settings,
+        row=row,
+    )
+
+    assert action is None
+    assert side is None
+    assert target_yes is None
+    assert edge_bps == -333
+    assert trace["outcome"] == "predicted_winner_blocked"
+    assert trace["predicted_winner_side"] == "yes"
+    assert trace["selected_side"] == "yes"
+    assert trace["selection_reason"] == "fee_adjusted_edge_below_live_min"
+    assert trace["candidates"][0]["side"] == "yes"
+    assert trace["candidates"][0]["model_winner"] is True
+    assert trace["candidates"][1]["side"] == "no"
 
 
 def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
