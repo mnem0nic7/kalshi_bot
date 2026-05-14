@@ -210,6 +210,65 @@ def test_crypto_replay_gate_blocks_losing_model_even_with_good_calibration(tmp_p
     assert any("Net simulated P/L" in reason for reason in gate["reasons"])
 
 
+def test_crypto_replay_gate_allows_bucket_gated_market_mid_tie_when_profitable(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=10,
+        crypto_replay_min_trade_candidates=2,
+        crypto_replay_require_calibration_better_than_mid=False,
+        crypto_replay_require_pnl_beats_market_mid=True,
+    )
+    service = CryptoReplayService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+
+    gate = service.evaluate_gate(
+        {
+            "metrics_source": "empirical_bucket_gated",
+            "resolved_sample_count": 20,
+            "trade_candidate_count": 3,
+            "current_model_live_quality_candidate_count": 3,
+            "strict_trade_eligible_count": 20,
+            "net_simulated_pl_dollars": 0.21,
+            "market_mid_net_simulated_pl_dollars": 0.21,
+            "pnl_advantage_vs_market_mid_dollars": 0.0,
+            "hard_cap_breaches": 0,
+            "candle_count": 20,
+            "spot_feature_coverage_pct": 1.0,
+        }
+    )
+
+    assert gate["passed"] is True
+
+
+def test_crypto_replay_gate_blocks_bucket_gated_market_mid_underperformance(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=10,
+        crypto_replay_min_trade_candidates=2,
+        crypto_replay_require_calibration_better_than_mid=False,
+        crypto_replay_require_pnl_beats_market_mid=True,
+    )
+    service = CryptoReplayService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+
+    gate = service.evaluate_gate(
+        {
+            "metrics_source": "empirical_bucket_gated",
+            "resolved_sample_count": 20,
+            "trade_candidate_count": 3,
+            "current_model_live_quality_candidate_count": 3,
+            "strict_trade_eligible_count": 20,
+            "net_simulated_pl_dollars": 0.20,
+            "market_mid_net_simulated_pl_dollars": 0.21,
+            "pnl_advantage_vs_market_mid_dollars": -0.01,
+            "hard_cap_breaches": 0,
+            "candle_count": 20,
+            "spot_feature_coverage_pct": 1.0,
+        }
+    )
+
+    assert gate["passed"] is False
+    assert any("market-mid baseline" in reason for reason in gate["reasons"])
+
+
 @pytest.mark.asyncio
 async def test_crypto_replay_gate_falls_back_to_per_asset_artifacts_for_multi_asset_request(tmp_path) -> None:
     settings = _settings(

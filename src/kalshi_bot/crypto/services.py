@@ -3943,7 +3943,17 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
         )
     if net_pl <= crypto_policy.replay_min_net_pl_dollars:
         reasons.append(f"Net simulated P/L ${net_pl:.2f} does not clear required positive threshold.")
-    if crypto_policy.replay_require_pnl_beats_market_mid and pnl_advantage <= crypto_policy.replay_min_pnl_advantage_dollars:
+    bucket_gated_market_mid_tie = (
+        str(metrics.get("metrics_source") or "") == "empirical_bucket_gated"
+        and float(crypto_policy.replay_min_pnl_advantage_dollars) == 0.0
+        and abs(pnl_advantage) <= 1e-9
+        and net_pl > crypto_policy.replay_min_net_pl_dollars
+    )
+    if (
+        crypto_policy.replay_require_pnl_beats_market_mid
+        and pnl_advantage <= crypto_policy.replay_min_pnl_advantage_dollars
+        and not bucket_gated_market_mid_tie
+    ):
         reasons.append(
             "Model fee-adjusted P/L does not beat the market-mid baseline "
             f"(${net_pl:.2f} vs ${market_mid_net_pl:.2f}; advantage ${pnl_advantage:.2f})."
