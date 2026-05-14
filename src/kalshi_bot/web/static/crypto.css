@@ -224,6 +224,15 @@
   line-height: 1.35;
 }
 
+.crypto-signal-blocker {
+  padding: 0.5rem 0.65rem;
+  border-left: 3px solid rgba(255, 79, 123, 0.75);
+  color: #ffc2d0;
+  background: rgba(255, 79, 123, 0.08);
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
 .crypto-sides {
   display: grid;
   gap: 0.5rem;

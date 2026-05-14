@@ -50,6 +50,9 @@ def _crypto_payload() -> dict[str, object]:
                         "candidates": [
                             {
                                 "side": "yes",
+                                "candidate_status": "blocked_fee_edge",
+                                "reason": "fee_adjusted_edge_below_live_min",
+                                "live_eligible": False,
                                 "rank": 1,
                                 "edge_bps": 55,
                                 "expected_net_edge": "-0.0145",
@@ -194,6 +197,10 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
                 == "raw +55bps / net -145bps / need +500bps"
             )
             assert (
+                page.locator('[data-market="KXBTC15M-TEST"] .crypto-signal-blocker').inner_text()
+                == "Signal blocked: fee adjusted edge below live min"
+            )
+            assert (
                 page.locator('[data-market="KXETH15M-TEST"] .crypto-edge-summary').inner_text()
                 == "raw +420bps / net -50bps / need +500bps"
             )
@@ -208,8 +215,8 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             assert page.evaluate(
                 """
                 () => [...document.querySelectorAll('.crypto-card')].every((card) => {
-                  const bounds = card.getBoundingClientRect();
-                  return [...card.querySelectorAll('select, button, a, h2, .crypto-live-blockers, .crypto-edge-summary')]
+	                  const bounds = card.getBoundingClientRect();
+	                  return [...card.querySelectorAll('select, button, a, h2, .crypto-live-blockers, .crypto-signal-blocker, .crypto-edge-summary')]
                     .every((element) => {
                       const rect = element.getBoundingClientRect();
                       return rect.left >= bounds.left - 1 && rect.right <= bounds.right + 1;

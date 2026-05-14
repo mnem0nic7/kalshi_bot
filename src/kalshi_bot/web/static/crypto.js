@@ -148,6 +148,24 @@
     return parts.length ? parts.join(" / ") : "edge n/a";
   }
 
+  function humanizeCode(value) {
+    return String(value || "").replace(/_/g, " ");
+  }
+
+  function candidateBlocker(signal) {
+    const trace = signalTrace(signal || {});
+    const candidate = visibleCandidate(signal || {});
+    if (!candidate) return "";
+    const status = String(candidate.candidate_status || candidate.status || trace.candidate_status || "").toLowerCase();
+    const reason = candidate.reason || (Array.isArray(candidate.reasons) ? candidate.reasons[0] : null) || trace.selection_reason;
+    const liveEligible = candidate.live_eligible;
+    if (status && !["live_quality", "selected", "tradeable"].includes(status)) {
+      return reason ? humanizeCode(reason) : humanizeCode(status);
+    }
+    if (liveEligible === false && reason) return humanizeCode(reason);
+    return "";
+  }
+
   function trendScore(market) {
     const metrics = edgeMetrics((market || {}).signal || {});
     return Math.abs(Number(metrics.sortBps || 0));
@@ -200,6 +218,10 @@
     const blockersHtml = mode === "live" && blockers
       ? `<div class="crypto-live-blockers">Live blocked: ${escapeHtml(blockers)}</div>`
       : "";
+    const signalBlocker = candidateBlocker(signal);
+    const signalBlockerHtml = signalBlocker
+      ? `<div class="crypto-signal-blocker">Signal blocked: ${escapeHtml(signalBlocker)}</div>`
+      : "";
     return `
       <article class="crypto-card crypto-card-${mode}" data-market="${escapeHtml(market.market_ticker)}">
         <div class="crypto-card-header">
@@ -230,6 +252,7 @@
           </div>
         </div>
         ${blockersHtml}
+        ${signalBlockerHtml}
         <div class="crypto-sides">
           <div class="crypto-side-row">
             <span class="crypto-side-name">Up</span>
