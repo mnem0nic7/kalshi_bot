@@ -622,7 +622,7 @@ def test_crypto_live_path_stale_spot_is_advisory_not_readiness_blocker() -> None
                 }
             },
             "asset_modes": {"BTC": "shadow"},
-            "asset_entry_thresholds": {"BTC": {"min_fee_adjusted_edge_bps": 750}},
+            "asset_entry_thresholds": {"BTC": {"min_fee_adjusted_edge_bps": 500}},
         },
         strict_rows_target=60,
         candidate_target=50,

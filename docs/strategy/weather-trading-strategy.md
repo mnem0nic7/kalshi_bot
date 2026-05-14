@@ -175,7 +175,7 @@ Important fallback thresholds:
 
 | Gate | Fallback |
 |---|---:|
-| Minimum edge | `risk_min_edge_bps`, default 750 bps |
+| Minimum edge | `risk_min_edge_bps`, default 500 bps |
 | Quality edge buffer | 25 bps |
 | Maximum credible edge | 10000 bps |
 | Minimum confidence | 0.80 |

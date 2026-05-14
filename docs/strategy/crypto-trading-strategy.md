@@ -211,7 +211,7 @@ Current runtime entry thresholds observed in production on 2026-05-14:
 
 | Gate | Active value |
 |---|---:|
-| Minimum fee-adjusted edge | 750 bps |
+| Minimum fee-adjusted edge | 500 bps |
 | Max spread | 250 bps |
 | Minimum confidence | 0.80 |
 | Minimum contract price | $0.50 |

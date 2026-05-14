@@ -46,7 +46,7 @@ def _crypto_payload() -> dict[str, object]:
                     "edge_bps": 1736,
                     "candidate_trace": {
                         "selected_side": "no",
-                        "min_edge_bps": 750,
+                        "min_edge_bps": 500,
                         "candidates": [
                             {
                                 "side": "no",
@@ -56,7 +56,7 @@ def _crypto_payload() -> dict[str, object]:
                                 "rank": 1,
                                 "edge_bps": 1736,
                                 "expected_net_edge": "0.1536",
-                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 750},
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
                             },
                             {
                                 "side": "yes",
@@ -66,7 +66,7 @@ def _crypto_payload() -> dict[str, object]:
                                 "rank": 2,
                                 "edge_bps": -1736,
                                 "expected_net_edge": "-0.1936",
-                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 750},
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
                             },
                         ],
                     },
@@ -127,10 +127,10 @@ def _crypto_payload() -> dict[str, object]:
                 "live_blockers": [],
                 "signal": {
                     "recommended_side": "no",
-                    "edge_bps": 786,
+                    "edge_bps": 686,
                     "candidate_trace": {
                         "selected_side": "no",
-                        "min_edge_bps": 750,
+                        "min_edge_bps": 500,
                         "candidates": [
                             {
                                 "side": "no",
@@ -138,9 +138,9 @@ def _crypto_payload() -> dict[str, object]:
                                 "reason": "broad_shadow_exploration",
                                 "live_eligible": False,
                                 "rank": 1,
-                                "edge_bps": 786,
-                                "expected_net_edge": "0.0586",
-                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 750},
+                                "edge_bps": 686,
+                                "expected_net_edge": "0.0486",
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
                             },
                             {
                                 "side": "yes",
@@ -150,7 +150,7 @@ def _crypto_payload() -> dict[str, object]:
                                 "rank": 2,
                                 "edge_bps": -1386,
                                 "expected_net_edge": "-0.1186",
-                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 750},
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
                             },
                         ],
                     },
@@ -242,15 +242,15 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             assert page.locator('[data-market="KXETH15M-TEST"] .crypto-gate').inner_text() == "blocked"
             assert (
                 page.locator('[data-market="KXBTC15M-TEST"] .crypto-edge-summary').inner_text()
-                == "raw +1736bps / net +1536bps / need +750bps"
+                == "raw +1736bps / net +1536bps / need +500bps"
             )
             assert (
                 page.locator('[data-market="KXBTC15M-TEST"] .crypto-signal-blocker').inner_text()
                 == "Signal blocked on Down: contract price below crypto min"
             )
             btc_side_details = page.locator('[data-market="KXBTC15M-TEST"] .crypto-side-detail').all_inner_texts()
-            assert "net -1936bps / need +750bps · blocked: net edge below live min" in btc_side_details
-            assert "net +1536bps / need +750bps · blocked: contract price below crypto min" in btc_side_details
+            assert "net -1936bps / need +500bps · blocked: net edge below live min" in btc_side_details
+            assert "net +1536bps / need +500bps · blocked: contract price below crypto min" in btc_side_details
             assert (
                 page.locator('[data-market="KXETH15M-TEST"] .crypto-edge-summary').inner_text()
                 == "raw +420bps / net -50bps / need +500bps"
@@ -261,7 +261,7 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             )
             assert (
                 page.locator('[data-market="KXSOL15M-TEST"] .crypto-side-selected .crypto-side-detail').inner_text()
-                == "net +586bps / need +750bps · blocked: net edge below live min; shadow only"
+                == "net +486bps / need +500bps · blocked: net edge below live min; shadow only"
             )
             btc_select = page.locator('[data-asset-mode="BTC"]')
             assert btc_select.input_value() == "shadow"

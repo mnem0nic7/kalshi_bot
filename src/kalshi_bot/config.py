@@ -247,7 +247,7 @@ class Settings(BaseSettings):
     risk_risky_capital_max_ratio: float = 0.0
     risk_stale_market_seconds: int = 60
     risk_stale_weather_seconds: int = 900
-    risk_min_edge_bps: int = 750
+    risk_min_edge_bps: int = 500
     risk_fee_aware_edge_enabled: bool = True
     risk_max_credible_edge_bps: int = 10000
     risk_min_confidence: float = 0.80
