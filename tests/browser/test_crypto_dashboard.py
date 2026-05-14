@@ -111,6 +111,51 @@ def _crypto_payload() -> dict[str, object]:
                     },
                 },
             },
+            {
+                "market_ticker": "KXSOL15M-TEST",
+                "asset_symbol": "SOL",
+                "status": "open",
+                "close_time": "2026-05-01T12:15:00Z",
+                "target_price_dollars": "91.20",
+                "yes_ask_dollars": "0.1900",
+                "yes_bid_dollars": "0.1800",
+                "no_ask_dollars": "0.8200",
+                "volume": 42,
+                "asset_mode": "shadow",
+                "replay_gate": {"status": "passed"},
+                "live_eligible": False,
+                "live_blockers": [],
+                "signal": {
+                    "recommended_side": "no",
+                    "edge_bps": 786,
+                    "candidate_trace": {
+                        "selected_side": "no",
+                        "min_edge_bps": 750,
+                        "candidates": [
+                            {
+                                "side": "no",
+                                "candidate_status": "exploratory_shadow",
+                                "reason": "broad_shadow_exploration",
+                                "live_eligible": False,
+                                "rank": 1,
+                                "edge_bps": 786,
+                                "expected_net_edge": "0.0586",
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 750},
+                            },
+                            {
+                                "side": "yes",
+                                "candidate_status": "blocked_fee_edge",
+                                "reason": "contract_price_below_crypto_min",
+                                "live_eligible": False,
+                                "rank": 2,
+                                "edge_bps": -1386,
+                                "expected_net_edge": "-0.1186",
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 750},
+                            },
+                        ],
+                    },
+                },
+            },
         ],
     }
 
@@ -189,7 +234,7 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             page.goto("http://crypto.test/crypto", wait_until="load", timeout=15_000)
             page.wait_for_selector(".crypto-card", timeout=15_000)
 
-            assert page.locator(".crypto-card").count() == 2
+            assert page.locator(".crypto-card").count() == 3
             assert page.locator(".crypto-live-blockers").count() == 1
             assert "passed" in page.locator(".crypto-status-pill", has_text="Replay Gate").inner_text()
             assert page.locator(".crypto-card").first.get_attribute("data-market") == "KXBTC15M-TEST"
@@ -204,11 +249,19 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
                 == "Signal blocked on Down: contract price below crypto min"
             )
             btc_side_details = page.locator('[data-market="KXBTC15M-TEST"] .crypto-side-detail').all_inner_texts()
-            assert "net -1936bps / need +750bps · blocked: fee adjusted edge below live min" in btc_side_details
+            assert "net -1936bps / need +750bps · blocked: net edge below live min" in btc_side_details
             assert "net +1536bps / need +750bps · blocked: contract price below crypto min" in btc_side_details
             assert (
                 page.locator('[data-market="KXETH15M-TEST"] .crypto-edge-summary').inner_text()
                 == "raw +420bps / net -50bps / need +500bps"
+            )
+            assert (
+                page.locator('[data-market="KXSOL15M-TEST"] .crypto-signal-blocker').inner_text()
+                == "Signal blocked on Down: net edge below live min; shadow only"
+            )
+            assert (
+                page.locator('[data-market="KXSOL15M-TEST"] .crypto-side-selected .crypto-side-detail').inner_text()
+                == "net +586bps / need +750bps · blocked: net edge below live min; shadow only"
             )
             btc_select = page.locator('[data-asset-mode="BTC"]')
             assert btc_select.input_value() == "shadow"

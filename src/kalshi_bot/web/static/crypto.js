@@ -176,7 +176,18 @@
   }
 
   function humanizeCode(value) {
-    return String(value || "").replace(/_/g, " ");
+    const code = String(value || "");
+    const labels = {
+      broad_shadow_exploration: "net edge below live min; shadow only",
+      fee_adjusted_edge_below_live_min: "net edge below live min",
+      contract_price_below_crypto_min: "contract price below crypto min",
+      remaining_payout_below_crypto_min: "remaining payout below crypto min",
+      spread_above_live_max: "spread above live max",
+      crypto_market_too_early_for_live_entry: "market too early for live entry",
+      crypto_market_too_late_for_live_entry: "market too late for live entry",
+      crypto_entry_window_unknown: "entry window unknown",
+    };
+    return labels[code] || code.replace(/_/g, " ");
   }
 
   function candidateBlockerText(candidate, trace) {
