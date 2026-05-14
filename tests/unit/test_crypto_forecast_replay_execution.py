@@ -1992,6 +1992,38 @@ def test_crypto_empirical_bucket_gate_blocks_missing_or_bad_buckets(tmp_path) ->
         assert yes_candidate["live_eligible"] is False
 
 
+def test_crypto_empirical_bucket_gate_defaults_to_all_live_assets(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    row = {
+        "market_ticker": "KXHYPE15M-BUCKET-GATE",
+        "asset_symbol": "HYPE",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.4900"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5100"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
+    }
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.9000"),
+        settings=settings,
+        empirical_bucket_matrix=[],
+        enforce_empirical_bucket_gate=True,
+    )
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert settings.crypto_empirical_bucket_gate_assets == "BTC,ETH,HYPE,XRP"
+    assert yes_candidate["candidate_status"] == "blocked_empirical_bucket"
+    assert yes_candidate["reason"] == "empirical_bucket_not_allowed"
+    assert yes_candidate["empirical_bucket_gate"]["reason"] == "empirical_bucket_missing"
+
+
 def test_late_high_confidence_candidate_still_requires_empirical_bucket(tmp_path) -> None:
     settings = _settings(
         tmp_path,
@@ -2606,8 +2638,8 @@ def test_passive_prices_do_not_cross_crypto_touch(tmp_path) -> None:
     yes_price = service.passive_yes_price(market, ContractSide.YES)
     no_price = service.passive_yes_price(market, ContractSide.NO)
 
-    assert yes_price == Decimal("0.48")
-    assert no_price == Decimal("0.48")
+    assert yes_price == Decimal("0.47")
+    assert no_price == Decimal("0.49")
 
 
 def test_passive_prices_use_valid_cent_ticks_for_one_cent_spread(tmp_path) -> None:
@@ -3162,7 +3194,7 @@ async def test_crypto_execution_live_asset_reaches_base_execution(tmp_path) -> N
 
     assert receipt.status == "submitted"
     assert fake_base.calls[0]["client_order_id"] == "crypto-test:maker"
-    assert fake_base.calls[0]["ticket"].yes_price_dollars == Decimal("0.48")
+    assert fake_base.calls[0]["ticket"].yes_price_dollars == Decimal("0.47")
     await engine.dispose()
 
 

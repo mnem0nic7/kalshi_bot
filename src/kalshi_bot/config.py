@@ -196,7 +196,7 @@ class Settings(BaseSettings):
     coinbase_cdp_private_key: str | None = None
     coinbase_advanced_trade_authenticated_enabled: bool = True
     crypto_spot_proxy_fallback_enabled: bool = False
-    crypto_spot_coinbase_max_stale_seconds: int = 5
+    crypto_spot_coinbase_max_stale_seconds: int = 180
     crypto_spot_coingecko_max_stale_seconds: int = 90
     crypto_spot_history_auto_enabled: bool = True
     crypto_spot_history_auto_lookback_days: int = 2
@@ -216,7 +216,7 @@ class Settings(BaseSettings):
     crypto_shadow_exploration_max_spread_bps: int = 500
     crypto_live_max_spread_bps: int = 500
     crypto_empirical_bucket_gate_enabled: bool = True
-    crypto_empirical_bucket_gate_assets: str = "BTC"
+    crypto_empirical_bucket_gate_assets: str = "BTC,ETH,HYPE,XRP"
     crypto_empirical_bucket_min_samples: int = 20
     crypto_empirical_bucket_min_net_pnl_dollars: float = 0.0
     crypto_empirical_bucket_min_win_rate: float = 0.55

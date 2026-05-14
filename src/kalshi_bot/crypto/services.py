@@ -2710,17 +2710,18 @@ class CryptoExecutionService:
         if yes_bid is None and yes_ask is None:
             return None
         if side == ContractSide.YES:
-            ceiling = yes_ask - tick if yes_ask is not None else Decimal("0.99")
-            if ceiling < Decimal("0.01"):
+            if yes_bid is not None:
+                return _clamp_cent_price(yes_bid)
+            price = yes_ask - tick if yes_ask is not None else None
+            if price is None or price < Decimal("0.01"):
                 return None
-            base = yes_bid + tick if yes_bid is not None else Decimal("0.01")
-            return _clamp_cent_price(min(base, ceiling))
-        floor = yes_bid + tick if yes_bid is not None else Decimal("0.01")
-        ceiling = yes_ask if yes_ask is not None else Decimal("0.99")
-        if floor > ceiling or floor > Decimal("0.99"):
+            return _clamp_cent_price(price)
+        if yes_ask is not None:
+            return _clamp_cent_price(yes_ask)
+        price = yes_bid + tick if yes_bid is not None else None
+        if price is None or price > Decimal("0.99"):
             return None
-        base = yes_ask - tick if yes_ask is not None else floor
-        return _clamp_cent_price(max(base, floor))
+        return _clamp_cent_price(price)
 
     async def execute(
         self,
