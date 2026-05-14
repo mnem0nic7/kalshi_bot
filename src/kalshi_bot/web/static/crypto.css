@@ -243,12 +243,37 @@
   grid-template-columns: 1fr auto auto;
   align-items: center;
   gap: 0.6rem;
-  min-height: 1.7rem;
+  min-height: 2.2rem;
+  padding: 0.18rem 0;
+}
+
+.crypto-side-selected {
+  border-left: 2px solid rgba(255, 204, 102, 0.9);
+  padding-left: 0.45rem;
+}
+
+.crypto-side-copy {
+  min-width: 0;
 }
 
 .crypto-side-name {
+  display: block;
   color: #f4f6fb;
   font-weight: 700;
+}
+
+.crypto-side-detail {
+  display: block;
+  margin-top: 0.12rem;
+  color: #a9b4c2;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.crypto-side-selected .crypto-side-detail {
+  color: #ffde99;
 }
 
 .crypto-side-price {

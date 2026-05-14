@@ -33,37 +33,40 @@ def _crypto_payload() -> dict[str, object]:
                 "status": "open",
                 "close_time": "2026-05-01T12:15:00Z",
                 "target_price_dollars": "76468.89",
-                "yes_ask_dollars": "0.4900",
-                "yes_bid_dollars": "0.4700",
-                "no_ask_dollars": "0.5300",
+                "yes_ask_dollars": "0.5700",
+                "yes_bid_dollars": "0.5600",
+                "no_ask_dollars": "0.4400",
                 "volume": 105941,
                 "asset_mode": "shadow",
                 "replay_gate": {"status": "passed"},
                 "live_eligible": False,
                 "live_blockers": ["Asset BTC mode is shadow; set it to live to allow live orders."],
                 "signal": {
-                    "recommended_side": "yes",
-                    "edge_bps": 55,
+                    "recommended_side": "no",
+                    "edge_bps": 1736,
                     "candidate_trace": {
-                        "selected_side": "yes",
-                        "min_edge_bps": 500,
+                        "selected_side": "no",
+                        "min_edge_bps": 750,
                         "candidates": [
+                            {
+                                "side": "no",
+                                "candidate_status": "blocked_fee_edge",
+                                "reason": "contract_price_below_crypto_min",
+                                "live_eligible": False,
+                                "rank": 1,
+                                "edge_bps": 1736,
+                                "expected_net_edge": "0.1536",
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 750},
+                            },
                             {
                                 "side": "yes",
                                 "candidate_status": "blocked_fee_edge",
                                 "reason": "fee_adjusted_edge_below_live_min",
                                 "live_eligible": False,
-                                "rank": 1,
-                                "edge_bps": 55,
-                                "expected_net_edge": "-0.0145",
-                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
-                            },
-                            {
-                                "side": "no",
                                 "rank": 2,
-                                "edge_bps": -122,
-                                "expected_net_edge": "-0.0422",
-                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
+                                "edge_bps": -1736,
+                                "expected_net_edge": "-0.1936",
+                                "runtime_thresholds": {"min_fee_adjusted_edge_bps": 750},
                             },
                         ],
                     },
@@ -190,16 +193,19 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             assert page.locator(".crypto-live-blockers").count() == 1
             assert "passed" in page.locator(".crypto-status-pill", has_text="Replay Gate").inner_text()
             assert page.locator(".crypto-card").first.get_attribute("data-market") == "KXBTC15M-TEST"
-            assert page.locator('[data-market="KXBTC15M-TEST"] .crypto-gate').inner_text() == "passed"
+            assert page.locator('[data-market="KXBTC15M-TEST"] .crypto-gate').inner_text() == "blocked"
             assert page.locator('[data-market="KXETH15M-TEST"] .crypto-gate').inner_text() == "blocked"
             assert (
                 page.locator('[data-market="KXBTC15M-TEST"] .crypto-edge-summary').inner_text()
-                == "raw +55bps / net -145bps / need +500bps"
+                == "raw +1736bps / net +1536bps / need +750bps"
             )
             assert (
                 page.locator('[data-market="KXBTC15M-TEST"] .crypto-signal-blocker').inner_text()
-                == "Signal blocked: fee adjusted edge below live min"
+                == "Signal blocked on Down: contract price below crypto min"
             )
+            btc_side_details = page.locator('[data-market="KXBTC15M-TEST"] .crypto-side-detail').all_inner_texts()
+            assert "net -1936bps / need +750bps · blocked: fee adjusted edge below live min" in btc_side_details
+            assert "net +1536bps / need +750bps · blocked: contract price below crypto min" in btc_side_details
             assert (
                 page.locator('[data-market="KXETH15M-TEST"] .crypto-edge-summary').inner_text()
                 == "raw +420bps / net -50bps / need +500bps"

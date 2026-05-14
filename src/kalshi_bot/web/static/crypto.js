@@ -118,9 +118,27 @@
     return candidates.find((candidate) => Number(candidate.rank) === 1) || candidates[0] || null;
   }
 
+  function candidateForSide(signal, side) {
+    const trace = signalTrace(signal);
+    const candidates = Array.isArray(trace.candidates) ? trace.candidates : [];
+    const normalized = String(side || "").toLowerCase();
+    return candidates.find((candidate) => String(candidate.side || "").toLowerCase() === normalized) || null;
+  }
+
+  function sideLabel(side) {
+    return String(side || "").toLowerCase() === "no" ? "Down" : "Up";
+  }
+
   function edgeMetrics(signal) {
     const trace = signalTrace(signal);
     const candidate = visibleCandidate(signal) || {};
+    return candidateEdgeMetrics(candidate, trace, signal);
+  }
+
+  function candidateEdgeMetrics(candidate, trace, signal) {
+    candidate = candidate || {};
+    trace = trace || {};
+    signal = signal || {};
     const rawBps = numberOrNull(
       candidate.edge_bps ?? trace.selected_edge_bps ?? signal.edge_bps,
     );
@@ -139,6 +157,15 @@
     };
   }
 
+  function candidateEdgeSummary(candidate, trace, signal) {
+    const metrics = candidateEdgeMetrics(candidate || {}, trace || {}, signal || {});
+    const parts = [];
+    if (metrics.netBps !== null) parts.push(`net ${signedBps(metrics.netBps)}`);
+    if (metrics.neededBps !== null) parts.push(`need ${signedBps(metrics.neededBps)}`);
+    if (!parts.length && metrics.rawBps !== null) parts.push(`raw ${signedBps(metrics.rawBps)}`);
+    return parts.join(" / ");
+  }
+
   function edgeSummary(signal) {
     const metrics = edgeMetrics(signal || {});
     const parts = [];
@@ -152,18 +179,55 @@
     return String(value || "").replace(/_/g, " ");
   }
 
-  function candidateBlocker(signal) {
-    const trace = signalTrace(signal || {});
-    const candidate = visibleCandidate(signal || {});
+  function candidateBlockerText(candidate, trace) {
+    trace = trace || {};
     if (!candidate) return "";
     const status = String(candidate.candidate_status || candidate.status || trace.candidate_status || "").toLowerCase();
     const reason = candidate.reason || (Array.isArray(candidate.reasons) ? candidate.reasons[0] : null) || trace.selection_reason;
     const liveEligible = candidate.live_eligible;
+    const metrics = candidateEdgeMetrics(candidate, trace, {});
     if (status && !["live_quality", "selected", "tradeable"].includes(status)) {
       return reason ? humanizeCode(reason) : humanizeCode(status);
     }
     if (liveEligible === false && reason) return humanizeCode(reason);
+    if (metrics.netBps !== null && metrics.neededBps !== null && metrics.netBps < metrics.neededBps) {
+      return "fee adjusted edge below live min";
+    }
     return "";
+  }
+
+  function candidateBlocker(signal) {
+    const trace = signalTrace(signal || {});
+    const candidate = visibleCandidate(signal || {});
+    return candidateBlockerText(candidate, trace);
+  }
+
+  function candidateStatusLabel(candidate, trace) {
+    if (!candidate) return "no candidate";
+    const blocker = candidateBlockerText(candidate, trace);
+    if (blocker) return `blocked: ${blocker}`;
+    const status = String(candidate.candidate_status || candidate.status || "").toLowerCase();
+    if (status === "live_quality" || candidate.live_eligible === true) return "live quality";
+    if (status === "exploratory_shadow") return "shadow only";
+    return status ? humanizeCode(status) : "available";
+  }
+
+  function sideDiagnostic(signal, side) {
+    const trace = signalTrace(signal || {});
+    const candidate = candidateForSide(signal || {}, side);
+    if (!candidate) return "no model candidate";
+    const edge = candidateEdgeSummary(candidate, trace, signal);
+    const status = candidateStatusLabel(candidate, trace);
+    return [edge, status].filter(Boolean).join(" · ");
+  }
+
+  function signalState(signal, signalBlocker) {
+    if (signalBlocker) return { text: "blocked", className: "blocked" };
+    const candidate = visibleCandidate(signal || {});
+    if (candidate && (candidate.candidate_status === "live_quality" || candidate.live_eligible === true)) {
+      return { text: "passed", className: "passed" };
+    }
+    return { text: "watching", className: "mixed" };
   }
 
   function trendScore(market) {
@@ -206,7 +270,6 @@
 
   function card(market) {
     const signal = market.signal || {};
-    const gateStatus = (market.replay_gate || {}).status || ((state.payload || {}).replay_gate || {}).status || "missing";
     const room = market.active_room;
     const side = signal.recommended_side;
     const target = market.target_price_dollars ? money(market.target_price_dollars, 4) : "target n/a";
@@ -219,9 +282,11 @@
       ? `<div class="crypto-live-blockers">Live blocked: ${escapeHtml(blockers)}</div>`
       : "";
     const signalBlocker = candidateBlocker(signal);
+    const selectedSideLabel = side ? sideLabel(side) : "Candidate";
     const signalBlockerHtml = signalBlocker
-      ? `<div class="crypto-signal-blocker">Signal blocked: ${escapeHtml(signalBlocker)}</div>`
+      ? `<div class="crypto-signal-blocker">Signal blocked on ${escapeHtml(selectedSideLabel)}: ${escapeHtml(signalBlocker)}</div>`
       : "";
+    const signalStatus = signalState(signal, signalBlocker);
     return `
       <article class="crypto-card crypto-card-${mode}" data-market="${escapeHtml(market.market_ticker)}">
         <div class="crypto-card-header">
@@ -254,20 +319,26 @@
         ${blockersHtml}
         ${signalBlockerHtml}
         <div class="crypto-sides">
-          <div class="crypto-side-row">
-            <span class="crypto-side-name">Up</span>
+          <div class="crypto-side-row ${side === "yes" ? "crypto-side-selected" : ""}">
+            <span class="crypto-side-copy">
+              <span class="crypto-side-name">Up</span>
+              <span class="crypto-side-detail">${escapeHtml(sideDiagnostic(signal, "yes"))}</span>
+            </span>
             <span class="crypto-side-price">${price(market.yes_ask_dollars || market.yes_bid_dollars)}</span>
             <span class="crypto-badge crypto-badge-up">${side === "yes" ? "✓" : "×"}</span>
           </div>
-          <div class="crypto-side-row">
-            <span class="crypto-side-name">Down</span>
+          <div class="crypto-side-row ${side === "no" ? "crypto-side-selected" : ""}">
+            <span class="crypto-side-copy">
+              <span class="crypto-side-name">Down</span>
+              <span class="crypto-side-detail">${escapeHtml(sideDiagnostic(signal, "no"))}</span>
+            </span>
             <span class="crypto-side-price">${price(market.no_ask_dollars)}</span>
             <span class="crypto-badge crypto-badge-down">${side === "no" ? "✓" : "×"}</span>
           </div>
         </div>
         <div class="crypto-card-footer">
           <span>${escapeHtml(formatVolume(market.volume))}</span>
-          <span class="crypto-gate crypto-gate-${escapeHtml(gateStatus)}">${escapeHtml(gateStatus)}</span>
+          <span class="crypto-gate crypto-gate-${escapeHtml(signalStatus.className)}">${escapeHtml(signalStatus.text)}</span>
           <span class="crypto-edge-summary">${escapeHtml(edgeSummary(signal))}</span>
         </div>
       </article>
