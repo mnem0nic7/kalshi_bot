@@ -190,6 +190,8 @@ class DaemonService:
             "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
             "crypto_history_auto_enabled": self.settings.crypto_history_auto_enabled,
             "crypto_quote_evidence_enabled": self.settings.crypto_quote_evidence_enabled,
+            "crypto_spot_current_auto_enabled": self.settings.crypto_spot_current_auto_enabled,
+            "crypto_spot_current_interval_seconds": self.settings.crypto_spot_current_interval_seconds,
             "crypto_spot_history_auto_enabled": self.settings.crypto_spot_history_auto_enabled,
             "heartbeat_at": self._now_iso(),
         }
@@ -334,6 +336,7 @@ class DaemonService:
                 "monotonicity_arb": asyncio.create_task(self._periodic_monotonicity_arb_loop()),
                 "crypto_quote_evidence": asyncio.create_task(self._periodic_crypto_quote_evidence_loop()),
                 "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
+                "crypto_spot_current": asyncio.create_task(self._periodic_crypto_spot_current_loop()),
                 "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
                 "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
             }
@@ -777,6 +780,17 @@ class DaemonService:
                 await self.crypto_history_service.collect_open(frequency="15m")
             except Exception:
                 logger.warning("crypto quote evidence loop error", exc_info=True)
+
+    async def _periodic_crypto_spot_current_loop(self) -> None:
+        interval = max(1, int(self.settings.crypto_spot_current_interval_seconds))
+        while True:
+            if self.crypto_spot_service is not None and self.settings.crypto_spot_current_auto_enabled:
+                if await self._is_active_color():
+                    try:
+                        await self.crypto_spot_service.collect_current(frequency="15m")
+                    except Exception:
+                        logger.warning("crypto current spot loop error", exc_info=True)
+            await asyncio.sleep(interval)
 
     async def _periodic_crypto_spot_history_loop(self) -> None:
         while True:

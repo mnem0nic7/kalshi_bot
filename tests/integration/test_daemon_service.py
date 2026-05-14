@@ -129,6 +129,17 @@ class FakeTrainingCorpusService:
         }
 
 
+class FakeCryptoSpotService:
+    def __init__(self) -> None:
+        self.collect_current_calls: list[dict[str, object]] = []
+        self.collected = asyncio.Event()
+
+    async def collect_current(self, **kwargs: object) -> dict[str, object]:
+        self.collect_current_calls.append(kwargs)
+        self.collected.set()
+        return {"status": "ok", "stored": 1}
+
+
 class FakeHistoricalTrainingService:
     def __init__(self) -> None:
         self.capture_calls = 0
@@ -570,6 +581,62 @@ async def test_daemon_heartbeat_uses_settings_kalshi_env_for_control_state(tmp_p
     assert payload["kill_switch_enabled"] is False
     assert checkpoint.payload["kalshi_env"] == "production"
     assert checkpoint.payload["active_color"] == "blue"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_spot_current_loop_collects_immediately_for_active_color(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-crypto-spot-current.db",
+        kalshi_env="production",
+        app_color="blue",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
+        crypto_spot_current_auto_enabled=True,
+        crypto_spot_current_interval_seconds=30,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(
+            "blue",
+            kalshi_env="production",
+            initial_active_color="blue",
+            initial_kill_switch_enabled=False,
+        )
+        await session.commit()
+
+    spot_service = FakeCryptoSpotService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        crypto_spot_service=spot_service,  # type: ignore[arg-type]
+    )
+
+    task = asyncio.create_task(daemon._periodic_crypto_spot_current_loop())
+    try:
+        await asyncio.wait_for(spot_service.collected.wait(), timeout=1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert spot_service.collect_current_calls == [{"frequency": "15m"}]
 
     await engine.dispose()
 

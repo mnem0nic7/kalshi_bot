@@ -198,6 +198,8 @@ class Settings(BaseSettings):
     crypto_spot_proxy_fallback_enabled: bool = False
     crypto_spot_coinbase_max_stale_seconds: int = 180
     crypto_spot_coingecko_max_stale_seconds: int = 90
+    crypto_spot_current_auto_enabled: bool = True
+    crypto_spot_current_interval_seconds: int = 30
     crypto_spot_history_auto_enabled: bool = True
     crypto_spot_history_auto_lookback_days: int = 2
     crypto_replay_min_spot_coverage_pct: float = 0.80
