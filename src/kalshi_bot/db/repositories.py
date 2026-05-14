@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, case, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2041,10 +2041,20 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             if found is not None:
                 return found
         if kalshi_order_id is not None and kalshi_env is not None:
+            attribution_rank = case(
+                (
+                    OrderRecord.strategy_code.is_not(None)
+                    & OrderRecord.trade_ticket_id.is_not(None),
+                    0,
+                ),
+                (OrderRecord.strategy_code.is_not(None), 1),
+                (OrderRecord.trade_ticket_id.is_not(None), 2),
+                else_=3,
+            )
             stmt = select(OrderRecord).where(
                 OrderRecord.kalshi_env == kalshi_env,
                 OrderRecord.kalshi_order_id == kalshi_order_id,
-            ).order_by(OrderRecord.updated_at.desc(), OrderRecord.created_at.desc()).limit(1)
+            ).order_by(attribution_rank, OrderRecord.updated_at.desc(), OrderRecord.created_at.desc()).limit(1)
             found = (await self.session.execute(stmt)).scalar_one_or_none()
             if found is not None:
                 return found
@@ -2253,6 +2263,102 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             record.is_taker = is_taker
         await self.session.flush()
         return record
+
+    async def repair_fill_attribution(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        days: int = 7,
+        limit: int = 500,
+        dry_run: bool = True,
+        strategy_code: str | None = None,
+        market_prefix: str | None = None,
+    ) -> dict[str, Any]:
+        env = self._resolved_kalshi_env(kalshi_env)
+        cutoff = datetime.now(UTC) - timedelta(days=max(1, int(days)))
+        stmt = (
+            select(FillRecord)
+            .where(
+                FillRecord.kalshi_env == env,
+                FillRecord.created_at >= cutoff,
+                or_(FillRecord.strategy_code.is_(None), FillRecord.strategy_code == "", FillRecord.order_id.is_(None)),
+            )
+            .order_by(FillRecord.created_at.desc(), FillRecord.id.desc())
+            .limit(max(1, int(limit)))
+        )
+        if market_prefix:
+            stmt = stmt.where(FillRecord.market_ticker.like(f"{market_prefix}%"))
+        fills = list((await self.session.execute(stmt)).scalars())
+        repaired: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for fill in fills:
+            raw = fill.raw if isinstance(fill.raw, dict) else {}
+            raw_order_id = raw.get("order_id")
+            resolved_order_id, resolved_strategy, resolved_side = await self._resolve_fill_links(
+                strategy_code=None,
+                order_id=None if raw_order_id else fill.order_id,
+                kalshi_order_id=raw_order_id,
+                kalshi_env=env,
+                market_ticker=fill.market_ticker,
+                side=fill.side,
+                action=fill.action,
+                before=fill.created_at,
+            )
+            if strategy_code and resolved_strategy != strategy_code:
+                skipped.append(
+                    {
+                        "fill_id": fill.id,
+                        "trade_id": fill.trade_id,
+                        "reason": "resolved_strategy_mismatch",
+                        "resolved_strategy_code": resolved_strategy,
+                    }
+                )
+                continue
+            if not resolved_order_id and not resolved_strategy:
+                skipped.append(
+                    {
+                        "fill_id": fill.id,
+                        "trade_id": fill.trade_id,
+                        "reason": "no_attributed_order_match",
+                        "kalshi_order_id": raw_order_id,
+                    }
+                )
+                continue
+            change = {
+                "fill_id": fill.id,
+                "trade_id": fill.trade_id,
+                "market_ticker": fill.market_ticker,
+                "old_order_id": fill.order_id,
+                "new_order_id": resolved_order_id or fill.order_id,
+                "old_strategy_code": fill.strategy_code,
+                "new_strategy_code": resolved_strategy or fill.strategy_code,
+                "old_side": fill.side,
+                "new_side": resolved_side or fill.side,
+            }
+            if (
+                change["old_order_id"] == change["new_order_id"]
+                and change["old_strategy_code"] == change["new_strategy_code"]
+                and change["old_side"] == change["new_side"]
+            ):
+                skipped.append({**change, "reason": "no_change"})
+                continue
+            repaired.append(change)
+            if not dry_run:
+                fill.order_id = resolved_order_id or fill.order_id
+                fill.strategy_code = resolved_strategy or fill.strategy_code
+                fill.side = resolved_side or fill.side
+        if not dry_run:
+            await self.session.flush()
+        return {
+            "kalshi_env": env,
+            "dry_run": dry_run,
+            "days": days,
+            "scanned": len(fills),
+            "repairable": len(repaired),
+            "skipped": len(skipped),
+            "changes": repaired,
+            "skipped_samples": skipped[:20],
+        }
 
     async def list_fills_for_room(self, room_id: str) -> list[FillRecord]:
         stmt = (

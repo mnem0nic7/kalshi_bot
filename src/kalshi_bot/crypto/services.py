@@ -161,6 +161,16 @@ def normalize_asset_symbols(asset_symbols: list[str] | None) -> list[str]:
     return sorted({normalize_asset_symbol(symbol) for symbol in (asset_symbols or []) if str(symbol or "").strip()})
 
 
+def _normalize_asset_csv(value: str | None) -> set[str]:
+    symbols: set[str] = set()
+    for raw in str(value or "").replace(";", ",").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        symbols.add(normalize_asset_symbol(raw))
+    return symbols
+
+
 def _crypto_artifact_type(base: str, asset_symbols: list[str] | None = None) -> str:
     symbols = normalize_asset_symbols(asset_symbols)
     if len(symbols) == 1:
@@ -560,7 +570,22 @@ class CryptoMarketService:
                     kalshi_env=self.settings.kalshi_env,
                 )
                 if room is not None:
-                    active_rooms[market.market_ticker] = {"id": room.id, "stage": room.stage}
+                    risk = await repo.get_latest_risk_verdict_for_room(room.id)
+                    risk_payload = risk.payload if risk is not None and isinstance(risk.payload, dict) else {}
+                    risk_diagnostics = risk_payload.get("diagnostics") if isinstance(risk_payload.get("diagnostics"), dict) else {}
+                    active_rooms[market.market_ticker] = {
+                        "id": room.id,
+                        "stage": room.stage,
+                        "latest_risk": (
+                            {
+                                "status": risk.status,
+                                "reason_codes": risk_payload.get("reason_codes") or [],
+                                "crypto_position_add_on": risk_diagnostics.get("crypto_position_add_on"),
+                            }
+                            if risk is not None
+                            else None
+                        ),
+                    }
             await session.commit()
         mode_summary = self.asset_control_service.asset_mode_summary(
             asset_symbols=asset_symbols,
@@ -614,6 +639,7 @@ class CryptoMarketService:
                 for blocker in (market_payload.get("global_live_blockers") or [])
             }
         )
+        signal_summary = _crypto_dashboard_signal_summary(market_payloads)
         return {
             "market_domain": "crypto",
             "frequency": dashboard_frequency,
@@ -632,6 +658,7 @@ class CryptoMarketService:
             "asset_modes": mode_summary["modes"],
             "asset_mode_counts": mode_summary["counts"],
             "global_live_blockers": global_live_blockers,
+            "signal_summary": signal_summary,
             "replay_gate": replay_gate_summary,
             "generic_replay_gate": _artifact_summary(generic_gate),
             "markets": market_payloads,
@@ -1967,12 +1994,15 @@ class CryptoForecastService:
         market_row = _crypto_live_market_row(market, spot_rows=spot_rows, settings=self.settings)
         features = {**features, "spot_features": _json_ready_spot_features(market_row)}
         fair = _predict_crypto_probability(market_row, payload)
+        empirical_bucket_matrix = _crypto_empirical_bucket_matrix_from_artifacts(gate, backtest)
         action, side, target_yes, edge_bps, trace = _crypto_recommendation(
             market=market,
             fair_yes=fair,
             settings=self.settings,
             crypto_policy=crypto_policy,
             row=market_row,
+            empirical_bucket_matrix=empirical_bucket_matrix,
+            enforce_empirical_bucket_gate=True,
         )
         entry_policy = crypto_policy.entry_for_asset(market.asset_symbol)
         runtime_trading_enabled = self.settings.crypto_trading_enabled or crypto_policy.trading_enabled
@@ -2026,6 +2056,7 @@ class CryptoForecastService:
                 "features": features,
                 "model_version": artifact.version,
                 "model_metrics": artifact.metrics,
+                "empirical_bucket_matrix_count": len(empirical_bucket_matrix),
                 "prediction_model": {
                     "baseline_probability": _money_text(mid),
                     "calibrated_probability": _money_text(fair),
@@ -2055,6 +2086,8 @@ class CryptoForecastService:
                     "expected_net_edge": trace.get("expected_net_edge"),
                     "rank": trace.get("rank"),
                     "bucket_key": trace.get("bucket_key"),
+                    "empirical_bucket_gate": trace.get("empirical_bucket_gate"),
+                    "empirical_bucket_status": trace.get("empirical_bucket_status"),
                     "decision": "selected" if side is not None else "stand_down",
                     "status": "shadow_only" if trace.get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW else trace.get("candidate_status"),
                     "reason": trace.get("selection_reason") or ("crypto_live_trading_disabled" if not runtime_trading_enabled else None),
@@ -2402,6 +2435,7 @@ class CryptoReplayService:
         oos_statuses: set[str] = set()
         missing_model_assets: list[str] = []
         missing_backtest_assets: list[str] = []
+        aggregate_bucket_matrix: list[dict[str, Any]] = []
 
         for asset in asset_symbols:
             model = await repo.get_latest_crypto_model_artifact(
@@ -2428,6 +2462,9 @@ class CryptoReplayService:
             gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
             if not gate["passed"]:
                 aggregate_reasons.extend(f"{asset}: {reason}" for reason in gate["reasons"])
+            aggregate_bucket_matrix.extend(
+                bucket for bucket in metrics.get("bucket_matrix") or [] if isinstance(bucket, dict)
+            )
             asset_results.append(
                 {
                     "asset": asset,
@@ -2479,6 +2516,11 @@ class CryptoReplayService:
             else "partial"
         )
         aggregate_metrics["asset_gate_results"] = asset_results
+        aggregate_metrics = _crypto_metrics_with_empirical_buckets(
+            aggregate_metrics,
+            bucket_matrix=aggregate_bucket_matrix,
+            settings=self.settings,
+        )
         aggregate_gate = self.evaluate_gate(aggregate_metrics, crypto_policy=crypto_policy)
         gate = {
             **aggregate_gate,
@@ -2602,6 +2644,11 @@ class CryptoReplayService:
             "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
             "metrics_scope": "walk_forward",
         }
+        metrics = _crypto_metrics_with_empirical_buckets(
+            metrics,
+            bucket_matrix=(backtest.get("bucket_matrix") or metrics.get("bucket_matrix") or []),
+            settings=self.settings,
+        )
         gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
         issues: list[dict[str, Any]] = []
         if not (self.settings.crypto_trading_enabled or crypto_policy.trading_enabled):
@@ -3141,9 +3188,13 @@ class CryptoWorkflowService:
                     "crypto_candidate_not_live_eligible",
                 }
                 if receipt.external_order_id or receipt.status not in no_order_statuses:
+                    execution_client_order_id = _receipt_kalshi_client_order_id(
+                        receipt.details if isinstance(receipt.details, dict) else {},
+                        client_order_id,
+                    )
                     await repo.save_order(
                         ticket_id=ticket_record.id,
-                        client_order_id=client_order_id,
+                        client_order_id=execution_client_order_id,
                         market_ticker=approved_ticket.market_ticker,
                         status=receipt.status,
                         side=approved_ticket.side.value,
@@ -3551,6 +3602,31 @@ def _crypto_signal_payload_with_current_quote_metrics(
         if isinstance(refreshed.get("candidate_trace"), dict)
         else {}
     )
+    if (
+        isinstance(existing_trace.get("empirical_bucket_gate"), dict)
+        and isinstance(trace.get("empirical_bucket_gate"), dict)
+        and trace["empirical_bucket_gate"].get("enforced") is not True
+    ):
+        trace["empirical_bucket_gate"] = existing_trace["empirical_bucket_gate"]
+        trace["empirical_bucket_status"] = existing_trace.get("empirical_bucket_status")
+    existing_candidates = {
+        (str(candidate.get("side") or ""), str(candidate.get("bucket_key") or "")): candidate
+        for candidate in (existing_trace.get("candidates") or [])
+        if isinstance(candidate, dict)
+    }
+    for candidate in trace.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        gate = candidate.get("empirical_bucket_gate")
+        existing_candidate = existing_candidates.get((str(candidate.get("side") or ""), str(candidate.get("bucket_key") or "")))
+        if (
+            isinstance(existing_candidate, dict)
+            and isinstance(existing_candidate.get("empirical_bucket_gate"), dict)
+            and isinstance(gate, dict)
+            and gate.get("enforced") is not True
+        ):
+            candidate["empirical_bucket_gate"] = existing_candidate["empirical_bucket_gate"]
+            candidate["empirical_bucket_status"] = existing_candidate.get("empirical_bucket_status")
     refreshed_trace = {
         **existing_trace,
         **trace,
@@ -3580,6 +3656,8 @@ def _crypto_signal_payload_with_current_quote_metrics(
                 "expected_net_edge": trace.get("expected_net_edge"),
                 "rank": trace.get("rank"),
                 "bucket_key": trace.get("bucket_key"),
+                "empirical_bucket_gate": trace.get("empirical_bucket_gate"),
+                "empirical_bucket_status": trace.get("empirical_bucket_status"),
                 "decision": "selected" if action is not None else "stand_down",
                 "status": (
                     "shadow_only"
@@ -3642,6 +3720,58 @@ def _crypto_replay_gate_dashboard_summary(
         "generic_status": generic_summary["status"],
         "generic": generic_summary,
     }
+
+
+def _crypto_dashboard_signal_summary(market_payloads: list[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for market in market_payloads:
+        signal = market.get("signal")
+        if not isinstance(signal, dict):
+            continue
+        trace = signal.get("candidate_trace")
+        if not isinstance(trace, dict):
+            continue
+        reason = str(trace.get("selection_reason") or "")
+        candidate_status = str(trace.get("candidate_status") or "")
+        if candidate_status == CRYPTO_LIVE_QUALITY and reason == "positive_fee_adjusted_live_quality_edge":
+            counts["normal_edge_trade_count"] += 1
+        if trace.get("late_high_confidence_directional_entry") is True or reason == "late_high_confidence_directional_entry":
+            counts["late_high_confidence_trade_count"] += 1
+        gate = trace.get("empirical_bucket_gate")
+        if isinstance(gate, dict):
+            status = str(gate.get("status") or "unknown")
+            if status == "allowed":
+                counts["empirical_bucket_allowed_count"] += 1
+            elif status == "blocked":
+                counts["empirical_bucket_blocked_count"] += 1
+            elif status == "unknown":
+                counts["empirical_bucket_unknown_count"] += 1
+    return {
+        "normal_edge_trade_count": counts["normal_edge_trade_count"],
+        "late_high_confidence_trade_count": counts["late_high_confidence_trade_count"],
+        "empirical_bucket_allowed_count": counts["empirical_bucket_allowed_count"],
+        "empirical_bucket_blocked_count": counts["empirical_bucket_blocked_count"],
+        "empirical_bucket_unknown_count": counts["empirical_bucket_unknown_count"],
+    }
+
+
+def _receipt_kalshi_client_order_id(details: dict[str, Any] | None, fallback: str) -> str:
+    sources: list[Any] = [details or {}]
+    if isinstance(details, dict):
+        for key in ("order", "raw"):
+            value = details.get(key)
+            if isinstance(value, dict):
+                sources.append(value)
+                nested_order = value.get("order")
+                if isinstance(nested_order, dict):
+                    sources.append(nested_order)
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        raw = source.get("client_order_id") or source.get("client_id")
+        if raw not in (None, ""):
+            return str(raw)
+    return fallback
 
 
 def _runtime_crypto_policy_payload(
@@ -4044,6 +4174,8 @@ def _crypto_recommendation(
     crypto_policy: RuntimeCryptoPolicy | None = None,
     row: dict[str, Any] | None = None,
     require_spot_features: bool = True,
+    empirical_bucket_matrix: list[dict[str, Any]] | None = None,
+    enforce_empirical_bucket_gate: bool = False,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
     row = row or _crypto_live_market_row(market, settings=settings)
     candidates = _crypto_trade_candidates(
@@ -4052,6 +4184,8 @@ def _crypto_recommendation(
         settings=settings,
         crypto_policy=crypto_policy,
         require_spot_features=require_spot_features,
+        empirical_bucket_matrix=empirical_bucket_matrix,
+        enforce_empirical_bucket_gate=enforce_empirical_bucket_gate,
     )
     entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
@@ -4084,10 +4218,13 @@ def _crypto_recommendation(
         "selected_edge_bps": edge_bps,
         "candidate_status": selected_status,
         "selection_reason": selected.get("reason"),
+        "pre_empirical_selection_reason": selected.get("pre_empirical_reason"),
         "expected_net_edge": selected.get("expected_net_edge"),
         "late_high_confidence_directional_entry": selected.get("late_high_confidence_directional_entry") is True,
         "rank": selected.get("rank"),
         "bucket_key": selected.get("bucket_key"),
+        "empirical_bucket_gate": selected.get("empirical_bucket_gate"),
+        "empirical_bucket_status": selected.get("empirical_bucket_status"),
         "target_yes_price_dollars": _money_text(target_yes) if target_yes is not None else None,
         "min_edge_bps": entry_policy["min_fee_adjusted_edge_bps"],
         "max_spread_bps": entry_policy["max_spread_bps"],
@@ -4119,6 +4256,11 @@ def _crypto_candidate_gate_cascade(
                     "spread_bps": candidate.get("spread_bps"),
                     "expected_net_edge": candidate.get("expected_net_edge"),
                     "live_eligible": candidate.get("live_eligible"),
+                    "bucket_key": candidate.get("bucket_key"),
+                    "empirical_bucket_status": candidate.get("empirical_bucket_status"),
+                    "empirical_bucket_reason": (
+                        candidate.get("empirical_bucket_gate") or {}
+                    ).get("reason") if isinstance(candidate.get("empirical_bucket_gate"), dict) else None,
                 },
             }
         )
@@ -6700,6 +6842,11 @@ def _evaluate_crypto_walk_forward(
                 "candidate_counts_by_asset": diagnostic_quality["by_asset"],
             }
         )
+        empty_metrics = _crypto_metrics_with_empirical_buckets(
+            empty_metrics,
+            bucket_matrix=[],
+            settings=settings,
+        )
         baseline_policies = [
             _crypto_policy_metrics(name, [], settings=settings)
             for name in baseline_names
@@ -6861,6 +7008,8 @@ def _evaluate_crypto_walk_forward(
         "current_heuristic": _probability_metrics_decimal(heuristic_predictions),
         "calibrated": _probability_metrics_decimal(calibrated_predictions),
     }
+    bucket_matrix = _crypto_bucket_matrix(calibrated_trades, settings=settings)
+    bucket_diagnostics = _crypto_bucket_diagnostics(selection_trades)
     return {
         "status": "ok",
         "fold_count": len(folds),
@@ -6877,10 +7026,10 @@ def _evaluate_crypto_walk_forward(
             live_review_policy,
             exploratory_policy,
         ],
-        "bucket_matrix": _crypto_bucket_matrix(calibrated_trades, settings=settings),
-        "bucket_diagnostics": _crypto_bucket_diagnostics(selection_trades),
+        "bucket_matrix": bucket_matrix,
+        "bucket_diagnostics": bucket_diagnostics,
         "candidate_quality": diagnostic_quality,
-        "metrics": {
+        "metrics": _crypto_metrics_with_empirical_buckets({
             "sample_count": len(rows),
             "resolved_sample_count": len(rows),
             "prediction_eligible_count": sum(1 for row in rows if row.get("prediction_eligible", True)),
@@ -6920,7 +7069,7 @@ def _evaluate_crypto_walk_forward(
             "top_candidate_reason_counts": diagnostic_quality["top_candidate_reason_counts"],
             "candidate_rejection_reason_counts": diagnostic_quality["candidate_rejection_reason_counts"],
             "candidate_counts_by_asset": diagnostic_quality["by_asset"],
-        },
+        }, bucket_matrix=bucket_matrix, settings=settings),
     }
 
 
@@ -7048,6 +7197,8 @@ def _crypto_trade_candidates(
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy | None = None,
     require_spot_features: bool = True,
+    empirical_bucket_matrix: list[dict[str, Any]] | None = None,
+    enforce_empirical_bucket_gate: bool = False,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
@@ -7181,12 +7332,32 @@ def _crypto_trade_candidates(
             reason = live_entry_window_reason or "broad_shadow_exploration"
         elif spread_bps > max_shadow_spread:
             reason = "spread_above_shadow_exploration_max"
+        bucket_key = _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(cost)})
+        pre_empirical_status = candidate_status
+        pre_empirical_reason = reason
+        empirical_bucket_gate = _crypto_empirical_bucket_gate_for_candidate(
+            row,
+            bucket_key=bucket_key,
+            settings=settings,
+            bucket_matrix=empirical_bucket_matrix,
+            enforce=enforce_empirical_bucket_gate,
+        )
+        if (
+            candidate_status == CRYPTO_LIVE_QUALITY
+            and empirical_bucket_gate.get("enforced") is True
+            and empirical_bucket_gate.get("status") != "allowed"
+        ):
+            status = "blocked"
+            candidate_status = "blocked_empirical_bucket"
+            reason = "empirical_bucket_not_allowed"
         candidates.append(
             {
                 "side": side,
                 "status": status,
                 "candidate_status": candidate_status,
                 "reason": reason,
+                "pre_empirical_candidate_status": pre_empirical_status,
+                "pre_empirical_reason": pre_empirical_reason,
                 "target_yes_price_dollars": _money_text(_clamp_price(target_yes)),
                 "execution_price_dollars": _money_text(_clamp_price(cost)),
                 "edge_bps": raw_edge_bps,
@@ -7195,7 +7366,9 @@ def _crypto_trade_candidates(
                 "model_winner": model_winner,
                 "expected_fee": str(fee.quantize(Decimal("0.0001"))),
                 "remaining_payout_dollars": str(remaining_payout.quantize(Decimal("0.0001"))),
-                "bucket_key": _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(cost)}),
+                "bucket_key": bucket_key,
+                "empirical_bucket_gate": empirical_bucket_gate,
+                "empirical_bucket_status": empirical_bucket_gate.get("status"),
                 "spread_bps": spread_bps,
                 "spot_exchange_spread_bps": row.get("spot_exchange_spread_bps"),
                 "spot_exchange_recent_trade_count": row.get("spot_exchange_recent_trade_count"),
@@ -7204,6 +7377,7 @@ def _crypto_trade_candidates(
                 "time_to_close_seconds": row.get("time_to_close_seconds"),
                 "live_entry_window_reason": live_entry_window_reason,
                 "late_high_confidence_directional_entry": late_sure_thing,
+                "low_price_shadow_diagnostic": cost < Decimal("0.5000"),
                 "rank": None,
                 "live_eligible": candidate_status == CRYPTO_LIVE_QUALITY,
                 **settlement_diagnostics,
@@ -7266,6 +7440,8 @@ def _simulate_crypto_trade(
             "reason": best.get("reason") or "no_candidate",
             "candidate_status": best.get("candidate_status"),
             "expected_net_edge": best.get("expected_net_edge"),
+            "bucket_key": best.get("bucket_key"),
+            "empirical_bucket_gate": best.get("empirical_bucket_gate"),
             "candidates": candidates,
         }
     side = str(selected["side"])
@@ -7286,6 +7462,7 @@ def _simulate_crypto_trade(
         "net_pnl": str(net.quantize(Decimal("0.0001"))),
         "expected_net_edge": selected["expected_net_edge"],
         "bucket_key": selected["bucket_key"],
+        "empirical_bucket_gate": selected.get("empirical_bucket_gate"),
         "candidates": candidates,
     }
 
@@ -7402,6 +7579,7 @@ def _crypto_candidate_quality_report(
     top_status_counts: Counter[str] = Counter()
     top_reason_counts: Counter[str] = Counter()
     rejection_reason_counts: Counter[str] = Counter()
+    low_price_diagnostic_counts: Counter[str] = Counter()
     side_counts: Counter[str] = Counter()
     by_asset: dict[str, dict[str, Any]] = {}
     for row in diagnostic_rows:
@@ -7425,6 +7603,7 @@ def _crypto_candidate_quality_report(
                 "top_candidate_status_counts": Counter(),
                 "top_candidate_reason_counts": Counter(),
                 "candidate_rejection_reason_counts": Counter(),
+                "low_price_shadow_diagnostic_count": 0,
                 "live_quality_candidate_count": 0,
                 "exploratory_shadow_candidate_count": 0,
             },
@@ -7439,6 +7618,9 @@ def _crypto_candidate_quality_report(
             reason_counts[candidate_reason] += 1
             asset_summary["candidate_status_counts"][candidate_status] += 1
             asset_summary["candidate_reason_counts"][candidate_reason] += 1
+            if candidate.get("low_price_shadow_diagnostic"):
+                low_price_diagnostic_counts[str(candidate.get("side") or "unknown")] += 1
+                asset_summary["low_price_shadow_diagnostic_count"] += 1
         if candidates:
             top_candidate = candidates[0]
             top_status = str(top_candidate.get("candidate_status") or "unknown")
@@ -7480,6 +7662,7 @@ def _crypto_candidate_quality_report(
         "top_candidate_status_counts": dict(top_status_counts),
         "top_candidate_reason_counts": dict(top_reason_counts),
         "candidate_rejection_reason_counts": dict(rejection_reason_counts),
+        "low_price_shadow_diagnostic_counts": dict(low_price_diagnostic_counts),
         "by_asset": {
             asset: {
                 **{
@@ -7562,11 +7745,7 @@ def _crypto_live_rejection_reason(candidate: dict[str, Any]) -> str | None:
 def _eligible_crypto_buckets(rows: list[dict[str, Any]], *, settings: Settings) -> set[str]:
     simulations = [{**row, "simulation": _simulate_crypto_trade(row, _decimal(row["mid_yes_dollars"]), settings=settings)} for row in rows]
     matrix = _crypto_bucket_matrix([row for row in simulations if row["simulation"]["status"] == "fillable"], settings=settings)
-    eligible: set[str] = set()
-    for bucket in matrix:
-        if int(bucket["sample_count"]) >= settings.trade_behavior_empirical_gate_min_settled_fills and _decimal(bucket["net_pnl"]) > Decimal(str(settings.trade_behavior_empirical_gate_min_net_pnl_dollars)):
-            eligible.add(bucket["bucket_key"])
-    return eligible
+    return set(_crypto_empirical_bucket_summary(matrix, settings=settings)["allowed_bucket_keys"])
 
 
 def _crypto_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Settings) -> list[dict[str, Any]]:
@@ -7590,6 +7769,7 @@ def _crypto_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Setting
                 "side": (first.get("simulation") or {}).get("side"),
                 "entry_price_band": _price_band(_decimal((first.get("simulation") or {}).get("execution_price_dollars") or first.get("mid_yes_dollars"))),
                 "spread_band": _spread_band(first.get("spread_bps")),
+                "time_to_close_bucket": _crypto_time_to_close_bucket(float(first.get("time_to_close_seconds") or 0)),
                 "sample_count": len(values),
                 "win_rate": _ratio(wins / len(values)) if values else None,
                 "gross_pnl": str(sum(gross, Decimal("0")).quantize(Decimal("0.0001"))),
@@ -7669,8 +7849,156 @@ def _crypto_bucket_key(row: dict[str, Any], simulation: dict[str, Any]) -> str:
             str(side),
             _price_band(price),
             _spread_band(row.get("spread_bps")),
+            _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0)),
         ]
     )
+
+
+def _crypto_empirical_bucket_gate_enabled_for_asset(row: dict[str, Any], *, settings: Settings) -> bool:
+    if not bool(settings.crypto_empirical_bucket_gate_enabled):
+        return False
+    asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
+    configured = _normalize_asset_csv(settings.crypto_empirical_bucket_gate_assets)
+    return not configured or asset in configured
+
+
+def _crypto_bucket_matrix_by_key(bucket_matrix: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    keyed: dict[str, dict[str, Any]] = {}
+    for bucket in bucket_matrix or []:
+        if not isinstance(bucket, dict):
+            continue
+        key = str(bucket.get("bucket_key") or "").strip()
+        if key:
+            keyed[key] = bucket
+    return keyed
+
+
+def _crypto_empirical_bucket_review(bucket: dict[str, Any] | None, *, settings: Settings) -> dict[str, Any]:
+    min_samples = int(settings.crypto_empirical_bucket_min_samples)
+    min_net_pnl = Decimal(str(settings.crypto_empirical_bucket_min_net_pnl_dollars))
+    min_win_rate = float(settings.crypto_empirical_bucket_min_win_rate)
+    if bucket is None:
+        return {
+            "status": "unknown",
+            "allowed": False,
+            "reason": "empirical_bucket_missing",
+            "sample_count": 0,
+            "min_samples": min_samples,
+            "min_net_pnl_dollars": str(min_net_pnl.quantize(Decimal("0.0001"))),
+            "min_win_rate": min_win_rate,
+        }
+    sample_count = int(bucket.get("sample_count") or 0)
+    net_pnl = _decimal(bucket.get("net_pnl") or Decimal("0"))
+    win_rate_raw = bucket.get("win_rate")
+    win_rate = float(win_rate_raw) if win_rate_raw not in (None, "") else None
+    if sample_count < min_samples:
+        reason = "empirical_bucket_under_sampled"
+    elif net_pnl < min_net_pnl:
+        reason = "empirical_bucket_negative_pnl"
+    elif win_rate is None or win_rate < min_win_rate:
+        reason = "empirical_bucket_low_win_rate"
+    else:
+        reason = "empirical_bucket_allowed"
+    allowed = reason == "empirical_bucket_allowed"
+    return {
+        "status": "allowed" if allowed else "blocked",
+        "allowed": allowed,
+        "reason": reason,
+        "sample_count": sample_count,
+        "net_pnl": str(net_pnl.quantize(Decimal("0.0001"))),
+        "win_rate": win_rate,
+        "min_samples": min_samples,
+        "min_net_pnl_dollars": str(min_net_pnl.quantize(Decimal("0.0001"))),
+        "min_win_rate": min_win_rate,
+    }
+
+
+def _crypto_empirical_bucket_gate_for_candidate(
+    row: dict[str, Any],
+    *,
+    bucket_key: str,
+    settings: Settings,
+    bucket_matrix: list[dict[str, Any]] | None,
+    enforce: bool,
+) -> dict[str, Any]:
+    enabled_for_asset = _crypto_empirical_bucket_gate_enabled_for_asset(row, settings=settings)
+    if not enforce or not enabled_for_asset:
+        return {
+            "status": "not_evaluated" if enabled_for_asset else "not_applicable",
+            "allowed": True,
+            "enforced": False,
+            "bucket_key": bucket_key,
+            "reason": "empirical_bucket_gate_not_enforced" if enabled_for_asset else "asset_not_configured_for_empirical_bucket_gate",
+        }
+    bucket = _crypto_bucket_matrix_by_key(bucket_matrix).get(bucket_key)
+    review = _crypto_empirical_bucket_review(bucket, settings=settings)
+    return {
+        **review,
+        "enforced": True,
+        "bucket_key": bucket_key,
+    }
+
+
+def _crypto_empirical_bucket_summary(
+    bucket_matrix: list[dict[str, Any]] | None,
+    *,
+    settings: Settings,
+) -> dict[str, Any]:
+    allowed: list[str] = []
+    blocked: list[str] = []
+    reviews: dict[str, dict[str, Any]] = {}
+    for key, bucket in sorted(_crypto_bucket_matrix_by_key(bucket_matrix).items()):
+        review = _crypto_empirical_bucket_review(bucket, settings=settings)
+        reviews[key] = review
+        if review["allowed"]:
+            allowed.append(key)
+        else:
+            blocked.append(key)
+    return {
+        "enabled": bool(settings.crypto_empirical_bucket_gate_enabled),
+        "assets": sorted(_normalize_asset_csv(settings.crypto_empirical_bucket_gate_assets)),
+        "min_samples": int(settings.crypto_empirical_bucket_min_samples),
+        "min_net_pnl_dollars": float(settings.crypto_empirical_bucket_min_net_pnl_dollars),
+        "min_win_rate": float(settings.crypto_empirical_bucket_min_win_rate),
+        "allowed_bucket_keys": allowed,
+        "blocked_bucket_keys": blocked,
+        "bucket_reviews": reviews,
+    }
+
+
+def _crypto_metrics_with_empirical_buckets(
+    metrics: dict[str, Any],
+    *,
+    bucket_matrix: list[dict[str, Any]] | None,
+    settings: Settings,
+) -> dict[str, Any]:
+    summary = _crypto_empirical_bucket_summary(bucket_matrix, settings=settings)
+    return {
+        **metrics,
+        "bucket_matrix": list(bucket_matrix or []),
+        "allowed_bucket_keys": summary["allowed_bucket_keys"],
+        "blocked_bucket_keys": summary["blocked_bucket_keys"],
+        "empirical_bucket_gate": summary,
+    }
+
+
+def _crypto_empirical_bucket_matrix_from_artifacts(*artifacts: Any) -> list[dict[str, Any]]:
+    for artifact in artifacts:
+        if artifact is None:
+            continue
+        metrics = artifact.metrics if isinstance(getattr(artifact, "metrics", None), dict) else {}
+        payload = artifact.payload if isinstance(getattr(artifact, "payload", None), dict) else {}
+        matrix = metrics.get("bucket_matrix")
+        if isinstance(matrix, list):
+            return [bucket for bucket in matrix if isinstance(bucket, dict)]
+        matrix = payload.get("bucket_matrix")
+        if isinstance(matrix, list):
+            return [bucket for bucket in matrix if isinstance(bucket, dict)]
+        walk_forward = payload.get("walk_forward") if isinstance(payload.get("walk_forward"), dict) else {}
+        matrix = walk_forward.get("bucket_matrix") if isinstance(walk_forward, dict) else None
+        if isinstance(matrix, list):
+            return [bucket for bucket in matrix if isinstance(bucket, dict)]
+    return []
 
 
 def _expected_crypto_net_pnl(

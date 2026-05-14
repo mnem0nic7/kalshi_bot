@@ -213,8 +213,8 @@ async def test_weather_fast_readiness_summarizes_overnight_rooms_without_trade_a
 
 
 @pytest.mark.asyncio
-async def test_crypto_readiness_reports_assets_modes_and_production_autonomy_blocker(tmp_path) -> None:
-    settings, factory = await _settings_and_factory(tmp_path)
+async def test_crypto_readiness_scopes_blockers_to_live_assets(tmp_path) -> None:
+    settings, factory = await _settings_and_factory(tmp_path, crypto_production_autonomy_enabled=False)
     await _seed_control(factory, notes={"crypto_asset_modes": {"BTC": "live", "ETH": "shadow"}})
     decision_ts = datetime(2026, 5, 10, 6, 30, tzinfo=UTC)
     close_ts = datetime(2026, 5, 10, 6, 45, tzinfo=UTC)
@@ -265,10 +265,24 @@ async def test_crypto_readiness_reports_assets_modes_and_production_autonomy_blo
                 observed_at=decision_ts,
             )
         )
+        session.add(
+            CryptoSpotOHLCRecord(
+                kalshi_env="production",
+                provider="coinbase",
+                asset_symbol="BTC",
+                quote_currency="USD",
+                frequency="15m",
+                interval_seconds=900,
+                end_ts=NOW,
+                close_dollars=Decimal("70060"),
+                observed_at=NOW,
+            )
+        )
         for artifact_type, version, status in (
-            ("model", "crypto-model-trained", "trained"),
-            ("backtest", "crypto-backtest-pass", "pass"),
-            ("replay_gate", "crypto-gate-passed", "passed"),
+            ("model:BTC", "crypto-model-btc-trained", "trained"),
+            ("backtest:BTC", "crypto-backtest-btc-pass", "pass"),
+            ("replay_gate:BTC", "crypto-gate-btc-passed", "passed"),
+            ("replay_gate", "crypto-gate-aggregate-blocked", "blocked"),
         ):
             await repo.record_crypto_model_artifact(
                 frequency="15m",
@@ -277,7 +291,7 @@ async def test_crypto_readiness_reports_assets_modes_and_production_autonomy_blo
                 status=status,
                 sample_count=100,
                 metrics={"trade_candidate_count": 1},
-                payload={"model_type": "market_mid_baseline"} if artifact_type == "model" else {},
+                payload={"global_adjustment_bps": 6000} if artifact_type == "model:BTC" else {},
                 kalshi_env="production",
                 trained_at=NOW,
             )
@@ -297,7 +311,12 @@ async def test_crypto_readiness_reports_assets_modes_and_production_autonomy_blo
     evidence = report["domains"]["crypto"]["evidence"]
     assert evidence["asset_modes"]["BTC"] == "live"
     assert evidence["asset_modes"]["ETH"] == "shadow"
+    assert evidence["live_asset_symbols"] == ["BTC"]
     assert evidence["overnight_decision_rows_by_asset"]["BTC"] == 1
     codes = {issue["code"] for issue in report["hard_blockers"]}
-    assert "crypto_production_autonomy_not_supported" in codes
-    assert "crypto_asset_mode_not_live_eth" in codes
+    warning_codes = {issue["code"] for issue in report["warnings"]}
+    assert "crypto_production_autonomy_not_supported" in warning_codes
+    assert "crypto_asset_mode_not_live_eth" in warning_codes
+    assert "crypto_aggregate_replay_gate_not_passed" in warning_codes
+    assert "crypto_asset_mode_not_live_eth" not in codes
+    assert "crypto_replay_gate_not_passed" not in codes

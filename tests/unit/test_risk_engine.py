@@ -407,6 +407,96 @@ def test_risk_engine_blocks_same_ticker_add_ons_by_default() -> None:
     assert any("no pyramiding" in reason.lower() for reason in verdict.reasons)
 
 
+def _crypto_add_on_signal(*, asset: str = "BTC", side: ContractSide = ContractSide.YES) -> StrategySignal:
+    signal = make_signal(edge_bps=1200)
+    signal.recommended_side = side
+    signal.candidate_trace = {
+        "strategy_code": StrategyCode.CRYPTO_15M.value,
+        "asset_symbol": asset,
+        "candidate_status": "live_quality",
+        "bucket_key": f"{asset}|{side.value}|0.50-0.75|tight|5_10m",
+        "empirical_bucket_gate": {"status": "allowed", "allowed": True},
+    }
+    return signal
+
+
+def test_risk_engine_allows_one_btc_same_side_add_on_under_cap() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=False,
+    )
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-ADDON",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("1.00"),
+        ),
+        signal=_crypto_add_on_signal(),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            current_position_count_fp=Decimal("1.00"),
+            current_position_side="yes",
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert "crypto_position_add_on_allowed" in verdict.reason_codes
+
+
+def test_risk_engine_blocks_second_opposite_non_btc_and_oversized_crypto_add_ons() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=False,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    def evaluate(*, count: str, current: str, side: ContractSide, current_side: str, signal_asset: str = "BTC"):
+        return engine.evaluate(
+            room=make_room(),
+            control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+            ticket=TradeTicket(
+                market_ticker=f"KX{signal_asset}15M-ADDON",
+                action=TradeAction.BUY,
+                side=side,
+                yes_price_dollars=Decimal("0.5800") if side == ContractSide.YES else Decimal("0.4200"),
+                count_fp=Decimal(count),
+            ),
+            signal=_crypto_add_on_signal(asset=signal_asset, side=side),
+            context=RiskContext(
+                market_observed_at=datetime.now(UTC),
+                research_observed_at=datetime.now(UTC),
+                current_position_count_fp=Decimal(current),
+                current_position_side=current_side,
+                strategy_code=StrategyCode.CRYPTO_15M.value,
+            ),
+        )
+
+    second = evaluate(count="1.00", current="2.00", side=ContractSide.YES, current_side="yes")
+    opposite = evaluate(count="1.00", current="1.00", side=ContractSide.NO, current_side="yes")
+    non_btc = evaluate(count="1.00", current="1.00", side=ContractSide.YES, current_side="yes", signal_asset="ETH")
+    oversized = evaluate(count="2.00", current="0.50", side=ContractSide.YES, current_side="yes")
+
+    assert second.status == RiskStatus.BLOCKED
+    assert second.diagnostics["crypto_position_add_on"]["reason"] == "projected_position_above_crypto_add_on_cap"
+    assert opposite.status == RiskStatus.BLOCKED
+    assert any("opposite-side" in reason for reason in opposite.reasons)
+    assert non_btc.status == RiskStatus.BLOCKED
+    assert non_btc.diagnostics["crypto_position_add_on"]["reason"] == "crypto_position_add_on_asset_not_configured"
+    assert oversized.status == RiskStatus.BLOCKED
+    assert oversized.diagnostics["crypto_position_add_on"]["reason"] == "ticket_count_above_crypto_add_on_cap"
+
+
 def test_risk_engine_blocks_high_cost_side_with_tiny_remaining_payout() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",

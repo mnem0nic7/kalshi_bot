@@ -1996,6 +1996,24 @@ async def _run_repair_stop_loss_checkpoints_command(
     return 0
 
 
+async def _run_repair_fill_attribution_command(
+    args: argparse.Namespace,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    result = await repo.repair_fill_attribution(
+        kalshi_env=args.kalshi_env,
+        days=args.days,
+        limit=args.limit,
+        dry_run=args.dry_run,
+        strategy_code=args.strategy_code,
+        market_prefix=args.market_prefix,
+    )
+    await session.commit()
+    print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
 async def _run_create_web_user_command(
     args: argparse.Namespace,
     repo: PlatformRepository,
@@ -3474,6 +3492,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
             if args.command == "repair-stop-loss-checkpoints":
                 return await _run_repair_stop_loss_checkpoints_command(args, container, repo, session)
 
+            if args.command == "repair-fill-attribution":
+                return await _run_repair_fill_attribution_command(args, repo, session)
+
             if args.command == "create-web-user":
                 return await _run_create_web_user_command(args, repo, session)
 
@@ -3935,6 +3956,17 @@ def build_parser() -> argparse.ArgumentParser:
     trading_audit.add_argument("--limit", type=int, default=500)
     trading_audit.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
     trading_audit.add_argument("--repair-target", choices=["attribution", "stale-positions", "market-snapshots"], default="attribution")
+
+    repair_fill_attribution = subparsers.add_parser(
+        "repair-fill-attribution",
+        help="Backfill fill strategy/order attribution from matched attributed orders.",
+    )
+    repair_fill_attribution.add_argument("--kalshi-env", default="production")
+    repair_fill_attribution.add_argument("--days", type=int, default=7)
+    repair_fill_attribution.add_argument("--limit", type=int, default=500)
+    repair_fill_attribution.add_argument("--strategy-code", default=None)
+    repair_fill_attribution.add_argument("--market-prefix", default=None)
+    repair_fill_attribution.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
 
     trade_analysis = subparsers.add_parser(
         "trade-analysis",

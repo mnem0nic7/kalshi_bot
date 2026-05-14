@@ -32,6 +32,7 @@ from kalshi_bot.crypto.services import (
     CryptoReplayService,
     _crypto_data_quality,
     _crypto_decision_rows,
+    _crypto_bucket_key,
     _evaluate_crypto_walk_forward,
     _crypto_feature_schema,
     _crypto_model_candidate_report,
@@ -1156,6 +1157,29 @@ async def test_crypto_forecast_uses_deterministic_model_artifact(tmp_path) -> No
             trained_at=datetime.now(UTC),
         )
         now = datetime.now(UTC)
+        bucket_matrix = [
+            _empirical_bucket(
+                "BTC|yes|0.50-0.75|tight|5_10m",
+                sample_count=25,
+                net_pnl="3.0000",
+                win_rate=0.64,
+            )
+        ]
+        for artifact_type, version, status in (
+            ("backtest:BTC", "test-backtest", "pass"),
+            ("replay_gate:BTC", "test-gate", "passed"),
+        ):
+            await repo.record_crypto_model_artifact(
+                frequency="15m",
+                artifact_type=artifact_type,
+                version=version,
+                status=status,
+                sample_count=25,
+                metrics={"bucket_matrix": bucket_matrix, "allowed_bucket_keys": ["BTC|yes|0.50-0.75|tight|5_10m"]},
+                payload={"bucket_matrix": bucket_matrix},
+                kalshi_env=settings.kalshi_env,
+                trained_at=now,
+            )
         await repo.upsert_crypto_spot_ohlc(
             kalshi_env=settings.kalshi_env,
             provider="coinbase",
@@ -1179,6 +1203,8 @@ async def test_crypto_forecast_uses_deterministic_model_artifact(tmp_path) -> No
         spot_service=_SpotService(),  # type: ignore[arg-type]
     ).forecast(
         _market(
+            open_time=now - timedelta(minutes=5),
+            close_time=now + timedelta(minutes=10),
             yes_bid_dollars=Decimal("0.5000"),
             yes_ask_dollars=Decimal("0.5000"),
             no_ask_dollars=Decimal("0.5000"),
@@ -1908,6 +1934,101 @@ def test_crypto_candidate_quality_allows_late_high_confidence_directional_entry(
     assert no_candidate["late_high_confidence_directional_entry"] is True
 
 
+def _empirical_bucket(bucket_key: str, *, sample_count: int = 20, net_pnl: str = "1.0000", win_rate: float = 0.60) -> dict[str, object]:
+    return {
+        "bucket_key": bucket_key,
+        "asset_symbol": bucket_key.split("|", 1)[0],
+        "sample_count": sample_count,
+        "net_pnl": net_pnl,
+        "win_rate": win_rate,
+    }
+
+
+def test_crypto_bucket_key_includes_time_to_close_bucket(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    del settings
+    row = _replay_row(time_to_close_seconds=601, spread_bps=200)
+
+    key = _crypto_bucket_key(row, {"side": "yes", "execution_price_dollars": "0.5000"})
+
+    assert key == "BTC|yes|0.50-0.75|normal|10_15m"
+
+
+def test_crypto_empirical_bucket_gate_blocks_missing_or_bad_buckets(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    row = {
+        "market_ticker": "KXBTC15M-BUCKET-GATE",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.4900"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5100"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
+    }
+    bucket_key = _crypto_bucket_key(row, {"side": "yes", "execution_price_dollars": "0.5000"})
+
+    for matrix, reason in (
+        ([], "empirical_bucket_missing"),
+        ([_empirical_bucket(bucket_key, sample_count=19)], "empirical_bucket_under_sampled"),
+        ([_empirical_bucket(bucket_key, net_pnl="-0.0100")], "empirical_bucket_negative_pnl"),
+        ([_empirical_bucket(bucket_key, win_rate=0.50)], "empirical_bucket_low_win_rate"),
+    ):
+        candidates = _crypto_trade_candidates(
+            row,
+            Decimal("0.9000"),
+            settings=settings,
+            empirical_bucket_matrix=matrix,  # type: ignore[arg-type]
+            enforce_empirical_bucket_gate=True,
+        )
+        yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+        assert yes_candidate["candidate_status"] == "blocked_empirical_bucket"
+        assert yes_candidate["reason"] == "empirical_bucket_not_allowed"
+        assert yes_candidate["empirical_bucket_gate"]["reason"] == reason
+        assert yes_candidate["live_eligible"] is False
+
+
+def test_late_high_confidence_candidate_still_requires_empirical_bucket(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_late_sure_thing_min_probability=0.90,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-BUCKET",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.0350"),
+        "yes_bid_dollars": Decimal("0.0300"),
+        "yes_ask_dollars": Decimal("0.0400"),
+        "no_ask_dollars": Decimal("0.9700"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 60,
+        "market_age_seconds": 840,
+    }
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.0500"),
+        settings=settings,
+        empirical_bucket_matrix=[],
+        enforce_empirical_bucket_gate=True,
+    )
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["late_high_confidence_directional_entry"] is True
+    assert no_candidate["pre_empirical_reason"] == "late_high_confidence_directional_entry"
+    assert no_candidate["candidate_status"] == "blocked_empirical_bucket"
+    assert no_candidate["reason"] == "empirical_bucket_not_allowed"
+
+
 def test_crypto_candidate_quality_allows_mid_window_with_750bps_edge(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=750)
     row = {
@@ -2502,6 +2623,85 @@ async def test_crypto_asset_modes_default_shadow_and_persist(tmp_path) -> None:
     assert preserved_notes["kill_switch"] == {"mode": "manual_or_external"}
     assert preserved_notes["agent_packs"] == {"active_version": "green-pack"}
     assert preserved_notes["crypto_replay_gate"] == {"status": "passed"}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fill_resolution_prefers_attributed_order_duplicate(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        room = await repo.create_room(
+            RoomCreate(name="BTC fill attribution", market_ticker="KXBTC15M-FILL"),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        ticket = await repo.save_trade_ticket(
+            room.id,
+            TradeTicket(
+                market_ticker=room.market_ticker,
+                action=TradeAction.BUY,
+                side=ContractSide.NO,
+                yes_price_dollars=Decimal("0.1500"),
+                count_fp=Decimal("1.00"),
+            ),
+            client_order_id="room:btc-fill-ticket",
+            strategy_code="CRYPTO_15M",
+        )
+        attributed = await repo.save_order(
+            ticket_id=ticket.id,
+            client_order_id="room:btc-fill-ticket:maker",
+            market_ticker=room.market_ticker,
+            status="submitted",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.1500"),
+            count_fp=Decimal("1.00"),
+            raw={"order": {"client_order_id": "room:btc-fill-ticket:maker"}},
+            kalshi_order_id="kalshi-order-1",
+            kalshi_env=settings.kalshi_env,
+            strategy_code="CRYPTO_15M",
+        )
+        await repo.save_order(
+            ticket_id=None,
+            client_order_id="websocket-duplicate",
+            market_ticker=room.market_ticker,
+            status="filled",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.1500"),
+            count_fp=Decimal("1.00"),
+            raw={"source": "websocket"},
+            kalshi_order_id="kalshi-order-1",
+            kalshi_env=settings.kalshi_env,
+            strategy_code=None,
+        )
+        fill = await repo.upsert_fill(
+            market_ticker=room.market_ticker,
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.1500"),
+            count_fp=Decimal("1.00"),
+            raw={"order_id": "kalshi-order-1"},
+            trade_id="trade-1",
+            kalshi_env=settings.kalshi_env,
+        )
+        fill_order_id = fill.order_id
+        fill_strategy_code = fill.strategy_code
+        fill_side = fill.side
+        attributed_id = attributed.id
+        await session.commit()
+
+    assert fill_order_id == attributed_id
+    assert fill_strategy_code == "CRYPTO_15M"
+    assert fill_side == "no"
     await engine.dispose()
 
 

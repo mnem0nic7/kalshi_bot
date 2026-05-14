@@ -26,6 +26,13 @@ def _crypto_payload() -> dict[str, object]:
         "replay_gate": {"status": "passed", "scope": "live_assets"},
         "asset_modes": {"BTC": "shadow", "ETH": "live"},
         "asset_mode_counts": {"off": 0, "shadow": 1, "live": 1},
+        "signal_summary": {
+            "normal_edge_trade_count": 1,
+            "late_high_confidence_trade_count": 1,
+            "empirical_bucket_allowed_count": 2,
+            "empirical_bucket_blocked_count": 1,
+            "empirical_bucket_unknown_count": 1,
+        },
         "markets": [
             {
                 "market_ticker": "KXBTC15M-TEST",
@@ -57,6 +64,10 @@ def _crypto_payload() -> dict[str, object]:
                                 "edge_bps": 1736,
                                 "expected_net_edge": "0.1536",
                                 "runtime_thresholds": {"min_fee_adjusted_edge_bps": 500},
+                                "empirical_bucket_gate": {
+                                    "status": "blocked",
+                                    "reason": "empirical_bucket_under_sampled",
+                                },
                             },
                             {
                                 "side": "yes",
@@ -237,6 +248,8 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             assert page.locator(".crypto-card").count() == 3
             assert page.locator(".crypto-live-blockers").count() == 1
             assert "passed" in page.locator(".crypto-status-pill", has_text="Replay Gate").inner_text()
+            assert "1" in page.locator(".crypto-status-pill", has_text="Normal Edge").inner_text()
+            assert "1" in page.locator(".crypto-status-pill", has_text="Late Bypass").inner_text()
             assert page.locator(".crypto-card").first.get_attribute("data-market") == "KXBTC15M-TEST"
             assert page.locator('[data-market="KXBTC15M-TEST"] .crypto-gate').inner_text() == "blocked"
             assert page.locator('[data-market="KXETH15M-TEST"] .crypto-gate').inner_text() == "blocked"
@@ -250,7 +263,7 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             )
             btc_side_details = page.locator('[data-market="KXBTC15M-TEST"] .crypto-side-detail').all_inner_texts()
             assert "net -1936bps / need +500bps · blocked: net edge below live min" in btc_side_details
-            assert "net +1536bps / need +500bps · blocked: contract price below crypto min" in btc_side_details
+            assert "net +1536bps / need +500bps · blocked: contract price below crypto min · bucket blocked: empirical bucket under-sampled" in btc_side_details
             assert (
                 page.locator('[data-market="KXETH15M-TEST"] .crypto-edge-summary').inner_text()
                 == "raw +420bps / net -50bps / need +500bps"

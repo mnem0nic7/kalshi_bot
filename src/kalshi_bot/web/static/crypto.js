@@ -185,10 +185,46 @@
       spread_above_live_max: "spread above live max",
       crypto_market_too_early_for_live_entry: "market too early for live entry",
       crypto_market_too_late_for_live_entry: "market too late for live entry",
+      positive_fee_adjusted_live_quality_edge: "normal fee-adjusted edge",
       late_high_confidence_directional_entry: "late high-confidence model choice",
+      empirical_bucket_not_allowed: "empirical bucket not allowed",
+      empirical_bucket_missing: "empirical bucket unknown",
+      empirical_bucket_under_sampled: "empirical bucket under-sampled",
+      empirical_bucket_negative_pnl: "empirical bucket negative P&L",
+      empirical_bucket_low_win_rate: "empirical bucket below win-rate floor",
+      empirical_bucket_allowed: "empirical bucket passed",
+      crypto_position_add_on_allowed: "add-on allowed",
+      crypto_position_add_on_blocked: "add-on blocked",
       crypto_entry_window_unknown: "entry window unknown",
     };
     return labels[code] || code.replace(/_/g, " ");
+  }
+
+  function empiricalBucketLabel(candidate, trace) {
+    const gate =
+      (candidate && candidate.empirical_bucket_gate && typeof candidate.empirical_bucket_gate === "object"
+        ? candidate.empirical_bucket_gate
+        : null) ||
+      (trace && trace.empirical_bucket_gate && typeof trace.empirical_bucket_gate === "object"
+        ? trace.empirical_bucket_gate
+        : null);
+    if (!gate) return "";
+    const status = String(gate.status || "").toLowerCase();
+    if (status === "allowed") return "bucket passed";
+    if (status === "blocked") return `bucket blocked: ${humanizeCode(gate.reason)}`;
+    if (status === "unknown") return "bucket unknown";
+    return "";
+  }
+
+  function addOnLabel(market) {
+    const risk = market && market.active_room ? market.active_room.latest_risk : null;
+    const addOn = risk && risk.crypto_position_add_on && typeof risk.crypto_position_add_on === "object"
+      ? risk.crypto_position_add_on
+      : null;
+    if (!addOn) return "";
+    return addOn.reason === "crypto_position_add_on_allowed"
+      ? "add-on allowed"
+      : `add-on blocked: ${humanizeCode(addOn.reason)}`;
   }
 
   function candidateBlockerText(candidate, trace) {
@@ -230,7 +266,8 @@
     if (!candidate) return "no model candidate";
     const edge = candidateEdgeSummary(candidate, trace, signal);
     const status = candidateStatusLabel(candidate, trace);
-    return [edge, status].filter(Boolean).join(" · ");
+    const bucket = empiricalBucketLabel(candidate, trace);
+    return [edge, status, bucket].filter(Boolean).join(" · ");
   }
 
   function signalState(signal, signalBlocker) {
@@ -266,6 +303,7 @@
     const gate = (state.payload || {}).replay_gate || {};
     const settings = (state.payload || {}).settings || {};
     const counts = (state.payload || {}).asset_mode_counts || {};
+    const signalSummary = (state.payload || {}).signal_summary || {};
     const markets = (state.payload || {}).markets || [];
     const items = [
       ["Markets", markets.length],
@@ -273,6 +311,9 @@
       ["Trading", settings.crypto_trading_enabled ? "enabled" : "disabled"],
       ["Autonomy", settings.crypto_autonomy_enabled ? "enabled" : "disabled"],
       ["Live Assets", counts.live || 0],
+      ["Normal Edge", signalSummary.normal_edge_trade_count || 0],
+      ["Late Bypass", signalSummary.late_high_confidence_trade_count || 0],
+      ["Buckets", `${signalSummary.empirical_bucket_allowed_count || 0}/${signalSummary.empirical_bucket_blocked_count || 0}/${signalSummary.empirical_bucket_unknown_count || 0}`],
       ["Updated", timeLabel((state.payload || {}).updated_at)],
     ];
     statusEl.innerHTML = items
@@ -299,6 +340,8 @@
     const signalBlockerHtml = signalBlocker
       ? `<div class="crypto-signal-blocker">Signal blocked on ${escapeHtml(selectedSideLabel)}: ${escapeHtml(signalBlocker)}</div>`
       : "";
+    const addOn = addOnLabel(market);
+    const addOnHtml = addOn ? `<div class="crypto-signal-blocker">${escapeHtml(addOn)}</div>` : "";
     const signalStatus = signalState(signal, signalBlocker);
     return `
       <article class="crypto-card crypto-card-${mode}" data-market="${escapeHtml(market.market_ticker)}">
@@ -331,6 +374,7 @@
         </div>
         ${blockersHtml}
         ${signalBlockerHtml}
+        ${addOnHtml}
         <div class="crypto-sides">
           <div class="crypto-side-row ${side === "yes" ? "crypto-side-selected" : ""}">
             <span class="crypto-side-copy">

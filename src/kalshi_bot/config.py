@@ -214,6 +214,11 @@ class Settings(BaseSettings):
     crypto_shadow_exploration_max_per_asset_per_run: int = 2
     crypto_shadow_exploration_min_expected_net_edge_dollars: float = -0.03
     crypto_shadow_exploration_max_spread_bps: int = 500
+    crypto_empirical_bucket_gate_enabled: bool = True
+    crypto_empirical_bucket_gate_assets: str = "BTC"
+    crypto_empirical_bucket_min_samples: int = 20
+    crypto_empirical_bucket_min_net_pnl_dollars: float = 0.0
+    crypto_empirical_bucket_min_win_rate: float = 0.55
 
     stop_loss_enabled: bool = False
     stop_loss_threshold_pct: float = 0.10
@@ -246,6 +251,10 @@ class Settings(BaseSettings):
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False
+    crypto_position_add_ons_enabled: bool = True
+    crypto_position_add_on_assets: str = "BTC"
+    crypto_position_add_on_max_position_count_fp: float = 2.0
+    crypto_position_add_on_max_ticket_count_fp: float = 1.0
     risk_safe_capital_reserve_ratio: float = 0.0
     risk_risky_capital_max_ratio: float = 0.0
     risk_stale_market_seconds: int = 60

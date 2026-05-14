@@ -100,6 +100,98 @@ def _crypto_late_sure_thing_edge_bypass(signal: StrategySignal, context: RiskCon
     return strategy_code == "CRYPTO_15M" and trace.get("late_high_confidence_directional_entry") is True
 
 
+def _asset_set(value: str | None) -> set[str]:
+    return {
+        "".join(ch for ch in raw.strip().upper() if ch.isalnum())
+        for raw in str(value or "").replace(";", ",").split(",")
+        if raw.strip()
+    }
+
+
+def _crypto_add_on_asset(ticket: TradeTicket, candidate_trace: dict[str, Any]) -> str | None:
+    raw = candidate_trace.get("asset_symbol")
+    if raw not in (None, ""):
+        return "".join(ch for ch in str(raw).upper() if ch.isalnum()) or None
+    features = candidate_trace.get("features")
+    if isinstance(features, dict) and features.get("asset") not in (None, ""):
+        return "".join(ch for ch in str(features["asset"]).upper() if ch.isalnum()) or None
+    bucket_key = candidate_trace.get("bucket_key")
+    if isinstance(bucket_key, str) and "|" in bucket_key:
+        return "".join(ch for ch in bucket_key.split("|", 1)[0].upper() if ch.isalnum()) or None
+    ticker = str(ticket.market_ticker or "").upper()
+    if ticker.startswith("KX") and "15M" in ticker:
+        between = ticker[2:ticker.index("15M")]
+        return "".join(ch for ch in between if ch.isalnum()) or None
+    return None
+
+
+def _crypto_candidate_live_quality(candidate_trace: dict[str, Any]) -> bool:
+    if candidate_trace.get("candidate_status") == "live_quality":
+        return True
+    selection = candidate_trace.get("trade_selection_model")
+    if isinstance(selection, dict):
+        return selection.get("candidate_status") == "live_quality" or selection.get("status") == "live_quality"
+    return False
+
+
+def _crypto_empirical_bucket_allowed(candidate_trace: dict[str, Any]) -> bool:
+    gate = candidate_trace.get("empirical_bucket_gate")
+    if not isinstance(gate, dict):
+        selection = candidate_trace.get("trade_selection_model")
+        if isinstance(selection, dict):
+            gate = selection.get("empirical_bucket_gate")
+    return isinstance(gate, dict) and (gate.get("allowed") is True or gate.get("status") == "allowed")
+
+
+def _crypto_position_add_on_verdict(
+    *,
+    settings: Settings,
+    ticket: TradeTicket,
+    signal: StrategySignal,
+    context: RiskContext,
+    candidate_trace: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    strategy_code = str(context.strategy_code or candidate_trace.get("strategy_code") or "")
+    asset = _crypto_add_on_asset(ticket, candidate_trace)
+    configured_assets = _asset_set(settings.crypto_position_add_on_assets)
+    projected_count = context.current_position_count_fp + context.pending_order_count_fp + ticket.count_fp
+    diagnostics = {
+        "enabled": bool(settings.crypto_position_add_ons_enabled),
+        "strategy_code": strategy_code,
+        "asset_symbol": asset,
+        "configured_assets": sorted(configured_assets),
+        "current_position_side": context.current_position_side,
+        "ticket_side": ticket.side.value,
+        "current_position_count_fp": _decimal_text(context.current_position_count_fp),
+        "pending_order_count_fp": _decimal_text(context.pending_order_count_fp),
+        "ticket_count_fp": _decimal_text(ticket.count_fp),
+        "projected_position_count_fp": _decimal_text(projected_count),
+        "max_position_count_fp": _decimal_text(settings.crypto_position_add_on_max_position_count_fp),
+        "max_ticket_count_fp": _decimal_text(settings.crypto_position_add_on_max_ticket_count_fp),
+        "candidate_live_quality": _crypto_candidate_live_quality(candidate_trace),
+        "empirical_bucket_allowed": _crypto_empirical_bucket_allowed(candidate_trace),
+    }
+    if not settings.crypto_position_add_ons_enabled:
+        return False, {**diagnostics, "reason": "crypto_position_add_ons_disabled"}
+    if strategy_code != "CRYPTO_15M":
+        return False, {**diagnostics, "reason": "not_crypto_15m_strategy"}
+    if asset is None or (configured_assets and asset not in configured_assets):
+        return False, {**diagnostics, "reason": "crypto_position_add_on_asset_not_configured"}
+    if context.current_position_count_fp <= 0:
+        return False, {**diagnostics, "reason": "no_existing_position"}
+    if context.current_position_side != ticket.side.value:
+        return False, {**diagnostics, "reason": "opposite_side_position"}
+    if not _crypto_candidate_live_quality(candidate_trace):
+        return False, {**diagnostics, "reason": "candidate_not_live_quality"}
+    if not _crypto_empirical_bucket_allowed(candidate_trace):
+        return False, {**diagnostics, "reason": "empirical_bucket_not_allowed"}
+    if ticket.count_fp > Decimal(str(settings.crypto_position_add_on_max_ticket_count_fp)):
+        return False, {**diagnostics, "reason": "ticket_count_above_crypto_add_on_cap"}
+    if projected_count > Decimal(str(settings.crypto_position_add_on_max_position_count_fp)):
+        return False, {**diagnostics, "reason": "projected_position_above_crypto_add_on_cap"}
+    return True, {**diagnostics, "reason": "crypto_position_add_on_allowed"}
+
+
 def _bucket_fit_count(*, available_notional_dollars: Decimal, ticket: TradeTicket) -> Decimal | None:
     unit_notional = _ticket_unit_notional(ticket)
     if unit_notional <= Decimal("0"):
@@ -443,11 +535,29 @@ class DeterministicRiskEngine:
             block("Ticket size exceeds max order count.")
 
         effective_position_count_fp = context.current_position_count_fp + context.pending_order_count_fp
+        crypto_position_add_on_allowed = False
         if is_buy_entry and context.current_position_count_fp > 0 and not self.settings.risk_allow_position_add_ons:
-            block(
-                f"Existing live position in {room.market_ticker} blocks same-ticker add-ons; "
-                "no pyramiding is enabled."
+            crypto_position_add_on_allowed, crypto_add_on_diag = _crypto_position_add_on_verdict(
+                settings=self.settings,
+                ticket=ticket,
+                signal=signal,
+                context=context,
+                candidate_trace=candidate_trace,
             )
+            diagnostics["crypto_position_add_on"] = crypto_add_on_diag
+            if crypto_position_add_on_allowed:
+                note(
+                    f"BTC crypto same-side add-on is within capped add-on limits "
+                    f"({crypto_add_on_diag['projected_position_count_fp']} contracts)."
+                )
+                code("crypto_position_add_on_allowed")
+            else:
+                block(
+                    f"Existing live position in {room.market_ticker} blocks same-ticker add-ons; "
+                    "no pyramiding is enabled outside approved BTC crypto add-ons; "
+                    f"crypto capped add-on check failed: {crypto_add_on_diag['reason']}."
+                )
+                code("crypto_position_add_on_blocked")
         if (
             is_buy_entry
             and context.current_position_count_fp > 0

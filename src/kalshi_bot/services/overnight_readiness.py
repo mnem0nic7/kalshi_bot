@@ -16,10 +16,12 @@ from kalshi_bot.crypto.parsing import normalize_frequency
 from kalshi_bot.crypto.services import (
     CRYPTO_ASSET_MODE_LIVE,
     CRYPTO_LIVE_QUALITY,
+    _crypto_artifact_type,
     _crypto_candidate_quality_report,
     _crypto_data_quality,
     _crypto_decision_rows,
     _crypto_spot_quality,
+    normalize_asset_symbol,
 )
 from kalshi_bot.db.models import Checkpoint, DeploymentControl, FillRecord, OrderRecord, RiskVerdictRecord, Room, Signal, TradeTicketRecord
 from kalshi_bot.db.repositories import PlatformRepository
@@ -181,7 +183,7 @@ class OvernightReadinessService:
             "kalshi_env": kalshi_env,
             "settings_kalshi_env": self.settings.kalshi_env,
             "status": status,
-            "ready_for_live": status == "pass",
+            "ready_for_live": not hard_blockers,
             "read_only": True,
             "window": window.to_payload(),
             "domains_requested": sorted(domain_set),
@@ -535,20 +537,49 @@ class OvernightReadinessService:
                 artifact_type="replay_gate",
                 kalshi_env=kalshi_env,
             )
-
-        control_for_modes = control or SimpleNamespace(notes={}, active_color="", kill_switch_enabled=False)
-        asset_symbols = sorted(
-            {
-                row.asset_symbol
-                for row in [*snapshots, *candles, *spot_rows]
-                if getattr(row, "asset_symbol", None)
+            control_for_modes = control or SimpleNamespace(notes={}, active_color="", kill_switch_enabled=False)
+            asset_symbols = sorted(
+                {
+                    row.asset_symbol
+                    for row in [*snapshots, *candles, *spot_rows]
+                    if getattr(row, "asset_symbol", None)
+                }
+                | set(self.crypto_asset_control_service.modes_from_notes(getattr(control_for_modes, "notes", None)).keys())
+            )
+            mode_summary = self.crypto_asset_control_service.asset_mode_summary(
+                asset_symbols=asset_symbols,
+                modes=self.crypto_asset_control_service.modes_from_notes(getattr(control_for_modes, "notes", None)),
+            )
+            live_assets = [
+                normalize_asset_symbol(asset)
+                for asset, mode in mode_summary["modes"].items()
+                if mode == CRYPTO_ASSET_MODE_LIVE
+            ]
+            model_by_live_asset = {
+                asset: await repo.get_latest_crypto_model_artifact(
+                    frequency=freq,
+                    artifact_type=_crypto_artifact_type("model", [asset]),
+                    kalshi_env=kalshi_env,
+                )
+                for asset in live_assets
             }
-            | set(self.crypto_asset_control_service.modes_from_notes(getattr(control_for_modes, "notes", None)).keys())
-        )
-        mode_summary = self.crypto_asset_control_service.asset_mode_summary(
-            asset_symbols=asset_symbols,
-            modes=self.crypto_asset_control_service.modes_from_notes(getattr(control_for_modes, "notes", None)),
-        )
+            backtest_by_live_asset = {
+                asset: await repo.get_latest_crypto_model_artifact(
+                    frequency=freq,
+                    artifact_type=_crypto_artifact_type("backtest", [asset]),
+                    kalshi_env=kalshi_env,
+                )
+                for asset in live_assets
+            }
+            gate_by_live_asset = {
+                asset: await repo.get_latest_crypto_model_artifact(
+                    frequency=freq,
+                    artifact_type=_crypto_artifact_type("replay_gate", [asset]),
+                    kalshi_env=kalshi_env,
+                )
+                for asset in live_assets
+            }
+
         expected_assets_set = set(asset_symbols) | set(COINBASE_PRODUCT_IDS)
         if self.settings.crypto_spot_proxy_fallback_enabled:
             expected_assets_set.update(COINGECKO_IDS)
@@ -562,6 +593,7 @@ class OvernightReadinessService:
             spot_rows,
             expected_assets=expected_assets,
             min_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
+            settings=self.settings,
         )
         overnight_snapshots = [row for row in snapshots if window.contains(row.observed_at)]
         overnight_candles = [row for row in candles if window.contains(row.end_period_ts)]
@@ -572,16 +604,20 @@ class OvernightReadinessService:
             for row in decision_rows
             if window.contains(row.get("decision_ts"))
         ]
-        model_payload = dict(model.payload or {}) if model is not None else None
+        candidate_model_artifact = model
+        if candidate_model_artifact is None and len(live_assets) == 1:
+            candidate_model_artifact = model_by_live_asset.get(live_assets[0])
+        model_payload = dict(candidate_model_artifact.payload or {}) if candidate_model_artifact is not None else None
         candidate_quality = _crypto_candidate_quality_report(
             overnight_decision_rows,
             model_payload,
             settings=self.settings,
         )
 
+        scoped_gate = gate_by_live_asset.get(live_assets[0]) if len(live_assets) == 1 else gate
         global_live_blockers = self.crypto_asset_control_service.global_live_blockers(
             control=control_for_modes,
-            replay_gate=gate,
+            replay_gate=scoped_gate,
             has_write_credentials=self._has_write_credentials(kalshi_env=kalshi_env),
             frequency=freq,
         )
@@ -605,42 +641,75 @@ class OvernightReadinessService:
                 )
             )
         if _normalize_env(kalshi_env) == "production" and not self.settings.crypto_production_autonomy_enabled:
-            hard_blockers.append(
+            warnings.append(
                 _issue(
                     "crypto",
                     "crypto_production_autonomy_not_supported",
                     "Crypto production autonomy requires CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true.",
+                    severity="warn",
                 )
             )
+        if not live_assets:
+            hard_blockers.append(_issue("crypto", "crypto_no_live_assets", "No crypto assets are explicitly live."))
+        for asset in live_assets:
+            asset_model = model_by_live_asset.get(asset)
+            asset_backtest = backtest_by_live_asset.get(asset)
+            asset_gate = gate_by_live_asset.get(asset)
+            if asset_model is None:
+                hard_blockers.append(_issue("crypto", f"crypto_model_missing_{asset.lower()}", f"Crypto model artifact is missing for live asset {asset}."))
+            elif asset_model.status != "trained":
+                hard_blockers.append(_issue("crypto", f"crypto_model_not_trained_{asset.lower()}", f"Crypto model status for {asset} is {asset_model.status}; expected trained."))
+            if asset_backtest is None:
+                hard_blockers.append(_issue("crypto", f"crypto_backtest_missing_{asset.lower()}", f"Crypto backtest artifact is missing for live asset {asset}."))
+            elif asset_backtest.status != "pass":
+                hard_blockers.append(_issue("crypto", f"crypto_backtest_not_passing_{asset.lower()}", f"Crypto backtest status for {asset} is {asset_backtest.status}; expected pass."))
+            if asset_gate is None:
+                hard_blockers.append(_issue("crypto", f"crypto_replay_gate_missing_{asset.lower()}", f"Crypto replay gate artifact is missing for live asset {asset}."))
+            elif asset_gate.status != "passed":
+                hard_blockers.append(_issue("crypto", f"crypto_replay_gate_not_passed_{asset.lower()}", f"Crypto replay gate status for {asset} is {asset_gate.status}; expected passed."))
         if model is None:
-            hard_blockers.append(_issue("crypto", "crypto_model_missing", "Crypto model artifact is missing."))
+            warnings.append(_issue("crypto", "crypto_aggregate_model_missing", "Aggregate crypto model artifact is missing; live readiness is scoped to explicit live assets.", severity="warn"))
         elif model.status != "trained":
-            hard_blockers.append(_issue("crypto", "crypto_model_not_trained", f"Crypto model status is {model.status}; expected trained."))
+            warnings.append(_issue("crypto", "crypto_aggregate_model_not_trained", f"Aggregate crypto model status is {model.status}; live readiness is scoped to explicit live assets.", severity="warn"))
         if backtest is None:
-            hard_blockers.append(_issue("crypto", "crypto_backtest_missing", "Crypto backtest artifact is missing."))
+            warnings.append(_issue("crypto", "crypto_aggregate_backtest_missing", "Aggregate crypto backtest artifact is missing; live readiness is scoped to explicit live assets.", severity="warn"))
         elif backtest.status != "pass":
-            hard_blockers.append(_issue("crypto", "crypto_backtest_not_passing", f"Crypto backtest status is {backtest.status}; expected pass."))
+            warnings.append(_issue("crypto", "crypto_aggregate_backtest_not_passing", f"Aggregate crypto backtest status is {backtest.status}; live readiness is scoped to explicit live assets.", severity="warn"))
         if gate is None:
-            hard_blockers.append(_issue("crypto", "crypto_replay_gate_missing", "Crypto replay gate artifact is missing."))
+            warnings.append(_issue("crypto", "crypto_aggregate_replay_gate_missing", "Aggregate crypto replay gate artifact is missing; live readiness is scoped to explicit live assets.", severity="warn"))
         elif gate.status != "passed":
-            hard_blockers.append(_issue("crypto", "crypto_replay_gate_not_passed", f"Crypto replay gate status is {gate.status}; expected passed."))
-        live_quality_count = int((candidate_quality.get("live_quality_policy") or {}).get("selected_count") or 0)
-        if live_quality_count <= 0:
-            hard_blockers.append(_issue("crypto", "crypto_no_live_quality_overnight_candidates", f"No overnight candidates meet {CRYPTO_LIVE_QUALITY}."))
+            warnings.append(_issue("crypto", "crypto_aggregate_replay_gate_not_passed", f"Aggregate crypto replay gate status is {gate.status}; live readiness is scoped to explicit live assets.", severity="warn"))
+        candidate_by_asset = candidate_quality.get("by_asset") if isinstance(candidate_quality.get("by_asset"), dict) else {}
+        for asset in live_assets:
+            live_quality_count = int((candidate_by_asset.get(asset) or {}).get("live_quality_candidate_count") or 0)
+            if live_quality_count <= 0:
+                hard_blockers.append(_issue("crypto", f"crypto_no_live_quality_overnight_candidates_{asset.lower()}", f"No overnight {asset} candidates meet {CRYPTO_LIVE_QUALITY}."))
         for asset, mode in mode_summary["modes"].items():
             if mode != CRYPTO_ASSET_MODE_LIVE:
-                hard_blockers.append(
+                warnings.append(
                     _issue(
                         "crypto",
                         f"crypto_asset_mode_not_live_{asset.lower()}",
                         f"Asset {asset} mode is {mode}; set it to live to allow live orders.",
+                        severity="warn",
                         details={"asset_symbol": asset, "mode": mode},
                     )
                 )
+        data_assets = data_quality.get("assets") if isinstance(data_quality.get("assets"), dict) else {}
+        spot_assets = spot_quality.get("assets") if isinstance(spot_quality.get("assets"), dict) else {}
+        stale_spot_assets = set(spot_quality.get("stale_assets") or [])
+        missing_spot_assets = set(spot_quality.get("missing_assets") or [])
+        for asset in live_assets:
+            data_summary = data_assets.get(asset) or {}
+            if not data_summary or int(data_summary.get("snapshot_count") or 0) <= 0 or int(data_summary.get("candle_count") or 0) <= 0:
+                hard_blockers.append(_issue("crypto", f"crypto_data_quality_not_ready_{asset.lower()}", f"Crypto market data quality is not ready for live asset {asset}."))
+            spot_summary = spot_assets.get(asset) or {}
+            if asset in missing_spot_assets or asset in stale_spot_assets or bool(spot_summary.get("proxy_only")):
+                hard_blockers.append(_issue("crypto", f"crypto_spot_quality_not_ready_{asset.lower()}", f"Crypto spot data quality is not ready for live asset {asset}."))
         if data_quality.get("status") != "ready":
-            warnings.append(_issue("crypto", "crypto_data_quality_not_ready", "Crypto market data quality is not ready.", severity="warn"))
+            warnings.append(_issue("crypto", "crypto_data_quality_not_ready", "Aggregate crypto market data quality is not ready.", severity="warn"))
         if spot_quality.get("status") != "ready":
-            warnings.append(_issue("crypto", "crypto_spot_quality_not_ready", "Crypto spot data quality is not ready.", severity="warn"))
+            warnings.append(_issue("crypto", "crypto_spot_quality_not_ready", "Aggregate crypto spot data quality is not ready.", severity="warn"))
 
         hard_blockers = _unique_issues(hard_blockers)
         warnings = _unique_issues(warnings)
@@ -653,6 +722,7 @@ class OvernightReadinessService:
             "evidence": {
                 "window_days": days,
                 "asset_symbols": asset_symbols,
+                "live_asset_symbols": live_assets,
                 "asset_modes": mode_summary["modes"],
                 "asset_mode_counts": mode_summary["counts"],
                 "crypto_production_autonomy_enabled": self.settings.crypto_production_autonomy_enabled,
@@ -668,6 +738,9 @@ class OvernightReadinessService:
                 "model": _artifact_summary(model),
                 "backtest": _artifact_summary(backtest),
                 "replay_gate": _artifact_summary(gate),
+                "models_by_live_asset": {asset: _artifact_summary(artifact) for asset, artifact in model_by_live_asset.items()},
+                "backtests_by_live_asset": {asset: _artifact_summary(artifact) for asset, artifact in backtest_by_live_asset.items()},
+                "replay_gates_by_live_asset": {asset: _artifact_summary(artifact) for asset, artifact in gate_by_live_asset.items()},
                 "data_quality": data_quality,
                 "spot_quality": spot_quality,
                 "candidate_quality": candidate_quality,
