@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -379,7 +379,7 @@ class AgentPackService:
                 self.settings.risk_max_credible_edge_bps,
             ),
             risk_min_confidence=value_or_settings(thresholds.risk_min_confidence, self.settings.risk_min_confidence),
-            risk_min_contract_price_dollars=(
+            risk_min_contract_price_dollars=self._contract_price_floor(
                 value_or_settings(
                     thresholds.risk_min_contract_price_dollars,
                     self.settings.risk_min_contract_price_dollars,
@@ -431,11 +431,12 @@ class AgentPackService:
         from kalshi_bot.services.weather_policy import WeatherPolicyResolver
 
         active_pack = pack or self.default_pack()
-        return WeatherPolicyResolver().resolve(
+        resolved = WeatherPolicyResolver().resolve(
             pack=active_pack,
             context=context,
             fallback_thresholds=fallback_thresholds or self.runtime_thresholds(active_pack),
         )
+        return replace(resolved, thresholds=self._floor_runtime_thresholds(resolved.thresholds))
 
     def runtime_weather_thresholds(self, pack: AgentPack | None, context: Any) -> RuntimeThresholds:
         return self.resolve_weather_policy(pack, context).thresholds
@@ -451,7 +452,7 @@ class AgentPackService:
 
         overrides: dict[str, dict[str, Any]] = {}
         for raw_symbol, raw_entry in (policy.asset_entry_overrides or {}).items():
-            overrides[_normalize_crypto_asset_symbol(raw_symbol)] = {
+            override = {
                 "min_fee_adjusted_edge_bps": raw_entry.min_fee_adjusted_edge_bps,
                 "max_spread_bps": raw_entry.max_spread_bps,
                 "min_confidence": raw_entry.min_confidence,
@@ -459,12 +460,17 @@ class AgentPackService:
                 "min_remaining_payout_bps": raw_entry.min_remaining_payout_bps,
                 "max_credible_edge_bps": raw_entry.max_credible_edge_bps,
             }
+            if override["min_contract_price_dollars"] is not None:
+                override["min_contract_price_dollars"] = self._contract_price_floor(
+                    override["min_contract_price_dollars"]
+                )
+            overrides[_normalize_crypto_asset_symbol(raw_symbol)] = override
 
         return RuntimeCryptoPolicy(
             min_fee_adjusted_edge_bps=int(value_or_settings(entry.min_fee_adjusted_edge_bps, self.settings.risk_min_edge_bps)),
             max_spread_bps=int(value_or_settings(entry.max_spread_bps, self.settings.trigger_max_spread_bps)),
             min_confidence=float(value_or_settings(entry.min_confidence, self.settings.risk_min_confidence)),
-            min_contract_price_dollars=float(
+            min_contract_price_dollars=self._contract_price_floor(
                 value_or_settings(entry.min_contract_price_dollars, self.settings.risk_min_contract_price_dollars)
             ),
             min_remaining_payout_bps=int(
@@ -544,8 +550,8 @@ class AgentPackService:
         thresholds.risk_min_confidence = self._clamp_float(thresholds.risk_min_confidence, 0.60, 0.90)
         thresholds.risk_min_contract_price_dollars = self._clamp_float(
             thresholds.risk_min_contract_price_dollars,
-            0.03,
-            0.25,
+            self.settings.risk_min_contract_price_dollars,
+            0.99,
         )
         thresholds.trigger_max_spread_bps = self._clamp_int(thresholds.trigger_max_spread_bps, 50, 2500)
         thresholds.trigger_cooldown_seconds = self._clamp_int(thresholds.trigger_cooldown_seconds, 30, 3600)
@@ -627,9 +633,26 @@ class AgentPackService:
             min_fee_adjusted_edge_bps=self._clamp_int(entry.min_fee_adjusted_edge_bps, 250, 5000),
             max_spread_bps=self._clamp_int(entry.max_spread_bps, 50, 2500),
             min_confidence=self._clamp_float(entry.min_confidence, 0.50, 0.99),
-            min_contract_price_dollars=self._clamp_float(entry.min_contract_price_dollars, 0.01, 0.99),
+            min_contract_price_dollars=self._clamp_float(
+                entry.min_contract_price_dollars,
+                self.settings.risk_min_contract_price_dollars,
+                0.99,
+            ),
             min_remaining_payout_bps=self._clamp_int(entry.min_remaining_payout_bps, 100, 9900),
             max_credible_edge_bps=self._clamp_int(entry.max_credible_edge_bps, 2500, 10000),
+        )
+
+    def _contract_price_floor(self, value: Any) -> float:
+        if value is None:
+            return float(self.settings.risk_min_contract_price_dollars)
+        return max(float(value), float(self.settings.risk_min_contract_price_dollars))
+
+    def _floor_runtime_thresholds(self, thresholds: RuntimeThresholds) -> RuntimeThresholds:
+        return replace(
+            thresholds,
+            risk_min_contract_price_dollars=self._contract_price_floor(
+                thresholds.risk_min_contract_price_dollars
+            ),
         )
 
     def _sanitize_weather_policies(self, policies: dict[str, Any]) -> dict[str, Any]:
@@ -644,8 +667,8 @@ class AgentPackService:
             thresholds.risk_min_confidence = self._clamp_float(thresholds.risk_min_confidence, 0.60, 0.90)
             thresholds.risk_min_contract_price_dollars = self._clamp_float(
                 thresholds.risk_min_contract_price_dollars,
-                0.03,
-                0.25,
+                self.settings.risk_min_contract_price_dollars,
+                0.99,
             )
             thresholds.trigger_max_spread_bps = self._clamp_int(thresholds.trigger_max_spread_bps, 50, 2500)
             thresholds.trigger_cooldown_seconds = self._clamp_int(thresholds.trigger_cooldown_seconds, 30, 3600)

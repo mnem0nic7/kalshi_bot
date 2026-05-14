@@ -104,7 +104,7 @@ CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
 CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_fee_adjusted_edge_bps": (250, 500, 750, 1000, 1500),
     "max_spread_bps": (80, 150, 250, 400, 600, 1000),
-    "min_contract_price_dollars": (0.05, 0.10, 0.15, 0.25),
+    "min_contract_price_dollars": (0.50, 0.60, 0.70),
     "min_remaining_payout_bps": (1000, 1500, 2000, 3000),
 }
 
@@ -6733,7 +6733,12 @@ def _crypto_entry_policy_for_row(
     crypto_policy: RuntimeCryptoPolicy | None = None,
 ) -> dict[str, Any]:
     if crypto_policy is not None:
-        return crypto_policy.entry_for_asset(str(row.get("asset_symbol") or ""))
+        entry = dict(crypto_policy.entry_for_asset(str(row.get("asset_symbol") or "")))
+        entry["min_contract_price_dollars"] = max(
+            float(entry["min_contract_price_dollars"]),
+            float(settings.risk_min_contract_price_dollars),
+        )
+        return entry
     return {
         "min_fee_adjusted_edge_bps": int(settings.risk_min_edge_bps),
         "max_spread_bps": int(settings.trigger_max_spread_bps),

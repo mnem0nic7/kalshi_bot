@@ -179,7 +179,7 @@ Important fallback thresholds:
 | Quality edge buffer | 25 bps |
 | Maximum credible edge | 10000 bps |
 | Minimum confidence | 0.80 |
-| Minimum contract price | $0.25 |
+| Minimum contract price | $0.50 |
 | Probability midband exclusion | 25 percentage points around 50% |
 | Minimum forecast separation | 8 F |
 | Minimum remaining payout | 2000 bps ($0.20) |

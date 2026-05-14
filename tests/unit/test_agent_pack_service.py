@@ -67,7 +67,7 @@ def test_agent_pack_runtime_thresholds_override_all_tunable_gates() -> None:
     assert thresholds.risk_min_edge_bps == 1500
     assert thresholds.risk_max_credible_edge_bps == 7500
     assert thresholds.risk_min_confidence == 0.70
-    assert thresholds.risk_min_contract_price_dollars == 0.05
+    assert thresholds.risk_min_contract_price_dollars == settings.risk_min_contract_price_dollars
     assert thresholds.trigger_max_spread_bps == 500
     assert thresholds.strategy_min_abs_delta_f == 2.0
     assert thresholds.strategy_min_remaining_payout_bps == 1000
@@ -91,6 +91,7 @@ def test_agent_pack_runtime_crypto_policy_overrides_per_asset() -> None:
                     "btc": AgentPackCryptoEntryPolicy(
                         min_fee_adjusted_edge_bps=1500,
                         max_spread_bps=250,
+                        min_contract_price_dollars=0.05,
                     )
                 },
             )
@@ -103,13 +104,16 @@ def test_agent_pack_runtime_crypto_policy_overrides_per_asset() -> None:
     assert policy.entry_for_asset("eth")["min_fee_adjusted_edge_bps"] == 1000
     assert policy.entry_for_asset("BTC")["min_fee_adjusted_edge_bps"] == 1500
     assert policy.entry_for_asset("BTC")["max_spread_bps"] == 250
+    assert policy.entry_for_asset("BTC")["min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
+    assert policy.entry_for_asset("ETH")["min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
     assert thresholds.risk_min_edge_bps == 1500
     assert thresholds.trigger_max_spread_bps == 250
+    assert thresholds.risk_min_contract_price_dollars == settings.risk_min_contract_price_dollars
     assert thresholds.strategy_min_remaining_payout_bps == 1500
 
 
 def test_agent_pack_resolves_scoped_weather_policy_with_flat_threshold_fallback() -> None:
-    settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_contract_price_dollars=0.25)
+    settings = Settings(database_url="sqlite+aiosqlite:///./test.db")
     service = AgentPackService(settings)
     context = WeatherPolicyContext(
         strategy_code="A",
@@ -135,7 +139,7 @@ def test_agent_pack_resolves_scoped_weather_policy_with_flat_threshold_fallback(
     resolved = service.resolve_weather_policy(pack, context)
 
     assert resolved.policy_key == key
-    assert resolved.thresholds.risk_min_contract_price_dollars == 0.05
+    assert resolved.thresholds.risk_min_contract_price_dollars == settings.risk_min_contract_price_dollars
     assert resolved.thresholds.risk_min_edge_bps == settings.risk_min_edge_bps
     assert resolved.provenance()["reason_codes"] == ["unit_scoped_policy"]
 
@@ -186,7 +190,7 @@ def test_agent_pack_service_sanitizes_crypto_policy_bounds() -> None:
     assert sanitized.crypto_policy.entry.min_fee_adjusted_edge_bps == 5000
     assert sanitized.crypto_policy.entry.max_spread_bps == 50
     assert sanitized.crypto_policy.entry.min_confidence == 0.50
-    assert sanitized.crypto_policy.entry.min_contract_price_dollars == 0.01
+    assert sanitized.crypto_policy.entry.min_contract_price_dollars == settings.risk_min_contract_price_dollars
     assert sanitized.crypto_policy.entry.min_remaining_payout_bps == 100
     assert sanitized.crypto_policy.entry.max_credible_edge_bps == 10000
     assert sanitized.crypto_policy.live.asset_modes == {"BTC": "live", "ETH": "shadow"}

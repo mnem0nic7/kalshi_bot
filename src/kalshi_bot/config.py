@@ -250,7 +250,7 @@ class Settings(BaseSettings):
     risk_fee_aware_edge_enabled: bool = True
     risk_max_credible_edge_bps: int = 10000
     risk_min_confidence: float = 0.80
-    risk_min_contract_price_dollars: float = 0.25
+    risk_min_contract_price_dollars: float = 0.50
     risk_min_probability_extremity_pct: float = 25.0
     risk_probability_midband_max_extra_edge_bps: int = 500
     strategy_min_abs_delta_f: float = 8.0

@@ -97,9 +97,9 @@ def _replay_row(**overrides) -> dict[str, object]:
         "settlement_ts": datetime.fromisoformat(f"{day}T12:15:00+00:00"),
         "label_yes": 1,
         "mid_yes_dollars": Decimal("0.7000"),
-        "yes_bid_dollars": Decimal("0.4700"),
-        "yes_ask_dollars": Decimal("0.4900"),
-        "no_ask_dollars": Decimal("0.5300"),
+        "yes_bid_dollars": Decimal("0.4800"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5000"),
         "spread_bps": 200,
         "spot_feature_status": "available",
         "spot_provider": "coinbase",
@@ -1680,6 +1680,7 @@ def test_crypto_entry_optimizer_stages_only_passing_policy(tmp_path) -> None:
         tmp_path,
         crypto_min_training_samples=2,
         crypto_replay_min_trade_candidates=1,
+        crypto_replay_require_pnl_beats_market_mid=False,
         risk_min_edge_bps=5000,
     )
     policy = AgentPackService(settings).runtime_crypto_policy()
@@ -1687,10 +1688,10 @@ def test_crypto_entry_optimizer_stages_only_passing_policy(tmp_path) -> None:
         _replay_row(
             market_day=f"2026-05-0{day}",
             market_ticker=f"KXBTC15M-OPT-{day}",
-            mid_yes_dollars=Decimal("0.3000"),
-            yes_bid_dollars=Decimal("0.2900"),
-            yes_ask_dollars=Decimal("0.3000"),
-            no_ask_dollars=Decimal("0.7100"),
+            mid_yes_dollars=Decimal("0.5000"),
+            yes_bid_dollars=Decimal("0.4900"),
+            yes_ask_dollars=Decimal("0.5000"),
+            no_ask_dollars=Decimal("0.5100"),
             spread_bps=100,
             label_yes=1,
         )
@@ -1713,12 +1714,12 @@ def test_crypto_entry_optimizer_leaves_policy_unchanged_when_no_policy_passes(tm
     policy = AgentPackService(settings).runtime_crypto_policy()
     rows = [
         _replay_row(
-            market_day=f"2026-05-0{day}",
-            market_ticker=f"KXBTC15M-OPT-BLOCK-{day}",
-            mid_yes_dollars=Decimal("0.3000"),
-            yes_bid_dollars=Decimal("0.2900"),
-            yes_ask_dollars=Decimal("0.3000"),
-            no_ask_dollars=Decimal("0.7100"),
+                market_day=f"2026-05-0{day}",
+                market_ticker=f"KXBTC15M-OPT-BLOCK-{day}",
+                mid_yes_dollars=Decimal("0.7000"),
+                yes_bid_dollars=Decimal("0.4900"),
+                yes_ask_dollars=Decimal("0.5000"),
+                no_ask_dollars=Decimal("0.5100"),
             spread_bps=100,
             label_yes=1,
         )
@@ -1782,9 +1783,9 @@ def test_crypto_candidate_quality_classifies_live_and_exploratory(tmp_path) -> N
         "market_ticker": "KXBTC15M-CAND",
         "asset_symbol": "BTC",
         "mid_yes_dollars": Decimal("0.5000"),
-        "yes_bid_dollars": Decimal("0.4700"),
-        "yes_ask_dollars": Decimal("0.4900"),
-        "no_ask_dollars": Decimal("0.5300"),
+        "yes_bid_dollars": Decimal("0.4800"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5000"),
         "spread_bps": 200,
         "spot_feature_status": "available",
         "spot_provider": "coinbase",
@@ -1824,9 +1825,9 @@ def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
         "market_ticker": "KXBTC15M-RUNTIME",
         "asset_symbol": "BTC",
         "mid_yes_dollars": Decimal("0.5000"),
-        "yes_bid_dollars": Decimal("0.4700"),
-        "yes_ask_dollars": Decimal("0.4900"),
-        "no_ask_dollars": Decimal("0.5300"),
+        "yes_bid_dollars": Decimal("0.4800"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5000"),
         "spread_bps": 200,
         "spot_feature_status": "available",
         "spot_provider": "coinbase",
@@ -1837,6 +1838,7 @@ def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
 
     assert candidates[0]["candidate_status"] == CRYPTO_LIVE_QUALITY
     assert candidates[0]["runtime_thresholds"]["max_spread_bps"] == 250
+    assert candidates[0]["runtime_thresholds"]["min_contract_price_dollars"] == 0.5
 
 
 def test_crypto_candidate_quality_blocks_runtime_spread_over_asset_limit(tmp_path) -> None:
