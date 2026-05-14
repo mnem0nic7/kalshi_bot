@@ -1968,6 +1968,7 @@ def test_crypto_candidate_quality_allows_late_high_confidence_directional_entry(
         tmp_path,
         risk_min_edge_bps=500,
         crypto_autonomy_min_seconds_to_close=120,
+        crypto_late_sure_thing_max_seconds_to_close=120,
         crypto_late_sure_thing_min_probability=0.90,
     )
     row = {
@@ -1994,6 +1995,76 @@ def test_crypto_candidate_quality_allows_late_high_confidence_directional_entry(
     assert no_candidate["expected_net_edge"].startswith("-")
     assert no_candidate["live_entry_window_reason"] == "crypto_market_too_late_for_live_entry"
     assert no_candidate["late_high_confidence_directional_entry"] is True
+
+
+def test_crypto_candidate_quality_allows_late_market_confirmed_edge_bypass_before_no_entry_cutoff(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_late_sure_thing_max_seconds_to_close=300,
+        crypto_late_sure_thing_min_probability=0.90,
+        crypto_late_sure_thing_min_market_probability=0.75,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-MARKET-CONFIRMED",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.9650"),
+        "yes_bid_dollars": Decimal("0.9600"),
+        "yes_ask_dollars": Decimal("0.9700"),
+        "no_ask_dollars": Decimal("0.0400"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 240,
+        "market_age_seconds": 660,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.9500"), settings=settings)
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert yes_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert yes_candidate["edge_bps"] < 0
+    assert yes_candidate["expected_net_edge"].startswith("-")
+    assert yes_candidate["market_side_probability"] == "0.9650"
+    assert yes_candidate["live_entry_window_reason"] is None
+    assert yes_candidate["late_high_confidence_directional_entry"] is True
+
+
+def test_crypto_late_high_confidence_requires_market_price_confirmation(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=5000,
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_late_sure_thing_max_seconds_to_close=300,
+        crypto_late_sure_thing_min_probability=0.90,
+        crypto_late_sure_thing_min_market_probability=0.75,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-MODEL-ONLY",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.4900"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5100"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 240,
+        "market_age_seconds": 660,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.9500"), settings=settings)
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["candidate_status"] != CRYPTO_LIVE_QUALITY
+    assert yes_candidate["candidate_status"] == CRYPTO_EXPLORATORY_SHADOW
+    assert yes_candidate["reason"] == "broad_shadow_exploration"
+    assert yes_candidate["market_side_probability"] == "0.5000"
+    assert yes_candidate["late_high_confidence_directional_entry"] is False
 
 
 def _empirical_bucket(

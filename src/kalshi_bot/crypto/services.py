@@ -7272,6 +7272,7 @@ def _crypto_live_entry_window_reason(row: dict[str, Any], *, settings: Settings)
 
 def _crypto_late_sure_thing_candidate(
     *,
+    side: str,
     model_winner: bool,
     probability: Decimal,
     live_entry_window_reason: str | None,
@@ -7280,7 +7281,7 @@ def _crypto_late_sure_thing_candidate(
 ) -> bool:
     if not bool(settings.crypto_late_sure_thing_enabled):
         return False
-    if live_entry_window_reason != "crypto_market_too_late_for_live_entry":
+    if live_entry_window_reason == "crypto_market_too_early_for_live_entry":
         return False
     if not model_winner:
         return False
@@ -7290,7 +7291,13 @@ def _crypto_late_sure_thing_candidate(
     if time_to_close > max(0, int(settings.crypto_late_sure_thing_max_seconds_to_close)):
         return False
     min_probability = Decimal(str(settings.crypto_late_sure_thing_min_probability))
-    return probability >= min_probability
+    if probability < min_probability:
+        return False
+    market_probability = _crypto_market_side_probability(row, side)
+    if market_probability is None:
+        return False
+    min_market_probability = Decimal(str(settings.crypto_late_sure_thing_min_market_probability))
+    return market_probability >= min_market_probability
 
 
 def crypto_late_sure_thing_trace(candidate_trace: dict[str, Any] | None) -> bool:
@@ -7365,6 +7372,21 @@ def _crypto_market_mid_probability_text(row: dict[str, Any]) -> str | None:
         return _money_text(_clamp_price(_decimal(mid)))
     except Exception:
         return None
+
+
+def _crypto_market_side_probability(row: dict[str, Any], side: str) -> Decimal | None:
+    mid = row.get("mid_yes_dollars")
+    if mid in (None, ""):
+        return None
+    try:
+        mid_yes = _clamp_price(_decimal(mid))
+    except Exception:
+        return None
+    if str(side).lower() == "yes":
+        return mid_yes
+    if str(side).lower() == "no":
+        return _clamp_price(Decimal("1.0000") - mid_yes)
+    return None
 
 
 def _crypto_settlement_diagnostics(row: dict[str, Any]) -> dict[str, Any]:
@@ -7515,7 +7537,9 @@ def _crypto_trade_candidates(
         raw_edge_bps = int((raw_edge * Decimal("10000")).to_integral_value())
         model_winner = side == predicted_winner_side
         raw_model_winner = side == raw_predicted_winner_side
+        market_side_probability = _crypto_market_side_probability(row, side)
         late_sure_thing = _crypto_late_sure_thing_candidate(
+            side=side,
             model_winner=model_winner,
             probability=probability,
             live_entry_window_reason=live_entry_window_reason,
@@ -7584,6 +7608,9 @@ def _crypto_trade_candidates(
                 "raw_model_probability": str(raw_probability.quantize(Decimal("0.0001"))),
                 "market_anchored_probability": str(probability.quantize(Decimal("0.0001"))),
                 "market_mid_probability": market_mid_probability,
+                "market_side_probability": str(market_side_probability.quantize(Decimal("0.0001")))
+                if market_side_probability is not None
+                else None,
                 "market_price_anchor_weight": float(anchor_weight),
                 "model_winner": model_winner,
                 "raw_model_winner": raw_model_winner,
