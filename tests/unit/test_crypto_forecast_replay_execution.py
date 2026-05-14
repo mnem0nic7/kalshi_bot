@@ -3180,6 +3180,166 @@ async def test_crypto_autonomy_skips_off_assets_and_existing_rooms(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_crypto_autonomy_reevaluates_existing_live_room(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_autonomy_enabled=True,
+        crypto_trading_enabled=True,
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_live_min_market_age_seconds=180,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    now = datetime.now(UTC)
+    market = _market(
+        market_ticker="KXBTC15M-LIVE-REEVAL",
+        asset_symbol="BTC",
+        open_time=now - timedelta(minutes=5),
+        close_time=now + timedelta(minutes=10),
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await AgentPackService(settings).ensure_initialized(repo)
+        room = await repo.create_room(
+            RoomCreate(name="BTC live duplicate", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=now,
+        )
+        await session.commit()
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+
+    class _FakeKalshi:
+        write_credentials = object()
+
+    class _FakeMarketService:
+        kalshi = _FakeKalshi()
+
+        def __init__(self) -> None:
+            self.created: list[str] = []
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            return [market]
+
+        async def create_room_for_market(self, market_ticker: str, *, reason: str) -> dict[str, object]:
+            self.created.append(market_ticker)
+            raise AssertionError("existing live room should be re-evaluated, not recreated")
+
+    class _FakeWorkflowService:
+        def __init__(self) -> None:
+            self.runs: list[tuple[str, str]] = []
+
+        async def run_room(self, room_id: str, *, reason: str) -> None:
+            self.runs.append((room_id, reason))
+
+    market_service = _FakeMarketService()
+    workflow_service = _FakeWorkflowService()
+    result = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=market_service,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=workflow_service,  # type: ignore[arg-type]
+    ).run_once()
+
+    assert result["status"] == "ok"
+    assert market_service.created == []
+    assert workflow_service.runs == [(room.id, "crypto_autonomy_reevaluate")]
+    assert result["reevaluated"][0]["room_id"] == room.id
+    assert result["reevaluated"][0]["market_ticker"] == market.market_ticker
+    assert not any(item.get("reason") == "room_already_exists" for item in result["skipped"])
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_autonomy_skips_markets_before_live_entry_window(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=True,
+        crypto_autonomy_enabled=True,
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_live_min_market_age_seconds=180,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await session.commit()
+
+    class _FakeKalshi:
+        write_credentials = None
+
+    class _FakeMarketService:
+        kalshi = _FakeKalshi()
+
+        def __init__(self) -> None:
+            now = datetime.now(UTC)
+            self.markets = [
+                _market(
+                    market_ticker="KXBTC15M-EARLY",
+                    asset_symbol="BTC",
+                    open_time=now - timedelta(seconds=90),
+                    close_time=now + timedelta(seconds=810),
+                )
+            ]
+            self.created: list[str] = []
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            return self.markets
+
+        async def create_room_for_market(self, market_ticker: str, *, reason: str) -> dict[str, object]:
+            self.created.append(market_ticker)
+            raise AssertionError("early market should not create a room")
+
+    class _FakeWorkflowService:
+        async def run_room(self, room_id: str, *, reason: str) -> None:
+            raise AssertionError("early market should not run a room")
+
+    market_service = _FakeMarketService()
+    result = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=market_service,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=_FakeWorkflowService(),  # type: ignore[arg-type]
+    ).run_once()
+
+    assert result["status"] == "ok"
+    assert market_service.created == []
+    assert result["eligible_markets"] == 0
+    assert result["skipped"][0]["reason"] == "crypto_market_too_early_for_live_entry"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_crypto_autonomy_run_once_can_be_forced_for_operator_shadow_pass(tmp_path) -> None:
     settings = _settings(
         tmp_path,

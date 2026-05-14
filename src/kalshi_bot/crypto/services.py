@@ -3303,10 +3303,15 @@ class CryptoAutonomyService:
         skipped: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         min_seconds = max(0, int(self.settings.crypto_autonomy_min_seconds_to_close))
-        markets, ineligible = _eligible_market_per_asset(discovered, min_seconds_to_close=min_seconds)
+        markets, ineligible = _eligible_market_per_asset(
+            discovered,
+            min_seconds_to_close=min_seconds,
+            min_market_age_seconds=max(0, int(self.settings.crypto_live_min_market_age_seconds)),
+        )
         max_rooms = max(0, int(self.settings.crypto_autonomy_max_rooms_per_run))
         max_per_asset = max(1, int(self.settings.crypto_autonomy_max_per_asset_per_run))
         markets, cap_skips = _cap_crypto_autonomy_markets(markets, max_rooms=max_rooms, max_per_asset=max_per_asset)
+        reevaluated: list[dict[str, Any]] = []
         skipped.extend(ineligible)
         skipped.extend(cap_skips)
 
@@ -3369,6 +3374,18 @@ class CryptoAutonomyService:
                     )
                     await session.commit()
                 if existing is not None:
+                    if live_status["asset_mode"] == CRYPTO_ASSET_MODE_LIVE and live_status["live_eligible"]:
+                        await self.workflow_service.run_room(existing.id, reason="crypto_autonomy_reevaluate")
+                        reevaluated.append(
+                            {
+                                "room_id": existing.id,
+                                "market_ticker": market.market_ticker,
+                                "asset_symbol": market.asset_symbol,
+                                "seconds_to_close": seconds_to_close,
+                                "requested_asset_mode": live_status["asset_mode"],
+                            }
+                        )
+                        continue
                     skipped.append(
                         {
                             "market_ticker": market.market_ticker,
@@ -3410,6 +3427,7 @@ class CryptoAutonomyService:
             "shadow_evidence_mode": shadow_evidence_mode,
             "checked_markets": len(discovered),
             "eligible_markets": len(markets),
+            "reevaluated": reevaluated,
             "caps": {
                 "max_rooms_per_run": max_rooms,
                 "max_per_asset_per_run": max_per_asset,
@@ -3679,6 +3697,7 @@ def _eligible_market_per_asset(
     markets: list[CryptoMarket],
     *,
     min_seconds_to_close: int,
+    min_market_age_seconds: int = 0,
 ) -> tuple[list[CryptoMarket], list[dict[str, Any]]]:
     now = datetime.now(UTC)
     grouped: dict[str, list[CryptoMarket]] = {}
@@ -3708,6 +3727,18 @@ def _eligible_market_per_asset(
                     "seconds_to_close": seconds_to_close,
                 }
                 continue
+            market_age_seconds = _crypto_live_market_age_seconds(now, market)
+            if min_market_age_seconds > 0 and (
+                market_age_seconds is None or market_age_seconds < min_market_age_seconds
+            ):
+                latest_skip = {
+                    "market_ticker": market.market_ticker,
+                    "asset_symbol": market.asset_symbol,
+                    "reason": "crypto_market_too_early_for_live_entry",
+                    "market_age_seconds": market_age_seconds,
+                    "min_market_age_seconds": min_market_age_seconds,
+                }
+                continue
             chosen = market
             break
         if chosen is not None:
@@ -3721,6 +3752,19 @@ def _eligible_market_per_asset(
         sorted(selected, key=lambda market: (market.close_time or datetime.max.replace(tzinfo=UTC), market.asset_symbol)),
         skipped,
     )
+
+
+def _crypto_live_market_age_seconds(now: datetime, market: CryptoMarket) -> int | None:
+    market_age = _crypto_market_age_seconds(now, market.open_time)
+    if market_age is not None:
+        return market_age
+    close_time = market.close_time or market.expected_expiration_time
+    if close_time is None:
+        return None
+    if normalize_frequency(market.frequency) != "15m":
+        return None
+    seconds_to_close = int((_as_utc_datetime(close_time) - _as_utc_datetime(now)).total_seconds())
+    return max(0, 900 - seconds_to_close)
 
 
 def _cap_crypto_autonomy_markets(
