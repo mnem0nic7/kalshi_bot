@@ -11,6 +11,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, RiskStatus, RoomOrigin, StandDownReason, TradeAction
 from kalshi_bot.core.schemas import (
     AgentPackCryptoEntryPolicy,
+    AgentPackCryptoLivePolicy,
     AgentPackCryptoPolicy,
     AgentPackCryptoReplayPolicy,
     ExecReceiptPayload,
@@ -30,6 +31,7 @@ from kalshi_bot.crypto.services import (
     CryptoExecutionService,
     CryptoForecastService,
     CryptoReplayService,
+    _crypto_apply_empirical_bucket_gate_to_replay_metrics,
     _crypto_data_quality,
     _crypto_decision_rows,
     _crypto_bucket_key,
@@ -1829,7 +1831,7 @@ def test_crypto_ensemble_prediction_is_deterministic(tmp_path) -> None:
 
 
 def test_crypto_candidate_quality_classifies_live_and_exploratory(tmp_path) -> None:
-    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    settings = _settings(tmp_path, risk_min_edge_bps=500, crypto_empirical_bucket_gate_assets="BTC")
     row = {
         "market_ticker": "KXBTC15M-CAND",
         "asset_symbol": "BTC",
@@ -1955,7 +1957,7 @@ def test_crypto_bucket_key_includes_time_to_close_bucket(tmp_path) -> None:
 
 
 def test_crypto_empirical_bucket_gate_blocks_missing_or_bad_buckets(tmp_path) -> None:
-    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    settings = _settings(tmp_path, risk_min_edge_bps=500, crypto_empirical_bucket_gate_assets="BTC")
     row = {
         "market_ticker": "KXBTC15M-BUCKET-GATE",
         "asset_symbol": "BTC",
@@ -1992,8 +1994,92 @@ def test_crypto_empirical_bucket_gate_blocks_missing_or_bad_buckets(tmp_path) ->
         assert yes_candidate["live_eligible"] is False
 
 
-def test_crypto_empirical_bucket_gate_defaults_to_all_live_assets(tmp_path) -> None:
+def test_crypto_empirical_bucket_gate_defaults_to_dynamic_live_assets(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=500)
+    policy = AgentPackService(settings).runtime_crypto_policy(
+        AgentPackService(settings).default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    live=AgentPackCryptoLivePolicy(asset_modes={"HYPE": "live"})
+                )
+            }
+        )
+    )
+    row = {
+        "market_ticker": "KXHYPE15M-BUCKET-GATE",
+        "asset_symbol": "HYPE",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.4900"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5100"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
+    }
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.9000"),
+        settings=settings,
+        crypto_policy=policy,
+        empirical_bucket_matrix=[],
+        enforce_empirical_bucket_gate=True,
+    )
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert settings.crypto_empirical_bucket_gate_assets == "live"
+    assert yes_candidate["candidate_status"] == "blocked_empirical_bucket"
+    assert yes_candidate["reason"] == "empirical_bucket_not_allowed"
+    assert yes_candidate["empirical_bucket_gate"]["reason"] == "empirical_bucket_missing"
+
+
+def test_crypto_empirical_bucket_gate_applies_to_requested_shadow_replay_asset(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    policy = AgentPackService(settings).runtime_crypto_policy(
+        AgentPackService(settings).default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    live=AgentPackCryptoLivePolicy(asset_modes={"SOL": "shadow"})
+                )
+            }
+        )
+    )
+    row = {
+        "market_ticker": "KXSOL15M-BUCKET-GATE",
+        "asset_symbol": "SOL",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.4900"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5100"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
+    }
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.9000"),
+        settings=settings,
+        crypto_policy=policy,
+        empirical_bucket_matrix=[],
+        enforce_empirical_bucket_gate=True,
+        empirical_bucket_requested_assets=["SOL"],
+        force_empirical_bucket_for_requested_assets=True,
+    )
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["candidate_status"] == "blocked_empirical_bucket"
+    assert yes_candidate["empirical_bucket_gate"]["reason"] == "empirical_bucket_missing"
+
+
+def test_crypto_empirical_bucket_gate_preserves_explicit_asset_csv_scope(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500, crypto_empirical_bucket_gate_assets="BTC")
     row = {
         "market_ticker": "KXHYPE15M-BUCKET-GATE",
         "asset_symbol": "HYPE",
@@ -2018,16 +2104,15 @@ def test_crypto_empirical_bucket_gate_defaults_to_all_live_assets(tmp_path) -> N
     )
     yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
 
-    assert settings.crypto_empirical_bucket_gate_assets == "BTC,ETH,HYPE,XRP"
-    assert yes_candidate["candidate_status"] == "blocked_empirical_bucket"
-    assert yes_candidate["reason"] == "empirical_bucket_not_allowed"
-    assert yes_candidate["empirical_bucket_gate"]["reason"] == "empirical_bucket_missing"
+    assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert yes_candidate["empirical_bucket_gate"]["reason"] == "asset_not_configured_for_empirical_bucket_gate"
 
 
 def test_late_high_confidence_candidate_still_requires_empirical_bucket(tmp_path) -> None:
     settings = _settings(
         tmp_path,
         risk_min_edge_bps=500,
+        crypto_empirical_bucket_gate_assets="BTC",
         crypto_autonomy_min_seconds_to_close=120,
         crypto_late_sure_thing_min_probability=0.90,
     )
@@ -2489,6 +2574,140 @@ def test_crypto_replay_gate_separates_oos_candidates_from_current_model_candidat
     assert gate["passed"] is False
     assert "Current model live-quality candidate count 0 below minimum 50." in gate["reasons"]
     assert not any("Out-of-sample trade candidate count" in reason for reason in gate["reasons"])
+
+
+def test_crypto_replay_gate_uses_positive_bucket_gated_metrics(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=10,
+        crypto_replay_min_trade_candidates=2,
+        crypto_empirical_bucket_gate_assets="SOL",
+        crypto_empirical_bucket_min_samples=2,
+        crypto_empirical_bucket_min_win_rate=0.50,
+        crypto_replay_require_pnl_beats_market_mid=True,
+        crypto_replay_require_calibration_better_than_mid=False,
+    )
+    allowed_key = "SOL|yes|0.75-1.00|normal|5_10m"
+    blocked_key = "SOL|no|0.75-1.00|normal|5_10m"
+    selection_trades = [
+        {
+            "asset_symbol": "SOL",
+            "market_day": "2026-05-14",
+            "mid_yes_dollars": Decimal("0.8000"),
+            "spread_bps": 100,
+            "time_to_close_seconds": 600,
+            "simulation": {
+                "bucket_key": allowed_key,
+                "side": "yes",
+                "execution_price_dollars": "0.8000",
+                "net_pnl": "1.0000",
+                "gross_pnl": "1.0000",
+                "fees": "0.0000",
+            },
+        },
+        {
+            "asset_symbol": "SOL",
+            "market_day": "2026-05-14",
+            "mid_yes_dollars": Decimal("0.8000"),
+            "spread_bps": 100,
+            "time_to_close_seconds": 600,
+            "simulation": {
+                "bucket_key": allowed_key,
+                "side": "yes",
+                "execution_price_dollars": "0.8000",
+                "net_pnl": "0.8000",
+                "gross_pnl": "0.8000",
+                "fees": "0.0000",
+            },
+        },
+        {
+            "asset_symbol": "SOL",
+            "market_day": "2026-05-14",
+            "mid_yes_dollars": Decimal("0.8000"),
+            "spread_bps": 100,
+            "time_to_close_seconds": 600,
+            "simulation": {
+                "bucket_key": blocked_key,
+                "side": "no",
+                "execution_price_dollars": "0.8000",
+                "net_pnl": "-4.0000",
+                "gross_pnl": "-4.0000",
+                "fees": "0.0000",
+            },
+        },
+    ]
+    metrics = _crypto_apply_empirical_bucket_gate_to_replay_metrics(
+        {
+            "resolved_sample_count": 20,
+            "strict_trade_eligible_count": 20,
+            "trade_candidate_count": 3,
+            "current_model_live_quality_candidate_count": 3,
+            "oos_trade_candidate_count": 3,
+            "net_simulated_pl_dollars": -2.2,
+            "market_mid_net_simulated_pl_dollars": 0.0,
+            "pnl_advantage_vs_market_mid_dollars": -2.2,
+            "oos_evaluation_status": "ok",
+            "oos_fold_count": 1,
+            "candle_count": 20,
+            "spot_feature_coverage_pct": 1.0,
+            "hard_cap_breaches": 0,
+        },
+        selection_trades=selection_trades,
+        market_mid_trades=[],
+        bucket_matrix=[
+            _empirical_bucket(allowed_key, sample_count=2, win_rate=1.0, net_pnl="1.8000"),
+            _empirical_bucket(blocked_key, sample_count=2, win_rate=0.0, net_pnl="-4.0000"),
+        ],
+        settings=settings,
+    )
+    gate = CryptoReplayService(settings=settings, session_factory=None).evaluate_gate(metrics)  # type: ignore[arg-type]
+
+    assert metrics["empirical_bucket_gate_applied_to_metrics"] is True
+    assert metrics["pre_bucket_gate_metrics"]["net_simulated_pl_dollars"] == -2.2
+    assert metrics["net_simulated_pl_dollars"] == 1.8
+    assert metrics["trade_candidate_count"] == 2
+    assert gate["passed"] is True
+
+
+def test_crypto_replay_gate_blocks_when_asset_has_no_allowed_buckets(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=10,
+        crypto_replay_min_trade_candidates=2,
+        crypto_empirical_bucket_gate_assets="BNB",
+        crypto_empirical_bucket_min_samples=20,
+        crypto_replay_require_calibration_better_than_mid=False,
+    )
+    bucket_key = "BNB|yes|0.75-1.00|normal|5_10m"
+    metrics = _crypto_apply_empirical_bucket_gate_to_replay_metrics(
+        {
+            "resolved_sample_count": 20,
+            "strict_trade_eligible_count": 20,
+            "trade_candidate_count": 2,
+            "current_model_live_quality_candidate_count": 2,
+            "oos_trade_candidate_count": 2,
+            "net_simulated_pl_dollars": 3.0,
+            "market_mid_net_simulated_pl_dollars": 0.0,
+            "pnl_advantage_vs_market_mid_dollars": 3.0,
+            "oos_evaluation_status": "ok",
+            "oos_fold_count": 1,
+            "candle_count": 20,
+            "spot_feature_coverage_pct": 1.0,
+            "hard_cap_breaches": 0,
+        },
+        selection_trades=[],
+        market_mid_trades=[],
+        bucket_matrix=[
+            _empirical_bucket(bucket_key, sample_count=3, win_rate=1.0, net_pnl="3.0000"),
+        ],
+        settings=settings,
+    )
+    gate = CryptoReplayService(settings=settings, session_factory=None).evaluate_gate(metrics)  # type: ignore[arg-type]
+
+    assert metrics["empirical_bucket_gate_applied_to_metrics"] is True
+    assert metrics["empirical_bucket_gate"]["allowed_bucket_keys"] == []
+    assert metrics["trade_candidate_count"] == 0
+    assert gate["passed"] is False
 
 
 def test_crypto_proxy_quote_rows_are_prediction_only(tmp_path) -> None:

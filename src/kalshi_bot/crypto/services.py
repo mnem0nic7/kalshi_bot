@@ -1980,7 +1980,20 @@ class CryptoForecastService:
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            note_modes = CryptoAssetControlService(
+                settings=self.settings,
+                session_factory=self.session_factory,
+            ).modes_from_notes(getattr(control, "notes", None))
             await session.commit()
+        crypto_policy = _runtime_crypto_policy_with_asset_modes(
+            crypto_policy,
+            _resolved_crypto_asset_modes(
+                asset_symbols=[market.asset_symbol],
+                note_modes=note_modes,
+                crypto_policy=crypto_policy,
+            ),
+        )
         mid = market.mid_yes_dollars or market.last_price_dollars or Decimal("0.5000")
         if artifact is None or artifact.status != "trained":
             return self._stand_down(
@@ -2520,6 +2533,9 @@ class CryptoReplayService:
             aggregate_metrics,
             bucket_matrix=aggregate_bucket_matrix,
             settings=self.settings,
+            crypto_policy=crypto_policy,
+            requested_asset_symbols=asset_symbols,
+            force_requested_assets=bool(asset_symbols),
         )
         aggregate_gate = self.evaluate_gate(aggregate_metrics, crypto_policy=crypto_policy)
         gate = {
@@ -2601,6 +2617,11 @@ class CryptoReplayService:
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            note_modes = CryptoAssetControlService(
+                settings=self.settings,
+                session_factory=self.session_factory,
+            ).modes_from_notes(getattr(control, "notes", None))
             await session.commit()
         snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
@@ -2609,12 +2630,25 @@ class CryptoReplayService:
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
         if limit and limit > 0:
             rows = rows[-limit:]
+        mode_assets = requested_assets or sorted(
+            {normalize_asset_symbol(str(row.get("asset_symbol") or "")) for row in rows if row.get("asset_symbol")}
+        )
+        crypto_policy = _runtime_crypto_policy_with_asset_modes(
+            crypto_policy,
+            _resolved_crypto_asset_modes(
+                asset_symbols=mode_assets,
+                note_modes=note_modes,
+                crypto_policy=crypto_policy,
+            ),
+        )
         model_payload = model.payload if model is not None and isinstance(model.payload, dict) else None
         backtest = _evaluate_crypto_walk_forward(
             rows,
             settings=self.settings,
             crypto_policy=crypto_policy,
             diagnostic_model=model_payload,
+            empirical_bucket_requested_assets=requested_assets,
+            force_empirical_bucket_for_requested_assets=bool(requested_assets),
         )
         data_quality = _crypto_data_quality(
             snapshots,
@@ -2648,6 +2682,9 @@ class CryptoReplayService:
             metrics,
             bucket_matrix=(backtest.get("bucket_matrix") or metrics.get("bucket_matrix") or []),
             settings=self.settings,
+            crypto_policy=crypto_policy,
+            requested_asset_symbols=requested_assets,
+            force_requested_assets=bool(requested_assets),
         )
         gate = self.evaluate_gate(metrics, crypto_policy=crypto_policy)
         issues: list[dict[str, Any]] = []
@@ -6595,6 +6632,36 @@ def _runtime_crypto_policy_with_asset_entry(
     )
 
 
+def _runtime_crypto_policy_with_asset_modes(
+    crypto_policy: RuntimeCryptoPolicy,
+    asset_modes: dict[str, str],
+) -> RuntimeCryptoPolicy:
+    modes = {
+        normalize_asset_symbol(symbol): normalize_asset_mode(mode)
+        for symbol, mode in (asset_modes or {}).items()
+    }
+    return RuntimeCryptoPolicy(
+        min_fee_adjusted_edge_bps=crypto_policy.min_fee_adjusted_edge_bps,
+        max_spread_bps=crypto_policy.max_spread_bps,
+        min_confidence=crypto_policy.min_confidence,
+        min_contract_price_dollars=crypto_policy.min_contract_price_dollars,
+        min_remaining_payout_bps=crypto_policy.min_remaining_payout_bps,
+        max_credible_edge_bps=crypto_policy.max_credible_edge_bps,
+        replay_min_resolved_markets=crypto_policy.replay_min_resolved_markets,
+        replay_min_trade_candidates=crypto_policy.replay_min_trade_candidates,
+        replay_min_net_pl_dollars=crypto_policy.replay_min_net_pl_dollars,
+        replay_max_hard_cap_breaches=crypto_policy.replay_max_hard_cap_breaches,
+        replay_min_spot_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
+        replay_require_calibration_better_than_mid=crypto_policy.replay_require_calibration_better_than_mid,
+        replay_require_pnl_beats_market_mid=crypto_policy.replay_require_pnl_beats_market_mid,
+        replay_min_pnl_advantage_dollars=crypto_policy.replay_min_pnl_advantage_dollars,
+        trading_enabled=crypto_policy.trading_enabled,
+        production_autonomy_enabled=crypto_policy.production_autonomy_enabled,
+        asset_modes=modes,
+        asset_entry_overrides=dict(crypto_policy.asset_entry_overrides or {}),
+    )
+
+
 def _crypto_entry_policy_grid(base_entry: dict[str, Any]) -> list[dict[str, Any]]:
     policies: list[dict[str, Any]] = []
     for min_edge in CRYPTO_ENTRY_OPTIMIZER_GRID["min_fee_adjusted_edge_bps"]:
@@ -6793,6 +6860,8 @@ def _evaluate_crypto_walk_forward(
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy | None = None,
     diagnostic_model: dict[str, Any] | None = None,
+    empirical_bucket_requested_assets: list[str] | None = None,
+    force_empirical_bucket_for_requested_assets: bool = False,
 ) -> dict[str, Any]:
     baseline_names = ("market_mid_baseline", "always_0_5", "last_direction", "naive_momentum", "linear_on_returns")
     support_model = diagnostic_model if isinstance(diagnostic_model, dict) and diagnostic_model else None
@@ -6843,10 +6912,15 @@ def _evaluate_crypto_walk_forward(
                 "candidate_counts_by_asset": diagnostic_quality["by_asset"],
             }
         )
-        empty_metrics = _crypto_metrics_with_empirical_buckets(
+        empty_metrics = _crypto_apply_empirical_bucket_gate_to_replay_metrics(
             empty_metrics,
+            selection_trades=[],
+            market_mid_trades=[],
             bucket_matrix=[],
             settings=settings,
+            crypto_policy=crypto_policy,
+            requested_asset_symbols=empirical_bucket_requested_assets,
+            force_requested_assets=force_empirical_bucket_for_requested_assets,
         )
         baseline_policies = [
             _crypto_policy_metrics(name, [], settings=settings)
@@ -7030,47 +7104,58 @@ def _evaluate_crypto_walk_forward(
         "bucket_matrix": bucket_matrix,
         "bucket_diagnostics": bucket_diagnostics,
         "candidate_quality": diagnostic_quality,
-        "metrics": _crypto_metrics_with_empirical_buckets({
-            "sample_count": len(rows),
-            "resolved_sample_count": len(rows),
-            "prediction_eligible_count": sum(1 for row in rows if row.get("prediction_eligible", True)),
-            "strict_trade_eligible_count": sum(1 for row in rows if row.get("strict_trade_eligible")),
-            "proxy_quote_row_count": sum(1 for row in rows if row.get("quote_source") != "snapshot_quotes"),
-            "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
-            "spot_feature_coverage_pct": _spot_feature_coverage(rows),
-            "trade_candidate_count": diagnostic_live_policy["selected_count"],
-            "current_model_live_quality_candidate_count": diagnostic_live_policy["selected_count"],
-            "live_quality_candidate_count": diagnostic_live_policy["selected_count"],
-            "exploratory_shadow_candidate_count": diagnostic_quality["exploratory_shadow_count"],
-            "oos_evaluation_status": "ok",
-            "oos_fold_count": len(folds),
-            "oos_trade_candidate_count": selection_policy["selected_count"],
-            "oos_net_simulated_pl_dollars": float(_decimal(selection_policy["net_pnl"])),
-            "oos_market_mid_net_simulated_pl_dollars": float(_decimal(baseline_policy["net_pnl"])),
-            "oos_pnl_advantage_vs_market_mid_dollars": float(
-                _decimal(selection_policy["net_pnl"]) - _decimal(baseline_policy["net_pnl"])
-            ),
-            "diagnostic_net_simulated_pl_dollars": float(_decimal(diagnostic_live_policy["net_pnl"])),
-            "diagnostic_shadow_net_simulated_pl_dollars": float(_decimal(diagnostic_shadow_policy["net_pnl"])),
-            "net_simulated_pl_dollars": float(_decimal(selection_policy["net_pnl"])),
-            "market_mid_net_simulated_pl_dollars": float(_decimal(baseline_policy["net_pnl"])),
-            "pnl_advantage_vs_market_mid_dollars": float(_decimal(selection_policy["net_pnl"]) - _decimal(baseline_policy["net_pnl"])),
-            "fees_dollars": float(_decimal(selection_policy["fees"])),
-            "hard_cap_breaches": selection_policy["hard_cap_breaches"],
-            "calibration_brier": probability["calibrated"]["brier"],
-            "market_mid_brier": probability["baseline"]["brier"],
-            "calibration_log_loss": probability["calibrated"]["log_loss"],
-            "market_mid_log_loss": probability["baseline"]["log_loss"],
-            "calibration_ece": probability["calibrated"]["ece"],
-            "market_mid_ece": probability["baseline"]["ece"],
-            "fee_model_version": current_fee_model_version(),
-            "candidate_status_counts": diagnostic_quality["candidate_status_counts"],
-            "candidate_reason_counts": diagnostic_quality["candidate_reason_counts"],
-            "top_candidate_status_counts": diagnostic_quality["top_candidate_status_counts"],
-            "top_candidate_reason_counts": diagnostic_quality["top_candidate_reason_counts"],
-            "candidate_rejection_reason_counts": diagnostic_quality["candidate_rejection_reason_counts"],
-            "candidate_counts_by_asset": diagnostic_quality["by_asset"],
-        }, bucket_matrix=bucket_matrix, settings=settings),
+        "metrics": _crypto_apply_empirical_bucket_gate_to_replay_metrics(
+            {
+                "sample_count": len(rows),
+                "resolved_sample_count": len(rows),
+                "prediction_eligible_count": sum(1 for row in rows if row.get("prediction_eligible", True)),
+                "strict_trade_eligible_count": sum(1 for row in rows if row.get("strict_trade_eligible")),
+                "proxy_quote_row_count": sum(1 for row in rows if row.get("quote_source") != "snapshot_quotes"),
+                "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
+                "spot_feature_coverage_pct": _spot_feature_coverage(rows),
+                "trade_candidate_count": diagnostic_live_policy["selected_count"],
+                "current_model_live_quality_candidate_count": diagnostic_live_policy["selected_count"],
+                "live_quality_candidate_count": diagnostic_live_policy["selected_count"],
+                "exploratory_shadow_candidate_count": diagnostic_quality["exploratory_shadow_count"],
+                "oos_evaluation_status": "ok",
+                "oos_fold_count": len(folds),
+                "oos_trade_candidate_count": selection_policy["selected_count"],
+                "oos_net_simulated_pl_dollars": float(_decimal(selection_policy["net_pnl"])),
+                "oos_market_mid_net_simulated_pl_dollars": float(_decimal(baseline_policy["net_pnl"])),
+                "oos_pnl_advantage_vs_market_mid_dollars": float(
+                    _decimal(selection_policy["net_pnl"]) - _decimal(baseline_policy["net_pnl"])
+                ),
+                "diagnostic_net_simulated_pl_dollars": float(_decimal(diagnostic_live_policy["net_pnl"])),
+                "diagnostic_shadow_net_simulated_pl_dollars": float(_decimal(diagnostic_shadow_policy["net_pnl"])),
+                "net_simulated_pl_dollars": float(_decimal(selection_policy["net_pnl"])),
+                "market_mid_net_simulated_pl_dollars": float(_decimal(baseline_policy["net_pnl"])),
+                "pnl_advantage_vs_market_mid_dollars": float(
+                    _decimal(selection_policy["net_pnl"]) - _decimal(baseline_policy["net_pnl"])
+                ),
+                "fees_dollars": float(_decimal(selection_policy["fees"])),
+                "hard_cap_breaches": selection_policy["hard_cap_breaches"],
+                "calibration_brier": probability["calibrated"]["brier"],
+                "market_mid_brier": probability["baseline"]["brier"],
+                "calibration_log_loss": probability["calibrated"]["log_loss"],
+                "market_mid_log_loss": probability["baseline"]["log_loss"],
+                "calibration_ece": probability["calibrated"]["ece"],
+                "market_mid_ece": probability["baseline"]["ece"],
+                "fee_model_version": current_fee_model_version(),
+                "candidate_status_counts": diagnostic_quality["candidate_status_counts"],
+                "candidate_reason_counts": diagnostic_quality["candidate_reason_counts"],
+                "top_candidate_status_counts": diagnostic_quality["top_candidate_status_counts"],
+                "top_candidate_reason_counts": diagnostic_quality["top_candidate_reason_counts"],
+                "candidate_rejection_reason_counts": diagnostic_quality["candidate_rejection_reason_counts"],
+                "candidate_counts_by_asset": diagnostic_quality["by_asset"],
+            },
+            selection_trades=selection_trades,
+            market_mid_trades=baseline_trades_by_name["market_mid_baseline"],
+            bucket_matrix=bucket_matrix,
+            settings=settings,
+            crypto_policy=crypto_policy,
+            requested_asset_symbols=empirical_bucket_requested_assets,
+            force_requested_assets=force_empirical_bucket_for_requested_assets,
+        ),
     }
 
 
@@ -7200,6 +7285,8 @@ def _crypto_trade_candidates(
     require_spot_features: bool = True,
     empirical_bucket_matrix: list[dict[str, Any]] | None = None,
     enforce_empirical_bucket_gate: bool = False,
+    empirical_bucket_requested_assets: list[str] | None = None,
+    force_empirical_bucket_for_requested_assets: bool = False,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
@@ -7340,8 +7427,11 @@ def _crypto_trade_candidates(
             row,
             bucket_key=bucket_key,
             settings=settings,
+            crypto_policy=crypto_policy,
             bucket_matrix=empirical_bucket_matrix,
             enforce=enforce_empirical_bucket_gate,
+            requested_asset_symbols=empirical_bucket_requested_assets,
+            force_requested_assets=force_empirical_bucket_for_requested_assets,
         )
         if (
             candidate_status == CRYPTO_LIVE_QUALITY
@@ -7422,9 +7512,22 @@ def _simulate_crypto_trade(
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy | None = None,
     policy: str = "live_quality",
+    empirical_bucket_matrix: list[dict[str, Any]] | None = None,
+    enforce_empirical_bucket_gate: bool = False,
+    empirical_bucket_requested_assets: list[str] | None = None,
+    force_empirical_bucket_for_requested_assets: bool = False,
 ) -> dict[str, Any]:
     label_yes = int(row["label_yes"])
-    candidates = _crypto_trade_candidates(row, predicted_yes, settings=settings, crypto_policy=crypto_policy)
+    candidates = _crypto_trade_candidates(
+        row,
+        predicted_yes,
+        settings=settings,
+        crypto_policy=crypto_policy,
+        empirical_bucket_matrix=empirical_bucket_matrix,
+        enforce_empirical_bucket_gate=enforce_empirical_bucket_gate,
+        empirical_bucket_requested_assets=empirical_bucket_requested_assets,
+        force_empirical_bucket_for_requested_assets=force_empirical_bucket_for_requested_assets,
+    )
     allowed_statuses = {CRYPTO_LIVE_QUALITY}
     if policy == CRYPTO_EXPLORATORY_SHADOW:
         allowed_statuses = {CRYPTO_LIVE_QUALITY, CRYPTO_EXPLORATORY_SHADOW}
@@ -7502,6 +7605,112 @@ def _crypto_policy_metrics(policy_name: str, trade_rows: list[dict[str, Any]], *
         "cluster_count": len({(row.get("asset_symbol"), row.get("market_day")) for row in trade_rows}),
         "hard_cap_breaches": sum(1 for value in values if value < Decimal("-1.0000")),
         "worst_buckets": _crypto_bucket_matrix(trade_rows, settings=settings)[:10],
+    }
+
+
+_CRYPTO_REPLAY_GATE_METRIC_KEYS = (
+    "trade_candidate_count",
+    "current_model_live_quality_candidate_count",
+    "live_quality_candidate_count",
+    "oos_trade_candidate_count",
+    "oos_net_simulated_pl_dollars",
+    "oos_market_mid_net_simulated_pl_dollars",
+    "oos_pnl_advantage_vs_market_mid_dollars",
+    "net_simulated_pl_dollars",
+    "market_mid_net_simulated_pl_dollars",
+    "pnl_advantage_vs_market_mid_dollars",
+    "fees_dollars",
+    "hard_cap_breaches",
+)
+
+
+def _crypto_replay_gate_metric_snapshot(metrics: dict[str, Any]) -> dict[str, Any]:
+    return {key: metrics.get(key) for key in _CRYPTO_REPLAY_GATE_METRIC_KEYS if key in metrics}
+
+
+def _crypto_apply_empirical_bucket_gate_to_replay_metrics(
+    metrics: dict[str, Any],
+    *,
+    selection_trades: list[dict[str, Any]],
+    market_mid_trades: list[dict[str, Any]],
+    bucket_matrix: list[dict[str, Any]],
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+    requested_asset_symbols: list[str] | None = None,
+    force_requested_assets: bool = False,
+) -> dict[str, Any]:
+    metrics_with_buckets = _crypto_metrics_with_empirical_buckets(
+        metrics,
+        bucket_matrix=bucket_matrix,
+        settings=settings,
+        crypto_policy=crypto_policy,
+        requested_asset_symbols=requested_asset_symbols,
+        force_requested_assets=force_requested_assets,
+    )
+    summary = metrics_with_buckets["empirical_bucket_gate"]
+    pre_bucket_metrics = _crypto_replay_gate_metric_snapshot(metrics_with_buckets)
+    gate_applies = bool(summary.get("enabled")) and bool(summary.get("enforced_assets"))
+    if not gate_applies:
+        return {
+            **metrics_with_buckets,
+            "pre_bucket_gate_metrics": pre_bucket_metrics,
+            "bucket_gated_metrics": None,
+            "empirical_bucket_gate_applied_to_metrics": False,
+            "metrics_source": metrics_with_buckets.get("metrics_scope") or metrics.get("metrics_scope"),
+        }
+
+    allowed = set(summary.get("allowed_bucket_keys") or [])
+    gated_selection_trades = [
+        row
+        for row in selection_trades
+        if str((row.get("simulation") or {}).get("bucket_key") or "") in allowed
+    ]
+    gated_market_mid_trades = [
+        row
+        for row in market_mid_trades
+        if str((row.get("simulation") or {}).get("bucket_key") or "") in allowed
+    ]
+    gated_market_mid_policy = _crypto_policy_metrics(
+        "market_mid_baseline_bucket_gated",
+        gated_market_mid_trades,
+        settings=settings,
+    )
+    gated_selection_policy = _crypto_candidate_policy_metrics(
+        "candidate_quality_policy_bucket_gated",
+        gated_selection_trades,
+        settings=settings,
+        market_mid_net_pnl=_candidate_policy_net(gated_market_mid_policy),
+    )
+    selected_count = _candidate_policy_selected_count(gated_selection_policy)
+    net_pnl = _candidate_policy_net(gated_selection_policy)
+    market_mid_net = _candidate_policy_net(gated_market_mid_policy)
+    advantage = net_pnl - market_mid_net
+    bucket_metrics = {
+        "trade_candidate_count": selected_count,
+        "current_model_live_quality_candidate_count": selected_count,
+        "live_quality_candidate_count": selected_count,
+        "oos_trade_candidate_count": selected_count,
+        "oos_net_simulated_pl_dollars": float(net_pnl),
+        "oos_market_mid_net_simulated_pl_dollars": float(market_mid_net),
+        "oos_pnl_advantage_vs_market_mid_dollars": float(advantage),
+        "net_simulated_pl_dollars": float(net_pnl),
+        "market_mid_net_simulated_pl_dollars": float(market_mid_net),
+        "pnl_advantage_vs_market_mid_dollars": float(advantage),
+        "fees_dollars": float(_decimal(gated_selection_policy.get("fees") or Decimal("0"))),
+        "hard_cap_breaches": int(gated_selection_policy.get("hard_cap_breaches") or 0),
+    }
+    return {
+        **metrics_with_buckets,
+        **bucket_metrics,
+        "pre_bucket_gate_metrics": pre_bucket_metrics,
+        "bucket_gated_metrics": {
+            **bucket_metrics,
+            "selection_policy": gated_selection_policy,
+            "market_mid_policy": gated_market_mid_policy,
+            "allowed_bucket_keys": sorted(allowed),
+        },
+        "empirical_bucket_gate_applied_to_metrics": True,
+        "metrics_source": "empirical_bucket_gated",
     }
 
 
@@ -7855,12 +8064,31 @@ def _crypto_bucket_key(row: dict[str, Any], simulation: dict[str, Any]) -> str:
     )
 
 
-def _crypto_empirical_bucket_gate_enabled_for_asset(row: dict[str, Any], *, settings: Settings) -> bool:
+def _crypto_empirical_bucket_gate_enabled_for_asset(
+    row: dict[str, Any],
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+    requested_asset_symbols: list[str] | None = None,
+    force_requested_assets: bool = False,
+) -> bool:
     if not bool(settings.crypto_empirical_bucket_gate_enabled):
         return False
     asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
     configured = _normalize_asset_csv(settings.crypto_empirical_bucket_gate_assets)
-    return not configured or asset in configured
+    requested_assets = set(normalize_asset_symbols(requested_asset_symbols))
+    if force_requested_assets and requested_assets and asset in requested_assets:
+        return True
+    if not configured:
+        return True
+    if asset in configured:
+        return True
+    if "LIVE" not in configured:
+        return False
+    return (
+        crypto_policy is not None
+        and (crypto_policy.asset_modes or {}).get(asset) == CRYPTO_ASSET_MODE_LIVE
+    )
 
 
 def _crypto_bucket_matrix_by_key(bucket_matrix: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
@@ -7919,10 +8147,19 @@ def _crypto_empirical_bucket_gate_for_candidate(
     *,
     bucket_key: str,
     settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
     bucket_matrix: list[dict[str, Any]] | None,
     enforce: bool,
+    requested_asset_symbols: list[str] | None = None,
+    force_requested_assets: bool = False,
 ) -> dict[str, Any]:
-    enabled_for_asset = _crypto_empirical_bucket_gate_enabled_for_asset(row, settings=settings)
+    enabled_for_asset = _crypto_empirical_bucket_gate_enabled_for_asset(
+        row,
+        settings=settings,
+        crypto_policy=crypto_policy,
+        requested_asset_symbols=requested_asset_symbols,
+        force_requested_assets=force_requested_assets,
+    )
     if not enforce or not enabled_for_asset:
         return {
             "status": "not_evaluated" if enabled_for_asset else "not_applicable",
@@ -7944,11 +8181,24 @@ def _crypto_empirical_bucket_summary(
     bucket_matrix: list[dict[str, Any]] | None,
     *,
     settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+    requested_asset_symbols: list[str] | None = None,
+    force_requested_assets: bool = False,
 ) -> dict[str, Any]:
     allowed: list[str] = []
     blocked: list[str] = []
     reviews: dict[str, dict[str, Any]] = {}
+    enforced_assets: set[str] = set()
     for key, bucket in sorted(_crypto_bucket_matrix_by_key(bucket_matrix).items()):
+        if not _crypto_empirical_bucket_gate_enabled_for_asset(
+            bucket,
+            settings=settings,
+            crypto_policy=crypto_policy,
+            requested_asset_symbols=requested_asset_symbols,
+            force_requested_assets=force_requested_assets,
+        ):
+            continue
+        enforced_assets.add(normalize_asset_symbol(str(bucket.get("asset_symbol") or "UNKNOWN")))
         review = _crypto_empirical_bucket_review(bucket, settings=settings)
         reviews[key] = review
         if review["allowed"]:
@@ -7958,6 +8208,7 @@ def _crypto_empirical_bucket_summary(
     return {
         "enabled": bool(settings.crypto_empirical_bucket_gate_enabled),
         "assets": sorted(_normalize_asset_csv(settings.crypto_empirical_bucket_gate_assets)),
+        "enforced_assets": sorted(enforced_assets),
         "min_samples": int(settings.crypto_empirical_bucket_min_samples),
         "min_net_pnl_dollars": float(settings.crypto_empirical_bucket_min_net_pnl_dollars),
         "min_win_rate": float(settings.crypto_empirical_bucket_min_win_rate),
@@ -7972,8 +8223,17 @@ def _crypto_metrics_with_empirical_buckets(
     *,
     bucket_matrix: list[dict[str, Any]] | None,
     settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+    requested_asset_symbols: list[str] | None = None,
+    force_requested_assets: bool = False,
 ) -> dict[str, Any]:
-    summary = _crypto_empirical_bucket_summary(bucket_matrix, settings=settings)
+    summary = _crypto_empirical_bucket_summary(
+        bucket_matrix,
+        settings=settings,
+        crypto_policy=crypto_policy,
+        requested_asset_symbols=requested_asset_symbols,
+        force_requested_assets=force_requested_assets,
+    )
     return {
         **metrics,
         "bucket_matrix": list(bucket_matrix or []),

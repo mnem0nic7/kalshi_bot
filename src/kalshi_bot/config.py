@@ -218,7 +218,7 @@ class Settings(BaseSettings):
     crypto_shadow_exploration_max_spread_bps: int = 500
     crypto_live_max_spread_bps: int = 500
     crypto_empirical_bucket_gate_enabled: bool = True
-    crypto_empirical_bucket_gate_assets: str = "BTC,ETH,HYPE,XRP"
+    crypto_empirical_bucket_gate_assets: str = "live"
     crypto_empirical_bucket_min_samples: int = 20
     crypto_empirical_bucket_min_net_pnl_dollars: float = 0.0
     crypto_empirical_bucket_min_win_rate: float = 0.55
