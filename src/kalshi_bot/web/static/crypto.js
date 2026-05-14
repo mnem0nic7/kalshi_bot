@@ -37,6 +37,45 @@
     return number.toFixed(4);
   }
 
+  function quoteTripletForSide(market, side) {
+    const yesBid = numberOrNull(market && market.yes_bid_dollars);
+    const yesAsk = numberOrNull(market && market.yes_ask_dollars);
+    const noBid = numberOrNull(market && market.no_bid_dollars);
+    const noAsk = numberOrNull(market && market.no_ask_dollars);
+    let midYes = numberOrNull(market && market.mid_yes_dollars);
+    if (midYes === null && yesBid !== null && yesAsk !== null) {
+      midYes = (yesBid + yesAsk) / 2;
+    }
+
+    const normalizedSide = String(side || "").toLowerCase();
+    if (normalizedSide === "yes") {
+      return {
+        bid: yesBid,
+        ask: yesAsk,
+        mid: midYes,
+      };
+    }
+
+    const downBid = noBid !== null ? noBid : (yesAsk !== null ? 1 - yesAsk : null);
+    const downAsk = noAsk !== null ? noAsk : (yesBid !== null ? 1 - yesBid : null);
+    const downMid = midYes !== null ? 1 - midYes : (downBid !== null && downAsk !== null ? (downBid + downAsk) / 2 : null);
+    return {
+      bid: downBid,
+      ask: downAsk,
+      mid: downMid,
+    };
+  }
+
+  function quoteTripletLabel(market, side) {
+    const quote = quoteTripletForSide(market, side);
+    const spreadBps =
+      quote.ask !== null && quote.bid !== null
+        ? Math.round((quote.ask - quote.bid) * 10000)
+        : null;
+    const spreadLabel = spreadBps === null ? "spread n/a" : `spread ${signedBps(spreadBps)}`;
+    return `bid ${price(quote.bid)} / ask ${price(quote.ask)} / mid ${price(quote.mid)} / ${spreadLabel}`;
+  }
+
   function timeLabel(value) {
     if (!value) return "close unknown";
     const date = new Date(value);
@@ -107,15 +146,10 @@
       : {};
   }
 
-  function visibleCandidate(signal) {
-    const trace = signalTrace(signal);
-    const candidates = Array.isArray(trace.candidates) ? trace.candidates : [];
-    const side = String(signal.recommended_side || trace.selected_side || "").toLowerCase();
-    if (side) {
-      const sideCandidate = candidates.find((candidate) => String(candidate.side || "").toLowerCase() === side);
-      if (sideCandidate) return sideCandidate;
-    }
-    return candidates.find((candidate) => Number(candidate.rank) === 1) || candidates[0] || null;
+  function isLiveCandidate(candidate) {
+    if (!candidate || typeof candidate !== "object") return false;
+    const status = String(candidate.candidate_status || candidate.status || "").toLowerCase();
+    return candidate.live_eligible === true || status === "live_quality" || status === "selected" || status === "tradeable";
   }
 
   function candidateForSide(signal, side) {
@@ -123,6 +157,30 @@
     const candidates = Array.isArray(trace.candidates) ? trace.candidates : [];
     const normalized = String(side || "").toLowerCase();
     return candidates.find((candidate) => String(candidate.side || "").toLowerCase() === normalized) || null;
+  }
+
+  function visibleCandidate(signal) {
+    const trace = signalTrace(signal);
+    const candidates = Array.isArray(trace.candidates) ? trace.candidates : [];
+    const side = String(signal.recommended_side || trace.selected_side || "").toLowerCase();
+    if (side) {
+      const sideCandidate = candidateForSide(signal, side);
+      if (sideCandidate) return sideCandidate;
+    }
+    return candidates.find((candidate) => Number(candidate.rank) === 1) || candidates[0] || null;
+  }
+
+  function tradeCandidate(signal) {
+    const side = String((signal || {}).recommended_side || "").toLowerCase();
+    const action = String((signal || {}).recommended_action || "").toLowerCase();
+    const sideCandidate = side ? candidateForSide(signal, side) : null;
+    if (side && action && action !== "none") {
+      return sideCandidate || { side, live_eligible: true };
+    }
+    if (isLiveCandidate(sideCandidate)) return sideCandidate;
+    const trace = signalTrace(signal);
+    const candidates = Array.isArray(trace.candidates) ? trace.candidates : [];
+    return candidates.find(isLiveCandidate) || null;
   }
 
   function sideLabel(side) {
@@ -272,7 +330,7 @@
 
   function signalState(signal, signalBlocker) {
     if (signalBlocker) return { text: "blocked", className: "blocked" };
-    const candidate = visibleCandidate(signal || {});
+    const candidate = tradeCandidate(signal || {});
     if (candidate && (candidate.candidate_status === "live_quality" || candidate.live_eligible === true)) {
       return { text: "passed", className: "passed" };
     }
@@ -325,7 +383,10 @@
     const signal = market.signal || {};
     const trace = signalTrace(signal);
     const room = market.active_room;
-    const side = String(signal.recommended_side || trace.selected_side || "").toLowerCase() || null;
+    const selectedCandidate = tradeCandidate(signal);
+    const side = selectedCandidate ? String(selectedCandidate.side || "").toLowerCase() : null;
+    const blockedCandidate = visibleCandidate(signal);
+    const blockedSide = blockedCandidate ? String(blockedCandidate.side || trace.selected_side || "").toLowerCase() : trace.selected_side;
     const target = market.target_price_dollars ? money(market.target_price_dollars, 4) : "target n/a";
     const title = `${market.asset_symbol || "CRYPTO"} 15 min · ${target} target`;
     const iconText = String(market.asset_symbol || "?").slice(0, 2);
@@ -336,13 +397,15 @@
       ? `<div class="crypto-live-blockers">Live blocked: ${escapeHtml(blockers)}</div>`
       : "";
     const signalBlocker = candidateBlocker(signal);
-    const selectedSideLabel = side ? sideLabel(side) : "Candidate";
+    const selectedSideLabel = blockedSide ? sideLabel(blockedSide) : "Candidate";
     const signalBlockerHtml = signalBlocker
-      ? `<div class="crypto-signal-blocker">Signal blocked on ${escapeHtml(selectedSideLabel)}: ${escapeHtml(signalBlocker)}</div>`
+      ? `<div class="crypto-signal-blocker">Model blocked on ${escapeHtml(selectedSideLabel)}: ${escapeHtml(signalBlocker)}</div>`
       : "";
     const addOn = addOnLabel(market);
     const addOnHtml = addOn ? `<div class="crypto-signal-blocker">${escapeHtml(addOn)}</div>` : "";
     const signalStatus = signalState(signal, signalBlocker);
+    const upQuote = quoteTripletForSide(market, "yes");
+    const downQuote = quoteTripletForSide(market, "no");
     return `
       <article class="crypto-card crypto-card-${mode}" data-market="${escapeHtml(market.market_ticker)}">
         <div class="crypto-card-header">
@@ -380,16 +443,18 @@
             <span class="crypto-side-copy">
               <span class="crypto-side-name">Up</span>
               <span class="crypto-side-detail">${escapeHtml(sideDiagnostic(signal, "yes"))}</span>
+              <span class="crypto-side-quote">${escapeHtml(quoteTripletLabel(market, "yes"))}</span>
             </span>
-            <span class="crypto-side-price">${price(market.yes_ask_dollars || market.yes_bid_dollars)}</span>
+            <span class="crypto-side-price">${price(upQuote.ask ?? upQuote.bid)}</span>
             <span class="crypto-badge crypto-badge-up">${side === "yes" ? "✓" : "×"}</span>
           </div>
           <div class="crypto-side-row ${side === "no" ? "crypto-side-selected" : ""}">
             <span class="crypto-side-copy">
               <span class="crypto-side-name">Down</span>
               <span class="crypto-side-detail">${escapeHtml(sideDiagnostic(signal, "no"))}</span>
+              <span class="crypto-side-quote">${escapeHtml(quoteTripletLabel(market, "no"))}</span>
             </span>
-            <span class="crypto-side-price">${price(market.no_ask_dollars)}</span>
+            <span class="crypto-side-price">${price(downQuote.ask ?? downQuote.bid)}</span>
             <span class="crypto-badge crypto-badge-down">${side === "no" ? "✓" : "×"}</span>
           </div>
         </div>

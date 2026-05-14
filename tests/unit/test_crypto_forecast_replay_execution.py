@@ -2130,6 +2130,46 @@ def test_crypto_dashboard_signal_metrics_follow_current_quote(tmp_path) -> None:
     assert trace["quote_metrics_source"] == "current_market_quote_cached_prediction"
 
 
+def test_crypto_dashboard_quote_refresh_does_not_recommend_blocked_prediction(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_min_edge_bps=500)
+    market = _market(
+        close_time=datetime.now(UTC) + timedelta(minutes=10),
+        yes_bid_dollars=Decimal("0.9700"),
+        yes_ask_dollars=Decimal("0.9800"),
+        no_ask_dollars=Decimal("0.0250"),
+        last_price_dollars=Decimal("0.9800"),
+    )
+    signal_payload = {
+        "fair_yes_dollars": "0.3664",
+        "edge_bps": 6086,
+        "recommended_side": "no",
+        "target_yes_price_dollars": "0.9750",
+        "candidate_trace": {
+            "selected_side": "no",
+            "selected_edge_bps": 6086,
+            "selection_reason": "contract_price_below_crypto_min",
+        },
+    }
+
+    refreshed = _crypto_signal_payload_with_current_quote_metrics(
+        signal_payload,
+        market=market,
+        settings=settings,
+    )
+
+    assert refreshed is not None
+    assert refreshed["recommended_action"] is None
+    assert refreshed["recommended_side"] is None
+    assert refreshed["target_yes_price_dollars"] is None
+    trace = refreshed["candidate_trace"]
+    assert trace["outcome"] == "predicted_winner_blocked"
+    assert trace["selected_side"] == "no"
+    assert trace["selection_reason"] == "contract_price_below_crypto_min"
+    no_candidate = next(candidate for candidate in trace["candidates"] if candidate["side"] == "no")
+    assert no_candidate["candidate_status"] == "blocked_fee_edge"
+    assert no_candidate["reason"] == "contract_price_below_crypto_min"
+
+
 def test_crypto_recommendation_selects_model_winner_not_low_price_value_side(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=500)
     market = _market(

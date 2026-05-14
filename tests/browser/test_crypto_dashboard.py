@@ -259,8 +259,9 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             )
             assert (
                 page.locator('[data-market="KXBTC15M-TEST"] .crypto-signal-blocker').inner_text()
-                == "Signal blocked on Down: contract price below crypto min"
+                == "Model blocked on Down: contract price below crypto min"
             )
+            assert page.locator('[data-market="KXBTC15M-TEST"] .crypto-side-selected').count() == 0
             btc_side_details = page.locator('[data-market="KXBTC15M-TEST"] .crypto-side-detail').all_inner_texts()
             assert "net -1936bps / need +500bps · blocked: net edge below live min" in btc_side_details
             assert "net +1536bps / need +500bps · blocked: contract price below crypto min · bucket blocked: empirical bucket under-sampled" in btc_side_details
@@ -270,10 +271,11 @@ def test_crypto_dashboard_modes_render_and_failed_mode_reverts(viewport: dict[st
             )
             assert (
                 page.locator('[data-market="KXSOL15M-TEST"] .crypto-signal-blocker').inner_text()
-                == "Signal blocked on Down: net edge below live min; shadow only"
+                == "Model blocked on Down: net edge below live min; shadow only"
             )
+            assert page.locator('[data-market="KXSOL15M-TEST"] .crypto-side-selected').count() == 0
             assert (
-                page.locator('[data-market="KXSOL15M-TEST"] .crypto-side-selected .crypto-side-detail').inner_text()
+                page.locator('[data-market="KXSOL15M-TEST"] .crypto-side-row').nth(1).locator(".crypto-side-detail").inner_text()
                 == "net +486bps / need +500bps · blocked: net edge below live min; shadow only"
             )
             btc_select = page.locator('[data-asset-mode="BTC"]')

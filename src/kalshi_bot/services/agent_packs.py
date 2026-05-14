@@ -477,7 +477,7 @@ class AgentPackService:
                 int(value_or_settings(entry.min_fee_adjusted_edge_bps, self.settings.risk_min_edge_bps)),
                 int(self.settings.risk_min_edge_bps),
             ),
-            max_spread_bps=int(value_or_settings(entry.max_spread_bps, self.settings.trigger_max_spread_bps)),
+            max_spread_bps=int(value_or_settings(entry.max_spread_bps, self.settings.crypto_live_max_spread_bps)),
             min_confidence=float(value_or_settings(entry.min_confidence, self.settings.risk_min_confidence)),
             min_contract_price_dollars=self._contract_price_floor(
                 value_or_settings(entry.min_contract_price_dollars, self.settings.risk_min_contract_price_dollars)

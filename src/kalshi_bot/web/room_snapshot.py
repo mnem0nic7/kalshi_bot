@@ -304,13 +304,40 @@ def _source_summary(sources: list[dict]) -> dict:
     }
 
 
+def _signal_payload(signal: dict | None) -> dict:
+    payload = (signal or {}).get("payload") or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _signal_market(signal: dict | None) -> dict:
+    payload = _signal_payload(signal)
+    market_snapshot = payload.get("market_snapshot")
+    if isinstance(market_snapshot, dict):
+        market = market_snapshot.get("market")
+        if isinstance(market, dict):
+            return market
+        return market_snapshot
+    return {}
+
+
+def _signal_weather_facts(signal: dict | None) -> dict:
+    payload = _signal_payload(signal)
+    trader_context = payload.get("trader_context")
+    if isinstance(trader_context, dict):
+        numeric_facts = trader_context.get("numeric_facts")
+        if isinstance(numeric_facts, dict):
+            return numeric_facts
+    return {}
+
+
 def _pricing_summary(signal: dict | None, market_snapshot: dict | None, trade_ticket: dict | None) -> dict:
+    signal_market = _signal_market(signal)
     market = (market_snapshot or {}).get("market", market_snapshot or {})
     return {
-        "yes_bid_dollars": market.get("yes_bid_dollars"),
-        "yes_ask_dollars": market.get("yes_ask_dollars"),
-        "no_ask_dollars": market.get("no_ask_dollars"),
-        "last_price_dollars": market.get("last_price_dollars"),
+        "yes_bid_dollars": market.get("yes_bid_dollars") or signal_market.get("yes_bid_dollars"),
+        "yes_ask_dollars": market.get("yes_ask_dollars") or signal_market.get("yes_ask_dollars"),
+        "no_ask_dollars": market.get("no_ask_dollars") or signal_market.get("no_ask_dollars"),
+        "last_price_dollars": market.get("last_price_dollars") or signal_market.get("last_price_dollars"),
         "fair_yes_dollars": (signal or {}).get("fair_yes_dollars"),
         "edge_bps": (signal or {}).get("edge_bps"),
         "confidence": (signal or {}).get("confidence"),
@@ -451,13 +478,19 @@ def _intraday_detail(signal_payload: dict) -> str | None:
 def _weather_summary(research_dossier: dict | None, weather_bundle: dict | None) -> dict:
     numeric_facts = ((research_dossier or {}).get("summary") or {}).get("current_numeric_facts") or {}
     mapping = (weather_bundle or {}).get("mapping") or {}
-    forecast = extract_forecast_high_f((weather_bundle or {}).get("forecast", {}))
-    current = extract_current_temp_f((weather_bundle or {}).get("observation", {}))
+    forecast_payload = (weather_bundle or {}).get("forecast", {})
+    observation_payload = (weather_bundle or {}).get("observation", {})
+    forecast = extract_forecast_high_f(forecast_payload)
+    current = extract_current_temp_f(observation_payload)
+    forecast_summary = forecast_payload.get("summary", {}) if isinstance(forecast_payload, dict) else {}
+    observation_summary = observation_payload.get("summary", {}) if isinstance(observation_payload, dict) else {}
+    forecast_high_f = forecast if forecast is not None else forecast_summary.get("forecast_high_f")
+    current_temp_f = current if current is not None else observation_summary.get("current_temp_f")
     return {
         "threshold_f": mapping.get("threshold_f") or numeric_facts.get("threshold_f"),
         "operator": mapping.get("operator"),
-        "forecast_high_f": forecast if forecast is not None else numeric_facts.get("forecast_high_f"),
-        "current_temp_f": current if current is not None else numeric_facts.get("current_temp_f"),
+        "forecast_high_f": forecast_high_f if forecast_high_f is not None else numeric_facts.get("forecast_high_f"),
+        "current_temp_f": current_temp_f if current_temp_f is not None else numeric_facts.get("current_temp_f"),
         "station_id": mapping.get("station_id"),
         "location_name": mapping.get("location_name"),
         "forecast_updated_at": ((weather_bundle or {}).get("forecast", {}).get("properties", {}).get("updated")),
@@ -467,24 +500,25 @@ def _weather_summary(research_dossier: dict | None, weather_bundle: dict | None)
 
 def _crypto_summary(signal: dict | None, market_snapshot: dict | None) -> dict:
     market = (market_snapshot or {}).get("market") or {}
-    signal_payload = (signal or {}).get("payload") or {}
+    signal_payload = _signal_payload(signal)
     trace = signal_payload.get("candidate_trace") if isinstance(signal_payload, dict) else {}
+    features = (trace or {}).get("features") if isinstance(trace, dict) else {}
     if (market_snapshot or {}).get("market_domain") != "crypto" and signal_payload.get("market_domain") != "crypto":
         return {"market_domain": None}
     return {
         "market_domain": "crypto",
         "frequency": market.get("frequency") or signal_payload.get("frequency"),
-        "asset_symbol": market.get("asset_symbol"),
+        "asset_symbol": market.get("asset_symbol") or features.get("asset"),
         "asset_mode": (market_snapshot or {}).get("asset_mode"),
         "live_eligible": (market_snapshot or {}).get("live_eligible"),
         "live_blockers": (market_snapshot or {}).get("live_blockers") or [],
-        "target_price_dollars": market.get("target_price_dollars"),
+        "target_price_dollars": market.get("target_price_dollars") or features.get("target_price_dollars"),
         "close_time": market.get("close_time"),
         "status": market.get("status"),
         "volume": market.get("volume"),
         "open_interest": market.get("open_interest"),
-        "spread_bps": market.get("spread_bps"),
-        "mid_yes_dollars": market.get("mid_yes_dollars"),
+        "spread_bps": market.get("spread_bps") if market.get("spread_bps") is not None else features.get("spread_bps"),
+        "mid_yes_dollars": market.get("mid_yes_dollars") or features.get("mid_yes_dollars"),
         "fair_yes_dollars": (signal or {}).get("fair_yes_dollars"),
         "recommended_side": signal_payload.get("recommended_side"),
         "edge_bps": (signal or {}).get("edge_bps"),
@@ -627,9 +661,36 @@ async def load_room_snapshot(app_container: AppContainer, room_id: str, *, inclu
         if dossier_artifact is not None
         else latest_dossier.payload if latest_dossier is not None else None
     )
-    research_delta = delta_artifact.payload if delta_artifact is not None else None
-    market_snapshot = market_artifact.payload if market_artifact is not None else None
+    signal_payload = _signal_payload(serialized_signal)
+    signal_weather_facts = _signal_weather_facts(serialized_signal)
+    research_delta = delta_artifact.payload if delta_artifact is not None else signal_payload.get("research_delta")
+    market_snapshot = market_artifact.payload if market_artifact is not None else signal_payload.get("market_snapshot")
     weather_bundle = weather_artifact.payload if weather_artifact is not None else None
+    if weather_bundle is None and signal_weather_facts:
+        weather_bundle = {
+            "mapping": {
+                "threshold_f": signal_weather_facts.get("threshold_f"),
+                "operator": signal_weather_facts.get("operator"),
+                "station_id": signal_weather_facts.get("station_id"),
+                "location_name": signal_weather_facts.get("location_name"),
+            },
+            "forecast": {
+                "summary": {
+                    "forecast_high_f": signal_weather_facts.get("forecast_high_f"),
+                },
+                "properties": {
+                    "updated": signal_weather_facts.get("forecast_updated_at"),
+                },
+            },
+            "observation": {
+                "summary": {
+                    "current_temp_f": signal_weather_facts.get("current_temp_f"),
+                },
+                "properties": {
+                    "timestamp": signal_weather_facts.get("observation_at"),
+                },
+            },
+        }
 
     snapshot = {
         "room": serialized_room,

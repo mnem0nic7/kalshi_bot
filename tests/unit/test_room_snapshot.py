@@ -186,6 +186,69 @@ async def test_room_snapshot_displays_price_floor_stand_down(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_room_snapshot_uses_signal_payload_fallbacks_for_shadow_room_analytics(monkeypatch) -> None:
+    fake_repo = FakeRoomSnapshotRepo()
+    now = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    fake_repo.signal = SimpleNamespace(
+        id="signal-crypto-1",
+        room_id="room-1",
+        market_ticker="KXBTC-26MAY14-B95000",
+        fair_yes_dollars="0.6200",
+        edge_bps=810,
+        confidence=0.84,
+        summary="Shadow room captured crypto signal context.",
+        payload={
+            "market_domain": "crypto",
+            "frequency": "15m",
+            "recommended_side": "yes",
+            "research_delta": {"summary": "Fresh signal delta."},
+            "market_snapshot": {
+                "market": {
+                    "ticker": "KXBTC-26MAY14-B95000",
+                    "yes_bid_dollars": "0.5800",
+                    "yes_ask_dollars": "0.6100",
+                    "no_ask_dollars": "0.4200",
+                    "last_price_dollars": "0.6000",
+                }
+            },
+            "candidate_trace": {
+                "model_version": "crypto-model-v1",
+                "features": {
+                    "asset": "BTC",
+                    "target_price_dollars": "95000.0000",
+                    "spread_bps": 300,
+                    "mid_yes_dollars": "0.5950",
+                },
+            },
+            "trader_context": {
+                "numeric_facts": {
+                    "threshold_f": 72,
+                    "operator": ">=",
+                    "forecast_high_f": 74,
+                    "current_temp_f": 68,
+                    "station_id": "KBOS",
+                    "location_name": "Boston",
+                    "forecast_updated_at": "2026-05-14T11:30:00+00:00",
+                    "observation_at": "2026-05-14T11:45:00+00:00",
+                }
+            },
+        },
+        created_at=now,
+    )
+    monkeypatch.setattr(room_snapshot, "PlatformRepository", lambda _session: fake_repo)
+
+    payload = await room_snapshot.load_room_snapshot(FakeAppContainer(), "room-1")
+
+    assert payload["research_delta"]["summary"] == "Fresh signal delta."
+    assert payload["analytics"]["pricing"]["yes_bid_dollars"] == "0.5800"
+    assert payload["analytics"]["crypto"]["asset_symbol"] == "BTC"
+    assert payload["analytics"]["crypto"]["target_price_dollars"] == "95000.0000"
+    assert payload["analytics"]["crypto"]["spread_bps"] == 300
+    assert payload["analytics"]["weather"]["station_id"] == "KBOS"
+    assert payload["analytics"]["weather"]["forecast_high_f"] == 74
+
+
+@pytest.mark.asyncio
 async def test_load_room_snapshot_raises_key_error_for_unknown_room(monkeypatch) -> None:
     fake_repo = FakeRoomSnapshotRepo()
     monkeypatch.setattr(room_snapshot, "PlatformRepository", lambda _session: fake_repo)

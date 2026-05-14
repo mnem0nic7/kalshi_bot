@@ -3635,11 +3635,11 @@ def _crypto_signal_payload_with_current_quote_metrics(
     }
     refreshed["edge_bps"] = edge_bps
     refreshed["recommended_action"] = action.value if action is not None else None
-    refreshed["recommended_side"] = side.value if side is not None else trace.get("selected_side")
+    refreshed["recommended_side"] = side.value if side is not None else None
     refreshed["target_yes_price_dollars"] = (
         _money_text(target_yes)
         if target_yes is not None
-        else trace.get("target_yes_price_dollars")
+        else None
     )
     refreshed["candidate_trace"] = refreshed_trace
 

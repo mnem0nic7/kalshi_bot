@@ -204,7 +204,7 @@ class Settings(BaseSettings):
     crypto_autonomy_enabled: bool = False
     crypto_production_autonomy_enabled: bool = False
     crypto_autonomy_interval_seconds: int = 60
-    crypto_autonomy_min_seconds_to_close: int = 120
+    crypto_autonomy_min_seconds_to_close: int = 0
     crypto_late_sure_thing_enabled: bool = True
     crypto_late_sure_thing_max_seconds_to_close: int = 120
     crypto_late_sure_thing_min_probability: float = 0.90
@@ -214,6 +214,7 @@ class Settings(BaseSettings):
     crypto_shadow_exploration_max_per_asset_per_run: int = 2
     crypto_shadow_exploration_min_expected_net_edge_dollars: float = -0.03
     crypto_shadow_exploration_max_spread_bps: int = 500
+    crypto_live_max_spread_bps: int = 500
     crypto_empirical_bucket_gate_enabled: bool = True
     crypto_empirical_bucket_gate_assets: str = "BTC"
     crypto_empirical_bucket_min_samples: int = 20

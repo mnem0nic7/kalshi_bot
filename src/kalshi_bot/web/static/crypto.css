@@ -1,5 +1,6 @@
-.crypto-main {
-  max-width: 1240px;
+.shell-main.shell-main-wide.crypto-main {
+  max-width: none;
+  width: 100%;
 }
 
 .crypto-toolbar {
@@ -103,8 +104,14 @@
 
 .crypto-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.85rem;
+}
+
+@media (max-width: 1240px) {
+  .crypto-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .crypto-card {
@@ -274,6 +281,18 @@
 
 .crypto-side-selected .crypto-side-detail {
   color: #ffde99;
+}
+
+.crypto-side-quote {
+  display: block;
+  margin-top: 0.12rem;
+  color: #8ea0b7;
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.crypto-side-selected .crypto-side-quote {
+  color: #d8e7ff;
 }
 
 .crypto-side-price {
