@@ -54,7 +54,7 @@ from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.db.models import OrderRecord, RiskVerdictRecord, RoomMessage
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
-from kalshi_bot.services.risk import RiskContext
+from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
 from kalshi_bot.services.signal import StrategySignal
 
 
@@ -153,7 +153,8 @@ def _live_quality_signal(**overrides) -> StrategySignal:
         },
     }
     if overrides:
-        signal = signal.model_copy(update=overrides)
+        for key, value in overrides.items():
+            setattr(signal, key, value)
     return signal
 
 
@@ -1320,9 +1321,26 @@ class _FakeWorkflowMarketService:
 
 
 class _FakeForecastService:
+    def __init__(self, signal: StrategySignal | None = None) -> None:
+        self.signal = signal
+
     async def forecast(self, market: CryptoMarket) -> StrategySignal:
         del market
-        return _signal()
+        return self.signal or _signal()
+
+
+class _RecordingCryptoExecution:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def execute(self, **kwargs) -> ExecReceiptPayload:
+        self.calls.append(kwargs)
+        return ExecReceiptPayload(
+            status="submitted",
+            external_order_id="crypto-dynamic-order-1",
+            client_order_id=kwargs["client_order_id"],
+            details={"called": True},
+        )
 
 
 class _ApproveRiskEngine:
@@ -3995,6 +4013,82 @@ async def test_crypto_taker_fallback_requires_fee_adjusted_net_edge(tmp_path) ->
     assert receipt.status == "passive_unfilled_taker_blocked"
     assert len(fake_base.calls) == 1
     assert fake_base.calls[0]["client_order_id"] == "crypto-net-edge-taker:maker"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_workflow_dynamic_sizing_saves_ticket_and_executes_approved_count(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_max_order_count_fp=500.0,
+        risk_max_position_count_fp_per_ticker=500.0,
+        risk_position_pct=0.10,
+        crypto_dynamic_order_target_position_pct=0.10,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    market = _market(close_time=datetime.now(UTC) + timedelta(minutes=10), yes_bid_dollars=Decimal("0.5000"))
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    execution = _RecordingCryptoExecution()
+    workflow = CryptoWorkflowService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=_FakeWorkflowMarketService(market),  # type: ignore[arg-type]
+        forecast_service=_FakeForecastService(
+            _live_quality_signal(
+                target_yes_price_dollars=Decimal("0.5000"),
+                fair_yes_dollars=Decimal("0.6500"),
+            )
+        ),  # type: ignore[arg-type]
+        risk_engine=DeterministicRiskEngine(settings),
+        execution_service=execution,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await repo.set_checkpoint(
+            f"reconcile:{settings.kalshi_env}",
+            None,
+            {
+                "balance": {"balance": 10000, "portfolio_value": 0},
+                "reconciled_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC dynamic sizing workflow", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await session.commit()
+
+    await workflow.run_room(room.id, reason="test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        await session.commit()
+
+    assert ticket is not None
+    assert ticket.count_fp == Decimal("20.00")
+    assert ticket.payload["crypto_dynamic_sizing"]["mode"] == "dynamic"
+    assert ticket.payload["crypto_dynamic_sizing"]["requested_count_fp"] == "20.00"
+    assert verdict is not None
+    assert verdict.approved_count_fp == Decimal("20.00")
+    assert execution.calls[0]["ticket"].count_fp == Decimal("20.00")
     await engine.dispose()
 
 
