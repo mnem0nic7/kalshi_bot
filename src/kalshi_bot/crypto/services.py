@@ -9,7 +9,7 @@ import math
 from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Callable
 
 import httpx
@@ -121,6 +121,10 @@ def _version(prefix: str, payload: dict[str, Any]) -> str:
 
 def _money_text(value: Decimal | None) -> str | None:
     return str(value) if value is not None else None
+
+
+def _count_text(value: Decimal | None) -> str | None:
+    return f"{value:.2f}" if value is not None else None
 
 
 def _clamp_price(value: Decimal) -> Decimal:
@@ -3106,17 +3110,25 @@ class CryptoWorkflowService:
                     await session.commit()
                     return
 
-                count_fp = quantize_count(Decimal(str(self.settings.crypto_default_order_count_fp)))
-                ticket = TradeTicket(
+                default_count_fp = quantize_count(Decimal(str(self.settings.crypto_default_order_count_fp)))
+                base_ticket = TradeTicket(
                     market_ticker=market.market_ticker,
                     action=TradeAction.BUY,
                     side=signal.recommended_side,
                     yes_price_dollars=signal.target_yes_price_dollars,
-                    count_fp=count_fp,
+                    count_fp=default_count_fp,
                     capital_bucket=signal.capital_bucket,
                     time_in_force="immediate_or_cancel",
                     note="CRYPTO_15M passive-first candidate",
                 )
+                risk_context = await self._risk_context(repo, room, base_ticket, market)
+                count_fp, sizing_diagnostics = _crypto_dynamic_order_count_fp(
+                    settings=self.settings,
+                    ticket=base_ticket,
+                    signal=signal,
+                    context=risk_context,
+                )
+                ticket = base_ticket.model_copy(update={"count_fp": count_fp})
                 client_order_id = make_client_order_id(room.id, market.market_ticker, ticket.nonce)
                 ticket_record = await repo.save_trade_ticket(
                     room.id,
@@ -3135,6 +3147,7 @@ class CryptoWorkflowService:
                     "crypto_modeling": (signal_record.payload or {}).get("crypto_modeling"),
                     "prediction_model": ((signal_record.payload or {}).get("crypto_modeling") or {}).get("prediction_model"),
                     "trade_selection_model": ((signal_record.payload or {}).get("crypto_modeling") or {}).get("trade_selection_model"),
+                    "crypto_dynamic_sizing": sizing_diagnostics,
                 }
                 await repo.append_message(
                     room.id,
@@ -3147,7 +3160,6 @@ class CryptoWorkflowService:
                     ),
                 )
                 await repo.update_room_stage(room.id, RoomStage.RISK)
-                risk_context = await self._risk_context(repo, room, ticket, market)
                 verdict = self.risk_engine.evaluate(
                     room=room,
                     control=control,
@@ -4355,6 +4367,122 @@ def _signal_is_tradeable(signal: StrategySignal) -> bool:
         and signal.eligibility is not None
         and signal.eligibility.eligible
     )
+
+
+def _crypto_signal_candidate_status(signal: StrategySignal) -> str | None:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    selection = trace.get("trade_selection_model") if isinstance(trace.get("trade_selection_model"), dict) else {}
+    raw_status = selection.get("candidate_status") if isinstance(selection, dict) else None
+    if raw_status in (None, ""):
+        raw_status = trace.get("candidate_status")
+    if raw_status in (None, ""):
+        return None
+    return str(raw_status)
+
+
+def _crypto_ticket_unit_cost(ticket: TradeTicket) -> Decimal:
+    if ticket.side == ContractSide.YES:
+        return ticket.yes_price_dollars
+    return Decimal("1.0000") - ticket.yes_price_dollars
+
+
+def _floor_count_fp(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def _crypto_dynamic_order_count_fp(
+    *,
+    settings: Settings,
+    ticket: TradeTicket,
+    signal: StrategySignal,
+    context: RiskContext,
+) -> tuple[Decimal, dict[str, Any]]:
+    default_count = quantize_count(Decimal(str(settings.crypto_default_order_count_fp)))
+    requested_count = default_count
+    candidate_status = _crypto_signal_candidate_status(signal)
+    target_pct = Decimal(str(settings.crypto_dynamic_order_target_position_pct))
+    risk_pct = Decimal(str(settings.risk_position_pct))
+    effective_target_pct = min(target_pct, risk_pct)
+    unit_cost = _crypto_ticket_unit_cost(ticket)
+    max_order_count = Decimal(str(settings.risk_max_order_count_fp))
+    max_position_count = Decimal(str(settings.risk_max_position_count_fp_per_ticker))
+    current_position_count = Decimal(str(context.current_position_count_fp or Decimal("0")))
+    pending_order_count = Decimal(str(context.pending_order_count_fp or Decimal("0")))
+    remaining_position_count = max_position_count - current_position_count - pending_order_count
+    current_notional = Decimal(str(context.current_position_notional_dollars or Decimal("0")))
+    pending_notional = Decimal(str(context.pending_order_notional_dollars or Decimal("0")))
+    total_capital = context.total_capital_dollars
+
+    diagnostics: dict[str, Any] = {
+        "enabled": bool(settings.crypto_dynamic_order_sizing_enabled),
+        "scope": str(settings.crypto_dynamic_order_sizing_scope or ""),
+        "mode": "default",
+        "reason": None,
+        "candidate_status": candidate_status,
+        "default_count_fp": _count_text(default_count),
+        "requested_count_fp": _count_text(requested_count),
+        "unit_cost_dollars": _money_text(unit_cost),
+        "target_position_pct": float(target_pct),
+        "risk_position_pct": float(risk_pct),
+        "effective_target_position_pct": float(effective_target_pct),
+        "total_capital_dollars": _money_text(total_capital),
+        "target_notional_dollars": None,
+        "available_notional_dollars": None,
+        "current_position_notional_dollars": _money_text(current_notional),
+        "pending_order_notional_dollars": _money_text(pending_notional),
+        "current_position_count_fp": _count_text(current_position_count),
+        "pending_order_count_fp": _count_text(pending_order_count),
+        "risk_max_order_count_fp": _count_text(max_order_count),
+        "risk_max_position_count_fp_per_ticker": _count_text(max_position_count),
+        "remaining_position_count_fp": _count_text(remaining_position_count),
+        "raw_count_fp": None,
+        "capped_count_fp": None,
+    }
+
+    def use_default(reason: str) -> tuple[Decimal, dict[str, Any]]:
+        diagnostics["reason"] = reason
+        diagnostics["requested_count_fp"] = _count_text(default_count)
+        return default_count, diagnostics
+
+    if not settings.crypto_dynamic_order_sizing_enabled:
+        return use_default("dynamic_sizing_disabled")
+
+    scope = str(settings.crypto_dynamic_order_sizing_scope or "").strip().lower()
+    if scope != "live_quality":
+        return use_default("unsupported_dynamic_sizing_scope")
+    if candidate_status != CRYPTO_LIVE_QUALITY:
+        return use_default("candidate_not_live_quality")
+    if total_capital is None:
+        return use_default("missing_total_capital")
+    total_capital_dec = Decimal(str(total_capital))
+    if total_capital_dec <= Decimal("0"):
+        return use_default("non_positive_total_capital")
+    if effective_target_pct <= Decimal("0"):
+        return use_default("non_positive_target_position_pct")
+    if unit_cost <= Decimal("0"):
+        return use_default("non_positive_unit_cost")
+
+    target_notional = (total_capital_dec * effective_target_pct).quantize(Decimal("0.0001"))
+    available_notional = (target_notional - current_notional - pending_notional).quantize(Decimal("0.0001"))
+    raw_count = _floor_count_fp(available_notional / unit_cost) if available_notional > Decimal("0") else Decimal("0.00")
+    capped_count = min(raw_count, _floor_count_fp(max_order_count), _floor_count_fp(remaining_position_count))
+    capped_count = max(Decimal("0.00"), _floor_count_fp(capped_count))
+    diagnostics.update(
+        {
+            "target_notional_dollars": _money_text(target_notional),
+            "available_notional_dollars": _money_text(available_notional),
+            "raw_count_fp": _count_text(raw_count),
+            "capped_count_fp": _count_text(capped_count),
+        }
+    )
+    if capped_count < default_count:
+        return use_default("dynamic_count_below_default")
+
+    requested_count = quantize_count(capped_count)
+    diagnostics["mode"] = "dynamic"
+    diagnostics["reason"] = "target_position_budget"
+    diagnostics["requested_count_fp"] = _count_text(requested_count)
+    return requested_count, diagnostics
 
 
 def _crypto_data_quality(

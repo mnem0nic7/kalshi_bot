@@ -185,6 +185,9 @@ class Settings(BaseSettings):
     crypto_replay_require_pnl_beats_market_mid: bool = True
     crypto_replay_min_pnl_advantage_dollars: float = 0.0
     crypto_default_order_count_fp: float = 1.0
+    crypto_dynamic_order_sizing_enabled: bool = True
+    crypto_dynamic_order_sizing_scope: str = "live_quality"
+    crypto_dynamic_order_target_position_pct: float = 0.10
     crypto_history_auto_enabled: bool = True
     crypto_history_auto_interval_seconds: int = 3600
     crypto_history_auto_lookback_days: int = 2

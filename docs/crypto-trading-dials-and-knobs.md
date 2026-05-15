@@ -429,6 +429,9 @@ General risk settings affect crypto live entries.
 | `risk_daily_loss_dollars_by_strategy` | `{}` | Optional per-strategy daily-loss cap. Use key `CRYPTO_15M` for crypto. |
 | `risk_edge_scaled_sizing_enabled` | `False` | Enables edge-scaled sizing. Still bounded by existing caps. |
 | `risk_edge_scaled_kelly_multiplier` | `0.25` | Fractional-Kelly multiplier when edge-scaled sizing is enabled. |
+| `crypto_dynamic_order_sizing_enabled` | `True` | Enables crypto-specific dynamic order sizing when the sizing path is wired in. |
+| `crypto_dynamic_order_sizing_scope` | `live_quality` | Candidate scope for crypto dynamic sizing. |
+| `crypto_dynamic_order_target_position_pct` | `0.10` | Target crypto position allocation as a fraction of capital. |
 | `risk_max_order_count_fp` | `500.0` | Max ticket count. |
 | `risk_max_position_count_fp_per_ticker` | `200.0` | Max same-ticker position plus in-flight count. |
 | `risk_allow_position_add_ons` | `False` | Global same-side add-on switch. If false, only the crypto-specific add-on exception can allow approved add-ons. |

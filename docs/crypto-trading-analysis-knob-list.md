@@ -93,6 +93,9 @@ Use this as the candidate grid/search space for `CRYPTO_15M`.
 | `risk_max_position_notional_dollars` | `None` | dollars | Optional hard position cap. |
 | `risk_edge_scaled_sizing_enabled` | `False` | bool | Whether to size by edge instead of flat sizing. |
 | `risk_edge_scaled_kelly_multiplier` | `0.25` | multiplier | Fractional-Kelly multiplier when edge-scaled sizing is enabled. |
+| `crypto_dynamic_order_sizing_enabled` | `True` | bool | Whether crypto dynamic sizing should replace the static default order count when the path is wired in. |
+| `crypto_dynamic_order_sizing_scope` | `live_quality` | selector | Which candidate scope dynamic sizing should apply to. |
+| `crypto_dynamic_order_target_position_pct` | `0.10` | fraction of capital | Target crypto position allocation for dynamic sizing. |
 | `risk_max_order_count_fp` | `500.0` | contracts | Max contracts per ticket. |
 | `risk_max_position_count_fp_per_ticker` | `200.0` | contracts | Max contracts per ticker including in-flight orders. |
 | `risk_daily_loss_dollars_by_strategy["CRYPTO_15M"]` | unset | dollars | Per-strategy daily stop. Test drawdown containment. |

@@ -38,6 +38,7 @@ from kalshi_bot.crypto.services import (
     _crypto_bucket_matrix,
     _evaluate_crypto_walk_forward,
     _crypto_feature_schema,
+    _crypto_dynamic_order_count_fp,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
     _crypto_recommendation,
@@ -53,6 +54,7 @@ from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.db.models import OrderRecord, RiskVerdictRecord, RoomMessage
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+from kalshi_bot.services.risk import RiskContext
 from kalshi_bot.services.signal import StrategySignal
 
 
@@ -139,6 +141,171 @@ def _signal() -> StrategySignal:
         summary="BTC crypto test signal.",
         eligibility=TradeEligibilityVerdict(eligible=True),
     )
+
+
+def _live_quality_signal(**overrides) -> StrategySignal:
+    signal = _signal()
+    signal.candidate_trace = {
+        "candidate_status": CRYPTO_LIVE_QUALITY,
+        "trade_selection_model": {
+            "candidate_status": CRYPTO_LIVE_QUALITY,
+            "expected_net_edge": "0.0600",
+        },
+    }
+    if overrides:
+        signal = signal.model_copy(update=overrides)
+    return signal
+
+
+def _risk_context_for_sizing(**overrides) -> RiskContext:
+    values = {
+        "market_observed_at": datetime.now(UTC),
+        "research_observed_at": datetime.now(UTC),
+        "total_capital_dollars": Decimal("100.00"),
+        "current_position_notional_dollars": Decimal("0"),
+        "current_position_count_fp": Decimal("0"),
+        "pending_order_count_fp": Decimal("0"),
+        "pending_order_notional_dollars": Decimal("0"),
+        "open_ticker_count": 0,
+        "strategy_code": "CRYPTO_15M",
+    }
+    values.update(overrides)
+    return RiskContext(**values)
+
+
+def _sizing_ticket(**overrides) -> TradeTicket:
+    values = {
+        "market_ticker": "KXBTC15M-SIZING",
+        "action": TradeAction.BUY,
+        "side": ContractSide.YES,
+        "yes_price_dollars": Decimal("0.5000"),
+        "count_fp": Decimal("1.00"),
+    }
+    values.update(overrides)
+    return TradeTicket(**values)
+
+
+def test_crypto_dynamic_sizing_live_quality_yes_uses_position_budget(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_position_pct=0.10, crypto_dynamic_order_target_position_pct=0.10)
+
+    count, diagnostics = _crypto_dynamic_order_count_fp(
+        settings=settings,
+        ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.5000")),
+        signal=_live_quality_signal(),
+        context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
+    )
+
+    assert count == Decimal("20.00")
+    assert diagnostics["mode"] == "dynamic"
+    assert diagnostics["unit_cost_dollars"] == "0.5000"
+    assert diagnostics["target_notional_dollars"] == "10.0000"
+
+
+def test_crypto_dynamic_sizing_live_quality_no_uses_no_unit_cost(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_position_pct=0.10, crypto_dynamic_order_target_position_pct=0.10)
+
+    count, diagnostics = _crypto_dynamic_order_count_fp(
+        settings=settings,
+        ticket=_sizing_ticket(side=ContractSide.NO, yes_price_dollars=Decimal("0.2000")),
+        signal=_live_quality_signal(),
+        context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
+    )
+
+    assert count == Decimal("12.50")
+    assert diagnostics["unit_cost_dollars"] == "0.8000"
+
+
+def test_crypto_dynamic_sizing_floors_to_count_cent(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_position_pct=0.10, crypto_dynamic_order_target_position_pct=0.10)
+
+    count, diagnostics = _crypto_dynamic_order_count_fp(
+        settings=settings,
+        ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.3333")),
+        signal=_live_quality_signal(),
+        context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
+    )
+
+    assert count == Decimal("30.00")
+    assert diagnostics["raw_count_fp"] == "30.00"
+
+
+def test_crypto_dynamic_sizing_caps_order_and_remaining_position_count(tmp_path) -> None:
+    order_capped_settings = _settings(
+        tmp_path,
+        risk_position_pct=0.10,
+        crypto_dynamic_order_target_position_pct=0.10,
+        risk_max_order_count_fp=5.0,
+    )
+
+    order_capped, order_diag = _crypto_dynamic_order_count_fp(
+        settings=order_capped_settings,
+        ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.1000")),
+        signal=_live_quality_signal(),
+        context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
+    )
+
+    position_capped_settings = _settings(
+        tmp_path,
+        risk_position_pct=0.10,
+        crypto_dynamic_order_target_position_pct=0.10,
+        risk_max_position_count_fp_per_ticker=10.0,
+    )
+    position_capped, position_diag = _crypto_dynamic_order_count_fp(
+        settings=position_capped_settings,
+        ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.1000")),
+        signal=_live_quality_signal(),
+        context=_risk_context_for_sizing(
+            total_capital_dollars=Decimal("100.00"),
+            current_position_count_fp=Decimal("3.00"),
+            pending_order_count_fp=Decimal("2.00"),
+        ),
+    )
+
+    assert order_capped == Decimal("5.00")
+    assert order_diag["capped_count_fp"] == "5.00"
+    assert position_capped == Decimal("5.00")
+    assert position_diag["remaining_position_count_fp"] == "5.00"
+    assert position_diag["capped_count_fp"] == "5.00"
+
+
+def test_crypto_dynamic_sizing_subtracts_current_and_pending_notional(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_position_pct=0.10, crypto_dynamic_order_target_position_pct=0.10)
+
+    count, diagnostics = _crypto_dynamic_order_count_fp(
+        settings=settings,
+        ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.5000")),
+        signal=_live_quality_signal(),
+        context=_risk_context_for_sizing(
+            total_capital_dollars=Decimal("100.00"),
+            current_position_notional_dollars=Decimal("4.0000"),
+            pending_order_notional_dollars=Decimal("2.0000"),
+        ),
+    )
+
+    assert count == Decimal("8.00")
+    assert diagnostics["available_notional_dollars"] == "4.0000"
+
+
+def test_crypto_dynamic_sizing_non_live_quality_and_missing_capital_keep_default(tmp_path) -> None:
+    settings = _settings(tmp_path, risk_position_pct=0.10, crypto_dynamic_order_target_position_pct=0.10)
+
+    non_live_count, non_live_diag = _crypto_dynamic_order_count_fp(
+        settings=settings,
+        ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.5000")),
+        signal=_signal(),
+        context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
+    )
+    missing_capital_count, missing_capital_diag = _crypto_dynamic_order_count_fp(
+        settings=settings,
+        ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.5000")),
+        signal=_live_quality_signal(),
+        context=_risk_context_for_sizing(total_capital_dollars=None),
+    )
+
+    assert non_live_count == Decimal("1.00")
+    assert non_live_diag["reason"] == "candidate_not_live_quality"
+    assert missing_capital_count == Decimal("1.00")
+    assert missing_capital_diag["reason"] == "missing_total_capital"
 
 
 def test_crypto_replay_gate_passes_profitable_model_even_when_calibration_lags_market_mid(tmp_path) -> None:
