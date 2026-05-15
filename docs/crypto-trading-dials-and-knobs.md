@@ -396,7 +396,7 @@ same-side add-on path.
 | --- | ---: | --- |
 | `crypto_order_mode` | `passive_then_taker` | `passive_only` places only passive orders. `passive_then_taker` can fall back to taker under strict conditions. |
 | `crypto_passive_timeout_seconds` | `5` | Configured timeout for passive handling where used by the crypto path. |
-| `crypto_taker_fallback_close_seconds` | `90` | Non-late-sure-thing taker fallback only inside this close window. |
+| `crypto_taker_fallback_close_seconds` | `0` | Non-late-sure-thing taker fallback only inside this close window. `0` keeps normal edge trades passive-only. |
 | `crypto_default_order_count_fp` | `1.0` | Fallback crypto ticket size before risk resizing. Non-live-quality candidates keep this size. |
 
 Execution behavior:
@@ -404,7 +404,8 @@ Execution behavior:
 - Crypto creates a buy ticket with `time_in_force="immediate_or_cancel"`.
 - Passive-first execution tries the passive price before taker fallback.
 - `passive_only` stops after passive execution fails or loses edge.
-- `passive_then_taker` can fall back to taker if the candidate remains eligible.
+- `passive_then_taker` can fall back to taker if the candidate remains eligible and the relevant fallback window allows it.
+- Production keeps normal taker fallback disabled with `crypto_taker_fallback_close_seconds=0`; late high-confidence directional entries use `crypto_late_sure_thing_max_seconds_to_close`.
 - Base limit execution uses code constants for requotes and fill polling, not
   configurable settings.
 - App shadow mode, room shadow mode, kill switch, inactive color, and missing

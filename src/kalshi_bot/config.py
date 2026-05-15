@@ -174,7 +174,7 @@ class Settings(BaseSettings):
     crypto_history_lookback_days: int = 180
     crypto_order_mode: str = "passive_then_taker"
     crypto_passive_timeout_seconds: int = 5
-    crypto_taker_fallback_close_seconds: int = 90
+    crypto_taker_fallback_close_seconds: int = 0
     crypto_live_min_market_age_seconds: int = 180
     crypto_min_training_samples: int = 250
     crypto_replay_min_resolved_markets: int = 500

@@ -364,15 +364,19 @@ Portfolio defaults:
 ### 7. Execution Gates
 
 Crypto execution supports `passive_only` and `passive_then_taker`. Production
-BTC uses `passive_only` while settlement-proxy evidence is still being measured:
+crypto uses passive-first execution with taker fallback disabled for normal
+candidates:
 
 1. Submit a passive maker-style order one tick inside the quoted spread.
 2. If the passive order fills or receives a terminal non-retry status, stop.
 3. In `passive_only`, if the passive order is unfilled/cancelled or loses edge
    on requote, emit `passive_unfilled_no_taker`.
-4. In `passive_then_taker`, taker fallback is allowed only when the market is
-   within 90 seconds of close and fee-adjusted net edge still clears the active
-   minimum.
+4. In `passive_then_taker`, normal taker fallback is controlled by
+   `crypto_taker_fallback_close_seconds`. Production sets this to `0`, so normal
+   edge trades do not cross the spread after an unfilled passive attempt.
+5. Late high-confidence directional entries may still fall back to taker inside
+   `crypto_late_sure_thing_max_seconds_to_close` when the candidate remains
+   live-quality.
 
 Execution blocks live orders when:
 

@@ -4026,6 +4026,334 @@ async def test_crypto_taker_fallback_requires_fee_adjusted_net_edge(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_crypto_normal_taker_fallback_disabled_when_close_window_zero(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        crypto_order_mode="passive_then_taker",
+        crypto_taker_fallback_close_seconds=0,
+        risk_min_edge_bps=50,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeBaseExecutionStatus(["unfilled_cancelled"])
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    market = _market(close_time=datetime.now(UTC) + timedelta(seconds=60))
+    signal = _signal()
+    signal.candidate_trace = {
+        "candidate_status": CRYPTO_LIVE_QUALITY,
+        "trade_selection_model": {
+            "candidate_status": CRYPTO_LIVE_QUALITY,
+            "expected_net_edge": "0.1600",
+        },
+    }
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC normal fallback disabled", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.4900"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-normal-fallback-disabled",
+        fair_yes_dollars=Decimal("0.6500"),
+        market=market,
+        signal=signal,
+    )
+
+    assert receipt.status == "passive_unfilled_taker_blocked"
+    assert receipt.details["reason"] == "taker_fallback_not_allowed"
+    assert len(fake_base.calls) == 1
+    assert fake_base.calls[0]["client_order_id"] == "crypto-normal-fallback-disabled:maker"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_late_high_confidence_can_fall_back_to_taker_when_normal_window_zero(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        crypto_order_mode="passive_then_taker",
+        crypto_taker_fallback_close_seconds=0,
+        crypto_late_sure_thing_max_seconds_to_close=300,
+        risk_min_edge_bps=750,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeBaseExecutionStatus(["unfilled_cancelled", "submitted"])
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    market = _market(close_time=datetime.now(UTC) + timedelta(seconds=60))
+    signal = _signal()
+    signal.candidate_trace = {
+        "candidate_status": CRYPTO_LIVE_QUALITY,
+        "late_high_confidence_directional_entry": True,
+        "trade_selection_model": {
+            "candidate_status": CRYPTO_LIVE_QUALITY,
+            "expected_net_edge": "-0.0200",
+            "late_high_confidence_directional_entry": True,
+        },
+    }
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC late fallback", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.4900"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-late-fallback",
+        fair_yes_dollars=Decimal("0.6500"),
+        market=market,
+        signal=signal,
+    )
+
+    assert receipt.status == "submitted"
+    assert len(fake_base.calls) == 2
+    assert fake_base.calls[0]["client_order_id"] == "crypto-late-fallback:maker"
+    assert fake_base.calls[1]["client_order_id"] == "crypto-late-fallback:taker"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_late_high_confidence_taker_fallback_requires_live_quality(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        crypto_order_mode="passive_then_taker",
+        crypto_taker_fallback_close_seconds=0,
+        crypto_late_sure_thing_max_seconds_to_close=300,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeBaseExecutionStatus(["unfilled_cancelled"])
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    market = _market(close_time=datetime.now(UTC) + timedelta(seconds=60))
+    signal = _signal()
+    signal.candidate_trace = {"late_high_confidence_directional_entry": True}
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC late fallback no live quality", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.4900"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-late-no-live-quality",
+        fair_yes_dollars=Decimal("0.6500"),
+        market=market,
+        signal=signal,
+    )
+
+    assert receipt.status == "passive_unfilled_taker_blocked"
+    assert len(fake_base.calls) == 1
+    assert fake_base.calls[0]["client_order_id"] == "crypto-late-no-live-quality:maker"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_passive_then_taker_blocks_when_passive_quote_missing_and_fallback_not_allowed(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        crypto_order_mode="passive_then_taker",
+        crypto_taker_fallback_close_seconds=0,
+        risk_min_edge_bps=50,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeBaseExecutionStatus([])
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    market = _market(
+        close_time=datetime.now(UTC) + timedelta(seconds=60),
+        yes_bid_dollars=None,
+        yes_ask_dollars=None,
+    )
+    signal = _signal()
+    signal.candidate_trace = {
+        "candidate_status": CRYPTO_LIVE_QUALITY,
+        "trade_selection_model": {
+            "candidate_status": CRYPTO_LIVE_QUALITY,
+            "expected_net_edge": "0.1600",
+        },
+    }
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC missing passive quote", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.4900"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-missing-passive",
+        fair_yes_dollars=Decimal("0.6500"),
+        market=market,
+        signal=signal,
+    )
+
+    assert receipt.status == "passive_unfilled_taker_blocked"
+    assert receipt.details["passive_price_unavailable"] is True
+    assert receipt.details["no_order_submitted"] is True
+    assert fake_base.calls == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_crypto_workflow_dynamic_sizing_saves_ticket_and_executes_approved_count(tmp_path) -> None:
     settings = _settings(
         tmp_path,

@@ -2869,6 +2869,7 @@ class CryptoExecutionService:
             )
         order_mode = str(self.settings.crypto_order_mode or CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER).strip().lower()
         passive_price = self.passive_yes_price(market, ticket.side)
+        taker_fallback_checked = False
         if order_mode in {CRYPTO_ORDER_MODE_PASSIVE_ONLY, CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER}:
             if passive_price is None:
                 if order_mode == CRYPTO_ORDER_MODE_PASSIVE_ONLY:
@@ -2911,11 +2912,16 @@ class CryptoExecutionService:
                             "no_taker_fallback": True,
                         },
                     )
+                taker_fallback_checked = True
                 if not self._allow_taker_fallback(market, signal, crypto_policy=crypto_policy):
                     return ExecReceiptPayload(
                         status="passive_unfilled_taker_blocked",
                         client_order_id=client_order_id,
-                        details={"passive_receipt": passive_receipt.model_dump(mode="json")},
+                        details={
+                            "reason": "taker_fallback_not_allowed",
+                            "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER,
+                            "passive_receipt": passive_receipt.model_dump(mode="json"),
+                        },
                     )
         if order_mode == CRYPTO_ORDER_MODE_PASSIVE_ONLY:
             return ExecReceiptPayload(
@@ -2927,6 +2933,18 @@ class CryptoExecutionService:
                     "no_order_submitted": True,
                 },
             )
+        if order_mode == CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER and not taker_fallback_checked:
+            if not self._allow_taker_fallback(market, signal, crypto_policy=crypto_policy):
+                return ExecReceiptPayload(
+                    status="passive_unfilled_taker_blocked",
+                    client_order_id=client_order_id,
+                    details={
+                        "reason": "taker_fallback_not_allowed",
+                        "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER,
+                        "passive_price_unavailable": passive_price is None,
+                        "no_order_submitted": passive_price is None,
+                    },
+                )
         return await self.base_execution_service.execute(
             room=room,
             control=fresh_control,
@@ -2957,7 +2975,12 @@ class CryptoExecutionService:
         )
         expected_net_edge = _crypto_signal_expected_net_edge_bps(signal)
         if crypto_late_sure_thing_trace(signal.candidate_trace):
-            return seconds_to_close <= self.settings.crypto_late_sure_thing_max_seconds_to_close
+            selection = ((signal.candidate_trace or {}).get("trade_selection_model") or {}) if signal.candidate_trace else {}
+            candidate_status = selection.get("candidate_status") or (signal.candidate_trace or {}).get("candidate_status")
+            return (
+                candidate_status == CRYPTO_LIVE_QUALITY
+                and seconds_to_close <= self.settings.crypto_late_sure_thing_max_seconds_to_close
+            )
         return (
             seconds_to_close <= self.settings.crypto_taker_fallback_close_seconds
             and expected_net_edge is not None
