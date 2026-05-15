@@ -120,6 +120,7 @@ def test_risk_engine_allows_late_high_confidence_crypto_edge_bypass() -> None:
         context=RiskContext(
             market_observed_at=datetime.now(UTC),
             research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("1000.00"),
             strategy_code=StrategyCode.CRYPTO_15M.value,
         ),
         thresholds=RuntimeThresholds(
@@ -355,6 +356,167 @@ def test_risk_engine_blocks_when_position_limit_would_be_breached() -> None:
     assert any("position" in r.lower() for r in verdict_over.reasons)
 
 
+def test_risk_engine_downsizes_below_one_contract_to_fit_capital_position_pct() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=None,
+        risk_max_position_notional_dollars=None,
+        risk_position_pct=0.10,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("1.00"),
+        ),
+        signal=replace(
+            make_signal(edge_bps=500),
+            target_yes_price_dollars=Decimal("0.5000"),
+            fair_yes_dollars=Decimal("0.6500"),
+        ),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("3.00"),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("0.60")
+    assert verdict.approved_notional_dollars == Decimal("0.3000")
+    assert "position_notional_cap_resized" in verdict.reason_codes
+
+
+def test_risk_engine_counts_pending_notional_against_capital_position_pct() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=None,
+        risk_max_position_notional_dollars=None,
+        risk_position_pct=0.10,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("1.00"),
+        ),
+        signal=replace(
+            make_signal(edge_bps=500),
+            target_yes_price_dollars=Decimal("0.5000"),
+            fair_yes_dollars=Decimal("0.6500"),
+        ),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("5.00"),
+            pending_order_count_fp=Decimal("0.60"),
+            pending_order_notional_dollars=Decimal("0.3000"),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("0.40")
+    assert verdict.approved_notional_dollars == Decimal("0.2000")
+    assert verdict.diagnostics["position_notional_cap"]["pending_order_notional_dollars"] == "0.3000"
+
+
+def test_risk_engine_blocks_when_capital_position_pct_has_no_room() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=None,
+        risk_max_position_notional_dollars=None,
+        risk_allow_position_add_ons=True,
+        risk_position_pct=0.10,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("1.00"),
+        ),
+        signal=replace(
+            make_signal(edge_bps=500),
+            target_yes_price_dollars=Decimal("0.5000"),
+            fair_yes_dollars=Decimal("0.6500"),
+        ),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("3.00"),
+            current_position_notional_dollars=Decimal("0.3000"),
+            current_position_count_fp=Decimal("0.60"),
+            current_position_side="yes",
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert "position_notional_cap_reached" in verdict.reason_codes
+
+
+def test_risk_engine_blocks_crypto_entry_when_total_capital_is_missing() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_max_order_notional_dollars=None,
+        risk_max_position_notional_dollars=None,
+        risk_position_pct=0.10,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("1.00"),
+        ),
+        signal=replace(
+            make_signal(edge_bps=500),
+            target_yes_price_dollars=Decimal("0.5000"),
+            fair_yes_dollars=Decimal("0.6500"),
+        ),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert "position_notional_cap_missing_capital" in verdict.reason_codes
+
+
 def test_risk_engine_blocks_stale_data() -> None:
     settings = Settings(database_url="sqlite+aiosqlite:///./test.db", risk_min_edge_bps=50)
     engine = DeterministicRiskEngine(settings)
@@ -442,6 +604,7 @@ def test_risk_engine_allows_one_btc_same_side_add_on_under_cap() -> None:
         context=RiskContext(
             market_observed_at=datetime.now(UTC),
             research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("1000.00"),
             current_position_count_fp=Decimal("1.00"),
             current_position_side="yes",
             strategy_code=StrategyCode.CRYPTO_15M.value,
@@ -476,6 +639,7 @@ def test_risk_engine_blocks_second_opposite_non_btc_and_oversized_crypto_add_ons
             context=RiskContext(
                 market_observed_at=datetime.now(UTC),
                 research_observed_at=datetime.now(UTC),
+                total_capital_dollars=Decimal("1000.00"),
                 current_position_count_fp=Decimal(current),
                 current_position_side=current_side,
                 strategy_code=StrategyCode.CRYPTO_15M.value,

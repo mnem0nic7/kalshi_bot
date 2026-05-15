@@ -180,7 +180,7 @@ class ExtremeEdgeKalshi:
         return {
             "market": {
                 "ticker": ticker,
-                "title": "Will the high temp in Austin be >83 on Apr 29, 2026?",
+                "title": "Will the high temp in Austin be >83 on Apr 29, 2068?",
                 "subtitle": "84 or above",
                 "strike_type": "greater",
                 "floor_strike": 0.000083,
@@ -205,13 +205,13 @@ class ExtremeEdgeWeather:
             "mapping": mapping.model_dump(mode="json"),
             "forecast": {
                 "properties": {
-                    "updated": "2026-04-29T11:45:00+00:00",
+                    "updated": "2068-04-29T11:45:00+00:00",
                     "periods": [
                         {
                             "isDaytime": True,
                             "temperature": 95,
                             "temperatureUnit": "F",
-                            "startTime": "2026-04-29T07:00:00-05:00",
+                            "startTime": "2068-04-29T07:00:00-05:00",
                         },
                     ],
                 }
@@ -219,7 +219,7 @@ class ExtremeEdgeWeather:
             "observation": {
                 "properties": {
                     "temperature": {"value": 23.8889},
-                    "timestamp": "2026-04-29T12:00:00+00:00",
+                    "timestamp": "2068-04-29T12:00:00+00:00",
                 }
             },
             "points": {},
@@ -498,6 +498,7 @@ async def test_extreme_edge_diagnostic_stands_down_before_ticket_creation(tmp_pa
         llm_trading_enabled=False,
         risk_min_edge_bps=10,
         risk_max_credible_edge_bps=5000,
+        risk_min_contract_price_dollars=0.25,
         risk_max_order_notional_dollars=50,
         risk_max_position_notional_dollars=100,
         risk_max_order_count_fp=20,
@@ -566,19 +567,19 @@ async def test_extreme_edge_diagnostic_stands_down_before_ticket_creation(tmp_pa
         await repo.upsert_historical_weather_snapshot(
             station_id="KAUS",
             series_ticker="KXHIGHAUS",
-            local_market_day="2026-04-29",
-            asof_ts=datetime(2026, 4, 29, 10, 0, tzinfo=UTC),
+            local_market_day="2068-04-29",
+            asof_ts=datetime(2068, 4, 29, 10, 0, tzinfo=UTC),
             source_kind="archived_weather_bundle",
             source_id="seed:prior",
             source_hash="seed",
-            observation_ts=datetime(2026, 4, 29, 10, 0, tzinfo=UTC),
-            forecast_updated_ts=datetime(2026, 4, 29, 9, 45, tzinfo=UTC),
+            observation_ts=datetime(2068, 4, 29, 10, 0, tzinfo=UTC),
+            forecast_updated_ts=datetime(2068, 4, 29, 9, 45, tzinfo=UTC),
             forecast_high_f=Decimal("83.00"),
             current_temp_f=Decimal("74.00"),
             payload={"source": "prior_station_day_snapshot"},
         )
         room = await repo.create_room(
-            RoomCreate(name="Extreme Edge", market_ticker="KXHIGHAUS-26APR29-T83"),
+            RoomCreate(name="Extreme Edge", market_ticker="KXHIGHAUS-68APR29-T83"),
             active_color="blue",
             shadow_mode=False,
             kill_switch_enabled=False,

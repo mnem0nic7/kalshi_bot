@@ -29,10 +29,12 @@ class RiskContext:
     market_observed_at: datetime | None
     research_observed_at: datetime | None
     decision_time: datetime | None = None
+    total_capital_dollars: Decimal | None = None
     current_position_notional_dollars: Decimal = Decimal("0")
     current_position_count_fp: Decimal = Decimal("0")
     current_position_side: str | None = None
     pending_order_count_fp: Decimal = Decimal("0")
+    pending_order_notional_dollars: Decimal = Decimal("0")
     portfolio_bucket_snapshot: PortfolioBucketSnapshot | None = None
     open_ticker_count: int = 0
     strategy_code: str | None = None
@@ -192,14 +194,27 @@ def _crypto_position_add_on_verdict(
     return True, {**diagnostics, "reason": "crypto_position_add_on_allowed"}
 
 
-def _bucket_fit_count(*, available_notional_dollars: Decimal, ticket: TradeTicket) -> Decimal | None:
+def _fit_count_for_notional(
+    *,
+    available_notional_dollars: Decimal,
+    ticket: TradeTicket,
+    minimum_count_fp: Decimal,
+) -> Decimal | None:
     unit_notional = _ticket_unit_notional(ticket)
     if unit_notional <= Decimal("0"):
         return None
     raw_count = (available_notional_dollars / unit_notional).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    if raw_count < Decimal("1.00"):
+    if raw_count < minimum_count_fp:
         return None
     return quantize_count(raw_count)
+
+
+def _bucket_fit_count(*, available_notional_dollars: Decimal, ticket: TradeTicket) -> Decimal | None:
+    return _fit_count_for_notional(
+        available_notional_dollars=available_notional_dollars,
+        ticket=ticket,
+        minimum_count_fp=Decimal("1.00"),
+    )
 
 
 def _decimal_text(value: Any) -> str | None:
@@ -356,6 +371,7 @@ class DeterministicRiskEngine:
             "risk_min_contract_price_dollars": active_thresholds.risk_min_contract_price_dollars,
             "risk_max_order_notional_dollars": active_thresholds.risk_max_order_notional_dollars,
             "risk_max_position_notional_dollars": active_thresholds.risk_max_position_notional_dollars,
+            "risk_position_pct": self.settings.risk_position_pct,
             "trigger_max_spread_bps": active_thresholds.trigger_max_spread_bps,
             "strategy_min_abs_delta_f": active_thresholds.strategy_min_abs_delta_f,
             "strategy_min_remaining_payout_bps": active_thresholds.strategy_min_remaining_payout_bps,
@@ -624,7 +640,91 @@ class DeterministicRiskEngine:
 
         if is_buy_entry and active_thresholds.risk_max_order_notional_dollars is not None and float(order_notional) > active_thresholds.risk_max_order_notional_dollars:
             block("Ticket notional exceeds max order notional.")
-        if is_buy_entry and active_thresholds.risk_max_position_notional_dollars is not None and float(context.current_position_notional_dollars + order_notional) > active_thresholds.risk_max_position_notional_dollars:
+        current_position_notional = _quantize_money(context.current_position_notional_dollars)
+        pending_position_notional = _quantize_money(context.pending_order_notional_dollars)
+        dynamic_position_cap_dollars: Decimal | None = None
+        total_capital = context.total_capital_dollars
+        crypto_strategy = context.strategy_code == "CRYPTO_15M"
+        if total_capital is None:
+            if is_buy_entry and crypto_strategy:
+                block("Total capital is unavailable; cannot enforce the crypto position capital cap.")
+                code("position_notional_cap_missing_capital")
+        else:
+            total_capital_dec = _quantize_money(total_capital)
+            if total_capital_dec <= Decimal("0"):
+                if is_buy_entry and crypto_strategy:
+                    block("Total capital is non-positive; cannot enforce the crypto position capital cap.")
+                    code("position_notional_cap_missing_capital")
+            elif self.settings.risk_position_pct > 0:
+                dynamic_position_cap_dollars = _quantize_money(
+                    total_capital_dec * Decimal(str(self.settings.risk_position_pct))
+                )
+        projected_position_notional = _quantize_money(
+            current_position_notional + pending_position_notional + order_notional
+        )
+        diagnostics["position_notional_cap"] = {
+            "total_capital_dollars": _decimal_text(total_capital),
+            "risk_position_pct": self.settings.risk_position_pct,
+            "dynamic_cap_dollars": _decimal_text(dynamic_position_cap_dollars),
+            "configured_cap_dollars": _decimal_text(active_thresholds.risk_max_position_notional_dollars),
+            "current_position_notional_dollars": _decimal_text(current_position_notional),
+            "pending_order_notional_dollars": _decimal_text(pending_position_notional),
+            "approved_order_notional_dollars": _decimal_text(order_notional),
+            "projected_position_notional_dollars": _decimal_text(projected_position_notional),
+        }
+        if is_buy_entry and dynamic_position_cap_dollars is not None:
+            existing_and_pending_notional = _quantize_money(current_position_notional + pending_position_notional)
+            if existing_and_pending_notional >= dynamic_position_cap_dollars:
+                block(
+                    f"Position already uses {existing_and_pending_notional:.4f} of "
+                    f"the {self.settings.risk_position_pct:.0%} capital cap "
+                    f"({dynamic_position_cap_dollars:.4f})."
+                )
+                code("position_notional_cap_reached")
+            elif projected_position_notional > dynamic_position_cap_dollars:
+                available_notional = _quantize_money(dynamic_position_cap_dollars - existing_and_pending_notional)
+                fitted_count = _fit_count_for_notional(
+                    available_notional_dollars=available_notional,
+                    ticket=ticket,
+                    minimum_count_fp=Decimal("0.01"),
+                )
+                if fitted_count is None:
+                    block(
+                        f"Remaining position budget {available_notional:.4f} is below the minimum "
+                        f"0.01 count_fp at the current contract price."
+                    )
+                    code("position_notional_cap_no_fit")
+                else:
+                    original_count = approved_count
+                    approved_count = fitted_count
+                    approved_notional = _quantize_money(
+                        estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, approved_count)
+                    )
+                    order_notional = approved_notional
+                    projected_position_notional = _quantize_money(
+                        existing_and_pending_notional + order_notional
+                    )
+                    diagnostics["position_notional_cap"].update(
+                        {
+                            "available_notional_dollars": _decimal_text(available_notional),
+                            "resized": True,
+                            "original_count_fp": _decimal_text(original_count),
+                            "approved_count_fp": _decimal_text(approved_count),
+                            "approved_order_notional_dollars": _decimal_text(order_notional),
+                            "projected_position_notional_dollars": _decimal_text(projected_position_notional),
+                        }
+                    )
+                    note(
+                        f"Ticket downsized from {original_count:.2f} to {approved_count:.2f} contracts "
+                        f"so projected position notional stays within "
+                        f"{self.settings.risk_position_pct:.0%} of capital."
+                    )
+                    code("position_notional_cap_resized")
+        if (
+            is_buy_entry
+            and active_thresholds.risk_max_position_notional_dollars is not None
+            and float(projected_position_notional) > active_thresholds.risk_max_position_notional_dollars
+        ):
             block("Projected position exceeds max position notional.")
 
         # Per-strategy daily-loss envelope: hard stop distinct from the global

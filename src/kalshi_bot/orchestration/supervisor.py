@@ -115,6 +115,24 @@ def _runtime_threshold_payload(thresholds: RuntimeThresholds) -> dict[str, Any]:
     return {field: getattr(thresholds, field) for field in thresholds.__dataclass_fields__}
 
 
+def _position_cost_notional_dollars(position: Any, *, fallback_yes_price_dollars: Decimal) -> Decimal:
+    side = str(getattr(position, "side", "") or "").lower()
+    fallback_contract_price = (
+        fallback_yes_price_dollars
+        if side != ContractSide.NO.value
+        else Decimal("1.0000") - fallback_yes_price_dollars
+    )
+    try:
+        average_price = as_decimal(getattr(position, "average_price_dollars"))
+    except (ArithmeticError, TypeError, ValueError):
+        average_price = fallback_contract_price
+    try:
+        count_fp = abs(as_decimal(getattr(position, "count_fp")))
+    except (ArithmeticError, TypeError, ValueError):
+        return Decimal("0")
+    return (average_price * count_fp).quantize(Decimal("0.0001"))
+
+
 def _resolution_changes_thresholds(left: Any, right: Any) -> bool:
     return _runtime_threshold_payload(left.thresholds) != _runtime_threshold_payload(right.thresholds)
 
@@ -1495,10 +1513,9 @@ class WorkflowSupervisor:
                     )
                 open_position = max(ticker_positions, key=lambda p: p.count_fp) if ticker_positions else None
                 current_position_notional = (
-                    estimate_notional_dollars(
-                        ContractSide(open_position.side),
-                        open_position.average_price_dollars,
-                        open_position.count_fp,
+                    _position_cost_notional_dollars(
+                        open_position,
+                        fallback_yes_price_dollars=ticket.yes_price_dollars,
                     )
                     if open_position is not None
                     else Decimal("0")
@@ -1701,13 +1718,20 @@ class WorkflowSupervisor:
                     ticket.side.value,
                     kalshi_env=room.kalshi_env,
                 )
+                pending_order_notional = estimate_notional_dollars(
+                    ticket.side,
+                    ticket.yes_price_dollars,
+                    pending_order_count_fp,
+                )
                 risk_context = RiskContext(
                     market_observed_at=market_observed_at,
                     research_observed_at=research_observed_at,
+                    total_capital_dollars=total_capital,
                     current_position_notional_dollars=current_position_notional,
                     current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
                     current_position_side=open_position.side if open_position is not None else None,
                     pending_order_count_fp=pending_order_count_fp,
+                    pending_order_notional_dollars=pending_order_notional,
                     portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                     open_ticker_count=open_ticker_count,
                     strategy_code=StrategyCode.DIRECTIONAL.value,
@@ -3049,10 +3073,9 @@ class WorkflowSupervisor:
                             )
                         open_position = max(_ticker_positions, key=lambda p: p.count_fp) if _ticker_positions else None
                         current_position_notional = (
-                            estimate_notional_dollars(
-                                ContractSide(open_position.side),
-                                open_position.average_price_dollars,
-                                open_position.count_fp,
+                            _position_cost_notional_dollars(
+                                open_position,
+                                fallback_yes_price_dollars=ticket.yes_price_dollars,
                             )
                             if open_position is not None
                             else Decimal("0")
@@ -3097,6 +3120,11 @@ class WorkflowSupervisor:
                             ticket.side.value,
                             kalshi_env=room.kalshi_env,
                         )
+                        pending_order_notional = estimate_notional_dollars(
+                            ticket.side,
+                            ticket.yes_price_dollars,
+                            pending_order_count_fp,
+                        )
                         strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
                             strategy_code=StrategyCode.DIRECTIONAL.value,
                             kalshi_env=room.kalshi_env,
@@ -3104,10 +3132,12 @@ class WorkflowSupervisor:
                         risk_context = RiskContext(
                             market_observed_at=market_state.observed_at,
                             research_observed_at=_research_ref_time(signal, dossier.freshness.refreshed_at),
+                            total_capital_dollars=total_capital,
                             current_position_notional_dollars=current_position_notional,
                             current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
                             current_position_side=open_position.side if open_position is not None else None,
                             pending_order_count_fp=pending_order_count_fp,
+                            pending_order_notional_dollars=pending_order_notional,
                             portfolio_bucket_snapshot=portfolio_bucket_snapshot,
                             open_ticker_count=open_ticker_count,
                             strategy_code=StrategyCode.DIRECTIONAL.value,

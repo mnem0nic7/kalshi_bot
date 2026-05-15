@@ -3299,26 +3299,30 @@ class CryptoWorkflowService:
             ticket.side.value,
             kalshi_env=room.kalshi_env,
         )
+        pending_order_notional = estimate_notional_dollars(
+            ticket.side,
+            ticket.yes_price_dollars,
+            pending_order_count_fp,
+        )
+        total_capital = await repo.get_total_capital_dollars(kalshi_env=room.kalshi_env)
         strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
             strategy_code=StrategyCode.CRYPTO_15M.value,
             kalshi_env=room.kalshi_env,
         )
         current_position_notional = (
-            estimate_notional_dollars(
-                ContractSide(open_position.side),
-                open_position.average_price_dollars,
-                open_position.count_fp,
-            )
+            abs(Decimal(str(open_position.count_fp))) * Decimal(str(open_position.average_price_dollars))
             if open_position is not None
             else Decimal("0")
         )
         return RiskContext(
             market_observed_at=datetime.now(UTC),
             research_observed_at=datetime.now(UTC),
+            total_capital_dollars=total_capital,
             current_position_notional_dollars=current_position_notional,
             current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
             current_position_side=open_position.side if open_position is not None else None,
             pending_order_count_fp=pending_order_count_fp,
+            pending_order_notional_dollars=pending_order_notional,
             open_ticker_count=len({position.market_ticker for position in all_positions}),
             strategy_code=StrategyCode.CRYPTO_15M.value,
             strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
