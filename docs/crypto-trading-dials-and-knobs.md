@@ -340,12 +340,27 @@ execution checks.
 | `crypto_late_sure_thing_min_probability` | `0.85` | Minimum model probability for the winning side inside the standard window. |
 | `crypto_late_sure_thing_extended_min_probability` | `0.90` | Minimum model probability for the winning side from 180-300 seconds before close. |
 | `crypto_late_sure_thing_min_market_probability` | `0.75` | Minimum market-implied probability for the same side. |
+| `crypto_late_sure_thing_near_strike_momentum_guard_enabled` | `True` | Enables the near-strike adverse-momentum guard inside the standard late window. |
+| `crypto_late_sure_thing_near_strike_max_moneyness_pct` | `0.0001` | Treats contracts within 1 bp of the strike as near-strike. |
+| `crypto_late_sure_thing_near_strike_min_adverse_return_pct` | `0.0001` | Minimum recent spot return that counts as adverse momentum. |
+| `crypto_late_sure_thing_near_strike_min_adverse_returns` | `2` | Number of recent return windows that must point against the selected side. |
+| `crypto_late_sure_thing_near_strike_min_probability` | `0.90` | Required model probability when the near-strike adverse-momentum guard applies. |
+| `crypto_late_sure_thing_reversal_guard_enabled` | `True` | Blocks extended-window late entries when recent spot momentum points against the selected side. |
+| `crypto_late_sure_thing_reversal_guard_min_seconds_to_close` | `181` | Starts the adverse-momentum reversal guard in the 181-300 second window. |
+| `crypto_late_sure_thing_reversal_guard_min_adverse_return_pct` | `0.0001` | Minimum recent return that counts as adverse for the selected side. |
+| `crypto_late_sure_thing_target_distance_guard_enabled` | `True` | Requires enough target-distance cushion when `spot_target_distance_volatility` is available. |
+| `crypto_late_sure_thing_min_target_distance_volatility` | `3.0` | Minimum directional distance from strike, in volatility units, for late high-confidence entries. |
+| `crypto_late_sure_thing_max_loss_dollars` | `0.50` | Max dollars at risk for each late high-confidence order. |
 
 Late sure-thing also affects taker fallback. If the candidate trace is marked as
 late sure thing, taker fallback is allowed only inside
 `crypto_late_sure_thing_max_seconds_to_close`. The candidate must already have
 passed the stricter 180-300 second model-probability rule before that trace is
-set.
+set. Inside the standard late window, candidates very close to the strike also
+need the stricter near-strike probability floor when recent spot returns point
+against the selected side. The extended late window now also blocks candidates
+when recent returns point against the selected side, and late entries with
+available target-distance features need a directional volatility cushion.
 
 ## Autonomy and Room Creation Knobs
 

@@ -635,6 +635,17 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_LATE_SURE_THING_MIN_PROBABILITY` | `0.85` | Minimum model-side probability inside the standard late window. |
 | `CRYPTO_LATE_SURE_THING_EXTENDED_MIN_PROBABILITY` | `0.90` | Minimum model-side probability from 180-300 seconds before close. |
 | `CRYPTO_LATE_SURE_THING_MIN_MARKET_PROBABILITY` | `0.75` | Minimum market-implied side probability for late high-confidence entries. |
+| `CRYPTO_LATE_SURE_THING_NEAR_STRIKE_MOMENTUM_GUARD_ENABLED` | `true` | Enables the near-strike adverse-momentum guard inside the standard late window. |
+| `CRYPTO_LATE_SURE_THING_NEAR_STRIKE_MAX_MONEYNESS_PCT` | `0.0001` | Near-strike band as percent distance to target. |
+| `CRYPTO_LATE_SURE_THING_NEAR_STRIKE_MIN_ADVERSE_RETURN_PCT` | `0.0001` | Minimum recent spot return that counts as adverse momentum. |
+| `CRYPTO_LATE_SURE_THING_NEAR_STRIKE_MIN_ADVERSE_RETURNS` | `2` | Required count of adverse recent return windows. |
+| `CRYPTO_LATE_SURE_THING_NEAR_STRIKE_MIN_PROBABILITY` | `0.90` | Required model-side probability when the near-strike guard applies. |
+| `CRYPTO_LATE_SURE_THING_REVERSAL_GUARD_ENABLED` | `true` | Blocks extended-window late entries when spot momentum points against the selected side. |
+| `CRYPTO_LATE_SURE_THING_REVERSAL_GUARD_MIN_SECONDS_TO_CLOSE` | `181` | Start of the adverse-momentum block inside the extended late window. |
+| `CRYPTO_LATE_SURE_THING_REVERSAL_GUARD_MIN_ADVERSE_RETURN_PCT` | `0.0001` | Minimum recent return that counts as adverse for the selected side. |
+| `CRYPTO_LATE_SURE_THING_TARGET_DISTANCE_GUARD_ENABLED` | `true` | Requires directional target-distance cushion when the feature is available. |
+| `CRYPTO_LATE_SURE_THING_MIN_TARGET_DISTANCE_VOLATILITY` | `3.0` | Required target distance in volatility units. |
+| `CRYPTO_LATE_SURE_THING_MAX_LOSS_DOLLARS` | `0.50` | Per-order max loss for late high-confidence entries. |
 | `CRYPTO_AUTONOMY_MAX_ROOMS_PER_RUN` | `7` | Per-run room cap. |
 | `CRYPTO_AUTONOMY_MAX_PER_ASSET_PER_RUN` | `1` | Per-asset room cap. |
 | `CRYPTO_SHADOW_EXPLORATION_MAX_CANDIDATES_PER_RUN` | `12` | Shadow candidate cap. |

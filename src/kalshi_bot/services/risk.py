@@ -609,6 +609,46 @@ class DeterministicRiskEngine:
                 )
                 code("crypto_late_empirical_override_count_cap")
 
+        if is_buy_entry and late_sure_thing_edge_bypass:
+            max_loss_dollars = Decimal(str(self.settings.crypto_late_sure_thing_max_loss_dollars))
+            max_loss_count = (
+                (max_loss_dollars / contract_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                if max_loss_dollars > Decimal("0") and contract_price > Decimal("0")
+                else Decimal("0.00")
+            )
+            diagnostics["crypto_late_high_confidence_max_loss"] = {
+                "active": True,
+                "max_loss_dollars": _decimal_text(max_loss_dollars),
+                "unit_loss_dollars": _decimal_text(contract_price),
+                "max_count_fp": _decimal_text(max_loss_count),
+                "original_count_fp": _decimal_text(approved_count),
+            }
+            if max_loss_dollars <= Decimal("0"):
+                block("Crypto late high-confidence max-loss cap is non-positive.")
+                code("crypto_late_high_confidence_max_loss_invalid_cap")
+            elif max_loss_count < Decimal("0.01"):
+                block("Crypto late high-confidence max-loss cap cannot fit the 0.01 minimum count.")
+                code("crypto_late_high_confidence_max_loss_no_fit")
+            elif approved_count > max_loss_count:
+                original_count = approved_count
+                approved_count = quantize_count(max_loss_count)
+                approved_notional = _quantize_money(
+                    estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, approved_count)
+                )
+                order_notional = approved_notional
+                diagnostics["crypto_late_high_confidence_max_loss"].update(
+                    {
+                        "resized": True,
+                        "approved_count_fp": _decimal_text(approved_count),
+                        "approved_order_notional_dollars": _decimal_text(order_notional),
+                    }
+                )
+                note(
+                    f"Late high-confidence crypto max-loss cap downsized ticket from "
+                    f"{original_count:.2f} to {approved_count:.2f} contracts."
+                )
+                code("crypto_late_high_confidence_max_loss_cap")
+
         max_order_count_fp = weather_live_max_order_count_fp(
             control=control,
             strategy_code=context.strategy_code,

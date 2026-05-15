@@ -302,6 +302,35 @@ def test_crypto_dynamic_sizing_caps_late_empirical_override_to_one_contract(tmp_
     assert diagnostics["empirical_bucket_late_override_cap_active"] is True
 
 
+def test_crypto_dynamic_sizing_caps_late_high_confidence_to_max_loss(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_position_pct=0.10,
+        crypto_dynamic_order_target_position_pct=0.10,
+        risk_max_order_count_fp=500.0,
+        risk_max_position_count_fp_per_ticker=500.0,
+        crypto_late_sure_thing_max_loss_dollars=0.50,
+    )
+    signal = _live_quality_signal()
+    signal.candidate_trace = {
+        **(signal.candidate_trace or {}),
+        "late_high_confidence_directional_entry": True,
+    }
+
+    count, diagnostics = _crypto_dynamic_order_count_fp(
+        settings=settings,
+        ticket=_sizing_ticket(side=ContractSide.NO, yes_price_dollars=Decimal("0.1300")),
+        signal=signal,
+        context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
+    )
+
+    assert count == Decimal("0.57")
+    assert diagnostics["raw_count_fp"] == "11.49"
+    assert diagnostics["capped_count_fp"] == "0.57"
+    assert diagnostics["late_high_confidence_max_loss_cap_active"] is True
+    assert diagnostics["late_high_confidence_max_loss_count_fp"] == "0.57"
+
+
 def test_crypto_dynamic_sizing_subtracts_current_and_pending_notional(tmp_path) -> None:
     settings = _settings(tmp_path, risk_position_pct=0.10, crypto_dynamic_order_target_position_pct=0.10)
 
@@ -2322,6 +2351,166 @@ def test_crypto_late_high_confidence_allows_90_probability_from_180_to_300_secon
     assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
     assert yes_candidate["reason"] == "late_high_confidence_directional_entry"
     assert yes_candidate["late_high_confidence_directional_entry"] is True
+
+
+def test_crypto_late_high_confidence_blocks_extended_window_adverse_momentum(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_late_sure_thing_max_seconds_to_close=300,
+        crypto_late_sure_thing_standard_max_seconds_to_close=180,
+        crypto_late_sure_thing_min_probability=0.85,
+        crypto_late_sure_thing_extended_min_probability=0.90,
+        crypto_late_sure_thing_min_market_probability=0.75,
+    )
+    row = {
+        "market_ticker": "KXDOGE15M-LATE-REVERSAL",
+        "asset_symbol": "DOGE",
+        "mid_yes_dollars": Decimal("0.1000"),
+        "yes_bid_dollars": Decimal("0.0900"),
+        "yes_ask_dollars": Decimal("0.1100"),
+        "no_ask_dollars": Decimal("0.9100"),
+        "spread_bps": 200,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 240,
+        "market_age_seconds": 660,
+        "spot_return_1_pct": Decimal("0.0002"),
+        "spot_return_3_pct": Decimal("-0.0001"),
+        "spot_target_distance_volatility": Decimal("-4.0000"),
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.1000"), settings=settings)
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["candidate_status"] == "blocked_late_reversal_risk"
+    assert no_candidate["reason"] == "late_high_confidence_reversal_risk_guard"
+    assert no_candidate["late_high_confidence_directional_entry"] is False
+    review = no_candidate["late_high_confidence_reversal_risk"]
+    assert review["blocked"] is True
+    assert review["reason"] == "extended_window_adverse_momentum"
+    assert review["adverse_return_count"] == 1
+
+
+def test_crypto_late_high_confidence_blocks_target_distance_below_margin(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_autonomy_min_seconds_to_close=0,
+        crypto_late_sure_thing_max_seconds_to_close=300,
+        crypto_late_sure_thing_min_probability=0.85,
+        crypto_late_sure_thing_min_market_probability=0.75,
+        crypto_late_sure_thing_min_target_distance_volatility=3.0,
+    )
+    row = {
+        "market_ticker": "KXETH15M-LATE-TARGET-MARGIN",
+        "asset_symbol": "ETH",
+        "mid_yes_dollars": Decimal("0.1000"),
+        "yes_bid_dollars": Decimal("0.0900"),
+        "yes_ask_dollars": Decimal("0.1100"),
+        "no_ask_dollars": Decimal("0.9100"),
+        "spread_bps": 200,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 120,
+        "market_age_seconds": 780,
+        "spot_return_1_pct": Decimal("-0.0002"),
+        "spot_return_3_pct": Decimal("-0.0001"),
+        "spot_target_distance_volatility": Decimal("-2.5000"),
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.1000"), settings=settings)
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["candidate_status"] == "blocked_late_reversal_risk"
+    assert no_candidate["reason"] == "late_high_confidence_reversal_risk_guard"
+    review = no_candidate["late_high_confidence_reversal_risk"]
+    assert review["blocked"] is True
+    assert review["reason"] == "target_distance_volatility_below_min"
+    assert review["target_distance_ok"] is False
+
+
+def test_crypto_late_high_confidence_blocks_near_strike_adverse_momentum_below_90(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_autonomy_min_seconds_to_close=0,
+        crypto_late_sure_thing_standard_max_seconds_to_close=180,
+        crypto_late_sure_thing_min_probability=0.85,
+        crypto_late_sure_thing_near_strike_min_probability=0.90,
+    )
+    row = {
+        "market_ticker": "KXXRP15M-NEAR-STRIKE-ADVERSE",
+        "asset_symbol": "XRP",
+        "mid_yes_dollars": Decimal("0.1055"),
+        "yes_bid_dollars": Decimal("0.0910"),
+        "yes_ask_dollars": Decimal("0.1200"),
+        "no_ask_dollars": Decimal("0.9090"),
+        "spread_bps": 290,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 79,
+        "market_age_seconds": 821,
+        "spot_moneyness_pct": Decimal("-0.000035"),
+        "spot_return_1_pct": Decimal("0.000698"),
+        "spot_return_3_pct": Decimal("0.000558"),
+        "spot_return_6_pct": Decimal("0.000558"),
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.1057"), settings=settings)
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["model_probability"] == "0.8944"
+    assert no_candidate["candidate_status"] == "blocked_near_strike_momentum"
+    assert no_candidate["reason"] == "late_high_confidence_near_strike_momentum_guard"
+    assert no_candidate["late_high_confidence_directional_entry"] is False
+    guard = no_candidate["late_high_confidence_near_strike_momentum_guard"]
+    assert guard["blocked"] is True
+    assert guard["reason"] == "near_strike_adverse_momentum_probability_below_min"
+    assert guard["adverse_return_count"] >= 2
+
+
+def test_crypto_late_high_confidence_allows_near_strike_adverse_momentum_at_90(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_autonomy_min_seconds_to_close=0,
+        crypto_late_sure_thing_standard_max_seconds_to_close=180,
+        crypto_late_sure_thing_min_probability=0.85,
+        crypto_late_sure_thing_near_strike_min_probability=0.90,
+    )
+    row = {
+        "market_ticker": "KXXRP15M-NEAR-STRIKE-ADVERSE-OK",
+        "asset_symbol": "XRP",
+        "mid_yes_dollars": Decimal("0.1000"),
+        "yes_bid_dollars": Decimal("0.0910"),
+        "yes_ask_dollars": Decimal("0.1200"),
+        "no_ask_dollars": Decimal("0.9090"),
+        "spread_bps": 290,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 79,
+        "market_age_seconds": 821,
+        "spot_moneyness_pct": Decimal("-0.000035"),
+        "spot_return_1_pct": Decimal("0.000698"),
+        "spot_return_3_pct": Decimal("0.000558"),
+        "spot_return_6_pct": Decimal("0.000558"),
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.1000"), settings=settings)
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["model_probability"] == "0.9000"
+    assert no_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert no_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert no_candidate["late_high_confidence_directional_entry"] is True
+    assert no_candidate["late_high_confidence_near_strike_momentum_guard"]["reason"] == (
+        "near_strike_adverse_momentum_probability_allowed"
+    )
 
 
 def test_crypto_candidate_quality_allows_late_market_confirmed_edge_bypass_before_no_entry_cutoff(tmp_path) -> None:

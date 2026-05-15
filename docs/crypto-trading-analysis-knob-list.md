@@ -38,6 +38,15 @@ Use this as the candidate grid/search space for `CRYPTO_15M`.
 | `crypto_late_sure_thing_min_probability` | `0.85` | probability | Minimum model probability inside the standard close window. |
 | `crypto_late_sure_thing_extended_min_probability` | `0.90` | probability | Minimum model probability from 180-300 seconds before close. |
 | `crypto_late_sure_thing_min_market_probability` | `0.75` | probability | Minimum market-implied probability for late sure thing. |
+| `crypto_late_sure_thing_near_strike_momentum_guard_enabled` | `True` | bool | Compare standard late entries with and without the near-strike adverse-momentum guard. |
+| `crypto_late_sure_thing_near_strike_max_moneyness_pct` | `0.0001` | pct | Percent distance to strike treated as near-strike. |
+| `crypto_late_sure_thing_near_strike_min_probability` | `0.90` | probability | Required model probability when near-strike momentum points against the selected side. |
+| `crypto_late_sure_thing_reversal_guard_enabled` | `True` | bool | Compare extended-window late entries with and without adverse-momentum blocking. |
+| `crypto_late_sure_thing_reversal_guard_min_seconds_to_close` | `181` | seconds | Start point for the extended-window reversal guard. |
+| `crypto_late_sure_thing_reversal_guard_min_adverse_return_pct` | `0.0001` | pct | Minimum recent return counted as adverse momentum. |
+| `crypto_late_sure_thing_target_distance_guard_enabled` | `True` | bool | Compare late entries with and without target-distance margin filtering. |
+| `crypto_late_sure_thing_min_target_distance_volatility` | `3.0` | volatility units | Directional distance cushion required when the feature is available. |
+| `crypto_late_sure_thing_max_loss_dollars` | `0.50` | dollars | Per-order max loss for late high-confidence sizing and risk. |
 
 ## Market Anchor
 
@@ -171,6 +180,12 @@ Start with a small grid before doing broader optimization:
 | `crypto_late_sure_thing_min_probability` | `0.80`, `0.85`, `0.90`, `0.95` |
 | `crypto_late_sure_thing_extended_min_probability` | `0.85`, `0.90`, `0.95` |
 | `crypto_late_sure_thing_min_market_probability` | `0.60`, `0.70`, `0.75`, `0.80`, `0.90` |
+| `crypto_late_sure_thing_near_strike_max_moneyness_pct` | `0.00005`, `0.0001`, `0.0002` |
+| `crypto_late_sure_thing_near_strike_min_probability` | `0.90`, `0.92`, `0.95` |
+| `crypto_late_sure_thing_reversal_guard_min_seconds_to_close` | `181`, `211`, `241` |
+| `crypto_late_sure_thing_reversal_guard_min_adverse_return_pct` | `0.00005`, `0.0001`, `0.0002` |
+| `crypto_late_sure_thing_min_target_distance_volatility` | `2.5`, `3.0`, `3.5`, `4.0` |
+| `crypto_late_sure_thing_max_loss_dollars` | `0.25`, `0.50`, `0.75`, `1.00` |
 
 Keep replay sample gates fixed during the first sweep. Once entry/timing behavior
 is understood, sweep replay thresholds separately so the analysis does not mix

@@ -4454,23 +4454,31 @@ def _crypto_dynamic_order_count_fp(
     context: RiskContext,
 ) -> tuple[Decimal, dict[str, Any]]:
     configured_default_count = quantize_count(Decimal(str(settings.crypto_default_order_count_fp)))
+    candidate_status = _crypto_signal_candidate_status(signal)
+    unit_cost = _crypto_ticket_unit_cost(ticket)
     late_override_gate = _crypto_signal_empirical_late_override_gate(signal)
     late_override_cap = (
         quantize_count(Decimal(str(settings.crypto_empirical_late_override_max_count_fp)))
         if late_override_gate is not None
         else None
     )
-    default_count = (
-        min(configured_default_count, late_override_cap)
-        if late_override_cap is not None and late_override_cap > Decimal("0")
-        else configured_default_count
+    late_high_confidence = crypto_late_sure_thing_trace(signal.candidate_trace)
+    late_high_confidence_max_loss = Decimal(str(settings.crypto_late_sure_thing_max_loss_dollars))
+    late_high_confidence_max_loss_cap = (
+        _floor_count_fp(late_high_confidence_max_loss / unit_cost)
+        if late_high_confidence and late_high_confidence_max_loss > Decimal("0") and unit_cost > Decimal("0")
+        else None
     )
+    default_cap_candidates = [configured_default_count]
+    if late_override_cap is not None and late_override_cap > Decimal("0"):
+        default_cap_candidates.append(late_override_cap)
+    if late_high_confidence_max_loss_cap is not None and late_high_confidence_max_loss_cap > Decimal("0"):
+        default_cap_candidates.append(late_high_confidence_max_loss_cap)
+    default_count = min(default_cap_candidates)
     requested_count = default_count
-    candidate_status = _crypto_signal_candidate_status(signal)
     target_pct = Decimal(str(settings.crypto_dynamic_order_target_position_pct))
     risk_pct = Decimal(str(settings.risk_position_pct))
     effective_target_pct = min(target_pct, risk_pct)
-    unit_cost = _crypto_ticket_unit_cost(ticket)
     max_order_count = Decimal(str(settings.risk_max_order_count_fp))
     max_position_count = Decimal(str(settings.risk_max_position_count_fp_per_ticker))
     current_position_count = Decimal(str(context.current_position_count_fp or Decimal("0")))
@@ -4492,6 +4500,9 @@ def _crypto_dynamic_order_count_fp(
         "empirical_bucket_late_override_cap_active": late_override_gate is not None,
         "empirical_bucket_late_override_max_count_fp": _count_text(late_override_cap),
         "empirical_bucket_late_override_reason": late_override_gate.get("override_reason") if late_override_gate else None,
+        "late_high_confidence_max_loss_cap_active": late_high_confidence_max_loss_cap is not None,
+        "crypto_late_sure_thing_max_loss_dollars": _money_text(late_high_confidence_max_loss),
+        "late_high_confidence_max_loss_count_fp": _count_text(late_high_confidence_max_loss_cap),
         "unit_cost_dollars": _money_text(unit_cost),
         "target_position_pct": float(target_pct),
         "risk_position_pct": float(risk_pct),
@@ -4539,6 +4550,8 @@ def _crypto_dynamic_order_count_fp(
     cap_candidates = [raw_count, _floor_count_fp(max_order_count), _floor_count_fp(remaining_position_count)]
     if late_override_cap is not None:
         cap_candidates.append(_floor_count_fp(late_override_cap))
+    if late_high_confidence_max_loss_cap is not None:
+        cap_candidates.append(_floor_count_fp(late_high_confidence_max_loss_cap))
     capped_count = min(cap_candidates)
     capped_count = max(Decimal("0.00"), _floor_count_fp(capped_count))
     diagnostics.update(
@@ -7522,6 +7535,146 @@ def _crypto_late_sure_thing_min_probability(
     return max(base_probability, extended_probability)
 
 
+def _crypto_late_sure_thing_near_strike_momentum_guard(
+    *,
+    side: str,
+    probability: Decimal,
+    row: dict[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    enabled = bool(settings.crypto_late_sure_thing_near_strike_momentum_guard_enabled)
+    standard_max_seconds = max(0, int(settings.crypto_late_sure_thing_standard_max_seconds_to_close))
+    max_moneyness = Decimal(str(settings.crypto_late_sure_thing_near_strike_max_moneyness_pct))
+    min_adverse_return = Decimal(str(settings.crypto_late_sure_thing_near_strike_min_adverse_return_pct))
+    min_adverse_returns = max(1, int(settings.crypto_late_sure_thing_near_strike_min_adverse_returns))
+    min_probability = Decimal(str(settings.crypto_late_sure_thing_near_strike_min_probability))
+    review: dict[str, Any] = {
+        "enabled": enabled,
+        "blocked": False,
+        "applied": False,
+        "reason": "disabled" if not enabled else "not_evaluated",
+        "standard_max_seconds_to_close": standard_max_seconds,
+        "max_moneyness_pct": str(max_moneyness),
+        "min_adverse_return_pct": str(min_adverse_return),
+        "min_adverse_returns": min_adverse_returns,
+        "min_probability": str(min_probability),
+    }
+    if not enabled:
+        return review
+    time_to_close = _optional_int(row.get("time_to_close_seconds"))
+    review["time_to_close_seconds"] = time_to_close
+    if time_to_close is None:
+        review["reason"] = "time_to_close_unknown"
+        return review
+    if time_to_close > standard_max_seconds:
+        review["reason"] = "outside_standard_late_window"
+        return review
+    moneyness = _optional_decimal(row.get("spot_moneyness_pct"))
+    review["spot_moneyness_pct"] = str(moneyness) if moneyness is not None else None
+    if moneyness is None:
+        review["reason"] = "spot_moneyness_unknown"
+        return review
+    if abs(moneyness) > max_moneyness:
+        review["reason"] = "not_near_strike"
+        return review
+    returns: list[dict[str, Any]] = []
+    adverse_returns = 0
+    normalized_side = str(side or "").lower()
+    for key in ("spot_return_1_pct", "spot_return_3_pct", "spot_return_6_pct", "spot_momentum_pct"):
+        value = _optional_decimal(row.get(key))
+        if value is None:
+            continue
+        adverse = (
+            (normalized_side == "no" and value >= min_adverse_return)
+            or (normalized_side == "yes" and value <= -min_adverse_return)
+        )
+        if adverse:
+            adverse_returns += 1
+        returns.append({"key": key, "value": str(value), "adverse": adverse})
+    review["returns"] = returns
+    review["adverse_return_count"] = adverse_returns
+    if not returns:
+        review["reason"] = "momentum_unknown"
+        return review
+    if adverse_returns < min_adverse_returns:
+        review["reason"] = "momentum_not_adverse"
+        return review
+    review["applied"] = True
+    if probability < min_probability:
+        review["blocked"] = True
+        review["reason"] = "near_strike_adverse_momentum_probability_below_min"
+        return review
+    review["reason"] = "near_strike_adverse_momentum_probability_allowed"
+    return review
+
+
+def _crypto_late_sure_thing_reversal_risk_review(
+    *,
+    side: str,
+    row: dict[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    reversal_enabled = bool(settings.crypto_late_sure_thing_reversal_guard_enabled)
+    target_distance_enabled = bool(settings.crypto_late_sure_thing_target_distance_guard_enabled)
+    min_seconds_to_close = max(0, int(settings.crypto_late_sure_thing_reversal_guard_min_seconds_to_close))
+    min_adverse_return = Decimal(str(settings.crypto_late_sure_thing_reversal_guard_min_adverse_return_pct))
+    min_target_distance = abs(Decimal(str(settings.crypto_late_sure_thing_min_target_distance_volatility)))
+    review: dict[str, Any] = {
+        "reversal_guard_enabled": reversal_enabled,
+        "target_distance_guard_enabled": target_distance_enabled,
+        "blocked": False,
+        "applied": False,
+        "reason": "not_evaluated",
+        "min_seconds_to_close": min_seconds_to_close,
+        "min_adverse_return_pct": str(min_adverse_return),
+        "min_target_distance_volatility": str(min_target_distance),
+    }
+    normalized_side = str(side or "").lower()
+    time_to_close = _optional_int(row.get("time_to_close_seconds"))
+    review["time_to_close_seconds"] = time_to_close
+    returns: list[dict[str, Any]] = []
+    adverse_returns = 0
+    for key in ("spot_return_1_pct", "spot_return_3_pct", "spot_return_6_pct", "spot_momentum_pct"):
+        value = _optional_decimal(row.get(key))
+        if value is None:
+            continue
+        adverse = (
+            (normalized_side == "no" and value >= min_adverse_return)
+            or (normalized_side == "yes" and value <= -min_adverse_return)
+        )
+        if adverse:
+            adverse_returns += 1
+        returns.append({"key": key, "value": str(value), "adverse": adverse})
+    review["returns"] = returns
+    review["adverse_return_count"] = adverse_returns
+    if reversal_enabled:
+        if time_to_close is None:
+            review["reason"] = "time_to_close_unknown"
+        elif time_to_close >= min_seconds_to_close and adverse_returns > 0:
+            review["applied"] = True
+            review["blocked"] = True
+            review["reason"] = "extended_window_adverse_momentum"
+            return review
+    target_distance = _optional_decimal(row.get("spot_target_distance_volatility"))
+    review["target_distance_volatility"] = str(target_distance) if target_distance is not None else None
+    if target_distance_enabled:
+        if target_distance is None:
+            review["reason"] = review["reason"] if review["reason"] != "not_evaluated" else "target_distance_unknown"
+            return review
+        target_distance_ok = (
+            (normalized_side == "no" and target_distance <= -min_target_distance)
+            or (normalized_side == "yes" and target_distance >= min_target_distance)
+        )
+        review["target_distance_ok"] = target_distance_ok
+        if not target_distance_ok:
+            review["applied"] = True
+            review["blocked"] = True
+            review["reason"] = "target_distance_volatility_below_min"
+            return review
+    review["reason"] = "allowed"
+    return review
+
+
 def crypto_late_sure_thing_trace(candidate_trace: dict[str, Any] | None) -> bool:
     return bool(
         isinstance(candidate_trace, dict)
@@ -7768,6 +7921,22 @@ def _crypto_trade_candidates(
             row=row,
             settings=settings,
         )
+        late_near_strike_momentum_guard = _crypto_late_sure_thing_near_strike_momentum_guard(
+            side=side,
+            probability=probability,
+            row=row,
+            settings=settings,
+        )
+        late_reversal_risk_review = _crypto_late_sure_thing_reversal_risk_review(
+            side=side,
+            row=row,
+            settings=settings,
+        )
+        late_sure_thing_base = late_sure_thing
+        if late_reversal_risk_review.get("blocked") is True:
+            late_sure_thing = False
+        if late_near_strike_momentum_guard.get("blocked") is True:
+            late_sure_thing = False
         candidate_status = "blocked_fee_edge"
         status = "blocked"
         reason = "fee_adjusted_edge_below_live_min"
@@ -7783,6 +7952,12 @@ def _crypto_trade_candidates(
             status = "eligible"
             candidate_status = CRYPTO_LIVE_QUALITY
             reason = "late_high_confidence_directional_entry"
+        elif late_sure_thing_base and late_reversal_risk_review.get("blocked") is True:
+            candidate_status = "blocked_late_reversal_risk"
+            reason = "late_high_confidence_reversal_risk_guard"
+        elif late_sure_thing_base and late_near_strike_momentum_guard.get("blocked") is True:
+            candidate_status = "blocked_near_strike_momentum"
+            reason = "late_high_confidence_near_strike_momentum_guard"
         elif expected_net_edge >= min_live_edge and live_entry_window_reason is None:
             status = "eligible"
             candidate_status = CRYPTO_LIVE_QUALITY
@@ -7883,6 +8058,8 @@ def _crypto_trade_candidates(
                 "time_to_close_seconds": row.get("time_to_close_seconds"),
                 "live_entry_window_reason": live_entry_window_reason,
                 "late_high_confidence_directional_entry": late_sure_thing,
+                "late_high_confidence_near_strike_momentum_guard": late_near_strike_momentum_guard,
+                "late_high_confidence_reversal_risk": late_reversal_risk_review,
                 "low_price_shadow_diagnostic": cost < Decimal("0.5000"),
                 "rank": None,
                 "live_eligible": candidate_status == CRYPTO_LIVE_QUALITY,

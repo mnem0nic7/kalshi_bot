@@ -216,6 +216,17 @@ class Settings(BaseSettings):
     crypto_late_sure_thing_min_probability: float = 0.85
     crypto_late_sure_thing_extended_min_probability: float = 0.90
     crypto_late_sure_thing_min_market_probability: float = 0.75
+    crypto_late_sure_thing_near_strike_momentum_guard_enabled: bool = True
+    crypto_late_sure_thing_near_strike_max_moneyness_pct: float = 0.0001
+    crypto_late_sure_thing_near_strike_min_adverse_return_pct: float = 0.0001
+    crypto_late_sure_thing_near_strike_min_adverse_returns: int = 2
+    crypto_late_sure_thing_near_strike_min_probability: float = 0.90
+    crypto_late_sure_thing_reversal_guard_enabled: bool = True
+    crypto_late_sure_thing_reversal_guard_min_seconds_to_close: int = 181
+    crypto_late_sure_thing_reversal_guard_min_adverse_return_pct: float = 0.0001
+    crypto_late_sure_thing_target_distance_guard_enabled: bool = True
+    crypto_late_sure_thing_min_target_distance_volatility: float = 3.0
+    crypto_late_sure_thing_max_loss_dollars: float = 0.50
     crypto_market_price_anchor_enabled: bool = True
     crypto_market_price_anchor_weight: float = 0.75
     crypto_autonomy_max_rooms_per_run: int = 7

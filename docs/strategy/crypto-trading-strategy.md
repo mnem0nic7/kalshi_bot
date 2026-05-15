@@ -377,7 +377,12 @@ candidates:
 5. Late high-confidence directional entries may still fall back to taker inside
    `crypto_late_sure_thing_max_seconds_to_close` when the candidate remains
    live-quality. The standard late window is 180 seconds; entries from 180-300
-   seconds before close must have model probability at least 0.90.
+   seconds before close must have model probability at least 0.90. Inside the
+   standard window, near-strike entries with recent spot momentum against the
+   selected side also require at least 0.90 model probability. In the extended
+   late window, recent adverse spot momentum blocks the late path, and available
+   target-distance features must show at least 3 volatility units of directional
+   cushion. Late high-confidence orders are also capped to $0.50 max loss.
 
 Execution blocks live orders when:
 
