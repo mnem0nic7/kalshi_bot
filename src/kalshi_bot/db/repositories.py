@@ -82,6 +82,27 @@ def _fill_fee_dollars(fill: FillRecord) -> Decimal:
     return Decimal("0")
 
 
+def _candidate_trade_ticket_client_order_ids(client_order_id: str) -> list[str]:
+    candidates: list[str] = []
+
+    def add(value: str) -> None:
+        if value and value not in candidates:
+            candidates.append(value)
+
+    raw = str(client_order_id).strip()
+    add(raw)
+    quote_base, sep, quote_num = raw.rpartition("_q")
+    if sep and quote_num.isdigit():
+        add(quote_base)
+    else:
+        quote_base = raw
+    for base in list(candidates):
+        for suffix in (":maker", ":taker"):
+            if base.endswith(suffix):
+                add(base[: -len(suffix)])
+    return candidates
+
+
 def _settled_buy_fill_pnl(fill: FillRecord) -> Decimal | None:
     if fill.action != "buy" or fill.settlement_result not in {"win", "loss"}:
         return None
@@ -1781,7 +1802,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 return found
         if client_order_id is not None:
             stmt = select(TradeTicketRecord.strategy_code).where(
-                TradeTicketRecord.client_order_id == client_order_id
+                TradeTicketRecord.client_order_id.in_(_candidate_trade_ticket_client_order_ids(client_order_id))
             )
             found = (await self.session.execute(stmt)).scalar_one_or_none()
             if found is not None:
@@ -1798,7 +1819,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             return ticket_id
         if not client_order_id:
             return None
-        stmt = select(TradeTicketRecord.id).where(TradeTicketRecord.client_order_id == client_order_id)
+        stmt = select(TradeTicketRecord.id).where(
+            TradeTicketRecord.client_order_id.in_(_candidate_trade_ticket_client_order_ids(client_order_id))
+        )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     @staticmethod
@@ -2819,29 +2842,66 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         raw: dict[str, Any],
     ) -> PositionRecord:
         env = self._resolved_kalshi_env(kalshi_env)
-        stmt = select(PositionRecord).where(
-            PositionRecord.kalshi_env == env,
-            PositionRecord.market_ticker == market_ticker,
-            PositionRecord.subaccount == subaccount,
-        )
-        existing = (await self.session.execute(stmt)).scalar_one_or_none()
-        if existing is None:
-            existing = PositionRecord(
-                market_ticker=market_ticker,
-                subaccount=subaccount,
-                kalshi_env=env,
-                side=side,
-                count_fp=count_fp,
-                average_price_dollars=average_price_dollars,
-                raw=raw,
+        now = datetime.now(UTC)
+        insert_values = {
+            "id": str(uuid4()),
+            "market_ticker": market_ticker,
+            "subaccount": subaccount,
+            "kalshi_env": env,
+            "side": side,
+            "count_fp": count_fp,
+            "average_price_dollars": average_price_dollars,
+            "raw": raw,
+            "created_at": now,
+            "updated_at": now,
+        }
+        update_values = {
+            "side": side,
+            "count_fp": count_fp,
+            "average_price_dollars": average_price_dollars,
+            "raw": raw,
+            "updated_at": now,
+        }
+        dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
+        if dialect_name == "postgresql":
+            stmt = pg_insert(PositionRecord).values(**insert_values)
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(PositionRecord).values(**insert_values)
+        else:
+            stmt = None
+        if stmt is not None:
+            await self.session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["kalshi_env", "market_ticker", "subaccount"],
+                    set_=update_values,
+                )
             )
+            await self.session.flush()
+            return (
+                await self.session.execute(
+                    select(PositionRecord).where(
+                        PositionRecord.kalshi_env == env,
+                        PositionRecord.market_ticker == market_ticker,
+                        PositionRecord.subaccount == subaccount,
+                    )
+                )
+            ).scalar_one()
+
+        existing = (
+            await self.session.execute(
+                select(PositionRecord).where(
+                    PositionRecord.kalshi_env == env,
+                    PositionRecord.market_ticker == market_ticker,
+                    PositionRecord.subaccount == subaccount,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            existing = PositionRecord(**insert_values)
             self.session.add(existing)
         else:
-            existing.kalshi_env = env
-            existing.side = side
-            existing.count_fp = count_fp
-            existing.average_price_dollars = average_price_dollars
-            existing.raw = raw
+            for key, value in update_values.items():
+                setattr(existing, key, value)
         await self.session.flush()
         return existing
 

@@ -1343,6 +1343,15 @@ class _RecordingCryptoExecution:
         )
 
 
+class _FailingCryptoExecution:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def execute(self, **kwargs) -> ExecReceiptPayload:
+        self.calls.append(kwargs)
+        raise RuntimeError("exchange side effect failed after approval")
+
+
 class _ApproveRiskEngine:
     def evaluate(self, *, ticket: TradeTicket, **kwargs) -> RiskVerdictPayload:
         del kwargs
@@ -4089,6 +4098,79 @@ async def test_crypto_workflow_dynamic_sizing_saves_ticket_and_executes_approved
     assert verdict is not None
     assert verdict.approved_count_fp == Decimal("20.00")
     assert execution.calls[0]["ticket"].count_fp == Decimal("20.00")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_workflow_commits_approved_ticket_before_external_execution_failure(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    market = _market(close_time=datetime.now(UTC) + timedelta(minutes=10), yes_bid_dollars=Decimal("0.5000"))
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    execution = _FailingCryptoExecution()
+    workflow = CryptoWorkflowService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=_FakeWorkflowMarketService(market),  # type: ignore[arg-type]
+        forecast_service=_FakeForecastService(
+            _live_quality_signal(
+                target_yes_price_dollars=Decimal("0.5000"),
+                fair_yes_dollars=Decimal("0.6500"),
+            )
+        ),  # type: ignore[arg-type]
+        risk_engine=_ApproveRiskEngine(),  # type: ignore[arg-type]
+        execution_service=execution,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await repo.set_checkpoint(
+            f"reconcile:{settings.kalshi_env}",
+            None,
+            {
+                "balance": {"balance": 10000, "portfolio_value": 0},
+                "reconciled_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC execution failure workflow", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await session.commit()
+
+    with pytest.raises(RuntimeError, match="exchange side effect failed"):
+        await workflow.run_room(room.id, reason="test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        orders = list((await session.execute(select(OrderRecord))).scalars())
+        await session.commit()
+
+    assert execution.calls
+    assert ticket is not None
+    assert ticket.status == "approved"
+    assert verdict is not None
+    assert verdict.status == RiskStatus.APPROVED.value
+    assert orders == []
     await engine.dispose()
 
 

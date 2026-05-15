@@ -3223,6 +3223,7 @@ class CryptoWorkflowService:
                 approved_ticket = approved_ticket_for_verdict(ticket, verdict)
                 await repo.update_trade_ticket_status(ticket_record.id, "approved")
                 await repo.update_room_stage(room.id, RoomStage.EXECUTING)
+                await session.commit()
                 receipt = await self.execution_service.execute(
                     room=room,
                     control=control,

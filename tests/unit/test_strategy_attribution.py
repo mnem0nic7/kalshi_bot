@@ -109,6 +109,36 @@ async def test_upsert_order_inherits_strategy_code_from_ticket(repo_factory, roo
 
 
 @pytest.mark.asyncio
+async def test_upsert_order_matches_crypto_execution_client_order_suffix(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        ticket = await repo.save_trade_ticket(
+            room_id,
+            _ticket("KXBTC15M-26MAY151445-45", ContractSide.NO),
+            client_order_id="room:crypto-ticket",
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        )
+
+        order = await repo.upsert_order(
+            client_order_id="room:crypto-ticket:maker_q1",
+            market_ticker="KXBTC15M-26MAY151445-45",
+            status="executed",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.1700"),
+            count_fp=Decimal("2.91"),
+            raw={"source": "reconcile"},
+            kalshi_order_id="kalshi-crypto-order",
+            kalshi_env="demo",
+        )
+
+        assert order.trade_ticket_id == ticket.id
+        assert order.strategy_code == StrategyCode.CRYPTO_15M.value
+        assert ticket.status == "executed"
+
+
+@pytest.mark.asyncio
 async def test_save_order_repairs_stream_placeholder_with_ticket_attribution(repo_factory, room_id):
     """Execution persistence can race websocket/reconcile order ingestion.
 
