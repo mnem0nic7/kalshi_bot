@@ -209,7 +209,7 @@ class Settings(BaseSettings):
     crypto_autonomy_min_seconds_to_close: int = 0
     crypto_late_sure_thing_enabled: bool = True
     crypto_late_sure_thing_max_seconds_to_close: int = 300
-    crypto_late_sure_thing_min_probability: float = 0.90
+    crypto_late_sure_thing_min_probability: float = 0.85
     crypto_late_sure_thing_min_market_probability: float = 0.75
     crypto_market_price_anchor_enabled: bool = True
     crypto_market_price_anchor_weight: float = 0.75
