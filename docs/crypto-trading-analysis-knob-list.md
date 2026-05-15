@@ -105,9 +105,9 @@ Use this as the candidate grid/search space for `CRYPTO_15M`.
 | Knob | Current default | Units | What to test |
 | --- | ---: | --- | --- |
 | `crypto_position_add_ons_enabled` | `True` | bool | Whether crypto-specific same-side add-ons are allowed. |
-| `crypto_position_add_on_assets` | `BTC` | asset list | Assets eligible for add-ons. |
-| `crypto_position_add_on_max_position_count_fp` | `2.0` | contracts | Max projected count for add-on exception. |
-| `crypto_position_add_on_max_ticket_count_fp` | `1.0` | contracts | Max ticket size for add-on exception. |
+| `crypto_position_add_on_assets` | `live` | asset scope/list | Assets eligible for add-ons. `live`, `all`, `any`, or `*` allow any live-quality crypto asset; CSV assets still narrow scope. |
+| `crypto_position_add_on_max_position_count_fp` | `200.0` | contracts | Max projected count for add-on exception. The 10% notional cap remains the primary limiter. |
+| `crypto_position_add_on_max_ticket_count_fp` | `500.0` | contracts | Max ticket size for add-on exception. Oversized notional can still be resized down to the 10% cap. |
 
 ## Analysis Dimensions
 

@@ -655,12 +655,58 @@ def test_risk_engine_allows_one_btc_same_side_add_on_under_cap() -> None:
     assert "crypto_position_add_on_allowed" in verdict.reason_codes
 
 
+def test_risk_engine_downsizes_live_crypto_same_side_add_on_to_position_pct_cap() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=False,
+        crypto_position_add_on_assets="live",
+        risk_max_order_notional_dollars=None,
+        risk_max_position_notional_dollars=None,
+        risk_position_pct=0.10,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXETH15M-ADDON",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=_crypto_add_on_signal(asset="ETH", side=ContractSide.YES),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("100.00"),
+            current_position_count_fp=Decimal("18.00"),
+            current_position_notional_dollars=Decimal("9.0000"),
+            current_position_side="yes",
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("2.00")
+    assert verdict.approved_notional_dollars == Decimal("1.0000")
+    assert "crypto_position_add_on_allowed" in verdict.reason_codes
+    assert "position_notional_cap_resized" in verdict.reason_codes
+    assert verdict.diagnostics["position_notional_cap"]["projected_position_notional_dollars"] == "10.0000"
+
+
 def test_risk_engine_blocks_second_opposite_non_btc_and_oversized_crypto_add_ons() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         risk_min_edge_bps=50,
         risk_min_probability_extremity_pct=0.0,
         risk_allow_position_add_ons=False,
+        crypto_position_add_on_assets="BTC",
+        crypto_position_add_on_max_position_count_fp=2.0,
+        crypto_position_add_on_max_ticket_count_fp=1.0,
     )
     engine = DeterministicRiskEngine(settings)
 

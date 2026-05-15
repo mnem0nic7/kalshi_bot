@@ -103,11 +103,28 @@ def _crypto_late_sure_thing_edge_bypass(signal: StrategySignal, context: RiskCon
 
 
 def _asset_set(value: str | None) -> set[str]:
-    return {
-        "".join(ch for ch in raw.strip().upper() if ch.isalnum())
-        for raw in str(value or "").replace(";", ",").split(",")
-        if raw.strip()
-    }
+    assets: set[str] = set()
+    for raw in str(value or "").replace(";", ",").split(","):
+        stripped = raw.strip().upper()
+        if not stripped:
+            continue
+        if stripped == "*":
+            assets.add("*")
+            continue
+        normalized = "".join(ch for ch in stripped if ch.isalnum())
+        if normalized:
+            assets.add(normalized)
+    return assets
+
+
+def _asset_allowed_by_scope(asset: str | None, configured_assets: set[str]) -> bool:
+    if asset is None:
+        return False
+    if not configured_assets:
+        return True
+    if configured_assets.intersection({"ALL", "ANY", "LIVE", "*"}):
+        return True
+    return asset in configured_assets
 
 
 def _crypto_add_on_asset(ticket: TradeTicket, candidate_trace: dict[str, Any]) -> str | None:
@@ -177,7 +194,7 @@ def _crypto_position_add_on_verdict(
         return False, {**diagnostics, "reason": "crypto_position_add_ons_disabled"}
     if strategy_code != "CRYPTO_15M":
         return False, {**diagnostics, "reason": "not_crypto_15m_strategy"}
-    if asset is None or (configured_assets and asset not in configured_assets):
+    if not _asset_allowed_by_scope(asset, configured_assets):
         return False, {**diagnostics, "reason": "crypto_position_add_on_asset_not_configured"}
     if context.current_position_count_fp <= 0:
         return False, {**diagnostics, "reason": "no_existing_position"}
@@ -563,14 +580,14 @@ class DeterministicRiskEngine:
             diagnostics["crypto_position_add_on"] = crypto_add_on_diag
             if crypto_position_add_on_allowed:
                 note(
-                    f"BTC crypto same-side add-on is within capped add-on limits "
+                    f"Crypto same-side add-on is within capped add-on limits "
                     f"({crypto_add_on_diag['projected_position_count_fp']} contracts)."
                 )
                 code("crypto_position_add_on_allowed")
             else:
                 block(
                     f"Existing live position in {room.market_ticker} blocks same-ticker add-ons; "
-                    "no pyramiding is enabled outside approved BTC crypto add-ons; "
+                    "no pyramiding is enabled outside approved crypto add-ons; "
                     f"crypto capped add-on check failed: {crypto_add_on_diag['reason']}."
                 )
                 code("crypto_position_add_on_blocked")

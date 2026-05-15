@@ -467,18 +467,21 @@ Crypto-specific add-on settings:
 | Setting | Current default | Effect |
 | --- | ---: | --- |
 | `crypto_position_add_ons_enabled` | `True` | Enables the crypto-specific same-side add-on exception. |
-| `crypto_position_add_on_assets` | `BTC` | Assets allowed to use the crypto add-on exception. |
-| `crypto_position_add_on_max_position_count_fp` | `2.0` | Max projected count for approved crypto add-ons. |
-| `crypto_position_add_on_max_ticket_count_fp` | `1.0` | Max ticket count for approved crypto add-ons. |
+| `crypto_position_add_on_assets` | `live` | Assets allowed to use the crypto add-on exception. `live`, `all`, `any`, or `*` allow any live-quality crypto asset; an explicit CSV list still narrows the scope. |
+| `crypto_position_add_on_max_position_count_fp` | `200.0` | Max projected count for approved crypto add-ons. The 10% notional cap is the primary limiter. |
+| `crypto_position_add_on_max_ticket_count_fp` | `500.0` | Max ticket count for approved crypto add-ons. The 10% notional cap can still downsize the final order. |
 
 Crypto add-ons require all of these:
 
 - Strategy is `CRYPTO_15M`.
-- Asset is in `crypto_position_add_on_assets`.
+- Asset is allowed by `crypto_position_add_on_assets`.
 - There is an existing same-side position.
 - Candidate is `live_quality`.
 - Empirical bucket gate allows it.
-- Ticket count and projected position count fit the crypto add-on caps.
+- Ticket count and projected position count fit the crypto add-on count caps.
+- If the recommendation would exceed the 10% position-notional cap but some
+  budget remains, risk downsizes the approved count to the remaining budget
+  instead of blocking only because the recommendation was oversized.
 
 ## Live Path and Readiness Knobs
 

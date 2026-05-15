@@ -261,9 +261,9 @@ class Settings(BaseSettings):
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False
     crypto_position_add_ons_enabled: bool = True
-    crypto_position_add_on_assets: str = "BTC"
-    crypto_position_add_on_max_position_count_fp: float = 2.0
-    crypto_position_add_on_max_ticket_count_fp: float = 1.0
+    crypto_position_add_on_assets: str = "live"
+    crypto_position_add_on_max_position_count_fp: float = 200.0
+    crypto_position_add_on_max_ticket_count_fp: float = 500.0
     risk_safe_capital_reserve_ratio: float = 0.0
     risk_risky_capital_max_ratio: float = 0.0
     risk_stale_market_seconds: int = 60
