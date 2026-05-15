@@ -302,14 +302,13 @@ def test_crypto_dynamic_sizing_caps_late_empirical_override_to_one_contract(tmp_
     assert diagnostics["empirical_bucket_late_override_cap_active"] is True
 
 
-def test_crypto_dynamic_sizing_caps_late_high_confidence_to_max_loss(tmp_path) -> None:
+def test_crypto_dynamic_sizing_late_high_confidence_uses_position_budget(tmp_path) -> None:
     settings = _settings(
         tmp_path,
         risk_position_pct=0.10,
         crypto_dynamic_order_target_position_pct=0.10,
         risk_max_order_count_fp=500.0,
         risk_max_position_count_fp_per_ticker=500.0,
-        crypto_late_sure_thing_max_loss_dollars=0.50,
     )
     signal = _live_quality_signal()
     signal.candidate_trace = {
@@ -324,11 +323,11 @@ def test_crypto_dynamic_sizing_caps_late_high_confidence_to_max_loss(tmp_path) -
         context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
     )
 
-    assert count == Decimal("0.57")
+    assert count == Decimal("11.49")
     assert diagnostics["raw_count_fp"] == "11.49"
-    assert diagnostics["capped_count_fp"] == "0.57"
-    assert diagnostics["late_high_confidence_max_loss_cap_active"] is True
-    assert diagnostics["late_high_confidence_max_loss_count_fp"] == "0.57"
+    assert diagnostics["capped_count_fp"] == "11.49"
+    assert "late_high_confidence_max_loss_cap_active" not in diagnostics
+    assert "late_high_confidence_max_loss_count_fp" not in diagnostics
 
 
 def test_crypto_dynamic_sizing_subtracts_current_and_pending_notional(tmp_path) -> None:

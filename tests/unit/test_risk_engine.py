@@ -873,7 +873,7 @@ def test_risk_engine_caps_crypto_late_empirical_override_ticket_to_one_contract(
     assert verdict.diagnostics["crypto_empirical_late_override"]["approved_count_fp"] == "1.0000"
 
 
-def test_risk_engine_caps_crypto_late_high_confidence_to_max_loss() -> None:
+def test_risk_engine_late_high_confidence_uses_existing_position_caps() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         risk_min_edge_bps=50,
@@ -883,7 +883,6 @@ def test_risk_engine_caps_crypto_late_high_confidence_to_max_loss() -> None:
         risk_max_position_notional_dollars=300,
         risk_position_pct=0.10,
         strategy_min_remaining_payout_bps=0,
-        crypto_late_sure_thing_max_loss_dollars=0.50,
     )
     signal = make_signal(edge_bps=300)
     signal.recommended_side = ContractSide.NO
@@ -898,7 +897,7 @@ def test_risk_engine_caps_crypto_late_high_confidence_to_max_loss() -> None:
         room=make_room(),
         control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
         ticket=TradeTicket(
-            market_ticker="KXETH15M-LATE-MAX-LOSS",
+            market_ticker="KXETH15M-LATE-POSITION-BUDGET",
             action=TradeAction.BUY,
             side=ContractSide.NO,
             yes_price_dollars=Decimal("0.1300"),
@@ -914,10 +913,9 @@ def test_risk_engine_caps_crypto_late_high_confidence_to_max_loss() -> None:
     )
 
     assert verdict.status == RiskStatus.APPROVED
-    assert verdict.approved_count_fp == Decimal("0.57")
-    assert "crypto_late_high_confidence_max_loss_cap" in verdict.reason_codes
-    assert verdict.diagnostics["crypto_late_high_confidence_max_loss"]["max_count_fp"] == "0.5700"
-    assert verdict.diagnostics["crypto_late_high_confidence_max_loss"]["approved_count_fp"] == "0.5700"
+    assert verdict.approved_count_fp == Decimal("10.00")
+    assert "crypto_late_high_confidence_max_loss_cap" not in verdict.reason_codes
+    assert "crypto_late_high_confidence_max_loss" not in verdict.diagnostics
 
 
 def test_risk_engine_blocks_near_threshold_regime() -> None:

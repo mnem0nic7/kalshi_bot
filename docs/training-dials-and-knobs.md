@@ -645,7 +645,6 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_LATE_SURE_THING_REVERSAL_GUARD_MIN_ADVERSE_RETURN_PCT` | `0.0001` | Minimum recent return that counts as adverse for the selected side. |
 | `CRYPTO_LATE_SURE_THING_TARGET_DISTANCE_GUARD_ENABLED` | `true` | Requires directional target-distance cushion when the feature is available. |
 | `CRYPTO_LATE_SURE_THING_MIN_TARGET_DISTANCE_VOLATILITY` | `3.0` | Required target distance in volatility units. |
-| `CRYPTO_LATE_SURE_THING_MAX_LOSS_DOLLARS` | `0.50` | Per-order max loss for late high-confidence entries. |
 | `CRYPTO_AUTONOMY_MAX_ROOMS_PER_RUN` | `7` | Per-run room cap. |
 | `CRYPTO_AUTONOMY_MAX_PER_ASSET_PER_RUN` | `1` | Per-asset room cap. |
 | `CRYPTO_SHADOW_EXPLORATION_MAX_CANDIDATES_PER_RUN` | `12` | Shadow candidate cap. |

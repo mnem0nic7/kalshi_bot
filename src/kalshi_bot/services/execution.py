@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -250,6 +251,86 @@ class ExecutionService:
             status="unfilled_cancelled",
             client_order_id=client_order_id,
             details={"attempts": min(attempt, _MAX_REQUOTES)},
+        )
+
+    async def execute_fixed_limit_until_close(
+        self,
+        *,
+        ticket: TradeTicket,
+        client_order_id: str,
+        close_time: datetime | None,
+        cancel_grace_seconds: int = 2,
+        poll_interval_seconds: float = _POLL_INTERVAL,
+    ) -> ExecReceiptPayload:
+        """Submit one fixed GTC limit and leave it resting until close/cancel."""
+        limit_ticket = ticket.model_copy(update={"time_in_force": KALSHI_GTC_TIME_IN_FORCE})
+        receipt = await self._place_order(limit_ticket, client_order_id)
+        order_id = receipt.external_order_id
+        if order_id is None:
+            if receipt.status.startswith("rejected_"):
+                return receipt
+            return ExecReceiptPayload(
+                status="order_id_missing",
+                client_order_id=client_order_id,
+                details=receipt.details,
+            )
+
+        deadline = close_time
+        if deadline is None:
+            deadline = datetime.now(UTC) + timedelta(seconds=_FILL_TIMEOUT)
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        deadline = deadline.astimezone(UTC) + timedelta(seconds=max(0, cancel_grace_seconds))
+        last_order: dict[str, Any] | None = None
+        while datetime.now(UTC) < deadline:
+            try:
+                resp = await self.kalshi.get_order(order_id)
+                order = resp.get("order", {})
+                last_order = order if isinstance(order, dict) else None
+                status = str(order.get("status", "") if isinstance(order, dict) else "")
+                if status in _FILL_DONE:
+                    return ExecReceiptPayload(
+                        status="filled",
+                        external_order_id=order_id,
+                        client_order_id=client_order_id,
+                        details={
+                            **(receipt.details if isinstance(receipt.details, dict) else {}),
+                            "last_poll": resp,
+                            "fixed_limit_until_close": True,
+                        },
+                    )
+                if status in _FILL_TERMINAL:
+                    return ExecReceiptPayload(
+                        status=status or "closed",
+                        external_order_id=order_id,
+                        client_order_id=client_order_id,
+                        details={
+                            **(receipt.details if isinstance(receipt.details, dict) else {}),
+                            "last_poll": resp,
+                            "fixed_limit_until_close": True,
+                        },
+                    )
+            except Exception:
+                logger.warning("poll failed for order %s", order_id, exc_info=True)
+            remaining = max(0.0, (deadline - datetime.now(UTC)).total_seconds())
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(max(0.01, poll_interval_seconds), remaining))
+
+        try:
+            await self.kalshi.cancel_order(order_id)
+        except Exception:
+            logger.warning("cancel failed for %s order %s", ticket.market_ticker, order_id, exc_info=True)
+        return ExecReceiptPayload(
+            status="unfilled_cancelled",
+            external_order_id=order_id,
+            client_order_id=client_order_id,
+            details={
+                **(receipt.details if isinstance(receipt.details, dict) else {}),
+                "fixed_limit_until_close": True,
+                "cancel_after_close": True,
+                "last_order_status": (last_order or {}).get("status"),
+            },
         )
 
     async def close_position(

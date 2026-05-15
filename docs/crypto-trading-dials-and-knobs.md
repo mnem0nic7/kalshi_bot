@@ -350,7 +350,6 @@ execution checks.
 | `crypto_late_sure_thing_reversal_guard_min_adverse_return_pct` | `0.0001` | Minimum recent return that counts as adverse for the selected side. |
 | `crypto_late_sure_thing_target_distance_guard_enabled` | `True` | Requires enough target-distance cushion when `spot_target_distance_volatility` is available. |
 | `crypto_late_sure_thing_min_target_distance_volatility` | `3.0` | Minimum directional distance from strike, in volatility units, for late high-confidence entries. |
-| `crypto_late_sure_thing_max_loss_dollars` | `0.50` | Max dollars at risk for each late high-confidence order. |
 
 Late sure-thing also affects taker fallback. If the candidate trace is marked as
 late sure thing, taker fallback is allowed only inside

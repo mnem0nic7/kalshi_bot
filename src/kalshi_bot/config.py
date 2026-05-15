@@ -226,7 +226,12 @@ class Settings(BaseSettings):
     crypto_late_sure_thing_reversal_guard_min_adverse_return_pct: float = 0.0001
     crypto_late_sure_thing_target_distance_guard_enabled: bool = True
     crypto_late_sure_thing_min_target_distance_volatility: float = 3.0
-    crypto_late_sure_thing_max_loss_dollars: float = 0.50
+    crypto_last_minute_passive_enabled: bool = True
+    crypto_last_minute_passive_assets: str = "live"
+    crypto_last_minute_passive_max_seconds_to_close: int = 60
+    crypto_last_minute_passive_bid_by_asset: str = "BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84"
+    crypto_last_minute_passive_require_no_cross: bool = True
+    crypto_last_minute_passive_risk_mode: str = "normal_cap"
     crypto_market_price_anchor_enabled: bool = True
     crypto_market_price_anchor_weight: float = 0.75
     crypto_autonomy_max_rooms_per_run: int = 7

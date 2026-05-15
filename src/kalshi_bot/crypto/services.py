@@ -90,6 +90,7 @@ CRYPTO_SETTLEMENT_BENCHMARK_SOURCE = "cfb_rti_60s_average"
 CRYPTO_SETTLEMENT_PROXY_REASON_CODE = "crypto_settlement_proxy_for_cfb_rti"
 CRYPTO_ORDER_MODE_PASSIVE_ONLY = "passive_only"
 CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER = "passive_then_taker"
+CRYPTO_LAST_MINUTE_PASSIVE_REASON = "last_minute_passive_market_confidence"
 CRYPTO_SPOT_MAX_STALE_SECONDS_BY_PROVIDER = {
     "coinbase": 5,
     "coingecko": 90,
@@ -173,6 +174,21 @@ def _normalize_asset_csv(value: str | None) -> set[str]:
             continue
         symbols.add(normalize_asset_symbol(raw))
     return symbols
+
+
+def _crypto_last_minute_passive_bid_by_asset(settings: Settings) -> dict[str, Decimal]:
+    bids: dict[str, Decimal] = {}
+    for raw in str(settings.crypto_last_minute_passive_bid_by_asset or "").replace(";", ",").split(","):
+        if ":" not in raw:
+            continue
+        symbol_raw, price_raw = raw.split(":", 1)
+        try:
+            symbol = normalize_asset_symbol(symbol_raw)
+            price = _clamp_cent_price(Decimal(str(price_raw).strip()))
+        except Exception:
+            continue
+        bids[symbol] = price
+    return bids
 
 
 def _crypto_artifact_type(base: str, asset_symbols: list[str] | None = None) -> str:
@@ -2111,6 +2127,10 @@ class CryptoForecastService:
                     "empirical_bucket_status": trace.get("empirical_bucket_status"),
                     "empirical_bucket_late_override": trace.get("empirical_bucket_late_override"),
                     "empirical_bucket_gap_sample": trace.get("empirical_bucket_gap_sample"),
+                    "last_minute_passive_market_confidence": trace.get("last_minute_passive_market_confidence") is True,
+                    "last_minute_passive": trace.get("last_minute_passive"),
+                    "last_minute_passive_bid_threshold_dollars": trace.get("last_minute_passive_bid_threshold_dollars"),
+                    "last_minute_passive_no_cross": trace.get("last_minute_passive_no_cross"),
                     "decision": "selected" if side is not None else "stand_down",
                     "status": "shadow_only" if trace.get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW else trace.get("candidate_status"),
                     "reason": trace.get("selection_reason") or ("crypto_live_trading_disabled" if not runtime_trading_enabled else None),
@@ -2869,6 +2889,25 @@ class CryptoExecutionService:
                     else None,
                 },
             )
+        if crypto_last_minute_passive_trace(signal.candidate_trace):
+            fixed_ticket = ticket.model_copy(update={"time_in_force": KALSHI_GTC_TIME_IN_FORCE})
+            receipt = await self.base_execution_service.execute_fixed_limit_until_close(
+                ticket=fixed_ticket,
+                client_order_id=f"{client_order_id}:maker",
+                close_time=market.close_time or market.expected_expiration_time,
+            )
+            receipt.details = {
+                **(receipt.details if isinstance(receipt.details, dict) else {}),
+                "crypto_order_mode": "last_minute_passive",
+                "fixed_limit_until_close": True,
+                "last_minute_passive": (
+                    ((signal.candidate_trace or {}).get("last_minute_passive") or {})
+                    if isinstance(signal.candidate_trace, dict)
+                    else {}
+                ),
+                "no_taker_fallback": True,
+            }
+            return receipt
         order_mode = str(self.settings.crypto_order_mode or CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER).strip().lower()
         passive_price = self.passive_yes_price(market, ticket.side)
         taker_fallback_checked = False
@@ -3749,6 +3788,10 @@ def _crypto_signal_payload_with_current_quote_metrics(
                 "bucket_key": trace.get("bucket_key"),
                 "empirical_bucket_gate": trace.get("empirical_bucket_gate"),
                 "empirical_bucket_status": trace.get("empirical_bucket_status"),
+                "last_minute_passive_market_confidence": trace.get("last_minute_passive_market_confidence") is True,
+                "last_minute_passive": trace.get("last_minute_passive"),
+                "last_minute_passive_bid_threshold_dollars": trace.get("last_minute_passive_bid_threshold_dollars"),
+                "last_minute_passive_no_cross": trace.get("last_minute_passive_no_cross"),
                 "decision": "selected" if action is not None else "stand_down",
                 "status": (
                     "shadow_only"
@@ -3828,6 +3871,8 @@ def _crypto_dashboard_signal_summary(market_payloads: list[dict[str, Any]]) -> d
             counts["normal_edge_trade_count"] += 1
         if trace.get("late_high_confidence_directional_entry") is True or reason == "late_high_confidence_directional_entry":
             counts["late_high_confidence_trade_count"] += 1
+        if trace.get("last_minute_passive_market_confidence") is True or reason == CRYPTO_LAST_MINUTE_PASSIVE_REASON:
+            counts["last_minute_passive_trade_count"] += 1
         gate = trace.get("empirical_bucket_gate")
         if isinstance(gate, dict):
             status = str(gate.get("status") or "unknown")
@@ -3844,6 +3889,7 @@ def _crypto_dashboard_signal_summary(market_payloads: list[dict[str, Any]]) -> d
     return {
         "normal_edge_trade_count": counts["normal_edge_trade_count"],
         "late_high_confidence_trade_count": counts["late_high_confidence_trade_count"],
+        "last_minute_passive_trade_count": counts["last_minute_passive_trade_count"],
         "empirical_bucket_allowed_count": counts["empirical_bucket_allowed_count"],
         "empirical_bucket_blocked_count": counts["empirical_bucket_blocked_count"],
         "empirical_bucket_unknown_count": counts["empirical_bucket_unknown_count"],
@@ -4243,6 +4289,7 @@ def _crypto_live_market_row(
         "mid_yes_dollars": _clamp_price(mid),
         "yes_bid_dollars": _clamp_price(market.yes_bid_dollars) if market.yes_bid_dollars is not None else None,
         "yes_ask_dollars": _clamp_price(market.yes_ask_dollars) if market.yes_ask_dollars is not None else None,
+        "no_bid_dollars": _clamp_price(market.no_bid_dollars) if market.no_bid_dollars is not None else None,
         "no_ask_dollars": _clamp_price(no_ask) if no_ask is not None else None,
         "spread_bps": market.spread_bps,
         "volume": market.volume,
@@ -4308,7 +4355,17 @@ def _crypto_recommendation(
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
     raw_prediction_side = "yes" if raw_fair_yes >= Decimal("0.5000") else "no"
     prediction_side = "yes" if trade_fair_yes >= Decimal("0.5000") else "no"
-    selected = next((candidate for candidate in candidates if candidate.get("side") == prediction_side), None)
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("last_minute_passive_market_confidence") is True
+            and candidate.get("candidate_status") == CRYPTO_LIVE_QUALITY
+        ),
+        None,
+    )
+    if selected is None:
+        selected = next((candidate for candidate in candidates if candidate.get("side") == prediction_side), None)
     if selected is None:
         edge_bps = max([int(candidate["edge_bps"]) for candidate in candidates if candidate["edge_bps"] is not None] or [0])
         return None, None, None, edge_bps, {
@@ -4327,7 +4384,7 @@ def _crypto_recommendation(
             **settlement_diagnostics,
         }
     selected_status = str(selected.get("candidate_status") or "")
-    side = ContractSide(prediction_side)
+    side = ContractSide(str(selected.get("side") or prediction_side))
     target_raw = selected.get("target_yes_price_dollars")
     target_yes = quantize_price(target_raw) if target_raw is not None else None
     edge_bps = int(selected["edge_bps"] or 0)
@@ -4347,6 +4404,10 @@ def _crypto_recommendation(
         "pre_empirical_selection_reason": selected.get("pre_empirical_reason"),
         "expected_net_edge": selected.get("expected_net_edge"),
         "late_high_confidence_directional_entry": selected.get("late_high_confidence_directional_entry") is True,
+        "last_minute_passive_market_confidence": selected.get("last_minute_passive_market_confidence") is True,
+        "last_minute_passive": selected.get("last_minute_passive"),
+        "last_minute_passive_bid_threshold_dollars": selected.get("last_minute_passive_bid_threshold_dollars"),
+        "last_minute_passive_no_cross": selected.get("last_minute_passive_no_cross"),
         "rank": selected.get("rank"),
         "bucket_key": selected.get("bucket_key"),
         "empirical_bucket_gate": selected.get("empirical_bucket_gate"),
@@ -4392,6 +4453,10 @@ def _crypto_candidate_gate_cascade(
                     "empirical_bucket_override_reason": (
                         candidate.get("empirical_bucket_gate") or {}
                     ).get("override_reason") if isinstance(candidate.get("empirical_bucket_gate"), dict) else None,
+                    "last_minute_passive_market_confidence": candidate.get("last_minute_passive_market_confidence") is True,
+                    "last_minute_passive_reason": (
+                        candidate.get("last_minute_passive") or {}
+                    ).get("reason") if isinstance(candidate.get("last_minute_passive"), dict) else None,
                 },
             }
         )
@@ -4462,18 +4527,9 @@ def _crypto_dynamic_order_count_fp(
         if late_override_gate is not None
         else None
     )
-    late_high_confidence = crypto_late_sure_thing_trace(signal.candidate_trace)
-    late_high_confidence_max_loss = Decimal(str(settings.crypto_late_sure_thing_max_loss_dollars))
-    late_high_confidence_max_loss_cap = (
-        _floor_count_fp(late_high_confidence_max_loss / unit_cost)
-        if late_high_confidence and late_high_confidence_max_loss > Decimal("0") and unit_cost > Decimal("0")
-        else None
-    )
     default_cap_candidates = [configured_default_count]
     if late_override_cap is not None and late_override_cap > Decimal("0"):
         default_cap_candidates.append(late_override_cap)
-    if late_high_confidence_max_loss_cap is not None and late_high_confidence_max_loss_cap > Decimal("0"):
-        default_cap_candidates.append(late_high_confidence_max_loss_cap)
     default_count = min(default_cap_candidates)
     requested_count = default_count
     target_pct = Decimal(str(settings.crypto_dynamic_order_target_position_pct))
@@ -4500,9 +4556,6 @@ def _crypto_dynamic_order_count_fp(
         "empirical_bucket_late_override_cap_active": late_override_gate is not None,
         "empirical_bucket_late_override_max_count_fp": _count_text(late_override_cap),
         "empirical_bucket_late_override_reason": late_override_gate.get("override_reason") if late_override_gate else None,
-        "late_high_confidence_max_loss_cap_active": late_high_confidence_max_loss_cap is not None,
-        "crypto_late_sure_thing_max_loss_dollars": _money_text(late_high_confidence_max_loss),
-        "late_high_confidence_max_loss_count_fp": _count_text(late_high_confidence_max_loss_cap),
         "unit_cost_dollars": _money_text(unit_cost),
         "target_position_pct": float(target_pct),
         "risk_position_pct": float(risk_pct),
@@ -4550,8 +4603,6 @@ def _crypto_dynamic_order_count_fp(
     cap_candidates = [raw_count, _floor_count_fp(max_order_count), _floor_count_fp(remaining_position_count)]
     if late_override_cap is not None:
         cap_candidates.append(_floor_count_fp(late_override_cap))
-    if late_high_confidence_max_loss_cap is not None:
-        cap_candidates.append(_floor_count_fp(late_high_confidence_max_loss_cap))
     capped_count = min(cap_candidates)
     capped_count = max(Decimal("0.00"), _floor_count_fp(capped_count))
     diagnostics.update(
@@ -7682,6 +7733,98 @@ def crypto_late_sure_thing_trace(candidate_trace: dict[str, Any] | None) -> bool
     )
 
 
+def crypto_last_minute_passive_trace(candidate_trace: dict[str, Any] | None) -> bool:
+    return bool(
+        isinstance(candidate_trace, dict)
+        and candidate_trace.get("last_minute_passive_market_confidence") is True
+    )
+
+
+def _crypto_last_minute_passive_enabled_for_asset(
+    row: dict[str, Any],
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+) -> bool:
+    if not bool(settings.crypto_last_minute_passive_enabled):
+        return False
+    asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
+    configured = _normalize_asset_csv(settings.crypto_last_minute_passive_assets)
+    if not configured:
+        return True
+    if asset in configured:
+        return True
+    if "LIVE" not in configured:
+        return False
+    return (
+        crypto_policy is not None
+        and (crypto_policy.asset_modes or {}).get(asset) == CRYPTO_ASSET_MODE_LIVE
+    )
+
+
+def _crypto_last_minute_passive_review(
+    *,
+    side: str,
+    row: dict[str, Any],
+    cost: Decimal,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+) -> dict[str, Any]:
+    asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
+    bids = _crypto_last_minute_passive_bid_by_asset(settings)
+    threshold = bids.get(asset)
+    time_to_close = _optional_int(row.get("time_to_close_seconds"))
+    market_side_probability = _crypto_market_side_probability(row, side)
+    max_seconds = max(0, int(settings.crypto_last_minute_passive_max_seconds_to_close))
+    review: dict[str, Any] = {
+        "enabled": bool(settings.crypto_last_minute_passive_enabled),
+        "allowed": False,
+        "reason": "last_minute_passive_not_allowed",
+        "asset_symbol": asset,
+        "side": side,
+        "time_to_close_seconds": time_to_close,
+        "max_seconds_to_close": max_seconds,
+        "bid_threshold_dollars": _money_text(threshold),
+        "market_side_probability": (
+            str(market_side_probability.quantize(Decimal("0.0001")))
+            if market_side_probability is not None
+            else None
+        ),
+        "current_side_ask_dollars": _money_text(cost),
+        "require_no_cross": bool(settings.crypto_last_minute_passive_require_no_cross),
+        "risk_mode": str(settings.crypto_last_minute_passive_risk_mode or ""),
+    }
+    if not review["enabled"]:
+        return {**review, "reason": "last_minute_passive_disabled"}
+    if not _crypto_last_minute_passive_enabled_for_asset(
+        row,
+        settings=settings,
+        crypto_policy=crypto_policy,
+    ):
+        return {**review, "reason": "asset_not_configured_for_last_minute_passive"}
+    if threshold is None:
+        return {**review, "reason": "asset_missing_last_minute_passive_bid"}
+    if time_to_close is None:
+        return {**review, "reason": "time_to_close_unknown"}
+    if time_to_close <= 0:
+        return {**review, "reason": "market_closed"}
+    if time_to_close > max_seconds:
+        return {**review, "reason": "outside_last_minute_passive_window"}
+    if market_side_probability is None:
+        return {**review, "reason": "market_side_probability_unknown"}
+    if market_side_probability <= threshold:
+        return {**review, "reason": "market_confidence_below_last_minute_bid"}
+    if bool(settings.crypto_last_minute_passive_require_no_cross) and cost <= threshold:
+        return {**review, "reason": "last_minute_passive_would_cross_touch"}
+    expected_edge = market_side_probability - threshold
+    return {
+        **review,
+        "allowed": True,
+        "reason": CRYPTO_LAST_MINUTE_PASSIVE_REASON,
+        "expected_edge_dollars": str(expected_edge.quantize(Decimal("0.0001"))),
+    }
+
+
 def _crypto_configured_market_price_anchor_weight(settings: Settings) -> Decimal:
     if not bool(settings.crypto_market_price_anchor_enabled):
         return Decimal("0")
@@ -7913,6 +8056,13 @@ def _crypto_trade_candidates(
         model_winner = side == predicted_winner_side
         raw_model_winner = side == raw_predicted_winner_side
         market_side_probability = _crypto_market_side_probability(row, side)
+        last_minute_passive_review = _crypto_last_minute_passive_review(
+            side=side,
+            row=row,
+            cost=cost,
+            settings=settings,
+            crypto_policy=crypto_policy,
+        )
         late_sure_thing = _crypto_late_sure_thing_candidate(
             side=side,
             model_winner=model_winner,
@@ -7968,7 +8118,30 @@ def _crypto_trade_candidates(
             reason = live_entry_window_reason or "broad_shadow_exploration"
         elif spread_bps > max_shadow_spread:
             reason = "spread_above_shadow_exploration_max"
-        bucket_key = _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(cost)})
+        execution_cost = cost
+        last_minute_passive = last_minute_passive_review.get("allowed") is True
+        if last_minute_passive:
+            execution_cost = _decimal(last_minute_passive_review["bid_threshold_dollars"])
+            target_yes = execution_cost if side == "yes" else Decimal("1.0000") - execution_cost
+            remaining_payout = Decimal("1.0000") - execution_cost
+            market_edge = (market_side_probability or Decimal("0")) - execution_cost
+            fee = estimate_kalshi_taker_fee_dollars(
+                price_dollars=execution_cost,
+                count=Decimal("1.00"),
+                fee_rate=Decimal(str(settings.kalshi_taker_fee_rate)),
+            )
+            expected_net_edge = market_edge - fee
+            raw_edge_bps = int((market_edge * Decimal("10000")).to_integral_value())
+            status = "eligible"
+            candidate_status = CRYPTO_LIVE_QUALITY
+            reason = CRYPTO_LAST_MINUTE_PASSIVE_REASON
+        elif (
+            last_minute_passive_review.get("reason") == "last_minute_passive_would_cross_touch"
+            and candidate_status != CRYPTO_LIVE_QUALITY
+        ):
+            candidate_status = "blocked_last_minute_passive"
+            reason = "last_minute_passive_would_cross_touch"
+        bucket_key = _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(execution_cost)})
         pre_empirical_status = candidate_status
         pre_empirical_reason = reason
         empirical_bucket_gate = _crypto_empirical_bucket_gate_for_candidate(
@@ -7990,6 +8163,7 @@ def _crypto_trade_candidates(
         )
         if (
             candidate_status == CRYPTO_LIVE_QUALITY
+            and not last_minute_passive
             and empirical_bucket_gate.get("enforced") is True
             and empirical_bucket_gate.get("status") != "allowed"
         ):
@@ -8010,7 +8184,7 @@ def _crypto_trade_candidates(
                 "pre_empirical_candidate_status": pre_empirical_status,
                 "pre_empirical_reason": pre_empirical_reason,
                 "target_yes_price_dollars": _money_text(_clamp_price(target_yes)),
-                "execution_price_dollars": _money_text(_clamp_price(cost)),
+                "execution_price_dollars": _money_text(_clamp_price(execution_cost)),
                 "edge_bps": raw_edge_bps,
                 "expected_net_edge": str(expected_net_edge.quantize(Decimal("0.0001"))),
                 "model_probability": str(probability.quantize(Decimal("0.0001"))),
@@ -8032,7 +8206,7 @@ def _crypto_trade_candidates(
                 "empirical_bucket_gap_sample": _crypto_empirical_bucket_gap_sample(
                     row,
                     side=side,
-                    cost=cost,
+                    cost=execution_cost,
                     target_yes=target_yes,
                     pre_empirical_status=pre_empirical_status,
                     pre_empirical_reason=pre_empirical_reason,
@@ -8060,7 +8234,13 @@ def _crypto_trade_candidates(
                 "late_high_confidence_directional_entry": late_sure_thing,
                 "late_high_confidence_near_strike_momentum_guard": late_near_strike_momentum_guard,
                 "late_high_confidence_reversal_risk": late_reversal_risk_review,
-                "low_price_shadow_diagnostic": cost < Decimal("0.5000"),
+                "last_minute_passive_market_confidence": last_minute_passive,
+                "last_minute_passive": last_minute_passive_review,
+                "last_minute_passive_bid_threshold_dollars": last_minute_passive_review.get("bid_threshold_dollars"),
+                "last_minute_passive_no_cross": (
+                    last_minute_passive_review.get("reason") != "last_minute_passive_would_cross_touch"
+                ),
+                "low_price_shadow_diagnostic": execution_cost < Decimal("0.5000"),
                 "rank": None,
                 "live_eligible": candidate_status == CRYPTO_LIVE_QUALITY,
                 **settlement_diagnostics,
@@ -8068,6 +8248,7 @@ def _crypto_trade_candidates(
         )
     candidates.sort(
         key=lambda item: (
+            item.get("last_minute_passive_market_confidence") is True,
             item.get("model_winner") is True,
             _decimal(item.get("model_probability") or Decimal("-1")),
             _decimal(item.get("expected_net_edge") or Decimal("-999")),

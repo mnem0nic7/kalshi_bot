@@ -102,6 +102,12 @@ def _crypto_late_sure_thing_edge_bypass(signal: StrategySignal, context: RiskCon
     return strategy_code == "CRYPTO_15M" and trace.get("late_high_confidence_directional_entry") is True
 
 
+def _crypto_last_minute_passive_edge_bypass(signal: StrategySignal, context: RiskContext) -> bool:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    strategy_code = str(context.strategy_code or trace.get("strategy_code") or "")
+    return strategy_code == "CRYPTO_15M" and trace.get("last_minute_passive_market_confidence") is True
+
+
 def _asset_set(value: str | None) -> set[str]:
     assets: set[str] = set()
     for raw in str(value or "").replace(";", ",").split(","):
@@ -374,6 +380,8 @@ class DeterministicRiskEngine:
         gross_edge_bps = signal.edge_bps
         candidate_trace = dict(signal.candidate_trace or {})
         late_sure_thing_edge_bypass = _crypto_late_sure_thing_edge_bypass(signal, context)
+        last_minute_passive_edge_bypass = _crypto_last_minute_passive_edge_bypass(signal, context)
+        edge_floor_bypass = late_sure_thing_edge_bypass or last_minute_passive_edge_bypass
         policy_service = DecisionPolicyVariantService(self.settings)
         applied_policy_variant = candidate_trace.get("policy_variant_applied")
         fee_estimate_dollars_per_contract: Decimal | None = None
@@ -439,8 +447,14 @@ class DeterministicRiskEngine:
         if signal.eligibility is not None and not signal.eligibility.eligible:
             for reason in signal.eligibility.reasons:
                 block(reason)
-        if signal.edge_bps < active_thresholds.risk_min_edge_bps and not late_sure_thing_edge_bypass:
+        if signal.edge_bps < active_thresholds.risk_min_edge_bps and not edge_floor_bypass:
             block(f"Edge {signal.edge_bps}bps is below configured minimum of {active_thresholds.risk_min_edge_bps}bps.")
+        elif signal.edge_bps < active_thresholds.risk_min_edge_bps and last_minute_passive_edge_bypass:
+            note(
+                f"Last-minute passive market-confidence entry bypassed the model edge floor "
+                f"({signal.edge_bps}bps versus {active_thresholds.risk_min_edge_bps}bps)."
+            )
+            code("last_minute_passive_edge_bypass")
         elif signal.edge_bps < active_thresholds.risk_min_edge_bps:
             note(
                 f"Late high-confidence crypto model choice bypassed the edge floor "
@@ -573,6 +587,13 @@ class DeterministicRiskEngine:
             block("Research data is stale.")
             code("research_stale")
 
+        if is_buy_entry and last_minute_passive_edge_bypass and context.pending_order_count_fp > 0:
+            block(
+                f"Existing pending same-side order in {room.market_ticker} blocks duplicate "
+                "last-minute passive entry."
+            )
+            code("last_minute_passive_duplicate_open_order")
+
         late_override_gate = _crypto_empirical_late_override_gate(candidate_trace)
         if is_buy_entry and context.strategy_code == "CRYPTO_15M" and late_override_gate is not None:
             late_override_cap = quantize_count(
@@ -608,46 +629,6 @@ class DeterministicRiskEngine:
                     f"{original_count:.2f} to {approved_count:.2f} contracts."
                 )
                 code("crypto_late_empirical_override_count_cap")
-
-        if is_buy_entry and late_sure_thing_edge_bypass:
-            max_loss_dollars = Decimal(str(self.settings.crypto_late_sure_thing_max_loss_dollars))
-            max_loss_count = (
-                (max_loss_dollars / contract_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                if max_loss_dollars > Decimal("0") and contract_price > Decimal("0")
-                else Decimal("0.00")
-            )
-            diagnostics["crypto_late_high_confidence_max_loss"] = {
-                "active": True,
-                "max_loss_dollars": _decimal_text(max_loss_dollars),
-                "unit_loss_dollars": _decimal_text(contract_price),
-                "max_count_fp": _decimal_text(max_loss_count),
-                "original_count_fp": _decimal_text(approved_count),
-            }
-            if max_loss_dollars <= Decimal("0"):
-                block("Crypto late high-confidence max-loss cap is non-positive.")
-                code("crypto_late_high_confidence_max_loss_invalid_cap")
-            elif max_loss_count < Decimal("0.01"):
-                block("Crypto late high-confidence max-loss cap cannot fit the 0.01 minimum count.")
-                code("crypto_late_high_confidence_max_loss_no_fit")
-            elif approved_count > max_loss_count:
-                original_count = approved_count
-                approved_count = quantize_count(max_loss_count)
-                approved_notional = _quantize_money(
-                    estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, approved_count)
-                )
-                order_notional = approved_notional
-                diagnostics["crypto_late_high_confidence_max_loss"].update(
-                    {
-                        "resized": True,
-                        "approved_count_fp": _decimal_text(approved_count),
-                        "approved_order_notional_dollars": _decimal_text(order_notional),
-                    }
-                )
-                note(
-                    f"Late high-confidence crypto max-loss cap downsized ticket from "
-                    f"{original_count:.2f} to {approved_count:.2f} contracts."
-                )
-                code("crypto_late_high_confidence_max_loss_cap")
 
         max_order_count_fp = weather_live_max_order_count_fp(
             control=control,
@@ -913,13 +894,19 @@ class DeterministicRiskEngine:
                 count_fp=approved_count,
                 gross_edge_bps=gross_edge_bps,
             )
-            if net_edge_bps < active_thresholds.risk_min_edge_bps and not late_sure_thing_edge_bypass:
+            if net_edge_bps < active_thresholds.risk_min_edge_bps and not edge_floor_bypass:
                 block(
                     f"Fee-adjusted edge {net_edge_bps}bps is below configured minimum of "
                     f"{active_thresholds.risk_min_edge_bps}bps "
                     f"(gross {gross_edge_bps}bps, estimated taker fee {fee_edge_bps}bps)."
                 )
                 code("fee_adjusted_edge_below_min")
+            elif net_edge_bps < active_thresholds.risk_min_edge_bps and last_minute_passive_edge_bypass:
+                note(
+                    f"Last-minute passive market-confidence entry bypassed the fee-adjusted edge floor "
+                    f"({net_edge_bps}bps versus {active_thresholds.risk_min_edge_bps}bps)."
+                )
+                code("last_minute_passive_fee_adjusted_edge_bypass")
             elif net_edge_bps < active_thresholds.risk_min_edge_bps:
                 note(
                     f"Late high-confidence crypto model choice bypassed the fee-adjusted edge floor "

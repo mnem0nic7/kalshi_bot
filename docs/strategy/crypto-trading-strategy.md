@@ -382,7 +382,7 @@ candidates:
    selected side also require at least 0.90 model probability. In the extended
    late window, recent adverse spot momentum blocks the late path, and available
    target-distance features must show at least 3 volatility units of directional
-   cushion. Late high-confidence orders are also capped to $0.50 max loss.
+   cushion.
 
 Execution blocks live orders when:
 
