@@ -140,6 +140,31 @@ class FakeCryptoSpotService:
         return {"status": "ok", "stored": 1}
 
 
+class FakeCryptoAutonomyService:
+    def __init__(self) -> None:
+        self.run_once_calls: list[dict[str, object]] = []
+        self.first_finished = asyncio.Event()
+        self.second_started = asyncio.Event()
+        self.overlapped = False
+        self._running = False
+
+    async def run_once(self, **kwargs: object) -> dict[str, object]:
+        if self._running:
+            self.overlapped = True
+        self._running = True
+        self.run_once_calls.append(kwargs)
+        try:
+            if len(self.run_once_calls) == 1:
+                await asyncio.sleep(0.01)
+                self.first_finished.set()
+            elif len(self.run_once_calls) == 2:
+                if self.first_finished.is_set():
+                    self.second_started.set()
+        finally:
+            self._running = False
+        return {"status": "ok"}
+
+
 class FakeHistoricalTrainingService:
     def __init__(self) -> None:
         self.capture_calls = 0
@@ -637,6 +662,62 @@ async def test_crypto_spot_current_loop_collects_immediately_for_active_color(tm
         await asyncio.gather(task, return_exceptions=True)
 
     assert spot_service.collect_current_calls == [{"frequency": "15m"}]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_autonomy_loop_runs_next_pass_as_soon_as_previous_finishes(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-crypto-autonomy-continuous.db",
+        kalshi_env="production",
+        app_color="blue",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        daemon_startup_grace_seconds=0,
+        daemon_startup_jitter_seconds=0,
+        crypto_autonomy_interval_seconds=30,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.ensure_deployment_control(
+            "blue",
+            kalshi_env="production",
+            initial_active_color="blue",
+            initial_kill_switch_enabled=False,
+        )
+        await session.commit()
+
+    autonomy_service = FakeCryptoAutonomyService()
+    daemon = DaemonService(
+        settings,
+        session_factory,
+        WeatherMarketDirectory({}),
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),  # type: ignore[arg-type]
+        crypto_autonomy_service=autonomy_service,  # type: ignore[arg-type]
+    )
+
+    task = asyncio.create_task(daemon._periodic_crypto_autonomy_loop())
+    try:
+        await asyncio.wait_for(autonomy_service.second_started.wait(), timeout=1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert autonomy_service.overlapped is False
+    assert autonomy_service.run_once_calls[:2] == [{"frequency": "15m"}, {"frequency": "15m"}]
 
     await engine.dispose()
 

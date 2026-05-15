@@ -393,7 +393,7 @@ opposite-side gates still apply.
 
 | Setting or CLI flag | Current default | Effect |
 | --- | ---: | --- |
-| `crypto_autonomy_interval_seconds` | `30` | Scheduled autonomy cadence. |
+| `crypto_autonomy_interval_seconds` | `30` | Idle retry interval when the daemon cannot run autonomy. On the active color, autonomy runs continuously and starts the next pass as soon as the prior pass finishes. |
 | `crypto_autonomy_min_seconds_to_close` | `0` | Minimum seconds-to-close filter for autonomy. `0` keeps evaluating until close. |
 | `crypto_live_min_market_age_seconds` | `180` | Minimum market age before live-quality entry. |
 | `crypto_autonomy_max_rooms_per_run` | `7` | Max crypto rooms per autonomy run. |
