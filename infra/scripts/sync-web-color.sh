@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-reason="${1:-systemd_boot}"
+target_env="${1:-all}"
 compose_file="infra/docker-compose.yml"
 compose_env_file="--env-file .env"
 
-build_app_image() {
-  docker compose -f "${compose_file}" ${compose_env_file} build migrate_demo >/dev/null
-}
+if [[ "${target_env}" != "all" && "${target_env}" != "demo" && "${target_env}" != "production" ]]; then
+  echo "env must be demo, production, or all" >&2
+  exit 1
+fi
 
 service_health() {
   local service="$1"
@@ -56,12 +57,6 @@ wait_for_services_health() {
   return "${status}"
 }
 
-run_migrate() {
-  local env_name="$1"
-  shift
-  docker compose -f "${compose_file}" ${compose_env_file} run --rm --no-deps "migrate_${env_name}" "$@"
-}
-
 run_control() {
   local env_name="$1"
   shift
@@ -76,41 +71,55 @@ run_control() {
     docker compose -f "${compose_file}" ${compose_env_file} exec -T "${secondary_service}" "${cmd[@]}"
     return
   fi
-  run_migrate "${env_name}" "${cmd[@]}"
+  docker compose -f "${compose_file}" ${compose_env_file} run --rm --no-deps "migrate_${env_name}" "${cmd[@]}"
+}
+
+active_color_for_env() {
+  local env_name="$1"
+  run_control "${env_name}" python -m kalshi_bot.cli status \
+    | python3 -c 'import json, sys
+payload = json.load(sys.stdin)
+color = payload.get("active_color")
+if color not in {"blue", "green"}:
+    raise SystemExit(f"unexpected active_color: {color!r}")
+print(color)'
 }
 
 docker compose -f "${compose_file}" ${compose_env_file} config >/dev/null
-build_app_image
-docker compose -f "${compose_file}" ${compose_env_file} up -d postgres_demo postgres_production
-wait_for_services_health 60 postgres_demo postgres_production
-run_migrate demo &
-demo_migrate_pid="$!"
-run_migrate production &
-production_migrate_pid="$!"
-migrate_status=0
-if ! wait "${demo_migrate_pid}"; then
-  migrate_status=1
-fi
-if ! wait "${production_migrate_pid}"; then
-  migrate_status=1
-fi
-if [[ "${migrate_status}" -ne 0 ]]; then
-  exit "${migrate_status}"
-fi
-docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build \
-  app_demo_blue app_demo_green daemon_demo_blue daemon_demo_green \
-  app_production_blue app_production_green daemon_production_blue daemon_production_green
-wait_for_services_health 180 \
-  app_demo_blue app_demo_green app_production_blue app_production_green
-infra/scripts/sync-web-color.sh all
-# Stop and remove caddy explicitly before recreating to avoid Docker compose
-# removal-in-progress races during full machine recovery.
-docker compose -f "${compose_file}" ${compose_env_file} stop caddy 2>/dev/null || true
-docker compose -f "${compose_file}" ${compose_env_file} rm -f caddy 2>/dev/null || true
-docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps --force-recreate caddy
-wait_for_service_health caddy 90
 
-run_control demo python -m kalshi_bot.cli watchdog mark-boot --status success --reason "${reason}"
-run_control production python -m kalshi_bot.cli watchdog mark-boot --status success --reason "${reason}"
+demo_color=""
+production_color=""
+if [[ "${target_env}" == "all" || "${target_env}" == "demo" ]]; then
+  demo_color="$(active_color_for_env demo)"
+fi
+if [[ "${target_env}" == "all" || "${target_env}" == "production" ]]; then
+  production_color="$(active_color_for_env production)"
+fi
+if [[ -z "${demo_color}" ]]; then
+  demo_color="$(active_color_for_env demo 2>/dev/null || true)"
+fi
+if [[ -z "${demo_color}" ]]; then
+  demo_color="${production_color:-${WEB_APP_COLOR:-blue}}"
+fi
+if [[ -z "${production_color}" ]]; then
+  production_color="${demo_color:-${WEB_APP_COLOR:-blue}}"
+fi
 
-echo "Started Kalshi Bot stack (${reason})"
+export WEB_DEMO_APP_COLOR="${demo_color}"
+export WEB_STRATEGIES_APP_COLOR="${demo_color}"
+export WEB_PRODUCTION_APP_COLOR="${production_color}"
+
+web_services=()
+if [[ "${target_env}" == "all" || "${target_env}" == "demo" ]]; then
+  web_services+=("web_demo")
+fi
+if [[ "${target_env}" == "all" || "${target_env}" == "production" ]]; then
+  web_services+=("web_production")
+fi
+web_services+=("web_strategies")
+
+docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps --force-recreate \
+  "${web_services[@]}"
+wait_for_services_health 180 "${web_services[@]}"
+
+echo "Synced web app colors: demo=${WEB_DEMO_APP_COLOR}, production=${WEB_PRODUCTION_APP_COLOR}, strategies=${WEB_STRATEGIES_APP_COLOR}"

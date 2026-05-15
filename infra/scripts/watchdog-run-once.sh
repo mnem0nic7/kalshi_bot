@@ -97,6 +97,7 @@ execute_plan() {
     failover)
       if docker compose -f "${compose_file}" ${compose_env_file} restart "app_${env_name}_${failed}" "daemon_${env_name}_${failed}"; then
         record_action "${env_name}" "failover" "succeeded" "${reason}" "${target}" "${failed}"
+        ./infra/scripts/sync-web-color.sh "${env_name}"
       else
         record_action "${env_name}" "failover" "failed" "${reason}" "${target}" "${failed}"
         return 1

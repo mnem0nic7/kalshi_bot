@@ -102,17 +102,7 @@ for env_name in "${envs[@]}"; do
   wait_for_service_health "${app_service}" 180
 done
 
-web_services=("web_strategies")
-if [[ "${target_env}" == "all" || "${target_env}" == "demo" ]]; then
-  web_services+=("web_demo")
-fi
-if [[ "${target_env}" == "all" || "${target_env}" == "production" ]]; then
-  web_services+=("web_production")
-fi
-
-docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps --force-recreate \
-  "${web_services[@]}"
-wait_for_services_health 180 "${web_services[@]}"
+infra/scripts/sync-web-color.sh "${target_env}"
 
 if [[ "${refresh_caddy}" == "true" ]]; then
   # Stop and remove caddy explicitly before recreating to avoid removal-in-progress errors.

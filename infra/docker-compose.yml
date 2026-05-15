@@ -328,7 +328,7 @@ services:
     <<: *demo-app-base
     environment:
       <<: *demo-web-env
-      APP_COLOR: ${WEB_APP_COLOR:-blue}
+      APP_COLOR: ${WEB_DEMO_APP_COLOR:-${WEB_APP_COLOR:-blue}}
       KALSHI_ENV: demo
       WEB_SITE_KIND: demo
 
@@ -336,7 +336,7 @@ services:
     <<: *production-app-base
     environment:
       <<: *production-web-env
-      APP_COLOR: ${WEB_APP_COLOR:-blue}
+      APP_COLOR: ${WEB_PRODUCTION_APP_COLOR:-${WEB_APP_COLOR:-blue}}
       KALSHI_ENV: production
       WEB_SITE_KIND: production
 
@@ -344,7 +344,7 @@ services:
     <<: *demo-app-base
     environment:
       <<: *demo-web-env
-      APP_COLOR: ${WEB_APP_COLOR:-blue}
+      APP_COLOR: ${WEB_STRATEGIES_APP_COLOR:-${WEB_DEMO_APP_COLOR:-${WEB_APP_COLOR:-blue}}}
       KALSHI_ENV: demo
       WEB_SITE_KIND: strategies
       POSTGRES_SECONDARY_HOST: postgres_production
