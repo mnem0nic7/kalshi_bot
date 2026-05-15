@@ -330,8 +330,14 @@
     const edge = candidateEdgeSummary(candidate, trace, signal);
     const status = candidateStatusLabel(candidate, trace);
     const bucket = empiricalBucketLabel(candidate, trace);
+    const lastMinuteSource =
+      candidate.last_minute_price_source === "learned_price_matrix"
+        ? "matrix"
+        : candidate.last_minute_price_source === "fixed_bid"
+          ? "fixed"
+          : "";
     const lastMinute = candidate.last_minute_passive_market_confidence
-      ? `last-minute passive @ ${price(candidate.last_minute_passive_bid_threshold_dollars)}`
+      ? `last-minute ${lastMinuteSource ? lastMinuteSource + " " : ""}@ ${price(candidate.last_minute_passive_bid_threshold_dollars)}`
       : "";
     return [edge, status, lastMinute, bucket].filter(Boolean).join(" · ");
   }
@@ -380,6 +386,8 @@
       ["Normal Edge", signalSummary.normal_edge_trade_count || 0],
       ["Late Bypass", signalSummary.late_high_confidence_trade_count || 0],
       ["Last Minute", signalSummary.last_minute_passive_trade_count || 0],
+      ["LM Matrix", signalSummary.last_minute_passive_learned_price_count || 0],
+      ["LM Fixed", signalSummary.last_minute_passive_fixed_fallback_count || 0],
       ["Bucket Override", signalSummary.empirical_bucket_override_count || 0],
       ["Buckets", `${signalSummary.empirical_bucket_allowed_count || 0}/${signalSummary.empirical_bucket_blocked_count || 0}/${signalSummary.empirical_bucket_unknown_count || 0}`],
       ["Updated", timeLabel((state.payload || {}).updated_at)],

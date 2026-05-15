@@ -34,6 +34,13 @@ Use this as the candidate grid/search space for `CRYPTO_15M`.
 | `crypto_last_minute_passive_bid_by_asset` | `BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84` | map | Asset-specific passive bid thresholds. |
 | `crypto_last_minute_passive_require_no_cross` | `True` | bool | Require the configured passive bid to sit below the current ask. |
 | `crypto_last_minute_passive_risk_mode` | `normal_cap` | enum | Uses standard dynamic sizing and the 10% position cap. |
+| `crypto_last_minute_passive_price_matrix_enabled` | `True` | bool | Use learned final-minute bid pricing before falling back to fixed thresholds. |
+| `crypto_last_minute_passive_price_matrix_min_samples` | `30` | count | Minimum covered signals for a learned bid row. |
+| `crypto_last_minute_passive_price_matrix_min_fills` | `3` | count | Minimum simulated fills for a learned bid row. |
+| `crypto_last_minute_passive_price_matrix_min_fill_rate` | `0.10` | probability | Minimum simulated fill probability for a learned bid row. |
+| `crypto_last_minute_passive_price_matrix_min_net_pnl_dollars` | `0.0` | dollars | Minimum fee-adjusted net P/L for a learned bid row. |
+| `crypto_last_minute_passive_price_matrix_fallback` | `fixed_bid` | enum | Runtime fallback when no mature learned bid is available. |
+| `crypto_last_minute_passive_price_ladder` | `0.01:0.99:0.01` | range | Candidate passive bids evaluated in replay. |
 
 ## Late Sure-Thing Path
 

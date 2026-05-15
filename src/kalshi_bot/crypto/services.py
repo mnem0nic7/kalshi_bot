@@ -191,6 +191,38 @@ def _crypto_last_minute_passive_bid_by_asset(settings: Settings) -> dict[str, De
     return bids
 
 
+def _crypto_last_minute_passive_price_ladder(settings: Settings) -> list[Decimal]:
+    raw_value = str(settings.crypto_last_minute_passive_price_ladder or "").strip()
+    values: set[Decimal] = set()
+    if raw_value.count(":") == 2:
+        start_raw, end_raw, step_raw = raw_value.split(":", 2)
+        try:
+            current = _clamp_cent_price(Decimal(start_raw.strip()))
+            end = _clamp_cent_price(Decimal(end_raw.strip()))
+            step = abs(Decimal(step_raw.strip())).quantize(CRYPTO_PASSIVE_PRICE_TICK)
+            if step > 0:
+                while current <= end:
+                    values.add(_clamp_cent_price(current))
+                    current += step
+        except Exception:
+            values.clear()
+    else:
+        for raw in raw_value.replace(";", ",").split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                values.add(_clamp_cent_price(Decimal(raw)))
+            except Exception:
+                continue
+    if not values:
+        current = Decimal("0.01")
+        while current <= Decimal("0.99"):
+            values.add(_clamp_cent_price(current))
+            current += Decimal("0.01")
+    return sorted(values)
+
+
 def _crypto_artifact_type(base: str, asset_symbols: list[str] | None = None) -> str:
     symbols = normalize_asset_symbols(asset_symbols)
     if len(symbols) == 1:
@@ -2028,6 +2060,7 @@ class CryptoForecastService:
         features = {**features, "spot_features": _json_ready_spot_features(market_row)}
         fair = _predict_crypto_probability(market_row, payload)
         empirical_bucket_matrix = _crypto_empirical_bucket_matrix_from_artifacts(gate, backtest)
+        last_minute_passive_price_matrix = _crypto_last_minute_passive_price_matrix_from_artifacts(gate, backtest)
         action, side, target_yes, edge_bps, trace = _crypto_recommendation(
             market=market,
             fair_yes=fair,
@@ -2035,6 +2068,7 @@ class CryptoForecastService:
             crypto_policy=crypto_policy,
             row=market_row,
             empirical_bucket_matrix=empirical_bucket_matrix,
+            last_minute_passive_price_matrix=last_minute_passive_price_matrix,
             enforce_empirical_bucket_gate=True,
         )
         entry_policy = crypto_policy.entry_for_asset(market.asset_symbol)
@@ -2092,6 +2126,7 @@ class CryptoForecastService:
                 "model_version": artifact.version,
                 "model_metrics": artifact.metrics,
                 "empirical_bucket_matrix_count": len(empirical_bucket_matrix),
+                "last_minute_passive_price_matrix_count": len(last_minute_passive_price_matrix),
                 "prediction_model": {
                     "baseline_probability": _money_text(mid),
                     "calibrated_probability": _money_text(fair),
@@ -2130,6 +2165,16 @@ class CryptoForecastService:
                     "last_minute_passive_market_confidence": trace.get("last_minute_passive_market_confidence") is True,
                     "last_minute_passive": trace.get("last_minute_passive"),
                     "last_minute_passive_bid_threshold_dollars": trace.get("last_minute_passive_bid_threshold_dollars"),
+                    "last_minute_price_source": trace.get("last_minute_price_source"),
+                    "last_minute_chosen_bid_dollars": trace.get("last_minute_chosen_bid_dollars"),
+                    "last_minute_fixed_fallback_bid_dollars": trace.get("last_minute_fixed_fallback_bid_dollars"),
+                    "last_minute_price_matrix_key": trace.get("last_minute_price_matrix_key"),
+                    "last_minute_price_matrix_base_key": trace.get("last_minute_price_matrix_base_key"),
+                    "last_minute_price_matrix_sample_count": trace.get("last_minute_price_matrix_sample_count"),
+                    "last_minute_price_matrix_fill_count": trace.get("last_minute_price_matrix_fill_count"),
+                    "last_minute_price_matrix_fill_rate": trace.get("last_minute_price_matrix_fill_rate"),
+                    "last_minute_price_matrix_net_pnl": trace.get("last_minute_price_matrix_net_pnl"),
+                    "last_minute_price_matrix_net_pnl_per_signal": trace.get("last_minute_price_matrix_net_pnl_per_signal"),
                     "last_minute_passive_no_cross": trace.get("last_minute_passive_no_cross"),
                     "decision": "selected" if side is not None else "stand_down",
                     "status": "shadow_only" if trace.get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW else trace.get("candidate_status"),
@@ -2446,6 +2491,7 @@ class CryptoReplayService:
             "hard_cap_breaches",
             "candle_count",
             "leakage_row_count",
+            "last_minute_passive_price_matrix_count",
         )
         money_keys = (
             "net_simulated_pl_dollars",
@@ -2479,6 +2525,7 @@ class CryptoReplayService:
         missing_model_assets: list[str] = []
         missing_backtest_assets: list[str] = []
         aggregate_bucket_matrix: list[dict[str, Any]] = []
+        aggregate_last_minute_price_matrix: list[dict[str, Any]] = []
 
         for asset in asset_symbols:
             model = await repo.get_latest_crypto_model_artifact(
@@ -2507,6 +2554,9 @@ class CryptoReplayService:
                 aggregate_reasons.extend(f"{asset}: {reason}" for reason in gate["reasons"])
             aggregate_bucket_matrix.extend(
                 bucket for bucket in metrics.get("bucket_matrix") or [] if isinstance(bucket, dict)
+            )
+            aggregate_last_minute_price_matrix.extend(
+                row for row in metrics.get("last_minute_passive_price_matrix") or [] if isinstance(row, dict)
             )
             asset_results.append(
                 {
@@ -2559,6 +2609,8 @@ class CryptoReplayService:
             else "partial"
         )
         aggregate_metrics["asset_gate_results"] = asset_results
+        aggregate_metrics["last_minute_passive_price_matrix"] = aggregate_last_minute_price_matrix
+        aggregate_metrics["last_minute_passive_price_matrix_count"] = len(aggregate_last_minute_price_matrix)
         aggregate_metrics = _crypto_metrics_with_empirical_buckets(
             aggregate_metrics,
             bucket_matrix=aggregate_bucket_matrix,
@@ -3791,6 +3843,16 @@ def _crypto_signal_payload_with_current_quote_metrics(
                 "last_minute_passive_market_confidence": trace.get("last_minute_passive_market_confidence") is True,
                 "last_minute_passive": trace.get("last_minute_passive"),
                 "last_minute_passive_bid_threshold_dollars": trace.get("last_minute_passive_bid_threshold_dollars"),
+                "last_minute_price_source": trace.get("last_minute_price_source"),
+                "last_minute_chosen_bid_dollars": trace.get("last_minute_chosen_bid_dollars"),
+                "last_minute_fixed_fallback_bid_dollars": trace.get("last_minute_fixed_fallback_bid_dollars"),
+                "last_minute_price_matrix_key": trace.get("last_minute_price_matrix_key"),
+                "last_minute_price_matrix_base_key": trace.get("last_minute_price_matrix_base_key"),
+                "last_minute_price_matrix_sample_count": trace.get("last_minute_price_matrix_sample_count"),
+                "last_minute_price_matrix_fill_count": trace.get("last_minute_price_matrix_fill_count"),
+                "last_minute_price_matrix_fill_rate": trace.get("last_minute_price_matrix_fill_rate"),
+                "last_minute_price_matrix_net_pnl": trace.get("last_minute_price_matrix_net_pnl"),
+                "last_minute_price_matrix_net_pnl_per_signal": trace.get("last_minute_price_matrix_net_pnl_per_signal"),
                 "last_minute_passive_no_cross": trace.get("last_minute_passive_no_cross"),
                 "decision": "selected" if action is not None else "stand_down",
                 "status": (
@@ -3873,6 +3935,11 @@ def _crypto_dashboard_signal_summary(market_payloads: list[dict[str, Any]]) -> d
             counts["late_high_confidence_trade_count"] += 1
         if trace.get("last_minute_passive_market_confidence") is True or reason == CRYPTO_LAST_MINUTE_PASSIVE_REASON:
             counts["last_minute_passive_trade_count"] += 1
+            source = str(trace.get("last_minute_price_source") or "")
+            if source == "learned_price_matrix":
+                counts["last_minute_passive_learned_price_count"] += 1
+            elif source == "fixed_bid":
+                counts["last_minute_passive_fixed_fallback_count"] += 1
         gate = trace.get("empirical_bucket_gate")
         if isinstance(gate, dict):
             status = str(gate.get("status") or "unknown")
@@ -3890,6 +3957,8 @@ def _crypto_dashboard_signal_summary(market_payloads: list[dict[str, Any]]) -> d
         "normal_edge_trade_count": counts["normal_edge_trade_count"],
         "late_high_confidence_trade_count": counts["late_high_confidence_trade_count"],
         "last_minute_passive_trade_count": counts["last_minute_passive_trade_count"],
+        "last_minute_passive_learned_price_count": counts["last_minute_passive_learned_price_count"],
+        "last_minute_passive_fixed_fallback_count": counts["last_minute_passive_fixed_fallback_count"],
         "empirical_bucket_allowed_count": counts["empirical_bucket_allowed_count"],
         "empirical_bucket_blocked_count": counts["empirical_bucket_blocked_count"],
         "empirical_bucket_unknown_count": counts["empirical_bucket_unknown_count"],
@@ -4331,6 +4400,7 @@ def _crypto_recommendation(
     row: dict[str, Any] | None = None,
     require_spot_features: bool = True,
     empirical_bucket_matrix: list[dict[str, Any]] | None = None,
+    last_minute_passive_price_matrix: list[dict[str, Any]] | None = None,
     enforce_empirical_bucket_gate: bool = False,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
     row = row or _crypto_live_market_row(market, settings=settings)
@@ -4349,6 +4419,7 @@ def _crypto_recommendation(
         crypto_policy=crypto_policy,
         require_spot_features=require_spot_features,
         empirical_bucket_matrix=empirical_bucket_matrix,
+        last_minute_passive_price_matrix=last_minute_passive_price_matrix,
         enforce_empirical_bucket_gate=enforce_empirical_bucket_gate,
     )
     entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
@@ -4407,6 +4478,16 @@ def _crypto_recommendation(
         "last_minute_passive_market_confidence": selected.get("last_minute_passive_market_confidence") is True,
         "last_minute_passive": selected.get("last_minute_passive"),
         "last_minute_passive_bid_threshold_dollars": selected.get("last_minute_passive_bid_threshold_dollars"),
+        "last_minute_price_source": selected.get("last_minute_price_source"),
+        "last_minute_chosen_bid_dollars": selected.get("last_minute_chosen_bid_dollars"),
+        "last_minute_fixed_fallback_bid_dollars": selected.get("last_minute_fixed_fallback_bid_dollars"),
+        "last_minute_price_matrix_key": selected.get("last_minute_price_matrix_key"),
+        "last_minute_price_matrix_base_key": selected.get("last_minute_price_matrix_base_key"),
+        "last_minute_price_matrix_sample_count": selected.get("last_minute_price_matrix_sample_count"),
+        "last_minute_price_matrix_fill_count": selected.get("last_minute_price_matrix_fill_count"),
+        "last_minute_price_matrix_fill_rate": selected.get("last_minute_price_matrix_fill_rate"),
+        "last_minute_price_matrix_net_pnl": selected.get("last_minute_price_matrix_net_pnl"),
+        "last_minute_price_matrix_net_pnl_per_signal": selected.get("last_minute_price_matrix_net_pnl_per_signal"),
         "last_minute_passive_no_cross": selected.get("last_minute_passive_no_cross"),
         "rank": selected.get("rank"),
         "bucket_key": selected.get("bucket_key"),
@@ -4457,6 +4538,9 @@ def _crypto_candidate_gate_cascade(
                     "last_minute_passive_reason": (
                         candidate.get("last_minute_passive") or {}
                     ).get("reason") if isinstance(candidate.get("last_minute_passive"), dict) else None,
+                    "last_minute_price_source": candidate.get("last_minute_price_source"),
+                    "last_minute_chosen_bid_dollars": candidate.get("last_minute_chosen_bid_dollars"),
+                    "last_minute_price_matrix_key": candidate.get("last_minute_price_matrix_key"),
                 },
             }
         )
@@ -7188,6 +7272,7 @@ def _evaluate_crypto_walk_forward(
     )
     diagnostic_live_policy = diagnostic_quality["live_quality_policy"]
     diagnostic_shadow_policy = diagnostic_quality["shadow_exploration_policy"]
+    last_minute_passive_price_matrix = _crypto_last_minute_passive_price_matrix(rows, settings=settings)
     folds = _crypto_walk_forward_folds(rows, min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)))
     if not folds:
         empty_metrics = _crypto_model_metrics([], {}, settings=settings, crypto_policy=crypto_policy)
@@ -7218,6 +7303,8 @@ def _evaluate_crypto_walk_forward(
                 "top_candidate_reason_counts": diagnostic_quality["top_candidate_reason_counts"],
                 "candidate_rejection_reason_counts": diagnostic_quality["candidate_rejection_reason_counts"],
                 "candidate_counts_by_asset": diagnostic_quality["by_asset"],
+                "last_minute_passive_price_matrix": last_minute_passive_price_matrix,
+                "last_minute_passive_price_matrix_count": len(last_minute_passive_price_matrix),
             }
         )
         empty_metrics = _crypto_apply_empirical_bucket_gate_to_replay_metrics(
@@ -7249,6 +7336,7 @@ def _evaluate_crypto_walk_forward(
                 diagnostic_shadow_policy | {"policy_name": "shadow_exploration_policy", "policy_family": "shadow_exploration"},
             ],
             "bucket_matrix": [],
+            "last_minute_passive_price_matrix": last_minute_passive_price_matrix,
             "bucket_diagnostics": _crypto_bucket_diagnostics([]),
             "candidate_quality": diagnostic_quality,
             "metrics": empty_metrics,
@@ -7410,6 +7498,7 @@ def _evaluate_crypto_walk_forward(
             exploratory_policy,
         ],
         "bucket_matrix": bucket_matrix,
+        "last_minute_passive_price_matrix": last_minute_passive_price_matrix,
         "bucket_diagnostics": bucket_diagnostics,
         "candidate_quality": diagnostic_quality,
         "metrics": _crypto_apply_empirical_bucket_gate_to_replay_metrics(
@@ -7455,6 +7544,8 @@ def _evaluate_crypto_walk_forward(
                 "top_candidate_reason_counts": diagnostic_quality["top_candidate_reason_counts"],
                 "candidate_rejection_reason_counts": diagnostic_quality["candidate_rejection_reason_counts"],
                 "candidate_counts_by_asset": diagnostic_quality["by_asset"],
+                "last_minute_passive_price_matrix": last_minute_passive_price_matrix,
+                "last_minute_passive_price_matrix_count": len(last_minute_passive_price_matrix),
             },
             selection_trades=selection_trades,
             market_mid_trades=baseline_trades_by_name["market_mid_baseline"],
@@ -7769,10 +7860,13 @@ def _crypto_last_minute_passive_review(
     cost: Decimal,
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy | None = None,
+    price_matrix: list[dict[str, Any]] | None = None,
+    min_contract_price: Decimal | None = None,
 ) -> dict[str, Any]:
     asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
     bids = _crypto_last_minute_passive_bid_by_asset(settings)
-    threshold = bids.get(asset)
+    fixed_threshold = bids.get(asset)
+    threshold = fixed_threshold
     time_to_close = _optional_int(row.get("time_to_close_seconds"))
     market_side_probability = _crypto_market_side_probability(row, side)
     max_seconds = max(0, int(settings.crypto_last_minute_passive_max_seconds_to_close))
@@ -7785,6 +7879,10 @@ def _crypto_last_minute_passive_review(
         "time_to_close_seconds": time_to_close,
         "max_seconds_to_close": max_seconds,
         "bid_threshold_dollars": _money_text(threshold),
+        "fixed_fallback_bid_dollars": _money_text(fixed_threshold),
+        "last_minute_price_source": "fixed_bid",
+        "chosen_bid_dollars": _money_text(threshold),
+        "price_matrix": None,
         "market_side_probability": (
             str(market_side_probability.quantize(Decimal("0.0001")))
             if market_side_probability is not None
@@ -7802,8 +7900,6 @@ def _crypto_last_minute_passive_review(
         crypto_policy=crypto_policy,
     ):
         return {**review, "reason": "asset_not_configured_for_last_minute_passive"}
-    if threshold is None:
-        return {**review, "reason": "asset_missing_last_minute_passive_bid"}
     if time_to_close is None:
         return {**review, "reason": "time_to_close_unknown"}
     if time_to_close <= 0:
@@ -7812,6 +7908,35 @@ def _crypto_last_minute_passive_review(
         return {**review, "reason": "outside_last_minute_passive_window"}
     if market_side_probability is None:
         return {**review, "reason": "market_side_probability_unknown"}
+    matrix_review = _crypto_last_minute_passive_price_matrix_choice(
+        side=side,
+        row=row,
+        current_cost=cost,
+        market_side_probability=market_side_probability,
+        min_contract_price=min_contract_price or Decimal("0.01"),
+        settings=settings,
+        price_matrix=price_matrix,
+    )
+    review["price_matrix"] = matrix_review
+    if matrix_review.get("allowed") is True:
+        threshold = _clamp_cent_price(_decimal(matrix_review["bid_price_dollars"]))
+        review["bid_threshold_dollars"] = _money_text(threshold)
+        review["chosen_bid_dollars"] = _money_text(threshold)
+        review["last_minute_price_source"] = "learned_price_matrix"
+        review["matrix_key"] = matrix_review.get("matrix_key")
+        review["matrix_base_key"] = matrix_review.get("matrix_base_key")
+        review["matrix_sample_count"] = matrix_review.get("sample_count")
+        review["matrix_fill_count"] = matrix_review.get("fill_count")
+        review["matrix_fill_rate"] = matrix_review.get("fill_rate")
+        review["matrix_win_rate"] = matrix_review.get("win_rate")
+        review["matrix_gross_pnl"] = matrix_review.get("gross_pnl")
+        review["matrix_net_pnl"] = matrix_review.get("net_pnl")
+        review["matrix_net_pnl_per_signal"] = matrix_review.get("net_pnl_per_signal")
+        review["matrix_net_pnl_per_fill"] = matrix_review.get("net_pnl_per_fill")
+    elif threshold is None:
+        return {**review, "reason": "asset_missing_last_minute_passive_bid"}
+    elif str(settings.crypto_last_minute_passive_price_matrix_fallback or "").strip().lower() != "fixed_bid":
+        return {**review, "reason": matrix_review.get("reason") or "price_matrix_not_allowed"}
     if market_side_probability <= threshold:
         return {**review, "reason": "market_confidence_below_last_minute_bid"}
     if bool(settings.crypto_last_minute_passive_require_no_cross) and cost <= threshold:
@@ -7821,6 +7946,8 @@ def _crypto_last_minute_passive_review(
         **review,
         "allowed": True,
         "reason": CRYPTO_LAST_MINUTE_PASSIVE_REASON,
+        "bid_threshold_dollars": _money_text(threshold),
+        "chosen_bid_dollars": _money_text(threshold),
         "expected_edge_dollars": str(expected_edge.quantize(Decimal("0.0001"))),
     }
 
@@ -7907,6 +8034,182 @@ def _crypto_market_side_probability(row: dict[str, Any], side: str) -> Decimal |
     return None
 
 
+def _crypto_side_ask(row: dict[str, Any], side: str) -> Decimal | None:
+    key = "yes_ask_dollars" if str(side).lower() == "yes" else "no_ask_dollars"
+    raw = row.get(key)
+    if raw in (None, ""):
+        return None
+    try:
+        return _clamp_price(_decimal(raw))
+    except Exception:
+        return None
+
+
+def _crypto_last_minute_price_matrix_base_key(
+    row: dict[str, Any],
+    *,
+    side: str,
+    market_side_probability: Decimal | None = None,
+) -> str | None:
+    probability = market_side_probability
+    if probability is None:
+        probability = _crypto_market_side_probability(row, side)
+    if probability is None:
+        return None
+    time_to_close = _optional_int(row.get("time_to_close_seconds"))
+    if time_to_close is None:
+        return None
+    return "|".join(
+        [
+            normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN")),
+            str(side).lower(),
+            _crypto_time_to_close_bucket(float(time_to_close)),
+            _price_band(_clamp_price(probability)),
+            _spread_band(row.get("spread_bps")),
+        ]
+    )
+
+
+def _crypto_last_minute_price_matrix_key(
+    row: dict[str, Any],
+    *,
+    side: str,
+    bid: Decimal,
+    market_side_probability: Decimal | None = None,
+) -> str | None:
+    base = _crypto_last_minute_price_matrix_base_key(
+        row,
+        side=side,
+        market_side_probability=market_side_probability,
+    )
+    if base is None:
+        return None
+    return f"{base}|{_money_text(_clamp_cent_price(bid))}"
+
+
+def _crypto_last_minute_passive_price_matrix_by_base(
+    price_matrix: list[dict[str, Any]] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in price_matrix or []:
+        if not isinstance(row, dict):
+            continue
+        base_key = str(row.get("matrix_base_key") or "").strip()
+        if not base_key:
+            matrix_key = str(row.get("matrix_key") or "").strip()
+            parts = matrix_key.split("|")
+            if len(parts) >= 6:
+                base_key = "|".join(parts[:5])
+        if base_key:
+            grouped[base_key].append(row)
+    return grouped
+
+
+def _crypto_last_minute_passive_price_matrix_choice(
+    *,
+    side: str,
+    row: dict[str, Any],
+    current_cost: Decimal,
+    market_side_probability: Decimal,
+    min_contract_price: Decimal,
+    settings: Settings,
+    price_matrix: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    review: dict[str, Any] = {
+        "enabled": bool(settings.crypto_last_minute_passive_price_matrix_enabled),
+        "status": "disabled",
+        "allowed": False,
+        "reason": "price_matrix_disabled",
+        "matrix_base_key": None,
+        "matrix_key": None,
+        "candidate_count": 0,
+        "qualified_count": 0,
+        "min_samples": int(settings.crypto_last_minute_passive_price_matrix_min_samples),
+        "min_fills": int(settings.crypto_last_minute_passive_price_matrix_min_fills),
+        "min_fill_rate": float(settings.crypto_last_minute_passive_price_matrix_min_fill_rate),
+        "min_net_pnl_dollars": str(
+            Decimal(str(settings.crypto_last_minute_passive_price_matrix_min_net_pnl_dollars)).quantize(Decimal("0.0001"))
+        ),
+    }
+    if not review["enabled"]:
+        return review
+    base_key = _crypto_last_minute_price_matrix_base_key(
+        row,
+        side=side,
+        market_side_probability=market_side_probability,
+    )
+    review["matrix_base_key"] = base_key
+    if base_key is None:
+        return {**review, "status": "missing", "reason": "price_matrix_base_key_unavailable"}
+    candidates = _crypto_last_minute_passive_price_matrix_by_base(price_matrix).get(base_key, [])
+    review["candidate_count"] = len(candidates)
+    if not candidates:
+        return {**review, "status": "missing", "reason": "price_matrix_missing"}
+    min_samples = int(settings.crypto_last_minute_passive_price_matrix_min_samples)
+    min_fills = int(settings.crypto_last_minute_passive_price_matrix_min_fills)
+    min_fill_rate = float(settings.crypto_last_minute_passive_price_matrix_min_fill_rate)
+    min_net_pnl = Decimal(str(settings.crypto_last_minute_passive_price_matrix_min_net_pnl_dollars))
+    qualified: list[dict[str, Any]] = []
+    for candidate in candidates:
+        bid_raw = candidate.get("bid_price_dollars")
+        if bid_raw in (None, ""):
+            continue
+        try:
+            bid = _clamp_cent_price(_decimal(bid_raw))
+        except Exception:
+            continue
+        sample_count = int(candidate.get("sample_count") or 0)
+        fill_count = int(candidate.get("fill_count") or 0)
+        fill_rate = float(candidate.get("fill_rate") or 0.0)
+        net_pnl = _decimal(candidate.get("net_pnl") or Decimal("0"))
+        if bid >= current_cost:
+            continue
+        if bid < min_contract_price:
+            continue
+        if market_side_probability <= bid:
+            continue
+        if sample_count < min_samples:
+            continue
+        if fill_count < min_fills:
+            continue
+        if fill_rate < min_fill_rate:
+            continue
+        if net_pnl < min_net_pnl:
+            continue
+        qualified.append({**candidate, "_bid_decimal": bid})
+    review["qualified_count"] = len(qualified)
+    if not qualified:
+        return {**review, "status": "blocked", "reason": "price_matrix_no_mature_profitable_bid"}
+    qualified.sort(
+        key=lambda candidate: (
+            _decimal(candidate.get("net_pnl_per_signal") or Decimal("-999")),
+            float(candidate.get("fill_rate") or 0.0),
+            -float(candidate["_bid_decimal"]),
+        ),
+        reverse=True,
+    )
+    selected = qualified[0]
+    bid = selected["_bid_decimal"]
+    public_selected = {key: value for key, value in selected.items() if key != "_bid_decimal"}
+    return {
+        **review,
+        "status": "allowed",
+        "allowed": True,
+        "reason": "price_matrix_bid_selected",
+        "matrix_key": selected.get("matrix_key"),
+        "bid_price_dollars": _money_text(bid),
+        "selected": public_selected,
+        "sample_count": int(selected.get("sample_count") or 0),
+        "fill_count": int(selected.get("fill_count") or 0),
+        "fill_rate": float(selected.get("fill_rate") or 0.0),
+        "win_rate": selected.get("win_rate"),
+        "gross_pnl": selected.get("gross_pnl"),
+        "net_pnl": selected.get("net_pnl"),
+        "net_pnl_per_signal": selected.get("net_pnl_per_signal"),
+        "net_pnl_per_fill": selected.get("net_pnl_per_fill"),
+    }
+
+
 def _crypto_settlement_diagnostics(row: dict[str, Any]) -> dict[str, Any]:
     provider = row.get("spot_provider")
     source_kind = row.get("spot_source_kind")
@@ -7929,6 +8232,7 @@ def _crypto_trade_candidates(
     crypto_policy: RuntimeCryptoPolicy | None = None,
     require_spot_features: bool = True,
     empirical_bucket_matrix: list[dict[str, Any]] | None = None,
+    last_minute_passive_price_matrix: list[dict[str, Any]] | None = None,
     enforce_empirical_bucket_gate: bool = False,
     empirical_bucket_requested_assets: list[str] | None = None,
     force_empirical_bucket_for_requested_assets: bool = False,
@@ -8062,6 +8366,8 @@ def _crypto_trade_candidates(
             cost=cost,
             settings=settings,
             crypto_policy=crypto_policy,
+            price_matrix=last_minute_passive_price_matrix,
+            min_contract_price=min_contract_price,
         )
         late_sure_thing = _crypto_late_sure_thing_candidate(
             side=side,
@@ -8237,6 +8543,16 @@ def _crypto_trade_candidates(
                 "last_minute_passive_market_confidence": last_minute_passive,
                 "last_minute_passive": last_minute_passive_review,
                 "last_minute_passive_bid_threshold_dollars": last_minute_passive_review.get("bid_threshold_dollars"),
+                "last_minute_price_source": last_minute_passive_review.get("last_minute_price_source"),
+                "last_minute_chosen_bid_dollars": last_minute_passive_review.get("chosen_bid_dollars"),
+                "last_minute_fixed_fallback_bid_dollars": last_minute_passive_review.get("fixed_fallback_bid_dollars"),
+                "last_minute_price_matrix_key": last_minute_passive_review.get("matrix_key"),
+                "last_minute_price_matrix_base_key": last_minute_passive_review.get("matrix_base_key"),
+                "last_minute_price_matrix_sample_count": last_minute_passive_review.get("matrix_sample_count"),
+                "last_minute_price_matrix_fill_count": last_minute_passive_review.get("matrix_fill_count"),
+                "last_minute_price_matrix_fill_rate": last_minute_passive_review.get("matrix_fill_rate"),
+                "last_minute_price_matrix_net_pnl": last_minute_passive_review.get("matrix_net_pnl"),
+                "last_minute_price_matrix_net_pnl_per_signal": last_minute_passive_review.get("matrix_net_pnl_per_signal"),
                 "last_minute_passive_no_cross": (
                     last_minute_passive_review.get("reason") != "last_minute_passive_would_cross_touch"
                 ),
@@ -8286,6 +8602,7 @@ def _simulate_crypto_trade(
     crypto_policy: RuntimeCryptoPolicy | None = None,
     policy: str = "live_quality",
     empirical_bucket_matrix: list[dict[str, Any]] | None = None,
+    last_minute_passive_price_matrix: list[dict[str, Any]] | None = None,
     enforce_empirical_bucket_gate: bool = False,
     empirical_bucket_requested_assets: list[str] | None = None,
     force_empirical_bucket_for_requested_assets: bool = False,
@@ -8297,6 +8614,7 @@ def _simulate_crypto_trade(
         settings=settings,
         crypto_policy=crypto_policy,
         empirical_bucket_matrix=empirical_bucket_matrix,
+        last_minute_passive_price_matrix=last_minute_passive_price_matrix,
         enforce_empirical_bucket_gate=enforce_empirical_bucket_gate,
         empirical_bucket_requested_assets=empirical_bucket_requested_assets,
         force_empirical_bucket_for_requested_assets=force_empirical_bucket_for_requested_assets,
@@ -8769,6 +9087,145 @@ def _crypto_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Setting
     return matrix
 
 
+def _crypto_last_minute_passive_price_matrix(rows: list[dict[str, Any]], *, settings: Settings) -> list[dict[str, Any]]:
+    max_seconds = max(0, int(settings.crypto_last_minute_passive_max_seconds_to_close))
+    ladder = _crypto_last_minute_passive_price_ladder(settings)
+    rows_by_market: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get("strict_trade_eligible") is not True:
+            continue
+        if str(row.get("quote_source") or "") != "snapshot_quotes":
+            continue
+        if row.get("label_yes") is None:
+            continue
+        decision_ts = row.get("decision_ts")
+        settlement_ts = row.get("settlement_ts")
+        if not isinstance(decision_ts, datetime) or not isinstance(settlement_ts, datetime):
+            continue
+        time_to_close = _optional_int(row.get("time_to_close_seconds"))
+        if time_to_close is None or time_to_close <= 0 or time_to_close > max_seconds:
+            continue
+        rows_by_market[str(row.get("market_ticker") or "")].append(row)
+    for market_rows in rows_by_market.values():
+        market_rows.sort(key=lambda item: item.get("decision_ts") or datetime.max.replace(tzinfo=UTC))
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for market_rows in rows_by_market.values():
+        for idx, row in enumerate(market_rows):
+            decision_ts = row.get("decision_ts")
+            settlement_ts = row.get("settlement_ts")
+            future_rows = [
+                future
+                for future in market_rows[idx + 1 :]
+                if isinstance(future.get("decision_ts"), datetime)
+                and future["decision_ts"] > decision_ts
+                and future["decision_ts"] < settlement_ts
+            ]
+            if not future_rows:
+                continue
+            label_yes = int(row.get("label_yes") or 0)
+            for side in ("yes", "no"):
+                cost = _crypto_side_ask(row, side)
+                market_side_probability = _crypto_market_side_probability(row, side)
+                if cost is None or market_side_probability is None:
+                    continue
+                base_key = _crypto_last_minute_price_matrix_base_key(
+                    row,
+                    side=side,
+                    market_side_probability=market_side_probability,
+                )
+                if base_key is None:
+                    continue
+                future_costs = [
+                    value
+                    for future in future_rows
+                    if (value := _crypto_side_ask(future, side)) is not None
+                ]
+                if not future_costs:
+                    continue
+                for bid in ladder:
+                    if bid >= cost:
+                        continue
+                    if market_side_probability <= bid:
+                        continue
+                    matrix_key = _crypto_last_minute_price_matrix_key(
+                        row,
+                        side=side,
+                        bid=bid,
+                        market_side_probability=market_side_probability,
+                    )
+                    if matrix_key is None:
+                        continue
+                    bucket = grouped.setdefault(
+                        matrix_key,
+                        {
+                            "matrix_key": matrix_key,
+                            "matrix_base_key": base_key,
+                            "asset_symbol": normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN")),
+                            "side": side,
+                            "time_to_close_bucket": _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0)),
+                            "market_probability_band": _price_band(_clamp_price(market_side_probability)),
+                            "spread_band": _spread_band(row.get("spread_bps")),
+                            "bid_price_dollars": _money_text(bid),
+                            "sample_count": 0,
+                            "fill_count": 0,
+                            "win_count": 0,
+                            "gross_pnl": Decimal("0"),
+                            "fees": Decimal("0"),
+                            "net_pnl": Decimal("0"),
+                        },
+                    )
+                    bucket["sample_count"] += 1
+                    filled = any(future_cost <= bid for future_cost in future_costs)
+                    if not filled:
+                        continue
+                    bucket["fill_count"] += 1
+                    side_won = (side == "yes" and label_yes == 1) or (side == "no" and label_yes == 0)
+                    if side_won:
+                        bucket["win_count"] += 1
+                    gross = (Decimal("1") if side_won else Decimal("0")) - bid
+                    fee = estimate_kalshi_taker_fee_dollars(
+                        price_dollars=bid,
+                        count=Decimal("1.00"),
+                        fee_rate=Decimal(str(settings.kalshi_taker_fee_rate)),
+                    )
+                    bucket["gross_pnl"] += gross
+                    bucket["fees"] += fee
+                    bucket["net_pnl"] += gross - fee
+    matrix: list[dict[str, Any]] = []
+    for bucket in grouped.values():
+        sample_count = int(bucket["sample_count"])
+        fill_count = int(bucket["fill_count"])
+        gross = _decimal(bucket["gross_pnl"])
+        fees = _decimal(bucket["fees"])
+        net = _decimal(bucket["net_pnl"])
+        item = {
+            **bucket,
+            "sample_count": sample_count,
+            "fill_count": fill_count,
+            "win_count": int(bucket["win_count"]),
+            "fill_rate": _ratio(fill_count / sample_count) if sample_count else None,
+            "win_rate": _ratio(int(bucket["win_count"]) / fill_count) if fill_count else None,
+            "gross_pnl": str(gross.quantize(Decimal("0.0001"))),
+            "fees": str(fees.quantize(Decimal("0.0001"))),
+            "net_pnl": str(net.quantize(Decimal("0.0001"))),
+            "net_pnl_per_signal": str((net / Decimal(sample_count)).quantize(Decimal("0.0001"))) if sample_count else None,
+            "net_pnl_per_fill": str((net / Decimal(fill_count)).quantize(Decimal("0.0001"))) if fill_count else None,
+            "fee_model_version": current_fee_model_version(),
+        }
+        matrix.append(item)
+    matrix.sort(
+        key=lambda item: (
+            _decimal(item.get("net_pnl_per_signal") or Decimal("-999")),
+            float(item.get("fill_rate") or 0.0),
+            -float(_decimal(item.get("bid_price_dollars") or Decimal("0"))),
+            str(item.get("matrix_key") or ""),
+        ),
+        reverse=True,
+    )
+    return matrix
+
+
 def _crypto_bucket_diagnostics(trade_rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     return {
         "by_price_bucket": _crypto_dimension_bucket_diagnostics(
@@ -9236,6 +9693,25 @@ def _crypto_empirical_bucket_matrix_from_artifacts(*artifacts: Any) -> list[dict
         matrix = walk_forward.get("bucket_matrix") if isinstance(walk_forward, dict) else None
         if isinstance(matrix, list):
             return [bucket for bucket in matrix if isinstance(bucket, dict)]
+    return []
+
+
+def _crypto_last_minute_passive_price_matrix_from_artifacts(*artifacts: Any) -> list[dict[str, Any]]:
+    for artifact in artifacts:
+        if artifact is None:
+            continue
+        metrics = artifact.metrics if isinstance(getattr(artifact, "metrics", None), dict) else {}
+        payload = artifact.payload if isinstance(getattr(artifact, "payload", None), dict) else {}
+        matrix = metrics.get("last_minute_passive_price_matrix")
+        if isinstance(matrix, list):
+            return [row for row in matrix if isinstance(row, dict)]
+        matrix = payload.get("last_minute_passive_price_matrix")
+        if isinstance(matrix, list):
+            return [row for row in matrix if isinstance(row, dict)]
+        walk_forward = payload.get("walk_forward") if isinstance(payload.get("walk_forward"), dict) else {}
+        matrix = walk_forward.get("last_minute_passive_price_matrix") if isinstance(walk_forward, dict) else None
+        if isinstance(matrix, list):
+            return [row for row in matrix if isinstance(row, dict)]
     return []
 
 

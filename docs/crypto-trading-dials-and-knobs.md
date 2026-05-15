@@ -371,12 +371,23 @@ available target-distance features need a directional volatility cushion.
 | `crypto_last_minute_passive_bid_by_asset` | `BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84` | Asset-specific passive bid thresholds from the last-minute sweep. |
 | `crypto_last_minute_passive_require_no_cross` | `True` | Skips the path if the bid would immediately cross the current ask. |
 | `crypto_last_minute_passive_risk_mode` | `normal_cap` | Uses normal crypto sizing and the 10% position cap. |
+| `crypto_last_minute_passive_price_matrix_enabled` | `True` | Chooses a learned profitable bid before fixed-threshold fallback. |
+| `crypto_last_minute_passive_price_matrix_min_samples` | `30` | Minimum covered final-minute signals for a learned bid. |
+| `crypto_last_minute_passive_price_matrix_min_fills` | `3` | Minimum simulated fills for a learned bid. |
+| `crypto_last_minute_passive_price_matrix_min_fill_rate` | `0.10` | Minimum simulated fill probability for a learned bid. |
+| `crypto_last_minute_passive_price_matrix_min_net_pnl_dollars` | `0.0` | Minimum fee-adjusted net P/L for a learned bid. |
+| `crypto_last_minute_passive_price_matrix_fallback` | `fixed_bid` | Uses the old asset threshold when the learned row is immature. |
+| `crypto_last_minute_passive_price_ladder` | `0.01:0.99:0.01` | Passive bid ladder evaluated in replay. |
 
 This path is separate from late sure-thing. It uses market-implied side
 probability instead of model edge, records model probability only for
 diagnostics, bypasses the normal edge floors in risk, and submits one fixed GTC
-bid that rests until close. Existing replay, asset-mode, kill-switch, active
-color, capital, position, and opposite-side gates still apply.
+bid that rests until close. Replay stores a learned price matrix keyed by asset,
+side, final-minute time bucket, market probability band, spread band, and bid
+price; runtime chooses the mature row with the best fee-adjusted expected P/L
+per signal, then falls back to the fixed asset threshold if no row qualifies.
+Existing replay, asset-mode, kill-switch, active color, capital, position, and
+opposite-side gates still apply.
 
 ## Autonomy and Room Creation Knobs
 

@@ -232,6 +232,13 @@ class Settings(BaseSettings):
     crypto_last_minute_passive_bid_by_asset: str = "BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84"
     crypto_last_minute_passive_require_no_cross: bool = True
     crypto_last_minute_passive_risk_mode: str = "normal_cap"
+    crypto_last_minute_passive_price_matrix_enabled: bool = True
+    crypto_last_minute_passive_price_matrix_min_samples: int = 30
+    crypto_last_minute_passive_price_matrix_min_fills: int = 3
+    crypto_last_minute_passive_price_matrix_min_fill_rate: float = 0.10
+    crypto_last_minute_passive_price_matrix_min_net_pnl_dollars: float = 0.0
+    crypto_last_minute_passive_price_matrix_fallback: str = "fixed_bid"
+    crypto_last_minute_passive_price_ladder: str = "0.01:0.99:0.01"
     crypto_market_price_anchor_enabled: bool = True
     crypto_market_price_anchor_weight: float = 0.75
     crypto_autonomy_max_rooms_per_run: int = 7

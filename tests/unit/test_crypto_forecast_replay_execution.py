@@ -41,6 +41,8 @@ from kalshi_bot.crypto.services import (
     _crypto_feature_schema,
     _crypto_dynamic_order_count_fp,
     _crypto_last_minute_passive_bid_by_asset,
+    _crypto_last_minute_passive_price_ladder,
+    _crypto_last_minute_passive_price_matrix,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
     _crypto_recommendation,
@@ -2878,6 +2880,109 @@ def test_crypto_last_minute_passive_bid_map_parses_v1_thresholds(tmp_path) -> No
     }
 
 
+def test_crypto_last_minute_passive_price_ladder_parses_cent_range(tmp_path) -> None:
+    settings = _settings(tmp_path)
+
+    ladder = _crypto_last_minute_passive_price_ladder(settings)
+
+    assert ladder[0] == Decimal("0.01")
+    assert ladder[-1] == Decimal("0.99")
+    assert len(ladder) == 99
+    assert Decimal("0.55") in ladder
+
+
+def _last_minute_matrix_row(
+    *,
+    market_ticker: str,
+    decision_ts: datetime,
+    seconds_to_close: int,
+    yes_ask: Decimal,
+    label_yes: int = 1,
+    mid_yes: Decimal = Decimal("0.7000"),
+) -> dict[str, object]:
+    return _replay_row(
+        market_ticker=market_ticker,
+        market_day=decision_ts.date().isoformat(),
+        decision_ts=decision_ts,
+        settlement_ts=decision_ts + timedelta(seconds=seconds_to_close),
+        time_to_close_seconds=seconds_to_close,
+        market_age_seconds=900 - seconds_to_close,
+        label_yes=label_yes,
+        settlement_result="yes" if label_yes else "no",
+        mid_yes_dollars=mid_yes,
+        yes_bid_dollars=yes_ask - Decimal("0.1000"),
+        yes_ask_dollars=yes_ask,
+        no_ask_dollars=Decimal("1.0000") - (yes_ask - Decimal("0.1000")),
+        spread_bps=1000,
+    )
+
+
+def test_crypto_last_minute_passive_price_matrix_scores_future_fill_coverage(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        kalshi_taker_fee_rate=0.0,
+        crypto_last_minute_passive_price_ladder="0.55:0.59:0.04",
+    )
+    base_ts = datetime(2026, 5, 1, 12, 14, 20, tzinfo=UTC)
+    rows = [
+        _last_minute_matrix_row(
+            market_ticker="KXBTC15M-MATRIX-A",
+            decision_ts=base_ts,
+            seconds_to_close=40,
+            yes_ask=Decimal("0.6000"),
+            label_yes=1,
+        ),
+        _last_minute_matrix_row(
+            market_ticker="KXBTC15M-MATRIX-A",
+            decision_ts=base_ts + timedelta(seconds=10),
+            seconds_to_close=30,
+            yes_ask=Decimal("0.5500"),
+            label_yes=1,
+        ),
+        _last_minute_matrix_row(
+            market_ticker="KXBTC15M-MATRIX-B",
+            decision_ts=base_ts,
+            seconds_to_close=40,
+            yes_ask=Decimal("0.6000"),
+            label_yes=0,
+        ),
+        _last_minute_matrix_row(
+            market_ticker="KXBTC15M-MATRIX-B",
+            decision_ts=base_ts + timedelta(seconds=10),
+            seconds_to_close=30,
+            yes_ask=Decimal("0.5800"),
+            label_yes=0,
+        ),
+    ]
+
+    matrix = _crypto_last_minute_passive_price_matrix(rows, settings=settings)
+    by_bid = {row["bid_price_dollars"]: row for row in matrix if row["side"] == "yes"}
+
+    assert by_bid["0.55"]["sample_count"] == 2
+    assert by_bid["0.55"]["fill_count"] == 1
+    assert by_bid["0.55"]["fill_rate"] == 0.5
+    assert by_bid["0.55"]["win_rate"] == 1.0
+    assert by_bid["0.55"]["gross_pnl"] == "0.4500"
+    assert by_bid["0.55"]["net_pnl_per_signal"] == "0.2250"
+    assert by_bid["0.59"]["sample_count"] == 2
+    assert by_bid["0.59"]["fill_count"] == 2
+    assert by_bid["0.59"]["net_pnl"] == "-0.1800"
+
+
+def test_crypto_last_minute_passive_price_matrix_excludes_rows_without_future_quotes(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    row = _last_minute_matrix_row(
+        market_ticker="KXBTC15M-NO-FUTURE",
+        decision_ts=datetime(2026, 5, 1, 12, 14, 20, tzinfo=UTC),
+        seconds_to_close=40,
+        yes_ask=Decimal("0.6000"),
+    )
+
+    matrix = _crypto_last_minute_passive_price_matrix([row], settings=settings)
+
+    assert matrix == []
+
+
 def test_crypto_last_minute_passive_uses_market_confidence_over_model_winner(tmp_path) -> None:
     settings = _settings(
         tmp_path,
@@ -2927,6 +3032,212 @@ def test_crypto_last_minute_passive_uses_market_confidence_over_model_winner(tmp
     assert trace["last_minute_passive_market_confidence"] is True
     assert trace["empirical_bucket_gate"]["reason"] == "empirical_bucket_missing"
     assert trace["candidate_status"] == CRYPTO_LIVE_QUALITY
+
+
+def test_crypto_last_minute_passive_uses_best_mature_price_matrix_bid(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_contract_price_dollars=0.50,
+        crypto_last_minute_passive_assets="BTC",
+        crypto_last_minute_passive_price_matrix_min_samples=2,
+        crypto_last_minute_passive_price_matrix_min_fills=1,
+        crypto_last_minute_passive_price_matrix_min_fill_rate=0.10,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LAST-MINUTE-MATRIX",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.7000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.6000"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 1000,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 45,
+        "market_age_seconds": 855,
+    }
+    matrix = [
+        {
+            "matrix_key": "BTC|yes|0_5m|0.50-0.75|wide|0.55",
+            "matrix_base_key": "BTC|yes|0_5m|0.50-0.75|wide",
+            "asset_symbol": "BTC",
+            "side": "yes",
+            "bid_price_dollars": "0.55",
+            "sample_count": 10,
+            "fill_count": 2,
+            "fill_rate": 0.2,
+            "net_pnl": "0.1000",
+            "net_pnl_per_signal": "0.0100",
+        },
+        {
+            "matrix_key": "BTC|yes|0_5m|0.50-0.75|wide|0.56",
+            "matrix_base_key": "BTC|yes|0_5m|0.50-0.75|wide",
+            "asset_symbol": "BTC",
+            "side": "yes",
+            "bid_price_dollars": "0.56",
+            "sample_count": 10,
+            "fill_count": 3,
+            "fill_rate": 0.3,
+            "net_pnl": "0.2000",
+            "net_pnl_per_signal": "0.0200",
+        },
+    ]
+
+    action, side, target_yes, edge_bps, trace = _crypto_recommendation(
+        market=_market(),
+        fair_yes=Decimal("0.2000"),
+        settings=settings,
+        row=row,
+        empirical_bucket_matrix=[],
+        last_minute_passive_price_matrix=matrix,
+        enforce_empirical_bucket_gate=True,
+    )
+
+    assert action == TradeAction.BUY
+    assert side == ContractSide.YES
+    assert target_yes == Decimal("0.5600")
+    assert edge_bps == 1400
+    assert trace["last_minute_price_source"] == "learned_price_matrix"
+    assert trace["last_minute_chosen_bid_dollars"] == "0.56"
+    assert trace["last_minute_price_matrix_key"] == "BTC|yes|0_5m|0.50-0.75|wide|0.56"
+
+
+def test_crypto_last_minute_passive_price_matrix_never_crosses_current_ask(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_contract_price_dollars=0.50,
+        crypto_last_minute_passive_assets="BTC",
+        crypto_last_minute_passive_price_matrix_min_samples=1,
+        crypto_last_minute_passive_price_matrix_min_fills=1,
+        crypto_last_minute_passive_price_matrix_min_fill_rate=0.10,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LAST-MINUTE-MATRIX-NOCROSS",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.7000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.5700"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 700,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 45,
+        "market_age_seconds": 855,
+    }
+    matrix = [
+        {
+            "matrix_key": "BTC|yes|0_5m|0.50-0.75|wide|0.58",
+            "matrix_base_key": "BTC|yes|0_5m|0.50-0.75|wide",
+            "bid_price_dollars": "0.58",
+            "sample_count": 5,
+            "fill_count": 4,
+            "fill_rate": 0.8,
+            "net_pnl": "0.5000",
+            "net_pnl_per_signal": "0.1000",
+        },
+        {
+            "matrix_key": "BTC|yes|0_5m|0.50-0.75|wide|0.55",
+            "matrix_base_key": "BTC|yes|0_5m|0.50-0.75|wide",
+            "bid_price_dollars": "0.55",
+            "sample_count": 5,
+            "fill_count": 1,
+            "fill_rate": 0.2,
+            "net_pnl": "0.1000",
+            "net_pnl_per_signal": "0.0200",
+        },
+    ]
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.2000"),
+        settings=settings,
+        last_minute_passive_price_matrix=matrix,
+    )
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert yes_candidate["execution_price_dollars"] == "0.5500"
+    assert yes_candidate["last_minute_price_source"] == "learned_price_matrix"
+
+
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        [],
+        [
+            {
+                "matrix_key": "BTC|yes|0_5m|0.50-0.75|wide|0.56",
+                "matrix_base_key": "BTC|yes|0_5m|0.50-0.75|wide",
+                "bid_price_dollars": "0.56",
+                "sample_count": 1,
+                "fill_count": 1,
+                "fill_rate": 1.0,
+                "net_pnl": "0.1000",
+                "net_pnl_per_signal": "0.1000",
+            }
+        ],
+        [
+            {
+                "matrix_key": "BTC|yes|0_5m|0.50-0.75|wide|0.56",
+                "matrix_base_key": "BTC|yes|0_5m|0.50-0.75|wide",
+                "bid_price_dollars": "0.56",
+                "sample_count": 10,
+                "fill_count": 0,
+                "fill_rate": 0.0,
+                "net_pnl": "0.1000",
+                "net_pnl_per_signal": "0.0100",
+            }
+        ],
+        [
+            {
+                "matrix_key": "BTC|yes|0_5m|0.50-0.75|wide|0.56",
+                "matrix_base_key": "BTC|yes|0_5m|0.50-0.75|wide",
+                "bid_price_dollars": "0.56",
+                "sample_count": 10,
+                "fill_count": 3,
+                "fill_rate": 0.3,
+                "net_pnl": "-0.0100",
+                "net_pnl_per_signal": "-0.0010",
+            }
+        ],
+    ],
+)
+def test_crypto_last_minute_passive_price_matrix_falls_back_to_fixed_bid(tmp_path, matrix) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_last_minute_passive_assets="BTC",
+        crypto_last_minute_passive_price_matrix_min_samples=2,
+        crypto_last_minute_passive_price_matrix_min_fills=1,
+        crypto_last_minute_passive_price_matrix_min_fill_rate=0.10,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LAST-MINUTE-MATRIX-FALLBACK",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.7000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.6000"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 1000,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 45,
+        "market_age_seconds": 855,
+    }
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.2000"),
+        settings=settings,
+        last_minute_passive_price_matrix=matrix,
+    )
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert yes_candidate["execution_price_dollars"] == "0.5500"
+    assert yes_candidate["last_minute_price_source"] == "fixed_bid"
 
 
 def test_crypto_last_minute_passive_no_side_converts_bid_to_yes_price(tmp_path) -> None:
