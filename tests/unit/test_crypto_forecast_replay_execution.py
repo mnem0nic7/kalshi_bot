@@ -2243,8 +2243,8 @@ def test_crypto_late_high_confidence_default_probability_floor_is_85(tmp_path) -
         "spot_feature_status": "available",
         "spot_provider": "coinbase",
         "spot_source_kind": "spot_tick",
-        "time_to_close_seconds": 240,
-        "market_age_seconds": 660,
+        "time_to_close_seconds": 120,
+        "market_age_seconds": 780,
     }
 
     candidates = _crypto_trade_candidates(row, Decimal("0.8500"), settings=settings)
@@ -2252,6 +2252,74 @@ def test_crypto_late_high_confidence_default_probability_floor_is_85(tmp_path) -
 
     assert settings.crypto_late_sure_thing_min_probability == 0.85
     assert yes_candidate["market_anchored_probability"] == "0.8500"
+    assert yes_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert yes_candidate["late_high_confidence_directional_entry"] is True
+
+
+def test_crypto_late_high_confidence_requires_90_probability_from_180_to_300_seconds(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_late_sure_thing_max_seconds_to_close=300,
+        crypto_late_sure_thing_standard_max_seconds_to_close=180,
+        crypto_late_sure_thing_min_probability=0.85,
+        crypto_late_sure_thing_extended_min_probability=0.90,
+        crypto_late_sure_thing_min_market_probability=0.75,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-EXTENDED-TOO-LOW",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.8900"),
+        "yes_bid_dollars": Decimal("0.8800"),
+        "yes_ask_dollars": Decimal("0.9000"),
+        "no_ask_dollars": Decimal("0.1200"),
+        "spread_bps": 200,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 240,
+        "market_age_seconds": 660,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.8900"), settings=settings)
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["market_anchored_probability"] == "0.8900"
+    assert yes_candidate["reason"] != "late_high_confidence_directional_entry"
+    assert yes_candidate["candidate_status"] != CRYPTO_LIVE_QUALITY
+    assert yes_candidate["late_high_confidence_directional_entry"] is False
+
+
+def test_crypto_late_high_confidence_allows_90_probability_from_180_to_300_seconds(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_late_sure_thing_max_seconds_to_close=300,
+        crypto_late_sure_thing_standard_max_seconds_to_close=180,
+        crypto_late_sure_thing_min_probability=0.85,
+        crypto_late_sure_thing_extended_min_probability=0.90,
+        crypto_late_sure_thing_min_market_probability=0.75,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-EXTENDED-STRICT",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.9000"),
+        "yes_bid_dollars": Decimal("0.8900"),
+        "yes_ask_dollars": Decimal("0.9100"),
+        "no_ask_dollars": Decimal("0.1100"),
+        "spread_bps": 200,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 240,
+        "market_age_seconds": 660,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.9000"), settings=settings)
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["market_anchored_probability"] == "0.9000"
+    assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
     assert yes_candidate["reason"] == "late_high_confidence_directional_entry"
     assert yes_candidate["late_high_confidence_directional_entry"] is True
 

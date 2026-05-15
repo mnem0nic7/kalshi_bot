@@ -7496,7 +7496,10 @@ def _crypto_late_sure_thing_candidate(
         return False
     if time_to_close > max(0, int(settings.crypto_late_sure_thing_max_seconds_to_close)):
         return False
-    min_probability = Decimal(str(settings.crypto_late_sure_thing_min_probability))
+    min_probability = _crypto_late_sure_thing_min_probability(
+        time_to_close_seconds=time_to_close,
+        settings=settings,
+    )
     if probability < min_probability:
         return False
     market_probability = _crypto_market_side_probability(row, side)
@@ -7504,6 +7507,19 @@ def _crypto_late_sure_thing_candidate(
         return False
     min_market_probability = Decimal(str(settings.crypto_late_sure_thing_min_market_probability))
     return market_probability >= min_market_probability
+
+
+def _crypto_late_sure_thing_min_probability(
+    *,
+    time_to_close_seconds: int,
+    settings: Settings,
+) -> Decimal:
+    base_probability = Decimal(str(settings.crypto_late_sure_thing_min_probability))
+    standard_max_seconds = max(0, int(settings.crypto_late_sure_thing_standard_max_seconds_to_close))
+    if time_to_close_seconds <= standard_max_seconds:
+        return base_probability
+    extended_probability = Decimal(str(settings.crypto_late_sure_thing_extended_min_probability))
+    return max(base_probability, extended_probability)
 
 
 def crypto_late_sure_thing_trace(candidate_trace: dict[str, Any] | None) -> bool:

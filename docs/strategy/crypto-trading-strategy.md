@@ -376,7 +376,8 @@ candidates:
    edge trades do not cross the spread after an unfilled passive attempt.
 5. Late high-confidence directional entries may still fall back to taker inside
    `crypto_late_sure_thing_max_seconds_to_close` when the candidate remains
-   live-quality.
+   live-quality. The standard late window is 180 seconds; entries from 180-300
+   seconds before close must have model probability at least 0.90.
 
 Execution blocks live orders when:
 

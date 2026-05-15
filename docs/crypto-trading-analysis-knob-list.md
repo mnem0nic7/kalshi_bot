@@ -26,14 +26,17 @@ Use this as the candidate grid/search space for `CRYPTO_15M`.
 | `crypto_live_min_market_age_seconds` | `180` | seconds | Earliest allowed live entry after market opens. Sweep by asset and volatility regime. |
 | `crypto_autonomy_min_seconds_to_close` | `0` | seconds | Minimum time remaining for autonomy to consider a market. Test stricter entry cutoffs such as 60, 120, 180, 300. |
 | `crypto_taker_fallback_close_seconds` | `0` | seconds | Taker fallback window for normal candidates. `0` keeps normal edge trades passive-only. Test fill rate vs edge decay near close. |
-| `crypto_late_sure_thing_max_seconds_to_close` | `300` | seconds | Max time-to-close for late sure-thing path. |
+| `crypto_late_sure_thing_max_seconds_to_close` | `300` | seconds | Outer max time-to-close for late sure-thing path. |
+| `crypto_late_sure_thing_standard_max_seconds_to_close` | `180` | seconds | Standard late window using the normal probability floor. |
 
 ## Late Sure-Thing Path
 
 | Knob | Current default | Units | What to test |
 | --- | ---: | --- | --- |
 | `crypto_late_sure_thing_enabled` | `True` | bool | Compare normal-only vs late-sure-thing candidates. |
-| `crypto_late_sure_thing_min_probability` | `0.85` | probability | Minimum model probability for late sure thing. |
+| `crypto_late_sure_thing_standard_max_seconds_to_close` | `180` | seconds | Boundary where the standard probability floor gives way to the extended-window floor. |
+| `crypto_late_sure_thing_min_probability` | `0.85` | probability | Minimum model probability inside the standard close window. |
+| `crypto_late_sure_thing_extended_min_probability` | `0.90` | probability | Minimum model probability from 180-300 seconds before close. |
 | `crypto_late_sure_thing_min_market_probability` | `0.75` | probability | Minimum market-implied probability for late sure thing. |
 
 ## Market Anchor
@@ -164,7 +167,9 @@ Start with a small grid before doing broader optimization:
 | `min_confidence` | `0.60`, `0.70`, `0.80`, `0.90` |
 | `min_contract_price_dollars` | `0.05`, `0.10`, `0.25`, `0.50`, `0.75` |
 | `crypto_market_price_anchor_weight` | `0.00`, `0.25`, `0.50`, `0.75`, `1.00` |
+| `crypto_late_sure_thing_standard_max_seconds_to_close` | `60`, `120`, `180`, `240` |
 | `crypto_late_sure_thing_min_probability` | `0.80`, `0.85`, `0.90`, `0.95` |
+| `crypto_late_sure_thing_extended_min_probability` | `0.85`, `0.90`, `0.95` |
 | `crypto_late_sure_thing_min_market_probability` | `0.60`, `0.70`, `0.75`, `0.80`, `0.90` |
 
 Keep replay sample gates fixed during the first sweep. Once entry/timing behavior

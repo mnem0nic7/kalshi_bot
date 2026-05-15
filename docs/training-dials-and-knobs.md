@@ -630,8 +630,10 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_AUTONOMY_INTERVAL_SECONDS` | `30` | Crypto autonomy cadence. |
 | `CRYPTO_AUTONOMY_MIN_SECONDS_TO_CLOSE` | `0` | Minimum seconds to close; `0` keeps evaluating until close. |
 | `CRYPTO_LATE_SURE_THING_ENABLED` | `true` | Allows the late high-confidence market-confirmed bypass path. |
-| `CRYPTO_LATE_SURE_THING_MAX_SECONDS_TO_CLOSE` | `300` | Maximum seconds to close for late high-confidence entries. |
-| `CRYPTO_LATE_SURE_THING_MIN_PROBABILITY` | `0.85` | Minimum model-side probability for late high-confidence entries. |
+| `CRYPTO_LATE_SURE_THING_MAX_SECONDS_TO_CLOSE` | `300` | Outer cap for late high-confidence entries. |
+| `CRYPTO_LATE_SURE_THING_STANDARD_MAX_SECONDS_TO_CLOSE` | `180` | Standard late window; entries inside it use the normal probability floor. |
+| `CRYPTO_LATE_SURE_THING_MIN_PROBABILITY` | `0.85` | Minimum model-side probability inside the standard late window. |
+| `CRYPTO_LATE_SURE_THING_EXTENDED_MIN_PROBABILITY` | `0.90` | Minimum model-side probability from 180-300 seconds before close. |
 | `CRYPTO_LATE_SURE_THING_MIN_MARKET_PROBABILITY` | `0.75` | Minimum market-implied side probability for late high-confidence entries. |
 | `CRYPTO_AUTONOMY_MAX_ROOMS_PER_RUN` | `7` | Per-run room cap. |
 | `CRYPTO_AUTONOMY_MAX_PER_ASSET_PER_RUN` | `1` | Per-asset room cap. |

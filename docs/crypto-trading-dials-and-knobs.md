@@ -335,13 +335,17 @@ execution checks.
 | Setting | Current default | Effect |
 | --- | ---: | --- |
 | `crypto_late_sure_thing_enabled` | `True` | Enables the late sure-thing candidate path. |
-| `crypto_late_sure_thing_max_seconds_to_close` | `300` | Candidate must be within this many seconds of close. |
-| `crypto_late_sure_thing_min_probability` | `0.85` | Minimum model probability for the winning side. |
+| `crypto_late_sure_thing_max_seconds_to_close` | `300` | Outer cap for late high-confidence entries. |
+| `crypto_late_sure_thing_standard_max_seconds_to_close` | `180` | Entries inside this window use the standard probability floor. |
+| `crypto_late_sure_thing_min_probability` | `0.85` | Minimum model probability for the winning side inside the standard window. |
+| `crypto_late_sure_thing_extended_min_probability` | `0.90` | Minimum model probability for the winning side from 180-300 seconds before close. |
 | `crypto_late_sure_thing_min_market_probability` | `0.75` | Minimum market-implied probability for the same side. |
 
 Late sure-thing also affects taker fallback. If the candidate trace is marked as
 late sure thing, taker fallback is allowed only inside
-`crypto_late_sure_thing_max_seconds_to_close`.
+`crypto_late_sure_thing_max_seconds_to_close`. The candidate must already have
+passed the stricter 180-300 second model-probability rule before that trace is
+set.
 
 ## Autonomy and Room Creation Knobs
 
