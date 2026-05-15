@@ -210,7 +210,7 @@ class AgentPackService:
             crypto_policy=AgentPackCryptoPolicy(
                 entry=AgentPackCryptoEntryPolicy(
                     min_fee_adjusted_edge_bps=self.settings.risk_min_edge_bps,
-                    max_spread_bps=self.settings.trigger_max_spread_bps,
+                    max_spread_bps=self.settings.crypto_live_max_spread_bps,
                     min_confidence=self.settings.risk_min_confidence,
                     min_contract_price_dollars=self.settings.risk_min_contract_price_dollars,
                     min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,

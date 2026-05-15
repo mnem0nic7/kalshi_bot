@@ -7369,7 +7369,7 @@ def _crypto_entry_policy_for_row(
         return entry
     return {
         "min_fee_adjusted_edge_bps": int(settings.risk_min_edge_bps),
-        "max_spread_bps": int(settings.trigger_max_spread_bps),
+        "max_spread_bps": int(settings.crypto_live_max_spread_bps),
         "min_confidence": float(settings.risk_min_confidence),
         "min_contract_price_dollars": float(settings.risk_min_contract_price_dollars),
         "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,

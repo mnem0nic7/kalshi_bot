@@ -11,7 +11,7 @@ Use this as the candidate grid/search space for `CRYPTO_15M`.
 | Knob | Current default | Units | What to test |
 | --- | ---: | --- | --- |
 | `min_fee_adjusted_edge_bps` | `500` | bps | Minimum post-fee edge required to enter. Sweep higher/lower by asset and time-to-close bucket. |
-| `max_spread_bps` | `250` to `500` | bps | Max bid/ask spread accepted. Built-in pack seeds from `trigger_max_spread_bps=250`; runtime fallback is `crypto_live_max_spread_bps=500`. |
+| `max_spread_bps` | `1000` | bps | Max bid/ask spread accepted for live crypto entries. Built-in pack and runtime fallback use `crypto_live_max_spread_bps`. |
 | `min_confidence` | `0.80` | probability | Minimum model confidence. Test against realized win rate and candidate starvation. |
 | `min_contract_price_dollars` | `0.50` | dollars | Minimum entry contract price. Test whether lower-priced entries have enough realized edge after fees. |
 | `max_credible_edge_bps` | `10000` | bps | Upper guardrail for implausibly large edge. Mostly a data-quality/outlier filter. |

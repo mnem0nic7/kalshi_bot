@@ -261,7 +261,7 @@ The runtime crypto policy merges active agent-pack settings with static settings
 | Entry field | Settings fallback | Current default behavior |
 | --- | --- | --- |
 | `min_fee_adjusted_edge_bps` | `risk_min_edge_bps` | Default `500`. Agent-pack values are floored at `risk_min_edge_bps`. Lower pack values do not undercut the settings floor. |
-| `max_spread_bps` | `crypto_live_max_spread_bps` | Settings fallback `500`. The built-in default pack currently seeds this from `trigger_max_spread_bps`, default `250`. |
+| `max_spread_bps` | `crypto_live_max_spread_bps` | Settings fallback `1000`. The built-in default pack seeds this from `crypto_live_max_spread_bps`. |
 | `min_confidence` | `risk_min_confidence` | Default `0.80`. |
 | `min_contract_price_dollars` | `risk_min_contract_price_dollars` | Default `0.50`. Agent-pack values are floored at the settings minimum. |
 | `min_remaining_payout_bps` | code constant | Currently fixed at `0` for crypto. |

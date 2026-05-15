@@ -222,7 +222,7 @@ class Settings(BaseSettings):
     crypto_shadow_exploration_max_per_asset_per_run: int = 2
     crypto_shadow_exploration_min_expected_net_edge_dollars: float = -0.03
     crypto_shadow_exploration_max_spread_bps: int = 500
-    crypto_live_max_spread_bps: int = 500
+    crypto_live_max_spread_bps: int = 1000
     crypto_empirical_bucket_gate_enabled: bool = True
     crypto_empirical_bucket_gate_assets: str = "live"
     crypto_empirical_bucket_min_samples: int = 20

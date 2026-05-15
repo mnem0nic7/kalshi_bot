@@ -639,7 +639,7 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_SHADOW_EXPLORATION_MAX_PER_ASSET_PER_RUN` | `2` | Shadow per-asset cap. |
 | `CRYPTO_SHADOW_EXPLORATION_MIN_EXPECTED_NET_EDGE_DOLLARS` | `-0.03` | Shadow exploration net-edge floor. |
 | `CRYPTO_SHADOW_EXPLORATION_MAX_SPREAD_BPS` | `500` | Shadow spread ceiling. |
-| `CRYPTO_LIVE_MAX_SPREAD_BPS` | `500` | Live spread ceiling. |
+| `CRYPTO_LIVE_MAX_SPREAD_BPS` | `1000` | Live spread ceiling. |
 | `CRYPTO_EMPIRICAL_BUCKET_GATE_ENABLED` | `true` | Enables empirical bucket gate. |
 | `CRYPTO_EMPIRICAL_BUCKET_GATE_ASSETS` | `live` | Assets subject to empirical bucket gate. |
 | `CRYPTO_EMPIRICAL_BUCKET_MIN_SAMPLES` | `20` | Bucket support threshold. |
