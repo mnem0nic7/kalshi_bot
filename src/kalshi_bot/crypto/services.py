@@ -2941,6 +2941,17 @@ class CryptoExecutionService:
                     else None,
                 },
             )
+        if _crypto_market_closed_for_execution(market):
+            return ExecReceiptPayload(
+                status="crypto_market_closed",
+                client_order_id=client_order_id,
+                details={
+                    "reason": "market close time has passed",
+                    "market_ticker": market.market_ticker,
+                    "close_time": _datetime_text(market.close_time or market.expected_expiration_time),
+                    "no_order_submitted": True,
+                },
+            )
         if crypto_last_minute_passive_trace(signal.candidate_trace):
             fixed_ticket = ticket.model_copy(update={"time_in_force": KALSHI_GTC_TIME_IN_FORCE})
             receipt = await self.base_execution_service.execute_fixed_limit_until_close(
@@ -3221,12 +3232,37 @@ class CryptoWorkflowService:
                         payload={"signal_id": signal_record.id, **(signal_record.payload or {})},
                     ),
                 )
+                if _crypto_market_closed_for_execution(market):
+                    await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+                    await repo.append_message(
+                        room.id,
+                        RoomMessageCreate(
+                            role=AgentRole.SYSTEM,
+                            kind=MessageKind.OPS_ALERT,
+                            stage=RoomStage.COMPLETE,
+                            content="Crypto market is already closed; no trade ticket created.",
+                            payload={
+                                "market_domain": "crypto",
+                                "market_ticker": market.market_ticker,
+                                "reason": "crypto_market_closed",
+                                "close_time": _datetime_text(market.close_time or market.expected_expiration_time),
+                                "no_order_submitted": True,
+                            },
+                        ),
+                    )
+                    await session.commit()
+                    return
                 if not _signal_is_tradeable(signal):
                     await repo.update_room_stage(room.id, RoomStage.COMPLETE)
                     await session.commit()
                     return
 
                 default_count_fp = quantize_count(Decimal(str(self.settings.crypto_default_order_count_fp)))
+                time_in_force = (
+                    KALSHI_GTC_TIME_IN_FORCE
+                    if crypto_last_minute_passive_trace(signal.candidate_trace)
+                    else "immediate_or_cancel"
+                )
                 base_ticket = TradeTicket(
                     market_ticker=market.market_ticker,
                     action=TradeAction.BUY,
@@ -3234,8 +3270,12 @@ class CryptoWorkflowService:
                     yes_price_dollars=signal.target_yes_price_dollars,
                     count_fp=default_count_fp,
                     capital_bucket=signal.capital_bucket,
-                    time_in_force="immediate_or_cancel",
-                    note="CRYPTO_15M passive-first candidate",
+                    time_in_force=time_in_force,
+                    note=(
+                        "CRYPTO_15M last-minute passive rest-to-close candidate"
+                        if time_in_force == KALSHI_GTC_TIME_IN_FORCE
+                        else "CRYPTO_15M passive-first candidate"
+                    ),
                 )
                 risk_context = await self._risk_context(repo, room, base_ticket, market)
                 count_fp, sizing_diagnostics = _crypto_dynamic_order_count_fp(
@@ -3357,6 +3397,7 @@ class CryptoWorkflowService:
                     "crypto_trading_disabled",
                     "crypto_replay_gate_blocked",
                     "crypto_candidate_not_live_eligible",
+                    "crypto_market_closed",
                 }
                 if receipt.external_order_id or receipt.status not in no_order_statuses:
                     execution_client_order_id = _receipt_kalshi_client_order_id(
@@ -4806,6 +4847,20 @@ def _as_utc_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _datetime_text(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return _as_utc_datetime(value).isoformat()
+
+
+def _crypto_market_closed_for_execution(market: CryptoMarket, *, now: datetime | None = None) -> bool:
+    close_time = market.close_time or market.expected_expiration_time
+    if close_time is None:
+        return False
+    current = _as_utc_datetime(now or datetime.now(UTC))
+    return _as_utc_datetime(close_time) <= current
 
 
 async def _crypto_shadow_evidence_counts(
@@ -7648,6 +7703,8 @@ def _crypto_late_sure_thing_candidate(
         return False
     time_to_close = _optional_int(row.get("time_to_close_seconds"))
     if time_to_close is None:
+        return False
+    if time_to_close <= 0:
         return False
     if time_to_close > max(0, int(settings.crypto_late_sure_thing_max_seconds_to_close)):
         return False

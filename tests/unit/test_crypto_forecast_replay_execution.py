@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import ContractSide, RiskStatus, RoomOrigin, StandDownReason, TradeAction
+from kalshi_bot.core.enums import ContractSide, MessageKind, RiskStatus, RoomOrigin, StandDownReason, TradeAction
 from kalshi_bot.core.schemas import (
     AgentPackCryptoEntryPolicy,
     AgentPackCryptoLivePolicy,
@@ -2274,6 +2274,37 @@ def test_crypto_candidate_quality_allows_late_high_confidence_directional_entry(
     assert no_candidate["expected_net_edge"].startswith("-")
     assert no_candidate["live_entry_window_reason"] == "crypto_market_too_late_for_live_entry"
     assert no_candidate["late_high_confidence_directional_entry"] is True
+
+
+def test_crypto_late_high_confidence_does_not_trade_after_close(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_autonomy_min_seconds_to_close=0,
+        crypto_late_sure_thing_max_seconds_to_close=120,
+        crypto_late_sure_thing_min_probability=0.90,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-CLOSED",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.0350"),
+        "yes_bid_dollars": Decimal("0.0300"),
+        "yes_ask_dollars": Decimal("0.0400"),
+        "no_ask_dollars": Decimal("0.9700"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": -4,
+        "market_age_seconds": 904,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.0500"), settings=settings)
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["candidate_status"] != CRYPTO_LIVE_QUALITY
+    assert no_candidate["reason"] != "late_high_confidence_directional_entry"
+    assert no_candidate["late_high_confidence_directional_entry"] is False
 
 
 def test_crypto_late_high_confidence_default_probability_floor_is_85(tmp_path) -> None:
@@ -5444,6 +5475,147 @@ async def test_crypto_workflow_dynamic_sizing_saves_ticket_and_executes_approved
     assert verdict is not None
     assert verdict.approved_count_fp == Decimal("20.00")
     assert execution.calls[0]["ticket"].count_fp == Decimal("20.00")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_workflow_persists_last_minute_passive_ticket_as_gtc(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    market = _market(close_time=datetime.now(UTC) + timedelta(seconds=45), yes_bid_dollars=Decimal("0.5000"))
+    signal = _live_quality_signal(
+        target_yes_price_dollars=Decimal("0.5500"),
+        fair_yes_dollars=Decimal("0.6500"),
+    )
+    signal.candidate_trace = {
+        "candidate_status": CRYPTO_LIVE_QUALITY,
+        "last_minute_passive_market_confidence": True,
+        "last_minute_passive": {"bid_threshold_dollars": "0.55"},
+        "trade_selection_model": {
+            "candidate_status": CRYPTO_LIVE_QUALITY,
+            "last_minute_passive_market_confidence": True,
+        },
+    }
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    execution = _RecordingCryptoExecution()
+    workflow = CryptoWorkflowService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=_FakeWorkflowMarketService(market),  # type: ignore[arg-type]
+        forecast_service=_FakeForecastService(signal),  # type: ignore[arg-type]
+        risk_engine=_ApproveRiskEngine(),  # type: ignore[arg-type]
+        execution_service=execution,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await repo.set_checkpoint(
+            f"reconcile:{settings.kalshi_env}",
+            None,
+            {
+                "balance": {"balance": 10000, "portfolio_value": 0},
+                "reconciled_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC last-minute workflow", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await session.commit()
+
+    await workflow.run_room(room.id, reason="test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        await session.commit()
+
+    assert ticket is not None
+    assert ticket.time_in_force == "good_till_canceled"
+    assert "last-minute passive" in ticket.payload["note"]
+    assert execution.calls[0]["ticket"].time_in_force == "good_till_canceled"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_workflow_does_not_create_ticket_after_market_close(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    market = _market(close_time=datetime.now(UTC) - timedelta(seconds=1), yes_bid_dollars=Decimal("0.5000"))
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    execution = _RecordingCryptoExecution()
+    workflow = CryptoWorkflowService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=_FakeWorkflowMarketService(market),  # type: ignore[arg-type]
+        forecast_service=_FakeForecastService(
+            _live_quality_signal(
+                target_yes_price_dollars=Decimal("0.5000"),
+                fair_yes_dollars=Decimal("0.6500"),
+            )
+        ),  # type: ignore[arg-type]
+        risk_engine=_ApproveRiskEngine(),  # type: ignore[arg-type]
+        execution_service=execution,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC closed workflow", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await session.commit()
+
+    await workflow.run_room(room.id, reason="test")
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        ticket = await repo.get_latest_trade_ticket_for_room(room.id)
+        verdict = await repo.get_latest_risk_verdict_for_room(room.id)
+        messages = list((await session.execute(select(RoomMessage))).scalars())
+        await session.commit()
+
+    assert ticket is None
+    assert verdict is None
+    assert execution.calls == []
+    assert any(
+        message.kind == MessageKind.OPS_ALERT.value and (message.payload or {}).get("reason") == "crypto_market_closed"
+        for message in messages
+    )
     await engine.dispose()
 
 
