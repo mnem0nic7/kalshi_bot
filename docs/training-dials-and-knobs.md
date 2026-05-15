@@ -610,9 +610,9 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_REPLAY_REQUIRE_PNL_BEATS_MARKET_MID` | `true` | Requires P/L to beat market mid. |
 | `CRYPTO_REPLAY_MIN_PNL_ADVANTAGE_DOLLARS` | `0.0` | Required P/L advantage. |
 | `CRYPTO_REPLAY_MIN_SPOT_COVERAGE_PCT` | `0.80` | Minimum spot coverage. |
-| `CRYPTO_DYNAMIC_ORDER_SIZING_ENABLED` | `true` | Enables crypto dynamic order sizing when the sizing path is wired in. |
+| `CRYPTO_DYNAMIC_ORDER_SIZING_ENABLED` | `true` | Enables dynamic initial ticket sizing for live-quality crypto candidates. |
 | `CRYPTO_DYNAMIC_ORDER_SIZING_SCOPE` | `live_quality` | Candidate scope for crypto dynamic sizing. |
-| `CRYPTO_DYNAMIC_ORDER_TARGET_POSITION_PCT` | `0.10` | Target crypto position allocation as a fraction of capital. |
+| `CRYPTO_DYNAMIC_ORDER_TARGET_POSITION_PCT` | `0.10` | Target crypto position allocation as a fraction of capital, capped by `RISK_POSITION_PCT`. |
 | `CRYPTO_HISTORY_AUTO_ENABLED` | `true` | Enables automatic history collection. |
 | `CRYPTO_HISTORY_AUTO_INTERVAL_SECONDS` | `3600` | History collection cadence. |
 | `CRYPTO_HISTORY_AUTO_LOOKBACK_DAYS` | `2` | Auto history lookback. |

@@ -397,7 +397,7 @@ same-side add-on path.
 | `crypto_order_mode` | `passive_then_taker` | `passive_only` places only passive orders. `passive_then_taker` can fall back to taker under strict conditions. |
 | `crypto_passive_timeout_seconds` | `5` | Configured timeout for passive handling where used by the crypto path. |
 | `crypto_taker_fallback_close_seconds` | `90` | Non-late-sure-thing taker fallback only inside this close window. |
-| `crypto_default_order_count_fp` | `1.0` | Default crypto ticket size before risk resizing. |
+| `crypto_default_order_count_fp` | `1.0` | Fallback crypto ticket size before risk resizing. Non-live-quality candidates keep this size. |
 
 Execution behavior:
 
@@ -429,9 +429,9 @@ General risk settings affect crypto live entries.
 | `risk_daily_loss_dollars_by_strategy` | `{}` | Optional per-strategy daily-loss cap. Use key `CRYPTO_15M` for crypto. |
 | `risk_edge_scaled_sizing_enabled` | `False` | Enables edge-scaled sizing. Still bounded by existing caps. |
 | `risk_edge_scaled_kelly_multiplier` | `0.25` | Fractional-Kelly multiplier when edge-scaled sizing is enabled. |
-| `crypto_dynamic_order_sizing_enabled` | `True` | Enables crypto-specific dynamic order sizing when the sizing path is wired in. |
-| `crypto_dynamic_order_sizing_scope` | `live_quality` | Candidate scope for crypto dynamic sizing. |
-| `crypto_dynamic_order_target_position_pct` | `0.10` | Target crypto position allocation as a fraction of capital. |
+| `crypto_dynamic_order_sizing_enabled` | `True` | Enables crypto-specific dynamic initial ticket sizing. |
+| `crypto_dynamic_order_sizing_scope` | `live_quality` | Candidate scope for crypto dynamic sizing. Current behavior sizes only `live_quality` candidates dynamically. |
+| `crypto_dynamic_order_target_position_pct` | `0.10` | Target crypto position allocation as a fraction of capital before risk applies hard caps. |
 | `risk_max_order_count_fp` | `500.0` | Max ticket count. |
 | `risk_max_position_count_fp_per_ticker` | `200.0` | Max same-ticker position plus in-flight count. |
 | `risk_allow_position_add_ons` | `False` | Global same-side add-on switch. If false, only the crypto-specific add-on exception can allow approved add-ons. |
@@ -445,6 +445,22 @@ General risk settings affect crypto live entries.
 | `risk_min_contract_price_dollars` | `0.50` | Minimum contract price. Also floors crypto policy overrides. |
 | `risk_min_probability_extremity_pct` | `25.0` | Mid-band probability guard input. |
 | `risk_probability_midband_max_extra_edge_bps` | `500` | Extra edge requirement cap from mid-band probability guard. |
+
+Crypto dynamic sizing:
+
+- Applies to accepted `CRYPTO_15M` candidates only when candidate status is
+  `live_quality`.
+- Unit cost is YES price for YES tickets and `1 - yes_price` for NO tickets.
+- Target notional is `total_capital * min(crypto_dynamic_order_target_position_pct, risk_position_pct)`.
+- Available notional subtracts current position notional and pending same-side
+  order notional.
+- Requested count is floored to `0.01` contract increments and capped by
+  `risk_max_order_count_fp`, remaining `risk_max_position_count_fp_per_ticker`,
+  and the target notional budget.
+- If the computed count is below `crypto_default_order_count_fp`, the workflow
+  keeps the default count and lets risk resize or block it.
+- Risk still independently enforces the 10% position-notional cap, missing
+  capital blocks, and all order/count/notional limits.
 
 Crypto-specific add-on settings:
 
