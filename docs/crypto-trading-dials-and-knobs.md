@@ -361,6 +361,23 @@ against the selected side. The extended late window now also blocks candidates
 when recent returns point against the selected side, and late entries with
 available target-distance features need a directional volatility cushion.
 
+## Last-Minute Passive Knobs
+
+| Setting | Current default | Effect |
+| --- | ---: | --- |
+| `crypto_last_minute_passive_enabled` | `True` | Enables the final-60s passive market-confidence path. |
+| `crypto_last_minute_passive_assets` | `live` | Applies the path to assets currently marked live. |
+| `crypto_last_minute_passive_max_seconds_to_close` | `60` | Latest window where the path can create candidates. |
+| `crypto_last_minute_passive_bid_by_asset` | `BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84` | Asset-specific passive bid thresholds from the last-minute sweep. |
+| `crypto_last_minute_passive_require_no_cross` | `True` | Skips the path if the bid would immediately cross the current ask. |
+| `crypto_last_minute_passive_risk_mode` | `normal_cap` | Uses normal crypto sizing and the 10% position cap. |
+
+This path is separate from late sure-thing. It uses market-implied side
+probability instead of model edge, records model probability only for
+diagnostics, bypasses the normal edge floors in risk, and submits one fixed GTC
+bid that rests until close. Existing replay, asset-mode, kill-switch, active
+color, capital, position, and opposite-side gates still apply.
+
 ## Autonomy and Room Creation Knobs
 
 | Setting or CLI flag | Current default | Effect |
@@ -433,6 +450,9 @@ Execution behavior:
 - `passive_only` stops after passive execution fails or loses edge.
 - `passive_then_taker` can fall back to taker if the candidate remains eligible and the relevant fallback window allows it.
 - Production keeps normal taker fallback disabled with `crypto_taker_fallback_close_seconds=0`; late high-confidence directional entries use `crypto_late_sure_thing_max_seconds_to_close`.
+- Last-minute passive candidates submit a fixed GTC bid at the configured
+  asset threshold, do not requote, do not use taker fallback, and cancel after
+  close if still open.
 - Base limit execution uses code constants for requotes and fill polling, not
   configurable settings.
 - App shadow mode, room shadow mode, kill switch, inactive color, and missing

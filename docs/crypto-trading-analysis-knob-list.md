@@ -28,6 +28,12 @@ Use this as the candidate grid/search space for `CRYPTO_15M`.
 | `crypto_taker_fallback_close_seconds` | `0` | seconds | Taker fallback window for normal candidates. `0` keeps normal edge trades passive-only. Test fill rate vs edge decay near close. |
 | `crypto_late_sure_thing_max_seconds_to_close` | `300` | seconds | Outer max time-to-close for late sure-thing path. |
 | `crypto_late_sure_thing_standard_max_seconds_to_close` | `180` | seconds | Standard late window using the normal probability floor. |
+| `crypto_last_minute_passive_enabled` | `True` | bool | Toggle the final-minute passive market-confidence strategy. |
+| `crypto_last_minute_passive_assets` | `live` | selector | Which assets can use the final-minute passive path. |
+| `crypto_last_minute_passive_max_seconds_to_close` | `60` | seconds | Final window for market-confidence passive bids. |
+| `crypto_last_minute_passive_bid_by_asset` | `BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84` | map | Asset-specific passive bid thresholds. |
+| `crypto_last_minute_passive_require_no_cross` | `True` | bool | Require the configured passive bid to sit below the current ask. |
+| `crypto_last_minute_passive_risk_mode` | `normal_cap` | enum | Uses standard dynamic sizing and the 10% position cap. |
 
 ## Late Sure-Thing Path
 

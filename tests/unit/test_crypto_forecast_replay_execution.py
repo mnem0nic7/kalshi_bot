@@ -23,6 +23,7 @@ from kalshi_bot.core.schemas import (
 from kalshi_bot.crypto.models import CryptoMarket, CryptoSeries
 from kalshi_bot.crypto.services import (
     CRYPTO_EXPLORATORY_SHADOW,
+    CRYPTO_LAST_MINUTE_PASSIVE_REASON,
     CRYPTO_LIVE_QUALITY,
     CryptoAssetControlService,
     CryptoAutonomyService,
@@ -39,6 +40,7 @@ from kalshi_bot.crypto.services import (
     _evaluate_crypto_walk_forward,
     _crypto_feature_schema,
     _crypto_dynamic_order_count_fp,
+    _crypto_last_minute_passive_bid_by_asset,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
     _crypto_recommendation,
@@ -1367,6 +1369,26 @@ class _FakeBaseExecutionStatus:
             status=status,
             client_order_id=kwargs["client_order_id"],
             details={"called": True},
+        )
+
+
+class _FakeFixedLimitExecution(_FakeBaseExecution):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fixed_calls: list[dict[str, object]] = []
+
+    async def execute_fixed_limit_until_close(self, **kwargs) -> ExecReceiptPayload:
+        self.fixed_calls.append(kwargs)
+        return ExecReceiptPayload(
+            status="submitted",
+            external_order_id="order-last-minute",
+            client_order_id=kwargs["client_order_id"],
+            details={
+                "order": {
+                    "order_id": "order-last-minute",
+                    "client_order_id": kwargs["client_order_id"],
+                }
+            },
         )
 
 
@@ -2838,6 +2860,148 @@ def test_crypto_empirical_bucket_gate_preserves_explicit_asset_csv_scope(tmp_pat
 
     assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
     assert yes_candidate["empirical_bucket_gate"]["reason"] == "asset_not_configured_for_empirical_bucket_gate"
+
+
+def test_crypto_last_minute_passive_bid_map_parses_v1_thresholds(tmp_path) -> None:
+    settings = _settings(tmp_path)
+
+    bids = _crypto_last_minute_passive_bid_by_asset(settings)
+
+    assert bids == {
+        "BTC": Decimal("0.55"),
+        "ETH": Decimal("0.54"),
+        "XRP": Decimal("0.54"),
+        "SOL": Decimal("0.63"),
+        "DOGE": Decimal("0.65"),
+        "BNB": Decimal("0.77"),
+        "HYPE": Decimal("0.84"),
+    }
+
+
+def test_crypto_last_minute_passive_uses_market_confidence_over_model_winner(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_last_minute_passive_assets="live",
+        crypto_empirical_bucket_gate_assets="BTC",
+    )
+    policy = AgentPackService(settings).runtime_crypto_policy(
+        AgentPackService(settings).default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    live=AgentPackCryptoLivePolicy(asset_modes={"BTC": "live"})
+                )
+            }
+        )
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LAST-MINUTE",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.7000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.6000"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 1000,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 45,
+        "market_age_seconds": 855,
+    }
+
+    action, side, target_yes, edge_bps, trace = _crypto_recommendation(
+        market=_market(),
+        fair_yes=Decimal("0.2000"),
+        settings=settings,
+        crypto_policy=policy,
+        row=row,
+        empirical_bucket_matrix=[],
+        enforce_empirical_bucket_gate=True,
+    )
+
+    assert action == TradeAction.BUY
+    assert side == ContractSide.YES
+    assert target_yes == Decimal("0.5500")
+    assert edge_bps == 1500
+    assert trace["selection_reason"] == CRYPTO_LAST_MINUTE_PASSIVE_REASON
+    assert trace["last_minute_passive_market_confidence"] is True
+    assert trace["empirical_bucket_gate"]["reason"] == "empirical_bucket_missing"
+    assert trace["candidate_status"] == CRYPTO_LIVE_QUALITY
+
+
+def test_crypto_last_minute_passive_no_side_converts_bid_to_yes_price(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_last_minute_passive_assets="BTC")
+    row = {
+        "market_ticker": "KXBTC15M-LAST-MINUTE-NO",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.3000"),
+        "yes_bid_dollars": Decimal("0.4000"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.6000"),
+        "spread_bps": 1000,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 30,
+        "market_age_seconds": 870,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.9000"), settings=settings)
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert no_candidate["reason"] == CRYPTO_LAST_MINUTE_PASSIVE_REASON
+    assert no_candidate["execution_price_dollars"] == "0.5500"
+    assert no_candidate["target_yes_price_dollars"] == "0.4500"
+
+
+def test_crypto_last_minute_passive_blocks_when_bid_would_cross_touch(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_last_minute_passive_assets="BTC")
+    row = {
+        "market_ticker": "KXBTC15M-LAST-MINUTE-CROSS",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.7000"),
+        "yes_bid_dollars": Decimal("0.5300"),
+        "yes_ask_dollars": Decimal("0.5400"),
+        "no_ask_dollars": Decimal("0.4700"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 30,
+        "market_age_seconds": 870,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.2000"), settings=settings)
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["candidate_status"] == "blocked_last_minute_passive"
+    assert yes_candidate["reason"] == "last_minute_passive_would_cross_touch"
+    assert yes_candidate["last_minute_passive_market_confidence"] is False
+
+
+def test_crypto_last_minute_passive_stays_inside_final_60_seconds(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_last_minute_passive_assets="BTC")
+    row = {
+        "market_ticker": "KXBTC15M-LAST-MINUTE-OUTSIDE",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.7000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.6000"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 1000,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 61,
+        "market_age_seconds": 839,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.2000"), settings=settings)
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert yes_candidate["candidate_status"] != CRYPTO_LIVE_QUALITY
+    assert yes_candidate["last_minute_passive"]["reason"] == "outside_last_minute_passive_window"
 
 
 def test_late_high_confidence_candidate_still_requires_empirical_bucket(tmp_path) -> None:
@@ -4327,6 +4491,92 @@ async def test_crypto_execution_live_asset_reaches_base_execution(tmp_path) -> N
     assert receipt.status == "submitted"
     assert fake_base.calls[0]["client_order_id"] == "crypto-test:maker"
     assert fake_base.calls[0]["ticket"].yes_price_dollars == Decimal("0.47")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_last_minute_passive_execution_uses_fixed_rest_to_close(tmp_path) -> None:
+    settings = _settings(tmp_path, app_shadow_mode=False, crypto_trading_enabled=True)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeFixedLimitExecution()
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    market = _market(close_time=datetime.now(UTC) + timedelta(seconds=45))
+    signal = _signal()
+    signal.candidate_trace = {
+        "candidate_status": CRYPTO_LIVE_QUALITY,
+        "last_minute_passive_market_confidence": True,
+        "last_minute_passive": {
+            "bid_threshold_dollars": "0.55",
+            "market_side_probability": "0.7000",
+        },
+        "trade_selection_model": {
+            "candidate_status": CRYPTO_LIVE_QUALITY,
+            "last_minute_passive_market_confidence": True,
+        },
+    }
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC last-minute passive", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5500"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-last-minute",
+        fair_yes_dollars=Decimal("0.2000"),
+        market=market,
+        signal=signal,
+    )
+
+    assert receipt.status == "submitted"
+    assert receipt.details["crypto_order_mode"] == "last_minute_passive"
+    assert receipt.details["no_taker_fallback"] is True
+    assert fake_base.calls == []
+    assert len(fake_base.fixed_calls) == 1
+    fixed_call = fake_base.fixed_calls[0]
+    assert fixed_call["client_order_id"] == "crypto-last-minute:maker"
+    assert fixed_call["ticket"].yes_price_dollars == Decimal("0.5500")
+    assert fixed_call["ticket"].time_in_force == "good_till_canceled"
+    assert fixed_call["close_time"] == market.close_time
     await engine.dispose()
 
 

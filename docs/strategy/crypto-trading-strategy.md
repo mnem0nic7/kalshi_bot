@@ -383,6 +383,10 @@ candidates:
    late window, recent adverse spot momentum blocks the late path, and available
    target-distance features must show at least 3 volatility units of directional
    cushion.
+6. Last-minute passive market-confidence entries are a separate final-60s path:
+   they use the Kalshi market-implied side probability, submit one fixed GTC bid
+   at the configured asset threshold, do not requote, do not use taker fallback,
+   and cancel after close if still open.
 
 Execution blocks live orders when:
 

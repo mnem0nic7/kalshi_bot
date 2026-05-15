@@ -141,6 +141,92 @@ def test_risk_engine_allows_late_high_confidence_crypto_edge_bypass() -> None:
     assert "late_high_confidence_fee_adjusted_edge_bypass" in verdict.reason_codes
 
 
+def test_risk_engine_allows_last_minute_passive_edge_bypass_and_normal_cap() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=500,
+        risk_min_probability_extremity_pct=0.0,
+        risk_position_pct=0.10,
+        risk_max_order_notional_dollars=100,
+        strategy_min_remaining_payout_bps=0,
+    )
+    signal = make_signal(edge_bps=-100)
+    signal.target_yes_price_dollars = Decimal("0.5500")
+    signal.fair_yes_dollars = Decimal("0.2000")
+    signal.confidence = 0.90
+    signal.candidate_trace = {
+        "strategy_code": StrategyCode.CRYPTO_15M.value,
+        "candidate_status": "live_quality",
+        "last_minute_passive_market_confidence": True,
+    }
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-LAST-MINUTE",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5500"),
+            count_fp=Decimal("100.00"),
+        ),
+        signal=signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("100.00"),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("18.18")
+    assert "last_minute_passive_edge_bypass" in verdict.reason_codes
+    assert "last_minute_passive_fee_adjusted_edge_bypass" in verdict.reason_codes
+    assert "position_notional_cap_resized" in verdict.reason_codes
+
+
+def test_risk_engine_blocks_duplicate_last_minute_passive_open_order() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=500,
+        risk_min_probability_extremity_pct=0.0,
+        strategy_min_remaining_payout_bps=0,
+    )
+    signal = make_signal(edge_bps=100)
+    signal.candidate_trace = {
+        "strategy_code": StrategyCode.CRYPTO_15M.value,
+        "candidate_status": "live_quality",
+        "last_minute_passive_market_confidence": True,
+    }
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-LAST-MINUTE",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5500"),
+            count_fp=Decimal("1.00"),
+        ),
+        signal=signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("100.00"),
+            pending_order_count_fp=Decimal("1.00"),
+            pending_order_notional_dollars=Decimal("0.5500"),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert "last_minute_passive_duplicate_open_order" in verdict.reason_codes
+
+
 def test_risk_engine_blocks_new_entries_when_source_health_pause_is_active() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",

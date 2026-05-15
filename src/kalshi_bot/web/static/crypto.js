@@ -245,6 +245,9 @@
       crypto_market_too_late_for_live_entry: "market too late for live entry",
       positive_fee_adjusted_live_quality_edge: "normal fee-adjusted edge",
       late_high_confidence_directional_entry: "late high-confidence market-anchored choice",
+      last_minute_passive_market_confidence: "last-minute passive market-confidence bid",
+      last_minute_passive_would_cross_touch: "last-minute passive would cross touch",
+      market_confidence_below_last_minute_bid: "market confidence below last-minute bid",
       empirical_bucket_not_allowed: "empirical bucket not allowed",
       empirical_bucket_missing: "empirical bucket unknown",
       empirical_bucket_under_sampled: "empirical bucket under-sampled",
@@ -327,7 +330,10 @@
     const edge = candidateEdgeSummary(candidate, trace, signal);
     const status = candidateStatusLabel(candidate, trace);
     const bucket = empiricalBucketLabel(candidate, trace);
-    return [edge, status, bucket].filter(Boolean).join(" · ");
+    const lastMinute = candidate.last_minute_passive_market_confidence
+      ? `last-minute passive @ ${price(candidate.last_minute_passive_bid_threshold_dollars)}`
+      : "";
+    return [edge, status, lastMinute, bucket].filter(Boolean).join(" · ");
   }
 
   function signalState(signal, signalBlocker) {
@@ -373,6 +379,7 @@
       ["Live Assets", counts.live || 0],
       ["Normal Edge", signalSummary.normal_edge_trade_count || 0],
       ["Late Bypass", signalSummary.late_high_confidence_trade_count || 0],
+      ["Last Minute", signalSummary.last_minute_passive_trade_count || 0],
       ["Bucket Override", signalSummary.empirical_bucket_override_count || 0],
       ["Buckets", `${signalSummary.empirical_bucket_allowed_count || 0}/${signalSummary.empirical_bucket_blocked_count || 0}/${signalSummary.empirical_bucket_unknown_count || 0}`],
       ["Updated", timeLabel((state.payload || {}).updated_at)],
