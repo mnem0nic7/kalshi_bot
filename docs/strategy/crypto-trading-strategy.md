@@ -155,10 +155,10 @@ Default/fallback controls:
 | Crypto autonomy enabled | false |
 | Production crypto autonomy enabled | false |
 | Quote evidence enabled | true |
-| Minimum seconds to close | 120 seconds |
+| Minimum seconds to close | 0 seconds |
 | Max rooms per run | 7 |
 | Max rooms per asset per run | 1 |
-| Autonomy interval | 60 seconds |
+| Autonomy interval | 30 seconds |
 
 In production, quote evidence mode can still collect shadow evidence when
 production autonomy is disabled, provided quote evidence is enabled. That mode
@@ -204,20 +204,20 @@ The live-quality candidate path blocks when:
 - contract price is below the minimum
 - raw edge exceeds the maximum credible edge
 - fee-adjusted expected net edge is below the active minimum
-- market age is below 180 seconds or time-to-close is below 120 seconds
+- market age is below 180 seconds or the market has already closed
 
 Current runtime entry thresholds observed in production on 2026-05-14:
 
 | Gate | Active value |
 |---|---:|
 | Minimum fee-adjusted edge | 500 bps |
-| Max spread | 250 bps |
+| Max spread | 1000 bps |
 | Minimum confidence | 0.80 |
 | Minimum contract price | $0.50 |
 | Minimum remaining payout | disabled (0 bps) |
 | Maximum credible edge | 10000 bps |
 | Minimum market age | 180 seconds |
-| Minimum seconds to close | 120 seconds |
+| Minimum seconds to close | 0 seconds |
 
 Shadow exploration controls:
 

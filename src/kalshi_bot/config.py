@@ -208,7 +208,7 @@ class Settings(BaseSettings):
     crypto_replay_min_spot_coverage_pct: float = 0.80
     crypto_autonomy_enabled: bool = False
     crypto_production_autonomy_enabled: bool = False
-    crypto_autonomy_interval_seconds: int = 60
+    crypto_autonomy_interval_seconds: int = 30
     crypto_autonomy_min_seconds_to_close: int = 0
     crypto_late_sure_thing_enabled: bool = True
     crypto_late_sure_thing_max_seconds_to_close: int = 300

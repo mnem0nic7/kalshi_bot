@@ -627,8 +627,8 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_SPOT_COINGECKO_MAX_STALE_SECONDS` | `90` | CoinGecko spot staleness limit. |
 | `CRYPTO_AUTONOMY_ENABLED` | `false` | Enables crypto autonomy loop. |
 | `CRYPTO_PRODUCTION_AUTONOMY_ENABLED` | `false` | Enables production autonomy. |
-| `CRYPTO_AUTONOMY_INTERVAL_SECONDS` | `60` | Crypto autonomy cadence. |
-| `CRYPTO_AUTONOMY_MIN_SECONDS_TO_CLOSE` | `0` | Minimum seconds to close. |
+| `CRYPTO_AUTONOMY_INTERVAL_SECONDS` | `30` | Crypto autonomy cadence. |
+| `CRYPTO_AUTONOMY_MIN_SECONDS_TO_CLOSE` | `0` | Minimum seconds to close; `0` keeps evaluating until close. |
 | `CRYPTO_LATE_SURE_THING_ENABLED` | `true` | Allows the late high-confidence market-confirmed bypass path. |
 | `CRYPTO_LATE_SURE_THING_MAX_SECONDS_TO_CLOSE` | `300` | Maximum seconds to close for late high-confidence entries. |
 | `CRYPTO_LATE_SURE_THING_MIN_PROBABILITY` | `0.85` | Minimum model-side probability for late high-confidence entries. |
