@@ -269,6 +269,39 @@ def test_crypto_dynamic_sizing_caps_order_and_remaining_position_count(tmp_path)
     assert position_diag["capped_count_fp"] == "5.00"
 
 
+def test_crypto_dynamic_sizing_caps_late_empirical_override_to_one_contract(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_position_pct=0.10,
+        crypto_dynamic_order_target_position_pct=0.10,
+        risk_max_order_count_fp=500.0,
+        risk_max_position_count_fp_per_ticker=500.0,
+    )
+    signal = _live_quality_signal()
+    signal.candidate_trace = {
+        **(signal.candidate_trace or {}),
+        "empirical_bucket_gate": {
+            "status": "override_allowed",
+            "allowed": True,
+            "override_allowed": True,
+            "override_reason": "late_high_confidence_empirical_bucket_missing_override",
+            "original_reason": "empirical_bucket_missing",
+        },
+    }
+
+    count, diagnostics = _crypto_dynamic_order_count_fp(
+        settings=settings,
+        ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.5000")),
+        signal=signal,
+        context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
+    )
+
+    assert count == Decimal("1.00")
+    assert diagnostics["raw_count_fp"] == "20.00"
+    assert diagnostics["capped_count_fp"] == "1.00"
+    assert diagnostics["empirical_bucket_late_override_cap_active"] is True
+
+
 def test_crypto_dynamic_sizing_subtracts_current_and_pending_notional(tmp_path) -> None:
     settings = _settings(tmp_path, risk_position_pct=0.10, crypto_dynamic_order_target_position_pct=0.10)
 
@@ -2556,6 +2589,7 @@ def test_late_high_confidence_candidate_still_requires_empirical_bucket(tmp_path
         tmp_path,
         risk_min_edge_bps=500,
         crypto_empirical_bucket_gate_assets="BTC",
+        crypto_empirical_late_override_enabled=False,
         crypto_autonomy_min_seconds_to_close=120,
         crypto_late_sure_thing_min_probability=0.90,
     )
@@ -2587,6 +2621,173 @@ def test_late_high_confidence_candidate_still_requires_empirical_bucket(tmp_path
     assert no_candidate["pre_empirical_reason"] == "late_high_confidence_directional_entry"
     assert no_candidate["candidate_status"] == "blocked_empirical_bucket"
     assert no_candidate["reason"] == "empirical_bucket_not_allowed"
+
+
+def test_late_high_confidence_overrides_missing_empirical_bucket_when_near_close(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_empirical_bucket_gate_assets="BTC",
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_late_sure_thing_min_probability=0.90,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-BUCKET-MISSING",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.0350"),
+        "yes_bid_dollars": Decimal("0.0300"),
+        "yes_ask_dollars": Decimal("0.0400"),
+        "no_ask_dollars": Decimal("0.9700"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 60,
+        "market_age_seconds": 840,
+    }
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.0500"),
+        settings=settings,
+        empirical_bucket_matrix=[],
+        enforce_empirical_bucket_gate=True,
+    )
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["late_high_confidence_directional_entry"] is True
+    assert no_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert no_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert no_candidate["empirical_bucket_status"] == "override_allowed"
+    assert no_candidate["empirical_bucket_gate"]["original_reason"] == "empirical_bucket_missing"
+    assert no_candidate["empirical_bucket_gate"]["late_override"]["max_count_fp"] == "1.00"
+    assert no_candidate["empirical_bucket_gap_sample"]["schema_version"] == "crypto-empirical-gap-sample-v1"
+    assert no_candidate["empirical_bucket_gap_sample"]["gap_analysis_candidate"] is True
+    assert no_candidate["empirical_bucket_gap_sample"]["late_override_allowed"] is True
+    assert no_candidate["empirical_bucket_gap_sample"]["dedupe_key"] == (
+        "KXBTC15M-LATE-BUCKET-MISSING|no|BTC|no|0.75-1.00|tight|0_5m|"
+        "late_high_confidence_directional_entry"
+    )
+    assert no_candidate["live_eligible"] is True
+
+
+def test_late_high_confidence_overrides_low_win_rate_bucket_with_positive_pnl(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_empirical_bucket_gate_assets="BTC",
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_late_sure_thing_min_probability=0.90,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-BUCKET-LOW-WIN",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.0350"),
+        "yes_bid_dollars": Decimal("0.0300"),
+        "yes_ask_dollars": Decimal("0.0400"),
+        "no_ask_dollars": Decimal("0.9700"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 60,
+        "market_age_seconds": 840,
+    }
+    bucket_key = _crypto_bucket_key(row, {"side": "no", "execution_price_dollars": "0.9700"})
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.0500"),
+        settings=settings,
+        empirical_bucket_matrix=[_empirical_bucket(bucket_key, net_pnl="0.0100", win_rate=0.50)],
+        enforce_empirical_bucket_gate=True,
+    )
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert no_candidate["empirical_bucket_status"] == "override_allowed"
+    assert no_candidate["empirical_bucket_gate"]["original_reason"] == "empirical_bucket_low_win_rate"
+    assert no_candidate["empirical_bucket_gate"]["late_override"]["reason"] == (
+        "late_high_confidence_empirical_bucket_low_win_rate_override"
+    )
+
+
+def test_late_high_confidence_does_not_override_negative_pnl_bucket_by_default(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_empirical_bucket_gate_assets="BTC",
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_late_sure_thing_min_probability=0.90,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-BUCKET-NEG-PNL",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.0350"),
+        "yes_bid_dollars": Decimal("0.0300"),
+        "yes_ask_dollars": Decimal("0.0400"),
+        "no_ask_dollars": Decimal("0.9700"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 60,
+        "market_age_seconds": 840,
+    }
+    bucket_key = _crypto_bucket_key(row, {"side": "no", "execution_price_dollars": "0.9700"})
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.0500"),
+        settings=settings,
+        empirical_bucket_matrix=[_empirical_bucket(bucket_key, net_pnl="-0.0100", win_rate=0.95)],
+        enforce_empirical_bucket_gate=True,
+    )
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["late_high_confidence_directional_entry"] is True
+    assert no_candidate["candidate_status"] == "blocked_empirical_bucket"
+    assert no_candidate["reason"] == "empirical_bucket_not_allowed"
+    assert no_candidate["empirical_bucket_gate"]["reason"] == "empirical_bucket_negative_pnl"
+    assert no_candidate["empirical_bucket_late_override"]["reason"] == "negative_pnl_override_disabled"
+
+
+def test_late_high_confidence_bucket_override_stays_inside_180_seconds(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=500,
+        crypto_empirical_bucket_gate_assets="BTC",
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_late_sure_thing_min_probability=0.90,
+        crypto_late_sure_thing_max_seconds_to_close=300,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-LATE-BUCKET-OUTSIDE-OVERRIDE",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.0350"),
+        "yes_bid_dollars": Decimal("0.0300"),
+        "yes_ask_dollars": Decimal("0.0400"),
+        "no_ask_dollars": Decimal("0.9700"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 240,
+        "market_age_seconds": 660,
+    }
+
+    candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.0500"),
+        settings=settings,
+        empirical_bucket_matrix=[],
+        enforce_empirical_bucket_gate=True,
+    )
+    no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
+
+    assert no_candidate["late_high_confidence_directional_entry"] is True
+    assert no_candidate["candidate_status"] == "blocked_empirical_bucket"
+    assert no_candidate["empirical_bucket_late_override"]["reason"] == "outside_late_override_window"
 
 
 def test_crypto_candidate_quality_allows_mid_window_with_750bps_edge(tmp_path) -> None:

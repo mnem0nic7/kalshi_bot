@@ -2109,6 +2109,8 @@ class CryptoForecastService:
                     "bucket_key": trace.get("bucket_key"),
                     "empirical_bucket_gate": trace.get("empirical_bucket_gate"),
                     "empirical_bucket_status": trace.get("empirical_bucket_status"),
+                    "empirical_bucket_late_override": trace.get("empirical_bucket_late_override"),
+                    "empirical_bucket_gap_sample": trace.get("empirical_bucket_gap_sample"),
                     "decision": "selected" if side is not None else "stand_down",
                     "status": "shadow_only" if trace.get("candidate_status") == CRYPTO_EXPLORATORY_SHADOW else trace.get("candidate_status"),
                     "reason": trace.get("selection_reason") or ("crypto_live_trading_disabled" if not runtime_trading_enabled else None),
@@ -3831,6 +3833,10 @@ def _crypto_dashboard_signal_summary(market_payloads: list[dict[str, Any]]) -> d
             status = str(gate.get("status") or "unknown")
             if status == "allowed":
                 counts["empirical_bucket_allowed_count"] += 1
+            elif status == "override_allowed":
+                counts["empirical_bucket_override_count"] += 1
+                original_reason = str(gate.get("original_reason") or gate.get("reason") or "unknown")
+                counts[f"empirical_bucket_override_{original_reason}_count"] += 1
             elif status == "blocked":
                 counts["empirical_bucket_blocked_count"] += 1
             elif status == "unknown":
@@ -3841,6 +3847,10 @@ def _crypto_dashboard_signal_summary(market_payloads: list[dict[str, Any]]) -> d
         "empirical_bucket_allowed_count": counts["empirical_bucket_allowed_count"],
         "empirical_bucket_blocked_count": counts["empirical_bucket_blocked_count"],
         "empirical_bucket_unknown_count": counts["empirical_bucket_unknown_count"],
+        "empirical_bucket_override_count": counts["empirical_bucket_override_count"],
+        "empirical_bucket_override_missing_count": counts["empirical_bucket_override_empirical_bucket_missing_count"],
+        "empirical_bucket_override_low_win_rate_count": counts["empirical_bucket_override_empirical_bucket_low_win_rate_count"],
+        "empirical_bucket_override_negative_pnl_count": counts["empirical_bucket_override_empirical_bucket_negative_pnl_count"],
     }
 
 
@@ -4341,6 +4351,8 @@ def _crypto_recommendation(
         "bucket_key": selected.get("bucket_key"),
         "empirical_bucket_gate": selected.get("empirical_bucket_gate"),
         "empirical_bucket_status": selected.get("empirical_bucket_status"),
+        "empirical_bucket_late_override": selected.get("empirical_bucket_late_override"),
+        "empirical_bucket_gap_sample": selected.get("empirical_bucket_gap_sample"),
         "target_yes_price_dollars": _money_text(target_yes) if target_yes is not None else None,
         "min_edge_bps": entry_policy["min_fee_adjusted_edge_bps"],
         "max_spread_bps": entry_policy["max_spread_bps"],
@@ -4377,6 +4389,9 @@ def _crypto_candidate_gate_cascade(
                     "empirical_bucket_reason": (
                         candidate.get("empirical_bucket_gate") or {}
                     ).get("reason") if isinstance(candidate.get("empirical_bucket_gate"), dict) else None,
+                    "empirical_bucket_override_reason": (
+                        candidate.get("empirical_bucket_gate") or {}
+                    ).get("override_reason") if isinstance(candidate.get("empirical_bucket_gate"), dict) else None,
                 },
             }
         )
@@ -4404,6 +4419,23 @@ def _crypto_signal_candidate_status(signal: StrategySignal) -> str | None:
     return str(raw_status)
 
 
+def _crypto_signal_empirical_late_override_gate(signal: StrategySignal) -> dict[str, Any] | None:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    gate = trace.get("empirical_bucket_gate")
+    if not isinstance(gate, dict):
+        selection = trace.get("trade_selection_model")
+        if isinstance(selection, dict):
+            gate = selection.get("empirical_bucket_gate")
+    if not isinstance(gate, dict):
+        return None
+    if gate.get("override_allowed") is True or gate.get("status") == "override_allowed":
+        return gate
+    late_override = gate.get("late_override")
+    if isinstance(late_override, dict) and late_override.get("allowed") is True:
+        return gate
+    return None
+
+
 def _crypto_ticket_unit_cost(ticket: TradeTicket) -> Decimal:
     if ticket.side == ContractSide.YES:
         return ticket.yes_price_dollars
@@ -4421,7 +4453,18 @@ def _crypto_dynamic_order_count_fp(
     signal: StrategySignal,
     context: RiskContext,
 ) -> tuple[Decimal, dict[str, Any]]:
-    default_count = quantize_count(Decimal(str(settings.crypto_default_order_count_fp)))
+    configured_default_count = quantize_count(Decimal(str(settings.crypto_default_order_count_fp)))
+    late_override_gate = _crypto_signal_empirical_late_override_gate(signal)
+    late_override_cap = (
+        quantize_count(Decimal(str(settings.crypto_empirical_late_override_max_count_fp)))
+        if late_override_gate is not None
+        else None
+    )
+    default_count = (
+        min(configured_default_count, late_override_cap)
+        if late_override_cap is not None and late_override_cap > Decimal("0")
+        else configured_default_count
+    )
     requested_count = default_count
     candidate_status = _crypto_signal_candidate_status(signal)
     target_pct = Decimal(str(settings.crypto_dynamic_order_target_position_pct))
@@ -4443,8 +4486,12 @@ def _crypto_dynamic_order_count_fp(
         "mode": "default",
         "reason": None,
         "candidate_status": candidate_status,
+        "configured_default_count_fp": _count_text(configured_default_count),
         "default_count_fp": _count_text(default_count),
         "requested_count_fp": _count_text(requested_count),
+        "empirical_bucket_late_override_cap_active": late_override_gate is not None,
+        "empirical_bucket_late_override_max_count_fp": _count_text(late_override_cap),
+        "empirical_bucket_late_override_reason": late_override_gate.get("override_reason") if late_override_gate else None,
         "unit_cost_dollars": _money_text(unit_cost),
         "target_position_pct": float(target_pct),
         "risk_position_pct": float(risk_pct),
@@ -4489,7 +4536,10 @@ def _crypto_dynamic_order_count_fp(
     target_notional = (total_capital_dec * effective_target_pct).quantize(Decimal("0.0001"))
     available_notional = (target_notional - current_notional - pending_notional).quantize(Decimal("0.0001"))
     raw_count = _floor_count_fp(available_notional / unit_cost) if available_notional > Decimal("0") else Decimal("0.00")
-    capped_count = min(raw_count, _floor_count_fp(max_order_count), _floor_count_fp(remaining_position_count))
+    cap_candidates = [raw_count, _floor_count_fp(max_order_count), _floor_count_fp(remaining_position_count)]
+    if late_override_cap is not None:
+        cap_candidates.append(_floor_count_fp(late_override_cap))
+    capped_count = min(cap_candidates)
     capped_count = max(Decimal("0.00"), _floor_count_fp(capped_count))
     diagnostics.update(
         {
@@ -7740,14 +7790,26 @@ def _crypto_trade_candidates(
             requested_asset_symbols=empirical_bucket_requested_assets,
             force_requested_assets=force_empirical_bucket_for_requested_assets,
         )
+        empirical_bucket_late_override = _crypto_empirical_late_override_review(
+            row,
+            empirical_bucket_gate,
+            pre_empirical_reason=pre_empirical_reason,
+            late_sure_thing=late_sure_thing,
+            settings=settings,
+        )
         if (
             candidate_status == CRYPTO_LIVE_QUALITY
             and empirical_bucket_gate.get("enforced") is True
             and empirical_bucket_gate.get("status") != "allowed"
         ):
-            status = "blocked"
-            candidate_status = "blocked_empirical_bucket"
-            reason = "empirical_bucket_not_allowed"
+            empirical_bucket_gate = _crypto_empirical_gate_with_late_override(
+                empirical_bucket_gate,
+                empirical_bucket_late_override,
+            )
+            if empirical_bucket_gate.get("status") != "override_allowed":
+                status = "blocked"
+                candidate_status = "blocked_empirical_bucket"
+                reason = "empirical_bucket_not_allowed"
         candidates.append(
             {
                 "side": side,
@@ -7775,6 +7837,28 @@ def _crypto_trade_candidates(
                 "bucket_key": bucket_key,
                 "empirical_bucket_gate": empirical_bucket_gate,
                 "empirical_bucket_status": empirical_bucket_gate.get("status"),
+                "empirical_bucket_late_override": empirical_bucket_late_override,
+                "empirical_bucket_gap_sample": _crypto_empirical_bucket_gap_sample(
+                    row,
+                    side=side,
+                    cost=cost,
+                    target_yes=target_yes,
+                    pre_empirical_status=pre_empirical_status,
+                    pre_empirical_reason=pre_empirical_reason,
+                    candidate_status=candidate_status,
+                    reason=reason,
+                    edge_bps=raw_edge_bps,
+                    expected_net_edge=expected_net_edge,
+                    model_probability=probability,
+                    raw_model_probability=raw_probability,
+                    market_side_probability=market_side_probability,
+                    fee=fee,
+                    remaining_payout=remaining_payout,
+                    bucket_key=bucket_key,
+                    empirical_bucket_gate=empirical_bucket_gate,
+                    empirical_bucket_late_override=empirical_bucket_late_override,
+                    late_sure_thing=late_sure_thing,
+                ),
                 "spread_bps": spread_bps,
                 "spot_exchange_spread_bps": row.get("spot_exchange_spread_bps"),
                 "spot_exchange_recent_trade_count": row.get("spot_exchange_recent_trade_count"),
@@ -8438,6 +8522,10 @@ def _crypto_bucket_matrix_by_key(bucket_matrix: list[dict[str, Any]] | None) -> 
     return keyed
 
 
+def _normalize_reason_csv(value: str | None) -> set[str]:
+    return {raw.strip().lower() for raw in str(value or "").replace(";", ",").split(",") if raw.strip()}
+
+
 def _crypto_empirical_bucket_review(bucket: dict[str, Any] | None, *, settings: Settings) -> dict[str, Any]:
     min_samples = int(settings.crypto_empirical_bucket_min_samples)
     min_net_pnl = Decimal(str(settings.crypto_empirical_bucket_min_net_pnl_dollars))
@@ -8484,6 +8572,176 @@ def _crypto_empirical_bucket_review(bucket: dict[str, Any] | None, *, settings: 
         "min_samples": min_samples,
         "min_net_pnl_dollars": str(min_net_pnl.quantize(Decimal("0.0001"))),
         "min_win_rate": min_win_rate,
+    }
+
+
+def _crypto_empirical_late_override_review(
+    row: dict[str, Any],
+    empirical_bucket_gate: dict[str, Any],
+    *,
+    pre_empirical_reason: str,
+    late_sure_thing: bool,
+    settings: Settings,
+) -> dict[str, Any]:
+    time_to_close = _optional_int(row.get("time_to_close_seconds"))
+    time_bucket = (
+        _crypto_time_to_close_bucket(float(time_to_close))
+        if time_to_close is not None
+        else "unknown"
+    )
+    original_reason = str(empirical_bucket_gate.get("reason") or "").strip()
+    allowed_reasons = _normalize_reason_csv(settings.crypto_empirical_late_override_reasons)
+    max_seconds = max(0, int(settings.crypto_empirical_late_override_max_seconds_to_close))
+    max_count = quantize_count(Decimal(str(settings.crypto_empirical_late_override_max_count_fp)))
+    review: dict[str, Any] = {
+        "enabled": bool(settings.crypto_empirical_late_override_enabled),
+        "allowed": False,
+        "reason": "late_empirical_override_not_allowed",
+        "original_bucket_status": empirical_bucket_gate.get("status"),
+        "original_bucket_reason": original_reason,
+        "pre_empirical_reason": pre_empirical_reason,
+        "late_high_confidence_directional_entry": late_sure_thing,
+        "time_to_close_seconds": time_to_close,
+        "time_to_close_bucket": time_bucket,
+        "max_seconds_to_close": max_seconds,
+        "allowed_reasons": sorted(allowed_reasons),
+        "max_count_fp": _count_text(max_count),
+    }
+    if not review["enabled"]:
+        return {**review, "reason": "late_empirical_override_disabled"}
+    if not late_sure_thing or pre_empirical_reason != "late_high_confidence_directional_entry":
+        return {**review, "reason": "not_late_high_confidence_entry"}
+    if time_to_close is None:
+        return {**review, "reason": "time_to_close_unknown"}
+    if time_to_close > max_seconds:
+        return {**review, "reason": "outside_late_override_window"}
+    if time_bucket != "0_5m":
+        return {**review, "reason": "outside_0_5m_bucket"}
+    if max_count <= Decimal("0"):
+        return {**review, "reason": "non_positive_late_override_count_cap"}
+    if original_reason == "empirical_bucket_negative_pnl" and not bool(
+        settings.crypto_empirical_late_override_negative_pnl_enabled
+    ):
+        return {**review, "reason": "negative_pnl_override_disabled"}
+    if original_reason not in allowed_reasons:
+        return {**review, "reason": "bucket_reason_not_late_override_allowed"}
+    if original_reason == "empirical_bucket_low_win_rate":
+        net_pnl = _decimal(empirical_bucket_gate.get("net_pnl") or Decimal("0"))
+        if net_pnl < Decimal("0"):
+            return {**review, "reason": "low_win_rate_bucket_negative_pnl"}
+    return {
+        **review,
+        "allowed": True,
+        "reason": f"late_high_confidence_{original_reason}_override",
+    }
+
+
+def _crypto_empirical_gate_with_late_override(
+    empirical_bucket_gate: dict[str, Any],
+    override_review: dict[str, Any],
+) -> dict[str, Any]:
+    if not override_review.get("allowed"):
+        return empirical_bucket_gate
+    return {
+        **empirical_bucket_gate,
+        "status": "override_allowed",
+        "allowed": True,
+        "override_allowed": True,
+        "original_status": empirical_bucket_gate.get("status"),
+        "original_reason": empirical_bucket_gate.get("reason"),
+        "override_reason": override_review.get("reason"),
+        "late_override": override_review,
+    }
+
+
+def _crypto_empirical_bucket_gap_sample(
+    row: dict[str, Any],
+    *,
+    side: str,
+    cost: Decimal,
+    target_yes: Decimal,
+    pre_empirical_status: str,
+    pre_empirical_reason: str,
+    candidate_status: str,
+    reason: str,
+    edge_bps: int,
+    expected_net_edge: Decimal,
+    model_probability: Decimal,
+    raw_model_probability: Decimal,
+    market_side_probability: Decimal | None,
+    fee: Decimal,
+    remaining_payout: Decimal,
+    bucket_key: str,
+    empirical_bucket_gate: dict[str, Any],
+    empirical_bucket_late_override: dict[str, Any],
+    late_sure_thing: bool,
+) -> dict[str, Any]:
+    gate_reason = str(
+        empirical_bucket_gate.get("original_reason")
+        or empirical_bucket_gate.get("reason")
+        or "unknown"
+    )
+    time_to_close = _optional_int(row.get("time_to_close_seconds"))
+    spread_bps = _optional_int(row.get("spread_bps"))
+    market_ticker = str(row.get("market_ticker") or "unknown")
+    return {
+        "schema_version": "crypto-empirical-gap-sample-v1",
+        "market_ticker": market_ticker,
+        "asset_symbol": normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN")),
+        "side": side,
+        "dedupe_key": "|".join([market_ticker, side, bucket_key, pre_empirical_reason]),
+        "bucket_key": bucket_key,
+        "bucket_reason": gate_reason,
+        "bucket_status": empirical_bucket_gate.get("status"),
+        "bucket_allowed": empirical_bucket_gate.get("allowed") is True,
+        "bucket_enforced": empirical_bucket_gate.get("enforced") is True,
+        "bucket_sample_count": empirical_bucket_gate.get("sample_count"),
+        "bucket_net_pnl": empirical_bucket_gate.get("net_pnl"),
+        "bucket_win_rate": empirical_bucket_gate.get("win_rate"),
+        "bucket_net_positive_rate": empirical_bucket_gate.get("net_positive_rate"),
+        "pre_empirical_candidate_status": pre_empirical_status,
+        "pre_empirical_reason": pre_empirical_reason,
+        "candidate_status": candidate_status,
+        "reason": reason,
+        "late_high_confidence_directional_entry": late_sure_thing,
+        "late_override_allowed": empirical_bucket_gate.get("override_allowed") is True,
+        "late_override_reason": empirical_bucket_gate.get("override_reason")
+        or empirical_bucket_late_override.get("reason"),
+        "target_yes_price_dollars": _money_text(_clamp_price(target_yes)),
+        "execution_price_dollars": _money_text(_clamp_price(cost)),
+        "entry_price_band": _price_band(cost),
+        "remaining_payout_dollars": str(remaining_payout.quantize(Decimal("0.0001"))),
+        "edge_bps": edge_bps,
+        "expected_net_edge": str(expected_net_edge.quantize(Decimal("0.0001"))),
+        "expected_fee": str(fee.quantize(Decimal("0.0001"))),
+        "model_probability": str(model_probability.quantize(Decimal("0.0001"))),
+        "raw_model_probability": str(raw_model_probability.quantize(Decimal("0.0001"))),
+        "market_side_probability": (
+            str(market_side_probability.quantize(Decimal("0.0001")))
+            if market_side_probability is not None
+            else None
+        ),
+        "time_to_close_seconds": time_to_close,
+        "time_to_close_bucket": _crypto_time_to_close_bucket(float(time_to_close or 0)),
+        "spread_bps": spread_bps,
+        "spread_band": _spread_band(spread_bps),
+        "yes_bid_dollars": _money_text(row.get("yes_bid_dollars")),
+        "yes_ask_dollars": _money_text(row.get("yes_ask_dollars")),
+        "no_bid_dollars": _money_text(row.get("no_bid_dollars")),
+        "no_ask_dollars": _money_text(row.get("no_ask_dollars")),
+        "volume": row.get("volume"),
+        "open_interest": row.get("open_interest"),
+        "market_age_seconds": row.get("market_age_seconds"),
+        "spot_feature_status": row.get("spot_feature_status"),
+        "spot_provider": row.get("spot_provider"),
+        "spot_source_kind": row.get("spot_source_kind"),
+        "spot_exchange_spread_bps": row.get("spot_exchange_spread_bps"),
+        "spot_exchange_recent_trade_count": row.get("spot_exchange_recent_trade_count"),
+        "gap_analysis_candidate": (
+            pre_empirical_status == CRYPTO_LIVE_QUALITY
+            and empirical_bucket_gate.get("enforced") is True
+            and gate_reason != "empirical_bucket_allowed"
+        ),
     }
 
 

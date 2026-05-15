@@ -65,6 +65,11 @@ Use this as the candidate grid/search space for `CRYPTO_15M`.
 | `crypto_empirical_bucket_min_samples` | `20` | count | Minimum settled rows per empirical bucket. |
 | `crypto_empirical_bucket_min_net_pnl_dollars` | `0.0` | dollars | Minimum bucket net P/L. |
 | `crypto_empirical_bucket_min_win_rate` | `0.55` | probability | Minimum bucket win rate. |
+| `crypto_empirical_late_override_enabled` | `True` | bool | Test narrow late high-confidence overrides separately from normal bucket passes. |
+| `crypto_empirical_late_override_max_seconds_to_close` | `180` | seconds | Maximum time-to-close for bucket override candidates. |
+| `crypto_empirical_late_override_reasons` | `empirical_bucket_missing,empirical_bucket_low_win_rate` | csv | Which blocked bucket reasons can be overridden. Keep negative P/L separate. |
+| `crypto_empirical_late_override_max_count_fp` | `1.0` | count | Ticket cap for the override experiment. |
+| `crypto_empirical_late_override_negative_pnl_enabled` | `False` | bool | Whether historically negative-P/L buckets can ever be overridden. |
 
 ## Shadow Exploration
 

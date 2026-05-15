@@ -823,6 +823,56 @@ def test_risk_engine_honors_remaining_payout_policy_variant_floor() -> None:
     assert verdict.diagnostics["remaining_payout"]["minimum_remaining_payout_bps"] == 1000
 
 
+def test_risk_engine_caps_crypto_late_empirical_override_ticket_to_one_contract() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_max_order_notional_dollars=100,
+        risk_max_position_notional_dollars=300,
+        risk_position_pct=0.10,
+    )
+    signal = make_signal(edge_bps=5000)
+    signal.candidate_trace = {
+        "strategy_code": StrategyCode.CRYPTO_15M.value,
+        "candidate_status": "live_quality",
+        "late_high_confidence_directional_entry": True,
+        "empirical_bucket_gate": {
+            "status": "override_allowed",
+            "allowed": True,
+            "override_allowed": True,
+            "override_reason": "late_high_confidence_empirical_bucket_missing_override",
+            "original_reason": "empirical_bucket_missing",
+        },
+    }
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-TEST",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("10.00"),
+        ),
+        signal=signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("1000.00"),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("1.00")
+    assert "crypto_late_empirical_override_count_cap" in verdict.reason_codes
+    assert verdict.diagnostics["crypto_empirical_late_override"]["original_count_fp"] == "10.0000"
+    assert verdict.diagnostics["crypto_empirical_late_override"]["approved_count_fp"] == "1.0000"
+
+
 def test_risk_engine_blocks_near_threshold_regime() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",

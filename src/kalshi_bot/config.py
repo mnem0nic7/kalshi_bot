@@ -228,6 +228,11 @@ class Settings(BaseSettings):
     crypto_empirical_bucket_min_samples: int = 20
     crypto_empirical_bucket_min_net_pnl_dollars: float = 0.0
     crypto_empirical_bucket_min_win_rate: float = 0.55
+    crypto_empirical_late_override_enabled: bool = True
+    crypto_empirical_late_override_max_seconds_to_close: int = 180
+    crypto_empirical_late_override_reasons: str = "empirical_bucket_missing,empirical_bucket_low_win_rate"
+    crypto_empirical_late_override_max_count_fp: float = 1.0
+    crypto_empirical_late_override_negative_pnl_enabled: bool = False
 
     stop_loss_enabled: bool = False
     stop_loss_threshold_pct: float = 0.10

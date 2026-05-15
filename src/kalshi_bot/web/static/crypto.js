@@ -251,6 +251,7 @@
       empirical_bucket_negative_pnl: "empirical bucket negative P&L",
       empirical_bucket_low_win_rate: "empirical bucket below win-rate floor",
       empirical_bucket_allowed: "empirical bucket passed",
+      override_allowed: "empirical bucket late override",
       crypto_position_add_on_allowed: "add-on allowed",
       crypto_position_add_on_blocked: "add-on blocked",
       crypto_entry_window_unknown: "entry window unknown",
@@ -269,6 +270,7 @@
     if (!gate) return "";
     const status = String(gate.status || "").toLowerCase();
     if (status === "allowed") return "bucket passed";
+    if (status === "override_allowed") return `bucket late override: ${humanizeCode(gate.original_reason || gate.reason)}`;
     if (status === "blocked") return `bucket blocked: ${humanizeCode(gate.reason)}`;
     if (status === "unknown") return "bucket unknown";
     return "";
@@ -371,6 +373,7 @@
       ["Live Assets", counts.live || 0],
       ["Normal Edge", signalSummary.normal_edge_trade_count || 0],
       ["Late Bypass", signalSummary.late_high_confidence_trade_count || 0],
+      ["Bucket Override", signalSummary.empirical_bucket_override_count || 0],
       ["Buckets", `${signalSummary.empirical_bucket_allowed_count || 0}/${signalSummary.empirical_bucket_blocked_count || 0}/${signalSummary.empirical_bucket_unknown_count || 0}`],
       ["Updated", timeLabel((state.payload || {}).updated_at)],
     ];

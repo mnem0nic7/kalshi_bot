@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -670,6 +671,67 @@ async def test_funnel_report_crypto_outputs_json(monkeypatch: pytest.MonkeyPatch
     assert output["schema_version"] == "funnel-report-v1"
     assert output["domain"] == "crypto"
     assert output["gate_counts"] == [{"gate": "spot data stale", "count": 1}]
+
+
+def test_crypto_empirical_gap_report_dedupes_repeated_close_window_candidates() -> None:
+    def signal(created_at: datetime, price: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            created_at=created_at,
+            market_ticker="KXBTC15M-GAP",
+            payload={
+                "candidate_trace": {
+                    "market_domain": "crypto",
+                    "frequency": "15m",
+                    "selected_side": "yes",
+                    "candidates": [
+                        {
+                            "side": "yes",
+                            "candidate_status": "blocked_empirical_bucket",
+                            "reason": "empirical_bucket_not_allowed",
+                            "pre_empirical_candidate_status": "live_quality",
+                            "pre_empirical_reason": "late_high_confidence_directional_entry",
+                            "execution_price_dollars": price,
+                            "target_yes_price_dollars": price,
+                            "expected_fee": "0.0010",
+                            "expected_net_edge": "0.0100",
+                            "bucket_key": "BTC|yes|0.75-1.00|tight|0_5m",
+                            "time_to_close_seconds": 120,
+                            "spread_bps": 10,
+                            "empirical_bucket_gate": {
+                                "status": "blocked",
+                                "enforced": True,
+                                "allowed": False,
+                                "reason": "empirical_bucket_missing",
+                                "sample_count": 0,
+                            },
+                        }
+                    ],
+                }
+            },
+        )
+
+    report = cli_module._crypto_empirical_gap_report_from_signals(
+        [
+            signal(datetime(2026, 5, 15, 19, 58, tzinfo=UTC), "0.9900"),
+            signal(datetime(2026, 5, 15, 19, 59, tzinfo=UTC), "0.9800"),
+        ],
+        {
+            "KXBTC15M-GAP": SimpleNamespace(
+                market_ticker="KXBTC15M-GAP",
+                settlement_result="yes",
+            )
+        },
+        frequency="15m",
+    )
+
+    assert report["raw_metrics"]["count"] == 2
+    assert report["raw_metrics"]["wins"] == 2
+    assert report["raw_metrics"]["gross_pnl"] == "0.0300"
+    assert report["raw_metrics"]["fee_adjusted_pnl"] == "0.0280"
+    assert report["deduped_metrics"]["count"] == 1
+    assert report["deduped_metrics"]["gross_pnl"] == "0.0200"
+    assert report["deduped_metrics"]["fee_adjusted_pnl"] == "0.0190"
+    assert report["breakdowns"]["by_gate_reason"][0]["key"] == "empirical_bucket_missing"
 
 
 def test_python_module_cli_exposes_weather_prediction_commands() -> None:

@@ -5,7 +5,8 @@ import asyncio
 from collections import Counter
 import csv
 from dataclasses import asdict
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 import io
 import json
 import os
@@ -26,8 +27,8 @@ from kalshi_bot.core.schemas import (
     ShadowCampaignRequest,
     TrainingBuildRequest,
 )
-from kalshi_bot.crypto.services import normalize_asset_symbols
-from kalshi_bot.db.models import Room, Signal, StrategyPromotionRecord
+from kalshi_bot.crypto.services import normalize_asset_symbol, normalize_asset_symbols
+from kalshi_bot.db.models import CryptoMarketSnapshotRecord, Room, Signal, StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.forecast.learned_head import (
@@ -1708,6 +1709,304 @@ async def _run_crypto_policy_command(args: argparse.Namespace, container: AppCon
     return 0
 
 
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _crypto_gap_trace(payload: dict[str, Any]) -> dict[str, Any]:
+    trace = payload.get("candidate_trace")
+    return trace if isinstance(trace, dict) else {}
+
+
+def _crypto_gap_selected_candidate(trace: dict[str, Any]) -> dict[str, Any] | None:
+    candidates = [item for item in trace.get("candidates") or [] if isinstance(item, dict)]
+    selected_side = str(trace.get("selected_side") or trace.get("predicted_winner_side") or "").lower()
+    if selected_side:
+        for candidate in candidates:
+            if str(candidate.get("side") or "").lower() == selected_side:
+                return candidate
+    if candidates:
+        return min(candidates, key=lambda item: int(item.get("rank") or 9999))
+    selection = trace.get("trade_selection_model")
+    if isinstance(selection, dict):
+        return selection
+    return None
+
+
+def _crypto_gap_gate(trace: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    gate = candidate.get("empirical_bucket_gate")
+    if isinstance(gate, dict):
+        return gate
+    gate = trace.get("empirical_bucket_gate")
+    if isinstance(gate, dict):
+        return gate
+    selection = trace.get("trade_selection_model")
+    if isinstance(selection, dict) and isinstance(selection.get("empirical_bucket_gate"), dict):
+        return dict(selection["empirical_bucket_gate"])
+    return {}
+
+
+def _crypto_gap_side_cost(candidate: dict[str, Any], side: str) -> Decimal | None:
+    execution_price = _decimal_or_none(candidate.get("execution_price_dollars"))
+    if execution_price is not None:
+        return execution_price
+    target_yes = _decimal_or_none(candidate.get("target_yes_price_dollars"))
+    if target_yes is None:
+        return None
+    if side == "yes":
+        return target_yes
+    if side == "no":
+        return Decimal("1.0000") - target_yes
+    return None
+
+
+def _crypto_gap_time_bucket(value: Any) -> str:
+    seconds = _float_or_none(value)
+    if seconds is None:
+        return "unknown"
+    if seconds <= 60:
+        return "0-60s"
+    if seconds <= 180:
+        return "61-180s"
+    if seconds <= 300:
+        return "181-300s"
+    if seconds <= 600:
+        return "301-600s"
+    return "600s+"
+
+
+def _crypto_gap_spread_bucket(value: Any) -> str:
+    spread = _float_or_none(value)
+    if spread is None:
+        return "unknown"
+    if spread <= 50:
+        return "tight<=50"
+    if spread <= 100:
+        return "tight<=100"
+    if spread <= 300:
+        return "normal<=300"
+    return "wide>300"
+
+
+def _crypto_gap_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    gross_values = [_decimal_or_none(row.get("gross_pnl")) or Decimal("0") for row in rows]
+    net_values = [_decimal_or_none(row.get("fee_adjusted_pnl")) or Decimal("0") for row in rows]
+    fee_values = [_decimal_or_none(row.get("expected_fee")) or Decimal("0") for row in rows]
+    wins = sum(1 for row in rows if row.get("would_win") is True)
+    ttc_values = [value for row in rows if (value := _float_or_none(row.get("time_to_close_seconds"))) is not None]
+    spread_values = [value for row in rows if (value := _float_or_none(row.get("spread_bps"))) is not None]
+    count = len(rows)
+    return {
+        "count": count,
+        "wins": wins,
+        "win_rate": round(wins / count, 4) if count else None,
+        "gross_pnl": str(sum(gross_values, Decimal("0")).quantize(Decimal("0.0001"))),
+        "fee_adjusted_pnl": str(sum(net_values, Decimal("0")).quantize(Decimal("0.0001"))),
+        "expected_fees": str(sum(fee_values, Decimal("0")).quantize(Decimal("0.0001"))),
+        "avg_time_to_close_seconds": round(sum(ttc_values) / len(ttc_values), 1) if ttc_values else None,
+        "avg_spread_bps": round(sum(spread_values) / len(spread_values), 1) if spread_values else None,
+        "worst_fee_adjusted_pnl": str(min(net_values).quantize(Decimal("0.0001"))) if net_values else None,
+    }
+
+
+def _crypto_gap_group(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get(key) or "unknown"), []).append(row)
+    return [
+        {"key": group_key, **_crypto_gap_metrics(group_rows)}
+        for group_key, group_rows in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))
+    ]
+
+
+def _crypto_empirical_gap_report_from_signals(
+    signals: list[Any],
+    settlements_by_ticker: dict[str, Any],
+    *,
+    assets: list[str] | None = None,
+    frequency: str = "15m",
+) -> dict[str, Any]:
+    requested_assets = set(normalize_asset_symbols(assets))
+    rows: list[dict[str, Any]] = []
+    raw_gap_candidate_count = 0
+    unsettled_candidate_count = 0
+    skipped_missing_cost_count = 0
+    for signal in signals:
+        payload = getattr(signal, "payload", None) or {}
+        if not isinstance(payload, dict):
+            continue
+        trace = _crypto_gap_trace(payload)
+        if trace and str(trace.get("market_domain") or "").lower() not in {"", "crypto"}:
+            continue
+        trace_frequency = str(trace.get("frequency") or frequency)
+        if frequency and trace_frequency != frequency:
+            continue
+        candidate = _crypto_gap_selected_candidate(trace)
+        if not candidate:
+            continue
+        gate = _crypto_gap_gate(trace, candidate)
+        if not gate:
+            continue
+        gate_status = str(gate.get("status") or candidate.get("empirical_bucket_status") or "").lower()
+        gate_reason = str(gate.get("original_reason") or gate.get("reason") or "unknown")
+        candidate_status = str(candidate.get("candidate_status") or trace.get("candidate_status") or "")
+        reason = str(candidate.get("reason") or trace.get("selection_reason") or "")
+        pre_empirical_status = str(candidate.get("pre_empirical_candidate_status") or "")
+        if pre_empirical_status and pre_empirical_status != "live_quality":
+            continue
+        is_gap_candidate = (
+            candidate_status == "blocked_empirical_bucket"
+            or reason == "empirical_bucket_not_allowed"
+            or gate_status == "override_allowed"
+            or gate.get("override_allowed") is True
+        )
+        if not is_gap_candidate:
+            continue
+        side = str(candidate.get("side") or trace.get("selected_side") or "").lower()
+        if side not in {"yes", "no"}:
+            continue
+        asset = normalize_asset_symbol(
+            str(
+                candidate.get("asset_symbol")
+                or trace.get("asset_symbol")
+                or ((trace.get("features") or {}) if isinstance(trace.get("features"), dict) else {}).get("asset")
+                or "UNKNOWN"
+            )
+        )
+        if requested_assets and asset not in requested_assets:
+            continue
+        raw_gap_candidate_count += 1
+        cost = _crypto_gap_side_cost(candidate, side)
+        if cost is None:
+            skipped_missing_cost_count += 1
+            continue
+        ticker = str(getattr(signal, "market_ticker", None) or candidate.get("market_ticker") or "unknown")
+        settlement = settlements_by_ticker.get(ticker)
+        if settlement is None or str(getattr(settlement, "settlement_result", "")).lower() not in {"yes", "no"}:
+            unsettled_candidate_count += 1
+            continue
+        settlement_result = str(getattr(settlement, "settlement_result")).lower()
+        would_win = side == settlement_result
+        gross_pnl = (Decimal("1.0000") - cost) if would_win else -cost
+        expected_fee = _decimal_or_none(candidate.get("expected_fee")) or Decimal("0")
+        fee_adjusted_pnl = gross_pnl - expected_fee
+        time_to_close = candidate.get("time_to_close_seconds") or ((trace.get("features") or {}) if isinstance(trace.get("features"), dict) else {}).get("time_to_close_seconds")
+        spread_bps = candidate.get("spread_bps") or ((trace.get("features") or {}) if isinstance(trace.get("features"), dict) else {}).get("spread_bps")
+        bucket_key = str(candidate.get("bucket_key") or trace.get("bucket_key") or gate.get("bucket_key") or "unknown")
+        pre_empirical_reason = str(candidate.get("pre_empirical_reason") or trace.get("pre_empirical_selection_reason") or "unknown")
+        dedupe_key = str(
+            (candidate.get("empirical_bucket_gap_sample") or {}).get("dedupe_key")
+            if isinstance(candidate.get("empirical_bucket_gap_sample"), dict)
+            else ""
+        ) or "|".join([ticker, side, bucket_key, pre_empirical_reason])
+        created_at = getattr(signal, "created_at", None)
+        rows.append(
+            {
+                "created_at": created_at.isoformat() if isinstance(created_at, datetime) else str(created_at or ""),
+                "market_ticker": ticker,
+                "asset_symbol": asset,
+                "side": side,
+                "settlement_result": settlement_result,
+                "would_win": would_win,
+                "execution_price_dollars": str(cost.quantize(Decimal("0.0001"))),
+                "gross_pnl": str(gross_pnl.quantize(Decimal("0.0001"))),
+                "expected_fee": str(expected_fee.quantize(Decimal("0.0001"))),
+                "fee_adjusted_pnl": str(fee_adjusted_pnl.quantize(Decimal("0.0001"))),
+                "gate_status": gate_status or "unknown",
+                "gate_reason": gate_reason,
+                "pre_empirical_reason": pre_empirical_reason,
+                "late_override_allowed": gate.get("override_allowed") is True or gate_status == "override_allowed",
+                "late_override_reason": gate.get("override_reason") or ((gate.get("late_override") or {}) if isinstance(gate.get("late_override"), dict) else {}).get("reason"),
+                "bucket_key": bucket_key,
+                "bucket_sample_count": gate.get("sample_count"),
+                "bucket_net_pnl": gate.get("net_pnl"),
+                "bucket_win_rate": gate.get("win_rate"),
+                "time_to_close_seconds": time_to_close,
+                "time_to_close_bucket": _crypto_gap_time_bucket(time_to_close),
+                "spread_bps": spread_bps,
+                "spread_bucket": _crypto_gap_spread_bucket(spread_bps),
+                "expected_net_edge": candidate.get("expected_net_edge") or trace.get("expected_net_edge"),
+                "dedupe_key": dedupe_key,
+            }
+        )
+    rows.sort(key=lambda row: row["created_at"], reverse=True)
+    deduped_by_key: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        deduped_by_key.setdefault(str(row["dedupe_key"]), row)
+    deduped_rows = list(deduped_by_key.values())
+    return {
+        "schema_version": "crypto-empirical-gap-analysis-v1",
+        "frequency": frequency,
+        "raw_gap_candidate_count": raw_gap_candidate_count,
+        "settled_candidate_count": len(rows),
+        "unsettled_candidate_count": unsettled_candidate_count,
+        "skipped_missing_cost_count": skipped_missing_cost_count,
+        "deduped_episode_count": len(deduped_rows),
+        "raw_metrics": _crypto_gap_metrics(rows),
+        "deduped_metrics": _crypto_gap_metrics(deduped_rows),
+        "breakdowns": {
+            "by_gate_reason": _crypto_gap_group(deduped_rows, "gate_reason"),
+            "by_asset": _crypto_gap_group(deduped_rows, "asset_symbol"),
+            "by_side": _crypto_gap_group(deduped_rows, "side"),
+            "by_time_to_close": _crypto_gap_group(deduped_rows, "time_to_close_bucket"),
+            "by_spread": _crypto_gap_group(deduped_rows, "spread_bucket"),
+            "by_pre_empirical_reason": _crypto_gap_group(deduped_rows, "pre_empirical_reason"),
+            "by_gate_status": _crypto_gap_group(deduped_rows, "gate_status"),
+        },
+        "sample_rows": rows[:50],
+    }
+
+
+async def _build_crypto_empirical_gap_report(
+    args: argparse.Namespace,
+    container: AppContainer,
+) -> dict[str, Any]:
+    cutoff = datetime.now(UTC) - timedelta(days=args.days)
+    async with container.session_factory() as session:
+        signal_result = await session.execute(
+            select(Signal)
+            .join(Room, Signal.room_id == Room.id)
+            .where(Room.kalshi_env == args.kalshi_env, Signal.created_at >= cutoff)
+            .order_by(Signal.created_at.desc())
+        )
+        signals = list(signal_result.scalars())
+        tickers = sorted({signal.market_ticker for signal in signals})
+        settlements_by_ticker: dict[str, CryptoMarketSnapshotRecord] = {}
+        if tickers:
+            settlement_result = await session.execute(
+                select(CryptoMarketSnapshotRecord)
+                .where(
+                    CryptoMarketSnapshotRecord.kalshi_env == args.kalshi_env,
+                    CryptoMarketSnapshotRecord.frequency == args.frequency,
+                    CryptoMarketSnapshotRecord.market_ticker.in_(tickers),
+                    CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
+                )
+                .order_by(CryptoMarketSnapshotRecord.market_ticker, CryptoMarketSnapshotRecord.observed_at.desc())
+            )
+            for row in settlement_result.scalars():
+                settlements_by_ticker.setdefault(row.market_ticker, row)
+    return _crypto_empirical_gap_report_from_signals(
+        signals,
+        settlements_by_ticker,
+        assets=args.assets,
+        frequency=args.frequency,
+    )
+
+
 def _format_funnel_report(payload: dict[str, Any]) -> str:
     lines = [
         f"funnel-report domain={payload.get('domain')} status={payload.get('status')}",
@@ -1725,6 +2024,26 @@ def _format_funnel_report(payload: dict[str, Any]) -> str:
             gate = item.get("relaxed_gate") or item.get("gate")
             count = item.get("would_pass_count") or item.get("count")
             lines.append(f"  {gate}: {count}")
+    empirical_gap = payload.get("empirical_bucket_gap_analysis") or {}
+    if empirical_gap:
+        raw = empirical_gap.get("raw_metrics") or {}
+        deduped = empirical_gap.get("deduped_metrics") or {}
+        lines.append("empirical bucket gap:")
+        lines.append(
+            "  raw: "
+            f"{raw.get('wins', 0)}/{raw.get('count', 0)} wins "
+            f"gross={raw.get('gross_pnl')} fee_adj={raw.get('fee_adjusted_pnl')}"
+        )
+        lines.append(
+            "  deduped: "
+            f"{deduped.get('wins', 0)}/{deduped.get('count', 0)} wins "
+            f"gross={deduped.get('gross_pnl')} fee_adj={deduped.get('fee_adjusted_pnl')}"
+        )
+        for item in (empirical_gap.get("breakdowns") or {}).get("by_gate_reason", [])[:10]:
+            lines.append(
+                f"  {item.get('key')}: {item.get('wins')}/{item.get('count')} "
+                f"gross={item.get('gross_pnl')} fee_adj={item.get('fee_adjusted_pnl')}"
+            )
     return "\n".join(lines)
 
 
@@ -1780,6 +2099,11 @@ async def _run_funnel_report_command(args: argparse.Namespace, container: AppCon
                 "spot": report.get("spot"),
                 "policy": report.get("policy"),
             }
+        empirical_gap = (
+            await _build_crypto_empirical_gap_report(args, container)
+            if hasattr(container, "session_factory")
+            else {}
+        )
         payload = {
             "schema_version": "funnel-report-v1",
             "domain": "crypto",
@@ -1804,6 +2128,7 @@ async def _run_funnel_report_command(args: argparse.Namespace, container: AppCon
             "by_asset": by_asset,
             "live_path_summary": status.get("summary"),
             "strict_row_growth": status.get("strict_row_growth"),
+            "empirical_bucket_gap_analysis": empirical_gap,
         }
     if args.json:
         print(json.dumps(payload, indent=2, default=str))

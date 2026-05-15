@@ -386,9 +386,18 @@ learn from rejected or marginal cases without taking risk.
 | `crypto_empirical_bucket_min_samples` | `20` | Minimum settled sample count in the relevant bucket. |
 | `crypto_empirical_bucket_min_net_pnl_dollars` | `0.0` | Minimum bucket net P/L. |
 | `crypto_empirical_bucket_min_win_rate` | `0.55` | Minimum bucket win rate. |
+| `crypto_empirical_late_override_enabled` | `True` | Allows a narrow late high-confidence override for selected bucket failures. |
+| `crypto_empirical_late_override_max_seconds_to_close` | `180` | Override applies only this close to expiry. |
+| `crypto_empirical_late_override_reasons` | `empirical_bucket_missing,empirical_bucket_low_win_rate` | Bucket failure reasons eligible for the late override. |
+| `crypto_empirical_late_override_max_count_fp` | `1.0` | Hard ticket cap for late bucket overrides. |
+| `crypto_empirical_late_override_negative_pnl_enabled` | `False` | Keeps historically negative-P/L buckets blocked unless explicitly enabled. |
 
 The risk engine also requires empirical bucket allowance for the special crypto
 same-side add-on path.
+
+Late empirical overrides do not relax normal edge trades. They apply only to
+late high-confidence directional entries in the `0_5m` time-to-close bucket, and
+risk re-enforces the configured override count cap.
 
 ## Execution Knobs
 

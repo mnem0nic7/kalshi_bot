@@ -159,7 +159,25 @@ def _crypto_empirical_bucket_allowed(candidate_trace: dict[str, Any]) -> bool:
         selection = candidate_trace.get("trade_selection_model")
         if isinstance(selection, dict):
             gate = selection.get("empirical_bucket_gate")
-    return isinstance(gate, dict) and (gate.get("allowed") is True or gate.get("status") == "allowed")
+    return isinstance(gate, dict) and (
+        gate.get("allowed") is True or gate.get("status") in {"allowed", "override_allowed"}
+    )
+
+
+def _crypto_empirical_late_override_gate(candidate_trace: dict[str, Any]) -> dict[str, Any] | None:
+    gate = candidate_trace.get("empirical_bucket_gate")
+    if not isinstance(gate, dict):
+        selection = candidate_trace.get("trade_selection_model")
+        if isinstance(selection, dict):
+            gate = selection.get("empirical_bucket_gate")
+    if not isinstance(gate, dict):
+        return None
+    if gate.get("override_allowed") is True or gate.get("status") == "override_allowed":
+        return gate
+    late_override = gate.get("late_override")
+    if isinstance(late_override, dict) and late_override.get("allowed") is True:
+        return gate
+    return None
 
 
 def _crypto_position_add_on_verdict(
@@ -554,6 +572,42 @@ class DeterministicRiskEngine:
         if research_observed_at is None or (now - research_observed_at).total_seconds() > self.settings.research_stale_seconds:
             block("Research data is stale.")
             code("research_stale")
+
+        late_override_gate = _crypto_empirical_late_override_gate(candidate_trace)
+        if is_buy_entry and context.strategy_code == "CRYPTO_15M" and late_override_gate is not None:
+            late_override_cap = quantize_count(
+                Decimal(str(self.settings.crypto_empirical_late_override_max_count_fp))
+            )
+            diagnostics["crypto_empirical_late_override"] = {
+                "active": True,
+                "gate_status": late_override_gate.get("status"),
+                "override_reason": late_override_gate.get("override_reason"),
+                "original_bucket_reason": late_override_gate.get("original_reason"),
+                "max_count_fp": _decimal_text(late_override_cap),
+                "original_count_fp": _decimal_text(approved_count),
+            }
+            if late_override_cap <= Decimal("0"):
+                block("Crypto late empirical override count cap is non-positive.")
+                code("crypto_late_empirical_override_invalid_cap")
+            elif approved_count > late_override_cap:
+                original_count = approved_count
+                approved_count = late_override_cap
+                approved_notional = _quantize_money(
+                    estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, approved_count)
+                )
+                order_notional = approved_notional
+                diagnostics["crypto_empirical_late_override"].update(
+                    {
+                        "resized": True,
+                        "approved_count_fp": _decimal_text(approved_count),
+                        "approved_order_notional_dollars": _decimal_text(order_notional),
+                    }
+                )
+                note(
+                    f"Late high-confidence empirical bucket override capped ticket from "
+                    f"{original_count:.2f} to {approved_count:.2f} contracts."
+                )
+                code("crypto_late_empirical_override_count_cap")
 
         max_order_count_fp = weather_live_max_order_count_fp(
             control=control,
