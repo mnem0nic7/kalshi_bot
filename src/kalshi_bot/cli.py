@@ -720,9 +720,20 @@ async def _run_crypto_spot_command(args: argparse.Namespace, container: AppConta
         result = await container.crypto_spot_service.coinbase_products(
             asset_symbols=asset_symbols,
         )
+    elif args.crypto_spot_command == "collect-funding-rates":
+        result = await container.crypto_spot_service.collect_funding_rates(
+            asset_symbols=asset_symbols,
+        )
+    elif args.crypto_spot_command == "backfill-funding-rates":
+        result = await container.crypto_spot_service.backfill_funding_rates(
+            asset_symbols=asset_symbols,
+            max_pages=getattr(args, "max_pages", 30),
+        )
     else:
         raise ValueError(f"unknown crypto-spot command {args.crypto_spot_command}")
     print(json.dumps(result, indent=2, default=str))
+    if args.crypto_spot_command in {"collect-funding-rates", "backfill-funding-rates"}:
+        return 0 if not any(v.get("error") for v in (result.get("per_asset") or {result.get("asset_symbol", ""): result}).values()) else 1
     return 0 if result.get("status") in {"ok", "warn"} else 1
 
 
@@ -4377,6 +4388,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_spot_products)
     crypto_spot_products.add_argument("--assets", nargs="*", default=None)
     crypto_spot_products.add_argument("--json", action="store_true")
+    crypto_spot_collect_funding = crypto_spot_subparsers.add_parser("collect-funding-rates")
+    add_kalshi_env_argument(crypto_spot_collect_funding)
+    crypto_spot_collect_funding.add_argument("--assets", nargs="*", default=None)
+    crypto_spot_collect_funding.add_argument("--json", action="store_true")
+    crypto_spot_backfill_funding = crypto_spot_subparsers.add_parser("backfill-funding-rates")
+    add_kalshi_env_argument(crypto_spot_backfill_funding)
+    crypto_spot_backfill_funding.add_argument("--assets", nargs="*", default=None)
+    crypto_spot_backfill_funding.add_argument("--max-pages", dest="max_pages", type=int, default=30)
+    crypto_spot_backfill_funding.add_argument("--json", action="store_true")
 
     crypto_model = subparsers.add_parser("crypto-model")
     crypto_model_subparsers = crypto_model.add_subparsers(dest="crypto_model_command", required=True)

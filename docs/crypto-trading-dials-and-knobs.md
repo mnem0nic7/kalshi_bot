@@ -184,6 +184,25 @@ python -m kalshi_bot.cli crypto-spot status --kalshi-env production --frequency 
 python -m kalshi_bot.cli crypto-spot coinbase-products --kalshi-env production --json
 ```
 
+### Perpetual Funding Rates (OKX)
+
+Funding rates settle every 8 hours (00:00 / 08:00 / 16:00 UTC) for all 7 supported crypto assets. Data is sourced from OKX (Binance and Bybit futures are geo-restricted from the production host). Coverage begins around 2026-02-12.
+
+| CLI command | Effect |
+| --- | --- |
+| `crypto-spot collect-funding-rates` | Fetch the latest ~10 settled rates per asset and upsert. Run periodically (e.g., every 8h). |
+| `crypto-spot backfill-funding-rates --max-pages 30` | Paginate OKX history back ~90 days for all assets. One-time bootstrap. |
+
+```bash
+# One-time backfill
+python -m kalshi_bot.cli crypto-spot backfill-funding-rates --kalshi-env production --json
+
+# Ongoing collection (runs in daemon or cron)
+python -m kalshi_bot.cli crypto-spot collect-funding-rates --kalshi-env production --json
+```
+
+Funding rates are stored in the `crypto_funding_rates` table (migration `20260516_0032`). Features (`funding_rate_current`, `funding_rate_delta`) will be added to the model in v5 after backfill is verified.
+
 ### Quote Evidence
 
 | Setting | Current default | Effect |
