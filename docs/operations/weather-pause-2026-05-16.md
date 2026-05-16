@@ -76,9 +76,11 @@ When the operator says to re-enable weather:
    PRODUCTION_TRIGGER_ENABLE_AUTO_ROOMS=true
    ```
 
-2. Restart the eight containers:
+2. Restart the eight containers using `--env-file .env` (required for correct
+   yaml variable substitution — without it, crypto autonomy env vars default
+   to false and crypto trading stops):
    ```
-   docker compose -f infra/docker-compose.yml restart \
+   docker compose -f infra/docker-compose.yml --env-file .env up -d --force-recreate \
      app_demo_blue app_demo_green \
      app_production_blue app_production_green \
      daemon_demo_blue daemon_demo_green \
