@@ -134,6 +134,11 @@ Crypto has two data streams:
 | Setting or CLI flag | Current default | Effect |
 | --- | ---: | --- |
 | `crypto_history_lookback_days` | `180` | Default historical horizon for bootstrap/training workflows. |
+| `kalshi_rest_rate_limit_per_second` | `8.0` | Local Kalshi REST token-bucket refill rate; bounded catch-ups can raise this while monitoring for `429` responses. |
+| `kalshi_rest_rate_limit_burst` | `16` | Local Kalshi REST token-bucket burst size. |
+| `crypto_collect_settled_candles_enabled` | `True` | Captures Kalshi candles during settled-label collection; full refresh catch-ups can disable it when history bootstrap will capture candles next. |
+| `crypto_settled_pagination_stop_at_cutoff` | `False` | Stops settled-market pagination when a full page is older than the requested cutoff; useful for bounded catch-ups after confirming Kalshi returns newest-first pages. |
+| `crypto_history_candle_concurrency` | `1` | Max concurrent Kalshi candlestick fetches during crypto history backfills. |
 | `crypto_history_auto_enabled` | `True` | Enables scheduled market-history collection. |
 | `crypto_history_auto_interval_seconds` | `3600` | Scheduled market-history collection cadence. |
 | `crypto_history_auto_lookback_days` | `2` | Lookback window for scheduled incremental collection. |
@@ -594,6 +599,59 @@ python -m kalshi_bot.cli crypto-status --kalshi-env production --frequency 15m
 python -m kalshi_bot.cli funnel-report --kalshi-env production --domain crypto --days 7 --frequency 15m --json
 python -m kalshi_bot.cli model-quality status --kalshi-env production --domain crypto --days 180 --frequency 15m --json
 python -m kalshi_bot.cli overnight-readiness report --kalshi-env production --domains crypto --frequency 15m --json
+```
+
+## Nightly Model Regeneration Knobs
+
+The daemon runs a once-per-local-date job (Tier-B heartbeat follow-up) that checks
+whether each configured crypto asset's model+backtest+gate trio is stale or has
+accumulated meaningful new strict-eligible rows since the last training run, and
+regenerates only what needs it. This job complements the external GitHub Actions
+`model-quality.yml` workflow rather than replacing it.
+
+**Staleness triggers (any one fires a refresh per asset):**
+
+1. No `model:<ASSET>` artifact exists, or its `status` is not `ready`.
+2. The artifact's `trained_at` is older than `CRYPTO_MODEL_NIGHTLY_MAX_AGE_HOURS`.
+3. The number of new strict-eligible rows in the last 24 h is ≥
+   `CRYPTO_MODEL_NIGHTLY_MIN_NEW_STRICT_ROWS`.
+
+After all per-asset passes, a single final pooled `replay_gate` is written so the
+global gate reflects all updated per-asset backtest slices.
+
+| Env var | Python attr | Default | Effect |
+| --- | --- | ---: | --- |
+| `CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED` | `crypto_model_nightly_auto_enabled` | `true` | Master switch. Set to `false` to disable; GitHub Actions workflow continues running daily. |
+| `CRYPTO_MODEL_NIGHTLY_TIMEZONE` | `crypto_model_nightly_timezone` | `America/Los_Angeles` | IANA timezone for local-date and hour checks. |
+| `CRYPTO_MODEL_NIGHTLY_HOUR_LOCAL` | `crypto_model_nightly_hour_local` | `3` | Local clock hour (0–23) at which the job becomes eligible. Runs once per date per env+color. |
+| `CRYPTO_MODEL_NIGHTLY_MIN_NEW_STRICT_ROWS` | `crypto_model_nightly_min_new_strict_rows` | `60` | Minimum strict-trade-eligible rows in the last 24 h to trigger a refresh. Matches `CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET`. |
+| `CRYPTO_MODEL_NIGHTLY_MAX_AGE_HOURS` | `crypto_model_nightly_max_age_hours` | `24` | Force-refresh if the model's `trained_at` is older than this, even if there is no new data. |
+| `CRYPTO_MODEL_NIGHTLY_ASSETS` | `crypto_model_nightly_assets` | `BTC,ETH,SOL,XRP,BNB,DOGE,HYPE` | Comma-separated ordered list of assets to evaluate. Per-asset decisions are logged and written to the checkpoint payload. |
+
+**Checkpoint and observability:**
+
+- Stream key: `daemon_crypto_model_nightly:{kalshi_env}:{app_color}`
+- Payload: `ran_at`, `refreshed_count`, `asset_decisions` map of asset → one of
+  `refreshed`, `skipped_fresh`, `missing_or_not_ready`, `aged_out`, `error`.
+- Per-asset failures are caught and logged; they do not abort the loop for other assets.
+
+**Disable / rollback:**
+
+```bash
+# In .env:
+CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED=false
+# Restart daemon containers. GitHub Actions continues to keep artifacts fresh daily.
+```
+
+**Verification (after a forced trigger):**
+
+```sql
+-- Expect artifact rows for each asset updated within the last 10 minutes:
+SELECT artifact_type, status, trained_at
+FROM crypto_model_artifacts
+WHERE artifact_type IN ('model:BTC','model:ETH','model:SOL','model:XRP','model:BNB','model:DOGE','model:HYPE','replay_gate')
+  AND trained_at > NOW() - INTERVAL '10 minutes'
+ORDER BY artifact_type;
 ```
 
 ## Crypto Policy Optimization

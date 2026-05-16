@@ -481,6 +481,8 @@ class AppContainer:
             crypto_history_service=crypto_history_service,
             crypto_spot_service=crypto_spot_service,
             crypto_autonomy_service=crypto_autonomy_service,
+            crypto_forecast_service=crypto_forecast_service,
+            crypto_replay_service=crypto_replay_service,
             weather_live_service=weather_live_service,
         )
         container = cls(

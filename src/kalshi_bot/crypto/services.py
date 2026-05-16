@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import importlib.metadata as importlib_metadata
@@ -1089,27 +1090,37 @@ class CryptoHistoryService:
             "markets_attempted": 0,
             "markets_skipped_existing": 0,
             "errors": [],
+            "concurrency": max(1, int(self.settings.crypto_history_candle_concurrency)),
         }
         commit_batch_size = 250
+        market_items = list(all_markets.values())
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            for index, market in enumerate(all_markets.values(), start=1):
+            for index, market in enumerate(market_items, start=1):
                 await self.market_service.record_market_snapshot(
                     repo,
                     market,
                     source_kind="historical" if market.market_ticker in historical_tickers else "live",
                     observed_at=market.close_time or datetime.now(UTC),
                 )
-                capture = await self._capture_candles(repo, market, cutoff=cutoff)
+                if index % commit_batch_size == 0:
+                    await session.commit()
+            await session.commit()
+            captures = await self._capture_candles_for_markets(
+                session,
+                repo,
+                market_items,
+                cutoff=cutoff,
+                commit_batch_size=commit_batch_size,
+            )
+            for _market, capture in captures:
                 candle_stats["stored"] += int(capture["stored"])
                 if capture["status"] == "skipped_existing":
                     candle_stats["markets_skipped_existing"] += 1
                 else:
                     candle_stats["markets_attempted"] += 1
                 if capture.get("error"):
-                    candle_stats["errors"].append({"market_ticker": market.market_ticker, "error": capture["error"]})
-                if index % commit_batch_size == 0:
-                    await session.commit()
+                    candle_stats["errors"].append({"market_ticker": _market.market_ticker, "error": capture["error"]})
             await session.commit()
             snapshots = await repo.list_crypto_market_snapshots(
                 frequency=normalize_frequency(frequency) or "15m",
@@ -1201,6 +1212,8 @@ class CryptoHistoryService:
             "markets_skipped_existing": 0,
             "errors": [],
             "source_counts": {},
+            "enabled": bool(self.settings.crypto_collect_settled_candles_enabled),
+            "concurrency": max(1, int(self.settings.crypto_history_candle_concurrency)),
         }
         asset_counts: Counter[str] = Counter({asset: 0 for asset in expected_assets})
         commit_batch_size = 250
@@ -1214,7 +1227,21 @@ class CryptoHistoryService:
                     observed_at=_crypto_settlement_observed_at(market),
                 )
                 asset_counts[market.asset_symbol] += 1
-                capture = await self._capture_candles(repo, market, cutoff=cutoff)
+                if index % commit_batch_size == 0:
+                    await session.commit()
+            await session.commit()
+            captures = []
+            if self.settings.crypto_collect_settled_candles_enabled:
+                captures = await self._capture_candles_for_markets(
+                    session,
+                    repo,
+                    settled_markets,
+                    cutoff=cutoff,
+                    commit_batch_size=commit_batch_size,
+                )
+            else:
+                candle_stats["skipped_reason"] = "crypto_collect_settled_candles_disabled"
+            for market, capture in captures:
                 candle_stats["stored"] += int(capture.get("stored") or 0)
                 if capture.get("status") == "skipped_existing":
                     candle_stats["markets_skipped_existing"] += 1
@@ -1230,8 +1257,6 @@ class CryptoHistoryService:
                             "attempted_sources": capture.get("attempted_sources") or [],
                         }
                     )
-                if index % commit_batch_size == 0:
-                    await session.commit()
             await session.commit()
             snapshots = await repo.list_crypto_market_snapshots(
                 frequency=freq,
@@ -1458,6 +1483,8 @@ class CryptoHistoryService:
                 and (market.close_time or market.expected_expiration_time) < cutoff
                 for market in parsed_page
             ):
+                if self.settings.crypto_settled_pagination_stop_at_cutoff:
+                    break
                 logger.debug(
                     "crypto settled page for %s is older than cutoff; continuing pagination because ordering is not guaranteed",
                     series.series_ticker,
@@ -1474,7 +1501,7 @@ class CryptoHistoryService:
             "errors": errors,
         }
 
-    async def _capture_candles(self, repo: PlatformRepository, market: CryptoMarket, *, cutoff: datetime) -> dict[str, Any]:
+    async def _fetch_candle_rows(self, market: CryptoMarket, *, cutoff: datetime) -> dict[str, Any]:
         now = datetime.now(UTC)
         end_time = min(now, market.close_time or market.expected_expiration_time or now)
         if market.close_time is not None and market.close_time < now:
@@ -1524,15 +1551,34 @@ class CryptoHistoryService:
             return {
                 "status": "error",
                 "stored": 0,
+                "candles": [],
                 "source": selected_source,
                 "attempted_sources": list(sources),
                 "error": "; ".join(f"{item['source']}: {item['error']}" for item in errors),
             }
-        count = 0
+        candles: list[dict[str, Any]] = []
         for row in _rows_from_response(response, "candlesticks") or _rows_from_response(response, "candles"):
             candle = normalize_candlestick(row)
             if candle is None:
                 continue
+            candles.append(candle)
+        return {
+            "status": "ok",
+            "stored": 0,
+            "candles": candles,
+            "source": selected_source,
+            "attempted_sources": list(sources),
+            "errors": errors,
+        }
+
+    async def _store_candle_rows(
+        self,
+        repo: PlatformRepository,
+        market: CryptoMarket,
+        capture: dict[str, Any],
+    ) -> dict[str, Any]:
+        count = 0
+        for candle in capture.get("candles") or []:
             await repo.upsert_crypto_market_candlestick(
                 kalshi_env=self.settings.kalshi_env,
                 series_ticker=market.series_ticker,
@@ -1549,13 +1595,46 @@ class CryptoHistoryService:
                 payload=candle["payload"],
             )
             count += 1
-        return {
-            "status": "ok",
-            "stored": count,
-            "source": selected_source,
-            "attempted_sources": list(sources),
-            "errors": errors,
-        }
+        result = {key: value for key, value in capture.items() if key != "candles"}
+        result["stored"] = count
+        return result
+
+    async def _capture_candles(self, repo: PlatformRepository, market: CryptoMarket, *, cutoff: datetime) -> dict[str, Any]:
+        capture = await self._fetch_candle_rows(market, cutoff=cutoff)
+        return await self._store_candle_rows(repo, market, capture)
+
+    async def _capture_candles_for_markets(
+        self,
+        session: AsyncSession,
+        repo: PlatformRepository,
+        markets: list[CryptoMarket],
+        *,
+        cutoff: datetime,
+        commit_batch_size: int,
+    ) -> list[tuple[CryptoMarket, dict[str, Any]]]:
+        concurrency = max(1, int(self.settings.crypto_history_candle_concurrency))
+        captures: list[tuple[CryptoMarket, dict[str, Any]]] = []
+        stored_since_commit = 0
+        for offset in range(0, len(markets), concurrency):
+            batch = markets[offset : offset + concurrency]
+            if concurrency <= 1:
+                fetched = [(market, await self._capture_candles(repo, market, cutoff=cutoff)) for market in batch]
+                captures.extend(fetched)
+                stored_since_commit += len(fetched)
+            else:
+                fetched = await asyncio.gather(
+                    *(self._fetch_candle_rows(market, cutoff=cutoff) for market in batch)
+                )
+                for market, capture in zip(batch, fetched, strict=True):
+                    stored_capture = await self._store_candle_rows(repo, market, capture)
+                    captures.append((market, stored_capture))
+                    stored_since_commit += 1
+            if stored_since_commit >= commit_batch_size:
+                await session.commit()
+                stored_since_commit = 0
+        if stored_since_commit:
+            await session.commit()
+        return captures
 
 
 class CryptoSpotService:

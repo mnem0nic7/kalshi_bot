@@ -79,7 +79,10 @@ class KalshiClient:
         self.read_credentials = self._load_credentials(write=False)
         self.write_credentials = self._load_credentials(write=True)
         self._signers: dict[tuple[str, bool], KalshiSigner] = {}
-        self._rate_limiter = _TokenBucket(rate=8.0, burst=16)
+        self._rate_limiter = _TokenBucket(
+            rate=max(0.1, float(settings.kalshi_rest_rate_limit_per_second)),
+            burst=max(1, int(settings.kalshi_rest_rate_limit_burst)),
+        )
 
     def _load_credentials(self, *, write: bool) -> KalshiCredentials | None:
         key_id = self.settings.api_key_id(write=write)

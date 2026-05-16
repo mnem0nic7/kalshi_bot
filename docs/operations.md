@@ -99,6 +99,8 @@ scripts/crypto_live_path_refresh.sh \
 
 The script discovers assets by default and still runs one CLI process per asset so model and replay memory is released between assets. Each refresh collects open real-quote snapshots, backfills recent settled labels with `crypto-history collect-settled`, refreshes historical/candle context, refreshes spot, trains, replays, and gates. On the host, set `POSTGRES_PORT=5433` for production because demo uses the default `5432` mapping. It writes per-asset JSON reports and stderr logs under `reports/crypto_live_path/`.
 
+For bounded manual catch-ups, the Kalshi REST limiter and candle fanout can be raised in the `CLI` environment. For example, `KALSHI_REST_RATE_LIMIT_PER_SECOND=80 KALSHI_REST_RATE_LIMIT_BURST=160 CRYPTO_HISTORY_CANDLE_CONCURRENCY=30` keeps one asset process at a time but fetches candlesticks concurrently. Full refresh catch-ups can also set `CRYPTO_COLLECT_SETTLED_CANDLES_ENABLED=false` because the next history bootstrap step captures candles. If recent settled pages are confirmed newest-first, `CRYPTO_SETTLED_PAGINATION_STOP_AT_CUTOFF=true` avoids walking old pages outside the requested window. Watch the per-asset log for `429 Too Many Requests`; observed exchange-side candlestick throttles may be lower than the account-wide read budget.
+
 For initial 1-hour catch-up, use a wider evidence window:
 
 ```bash

@@ -602,7 +602,12 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_1H_ENABLED` | `true` | Enables 1-hour crypto markets. |
 | `CRYPTO_AUTO_FREQUENCIES` | `15m` | Frequencies collected by daemon crypto loops; the dedicated 1h daemon sets this to `1h`. |
 | `CRYPTO_TRADING_ENABLED` | `false` | Allows crypto trading path. |
+| `KALSHI_REST_RATE_LIMIT_PER_SECOND` | `8.0` | Local Kalshi REST read/write token-bucket refill rate. Raise only for bounded catch-up jobs and watch for `429` responses. |
+| `KALSHI_REST_RATE_LIMIT_BURST` | `16` | Local Kalshi REST token-bucket burst size. |
 | `CRYPTO_HISTORY_LOOKBACK_DAYS` | `180` | Default history lookback. |
+| `CRYPTO_COLLECT_SETTLED_CANDLES_ENABLED` | `true` | Captures Kalshi candles during settled-label collection. Turn off for full `crypto-live-path refresh` catch-ups when the following history bootstrap will capture candles. |
+| `CRYPTO_SETTLED_PAGINATION_STOP_AT_CUTOFF` | `false` | Stops settled-market pagination once a whole page is older than the requested cutoff. Keep off for maximum conservatism; enable for bounded catch-ups after confirming Kalshi pages are newest-first. |
+| `CRYPTO_HISTORY_CANDLE_CONCURRENCY` | `1` | Max concurrent Kalshi candlestick fetches during crypto history backfills. |
 | `CRYPTO_MIN_TRAINING_SAMPLES` | `250` | Minimum rows for trained crypto model status. |
 | `CRYPTO_REPLAY_MIN_RESOLVED_MARKETS` | `500` | Replay gate resolved-market support. |
 | `CRYPTO_REPLAY_MIN_TRADE_CANDIDATES` | `50` | Replay gate candidate support. |
@@ -659,6 +664,19 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_EMPIRICAL_BUCKET_MIN_SAMPLES` | `20` | Bucket support threshold. |
 | `CRYPTO_EMPIRICAL_BUCKET_MIN_NET_PNL_DOLLARS` | `0.0` | Bucket net P/L floor. |
 | `CRYPTO_EMPIRICAL_BUCKET_MIN_WIN_RATE` | `0.55` | Bucket win-rate floor. |
+
+### Nightly Model Regeneration Settings
+
+The daemon runs a nightly per-asset model+backtest+gate refresh at a configured local hour. See `docs/crypto-trading-dials-and-knobs.md` for the full reference including staleness logic, checkpoint schema, and rollback steps.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED` | `true` | Master switch. |
+| `CRYPTO_MODEL_NIGHTLY_TIMEZONE` | `America/Los_Angeles` | IANA timezone for local-date and hour checks. |
+| `CRYPTO_MODEL_NIGHTLY_HOUR_LOCAL` | `3` | Local clock hour (0–23) at which the job becomes eligible. |
+| `CRYPTO_MODEL_NIGHTLY_MIN_NEW_STRICT_ROWS` | `60` | Minimum strict-trade-eligible rows in the last 24 h to trigger a refresh. |
+| `CRYPTO_MODEL_NIGHTLY_MAX_AGE_HOURS` | `24` | Force-refresh if the model's `trained_at` is older than this. |
+| `CRYPTO_MODEL_NIGHTLY_ASSETS` | `BTC,ETH,SOL,XRP,BNB,DOGE,HYPE` | Comma-separated ordered list of assets to evaluate. |
 
 ## Strategy C and Other Strategy Knobs
 

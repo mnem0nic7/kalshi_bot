@@ -16,7 +16,9 @@ from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import HistoricalIntelligenceRunRequest, ShadowCampaignRequest
 from kalshi_bot.crypto.services import (
     CryptoAutonomyService,
+    CryptoForecastService,
     CryptoHistoryService,
+    CryptoReplayService,
     CryptoSpotService,
     enabled_crypto_frequencies,
 )
@@ -84,6 +86,8 @@ class DaemonService:
         crypto_history_service: CryptoHistoryService | None = None,
         crypto_spot_service: CryptoSpotService | None = None,
         crypto_autonomy_service: CryptoAutonomyService | None = None,
+        crypto_forecast_service: CryptoForecastService | None = None,
+        crypto_replay_service: CryptoReplayService | None = None,
         weather_live_service: Any | None = None,
     ) -> None:
         self.settings = settings
@@ -115,6 +119,8 @@ class DaemonService:
         self.crypto_history_service = crypto_history_service
         self.crypto_spot_service = crypto_spot_service
         self.crypto_autonomy_service = crypto_autonomy_service
+        self.crypto_forecast_service = crypto_forecast_service
+        self.crypto_replay_service = crypto_replay_service
         self.weather_live_service = weather_live_service
         self.stop_loss_service = stop_loss_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
@@ -935,6 +941,9 @@ class DaemonService:
             momentum_calibration_nightly = await self._maybe_run_momentum_calibration_nightly()
             if momentum_calibration_nightly is not None:
                 payload["momentum_calibration_nightly"] = momentum_calibration_nightly
+            crypto_model_nightly = await self._maybe_run_crypto_model_nightly()
+            if crypto_model_nightly is not None:
+                payload["crypto_model_nightly"] = crypto_model_nightly
             historical_pipeline = await self._maybe_run_historical_pipeline()
             if historical_pipeline is not None:
                 payload["historical_pipeline"] = historical_pipeline
@@ -1447,6 +1456,141 @@ class DaemonService:
             "local_now": local_now,
             "target_local": target_local,
         }
+
+    async def _maybe_run_crypto_model_nightly(self) -> dict[str, Any] | None:
+        if not self.settings.crypto_model_nightly_auto_enabled:
+            return None
+        if (
+            self.crypto_history_service is None
+            or self.crypto_forecast_service is None
+            or self.crypto_replay_service is None
+        ):
+            return None
+
+        night_state = self._crypto_model_nightly_state()
+        if not night_state["due"]:
+            return None
+
+        checkpoint_name = f"daemon_crypto_model_nightly:{self.settings.kalshi_env}:{self.settings.app_color}"
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            checkpoint = await repo.get_checkpoint(checkpoint_name)
+            await session.commit()
+        if checkpoint is not None and isinstance(checkpoint.payload, dict):
+            if checkpoint.payload.get("ran_at"):
+                try:
+                    ran_at = datetime.fromisoformat(checkpoint.payload["ran_at"])
+                    local_ran = ran_at.astimezone(ZoneInfo(self.settings.crypto_model_nightly_timezone))
+                    if local_ran.date().isoformat() == night_state["local_date"]:
+                        return None
+                except (ValueError, TypeError):
+                    pass
+
+        try:
+            return await self._run_crypto_model_nightly_for_env(checkpoint_name)
+        except Exception:
+            logger.warning("crypto_model nightly run error", exc_info=True)
+            return None
+
+    def _crypto_model_nightly_state(self) -> dict[str, Any]:
+        now = self._utc_now()
+        timezone = ZoneInfo(self.settings.crypto_model_nightly_timezone)
+        local_now = now.astimezone(timezone)
+        target_local = local_now.replace(
+            hour=self.settings.crypto_model_nightly_hour_local,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        return {
+            "due": local_now >= target_local,
+            "local_date": local_now.date().isoformat(),
+            "local_now": local_now,
+            "target_local": target_local,
+        }
+
+    async def _run_crypto_model_nightly_for_env(self, checkpoint_name: str) -> dict[str, Any]:
+        assets = [a.strip().upper() for a in self.settings.crypto_model_nightly_assets.split(",") if a.strip()]
+        max_age_td = timedelta(hours=self.settings.crypto_model_nightly_max_age_hours)
+        now = self._utc_now()
+
+        status = await self.crypto_history_service.status(days=1)
+        by_asset_rows: dict[str, int] = {}
+        for asset, info in status.get("quote_evidence", {}).get("trade_candidate_support_by_asset", {}).items():
+            by_asset_rows[asset.upper()] = int(info.get("strict_trade_eligible_rows") or 0)
+
+        asset_decisions: dict[str, str] = {}
+        refreshed_assets: list[str] = []
+
+        for asset in assets:
+            refresh_reason: str | None = None
+
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                artifact = await repo.get_latest_crypto_model_artifact(
+                    frequency="15m",
+                    artifact_type=f"model:{asset}",
+                    kalshi_env=self.settings.kalshi_env,
+                )
+                await session.commit()
+
+            if artifact is None or artifact.status != "ready":
+                refresh_reason = "missing_or_not_ready"
+            else:
+                trained_at = artifact.trained_at
+                if trained_at is not None:
+                    if trained_at.tzinfo is None:
+                        trained_at = trained_at.replace(tzinfo=UTC)
+                    if (now - trained_at.astimezone(UTC)) > max_age_td:
+                        refresh_reason = "aged_out"
+                if refresh_reason is None:
+                    new_rows = by_asset_rows.get(asset, 0)
+                    if new_rows >= self.settings.crypto_model_nightly_min_new_strict_rows:
+                        refresh_reason = "new_data"
+
+            if refresh_reason is None:
+                asset_decisions[asset] = "skipped_fresh"
+                logger.info(
+                    "crypto_model_nightly skip asset=%s strict_rows_24h=%d",
+                    asset,
+                    by_asset_rows.get(asset, 0),
+                )
+                continue
+
+            try:
+                await self.crypto_history_service.collect_settled(frequency="15m", asset_symbols=[asset])
+                await self.crypto_history_service.bootstrap(frequency="15m", asset_symbols=[asset])
+                if self.crypto_spot_service is not None:
+                    try:
+                        await self.crypto_spot_service.collect_current(frequency="15m", asset_symbols=[asset])
+                    except Exception:
+                        logger.warning("crypto_model_nightly spot collect failed asset=%s", asset, exc_info=True)
+                await self.crypto_forecast_service.train(frequency="15m", asset_symbols=[asset])
+                await self.crypto_replay_service.run(frequency="15m", asset_symbols=[asset])
+                await self.crypto_replay_service.gate(frequency="15m", asset_symbols=[asset])
+                asset_decisions[asset] = "refreshed"
+                refreshed_assets.append(asset)
+                logger.info("crypto_model_nightly refreshed asset=%s reason=%s", asset, refresh_reason)
+            except Exception:
+                asset_decisions[asset] = "error"
+                logger.warning("crypto_model_nightly refresh error asset=%s", asset, exc_info=True)
+
+        if refreshed_assets:
+            try:
+                await self.crypto_replay_service.gate(frequency="15m", asset_symbols=assets)
+            except Exception:
+                logger.warning("crypto_model_nightly pooled gate error", exc_info=True)
+
+        result: dict[str, Any] = {
+            "ran_at": now.isoformat(),
+            "asset_decisions": asset_decisions,
+            "refreshed_count": len(refreshed_assets),
+        }
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            await repo.set_checkpoint(checkpoint_name, None, result)
+            await session.commit()
+        return result
 
     async def _checkpoint_time(self, stream_name: str) -> datetime | None:
         async with self.session_factory() as session:

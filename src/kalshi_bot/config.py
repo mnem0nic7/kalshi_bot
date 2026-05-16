@@ -172,8 +172,13 @@ class Settings(BaseSettings):
     crypto_15m_enabled: bool = True
     crypto_1h_enabled: bool = True
     crypto_auto_frequencies: str = "15m"
+    kalshi_rest_rate_limit_per_second: float = 8.0
+    kalshi_rest_rate_limit_burst: int = 16
     crypto_trading_enabled: bool = False
     crypto_history_lookback_days: int = 180
+    crypto_collect_settled_candles_enabled: bool = True
+    crypto_settled_pagination_stop_at_cutoff: bool = False
+    crypto_history_candle_concurrency: int = 1
     crypto_order_mode: str = "passive_then_taker"
     crypto_passive_timeout_seconds: int = 5
     crypto_taker_fallback_close_seconds: int = 0
@@ -289,6 +294,12 @@ class Settings(BaseSettings):
     momentum_calibration_recent_coverage_days: int = 7
     momentum_calibration_min_observations: int = 1000
     momentum_calibration_skip_critical_threshold: int = 4
+    crypto_model_nightly_auto_enabled: bool = True
+    crypto_model_nightly_timezone: str = "America/Los_Angeles"
+    crypto_model_nightly_hour_local: int = 3
+    crypto_model_nightly_min_new_strict_rows: int = 60
+    crypto_model_nightly_max_age_hours: int = 24
+    crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE"
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False

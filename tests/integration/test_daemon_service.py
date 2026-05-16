@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
-from kalshi_bot.db.models import Checkpoint, OpsEvent
+from kalshi_bot.db.models import Checkpoint, CryptoModelArtifactRecord, OpsEvent
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.daemon import DaemonService
@@ -1638,5 +1638,261 @@ async def test_daemon_heartbeat_skips_nightly_strategy_codex_when_codex_unavaila
 
     assert checkpoint.payload["reason"] == "codex_unavailable"
     assert "Nightly strategy Codex skipped: Codex provider unavailable" in summaries
+
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Fake services for crypto_model_nightly tests
+# ---------------------------------------------------------------------------
+
+
+class FakeCryptoHistoryServiceForNightly:
+    def __init__(self, *, strict_rows_by_asset: dict[str, int] | None = None) -> None:
+        self.collect_settled_calls: list[dict] = []
+        self.bootstrap_calls: list[dict] = []
+        self.strict_rows_by_asset = strict_rows_by_asset or {}
+
+    async def collect_settled(self, **kwargs: object) -> dict:
+        self.collect_settled_calls.append(dict(kwargs))
+        return {"status": "ok"}
+
+    async def bootstrap(self, **kwargs: object) -> dict:
+        self.bootstrap_calls.append(dict(kwargs))
+        return {"status": "ok"}
+
+    async def status(self, **kwargs: object) -> dict:
+        return {
+            "status": "ok",
+            "quote_evidence": {
+                "trade_candidate_support_by_asset": {
+                    asset: {"strict_trade_eligible_rows": rows}
+                    for asset, rows in self.strict_rows_by_asset.items()
+                }
+            },
+        }
+
+
+class FakeCryptoForecastServiceForNightly:
+    def __init__(self, *, fail_assets: list[str] | None = None) -> None:
+        self.train_calls: list[dict] = []
+        self.fail_assets = set(fail_assets or [])
+
+    async def train(self, **kwargs: object) -> dict:
+        self.train_calls.append(dict(kwargs))
+        for asset in (kwargs.get("asset_symbols") or []):
+            if asset in self.fail_assets:
+                raise RuntimeError(f"fake train failure: {asset}")
+        return {"status": "ok"}
+
+
+class FakeCryptoReplayServiceForNightly:
+    def __init__(self) -> None:
+        self.run_calls: list[dict] = []
+        self.gate_calls: list[dict] = []
+
+    async def run(self, **kwargs: object) -> dict:
+        self.run_calls.append(dict(kwargs))
+        return {"status": "ok"}
+
+    async def gate(self, **kwargs: object) -> dict:
+        self.gate_calls.append(dict(kwargs))
+        return {"status": "ok"}
+
+
+def _make_crypto_nightly_daemon(settings, session_factory, *, history_svc, forecast_svc, replay_svc, spot_svc=None):
+    directory = WeatherMarketDirectory({})
+    return DaemonService(
+        settings,
+        session_factory,
+        directory,
+        FakeDiscoveryService(),  # type: ignore[arg-type]
+        FakeStreamService(),  # type: ignore[arg-type]
+        FakeReconciliationService(),  # type: ignore[arg-type]
+        FakeResearchCoordinator(),  # type: ignore[arg-type]
+        FakeAutoTriggerService(),  # type: ignore[arg-type]
+        FakeShadowTrainingService(),  # type: ignore[arg-type]
+        None,
+        FakeSelfImproveService(),  # type: ignore[arg-type]
+        FakeTrainingCorpusService(),
+        crypto_history_service=history_svc,  # type: ignore[arg-type]
+        crypto_spot_service=spot_svc,  # type: ignore[arg-type]
+        crypto_forecast_service=forecast_svc,  # type: ignore[arg-type]
+        crypto_replay_service=replay_svc,  # type: ignore[arg-type]
+    )
+
+
+def _crypto_nightly_settings(tmp_path, *, db_name: str, assets: str = "BTC,ETH") -> Settings:
+    return Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/{db_name}",
+        daemon_start_with_reconcile=False,
+        daemon_reconcile_interval_seconds=60,
+        daemon_heartbeat_interval_seconds=60,
+        crypto_model_nightly_auto_enabled=True,
+        crypto_model_nightly_timezone="UTC",
+        crypto_model_nightly_hour_local=3,
+        crypto_model_nightly_min_new_strict_rows=60,
+        crypto_model_nightly_max_age_hours=24,
+        crypto_model_nightly_assets=assets,
+    )
+
+
+@pytest.mark.asyncio
+async def test_daemon_crypto_model_nightly_refreshes_missing_assets(tmp_path) -> None:
+    settings = _crypto_nightly_settings(tmp_path, db_name="crypto-nightly-missing.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    now = datetime(2026, 5, 17, 4, 0, tzinfo=UTC)
+    history_svc = FakeCryptoHistoryServiceForNightly(strict_rows_by_asset={"BTC": 0, "ETH": 0})
+    forecast_svc = FakeCryptoForecastServiceForNightly()
+    replay_svc = FakeCryptoReplayServiceForNightly()
+    spot_svc = FakeCryptoSpotService()
+
+    daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc, spot_svc=spot_svc)
+    daemon._utc_now = lambda: now  # type: ignore[method-assign]
+
+    payload = await daemon.heartbeat_once()
+
+    assert "crypto_model_nightly" in payload
+    result = payload["crypto_model_nightly"]
+    assert result["refreshed_count"] == 2
+    assert result["asset_decisions"] == {"BTC": "refreshed", "ETH": "refreshed"}
+    assert len(history_svc.collect_settled_calls) == 2
+    assert len(history_svc.bootstrap_calls) == 2
+    assert len(forecast_svc.train_calls) == 2
+    assert len(replay_svc.run_calls) == 2
+    # 2 per-asset gates + 1 final pooled gate
+    assert len(replay_svc.gate_calls) == 3
+
+    async with session_factory() as session:
+        checkpoint = (
+            await session.execute(
+                select(Checkpoint).where(Checkpoint.stream_name == "daemon_crypto_model_nightly:demo:blue")
+            )
+        ).scalar_one()
+        await session.commit()
+    assert checkpoint.payload["ran_at"] is not None
+    assert checkpoint.payload["refreshed_count"] == 2
+
+    # Second heartbeat is idempotent
+    second_payload = await daemon.heartbeat_once()
+    assert "crypto_model_nightly" not in second_payload
+    assert len(forecast_svc.train_calls) == 2
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_crypto_model_nightly_skips_fresh_assets(tmp_path) -> None:
+    settings = _crypto_nightly_settings(tmp_path, db_name="crypto-nightly-fresh.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    now = datetime(2026, 5, 17, 4, 0, tzinfo=UTC)
+    recent_trained_at = now - timedelta(hours=2)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        for asset in ("BTC", "ETH"):
+            await repo.record_crypto_model_artifact(
+                frequency="15m",
+                artifact_type=f"model:{asset}",
+                version="v1",
+                status="ready",
+                sample_count=1000,
+                metrics={},
+                payload={},
+                kalshi_env="demo",
+                trained_at=recent_trained_at,
+            )
+        await session.commit()
+
+    # < min_new_strict_rows=60 → no new data trigger
+    history_svc = FakeCryptoHistoryServiceForNightly(strict_rows_by_asset={"BTC": 5, "ETH": 3})
+    forecast_svc = FakeCryptoForecastServiceForNightly()
+    replay_svc = FakeCryptoReplayServiceForNightly()
+
+    daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc)
+    daemon._utc_now = lambda: now  # type: ignore[method-assign]
+
+    payload = await daemon.heartbeat_once()
+
+    result = payload["crypto_model_nightly"]
+    assert result["refreshed_count"] == 0
+    assert result["asset_decisions"] == {"BTC": "skipped_fresh", "ETH": "skipped_fresh"}
+    assert len(forecast_svc.train_calls) == 0
+    assert len(replay_svc.run_calls) == 0
+    assert len(replay_svc.gate_calls) == 0
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_crypto_model_nightly_aged_out_triggers_refresh(tmp_path) -> None:
+    settings = _crypto_nightly_settings(tmp_path, db_name="crypto-nightly-aged.db", assets="BTC")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    now = datetime(2026, 5, 17, 4, 0, tzinfo=UTC)
+    stale_trained_at = now - timedelta(hours=30)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="model:BTC",
+            version="v1",
+            status="ready",
+            sample_count=1000,
+            metrics={},
+            payload={},
+            kalshi_env="demo",
+            trained_at=stale_trained_at,
+        )
+        await session.commit()
+
+    history_svc = FakeCryptoHistoryServiceForNightly(strict_rows_by_asset={"BTC": 0})
+    forecast_svc = FakeCryptoForecastServiceForNightly()
+    replay_svc = FakeCryptoReplayServiceForNightly()
+
+    daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc)
+    daemon._utc_now = lambda: now  # type: ignore[method-assign]
+
+    payload = await daemon.heartbeat_once()
+
+    assert payload["crypto_model_nightly"]["asset_decisions"] == {"BTC": "refreshed"}
+    assert len(forecast_svc.train_calls) == 1
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_crypto_model_nightly_error_isolation(tmp_path) -> None:
+    settings = _crypto_nightly_settings(tmp_path, db_name="crypto-nightly-err.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    now = datetime(2026, 5, 17, 4, 0, tzinfo=UTC)
+    history_svc = FakeCryptoHistoryServiceForNightly(strict_rows_by_asset={"BTC": 0, "ETH": 0})
+    # BTC train will fail, ETH succeeds
+    forecast_svc = FakeCryptoForecastServiceForNightly(fail_assets=["BTC"])
+    replay_svc = FakeCryptoReplayServiceForNightly()
+
+    daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc)
+    daemon._utc_now = lambda: now  # type: ignore[method-assign]
+
+    payload = await daemon.heartbeat_once()
+
+    result = payload["crypto_model_nightly"]
+    assert result["asset_decisions"]["BTC"] == "error"
+    assert result["asset_decisions"]["ETH"] == "refreshed"
+    assert result["refreshed_count"] == 1
+    # Final pooled gate still runs for the refreshed asset
+    assert len(replay_svc.gate_calls) >= 2
 
     await engine.dispose()
