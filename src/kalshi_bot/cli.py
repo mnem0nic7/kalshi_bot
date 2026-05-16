@@ -27,7 +27,7 @@ from kalshi_bot.core.schemas import (
     ShadowCampaignRequest,
     TrainingBuildRequest,
 )
-from kalshi_bot.crypto.services import normalize_asset_symbol, normalize_asset_symbols
+from kalshi_bot.crypto.services import _latest_crypto_artifact_for_asset, normalize_asset_symbol, normalize_asset_symbols
 from kalshi_bot.db.models import CryptoMarketSnapshotRecord, Room, Signal, StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -1135,12 +1135,24 @@ async def _crypto_live_path_runtime_state(
             )
             artifacts[asset] = {}
             for artifact_type in ("model", "backtest", "replay_gate"):
-                record = await repo.get_latest_crypto_model_artifact(
+                record = await _latest_crypto_artifact_for_asset(
+                    repo,
                     frequency=frequency,
-                    artifact_type=f"{artifact_type}:{asset}",
+                    artifact_type=artifact_type,
                     kalshi_env=container.settings.kalshi_env,
+                    asset_symbol=asset,
                 )
-                artifacts[asset][artifact_type] = _crypto_artifact_payload(record)
+                payload = _crypto_artifact_payload(record)
+                if record is not None and artifact_type == "backtest":
+                    is_per_asset = record.artifact_type == f"backtest:{asset}"
+                    per_asset_slice = (record.metrics or {}).get("per_asset_metrics", {}).get(asset)
+                    if not is_per_asset and per_asset_slice:
+                        payload = {**payload, "metrics": per_asset_slice, "metrics_source": "pooled_fallback_slice"}
+                    elif not is_per_asset:
+                        payload = {**payload, "metrics_source": "pooled_aggregate"}
+                    else:
+                        payload = {**payload, "metrics_source": "per_asset_artifact"}
+                artifacts[asset][artifact_type] = payload
         deployment = {
             "kalshi_env": container.settings.kalshi_env,
             "app_color": container.settings.app_color,

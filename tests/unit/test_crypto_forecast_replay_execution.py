@@ -60,6 +60,7 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext
 from kalshi_bot.services.signal import StrategySignal
+from kalshi_bot.cli import _crypto_live_path_runtime_state
 
 
 def _settings(tmp_path, **overrides) -> Settings:
@@ -6438,4 +6439,221 @@ async def test_crypto_autonomy_production_fuse_skips_non_live_eligible_markets(t
     assert market_service.created == []
     assert result["skipped"][0]["reason"] == "not_live_eligible"
     assert "Asset BTC mode is shadow; set it to live to allow live orders." in result["skipped"][0]["live_blockers"]
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Change 3: per-asset OOS artifact write-side + read-side (per-asset metrics)
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_walk_forward_emits_per_asset_metrics(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_min_training_samples=2,
+        crypto_replay_min_resolved_markets=2,
+        crypto_replay_min_trade_candidates=1,
+    )
+    # Need 3+ distinct days to generate at least one OOS fold (fold at day 3 uses days 1+2 as train)
+    rows = [
+        _replay_row(market_day="2026-05-01", market_ticker="KXBTC15M-D1A", asset_symbol="BTC"),
+        _replay_row(market_day="2026-05-01", market_ticker="KXETH15M-D1B", asset_symbol="ETH", label_yes=0),
+        _replay_row(market_day="2026-05-02", market_ticker="KXBTC15M-D2A", asset_symbol="BTC"),
+        _replay_row(market_day="2026-05-02", market_ticker="KXETH15M-D2B", asset_symbol="ETH", label_yes=0),
+        _replay_row(market_day="2026-05-03", market_ticker="KXBTC15M-D3A", asset_symbol="BTC"),
+        _replay_row(market_day="2026-05-03", market_ticker="KXETH15M-D3B", asset_symbol="ETH", label_yes=0),
+    ]
+    report = _evaluate_crypto_walk_forward(
+        rows,  # type: ignore[arg-type]
+        settings=settings,
+        diagnostic_model={"model_type": "market_mid_baseline"},
+    )
+    metrics = report["metrics"]
+    assert report["status"] == "ok", f"Expected ok status, got {report['status']}"
+    assert "per_asset_metrics" in metrics
+    assert "oos_trade_candidate_count_by_asset" in metrics
+    # OOS candidates should be keyed by asset
+    for asset, count in metrics["oos_trade_candidate_count_by_asset"].items():
+        assert isinstance(asset, str)
+        assert isinstance(count, int)
+        assert metrics["per_asset_metrics"][asset]["oos_trade_candidate_count"] == count
+
+
+@pytest.mark.asyncio
+async def test_replay_service_run_writes_per_asset_backtest_artifacts(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_min_training_samples=2,
+        crypto_replay_min_resolved_markets=2,
+        crypto_replay_min_trade_candidates=1,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    await _seed_crypto_training_rows(session_factory, settings, days=4)
+
+    service = CryptoReplayService(settings=settings, session_factory=session_factory)
+    report = await service.run(frequency="15m", persist=True)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        pooled = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="backtest",
+            kalshi_env=settings.kalshi_env,
+        )
+        btc_artifact = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="backtest:BTC",
+            kalshi_env=settings.kalshi_env,
+        )
+        eth_artifact = await repo.get_latest_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="backtest:ETH",
+            kalshi_env=settings.kalshi_env,
+        )
+        await session.commit()
+
+    assert pooled is not None, "Pooled backtest artifact should exist"
+    assert "per_asset_metrics" in (pooled.metrics or {})
+
+    # Per-asset artifacts should be written for assets present in OOS selection
+    per_asset = (pooled.metrics or {}).get("per_asset_metrics") or {}
+    if "BTC" in per_asset:
+        assert btc_artifact is not None, "backtest:BTC artifact should be written"
+        assert (btc_artifact.metrics or {}).get("metrics_scope") == "per_asset"
+    if "ETH" in per_asset:
+        assert eth_artifact is not None, "backtest:ETH artifact should be written"
+        assert (eth_artifact.metrics or {}).get("metrics_scope") == "per_asset"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_live_path_runtime_state_falls_back_to_pooled_per_asset_slice(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    # Write only a pooled backtest artifact with per_asset_metrics — no per-asset artifact
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="backtest",
+            version="pooled-v1",
+            status="pass",
+            sample_count=50,
+            metrics={
+                "oos_trade_candidate_count": 25,
+                "per_asset_metrics": {
+                    "BTC": {"oos_trade_candidate_count": 15},
+                    "ETH": {"oos_trade_candidate_count": 10},
+                },
+            },
+            payload={},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        control = await repo.ensure_deployment_control(settings.app_color)
+        control.active_color = settings.app_color
+        await session.commit()
+
+    container = SimpleNamespace(
+        settings=settings,
+        session_factory=session_factory,
+        agent_pack_service=AgentPackService(settings),
+        crypto_asset_control_service=CryptoAssetControlService(
+            settings=settings,
+            session_factory=session_factory,
+        ),
+        kalshi=SimpleNamespace(write_credentials=None),
+    )
+
+    result = await _crypto_live_path_runtime_state(
+        container,  # type: ignore[arg-type]
+        assets=["BTC", "ETH"],
+        frequency="15m",
+    )
+
+    btc_backtest = ((result.get("artifacts") or {}).get("BTC") or {}).get("backtest") or {}
+    eth_backtest = ((result.get("artifacts") or {}).get("ETH") or {}).get("backtest") or {}
+
+    # Both assets should have fallen back to the pooled artifact's per_asset_metrics slice
+    assert btc_backtest.get("metrics_source") in ("pooled_fallback_slice", "per_asset_artifact")
+    assert eth_backtest.get("metrics_source") in ("pooled_fallback_slice", "per_asset_artifact")
+
+    # OOS count should come from per_asset_metrics, not the pooled total (25)
+    btc_metrics = btc_backtest.get("metrics") or {}
+    assert btc_metrics.get("oos_trade_candidate_count") == 15
+    eth_metrics = eth_backtest.get("metrics") or {}
+    assert eth_metrics.get("oos_trade_candidate_count") == 10
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_live_path_runtime_state_prefers_per_asset_artifact_when_present(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        # Pooled artifact with different (lower) per_asset_metrics count
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="backtest",
+            version="pooled-v1",
+            status="pass",
+            sample_count=50,
+            metrics={
+                "oos_trade_candidate_count": 25,
+                "per_asset_metrics": {"BTC": {"oos_trade_candidate_count": 5}},
+            },
+            payload={},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        # Dedicated per-asset artifact with higher count — should win
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="backtest:BTC",
+            version="per-asset-v1",
+            status="pass",
+            sample_count=20,
+            metrics={"oos_trade_candidate_count": 20, "metrics_scope": "per_asset"},
+            payload={},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        control = await repo.ensure_deployment_control(settings.app_color)
+        control.active_color = settings.app_color
+        await session.commit()
+
+    container = SimpleNamespace(
+        settings=settings,
+        session_factory=session_factory,
+        agent_pack_service=AgentPackService(settings),
+        crypto_asset_control_service=CryptoAssetControlService(
+            settings=settings,
+            session_factory=session_factory,
+        ),
+        kalshi=SimpleNamespace(write_credentials=None),
+    )
+
+    result = await _crypto_live_path_runtime_state(
+        container,  # type: ignore[arg-type]
+        assets=["BTC"],
+        frequency="15m",
+    )
+
+    btc_backtest = ((result.get("artifacts") or {}).get("BTC") or {}).get("backtest") or {}
+    assert btc_backtest.get("metrics_source") == "per_asset_artifact"
+    # The per-asset artifact's metrics should be used, not the pooled slice
+    btc_metrics = btc_backtest.get("metrics") or {}
+    assert btc_metrics.get("oos_trade_candidate_count") == 20
+
     await engine.dispose()
