@@ -958,6 +958,7 @@ class CryptoMarketService:
                     frequency=frequency,
                     crypto_policy=crypto_policy,
                 ),
+                active_color=control.active_color,
             ),
         }
 
@@ -2288,6 +2289,19 @@ class CryptoReplayService:
                     kalshi_env=self.settings.kalshi_env,
                     trained_at=datetime.now(UTC),
                 )
+                per_asset_metrics = (report.get("metrics") or {}).get("per_asset_metrics") or {}
+                for asset, asset_metrics in per_asset_metrics.items():
+                    await repo.record_crypto_model_artifact(
+                        frequency=report["frequency"],
+                        artifact_type=_crypto_artifact_type("backtest", [asset]),
+                        version=_version("crypto-15m-backtest", report),
+                        status=report["status"],
+                        sample_count=int(asset_metrics.get("oos_trade_candidate_count") or 0),
+                        metrics={**(report.get("metrics") or {}), **asset_metrics, "metrics_scope": "per_asset"},
+                        payload={"asset_symbol": asset, "pooled_version": artifact.version},
+                        kalshi_env=self.settings.kalshi_env,
+                        trained_at=datetime.now(UTC),
+                    )
                 await session.commit()
             report["version"] = artifact.version
         return report
@@ -5059,10 +5073,14 @@ def _crypto_readiness_score(
     backtest: dict[str, Any],
     gate: dict[str, Any],
     global_live_blockers: list[str],
+    active_color: str,
 ) -> dict[str, Any]:
     del global_live_blockers
-    live_orders = int(shadow_evidence.get("live_order_count") or 0)
-    safety = 10 if not settings.crypto_trading_enabled and live_orders == 0 else 0
+    is_active_color = settings.app_color == active_color
+    windowed_live_orders = int(shadow_evidence.get("recent_live_order_count") or 0)
+    applicable_live_orders = windowed_live_orders if is_active_color else 0
+    effectively_trading = settings.crypto_trading_enabled and is_active_color
+    safety = 10 if not effectively_trading and applicable_live_orders == 0 else 0
     data_freshness = 8 if data_quality.get("status") == "ready" else 4
     spot_coverage = float(spot_quality.get("coverage_pct") or 0.0)
     feature_coverage = int(round(min(1.0, max(0.0, spot_coverage)) * 10))
@@ -5107,7 +5125,7 @@ def _crypto_readiness_score(
     }
     score = round(sum(components.values()) / len(components), 1)
     blockers: list[str] = []
-    if live_orders:
+    if applicable_live_orders:
         blockers.append("crypto_live_orders_detected")
     if spot_quality.get("status") != "ready":
         blockers.append("spot_feature_coverage_or_freshness_needs_work")
@@ -5994,12 +6012,17 @@ def _fit_crypto_spot_distance_residual_model(rows: list[dict[str, Any]], *, fall
         for key, values in grouped.items()
         if values
     }
-    return {
+    model = {
         "model_type": "spot_distance_residual",
         "bucket_adjustments_bps": adjustments,
         "fallback_model": fallback,
         "training_cutoff": _crypto_training_cutoff(rows),
     }
+    model["probability_calibration"] = _fit_probability_calibration(
+        [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
+        [int(row["label_yes"]) for row in rows],
+    )
+    return model
 
 
 def _fit_crypto_asset_time_calibration_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:
@@ -6254,7 +6277,8 @@ def _predict_crypto_probability(
     if model_type == "spot_distance_residual":
         key = "|".join([str(row.get("asset_symbol") or "unknown"), _crypto_spot_distance_band(row)])
         adjustment = Decimal(int((model.get("bucket_adjustments_bps") or {}).get(key, 0))) / Decimal("10000")
-        return _clamp_price(_predict_crypto_probability(row, model.get("fallback_model")) + adjustment)
+        probability = _clamp_price(_predict_crypto_probability(row, model.get("fallback_model")) + adjustment)
+        return _apply_probability_calibration(probability, model.get("probability_calibration")) if apply_calibration else probability
     if model_type == "asset_time_calibration":
         bucket = _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0))
         key = "|".join([str(row.get("asset_symbol") or "unknown"), bucket])
@@ -7536,6 +7560,10 @@ def _evaluate_crypto_walk_forward(
     }
     bucket_matrix = _crypto_bucket_matrix(calibrated_trades, settings=settings)
     bucket_diagnostics = _crypto_bucket_diagnostics(selection_trades)
+    oos_by_asset: dict[str, int] = {}
+    for _trade in selection_trades:
+        _asset = str(_trade.get("asset_symbol") or "unknown")
+        oos_by_asset[_asset] = oos_by_asset.get(_asset, 0) + 1
     return {
         "status": "ok",
         "fold_count": len(folds),
@@ -7601,6 +7629,11 @@ def _evaluate_crypto_walk_forward(
                 "candidate_counts_by_asset": diagnostic_quality["by_asset"],
                 "last_minute_passive_price_matrix": last_minute_passive_price_matrix,
                 "last_minute_passive_price_matrix_count": len(last_minute_passive_price_matrix),
+                "oos_trade_candidate_count_by_asset": oos_by_asset,
+                "per_asset_metrics": {
+                    asset: {"oos_trade_candidate_count": count}
+                    for asset, count in oos_by_asset.items()
+                },
             },
             selection_trades=selection_trades,
             market_mid_trades=baseline_trades_by_name["market_mid_baseline"],
