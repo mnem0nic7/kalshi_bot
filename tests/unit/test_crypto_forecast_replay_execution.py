@@ -746,6 +746,51 @@ async def test_crypto_history_paginates_historical_markets(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_crypto_history_historical_pagination_can_stop_at_cutoff(tmp_path) -> None:
+    settings = _settings(tmp_path, crypto_historical_pagination_stop_at_cutoff=True)
+    now = datetime.now(UTC)
+    series = CryptoSeries(
+        series_ticker="KXBTC15M",
+        title="BTC 15m",
+        category="Crypto",
+        frequency="15m",
+        asset_symbol="BTC",
+    )
+
+    class _FakeKalshi:
+        async def list_historical_markets(self, **params):
+            if "cursor" not in params:
+                return {
+                    "markets": [
+                        {
+                            "ticker": "KXBTC15M-OLD",
+                            "series_ticker": "KXBTC15M",
+                            "close_time": (now - timedelta(days=5)).isoformat(),
+                            "result": "no",
+                            "status": "finalized",
+                        }
+                    ],
+                    "cursor": "recent",
+                }
+            raise AssertionError("old historical page should stop cutoff pagination")
+
+    result = await CryptoHistoryService(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        kalshi=_FakeKalshi(),  # type: ignore[arg-type]
+        market_service=None,  # type: ignore[arg-type]
+    )._list_historical_markets(
+        "KXBTC15M",
+        cutoff=now - timedelta(days=2),
+        frequency="15m",
+        series=series,
+    )
+
+    assert result["pages_fetched"] == 1
+    assert result["rows_seen"] == 1
+
+
+@pytest.mark.asyncio
 async def test_crypto_history_paginates_recent_settled_markets_until_lookback(tmp_path) -> None:
     settings = _settings(tmp_path)
     now = datetime.now(UTC)
@@ -1466,7 +1511,8 @@ async def test_crypto_history_bootstrap_scopes_requested_assets(tmp_path) -> Non
     historical_calls: list[str] = []
     captured_assets: list[str] = []
 
-    async def fake_list_historical_markets(series_ticker: str) -> dict[str, object]:
+    async def fake_list_historical_markets(series_ticker: str, **kwargs) -> dict[str, object]:
+        del kwargs
         historical_calls.append(series_ticker)
         return {"rows": [], "errors": [], "pages_fetched": 0, "rows_seen": 0}
 
@@ -2086,7 +2132,7 @@ def test_crypto_feature_vector_is_deterministic_and_point_in_time(tmp_path) -> N
     first = _crypto_raw_feature_vector(rows[0], schema)
     second = _crypto_raw_feature_vector(rows[0], schema)
 
-    assert schema["feature_schema_version"] == "crypto-rich-v3"
+    assert schema["feature_schema_version"] == "crypto-rich-v4"
     assert schema["asset_categories"] == ["BTC", "ETH"]
     assert "spot_return_3_pct" in schema["feature_names"]
     assert "time_to_close_bucket_0_5m" in schema["feature_names"]
@@ -2142,7 +2188,7 @@ def test_crypto_serialized_logistic_prediction_is_stable(tmp_path) -> None:
         "calibrated_weighted_ensemble",
         "market_mid_baseline",
     }
-    assert model["feature_schema_version"] == "crypto-rich-v3"
+    assert model["feature_schema_version"] == "crypto-rich-v4"
     assert model["candidate_report"]["primary_metric"] == "oos_candidate_net_pnl"
     assert first == second
     assert Decimal("0.0100") <= first <= Decimal("0.9900")

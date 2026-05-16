@@ -178,6 +178,7 @@ class Settings(BaseSettings):
     crypto_history_lookback_days: int = 180
     crypto_collect_settled_candles_enabled: bool = True
     crypto_settled_pagination_stop_at_cutoff: bool = False
+    crypto_historical_pagination_stop_at_cutoff: bool = False
     crypto_history_candle_concurrency: int = 1
     crypto_order_mode: str = "passive_then_taker"
     crypto_passive_timeout_seconds: int = 5

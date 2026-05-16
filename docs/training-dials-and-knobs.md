@@ -607,6 +607,7 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_HISTORY_LOOKBACK_DAYS` | `180` | Default history lookback. |
 | `CRYPTO_COLLECT_SETTLED_CANDLES_ENABLED` | `true` | Captures Kalshi candles during settled-label collection. Turn off for full `crypto-live-path refresh` catch-ups when the following history bootstrap will capture candles. |
 | `CRYPTO_SETTLED_PAGINATION_STOP_AT_CUTOFF` | `false` | Stops settled-market pagination once a whole page is older than the requested cutoff. Keep off for maximum conservatism; enable for bounded catch-ups after confirming Kalshi pages are newest-first. |
+| `CRYPTO_HISTORICAL_PAGINATION_STOP_AT_CUTOFF` | `false` | Stops historical-market pagination once a whole page is older than the requested cutoff. Keep off for maximum conservatism; enable for bounded catch-ups after confirming Kalshi pages are newest-first. |
 | `CRYPTO_HISTORY_CANDLE_CONCURRENCY` | `1` | Max concurrent Kalshi candlestick fetches during crypto history backfills. |
 | `CRYPTO_MIN_TRAINING_SAMPLES` | `250` | Minimum rows for trained crypto model status. |
 | `CRYPTO_REPLAY_MIN_RESOLVED_MARKETS` | `500` | Replay gate resolved-market support. |

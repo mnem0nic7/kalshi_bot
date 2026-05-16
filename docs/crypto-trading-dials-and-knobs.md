@@ -138,6 +138,7 @@ Crypto has two data streams:
 | `kalshi_rest_rate_limit_burst` | `16` | Local Kalshi REST token-bucket burst size. |
 | `crypto_collect_settled_candles_enabled` | `True` | Captures Kalshi candles during settled-label collection; full refresh catch-ups can disable it when history bootstrap will capture candles next. |
 | `crypto_settled_pagination_stop_at_cutoff` | `False` | Stops settled-market pagination when a full page is older than the requested cutoff; useful for bounded catch-ups after confirming Kalshi returns newest-first pages. |
+| `crypto_historical_pagination_stop_at_cutoff` | `False` | Stops historical-market pagination when a full page is older than the requested cutoff; useful for bounded catch-ups after confirming Kalshi returns newest-first pages. |
 | `crypto_history_candle_concurrency` | `1` | Max concurrent Kalshi candlestick fetches during crypto history backfills. |
 | `crypto_history_auto_enabled` | `True` | Enables scheduled market-history collection. |
 | `crypto_history_auto_interval_seconds` | `3600` | Scheduled market-history collection cadence. |

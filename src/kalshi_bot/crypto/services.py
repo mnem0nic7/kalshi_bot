@@ -82,7 +82,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v3"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v4"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
 CRYPTO_EXPLORATORY_SHADOW = "exploratory_shadow"
@@ -1063,7 +1063,12 @@ class CryptoHistoryService:
         errors: list[dict[str, str]] = []
         series_stats: list[dict[str, Any]] = []
         for series in series_rows:
-            result = await self._list_historical_markets(series.series_ticker)
+            result = await self._list_historical_markets(
+                series.series_ticker,
+                cutoff=cutoff,
+                frequency=frequency,
+                series=series,
+            )
             errors.extend({"series_ticker": series.series_ticker, "error": error} for error in result["errors"])
             markets_in_window = 0
             for row in result["rows"]:
@@ -1411,7 +1416,14 @@ class CryptoHistoryService:
             "quote_evidence": _crypto_quote_evidence_summary(snapshots, quote_rows, settings=self.settings),
         }
 
-    async def _list_historical_markets(self, series_ticker: str) -> dict[str, Any]:
+    async def _list_historical_markets(
+        self,
+        series_ticker: str,
+        *,
+        cutoff: datetime | None = None,
+        frequency: str = "15m",
+        series: CryptoSeries | None = None,
+    ) -> dict[str, Any]:
         rows: list[dict[str, Any]] = []
         errors: list[str] = []
         cursor: str | None = None
@@ -1429,6 +1441,18 @@ class CryptoHistoryService:
             page_rows = _rows_from_response(response, "markets")
             rows.extend(page_rows)
             pages_fetched += 1
+            if cutoff is not None and series is not None and self.settings.crypto_historical_pagination_stop_at_cutoff:
+                parsed_page = [
+                    parsed
+                    for row in page_rows
+                    if (parsed := parse_crypto_market(row, series=series, frequency=frequency)) is not None
+                ]
+                if parsed_page and all(
+                    (market.close_time or market.expected_expiration_time) is not None
+                    and (market.close_time or market.expected_expiration_time) < cutoff
+                    for market in parsed_page
+                ):
+                    break
             cursor = response.get("cursor") or response.get("next_cursor")
             if not cursor or cursor in seen_cursors:
                 break
@@ -2137,13 +2161,23 @@ class CryptoForecastService:
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbol=market.asset_symbol,
             )
+            _now = datetime.now(UTC)
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=market.frequency,
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbol=market.asset_symbol,
-                until=datetime.now(UTC),
-                limit=12,
+                until=_now,
+                limit=30,
             )
+            cross_asset_spot: dict[str, list[CryptoSpotOHLCRecord]] = {}
+            for _ca in [a for a in ("BTC", "ETH") if a != market.asset_symbol]:
+                cross_asset_spot[_ca] = await repo.list_crypto_spot_ohlc(
+                    frequency=market.frequency,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbol=_ca,
+                    until=_now,
+                    limit=10,
+                )
             backtest = await _latest_crypto_artifact_for_asset(
                 repo,
                 frequency=market.frequency,
@@ -2184,7 +2218,7 @@ class CryptoForecastService:
                 fair=mid,
             )
         payload = artifact.payload or {}
-        market_row = _crypto_live_market_row(market, spot_rows=spot_rows, settings=self.settings)
+        market_row = _crypto_live_market_row(market, spot_rows=spot_rows, cross_asset_spot=cross_asset_spot, settings=self.settings)
         features = {**features, "spot_features": _json_ready_spot_features(market_row)}
         fair = _predict_crypto_probability(market_row, payload)
         empirical_bucket_matrix = _crypto_empirical_bucket_matrix_from_artifacts(gate, backtest)
@@ -4523,6 +4557,7 @@ def _crypto_live_market_row(
     market: CryptoMarket,
     *,
     spot_rows: list[CryptoSpotOHLCRecord] | None = None,
+    cross_asset_spot: dict[str, list[CryptoSpotOHLCRecord]] | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
@@ -4574,6 +4609,7 @@ def _crypto_live_market_row(
             mode=CRYPTO_SPOT_CONTEXT_LIVE,
         )
     )
+    row.update(_cross_asset_context(cross_asset_spot or {}, decision_ts=now))
     return row
 
 
@@ -5403,6 +5439,7 @@ def _crypto_decision_rows(
                 "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
                 "candle_momentum_dollars": candle_momentum,
                 **spot_context,
+                **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
             }
         )
     for market_ticker, snapshot in settled_snapshots_by_market.items():
@@ -5465,6 +5502,7 @@ def _crypto_decision_rows(
                     "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
                     "candle_momentum_dollars": candle_momentum,
                     **spot_context,
+                    **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
                 }
             )
     return _crypto_add_recent_asset_features(rows)
@@ -5603,6 +5641,9 @@ def _spot_context_for_decision(
             "spot_exchange_spread_bps": None,
             "spot_exchange_latest_trade_size": None,
             "spot_exchange_recent_trade_count": None,
+            "spot_return_12_pct": None,
+            "spot_return_24_pct": None,
+            "spot_realized_volatility_32": None,
         }
     if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
         historical_eligible = [
@@ -5632,6 +5673,8 @@ def _spot_context_for_decision(
     spot_return_1_pct = momentum_pct
     spot_return_3_pct = _spot_return_pct(eligible, periods=3)
     spot_return_6_pct = _spot_return_pct(eligible, periods=6)
+    spot_return_12_pct = _spot_return_pct(eligible, periods=12)
+    spot_return_24_pct = _spot_return_pct(eligible, periods=24)
     returns: list[Decimal] = []
     window = eligible[-9:]
     for before, after in zip(window, window[1:], strict=False):
@@ -5644,6 +5687,18 @@ def _spot_context_for_decision(
         mean = sum(returns, Decimal("0")) / Decimal(len(returns))
         variance = sum((value - mean) * (value - mean) for value in returns) / Decimal(len(returns))
         volatility = Decimal(str(math.sqrt(float(variance))))
+    returns_32: list[Decimal] = []
+    window_32 = eligible[-33:]
+    for before, after in zip(window_32, window_32[1:], strict=False):
+        before_close = _decimal(before.close_dollars)
+        after_close = _decimal(after.close_dollars)
+        if before_close > 0:
+            returns_32.append((after_close - before_close) / before_close)
+    volatility_32 = None
+    if returns_32:
+        mean_32 = sum(returns_32, Decimal("0")) / Decimal(len(returns_32))
+        variance_32 = sum((v - mean_32) * (v - mean_32) for v in returns_32) / Decimal(len(returns_32))
+        volatility_32 = Decimal(str(math.sqrt(float(variance_32))))
     moneyness = None
     moneyness_pct = None
     spot_probability_proxy = None
@@ -5690,6 +5745,9 @@ def _spot_context_for_decision(
         "spot_exchange_spread_bps": int(spot_exchange_spread) if spot_exchange_spread not in (None, "") else None,
         "spot_exchange_latest_trade_size": spot_exchange_latest_trade_size,
         "spot_exchange_recent_trade_count": int(spot_exchange_recent_trade_count) if spot_exchange_recent_trade_count not in (None, "") else None,
+        "spot_return_12_pct": spot_return_12_pct,
+        "spot_return_24_pct": spot_return_24_pct,
+        "spot_realized_volatility_32": volatility_32,
     }
 
 
@@ -5701,6 +5759,29 @@ def _spot_return_pct(spot_rows: list[CryptoSpotOHLCRecord], *, periods: int) -> 
     if prior_close <= 0:
         return None
     return (current_close - prior_close) / prior_close
+
+
+def _cross_asset_context(
+    spot_by_asset: dict[str, list[CryptoSpotOHLCRecord]],
+    *,
+    decision_ts: datetime,
+) -> dict[str, Any]:
+    decision_utc = _as_utc_datetime(decision_ts)
+
+    def _cross_return(asset: str, periods: int) -> Decimal | None:
+        rows = spot_by_asset.get(asset) or []
+        eligible = sorted(
+            (r for r in rows if _as_utc_datetime(r.end_ts) <= decision_utc and r.close_dollars is not None),
+            key=lambda r: r.end_ts,
+        )
+        return _spot_return_pct(eligible, periods=periods)
+
+    return {
+        "btc_return_1_pct": _cross_return("BTC", 1),
+        "btc_return_3_pct": _cross_return("BTC", 3),
+        "eth_return_1_pct": _cross_return("ETH", 1),
+        "eth_return_3_pct": _cross_return("ETH", 3),
+    }
 
 
 def _crypto_add_recent_asset_features(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -5816,6 +5897,19 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "time_to_close_bucket_10_15m",
         "time_to_close_bucket_15m_plus",
         "market_age_ratio",
+        "spot_exchange_spread_bps",
+        "spot_exchange_recent_trade_count",
+        "spot_return_12_pct",
+        "spot_return_24_pct",
+        "spot_realized_volatility_32",
+        "close_hour_sin",
+        "close_hour_cos",
+        "close_dow_sin",
+        "close_dow_cos",
+        "btc_return_1_pct",
+        "btc_return_3_pct",
+        "eth_return_1_pct",
+        "eth_return_3_pct",
     ]
     feature_names = [*numeric, *[f"asset={asset}" for asset in assets]]
     return {
@@ -5874,15 +5968,34 @@ def _crypto_raw_feature_vector(
     spot_return_1 = float(_decimal(row.get("spot_return_1_pct") or Decimal("0")))
     spot_return_3 = float(_decimal(row.get("spot_return_3_pct") or Decimal("0")))
     spot_return_6 = float(_decimal(row.get("spot_return_6_pct") or Decimal("0")))
+    spot_return_12 = float(_decimal(row.get("spot_return_12_pct") or Decimal("0")))
+    spot_return_24 = float(_decimal(row.get("spot_return_24_pct") or Decimal("0")))
     spot_volatility = float(_decimal(row.get("spot_realized_volatility") or Decimal("0")))
+    spot_volatility_32 = float(_decimal(row.get("spot_realized_volatility_32") or Decimal("0")))
     spot_target_distance_volatility = float(_decimal(row.get("spot_target_distance_volatility") or Decimal("0")))
     kalshi_mid_spot_gap = float(_decimal(row.get("kalshi_mid_spot_gap") or Decimal("0")))
     spot_stale_seconds = max(0.0, float(row.get("spot_stale_seconds") or 0))
+    spot_exchange_spread = max(0.0, float(row.get("spot_exchange_spread_bps") or 0))
+    spot_exchange_trade_count = max(0.0, float(row.get("spot_exchange_recent_trade_count") or 0))
+    btc_return_1 = float(_decimal(row.get("btc_return_1_pct") or Decimal("0")))
+    btc_return_3 = float(_decimal(row.get("btc_return_3_pct") or Decimal("0")))
+    eth_return_1 = float(_decimal(row.get("eth_return_1_pct") or Decimal("0")))
+    eth_return_3 = float(_decimal(row.get("eth_return_3_pct") or Decimal("0")))
     market_age_seconds = max(0.0, float(row.get("market_age_seconds") or 0))
     default_values = _crypto_default_values_for_asset(asset, defaults or {})
     recent_yes = row.get("asset_recent_yes_rate")
     recent_error = row.get("asset_recent_mid_error")
     time_to_close_bucket = _crypto_time_to_close_bucket(time_to_close)
+    settlement_ts = row.get("settlement_ts")
+    if isinstance(settlement_ts, datetime):
+        _close_hour = _as_utc_datetime(settlement_ts).hour
+        _close_dow = _as_utc_datetime(settlement_ts).weekday()
+        close_hour_sin = math.sin(2 * math.pi * _close_hour / 24)
+        close_hour_cos = math.cos(2 * math.pi * _close_hour / 24)
+        close_dow_sin = math.sin(2 * math.pi * _close_dow / 7)
+        close_dow_cos = math.cos(2 * math.pi * _close_dow / 7)
+    else:
+        close_hour_sin = close_hour_cos = close_dow_sin = close_dow_cos = 0.0
     numeric_values = {
         "market_mid_logit": math.log(max(1e-6, mid) / max(1e-6, 1.0 - mid)),
         "mid_yes": mid,
@@ -5912,6 +6025,19 @@ def _crypto_raw_feature_vector(
         "time_to_close_bucket_10_15m": 1.0 if time_to_close_bucket == "10_15m" else 0.0,
         "time_to_close_bucket_15m_plus": 1.0 if time_to_close_bucket == "15m_plus" else 0.0,
         "market_age_ratio": min(market_age_seconds / 900.0, 8.0) / 8.0,
+        "spot_exchange_spread_bps": min(spot_exchange_spread / 200.0, 1.0),
+        "spot_exchange_recent_trade_count": min(spot_exchange_trade_count, 50.0) / 50.0,
+        "spot_return_12_pct": max(-0.20, min(0.20, spot_return_12)) * 5.0,
+        "spot_return_24_pct": max(-0.30, min(0.30, spot_return_24)) * (10.0 / 3.0),
+        "spot_realized_volatility_32": max(0.0, min(0.20, spot_volatility_32)) * 5.0,
+        "close_hour_sin": close_hour_sin,
+        "close_hour_cos": close_hour_cos,
+        "close_dow_sin": close_dow_sin,
+        "close_dow_cos": close_dow_cos,
+        "btc_return_1_pct": max(-0.05, min(0.05, btc_return_1)) * 20.0,
+        "btc_return_3_pct": max(-0.10, min(0.10, btc_return_3)) * 10.0,
+        "eth_return_1_pct": max(-0.05, min(0.05, eth_return_1)) * 20.0,
+        "eth_return_3_pct": max(-0.10, min(0.10, eth_return_3)) * 10.0,
     }
     values: list[float] = [numeric_values[name] for name in schema.get("numeric_feature_names") or []]
     values.extend(1.0 if asset == category else 0.0 for category in schema.get("asset_categories") or [])
