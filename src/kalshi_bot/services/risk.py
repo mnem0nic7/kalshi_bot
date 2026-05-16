@@ -379,9 +379,10 @@ class DeterministicRiskEngine:
         approved_notional = order_notional
         gross_edge_bps = signal.edge_bps
         candidate_trace = dict(signal.candidate_trace or {})
-        late_sure_thing_edge_bypass = _crypto_late_sure_thing_edge_bypass(signal, context)
         last_minute_passive_edge_bypass = _crypto_last_minute_passive_edge_bypass(signal, context)
-        edge_floor_bypass = late_sure_thing_edge_bypass or last_minute_passive_edge_bypass
+        # Late high-confidence crypto entries still need to clear the normal edge
+        # floors; only the explicit last-minute passive path can bypass them.
+        edge_floor_bypass = last_minute_passive_edge_bypass
         policy_service = DecisionPolicyVariantService(self.settings)
         applied_policy_variant = candidate_trace.get("policy_variant_applied")
         fee_estimate_dollars_per_contract: Decimal | None = None
@@ -455,12 +456,6 @@ class DeterministicRiskEngine:
                 f"({signal.edge_bps}bps versus {active_thresholds.risk_min_edge_bps}bps)."
             )
             code("last_minute_passive_edge_bypass")
-        elif signal.edge_bps < active_thresholds.risk_min_edge_bps:
-            note(
-                f"Late high-confidence crypto model choice bypassed the edge floor "
-                f"({signal.edge_bps}bps versus {active_thresholds.risk_min_edge_bps}bps)."
-            )
-            code("late_high_confidence_edge_bypass")
         if signal.edge_bps > active_thresholds.risk_max_credible_edge_bps:
             extreme_diag = candidate_trace.get("extreme_edge_diagnostic")
             validated_extreme_edge = (
@@ -907,12 +902,6 @@ class DeterministicRiskEngine:
                     f"({net_edge_bps}bps versus {active_thresholds.risk_min_edge_bps}bps)."
                 )
                 code("last_minute_passive_fee_adjusted_edge_bypass")
-            elif net_edge_bps < active_thresholds.risk_min_edge_bps:
-                note(
-                    f"Late high-confidence crypto model choice bypassed the fee-adjusted edge floor "
-                    f"({net_edge_bps}bps versus {active_thresholds.risk_min_edge_bps}bps)."
-                )
-                code("late_high_confidence_fee_adjusted_edge_bypass")
             else:
                 note(
                     f"Fee-adjusted edge {net_edge_bps}bps clears the configured minimum "

@@ -8494,7 +8494,7 @@ def _crypto_trade_candidates(
             reason = "remaining_payout_below_crypto_min"
         elif raw_edge_bps > max_credible_edge_bps:
             reason = "edge_above_crypto_credible_max"
-        elif late_sure_thing:
+        elif late_sure_thing and expected_net_edge >= min_live_edge:
             status = "eligible"
             candidate_status = CRYPTO_LIVE_QUALITY
             reason = "late_high_confidence_directional_entry"
@@ -8508,7 +8508,7 @@ def _crypto_trade_candidates(
             status = "eligible"
             candidate_status = CRYPTO_LIVE_QUALITY
             reason = "positive_fee_adjusted_live_quality_edge"
-        elif expected_net_edge >= min_shadow_edge and spread_bps <= max_shadow_spread:
+        elif not late_sure_thing and expected_net_edge >= min_shadow_edge and spread_bps <= max_shadow_spread:
             status = "eligible"
             candidate_status = CRYPTO_EXPLORATORY_SHADOW
             reason = live_entry_window_reason or "broad_shadow_exploration"

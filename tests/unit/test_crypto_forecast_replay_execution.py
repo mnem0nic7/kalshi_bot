@@ -2243,7 +2243,7 @@ def test_crypto_candidate_quality_blocks_live_inside_final_window(tmp_path) -> N
     assert candidates[0]["live_eligible"] is False
 
 
-def test_crypto_candidate_quality_allows_late_high_confidence_directional_entry(tmp_path) -> None:
+def test_crypto_candidate_quality_blocks_late_high_confidence_below_edge_floor(tmp_path) -> None:
     settings = _settings(
         tmp_path,
         risk_min_edge_bps=500,
@@ -2269,12 +2269,13 @@ def test_crypto_candidate_quality_allows_late_high_confidence_directional_entry(
     candidates = _crypto_trade_candidates(row, Decimal("0.0500"), settings=settings)
     no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
 
-    assert no_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
-    assert no_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert no_candidate["candidate_status"] == "blocked_fee_edge"
+    assert no_candidate["reason"] == "fee_adjusted_edge_below_live_min"
     assert no_candidate["edge_bps"] < 0
     assert no_candidate["expected_net_edge"].startswith("-")
     assert no_candidate["live_entry_window_reason"] == "crypto_market_too_late_for_live_entry"
     assert no_candidate["late_high_confidence_directional_entry"] is True
+    assert no_candidate["live_eligible"] is False
 
 
 def test_crypto_late_high_confidence_does_not_trade_after_close(tmp_path) -> None:
@@ -2336,7 +2337,9 @@ def test_crypto_late_high_confidence_default_probability_floor_is_85(tmp_path) -
 
     assert settings.crypto_late_sure_thing_min_probability == 0.85
     assert yes_candidate["market_anchored_probability"] == "0.8500"
-    assert yes_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert yes_candidate["candidate_status"] == "blocked_fee_edge"
+    assert yes_candidate["reason"] == "fee_adjusted_edge_below_live_min"
+    assert yes_candidate["edge_bps"] < 0
     assert yes_candidate["late_high_confidence_directional_entry"] is True
 
 
@@ -2374,7 +2377,7 @@ def test_crypto_late_high_confidence_requires_90_probability_from_180_to_300_sec
     assert yes_candidate["late_high_confidence_directional_entry"] is False
 
 
-def test_crypto_late_high_confidence_allows_90_probability_from_180_to_300_seconds(tmp_path) -> None:
+def test_crypto_late_high_confidence_requires_edge_floor_from_180_to_300_seconds(tmp_path) -> None:
     settings = _settings(
         tmp_path,
         risk_min_edge_bps=500,
@@ -2403,8 +2406,9 @@ def test_crypto_late_high_confidence_allows_90_probability_from_180_to_300_secon
     yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
 
     assert yes_candidate["market_anchored_probability"] == "0.9000"
-    assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
-    assert yes_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert yes_candidate["candidate_status"] == "blocked_fee_edge"
+    assert yes_candidate["reason"] == "fee_adjusted_edge_below_live_min"
+    assert yes_candidate["edge_bps"] < 0
     assert yes_candidate["late_high_confidence_directional_entry"] is True
 
 
@@ -2560,15 +2564,15 @@ def test_crypto_late_high_confidence_allows_near_strike_adverse_momentum_at_90(t
     no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
 
     assert no_candidate["model_probability"] == "0.9000"
-    assert no_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
-    assert no_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert no_candidate["candidate_status"] == "blocked_fee_edge"
+    assert no_candidate["reason"] == "fee_adjusted_edge_below_live_min"
     assert no_candidate["late_high_confidence_directional_entry"] is True
     assert no_candidate["late_high_confidence_near_strike_momentum_guard"]["reason"] == (
         "near_strike_adverse_momentum_probability_allowed"
     )
 
 
-def test_crypto_candidate_quality_allows_late_market_confirmed_edge_bypass_before_no_entry_cutoff(tmp_path) -> None:
+def test_crypto_candidate_quality_blocks_late_market_confirmed_below_edge_before_no_entry_cutoff(tmp_path) -> None:
     settings = _settings(
         tmp_path,
         risk_min_edge_bps=500,
@@ -2595,8 +2599,8 @@ def test_crypto_candidate_quality_allows_late_market_confirmed_edge_bypass_befor
     candidates = _crypto_trade_candidates(row, Decimal("0.9500"), settings=settings)
     yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
 
-    assert yes_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
-    assert yes_candidate["reason"] == "late_high_confidence_directional_entry"
+    assert yes_candidate["candidate_status"] == "blocked_fee_edge"
+    assert yes_candidate["reason"] == "fee_adjusted_edge_below_live_min"
     assert yes_candidate["edge_bps"] < 0
     assert yes_candidate["expected_net_edge"].startswith("-")
     assert yes_candidate["market_side_probability"] == "0.9650"
@@ -2746,10 +2750,10 @@ def test_crypto_empirical_bucket_gate_uses_outcome_win_rate_when_present(tmp_pat
     row = {
         "market_ticker": "KXBTC15M-BUCKET-GATE-OUTCOME",
         "asset_symbol": "BTC",
-        "mid_yes_dollars": Decimal("0.9900"),
-        "yes_bid_dollars": Decimal("0.9900"),
-        "yes_ask_dollars": Decimal("0.9900"),
-        "no_ask_dollars": Decimal("0.0100"),
+        "mid_yes_dollars": Decimal("0.9000"),
+        "yes_bid_dollars": Decimal("0.8400"),
+        "yes_ask_dollars": Decimal("0.8500"),
+        "no_ask_dollars": Decimal("0.1600"),
         "spread_bps": 0,
         "spot_feature_status": "available",
         "spot_provider": "coinbase",
@@ -2757,7 +2761,7 @@ def test_crypto_empirical_bucket_gate_uses_outcome_win_rate_when_present(tmp_pat
         "time_to_close_seconds": 60,
         "market_age_seconds": 840,
     }
-    bucket_key = _crypto_bucket_key(row, {"side": "yes", "execution_price_dollars": "0.9900"})
+    bucket_key = _crypto_bucket_key(row, {"side": "yes", "execution_price_dollars": "0.8500"})
 
     candidates = _crypto_trade_candidates(
         row,
@@ -3347,7 +3351,7 @@ def test_crypto_last_minute_passive_stays_inside_final_60_seconds(tmp_path) -> N
     assert yes_candidate["last_minute_passive"]["reason"] == "outside_last_minute_passive_window"
 
 
-def test_late_high_confidence_candidate_still_requires_empirical_bucket(tmp_path) -> None:
+def test_late_high_confidence_candidate_hits_edge_floor_before_empirical_bucket(tmp_path) -> None:
     settings = _settings(
         tmp_path,
         risk_min_edge_bps=500,
@@ -3381,12 +3385,13 @@ def test_late_high_confidence_candidate_still_requires_empirical_bucket(tmp_path
     no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
 
     assert no_candidate["late_high_confidence_directional_entry"] is True
-    assert no_candidate["pre_empirical_reason"] == "late_high_confidence_directional_entry"
-    assert no_candidate["candidate_status"] == "blocked_empirical_bucket"
-    assert no_candidate["reason"] == "empirical_bucket_not_allowed"
+    assert no_candidate["pre_empirical_reason"] == "fee_adjusted_edge_below_live_min"
+    assert no_candidate["candidate_status"] == "blocked_fee_edge"
+    assert no_candidate["reason"] == "fee_adjusted_edge_below_live_min"
+    assert no_candidate["empirical_bucket_late_override"]["reason"] == "late_empirical_override_disabled"
 
 
-def test_late_high_confidence_overrides_missing_empirical_bucket_when_near_close(tmp_path) -> None:
+def test_late_high_confidence_does_not_override_missing_empirical_bucket_below_edge_floor(tmp_path) -> None:
     settings = _settings(
         tmp_path,
         risk_min_edge_bps=500,
@@ -3419,22 +3424,22 @@ def test_late_high_confidence_overrides_missing_empirical_bucket_when_near_close
     no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
 
     assert no_candidate["late_high_confidence_directional_entry"] is True
-    assert no_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
-    assert no_candidate["reason"] == "late_high_confidence_directional_entry"
-    assert no_candidate["empirical_bucket_status"] == "override_allowed"
-    assert no_candidate["empirical_bucket_gate"]["original_reason"] == "empirical_bucket_missing"
-    assert no_candidate["empirical_bucket_gate"]["late_override"]["max_count_fp"] == "1.00"
+    assert no_candidate["candidate_status"] == "blocked_fee_edge"
+    assert no_candidate["reason"] == "fee_adjusted_edge_below_live_min"
+    assert no_candidate["empirical_bucket_status"] == "unknown"
+    assert no_candidate["empirical_bucket_gate"]["reason"] == "empirical_bucket_missing"
+    assert no_candidate["empirical_bucket_late_override"]["reason"] == "not_late_high_confidence_entry"
     assert no_candidate["empirical_bucket_gap_sample"]["schema_version"] == "crypto-empirical-gap-sample-v1"
-    assert no_candidate["empirical_bucket_gap_sample"]["gap_analysis_candidate"] is True
-    assert no_candidate["empirical_bucket_gap_sample"]["late_override_allowed"] is True
+    assert no_candidate["empirical_bucket_gap_sample"]["gap_analysis_candidate"] is False
+    assert no_candidate["empirical_bucket_gap_sample"]["late_override_allowed"] is False
     assert no_candidate["empirical_bucket_gap_sample"]["dedupe_key"] == (
         "KXBTC15M-LATE-BUCKET-MISSING|no|BTC|no|0.75-1.00|tight|0_5m|"
-        "late_high_confidence_directional_entry"
+        "fee_adjusted_edge_below_live_min"
     )
-    assert no_candidate["live_eligible"] is True
+    assert no_candidate["live_eligible"] is False
 
 
-def test_late_high_confidence_overrides_low_win_rate_bucket_with_positive_pnl(tmp_path) -> None:
+def test_late_high_confidence_does_not_override_low_win_rate_bucket_below_edge_floor(tmp_path) -> None:
     settings = _settings(
         tmp_path,
         risk_min_edge_bps=500,
@@ -3467,12 +3472,11 @@ def test_late_high_confidence_overrides_low_win_rate_bucket_with_positive_pnl(tm
     )
     no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
 
-    assert no_candidate["candidate_status"] == CRYPTO_LIVE_QUALITY
-    assert no_candidate["empirical_bucket_status"] == "override_allowed"
-    assert no_candidate["empirical_bucket_gate"]["original_reason"] == "empirical_bucket_low_win_rate"
-    assert no_candidate["empirical_bucket_gate"]["late_override"]["reason"] == (
-        "late_high_confidence_empirical_bucket_low_win_rate_override"
-    )
+    assert no_candidate["candidate_status"] == "blocked_fee_edge"
+    assert no_candidate["reason"] == "fee_adjusted_edge_below_live_min"
+    assert no_candidate["empirical_bucket_status"] == "blocked"
+    assert no_candidate["empirical_bucket_gate"]["reason"] == "empirical_bucket_low_win_rate"
+    assert no_candidate["empirical_bucket_late_override"]["reason"] == "not_late_high_confidence_entry"
 
 
 def test_late_high_confidence_does_not_override_negative_pnl_bucket_by_default(tmp_path) -> None:
@@ -3509,10 +3513,10 @@ def test_late_high_confidence_does_not_override_negative_pnl_bucket_by_default(t
     no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
 
     assert no_candidate["late_high_confidence_directional_entry"] is True
-    assert no_candidate["candidate_status"] == "blocked_empirical_bucket"
-    assert no_candidate["reason"] == "empirical_bucket_not_allowed"
+    assert no_candidate["candidate_status"] == "blocked_fee_edge"
+    assert no_candidate["reason"] == "fee_adjusted_edge_below_live_min"
     assert no_candidate["empirical_bucket_gate"]["reason"] == "empirical_bucket_negative_pnl"
-    assert no_candidate["empirical_bucket_late_override"]["reason"] == "negative_pnl_override_disabled"
+    assert no_candidate["empirical_bucket_late_override"]["reason"] == "not_late_high_confidence_entry"
 
 
 def test_late_high_confidence_bucket_override_stays_inside_180_seconds(tmp_path) -> None:
@@ -3549,8 +3553,9 @@ def test_late_high_confidence_bucket_override_stays_inside_180_seconds(tmp_path)
     no_candidate = next(candidate for candidate in candidates if candidate["side"] == "no")
 
     assert no_candidate["late_high_confidence_directional_entry"] is True
-    assert no_candidate["candidate_status"] == "blocked_empirical_bucket"
-    assert no_candidate["empirical_bucket_late_override"]["reason"] == "outside_late_override_window"
+    assert no_candidate["candidate_status"] == "blocked_fee_edge"
+    assert no_candidate["reason"] == "fee_adjusted_edge_below_live_min"
+    assert no_candidate["empirical_bucket_late_override"]["reason"] == "not_late_high_confidence_entry"
 
 
 def test_crypto_candidate_quality_allows_mid_window_with_750bps_edge(tmp_path) -> None:
@@ -5187,7 +5192,7 @@ async def test_crypto_late_high_confidence_can_fall_back_to_taker_when_normal_wi
         "late_high_confidence_directional_entry": True,
         "trade_selection_model": {
             "candidate_status": CRYPTO_LIVE_QUALITY,
-            "expected_net_edge": "-0.0200",
+            "expected_net_edge": "0.0200",
             "late_high_confidence_directional_entry": True,
         },
     }

@@ -89,7 +89,7 @@ def test_risk_engine_approves_fresh_small_trade() -> None:
     assert verdict.status == RiskStatus.APPROVED
 
 
-def test_risk_engine_allows_late_high_confidence_crypto_edge_bypass() -> None:
+def test_risk_engine_blocks_late_high_confidence_crypto_below_edge_floor() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         risk_min_edge_bps=500,
@@ -136,9 +136,14 @@ def test_risk_engine_allows_late_high_confidence_crypto_edge_bypass() -> None:
         ),
     )
 
-    assert verdict.status == RiskStatus.APPROVED
-    assert "late_high_confidence_edge_bypass" in verdict.reason_codes
-    assert "late_high_confidence_fee_adjusted_edge_bypass" in verdict.reason_codes
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any(
+        "Edge -200bps is below configured minimum of 500bps." == reason
+        for reason in verdict.reasons
+    )
+    assert "fee_adjusted_edge_below_min" in verdict.reason_codes
+    assert "late_high_confidence_edge_bypass" not in verdict.reason_codes
+    assert "late_high_confidence_fee_adjusted_edge_bypass" not in verdict.reason_codes
 
 
 def test_risk_engine_allows_last_minute_passive_edge_bypass_and_normal_cap() -> None:
