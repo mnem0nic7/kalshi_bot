@@ -65,7 +65,7 @@ class CryptoMarket:
     def to_payload(self) -> dict[str, Any]:
         return {
             "market_domain": "crypto",
-            "strategy_code": "CRYPTO_15M",
+            "strategy_code": _strategy_code_for_frequency(self.frequency),
             "market_ticker": self.market_ticker,
             "series_ticker": self.series_ticker,
             "event_ticker": self.event_ticker,
@@ -96,3 +96,10 @@ class CryptoMarket:
 
 def _decimal_text(value: Decimal | None) -> str | None:
     return str(value) if value is not None else None
+
+
+def _strategy_code_for_frequency(frequency: str | None) -> str:
+    normalized = str(frequency or "15m").strip().lower().replace(" ", "_")
+    if normalized in {"hourly", "1h", "one_hour"}:
+        return "CRYPTO_1H"
+    return "CRYPTO_15M"

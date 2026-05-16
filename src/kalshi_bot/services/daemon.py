@@ -14,7 +14,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.schemas import HistoricalIntelligenceRunRequest, ShadowCampaignRequest
-from kalshi_bot.crypto.services import CryptoAutonomyService, CryptoHistoryService, CryptoSpotService
+from kalshi_bot.crypto.services import (
+    CryptoAutonomyService,
+    CryptoHistoryService,
+    CryptoSpotService,
+    enabled_crypto_frequencies,
+)
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.services.autonomous_gate_tuning import AutonomousGateTuningService
@@ -118,6 +123,23 @@ class DaemonService:
         self._last_market_update_dispatched_at: dict[str, float] = {}
         self._threaded_liveness_stop: threading.Event | None = None
         self._threaded_liveness_thread: threading.Thread | None = None
+        self._heartbeat_role = "daemon"
+
+    @staticmethod
+    def _normalize_heartbeat_role(role: str | None) -> str:
+        normalized = "".join(ch if ch.isalnum() else "_" for ch in str(role or "daemon").strip().lower())
+        normalized = "_".join(part for part in normalized.split("_") if part)
+        return normalized or "daemon"
+
+    def _checkpoint_name(self, prefix: str) -> str:
+        base = f"{prefix}:{self.settings.kalshi_env}:{self.settings.app_color}"
+        return base if self._heartbeat_role == "daemon" else f"{base}:{self._heartbeat_role}"
+
+    def _reconcile_checkpoint_name(self) -> str:
+        return self._checkpoint_name("daemon_reconcile")
+
+    def _heartbeat_checkpoint_name(self) -> str:
+        return self._checkpoint_name("daemon_heartbeat")
 
     async def _recover_orphaned_rooms(self) -> None:
         async with self.session_factory() as session:
@@ -149,7 +171,7 @@ class DaemonService:
                 kalshi_env=self.settings.kalshi_env,
             )
             await repo.set_checkpoint(
-                f"daemon_reconcile:{self.settings.kalshi_env}:{self.settings.app_color}",
+                self._reconcile_checkpoint_name(),
                 None,
                 {
                     "reconciled_at": self._now_iso(),
@@ -190,10 +212,12 @@ class DaemonService:
             "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
             "crypto_history_auto_enabled": self.settings.crypto_history_auto_enabled,
             "crypto_quote_evidence_enabled": self.settings.crypto_quote_evidence_enabled,
+            "crypto_auto_frequencies": enabled_crypto_frequencies(self.settings),
             "crypto_spot_current_auto_enabled": self.settings.crypto_spot_current_auto_enabled,
             "crypto_spot_current_interval_seconds": self.settings.crypto_spot_current_interval_seconds,
             "crypto_spot_history_auto_enabled": self.settings.crypto_spot_history_auto_enabled,
             "heartbeat_at": self._now_iso(),
+            "daemon_role": self._heartbeat_role,
         }
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -217,11 +241,9 @@ class DaemonService:
                 source="daemon",
                 payload=payload,
             )
-            last_reconcile = await repo.get_checkpoint(
-                f"daemon_reconcile:{self.settings.kalshi_env}:{self.settings.app_color}"
-            )
+            last_reconcile = await repo.get_checkpoint(self._reconcile_checkpoint_name())
             await repo.set_checkpoint(
-                f"daemon_heartbeat:{self.settings.kalshi_env}:{self.settings.app_color}",
+                self._heartbeat_checkpoint_name(),
                 None,
                 {
                     **payload,
@@ -250,15 +272,14 @@ class DaemonService:
             "heartbeat_at": self._now_iso(),
             "lightweight": True,
             "reason": reason,
+            "daemon_role": self._heartbeat_role,
         }
         if details is not None:
             payload["details"] = details
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
-            last_reconcile = await repo.get_checkpoint(
-                f"daemon_reconcile:{self.settings.kalshi_env}:{self.settings.app_color}"
-            )
+            last_reconcile = await repo.get_checkpoint(self._reconcile_checkpoint_name())
             payload.update(
                 {
                     "active_color": control.active_color,
@@ -271,7 +292,7 @@ class DaemonService:
                 }
             )
             await repo.set_checkpoint(
-                f"daemon_heartbeat:{self.settings.kalshi_env}:{self.settings.app_color}",
+                self._heartbeat_checkpoint_name(),
                 None,
                 payload,
             )
@@ -286,7 +307,17 @@ class DaemonService:
         auto_trigger: bool | None = None,
         max_messages: int | None = None,
         run_seconds: float | None = None,
+        crypto_only: bool = False,
+        heartbeat_role: str | None = None,
     ) -> dict[str, Any]:
+        previous_heartbeat_role = self._heartbeat_role
+        self._heartbeat_role = self._normalize_heartbeat_role(heartbeat_role or ("crypto" if crypto_only else "daemon"))
+        if crypto_only:
+            try:
+                return await self._run_crypto_only(run_seconds=run_seconds)
+            finally:
+                self._heartbeat_role = previous_heartbeat_role
+
         should_auto_trigger = self.settings.trigger_enable_auto_rooms if auto_trigger is None else auto_trigger
         self._auto_trigger_enabled_for_run = should_auto_trigger
 
@@ -384,6 +415,62 @@ class DaemonService:
                 follow_up_task.cancel()
                 await asyncio.gather(follow_up_task, return_exceptions=True)
             self._stop_threaded_liveness_heartbeat()
+            self._heartbeat_role = previous_heartbeat_role
+
+    async def _run_crypto_only(self, *, run_seconds: float | None = None) -> dict[str, Any]:
+        tasks: dict[str, asyncio.Task] = {}
+        try:
+            await self.heartbeat_once(run_follow_up=False)
+            if run_seconds is None:
+                self._start_threaded_liveness_heartbeat()
+            tasks["heartbeat"] = asyncio.create_task(self._periodic_heartbeat_loop())
+
+            startup_delay = self._startup_delay_seconds()
+            if startup_delay > 0:
+                logger.info(
+                    "Crypto-only daemon startup warmup delaying work for %.1f seconds env=%s color=%s role=%s",
+                    startup_delay,
+                    self.settings.kalshi_env,
+                    self.settings.app_color,
+                    self._heartbeat_role,
+                )
+                await asyncio.sleep(startup_delay)
+
+            await self.heartbeat_once(run_follow_up=False)
+            tasks.update(
+                {
+                    "crypto_quote_evidence": asyncio.create_task(self._periodic_crypto_quote_evidence_loop()),
+                    "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
+                    "crypto_spot_current": asyncio.create_task(self._periodic_crypto_spot_current_loop()),
+                    "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
+                    "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
+                }
+            )
+            if run_seconds is not None:
+                tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
+
+            done, pending = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
+            completed_name = next(name for name, task in tasks.items() if task in done)
+            done_task = tasks[completed_name]
+            exc = None if done_task.cancelled() else done_task.exception()
+            if exc is not None:
+                raise exc
+
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            return {
+                "completed": completed_name,
+                "mode": "crypto_only",
+                "daemon_role": self._heartbeat_role,
+                "crypto_auto_frequencies": enabled_crypto_frequencies(self.settings),
+            }
+        finally:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            self._stop_threaded_liveness_heartbeat()
 
     def _start_threaded_liveness_heartbeat(self) -> None:
         if self._threaded_liveness_thread is not None and self._threaded_liveness_thread.is_alive():
@@ -394,7 +481,7 @@ class DaemonService:
         thread = threading.Thread(
             target=self._threaded_liveness_heartbeat_loop,
             args=(stop_event,),
-            name=f"daemon-liveness-{self.settings.kalshi_env}-{self.settings.app_color}",
+            name=f"daemon-liveness-{self.settings.kalshi_env}-{self.settings.app_color}-{self._heartbeat_role}",
             daemon=True,
         )
         self._threaded_liveness_stop = stop_event
@@ -437,6 +524,7 @@ class DaemonService:
             "lightweight": True,
             "threaded": True,
             "reason": reason,
+            "daemon_role": self._heartbeat_role,
         }
         if details is not None:
             payload["details"] = details
@@ -447,9 +535,7 @@ class DaemonService:
             async with session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                 control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
-                last_reconcile = await repo.get_checkpoint(
-                    f"daemon_reconcile:{self.settings.kalshi_env}:{self.settings.app_color}"
-                )
+                last_reconcile = await repo.get_checkpoint(self._reconcile_checkpoint_name())
                 payload.update(
                     {
                         "active_color": control.active_color,
@@ -462,7 +548,7 @@ class DaemonService:
                     }
                 )
                 await repo.set_checkpoint(
-                    f"daemon_heartbeat:{self.settings.kalshi_env}:{self.settings.app_color}",
+                    self._heartbeat_checkpoint_name(),
                     None,
                     payload,
                 )
@@ -745,7 +831,8 @@ class DaemonService:
                 await asyncio.sleep(idle_interval)
                 continue
             try:
-                await self.crypto_autonomy_service.run_once(frequency="15m")
+                for frequency in enabled_crypto_frequencies(self.settings):
+                    await self.crypto_autonomy_service.run_once(frequency=frequency)
             except Exception:
                 logger.warning("crypto autonomy loop error", exc_info=True)
             await asyncio.sleep(0)
@@ -763,14 +850,15 @@ class DaemonService:
             return
         if not await self._is_active_color():
             return
-        await self.crypto_history_service.collect_settled(
-            days=self.settings.crypto_history_auto_lookback_days,
-            frequency="15m",
-        )
-        await self.crypto_history_service.bootstrap(
-            days=self.settings.crypto_history_auto_lookback_days,
-            frequency="15m",
-        )
+        for frequency in enabled_crypto_frequencies(self.settings):
+            await self.crypto_history_service.collect_settled(
+                days=self.settings.crypto_history_auto_lookback_days,
+                frequency=frequency,
+            )
+            await self.crypto_history_service.bootstrap(
+                days=self.settings.crypto_history_auto_lookback_days,
+                frequency=frequency,
+            )
 
     async def _periodic_crypto_quote_evidence_loop(self) -> None:
         while True:
@@ -780,7 +868,8 @@ class DaemonService:
             if not await self._is_active_color():
                 continue
             try:
-                await self.crypto_history_service.collect_open(frequency="15m")
+                for frequency in enabled_crypto_frequencies(self.settings):
+                    await self.crypto_history_service.collect_open(frequency=frequency)
             except Exception:
                 logger.warning("crypto quote evidence loop error", exc_info=True)
 
@@ -790,7 +879,8 @@ class DaemonService:
             if self.crypto_spot_service is not None and self.settings.crypto_spot_current_auto_enabled:
                 if await self._is_active_color():
                     try:
-                        await self.crypto_spot_service.collect_current(frequency="15m")
+                        for frequency in enabled_crypto_frequencies(self.settings):
+                            await self.crypto_spot_service.collect_current(frequency=frequency)
                     except Exception:
                         logger.warning("crypto current spot loop error", exc_info=True)
             await asyncio.sleep(interval)
@@ -803,10 +893,11 @@ class DaemonService:
             if not await self._is_active_color():
                 continue
             try:
-                await self.crypto_spot_service.backfill(
-                    days=self.settings.crypto_spot_history_auto_lookback_days,
-                    frequency="15m",
-                )
+                for frequency in enabled_crypto_frequencies(self.settings):
+                    await self.crypto_spot_service.backfill(
+                        days=self.settings.crypto_spot_history_auto_lookback_days,
+                        frequency=frequency,
+                    )
             except Exception:
                 logger.warning("crypto spot history loop error", exc_info=True)
 

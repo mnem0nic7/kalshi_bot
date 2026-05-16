@@ -9,7 +9,9 @@ spot_days="2"
 replay_days="30"
 out_dir="reports/crypto_live_path"
 docker_container="${DOCKER_CONTAINER:-}"
-assets=(BTC ETH SOL XRP BNB DOGE HYPE)
+static_assets=(BTC ETH SOL XRP BNB DOGE HYPE)
+assets=()
+discover_assets=true
 
 usage() {
   cat <<'USAGE'
@@ -22,7 +24,7 @@ Options:
   --history-days <days>                Kalshi history bootstrap window. Default: 2.
   --spot-days <days>                   Spot backfill window. Default: 2.
   --replay-days <days>                 Replay window. Default: 30.
-  --assets <ASSET...>                  Assets to refresh. Default: BTC ETH SOL XRP BNB DOGE HYPE.
+  --assets <ASSET...>                  Assets to refresh. Omit or use "all" to discover current assets.
   --out-dir <path>                     Report output directory. Default: reports/crypto_live_path.
   --docker-container <name>            Run the CLI inside this Docker container.
   -h, --help                           Show this help.
@@ -76,6 +78,15 @@ while [[ $# -gt 0 ]]; do
         echo "--assets requires at least one asset" >&2
         exit 2
       fi
+      discover_assets=false
+      for asset in "${assets[@]}"; do
+        normalized="$(printf '%s' "${asset}" | tr '[:lower:]' '[:upper:]')"
+        if [[ "${normalized}" == "ALL" || "${normalized}" == "*" ]]; then
+          assets=()
+          discover_assets=true
+          break
+        fi
+      done
       ;;
     -h|--help)
       usage
@@ -95,6 +106,47 @@ if [[ -n "${docker_container}" ]]; then
   cli=(docker exec -i "${docker_container}" python -m kalshi_bot.cli)
 else
   read -r -a cli <<< "${CLI:-kalshi-bot-cli}"
+fi
+
+discover_current_assets() {
+  python -c '
+import json
+import sys
+
+text = sys.stdin.read()
+decoder = json.JSONDecoder()
+idx = 0
+found = None
+while idx < len(text):
+    while idx < len(text) and text[idx].isspace():
+        idx += 1
+    if idx >= len(text):
+        break
+    try:
+        obj, end = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+    if isinstance(obj, dict) and isinstance(obj.get("modes"), dict):
+        found = obj
+    idx = end
+if found is None:
+    raise SystemExit("asset discovery did not return modes")
+print(" ".join(sorted(str(asset).upper() for asset in found["modes"].keys() if str(asset).strip())))
+'
+}
+
+if [[ "${discover_assets}" == "true" ]]; then
+  discovery_log="${out_dir}/${kalshi_env}_${frequency}_asset_discovery.log"
+  if discovery_output="$("${cli[@]}" crypto-asset-mode list --kalshi-env "${kalshi_env}" --frequency "${frequency}" 2>"${discovery_log}")" \
+    && discovered_text="$(printf '%s' "${discovery_output}" | discover_current_assets)" \
+    && [[ -n "${discovered_text}" ]]; then
+    read -r -a assets <<< "${discovered_text}"
+    echo "discovered ${#assets[@]} ${frequency} asset(s): ${assets[*]}" >&2
+  else
+    assets=("${static_assets[@]}")
+    echo "asset discovery failed or returned no assets; falling back to: ${assets[*]}" >&2
+  fi
 fi
 
 status=0

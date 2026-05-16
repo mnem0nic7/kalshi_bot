@@ -16,9 +16,12 @@ from:
 
 ## Scope
 
-The active crypto strategy is `CRYPTO_15M`.
+The active crypto strategies are `CRYPTO_15M` and `CRYPTO_1H`. The hourly path
+uses the same training, replay, risk, asset-mode, and execution gates as the
+15-minute path, but ongoing hourly collection should run in the dedicated
+crypto-only 1h daemon with `CRYPTO_AUTO_FREQUENCIES=1h`.
 
-It trades Kalshi 15-minute crypto markets for these asset families:
+It trades Kalshi crypto markets for these asset families:
 
 - `KXBTC15M*` for BTC
 - `KXETH15M*` for ETH
@@ -27,6 +30,9 @@ It trades Kalshi 15-minute crypto markets for these asset families:
 - `KXDOGE15M*` for DOGE
 - `KXBNB15M*` for BNB
 - `KXHYPE15M*` for HYPE
+- hourly range/directional series such as `KXBTC*`, `KXBTCD*`, `KXETH*`,
+  `KXETHD*`, `KXSOLE*`, `KXSOLD*`, `KXXRP*`, `KXXRPD*`, `KXDOGE*`,
+  `KXDOGED*`, `KXBNB*`, `KXBNBD*`, `KXHYPE*`, and `KXHYPED*`.
 
 The main runtime modes are:
 
@@ -59,7 +65,8 @@ A production crypto fill requires all of the following:
 3. The runtime `app_color` is the active deployment color.
 4. Kalshi write credentials are present.
 5. `crypto_enabled` is true.
-6. `crypto_15m_enabled` is true.
+6. The frequency switch is true: `crypto_15m_enabled` for 15-minute markets or
+   `crypto_1h_enabled` for hourly markets.
 7. Crypto live trading is enabled by settings or the active agent pack.
 8. The asset mode is `live`.
 9. In production, the deployment-control asset mode is explicitly `live`.
@@ -77,6 +84,8 @@ command and environment.
 | --- | ---: | --- |
 | `crypto_enabled` | `True` | Master crypto feature switch. Turning this off blocks crypto workflow behavior. |
 | `crypto_15m_enabled` | `True` | Enables the 15-minute crypto strategy family. |
+| `crypto_1h_enabled` | `True` | Enables the 1-hour crypto strategy family. |
+| `crypto_auto_frequencies` | `15m` | Frequencies the daemon loops collect automatically; include `1h` to collect hourly evidence. |
 | `crypto_trading_enabled` | `False` | Global live-trading switch. The active agent pack can also set `crypto_policy.live.trading_enabled`. |
 | `crypto_autonomy_enabled` | `False` | Allows crypto autonomy outside production-specific live enablement. Useful for scheduled room creation and evidence generation. |
 | `crypto_production_autonomy_enabled` | `False` | Allows production crypto autonomy. The active agent pack can also set `crypto_policy.live.production_autonomy_enabled`. |
@@ -185,7 +194,7 @@ but it does not make a `live_quality` candidate.
 | Setting or CLI flag | Current default | Effect |
 | --- | ---: | --- |
 | `crypto_min_training_samples` | `250` | Minimum training sample count expected by crypto model training. |
-| `crypto-model train --assets` | `None` | Limits training to selected assets. If omitted, trains configured/default assets. |
+| `crypto-model train --assets` | `None` | Limits training to selected assets. If omitted, trains all available rows for the requested frequency. |
 | `crypto-model candidates --days` | `30` | Candidate-analysis lookback. |
 | `crypto-model candidates --assets` | `None` | Limits candidate analysis to selected assets. |
 
@@ -485,7 +494,7 @@ General risk settings affect crypto live entries.
 | `risk_max_order_notional_dollars` | `None` | Optional hard dollar cap per order. |
 | `risk_max_position_notional_dollars` | `None` | Optional hard dollar cap per position. |
 | `risk_daily_loss_limit_dollars` | `None` | Optional hard dollar daily-loss cap. |
-| `risk_daily_loss_dollars_by_strategy` | `{}` | Optional per-strategy daily-loss cap. Use key `CRYPTO_15M` for crypto. |
+| `risk_daily_loss_dollars_by_strategy` | `{}` | Optional per-strategy daily-loss cap. Use keys `CRYPTO_15M` and `CRYPTO_1H` for crypto. |
 | `risk_edge_scaled_sizing_enabled` | `False` | Enables edge-scaled sizing. Still bounded by existing caps. |
 | `risk_edge_scaled_kelly_multiplier` | `0.25` | Fractional-Kelly multiplier when edge-scaled sizing is enabled. |
 | `crypto_dynamic_order_sizing_enabled` | `True` | Enables crypto-specific dynamic initial ticket sizing. |
@@ -507,7 +516,7 @@ General risk settings affect crypto live entries.
 
 Crypto dynamic sizing:
 
-- Applies to accepted `CRYPTO_15M` candidates only when candidate status is
+- Applies to accepted crypto candidates only when candidate status is
   `live_quality`.
 - Unit cost is YES price for YES tickets and `1 - yes_price` for NO tickets.
 - Target notional is `total_capital * min(crypto_dynamic_order_target_position_pct, risk_position_pct)`.
@@ -532,7 +541,7 @@ Crypto-specific add-on settings:
 
 Crypto add-ons require all of these:
 
-- Strategy is `CRYPTO_15M`.
+- Strategy is `CRYPTO_15M` or `CRYPTO_1H`.
 - Asset is allowed by `crypto_position_add_on_assets`.
 - There is an existing same-side position.
 - Candidate is `live_quality`.
@@ -545,6 +554,9 @@ Crypto add-ons require all of these:
 ## Live Path and Readiness Knobs
 
 The live-path command is the fastest way to see what is still blocking an asset.
+When `--assets` is omitted or set to `all`, it discovers open Kalshi crypto
+assets for the requested frequency and falls back to the static crypto asset set
+only if discovery fails or returns empty.
 
 | CLI flag | Current default | Effect |
 | --- | ---: | --- |
@@ -561,10 +573,16 @@ The live-path command is the fastest way to see what is still blocking an asset.
 | `crypto-live-path refresh --max-iterations` | `1` | Max refresh loops. |
 | `crypto-live-path refresh --sleep-seconds` | `0.0` | Sleep between refresh loops. |
 
+For 1h, use `--assets all` or omit `--assets` so newly listed hourly assets
+enter evidence collection automatically. The daily 1h refresh container defaults
+to seven-day settled/history/spot windows because hourly settlements accumulate
+four times slower than 15-minute settlements.
+
 Commands:
 
 ```bash
 python -m kalshi_bot.cli crypto-live-path status --kalshi-env production --frequency 15m --json
+python -m kalshi_bot.cli crypto-live-path status --kalshi-env production --frequency 1h --assets all --json
 python -m kalshi_bot.cli crypto-live-path status --kalshi-env production --frequency 15m --assets BTC --require-ready --json
 python -m kalshi_bot.cli crypto-live-path refresh --kalshi-env production --frequency 15m --assets BTC --json
 ```
@@ -618,13 +636,13 @@ Use this order when changing crypto trading behavior:
 1. Check readiness and blockers.
 
    ```bash
-   python -m kalshi_bot.cli crypto-live-path status --kalshi-env production --frequency 15m --json
+   python -m kalshi_bot.cli crypto-live-path status --kalshi-env production --frequency 15m --assets all --json
    ```
 
 2. Refresh market and spot evidence.
 
    ```bash
-   python -m kalshi_bot.cli crypto-live-path refresh --kalshi-env production --frequency 15m --json
+   python -m kalshi_bot.cli crypto-live-path refresh --kalshi-env production --frequency 15m --assets all --json
    ```
 
 3. Train or retrain the model if the data changed materially.

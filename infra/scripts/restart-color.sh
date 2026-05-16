@@ -95,10 +95,14 @@ build_app_image
 for env_name in "${envs[@]}"; do
   app_service="app_${env_name}_${color}"
   daemon_service="daemon_${env_name}_${color}"
-  docker compose -f "${compose_file}" ${compose_env_file} stop "${app_service}" "${daemon_service}" 2>/dev/null || true
-  docker compose -f "${compose_file}" ${compose_env_file} rm -f "${app_service}" "${daemon_service}" 2>/dev/null || true
+  runtime_services=("${app_service}" "${daemon_service}")
+  if [[ "${env_name}" == "production" && "${ENABLE_CRYPTO_1H_DAEMON:-false}" == "true" ]]; then
+    runtime_services+=("daemon_production_crypto_1h_${color}")
+  fi
+  docker compose -f "${compose_file}" ${compose_env_file} stop "${runtime_services[@]}" 2>/dev/null || true
+  docker compose -f "${compose_file}" ${compose_env_file} rm -f "${runtime_services[@]}" 2>/dev/null || true
   docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps \
-    "${app_service}" "${daemon_service}"
+    "${runtime_services[@]}"
   wait_for_service_health "${app_service}" 180
 done
 

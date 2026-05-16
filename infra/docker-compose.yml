@@ -324,6 +324,81 @@ services:
       retries: 3
       start_period: 120s
 
+  daemon_production_crypto_1h_blue:
+    <<: *production-daemon-base
+    command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
+    environment:
+      <<: *production-env
+      KALSHI_ENV: production
+      APP_COLOR: blue
+      DAEMON_HEARTBEAT_ROLE: crypto_1h
+      CRYPTO_AUTO_FREQUENCIES: "1h"
+      CRYPTO_1H_ENABLED: ${CRYPTO_1H_ENABLED:-true}
+      CRYPTO_HISTORY_AUTO_LOOKBACK_DAYS: ${CRYPTO_1H_HISTORY_DAYS:-7}
+      CRYPTO_SPOT_HISTORY_AUTO_LOOKBACK_DAYS: ${CRYPTO_1H_SPOT_DAYS:-7}
+      CRYPTO_AUTONOMY_ENABLED: ${PRODUCTION_CRYPTO_1H_AUTONOMY_ENABLED:-false}
+      CRYPTO_PRODUCTION_AUTONOMY_ENABLED: ${PRODUCTION_CRYPTO_1H_PRODUCTION_AUTONOMY_ENABLED:-false}
+      CRYPTO_TRADING_ENABLED: ${PRODUCTION_CRYPTO_1H_TRADING_ENABLED:-false}
+    healthcheck:
+      test: ["CMD", "python", "-m", "kalshi_bot.docker_healthcheck", "daemon"]
+      interval: 60s
+      timeout: 60s
+      retries: 3
+      start_period: 120s
+
+  daemon_production_crypto_1h_green:
+    <<: *production-daemon-base
+    command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
+    environment:
+      <<: *production-env
+      KALSHI_ENV: production
+      APP_COLOR: green
+      DAEMON_HEARTBEAT_ROLE: crypto_1h
+      CRYPTO_AUTO_FREQUENCIES: "1h"
+      CRYPTO_1H_ENABLED: ${CRYPTO_1H_ENABLED:-true}
+      CRYPTO_HISTORY_AUTO_LOOKBACK_DAYS: ${CRYPTO_1H_HISTORY_DAYS:-7}
+      CRYPTO_SPOT_HISTORY_AUTO_LOOKBACK_DAYS: ${CRYPTO_1H_SPOT_DAYS:-7}
+      CRYPTO_AUTONOMY_ENABLED: ${PRODUCTION_CRYPTO_1H_AUTONOMY_ENABLED:-false}
+      CRYPTO_PRODUCTION_AUTONOMY_ENABLED: ${PRODUCTION_CRYPTO_1H_PRODUCTION_AUTONOMY_ENABLED:-false}
+      CRYPTO_TRADING_ENABLED: ${PRODUCTION_CRYPTO_1H_TRADING_ENABLED:-false}
+    healthcheck:
+      test: ["CMD", "python", "-m", "kalshi_bot.docker_healthcheck", "daemon"]
+      interval: 60s
+      timeout: 60s
+      retries: 3
+      start_period: 120s
+
+  crypto_1h_production:
+    <<: *production-daemon-base
+    command:
+      - bash
+      - -lc
+      - |
+        while true; do
+          echo "starting 1h crypto live-path refresh" >&2
+          if ! scripts/crypto_live_path_refresh.sh \
+            --kalshi-env production \
+            --frequency 1h \
+            --settled-days "${CRYPTO_1H_SETTLED_DAYS:-7}" \
+            --history-days "${CRYPTO_1H_HISTORY_DAYS:-7}" \
+            --spot-days "${CRYPTO_1H_SPOT_DAYS:-7}" \
+            --replay-days "${CRYPTO_1H_REPLAY_DAYS:-30}" \
+            --out-dir "${CRYPTO_1H_REPORT_DIR:-/app/data/training/reports/crypto_live_path/1h}"; then
+            echo "1h crypto live-path refresh failed" >&2
+          fi
+          sleep "${CRYPTO_1H_REFRESH_INTERVAL_SECONDS:-86400}"
+        done
+    environment:
+      <<: *production-env
+      KALSHI_ENV: production
+      APP_COLOR: ${CRYPTO_1H_APP_COLOR:-blue}
+      CLI: ${CRYPTO_1H_CLI:-python -m kalshi_bot.cli}
+      CRYPTO_AUTO_FREQUENCIES: "1h"
+      CRYPTO_1H_ENABLED: ${CRYPTO_1H_ENABLED:-true}
+      CRYPTO_AUTONOMY_ENABLED: ${PRODUCTION_CRYPTO_1H_AUTONOMY_ENABLED:-false}
+      CRYPTO_PRODUCTION_AUTONOMY_ENABLED: ${PRODUCTION_CRYPTO_1H_PRODUCTION_AUTONOMY_ENABLED:-false}
+      CRYPTO_TRADING_ENABLED: ${PRODUCTION_CRYPTO_1H_TRADING_ENABLED:-false}
+
   web_demo:
     <<: *demo-app-base
     environment:

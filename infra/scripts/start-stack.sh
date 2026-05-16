@@ -97,9 +97,18 @@ fi
 if [[ "${migrate_status}" -ne 0 ]]; then
   exit "${migrate_status}"
 fi
-docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build \
-  app_demo_blue app_demo_green daemon_demo_blue daemon_demo_green \
+runtime_services=(
+  app_demo_blue app_demo_green daemon_demo_blue daemon_demo_green
   app_production_blue app_production_green daemon_production_blue daemon_production_green
+)
+if [[ "${ENABLE_CRYPTO_1H_CONTAINER:-false}" == "true" ]]; then
+  runtime_services+=(crypto_1h_production)
+fi
+if [[ "${ENABLE_CRYPTO_1H_DAEMON:-false}" == "true" ]]; then
+  runtime_services+=(daemon_production_crypto_1h_blue daemon_production_crypto_1h_green)
+fi
+docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build \
+  "${runtime_services[@]}"
 wait_for_services_health 180 \
   app_demo_blue app_demo_green app_production_blue app_production_green
 infra/scripts/sync-web-color.sh all

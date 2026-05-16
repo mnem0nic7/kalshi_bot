@@ -1,6 +1,6 @@
 # Crypto Trading Strategy
 
-Last updated: 2026-05-14
+Last updated: 2026-05-16
 
 This document is the operator-facing summary of the crypto trading system: what
 we trade, which strategy is active, which gates must pass before an order can go
@@ -9,9 +9,9 @@ mode.
 
 ## Executive Summary
 
-The active crypto strategy is **CRYPTO_15M**: deterministic trading on Kalshi
-15-minute crypto markets using live Kalshi quotes, spot/candle evidence, a
-per-asset prediction model, and a fee-aware candidate selector.
+The active crypto strategies are **CRYPTO_15M** and **CRYPTO_1H**: deterministic
+trading on Kalshi crypto markets using live Kalshi quotes, spot/candle evidence,
+a per-asset prediction model, and a fee-aware candidate selector.
 
 Crypto is not a single global live switch. It is promoted per asset. BTC can be
 approved without approving ETH, and deployment-note asset mode `off` wins over
@@ -26,7 +26,8 @@ own replay, P/L, and asset-mode gates pass.
 | Strategy | Status | Description | Live eligibility |
 |---|---:|---|---|
 | `CRYPTO_15M` live-quality | Active shadow | Predict fair YES for 15-minute crypto markets and select the best fee-adjusted YES/NO buy candidate. | Per-asset live only after replay, asset-mode, risk, and execution gates pass. |
-| `CRYPTO_15M` exploratory shadow | Active shadow | Collect candidate and quote evidence even when live edge is not present. | Never live eligible; evidence only. |
+| `CRYPTO_1H` live-quality | Active shadow | Predict fair YES for 1-hour crypto markets and select the best fee-adjusted YES/NO buy candidate. | Same per-asset live gates as `CRYPTO_15M`; ongoing collection runs in the crypto-only 1h daemon with `CRYPTO_AUTO_FREQUENCIES=1h`. |
+| Crypto exploratory shadow | Active shadow | Collect candidate and quote evidence even when live edge is not present. | Never live eligible; evidence only. |
 | Per-asset policy promotion | Active control path | Stage asset-specific crypto policy in the active agent pack. | One asset at a time after live-path readiness passes. |
 | Crypto market making | Out of scope | Posting two-sided liquidity. | Not supported. |
 | Spot/perp trading | Out of scope | Trading on external crypto venues. | Not supported. |
@@ -36,7 +37,7 @@ Only `live_quality` candidates can reach live execution.
 
 ## Market Scope
 
-Crypto trading only applies to Kalshi 15-minute crypto markets such as:
+Crypto trading applies to Kalshi 15-minute and 1-hour crypto markets such as:
 
 - `KXBTC15M*`
 - `KXETH15M*`
@@ -494,7 +495,7 @@ Read crypto live-path status:
 kalshi-bot-cli crypto-live-path status \
   --kalshi-env production \
   --frequency 15m \
-  --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --assets all \
   --baselines \
   --json
 ```
@@ -509,9 +510,12 @@ scripts/crypto_live_path_refresh.sh \
   --history-days 2 \
   --spot-days 2 \
   --replay-days 30 \
-  --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --assets all \
   --docker-container infra-app_production_blue-1
 ```
+
+Omit `--assets` or use `--assets all` to discover open Kalshi crypto assets for
+the requested frequency. Explicit asset lists remain exact.
 
 Repair recent settlement labels directly:
 
@@ -520,7 +524,7 @@ kalshi-bot-cli crypto-history collect-settled \
   --kalshi-env production \
   --frequency 15m \
   --days 2 \
-  --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --assets BTC \
   --json
 ```
 

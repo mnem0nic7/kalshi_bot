@@ -41,7 +41,7 @@ Always migrate before live promotion.
 
 ## Fast deploys
 
-Use `infra/scripts/restart-color.sh <demo|production> <blue|green>` for the normal app deploy path. It builds the shared Python image once, recreates only the requested env/color app and daemon, refreshes the matching web surface plus `web_strategies`, and leaves Caddy alone.
+Use `infra/scripts/restart-color.sh <demo|production> <blue|green>` for the normal app deploy path. It builds the shared Python image once, recreates only the requested env/color app and daemon, recreates the matching production 1h crypto daemon when `ENABLE_CRYPTO_1H_DAEMON=true`, refreshes the matching web surface plus `web_strategies`, and leaves Caddy alone.
 
 Use `infra/scripts/restart-color.sh --refresh-caddy <demo|production|all> <blue|green>` only when Caddy routing/config also changed. Use `infra/scripts/start-stack.sh` for full host recovery; it still brings up both environments and runs both migration services.
 
@@ -61,7 +61,7 @@ Crypto autonomous gating now follows the same runtime source of truth as weather
 kalshi-bot-cli autonomous-gates status --kalshi-env production --domain all --format json
 ```
 
-Crypto policy is separate from weather thresholds and promotes per asset. A BTC candidate can stage, canary, and promote without changing ETH. Deployment-note asset mode `off`, inactive color, app shadow mode, missing write credentials, kill switch, disabled `crypto_enabled`/`crypto_15m_enabled`, replay-gate failure, stale data, position caps, and risk caps remain hard blockers.
+Crypto policy is separate from weather thresholds and promotes per asset. A BTC candidate can stage, canary, and promote without changing ETH. Deployment-note asset mode `off`, inactive color, app shadow mode, missing write credentials, kill switch, disabled `crypto_enabled`/frequency switches, replay-gate failure, stale data, position caps, and risk caps remain hard blockers.
 
 ## Crypto Live Path
 
@@ -73,10 +73,15 @@ Read-only status:
 kalshi-bot-cli crypto-live-path status \
   --kalshi-env production \
   --frequency 15m \
-  --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --assets all \
   --baselines \
   --json
 ```
+
+When `--assets` is omitted or set to `all`, `crypto-live-path` discovers open
+Kalshi crypto assets for the requested frequency and reports the resolution in
+`asset_discovery`. Static assets are used only as a fallback if discovery fails
+or returns empty. Explicit asset lists remain exact and bypass discovery.
 
 Evidence refresh loop:
 
@@ -89,10 +94,35 @@ scripts/crypto_live_path_refresh.sh \
   --history-days 2 \
   --spot-days 2 \
   --replay-days 30 \
-  --assets BTC ETH SOL XRP BNB DOGE HYPE
+  --assets all
 ```
 
-The script runs one CLI process per asset so model and replay memory is released between assets. Each refresh collects open real-quote snapshots, backfills recent settled labels with `crypto-history collect-settled`, refreshes historical/candle context, refreshes spot, trains, replays, and gates. On the host, set `POSTGRES_PORT=5433` for production because demo uses the default `5432` mapping. It writes per-asset JSON reports and stderr logs under `reports/crypto_live_path/`.
+The script discovers assets by default and still runs one CLI process per asset so model and replay memory is released between assets. Each refresh collects open real-quote snapshots, backfills recent settled labels with `crypto-history collect-settled`, refreshes historical/candle context, refreshes spot, trains, replays, and gates. On the host, set `POSTGRES_PORT=5433` for production because demo uses the default `5432` mapping. It writes per-asset JSON reports and stderr logs under `reports/crypto_live_path/`.
+
+For initial 1-hour catch-up, use a wider evidence window:
+
+```bash
+CLI="env PYTHONPATH=src POSTGRES_PORT=5433 APP_SHADOW_MODE=false .venv/bin/python -m kalshi_bot.cli" \
+scripts/crypto_live_path_refresh.sh \
+  --kalshi-env production \
+  --frequency 1h \
+  --settled-days 30 \
+  --history-days 30 \
+  --spot-days 30 \
+  --replay-days 30 \
+  --assets all
+```
+
+After a clean manual catch-up, `ENABLE_CRYPTO_1H_CONTAINER=true` starts the
+dedicated daily 1h refresh container. `ENABLE_CRYPTO_1H_DAEMON=true` starts the
+blue/green crypto-only 1h daemon pair with `CRYPTO_AUTO_FREQUENCIES=1h`. The
+1h daemon writes heartbeat checkpoints such as
+`daemon_heartbeat:production:blue:crypto_1h`, separate from the main daemon.
+Fast color redeploys recreate the matching crypto-only daemon when
+`ENABLE_CRYPTO_1H_DAEMON=true`; use `start-stack.sh` after first enabling the
+flag so both blue and green 1h daemon services are created.
+The 1h trading switches remain off by default; keep them off until per-asset
+readiness and promotion are intentional.
 
 Manual settled-label repair:
 
@@ -101,11 +131,14 @@ kalshi-bot-cli crypto-history collect-settled \
   --kalshi-env production \
   --frequency 15m \
   --days 2 \
-  --assets BTC ETH SOL XRP BNB DOGE HYPE \
+  --assets BTC \
   --json
 ```
 
-Use `--days 14` or `--days 30` only for catch-up sweeps. The normal refresh loop intentionally keeps the settled backfill window small.
+Use direct settled-label repair for targeted assets. Use the refresh script for
+discovered all-asset sweeps. Use `--days 14` or `--days 30` only for catch-up
+sweeps. The normal 15m refresh loop intentionally keeps the settled backfill
+window small; 1h incremental refreshes should use a larger 5-7 day window.
 
 Per asset readiness requires at least 60 strict labeled real-quote rows, at least 50 out-of-sample replay trade candidates, at least 50 current-model live-quality candidates, a passing replay gate, positive fee-adjusted simulated net P/L that beats the market-mid P/L baseline, at least 80% spot coverage, and fresh non-proxy spot data. Calibration versus market-mid remains a diagnostic, not a hard promotion gate. Keep BNB and HYPE shadow until their spot support is fresh and non-proxy.
 

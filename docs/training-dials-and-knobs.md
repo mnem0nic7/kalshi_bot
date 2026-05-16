@@ -590,8 +590,8 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `crypto-asset-mode list --kalshi-env --frequency` | Lists per-asset modes. |
 | `crypto-asset-mode set --kalshi-env SYMBOL off|shadow|live` | Overrides one asset mode. |
 | `crypto-policy optimize --kalshi-env --frequency --days --assets` | Optimizes crypto runtime policy from replay evidence. |
-| `crypto-live-path status --kalshi-env --frequency --assets --status-days --strict-rows-target --candidate-target --require-ready --baselines` | Readiness report for default assets `BTC,ETH,SOL,XRP,BNB,DOGE,HYPE`; defaults are `14` status days, `60` strict rows, and `50` trade candidates. |
-| `crypto-live-path refresh --kalshi-env --frequency --assets --settled-days --history-days --spot-days --replay-days --until-ready --max-iterations --sleep-seconds` | Runs history, spot, replay, and gate refresh loop toward live readiness. |
+| `crypto-live-path status --kalshi-env --frequency --assets --status-days --strict-rows-target --candidate-target --require-ready --baselines` | Readiness report for explicit assets, or discovered frequency-scoped assets when `--assets` is omitted or `all`; defaults are `14` status days, `60` strict rows, and `50` trade candidates. |
+| `crypto-live-path refresh --kalshi-env --frequency --assets --settled-days --history-days --spot-days --replay-days --until-ready --max-iterations --sleep-seconds` | Runs history, spot, replay, and gate refresh loop toward live readiness; omitted assets and `--assets all` use discovery. |
 
 ### Crypto Settings
 
@@ -599,6 +599,8 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | --- | --- | --- |
 | `CRYPTO_ENABLED` | `true` | Enables crypto domain. |
 | `CRYPTO_15M_ENABLED` | `true` | Enables 15-minute crypto markets. |
+| `CRYPTO_1H_ENABLED` | `true` | Enables 1-hour crypto markets. |
+| `CRYPTO_AUTO_FREQUENCIES` | `15m` | Frequencies collected by daemon crypto loops; the dedicated 1h daemon sets this to `1h`. |
 | `CRYPTO_TRADING_ENABLED` | `false` | Allows crypto trading path. |
 | `CRYPTO_HISTORY_LOOKBACK_DAYS` | `180` | Default history lookback. |
 | `CRYPTO_MIN_TRAINING_SAMPLES` | `250` | Minimum rows for trained crypto model status. |

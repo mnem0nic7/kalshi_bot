@@ -30,6 +30,18 @@ def daemon_threshold_components() -> dict[str, int]:
     }
 
 
+def normalize_heartbeat_role(role: str | None) -> str:
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in str(role or "daemon").strip().lower())
+    normalized = "_".join(part for part in normalized.split("_") if part)
+    return normalized or "daemon"
+
+
+def daemon_heartbeat_stream_name(kalshi_env: str, color: str, role: str | None = None) -> str:
+    normalized_role = normalize_heartbeat_role(role)
+    base = f"daemon_heartbeat:{kalshi_env}:{color}"
+    return base if normalized_role == "daemon" else f"{base}:{normalized_role}"
+
+
 def parse_heartbeat_at(payload: Any) -> datetime | None:
     if isinstance(payload, str):
         try:
@@ -58,9 +70,10 @@ async def _daemon_health() -> int:
 
     kalshi_env = os.getenv("KALSHI_ENV", "demo")
     color = os.getenv("APP_COLOR", "blue")
+    role = normalize_heartbeat_role(os.getenv("DAEMON_HEARTBEAT_ROLE", "daemon"))
     threshold_components = daemon_threshold_components()
     threshold_seconds = threshold_components["threshold_seconds"]
-    stream_name = f"daemon_heartbeat:{kalshi_env}:{color}"
+    stream_name = daemon_heartbeat_stream_name(kalshi_env, color, role)
 
     conn = await asyncpg.connect(
         host=os.getenv("POSTGRES_HOST", "postgres_demo"),
@@ -91,6 +104,8 @@ async def _daemon_health() -> int:
     result = {
         "kalshi_env": kalshi_env,
         "color": color,
+        "daemon_role": role,
+        "stream_name": stream_name,
         "healthy": healthy,
         "reason": "heartbeat fresh" if healthy else "heartbeat missing or stale",
         "heartbeat_at": heartbeat_at.isoformat() if heartbeat_at is not None else None,

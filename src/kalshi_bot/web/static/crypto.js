@@ -10,6 +10,11 @@
     payload: bootstrapEl ? JSON.parse(bootstrapEl.textContent || "{}") : { markets: [] },
     loading: false,
   };
+  const queryParams = new URLSearchParams(window.location.search || "");
+
+  function selectedFrequency() {
+    return (state.payload && state.payload.frequency) || queryParams.get("frequency") || "15m";
+  }
 
   function showAlert(message) {
     if (!alertEl) return;
@@ -495,7 +500,11 @@
     if (state.loading) return;
     state.loading = true;
     try {
-      const response = await fetch("/api/crypto/markets?frequency=15m", { headers: { Accept: "application/json" } });
+      const params = new URLSearchParams({ frequency: selectedFrequency() });
+      const response = await fetch(
+        `/api/crypto/markets?${params.toString()}`,
+        { headers: { Accept: "application/json" } },
+      );
       if (response.ok) {
         state.payload = await response.json();
         clearAlert();

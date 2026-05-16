@@ -29,6 +29,38 @@ def test_compose_file_declares_service_healthchecks() -> None:
     assert "${HTTPS_PORT:-443}:443" in compose_text
 
 
+def test_compose_declares_opt_in_crypto_1h_refresh_container() -> None:
+    compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
+    start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
+
+    assert "crypto_1h_production:" in compose_text
+    assert "--frequency 1h" in compose_text
+    assert 'CRYPTO_AUTO_FREQUENCIES: "1h"' in compose_text
+    assert '--settled-days "${CRYPTO_1H_SETTLED_DAYS:-7}"' in compose_text
+    assert "scripts/crypto_live_path_refresh.sh" in compose_text
+    assert "ENABLE_CRYPTO_1H_CONTAINER" in start_stack
+    assert "runtime_services+=(crypto_1h_production)" in start_stack
+    assert "COPY scripts/crypto_live_path_refresh.sh ./scripts/crypto_live_path_refresh.sh" in Path(
+        "infra/docker/Dockerfile"
+    ).read_text(encoding="utf-8")
+
+
+def test_compose_declares_opt_in_crypto_1h_daemon_pair() -> None:
+    compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
+    start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
+    restart_color = Path("infra/scripts/restart-color.sh").read_text(encoding="utf-8")
+
+    assert "daemon_production_crypto_1h_blue:" in compose_text
+    assert "daemon_production_crypto_1h_green:" in compose_text
+    assert '"--crypto-only", "--heartbeat-role", "crypto_1h"' in compose_text
+    assert "DAEMON_HEARTBEAT_ROLE: crypto_1h" in compose_text
+    assert 'CRYPTO_AUTO_FREQUENCIES: "1h"' in compose_text
+    assert "ENABLE_CRYPTO_1H_DAEMON" in start_stack
+    assert "daemon_production_crypto_1h_blue daemon_production_crypto_1h_green" in start_stack
+    assert "ENABLE_CRYPTO_1H_DAEMON" in restart_color
+    assert 'runtime_services+=("daemon_production_crypto_1h_${color}")' in restart_color
+
+
 def test_compose_uses_env_scoped_live_weather_switches() -> None:
     compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
 
@@ -40,7 +72,8 @@ def test_compose_uses_env_scoped_live_weather_switches() -> None:
     assert "STRATEGY_C_SHADOW_ONLY: ${DEMO_STRATEGY_C_SHADOW_ONLY:-true}" in compose_text
     assert "STRATEGY_C_ENABLED: ${PRODUCTION_STRATEGY_C_ENABLED:-false}" in compose_text
     assert "STRATEGY_C_SHADOW_ONLY: ${PRODUCTION_STRATEGY_C_SHADOW_ONLY:-true}" in compose_text
-    assert "CRYPTO_TRADING_ENABLED: ${CRYPTO_TRADING_ENABLED:-false}" in compose_text
+    assert "CRYPTO_TRADING_ENABLED: ${DEMO_CRYPTO_TRADING_ENABLED:-false}" in compose_text
+    assert "CRYPTO_TRADING_ENABLED: ${PRODUCTION_CRYPTO_TRADING_ENABLED:-false}" in compose_text
     assert "MONOTONICITY_ARB_ENABLED: ${MONOTONICITY_ARB_ENABLED:-false}" in compose_text
     assert "MONOTONICITY_ARB_SHADOW_ONLY: ${MONOTONICITY_ARB_SHADOW_ONLY:-true}" in compose_text
 
@@ -63,10 +96,14 @@ def test_runtime_scripts_rebuild_migrate_image_before_using_it() -> None:
 def test_runtime_scripts_refresh_caddy_after_app_recreate() -> None:
     start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
     restart_color = Path("infra/scripts/restart-color.sh").read_text(encoding="utf-8")
+    sync_web_color = Path("infra/scripts/sync-web-color.sh").read_text(encoding="utf-8")
 
     assert "wait_for_services_health 180" in start_stack
     assert "app_demo_blue app_demo_green app_production_blue app_production_green" in start_stack
-    assert "web_demo web_production web_strategies" in start_stack
+    assert "infra/scripts/sync-web-color.sh all" in start_stack
+    assert 'web_services+=("web_demo")' in sync_web_color
+    assert 'web_services+=("web_production")' in sync_web_color
+    assert 'web_services+=("web_strategies")' in sync_web_color
     assert 'docker compose -f "${compose_file}" ${compose_env_file} up -d --no-deps --force-recreate caddy' in start_stack
     assert 'app_${env_name}_${color}' in restart_color
     assert 'daemon_${env_name}_${color}' in restart_color

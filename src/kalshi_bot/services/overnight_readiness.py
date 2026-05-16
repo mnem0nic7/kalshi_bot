@@ -33,6 +33,31 @@ DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_START_HOUR = 22
 DEFAULT_END_HOUR = 6
 THIN_SAMPLE_WARNING_ROWS = 20
+CRYPTO_MARKET_PREFIXES = (
+    "KXBTC15M",
+    "KXETH15M",
+    "KXSOL15M",
+    "KXXRP15M",
+    "KXDOGE15M",
+    "KXBNB15M",
+    "KXHYPE15M",
+    "KXBTC",
+    "KXBTCD",
+    "KXETH",
+    "KXETHD",
+    "KXSOL",
+    "KXSOLE",
+    "KXSOLD",
+    "KXXRP",
+    "KXXRPD",
+    "KXRIPPLE",
+    "KXDOGE",
+    "KXDOGED",
+    "KXBNB",
+    "KXBNBD",
+    "KXHYPE",
+    "KXHYPED",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -627,6 +652,8 @@ class OvernightReadinessService:
             hard_blockers.append(_issue("crypto", "crypto_disabled", "Crypto is disabled."))
         if freq == "15m" and not self.settings.crypto_15m_enabled:
             hard_blockers.append(_issue("crypto", "crypto_15m_disabled", "15-minute crypto is disabled."))
+        if freq == "1h" and not self.settings.crypto_1h_enabled:
+            hard_blockers.append(_issue("crypto", "crypto_1h_disabled", "1-hour crypto is disabled."))
         if not self.settings.crypto_trading_enabled:
             hard_blockers.append(_issue("crypto", "crypto_trading_disabled", "Global crypto trading is disabled."))
         if not overnight_decision_rows:
@@ -930,10 +957,7 @@ def _weather_fast_decision_status(
 
 def _weather_ticker(market_ticker: str | None) -> bool:
     ticker = str(market_ticker or "").upper()
-    return not any(
-        ticker.startswith(prefix)
-        for prefix in ("KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M", "KXDOGE15M", "KXBNB15M", "KXHYPE15M")
-    )
+    return not any(ticker.startswith(prefix) for prefix in CRYPTO_MARKET_PREFIXES)
 
 
 def _series_from_ticker(market_ticker: str | None) -> str:

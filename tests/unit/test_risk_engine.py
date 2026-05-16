@@ -192,6 +192,52 @@ def test_risk_engine_allows_last_minute_passive_edge_bypass_and_normal_cap() -> 
     assert "position_notional_cap_resized" in verdict.reason_codes
 
 
+def test_risk_engine_allows_hourly_crypto_last_minute_passive_edge_bypass() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=500,
+        risk_min_probability_extremity_pct=0.0,
+        risk_position_pct=0.10,
+        risk_max_order_notional_dollars=100,
+        strategy_min_remaining_payout_bps=0,
+    )
+    signal = make_signal(edge_bps=-100)
+    signal.target_yes_price_dollars = Decimal("0.5500")
+    signal.fair_yes_dollars = Decimal("0.2000")
+    signal.confidence = 0.90
+    signal.candidate_trace = {
+        "strategy_code": StrategyCode.CRYPTO_1H.value,
+        "candidate_status": "live_quality",
+        "last_minute_passive_market_confidence": True,
+    }
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC-HOURLY-LAST-MINUTE",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5500"),
+            count_fp=Decimal("100.00"),
+        ),
+        signal=signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("100.00"),
+            strategy_code=StrategyCode.CRYPTO_1H.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("18.18")
+    assert "last_minute_passive_edge_bypass" in verdict.reason_codes
+    assert "last_minute_passive_fee_adjusted_edge_bypass" in verdict.reason_codes
+    assert "position_notional_cap_resized" in verdict.reason_codes
+
+
 def test_risk_engine_blocks_duplicate_last_minute_passive_open_order() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
@@ -746,6 +792,41 @@ def test_risk_engine_allows_one_btc_same_side_add_on_under_cap() -> None:
     assert "crypto_position_add_on_allowed" in verdict.reason_codes
 
 
+def test_risk_engine_allows_hourly_crypto_same_side_add_on_under_cap() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_allow_position_add_ons=False,
+    )
+    signal = _crypto_add_on_signal()
+    signal.candidate_trace["strategy_code"] = StrategyCode.CRYPTO_1H.value
+    engine = DeterministicRiskEngine(settings)
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC-HOURLY-ADDON",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5800"),
+            count_fp=Decimal("1.00"),
+        ),
+        signal=signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("1000.00"),
+            current_position_count_fp=Decimal("1.00"),
+            current_position_side="yes",
+            strategy_code=StrategyCode.CRYPTO_1H.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert "crypto_position_add_on_allowed" in verdict.reason_codes
+
+
 def test_risk_engine_downsizes_live_crypto_same_side_add_on_to_position_pct_cap() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
@@ -925,7 +1006,7 @@ def test_risk_engine_caps_crypto_late_empirical_override_ticket_to_one_contract(
     )
     signal = make_signal(edge_bps=5000)
     signal.candidate_trace = {
-        "strategy_code": StrategyCode.CRYPTO_15M.value,
+        "strategy_code": StrategyCode.CRYPTO_1H.value,
         "candidate_status": "live_quality",
         "late_high_confidence_directional_entry": True,
         "empirical_bucket_gate": {
@@ -953,7 +1034,7 @@ def test_risk_engine_caps_crypto_late_empirical_override_ticket_to_one_contract(
             market_observed_at=datetime.now(UTC),
             research_observed_at=datetime.now(UTC),
             total_capital_dollars=Decimal("1000.00"),
-            strategy_code=StrategyCode.CRYPTO_15M.value,
+            strategy_code=StrategyCode.CRYPTO_1H.value,
         ),
     )
 

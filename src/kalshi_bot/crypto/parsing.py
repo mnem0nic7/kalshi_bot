@@ -9,6 +9,10 @@ from kalshi_bot.core.fixed_point import quantize_price
 from kalshi_bot.crypto.models import CryptoMarket, CryptoSeries
 
 FIFTEEN_MIN_ALIASES = {"15m", "15min", "fifteen_min", "fifteen-minute", "fifteen_minute"}
+ASSET_SYMBOL_ALIASES = {
+    "RIPPLE": "XRP",
+    "SOLE": "SOL",
+}
 
 
 def normalize_frequency(value: object) -> str | None:
@@ -94,7 +98,20 @@ def parse_crypto_market(
     if not series_ticker:
         series_ticker = _series_from_market_ticker(ticker)
     asset = series.asset_symbol if series is not None else asset_symbol_from_series(series_ticker)
-    normalized = normalize_frequency(series.frequency if series is not None else market.get("frequency")) or normalize_frequency(frequency) or "15m"
+    open_time = parse_datetime(market.get("open_time") or market.get("open_ts"))
+    close_time = parse_datetime(market.get("close_time") or market.get("close_ts"))
+    expected_expiration_time = parse_datetime(
+        market.get("expected_expiration_time")
+        or market.get("expected_expiration_ts")
+        or market.get("expiration_time")
+    )
+    normalized = (
+        normalize_frequency(series.frequency if series is not None else market.get("frequency"))
+        or _frequency_from_ticker(series_ticker)
+        or _frequency_from_duration(open_time, close_time)
+        or normalize_frequency(frequency)
+        or "15m"
+    )
     return CryptoMarket(
         market_ticker=ticker,
         series_ticker=series_ticker,
@@ -104,13 +121,9 @@ def parse_crypto_market(
         title=market.get("title") or market.get("market_title") or market.get("yes_sub_title"),
         subtitle=market.get("subtitle") or market.get("sub_title"),
         status=market.get("status"),
-        open_time=parse_datetime(market.get("open_time") or market.get("open_ts")),
-        close_time=parse_datetime(market.get("close_time") or market.get("close_ts")),
-        expected_expiration_time=parse_datetime(
-            market.get("expected_expiration_time")
-            or market.get("expected_expiration_ts")
-            or market.get("expiration_time")
-        ),
+        open_time=open_time,
+        close_time=close_time,
+        expected_expiration_time=expected_expiration_time,
         target_price_dollars=parse_target_price(market),
         yes_bid_dollars=parse_price(market, dollar_keys=("yes_bid_dollars",), cent_keys=("yes_bid",)),
         yes_ask_dollars=parse_price(market, dollar_keys=("yes_ask_dollars",), cent_keys=("yes_ask",)),
@@ -171,7 +184,14 @@ def parse_price(
 
 
 def parse_target_price(raw: dict[str, Any]) -> Decimal | None:
-    for key in ("floor_strike", "floor_strike_dollars", "strike_price", "strike_price_dollars"):
+    for key in (
+        "floor_strike",
+        "floor_strike_dollars",
+        "strike_price",
+        "strike_price_dollars",
+        "cap_strike",
+        "cap_strike_dollars",
+    ):
         value = raw.get(key)
         if value in (None, ""):
             continue
@@ -181,10 +201,11 @@ def parse_target_price(raw: dict[str, Any]) -> Decimal | None:
         match = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", str(value))
         if match:
             return Decimal(match.group(0).replace(",", "")).quantize(Decimal("0.00000001"))
-    title = " ".join(str(raw.get(key) or "") for key in ("title", "subtitle", "yes_sub_title"))
-    match = re.search(r"\$?\s*([-+]?\d[\d,]*(?:\.\d+)?)", title)
-    if match:
-        return Decimal(match.group(1).replace(",", "")).quantize(Decimal("0.00000001"))
+    for key in ("yes_sub_title", "no_sub_title", "subtitle", "sub_title", "rules_primary", "title", "market_title"):
+        value = str(raw.get(key) or "")
+        match = re.search(r"\$\s*([-+]?\d[\d,]*(?:\.\d+)?)", value)
+        if match:
+            return Decimal(match.group(1).replace(",", "")).quantize(Decimal("0.00000001"))
     return None
 
 
@@ -259,8 +280,31 @@ def _series_from_market_ticker(ticker: str) -> str:
     return match.group(1) if match else upper
 
 
+def _frequency_from_ticker(ticker: str) -> str | None:
+    upper = str(ticker or "").upper()
+    if "15M" in upper:
+        return "15m"
+    if upper.endswith("1H"):
+        return "1h"
+    return None
+
+
+def _frequency_from_duration(open_time: datetime | None, close_time: datetime | None) -> str | None:
+    if open_time is None or close_time is None:
+        return None
+    seconds = int((close_time - open_time).total_seconds())
+    if 600 <= seconds <= 1_200:
+        return "15m"
+    if 3_000 <= seconds <= 4_200:
+        return "1h"
+    if 80_000 <= seconds <= 90_000:
+        return "1d"
+    return None
+
+
 def _clean_symbol(value: str) -> str:
     cleaned = re.sub(r"[^A-Z0-9]", "", value.upper())
+    cleaned = ASSET_SYMBOL_ALIASES.get(cleaned, cleaned)
     return cleaned or "CRYPTO"
 
 

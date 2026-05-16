@@ -27,9 +27,9 @@ def create_crypto_router(
     router = APIRouter()
 
     @router.get("/crypto", response_class=HTMLResponse)
-    async def crypto_dashboard(request: Request) -> HTMLResponse:
+    async def crypto_dashboard(request: Request, frequency: str = "15m") -> HTMLResponse:
         app_container = container(request)
-        payload = await app_container.crypto_market_service.dashboard_payload(frequency="15m")
+        payload = await app_container.crypto_market_service.dashboard_payload(frequency=frequency)
         return templates.TemplateResponse(
             request,
             "crypto.html",
@@ -40,9 +40,9 @@ def create_crypto_router(
         )
 
     @router.get("/api/crypto/status")
-    async def crypto_status(request: Request) -> JSONResponse:
+    async def crypto_status(request: Request, frequency: str = "15m") -> JSONResponse:
         app_container = container(request)
-        return JSONResponse(jsonable_encoder(await app_container.crypto_market_service.status(frequency="15m")))
+        return JSONResponse(jsonable_encoder(await app_container.crypto_market_service.status(frequency=frequency)))
 
     @router.get("/api/crypto/markets")
     async def crypto_markets(request: Request, frequency: str = "15m", current_only: bool = True) -> JSONResponse:

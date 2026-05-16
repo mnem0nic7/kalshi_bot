@@ -5,10 +5,12 @@
 {% block main_class %}shell-main-wide crypto-main{% endblock %}
 {% block content %}
 <script id="crypto-bootstrap" type="application/json">{{ crypto_bootstrap|tojson }}</script>
+{% set crypto_frequency = crypto_bootstrap.frequency|default("15m") %}
+{% set crypto_frequency_label = "1 Hour" if crypto_frequency == "1h" else "15 Minute" %}
 
 <section class="crypto-toolbar" aria-label="Crypto controls">
   <div>
-    <p class="crypto-eyebrow">15 Minute Crypto</p>
+    <p class="crypto-eyebrow">{{ crypto_frequency_label }} Crypto</p>
     <h1>Crypto Markets</h1>
   </div>
   <div class="crypto-actions">
@@ -24,7 +26,7 @@
 
 <div id="crypto-alert" class="crypto-alert" role="alert" hidden></div>
 <section class="crypto-status-strip" id="crypto-status-strip" aria-label="Crypto status"></section>
-<section class="crypto-grid" id="crypto-grid" aria-label="15 minute crypto markets"></section>
+<section class="crypto-grid" id="crypto-grid" aria-label="{{ crypto_frequency_label|lower }} crypto markets"></section>
 {% endblock %}
 
 {% block extra_scripts %}

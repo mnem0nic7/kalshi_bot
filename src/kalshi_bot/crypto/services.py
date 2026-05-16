@@ -113,6 +113,14 @@ CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_contract_price_dollars": (0.50, 0.60, 0.70),
     "min_remaining_payout_bps": (0,),
 }
+CRYPTO_STRATEGY_CODES = {
+    "15m": StrategyCode.CRYPTO_15M.value,
+    "1h": StrategyCode.CRYPTO_1H.value,
+}
+CRYPTO_FREQUENCY_LABELS = {
+    "15m": "15m",
+    "1h": "1h",
+}
 
 
 def _version(prefix: str, payload: dict[str, Any]) -> str:
@@ -164,6 +172,40 @@ def normalize_asset_mode(mode: str) -> str:
 
 def normalize_asset_symbols(asset_symbols: list[str] | None) -> list[str]:
     return sorted({normalize_asset_symbol(symbol) for symbol in (asset_symbols or []) if str(symbol or "").strip()})
+
+
+def crypto_strategy_code_for_frequency(frequency: object) -> str:
+    normalized = normalize_frequency(frequency) or "15m"
+    return CRYPTO_STRATEGY_CODES.get(normalized, f"CRYPTO_{normalized.upper().replace('-', '_')}")
+
+
+def crypto_frequency_label(frequency: object) -> str:
+    normalized = normalize_frequency(frequency) or "15m"
+    return CRYPTO_FREQUENCY_LABELS.get(normalized, normalized)
+
+
+def crypto_frequency_switch_enabled(settings: Settings, frequency: object) -> bool:
+    normalized = normalize_frequency(frequency) or "15m"
+    if normalized == "15m":
+        return bool(settings.crypto_15m_enabled)
+    if normalized == "1h":
+        return bool(settings.crypto_1h_enabled)
+    return False
+
+
+def crypto_frequency_enabled(settings: Settings, frequency: object) -> bool:
+    if not bool(settings.crypto_enabled):
+        return False
+    return crypto_frequency_switch_enabled(settings, frequency)
+
+
+def enabled_crypto_frequencies(settings: Settings) -> list[str]:
+    frequencies: list[str] = []
+    for raw in str(settings.crypto_auto_frequencies or "15m").replace(";", ",").split(","):
+        normalized = normalize_frequency(raw)
+        if normalized and normalized not in frequencies and crypto_frequency_enabled(settings, normalized):
+            frequencies.append(normalized)
+    return frequencies or (["15m"] if crypto_frequency_enabled(settings, "15m") else [])
 
 
 def _normalize_asset_csv(value: str | None) -> set[str]:
@@ -345,6 +387,8 @@ class CryptoAssetControlService:
             blockers.append("Crypto is disabled.")
         if normalized_frequency == "15m" and not self.settings.crypto_15m_enabled:
             blockers.append("15-minute crypto is disabled.")
+        if normalized_frequency == "1h" and not self.settings.crypto_1h_enabled:
+            blockers.append("1-hour crypto is disabled.")
         trading_enabled = self.settings.crypto_trading_enabled or bool(
             crypto_policy.trading_enabled if crypto_policy is not None else False
         )
@@ -701,6 +745,7 @@ class CryptoMarketService:
             "settings": {
                 "crypto_enabled": self.settings.crypto_enabled,
                 "crypto_15m_enabled": self.settings.crypto_15m_enabled,
+                "crypto_1h_enabled": self.settings.crypto_1h_enabled,
                 "crypto_trading_enabled": self.settings.crypto_trading_enabled,
                 "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
                 "crypto_order_mode": self.settings.crypto_order_mode,
@@ -719,6 +764,8 @@ class CryptoMarketService:
 
     async def create_room_for_market(self, market_ticker: str, *, reason: str = "crypto_dashboard") -> dict[str, Any]:
         market = await self.get_market(market_ticker, persist=True)
+        frequency_label = crypto_frequency_label(market.frequency)
+        strategy_code = crypto_strategy_code_for_frequency(market.frequency)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             control = await repo.ensure_deployment_control(self.settings.app_color)
@@ -741,10 +788,10 @@ class CryptoMarketService:
             shadow_mode = self.settings.app_shadow_mode or not live_status["live_eligible"]
             room = await repo.create_room(
                 RoomCreate(
-                    name=f"{market.asset_symbol} 15 Minute Crypto",
+                    name=f"{market.asset_symbol} {frequency_label} Crypto",
                     market_ticker=market.market_ticker,
                     prompt=(
-                        "Crypto 15m workflow. "
+                        f"Crypto {frequency_label} workflow. "
                         f"asset={market.asset_symbol} target={_money_text(market.target_price_dollars)} "
                         f"close_time={market.close_time.isoformat() if market.close_time else 'unknown'} "
                         f"asset_mode={live_status['asset_mode']} live_eligible={live_status['live_eligible']} "
@@ -767,7 +814,7 @@ class CryptoMarketService:
                 payload={
                     "market_domain": "crypto",
                     "frequency": market.frequency,
-                    "strategy_code": StrategyCode.CRYPTO_15M.value,
+                    "strategy_code": strategy_code,
                     "asset_mode": live_status["asset_mode"],
                     "control_asset_mode": live_status["control_asset_mode"],
                     "live_eligible": live_status["live_eligible"],
@@ -916,6 +963,7 @@ class CryptoMarketService:
             "active_pack_version": active_pack.version,
             "crypto_enabled": self.settings.crypto_enabled,
             "crypto_15m_enabled": self.settings.crypto_15m_enabled,
+            "crypto_1h_enabled": self.settings.crypto_1h_enabled,
             "crypto_trading_enabled": self.settings.crypto_trading_enabled,
             "crypto_autonomy_enabled": self.settings.crypto_autonomy_enabled,
             "runtime_crypto_trading_enabled": crypto_policy.trading_enabled,
@@ -1901,7 +1949,7 @@ class CryptoForecastService:
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
                 artifact_type=_crypto_artifact_type("model", requested_assets),
-                version=_version("crypto-15m-model", {"metrics": metrics, "payload": artifact_payload}),
+                version=_version(f"crypto-{freq}-model", {"metrics": metrics, "payload": artifact_payload}),
                 status=status,
                 sample_count=sample_count,
                 metrics=metrics,
@@ -1986,7 +2034,7 @@ class CryptoForecastService:
 
     async def forecast(self, market: CryptoMarket) -> StrategySignal:
         features = self.features(market)
-        if not self.settings.crypto_enabled or not self.settings.crypto_15m_enabled:
+        if not self.settings.crypto_enabled or not crypto_frequency_enabled(self.settings, market.frequency):
             return self._stand_down(market, StandDownReason.CRYPTO_DISABLED, "Crypto trading workflow is disabled.", features)
         if self.spot_service is not None:
             try:
@@ -2085,8 +2133,10 @@ class CryptoForecastService:
             if side is not None and display_side
             else f"predict {str(display_side).upper()}" if display_side else "no trade"
         )
+        frequency_label = crypto_frequency_label(market.frequency)
+        strategy_code = crypto_strategy_code_for_frequency(market.frequency)
         summary = (
-            f"{market.asset_symbol} 15m market-anchored fair yes {trade_fair} "
+            f"{market.asset_symbol} {frequency_label} market-anchored fair yes {trade_fair} "
             f"(model {fair}); "
             f"{display_decision} edge {edge_bps}bps."
         )
@@ -2122,7 +2172,7 @@ class CryptoForecastService:
                 **trace,
                 "market_domain": "crypto",
                 "frequency": market.frequency,
-                "strategy_code": StrategyCode.CRYPTO_15M.value,
+                "strategy_code": strategy_code,
                 "features": features,
                 "model_version": artifact.version,
                 "model_metrics": artifact.metrics,
@@ -2240,7 +2290,7 @@ class CryptoForecastService:
             candidate_trace={
                 "market_domain": "crypto",
                 "frequency": market.frequency,
-                "strategy_code": StrategyCode.CRYPTO_15M.value,
+                "strategy_code": crypto_strategy_code_for_frequency(market.frequency),
                 "stand_down_reason": reason.value,
                 "features": features,
             },
@@ -2281,7 +2331,7 @@ class CryptoReplayService:
                 artifact = await repo.record_crypto_model_artifact(
                     frequency=report["frequency"],
                     artifact_type=_crypto_artifact_type("backtest", report.get("asset_symbols") or []),
-                    version=_version("crypto-15m-backtest", report),
+                    version=_version(f"crypto-{report['frequency']}-backtest", report),
                     status=report["status"],
                     sample_count=int((report.get("dataset") or {}).get("row_count") or 0),
                     metrics=report.get("metrics") or {},
@@ -2294,7 +2344,7 @@ class CryptoReplayService:
                     await repo.record_crypto_model_artifact(
                         frequency=report["frequency"],
                         artifact_type=_crypto_artifact_type("backtest", [asset]),
-                        version=_version("crypto-15m-backtest", report),
+                        version=_version(f"crypto-{report['frequency']}-backtest", report),
                         status=report["status"],
                         sample_count=int(asset_metrics.get("oos_trade_candidate_count") or 0),
                         metrics={**(report.get("metrics") or {}), **asset_metrics, "metrics_scope": "per_asset"},
@@ -2442,7 +2492,7 @@ class CryptoReplayService:
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
                 artifact_type=_crypto_artifact_type("replay_gate", requested_assets),
-                version=_version("crypto-15m-gate", gate),
+                version=_version(f"crypto-{freq}-gate", gate),
                 status="passed" if gate["passed"] else "blocked",
                 sample_count=int(metrics.get("resolved_sample_count") or 0),
                 metrics=metrics,
@@ -3143,13 +3193,15 @@ class CryptoWorkflowService:
                         role=AgentRole.SYSTEM,
                         kind=MessageKind.OBSERVATION,
                         stage=RoomStage.RESEARCHING,
-                        content=f"Crypto 15m workflow started ({reason}).",
-                        payload={"market_domain": "crypto", "frequency": "15m", "reason": reason},
+                        content=f"Crypto workflow started ({reason}).",
+                        payload={"market_domain": "crypto", "reason": reason},
                     ),
                 )
                 await session.commit()
 
             market = await self.market_service.get_market(room.market_ticker, persist=True)
+            frequency_label = crypto_frequency_label(market.frequency)
+            strategy_code = crypto_strategy_code_for_frequency(market.frequency)
             signal = await self.forecast_service.forecast(market)
 
             async with self.session_factory() as session:
@@ -3185,11 +3237,11 @@ class CryptoWorkflowService:
                     room_id=room.id,
                     artifact_type="market_snapshot",
                     source="crypto_workflow",
-                    title=f"{market.asset_symbol} 15m crypto snapshot",
+                    title=f"{market.asset_symbol} {frequency_label} crypto snapshot",
                     payload={
                         "market_domain": "crypto",
                         "frequency": market.frequency,
-                        "strategy_code": StrategyCode.CRYPTO_15M.value,
+                        "strategy_code": strategy_code,
                         "asset_mode": live_status["asset_mode"],
                         "control_asset_mode": live_status["control_asset_mode"],
                         "live_eligible": live_status["live_eligible"],
@@ -3209,7 +3261,7 @@ class CryptoWorkflowService:
                     payload={
                         "market_domain": "crypto",
                         "frequency": market.frequency,
-                        "strategy_code": StrategyCode.CRYPTO_15M.value,
+                        "strategy_code": strategy_code,
                         "recommended_action": signal.recommended_action.value if signal.recommended_action else None,
                         "recommended_side": signal.recommended_side.value if signal.recommended_side else None,
                         "target_yes_price_dollars": _money_text(signal.target_yes_price_dollars),
@@ -3286,9 +3338,9 @@ class CryptoWorkflowService:
                     capital_bucket=signal.capital_bucket,
                     time_in_force=time_in_force,
                     note=(
-                        "CRYPTO_15M last-minute passive rest-to-close candidate"
+                        f"{strategy_code} last-minute passive rest-to-close candidate"
                         if time_in_force == KALSHI_GTC_TIME_IN_FORCE
-                        else "CRYPTO_15M passive-first candidate"
+                        else f"{strategy_code} passive-first candidate"
                     ),
                 )
                 risk_context = await self._risk_context(repo, room, base_ticket, market)
@@ -3304,7 +3356,7 @@ class CryptoWorkflowService:
                     room.id,
                     ticket,
                     client_order_id,
-                    strategy_code=StrategyCode.CRYPTO_15M.value,
+                    strategy_code=strategy_code,
                 )
                 ticket_record.payload = {
                     **(ticket_record.payload or {}),
@@ -3326,7 +3378,7 @@ class CryptoWorkflowService:
                         kind=MessageKind.TRADE_TICKET,
                         stage=RoomStage.PROPOSING,
                         content=f"Proposed crypto {ticket.side.value.upper()} ticket for {ticket.count_fp} contracts.",
-                        payload={**ticket_record.payload, "strategy_code": StrategyCode.CRYPTO_15M.value},
+                        payload={**ticket_record.payload, "strategy_code": strategy_code},
                     ),
                 )
                 await repo.update_room_stage(room.id, RoomStage.RISK)
@@ -3430,7 +3482,7 @@ class CryptoWorkflowService:
                         raw=receipt.details,
                         kalshi_order_id=receipt.external_order_id,
                         kalshi_env=room.kalshi_env,
-                        strategy_code=StrategyCode.CRYPTO_15M.value,
+                        strategy_code=strategy_code,
                     )
                 await repo.update_trade_ticket_status(ticket_record.id, receipt.status)
                 await repo.append_message(
@@ -3471,6 +3523,7 @@ class CryptoWorkflowService:
         ticket: TradeTicket,
         market: CryptoMarket,
     ) -> RiskContext:
+        strategy_code = crypto_strategy_code_for_frequency(market.frequency)
         positions = await repo.list_positions_for_ticker(
             room.market_ticker,
             kalshi_env=room.kalshi_env,
@@ -3490,7 +3543,7 @@ class CryptoWorkflowService:
         )
         total_capital = await repo.get_total_capital_dollars(kalshi_env=room.kalshi_env)
         strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
-            strategy_code=StrategyCode.CRYPTO_15M.value,
+            strategy_code=strategy_code,
             kalshi_env=room.kalshi_env,
         )
         current_position_notional = (
@@ -3508,7 +3561,7 @@ class CryptoWorkflowService:
             pending_order_count_fp=pending_order_count_fp,
             pending_order_notional_dollars=pending_order_notional,
             open_ticker_count=len({position.market_ticker for position in all_positions}),
-            strategy_code=StrategyCode.CRYPTO_15M.value,
+            strategy_code=strategy_code,
             strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
         )
 
@@ -4211,13 +4264,17 @@ def _nearest_market_per_asset(markets: list[CryptoMarket]) -> list[CryptoMarket]
     return sorted(by_asset.values(), key=lambda market: (market.close_time or datetime.max.replace(tzinfo=UTC), market.asset_symbol))
 
 
-def _market_sort_key(market: CryptoMarket, now: datetime) -> tuple[int, float, str]:
+def _market_sort_key(market: CryptoMarket, now: datetime) -> tuple[int, float, int, float, int, str]:
+    mid = market.mid_yes_dollars or market.last_price_dollars
+    quote_missing = 0 if market.yes_bid_dollars is not None and market.yes_ask_dollars is not None else 1
+    mid_distance = abs(float(mid - Decimal("0.5000"))) if mid is not None else float("inf")
+    spread_bps = market.spread_bps if market.spread_bps is not None else 1_000_000
     if market.close_time is None:
-        return (2, float("inf"), market.market_ticker)
+        return (2, float("inf"), quote_missing, mid_distance, spread_bps, market.market_ticker)
     seconds = (market.close_time - now).total_seconds()
     if seconds >= 0:
-        return (0, seconds, market.market_ticker)
-    return (1, abs(seconds), market.market_ticker)
+        return (0, seconds, quote_missing, mid_distance, spread_bps, market.market_ticker)
+    return (1, abs(seconds), quote_missing, mid_distance, spread_bps, market.market_ticker)
 
 
 def _eligible_market_per_asset(
@@ -4288,10 +4345,13 @@ def _crypto_live_market_age_seconds(now: datetime, market: CryptoMarket) -> int 
     close_time = market.close_time or market.expected_expiration_time
     if close_time is None:
         return None
-    if normalize_frequency(market.frequency) != "15m":
+    frequency = normalize_frequency(market.frequency) or "15m"
+    try:
+        interval_seconds = interval_seconds_for_frequency(frequency)
+    except ValueError:
         return None
     seconds_to_close = int((_as_utc_datetime(close_time) - _as_utc_datetime(now)).total_seconds())
-    return max(0, 900 - seconds_to_close)
+    return max(0, interval_seconds - seconds_to_close)
 
 
 def _cap_crypto_autonomy_markets(
@@ -4895,15 +4955,16 @@ async def _crypto_shadow_evidence_counts(
     if ticker_filter:
         room_stmt = room_stmt.where(Room.market_ticker.in_(ticker_filter))
         signal_stmt = signal_stmt.where(Signal.market_ticker.in_(ticker_filter))
+    crypto_strategy_codes = list(CRYPTO_STRATEGY_CODES.values())
     ticket_stmt = select(func.count(TradeTicketRecord.id)).where(
-        TradeTicketRecord.strategy_code == StrategyCode.CRYPTO_15M.value,
+        TradeTicketRecord.strategy_code.in_(crypto_strategy_codes),
         TradeTicketRecord.created_at >= recent_cutoff,
     )
     risk_stmt = (
         select(func.count(RiskVerdictRecord.id))
         .join(TradeTicketRecord, RiskVerdictRecord.ticket_id == TradeTicketRecord.id)
         .where(
-            TradeTicketRecord.strategy_code == StrategyCode.CRYPTO_15M.value,
+            TradeTicketRecord.strategy_code.in_(crypto_strategy_codes),
             RiskVerdictRecord.created_at >= recent_cutoff,
         )
     )
@@ -4913,9 +4974,13 @@ async def _crypto_shadow_evidence_counts(
         RoomMessage.content.ilike("%shadow_skipped%"),
     )
     live_order_stmt = select(func.count(OrderRecord.id)).where(
-        OrderRecord.strategy_code == StrategyCode.CRYPTO_15M.value,
+        OrderRecord.strategy_code.in_(crypto_strategy_codes),
         OrderRecord.kalshi_env == kalshi_env,
     )
+    if ticker_filter:
+        ticket_stmt = ticket_stmt.where(TradeTicketRecord.market_ticker.in_(ticker_filter))
+        risk_stmt = risk_stmt.where(TradeTicketRecord.market_ticker.in_(ticker_filter))
+        live_order_stmt = live_order_stmt.where(OrderRecord.market_ticker.in_(ticker_filter))
     recent_live_order_stmt = live_order_stmt.where(OrderRecord.created_at >= recent_cutoff)
     return {
         "window_days": 7,

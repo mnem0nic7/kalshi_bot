@@ -170,6 +170,8 @@ class Settings(BaseSettings):
 
     crypto_enabled: bool = True
     crypto_15m_enabled: bool = True
+    crypto_1h_enabled: bool = True
+    crypto_auto_frequencies: str = "15m"
     crypto_trading_enabled: bool = False
     crypto_history_lookback_days: int = 180
     crypto_order_mode: str = "passive_then_taker"

@@ -24,6 +24,9 @@ from kalshi_bot.services.strategy_cleanup import CleanupSignal
 from kalshi_bot.services.trade_behavior import entry_pause_reason, weather_live_max_order_count_fp
 
 
+CRYPTO_STRATEGY_CODES = {"CRYPTO_15M", "CRYPTO_1H"}
+
+
 @dataclass(slots=True)
 class RiskContext:
     market_observed_at: datetime | None
@@ -99,13 +102,17 @@ def _close_strike_probe_unlocked(signal: StrategySignal) -> bool:
 def _crypto_late_sure_thing_edge_bypass(signal: StrategySignal, context: RiskContext) -> bool:
     trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
     strategy_code = str(context.strategy_code or trace.get("strategy_code") or "")
-    return strategy_code == "CRYPTO_15M" and trace.get("late_high_confidence_directional_entry") is True
+    return _is_crypto_strategy_code(strategy_code) and trace.get("late_high_confidence_directional_entry") is True
 
 
 def _crypto_last_minute_passive_edge_bypass(signal: StrategySignal, context: RiskContext) -> bool:
     trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
     strategy_code = str(context.strategy_code or trace.get("strategy_code") or "")
-    return strategy_code == "CRYPTO_15M" and trace.get("last_minute_passive_market_confidence") is True
+    return _is_crypto_strategy_code(strategy_code) and trace.get("last_minute_passive_market_confidence") is True
+
+
+def _is_crypto_strategy_code(strategy_code: str | None) -> bool:
+    return str(strategy_code or "").upper() in CRYPTO_STRATEGY_CODES
 
 
 def _asset_set(value: str | None) -> set[str]:
@@ -216,8 +223,8 @@ def _crypto_position_add_on_verdict(
     }
     if not settings.crypto_position_add_ons_enabled:
         return False, {**diagnostics, "reason": "crypto_position_add_ons_disabled"}
-    if strategy_code != "CRYPTO_15M":
-        return False, {**diagnostics, "reason": "not_crypto_15m_strategy"}
+    if not _is_crypto_strategy_code(strategy_code):
+        return False, {**diagnostics, "reason": "not_crypto_strategy"}
     if not _asset_allowed_by_scope(asset, configured_assets):
         return False, {**diagnostics, "reason": "crypto_position_add_on_asset_not_configured"}
     if context.current_position_count_fp <= 0:
@@ -590,7 +597,7 @@ class DeterministicRiskEngine:
             code("last_minute_passive_duplicate_open_order")
 
         late_override_gate = _crypto_empirical_late_override_gate(candidate_trace)
-        if is_buy_entry and context.strategy_code == "CRYPTO_15M" and late_override_gate is not None:
+        if is_buy_entry and _is_crypto_strategy_code(context.strategy_code) and late_override_gate is not None:
             late_override_cap = quantize_count(
                 Decimal(str(self.settings.crypto_empirical_late_override_max_count_fp))
             )
@@ -731,7 +738,7 @@ class DeterministicRiskEngine:
         pending_position_notional = _quantize_money(context.pending_order_notional_dollars)
         dynamic_position_cap_dollars: Decimal | None = None
         total_capital = context.total_capital_dollars
-        crypto_strategy = context.strategy_code == "CRYPTO_15M"
+        crypto_strategy = _is_crypto_strategy_code(context.strategy_code)
         if total_capital is None:
             if is_buy_entry and crypto_strategy:
                 block("Total capital is unavailable; cannot enforce the crypto position capital cap.")

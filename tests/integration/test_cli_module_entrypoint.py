@@ -194,6 +194,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     model_quality_args = parser.parse_args(
         ["model-quality", "status", "--kalshi-env", "demo", "--domain", "all", "--json"]
     )
+    crypto_only_daemon_args = parser.parse_args(
+        ["daemon", "--crypto-only", "--heartbeat-role", "crypto_1h", "--run-seconds", "1"]
+    )
 
     assert history_args.command == "crypto-history"
     assert history_args.crypto_history_command == "status"
@@ -262,6 +265,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert model_quality_args.model_quality_command == "status"
     assert model_quality_args.kalshi_env == "demo"
     assert model_quality_args.domain == "all"
+    assert crypto_only_daemon_args.command == "daemon"
+    assert crypto_only_daemon_args.crypto_only is True
+    assert crypto_only_daemon_args.heartbeat_role == "crypto_1h"
 
 
 def test_crypto_live_path_recommends_settled_backfill_when_labels_missing() -> None:
@@ -292,12 +298,13 @@ def test_crypto_live_path_recommends_settled_backfill_when_labels_missing() -> N
             "asset_modes": {"ETH": "shadow"},
             "artifacts": {"ETH": {"model": {}, "backtest": {}, "replay_gate": {"status": "blocked"}}},
         },
+        frequency="1h",
         strict_rows_target=60,
         candidate_target=50,
     )
 
     assert report["next_command"] == (
-        "crypto-history collect-settled --kalshi-env production --frequency 15m --days 2 --assets ETH --json"
+        "crypto-history collect-settled --kalshi-env production --frequency 1h --days 2 --assets ETH --json"
     )
     assert report["quote_evidence"]["strict_quote_ingestion_audit"]["blocker_stage"] == "missing_settled_label"
 
@@ -332,13 +339,79 @@ def test_crypto_live_path_recommends_current_spot_when_spot_is_stale() -> None:
             "asset_modes": {"BTC": "shadow"},
             "artifacts": {"BTC": {"model": {"status": "trained"}, "backtest": {}, "replay_gate": {"status": "blocked"}}},
         },
+        frequency="1h",
         strict_rows_target=60,
         candidate_target=50,
     )
 
     assert report["next_command"] == (
-        "crypto-spot collect-current --kalshi-env production --frequency 15m --assets BTC --json"
+        "crypto-spot collect-current --kalshi-env production --frequency 1h --assets BTC --json"
     )
+
+
+@pytest.mark.asyncio
+async def test_crypto_live_path_asset_resolution_preserves_explicit_assets() -> None:
+    class MarketService:
+        async def discover_markets(self, **kwargs: object) -> list[object]:
+            raise AssertionError("explicit asset lists must not call discovery")
+
+    args = SimpleNamespace(assets=["xrp", "BTC"])
+    assets, discovery = await cli_module._crypto_live_path_asset_resolution(
+        args,
+        SimpleNamespace(crypto_market_service=MarketService()),
+        frequency="1h",
+    )
+
+    assert assets == ["BTC", "XRP"]
+    assert discovery["source"] == "explicit"
+    assert discovery["frequency"] == "1h"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("assets_arg", [None, ["all"], ["*"]])
+async def test_crypto_live_path_asset_resolution_discovers_omitted_or_all_assets(assets_arg: list[str] | None) -> None:
+    class MarketService:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def discover_markets(self, **kwargs: object) -> list[SimpleNamespace]:
+            self.calls.append(kwargs)
+            return [
+                SimpleNamespace(asset_symbol="ETH"),
+                SimpleNamespace(asset_symbol="btc"),
+                SimpleNamespace(asset_symbol="ETH"),
+            ]
+
+    market_service = MarketService()
+    args = SimpleNamespace(assets=assets_arg)
+    assets, discovery = await cli_module._crypto_live_path_asset_resolution(
+        args,
+        SimpleNamespace(crypto_market_service=market_service),
+        frequency="1h",
+    )
+
+    assert assets == ["BTC", "ETH"]
+    assert discovery["source"] == "discovered"
+    assert discovery["frequency"] == "1h"
+    assert market_service.calls == [{"frequency": "1h", "status": "open", "persist": False}]
+
+
+@pytest.mark.asyncio
+async def test_crypto_live_path_asset_resolution_falls_back_when_discovery_fails() -> None:
+    class MarketService:
+        async def discover_markets(self, **kwargs: object) -> list[object]:
+            raise RuntimeError("kalshi unavailable")
+
+    assets, discovery = await cli_module._crypto_live_path_asset_resolution(
+        SimpleNamespace(assets=["all"]),
+        SimpleNamespace(crypto_market_service=MarketService()),
+        frequency="1h",
+    )
+
+    assert assets == list(cli_module.CRYPTO_LIVE_PATH_DEFAULT_ASSETS)
+    assert discovery["source"] == "static_fallback"
+    assert discovery["reason"] == "discovery_failed"
+    assert "kalshi unavailable" in discovery["error"]
 
 
 def test_crypto_live_path_surfaces_candidate_rejection_counts() -> None:
@@ -535,6 +608,102 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
         "forecast_train",
         "replay_run",
         "replay_gate",
+    ]
+
+
+def _write_fake_crypto_live_path_cli(tmp_path) -> tuple[str, str]:
+    fake_cli = tmp_path / "fake_cli.py"
+    call_log = tmp_path / "calls.log"
+    fake_cli.write_text(
+        """
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+with open(os.environ["CALL_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(" ".join(args) + "\\n")
+if args[:2] == ["crypto-asset-mode", "list"]:
+    print(json.dumps({"log": "noise"}))
+    print(json.dumps({"modes": {"ETH": "shadow", "BTC": "shadow"}}))
+elif args[:2] == ["crypto-live-path", "refresh"]:
+    print(json.dumps({"status": "completed"}))
+else:
+    raise SystemExit(2)
+""".strip(),
+        encoding="utf-8",
+    )
+    return str(fake_cli), str(call_log)
+
+
+@pytest.mark.parametrize("asset_args", [[], ["--assets", "all"]])
+def test_crypto_live_path_refresh_script_discovers_assets(tmp_path, asset_args: list[str]) -> None:
+    fake_cli, call_log = _write_fake_crypto_live_path_cli(tmp_path)
+    out_dir = tmp_path / "reports"
+    env = {
+        **os.environ,
+        "CLI": f"{sys.executable} {fake_cli}",
+        "CALL_LOG": call_log,
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/crypto_live_path_refresh.sh",
+            "--kalshi-env",
+            "production",
+            "--frequency",
+            "1h",
+            "--out-dir",
+            str(out_dir),
+            *asset_args,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8").splitlines()
+    assert calls[0] == "crypto-asset-mode list --kalshi-env production --frequency 1h"
+    assert any("--frequency 1h" in call and "--assets BTC" in call for call in calls)
+    assert any("--frequency 1h" in call and "--assets ETH" in call for call in calls)
+    assert sum(1 for call in calls if call.startswith("crypto-live-path refresh ")) == 2
+
+
+def test_crypto_live_path_refresh_script_explicit_assets_bypass_discovery(tmp_path) -> None:
+    fake_cli, call_log = _write_fake_crypto_live_path_cli(tmp_path)
+    env = {
+        **os.environ,
+        "CLI": f"{sys.executable} {fake_cli}",
+        "CALL_LOG": call_log,
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/crypto_live_path_refresh.sh",
+            "--kalshi-env",
+            "production",
+            "--frequency",
+            "1h",
+            "--out-dir",
+            str(tmp_path / "reports"),
+            "--assets",
+            "XRP",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("crypto-asset-mode list ") for call in calls)
+    assert calls == [
+        "crypto-live-path refresh --kalshi-env production --frequency 1h --settled-days 2 --history-days 2 --spot-days 2 --replay-days 30 --assets XRP --json"
     ]
 
 

@@ -1,6 +1,12 @@
 from datetime import UTC, datetime
 
-from kalshi_bot.docker_healthcheck import _env_int, daemon_threshold_components, parse_heartbeat_at
+from kalshi_bot.docker_healthcheck import (
+    _env_int,
+    daemon_heartbeat_stream_name,
+    daemon_threshold_components,
+    normalize_heartbeat_role,
+    parse_heartbeat_at,
+)
 
 
 def test_parse_heartbeat_at_accepts_json_string() -> None:
@@ -59,3 +65,12 @@ def test_daemon_threshold_components_fallback_for_invalid_env(monkeypatch) -> No
         "grace_seconds": 0,
         "threshold_seconds": 135,
     }
+
+
+def test_daemon_heartbeat_stream_name_preserves_default_and_suffixes_roles() -> None:
+    assert normalize_heartbeat_role("Crypto 1H") == "crypto_1h"
+    assert daemon_heartbeat_stream_name("production", "blue") == "daemon_heartbeat:production:blue"
+    assert (
+        daemon_heartbeat_stream_name("production", "blue", "crypto_1h")
+        == "daemon_heartbeat:production:blue:crypto_1h"
+    )

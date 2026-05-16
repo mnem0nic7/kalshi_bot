@@ -27,7 +27,13 @@ from kalshi_bot.core.schemas import (
     ShadowCampaignRequest,
     TrainingBuildRequest,
 )
-from kalshi_bot.crypto.services import _latest_crypto_artifact_for_asset, normalize_asset_symbol, normalize_asset_symbols
+from kalshi_bot.crypto.services import (
+    _latest_crypto_artifact_for_asset,
+    crypto_frequency_switch_enabled,
+    crypto_strategy_code_for_frequency,
+    normalize_asset_symbol,
+    normalize_asset_symbols,
+)
 from kalshi_bot.db.models import CryptoMarketSnapshotRecord, Room, Signal, StrategyPromotionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -820,17 +826,47 @@ async def _run_crypto_autonomy_command(args: argparse.Namespace, container: AppC
 
 async def _run_crypto_asset_mode_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.crypto_asset_mode_command == "list":
-        asset_symbols: list[str] | None = None
+        asset_symbols: list[str] | None
+        asset_discovery: dict[str, Any]
         try:
             markets = await container.crypto_market_service.discover_markets(
                 frequency=args.frequency,
                 status="open",
                 persist=False,
             )
-            asset_symbols = sorted({market.asset_symbol for market in markets})
-        except Exception:
-            asset_symbols = None
+            asset_symbols = sorted(
+                {
+                    normalize_asset_symbol(getattr(market, "asset_symbol", ""))
+                    for market in markets
+                    if str(getattr(market, "asset_symbol", "")).strip()
+                }
+            )
+            if asset_symbols:
+                asset_discovery = {
+                    "source": "discovered",
+                    "frequency": args.frequency,
+                    "assets": asset_symbols,
+                    "market_count": len(markets),
+                }
+            else:
+                asset_symbols = _crypto_live_path_static_assets()
+                asset_discovery = {
+                    "source": "static_fallback",
+                    "frequency": args.frequency,
+                    "assets": asset_symbols,
+                    "reason": "discovery_empty",
+                }
+        except Exception as exc:
+            asset_symbols = _crypto_live_path_static_assets()
+            asset_discovery = {
+                "source": "static_fallback",
+                "frequency": args.frequency,
+                "assets": asset_symbols,
+                "reason": "discovery_failed",
+                "error": str(exc),
+            }
         result = await container.crypto_asset_control_service.list_asset_modes(asset_symbols=asset_symbols)
+        result["asset_discovery"] = asset_discovery
     elif args.crypto_asset_mode_command == "set":
         result = await container.crypto_asset_control_service.set_asset_mode(
             args.symbol,
@@ -843,9 +879,95 @@ async def _run_crypto_asset_mode_command(args: argparse.Namespace, container: Ap
     return 0
 
 
-def _crypto_live_path_assets(args: argparse.Namespace) -> list[str]:
-    assets = normalize_asset_symbols(getattr(args, "assets", None))
-    return assets or list(CRYPTO_LIVE_PATH_DEFAULT_ASSETS)
+def _crypto_live_path_static_assets() -> list[str]:
+    return list(CRYPTO_LIVE_PATH_DEFAULT_ASSETS)
+
+
+def _crypto_live_path_requested_assets(args: argparse.Namespace) -> tuple[list[str] | None, bool]:
+    raw_assets = list(getattr(args, "assets", None) or [])
+    if not raw_assets:
+        return None, True
+    if any(str(asset or "").strip().upper() in {"ALL", "*"} for asset in raw_assets):
+        return None, True
+    normalized = normalize_asset_symbols(raw_assets)
+    return normalized, False
+
+
+async def _discover_crypto_live_path_assets(
+    container: AppContainer,
+    *,
+    frequency: str,
+) -> tuple[list[str], dict[str, Any]]:
+    try:
+        markets = await container.crypto_market_service.discover_markets(
+            frequency=frequency,
+            status="open",
+            persist=False,
+        )
+        assets = sorted(
+            {
+                normalize_asset_symbol(getattr(market, "asset_symbol", ""))
+                for market in markets
+                if str(getattr(market, "asset_symbol", "")).strip()
+            }
+        )
+    except Exception as exc:
+        assets = _crypto_live_path_static_assets()
+        return assets, {
+            "source": "static_fallback",
+            "frequency": frequency,
+            "assets": assets,
+            "reason": "discovery_failed",
+            "error": str(exc),
+        }
+    if assets:
+        return assets, {
+            "source": "discovered",
+            "frequency": frequency,
+            "assets": assets,
+            "market_count": len(markets),
+        }
+    assets = _crypto_live_path_static_assets()
+    return assets, {
+        "source": "static_fallback",
+        "frequency": frequency,
+        "assets": assets,
+        "reason": "discovery_empty",
+    }
+
+
+async def _crypto_live_path_asset_resolution(
+    args: argparse.Namespace,
+    container: AppContainer,
+    *,
+    frequency: str,
+) -> tuple[list[str], dict[str, Any]]:
+    resolved_assets = getattr(args, "_crypto_live_path_resolved_assets", None)
+    resolved_discovery = getattr(args, "_crypto_live_path_asset_discovery", None)
+    if resolved_assets is not None and isinstance(resolved_discovery, dict):
+        assets = normalize_asset_symbols(list(resolved_assets))
+        return assets, {**resolved_discovery, "assets": assets}
+
+    requested_assets, should_discover = _crypto_live_path_requested_assets(args)
+    if requested_assets is not None and not should_discover:
+        return requested_assets, {
+            "source": "explicit",
+            "frequency": frequency,
+            "assets": requested_assets,
+        }
+    return await _discover_crypto_live_path_assets(container, frequency=frequency)
+
+
+def _crypto_live_path_args_with_asset_resolution(
+    args: argparse.Namespace,
+    *,
+    assets: list[str],
+    asset_discovery: dict[str, Any],
+) -> argparse.Namespace:
+    values = vars(args).copy()
+    values["_crypto_live_path_resolved_assets"] = list(assets)
+    values["_crypto_live_path_asset_discovery"] = dict(asset_discovery)
+    return argparse.Namespace(**values)
 
 
 def _crypto_artifact_payload(record: Any | None) -> dict[str, Any] | None:
@@ -1163,6 +1285,7 @@ async def _crypto_live_path_runtime_state(
             "has_write_credentials": container.kalshi.write_credentials is not None,
             "crypto_enabled": container.settings.crypto_enabled,
             "crypto_15m_enabled": container.settings.crypto_15m_enabled,
+            "crypto_1h_enabled": container.settings.crypto_1h_enabled,
             "crypto_trading_enabled": container.settings.crypto_trading_enabled,
             "crypto_autonomy_enabled": container.settings.crypto_autonomy_enabled,
             "crypto_production_autonomy_enabled": container.settings.crypto_production_autonomy_enabled,
@@ -1180,8 +1303,8 @@ async def _crypto_live_path_runtime_state(
     live_order_blockers: list[str] = []
     if not bool(deployment["crypto_enabled"]):
         live_order_blockers.append("CRYPTO_ENABLED=false")
-    if frequency == "15m" and not bool(deployment["crypto_15m_enabled"]):
-        live_order_blockers.append("CRYPTO_15M_ENABLED=false")
+    if not crypto_frequency_switch_enabled(container.settings, frequency):
+        live_order_blockers.append(f"{crypto_strategy_code_for_frequency(frequency)}_ENABLED=false")
     if not bool(deployment["runtime_crypto_trading_enabled"]):
         switch_blockers.append("CRYPTO_TRADING_ENABLED=false")
         live_order_blockers.append("CRYPTO_TRADING_ENABLED=false")
@@ -1233,6 +1356,7 @@ def _crypto_live_path_assess_asset(
     history_status: dict[str, Any],
     spot_status: dict[str, Any],
     runtime_state: dict[str, Any],
+    frequency: str = "15m",
     strict_rows_target: int,
     candidate_target: int,
 ) -> dict[str, Any]:
@@ -1333,7 +1457,7 @@ def _crypto_live_path_assess_asset(
         next_command = (
             "crypto-history collect-settled "
             f"--kalshi-env {_crypto_live_path_env(runtime_state)} "
-            "--frequency 15m "
+            f"--frequency {frequency} "
             "--days 2 "
             f"--assets {asset} "
             "--json"
@@ -1342,7 +1466,7 @@ def _crypto_live_path_assess_asset(
         next_command = (
             "crypto-spot collect-current "
             f"--kalshi-env {_crypto_live_path_env(runtime_state)} "
-            "--frequency 15m "
+            f"--frequency {frequency} "
             f"--assets {asset} "
             "--json"
         )
@@ -1421,8 +1545,8 @@ async def _crypto_live_path_status_payload(
     args: argparse.Namespace,
     container: AppContainer,
 ) -> dict[str, Any]:
-    assets = _crypto_live_path_assets(args)
     frequency = getattr(args, "frequency", "15m")
+    assets, asset_discovery = await _crypto_live_path_asset_resolution(args, container, frequency=frequency)
     status_days = getattr(args, "status_days", 14)
     history_status = await container.crypto_history_service.status(frequency=frequency, days=status_days)
     spot_status = await container.crypto_spot_service.status(
@@ -1437,6 +1561,7 @@ async def _crypto_live_path_status_payload(
             history_status=history_status,
             spot_status=spot_status,
             runtime_state=runtime_state,
+            frequency=frequency,
             strict_rows_target=getattr(args, "strict_rows_target", CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET),
             candidate_target=getattr(args, "candidate_target", CRYPTO_LIVE_PATH_TRADE_CANDIDATES_TARGET),
         )
@@ -1509,6 +1634,7 @@ async def _crypto_live_path_status_payload(
         "kalshi_env": container.settings.kalshi_env,
         "frequency": frequency,
         "assets": assets,
+        "asset_discovery": asset_discovery,
         "targets": {
             "strict_trade_eligible_count": getattr(
                 args,
@@ -1551,9 +1677,14 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
     if args.crypto_live_path_command != "refresh":
         raise ValueError(f"unknown crypto-live-path command {args.crypto_live_path_command}")
 
-    assets = _crypto_live_path_assets(args)
     frequency = getattr(args, "frequency", "15m")
-    pre_status = await _crypto_live_path_status_payload(args, container)
+    assets, asset_discovery = await _crypto_live_path_asset_resolution(args, container, frequency=frequency)
+    resolved_args = _crypto_live_path_args_with_asset_resolution(
+        args,
+        assets=assets,
+        asset_discovery=asset_discovery,
+    )
+    pre_status = await _crypto_live_path_status_payload(resolved_args, container)
     iteration_results: list[dict[str, Any]] = []
     operation_errors: list[dict[str, Any]] = []
     max_iterations = max(1, int(getattr(args, "max_iterations", 1) or 1))
@@ -1649,7 +1780,7 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
                 result["errors"].append(error)
                 operation_errors.append(error)
             asset_results.append(result)
-        iteration_status = await _crypto_live_path_status_payload(args, container)
+        iteration_status = await _crypto_live_path_status_payload(resolved_args, container)
         if getattr(args, "until_ready", False):
             current_strict_counts = _crypto_status_strict_counts(iteration_status)
             snapshot_counts = _crypto_status_snapshot_counts(iteration_status)
@@ -1687,13 +1818,15 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
         if iteration < max_iterations and float(getattr(args, "sleep_seconds", 0.0) or 0.0) > 0:
             await asyncio.sleep(float(args.sleep_seconds))
 
-    post_status = await _crypto_live_path_status_payload(args, container)
+    post_status = await _crypto_live_path_status_payload(resolved_args, container)
     output = {
         "schema_version": "crypto-live-path-v1",
         "status": "completed" if not operation_errors else "completed_with_errors",
+        "asset_discovery": asset_discovery,
         "pre_status": {
             "status": pre_status["status"],
             "ready_assets": pre_status["ready_assets"],
+            "asset_discovery": pre_status.get("asset_discovery"),
             "summary": pre_status["summary"],
         },
         "iterations": iteration_results,
@@ -2537,6 +2670,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 auto_trigger=(False if args.no_auto_trigger else True) if args.auto_trigger or args.no_auto_trigger else None,
                 max_messages=args.max_messages,
                 run_seconds=args.run_seconds,
+                crypto_only=args.crypto_only,
+                heartbeat_role=args.heartbeat_role,
             )
             print(json.dumps(result, indent=2))
             return 0
@@ -4006,6 +4141,8 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--public-only", action="store_true")
     daemon.add_argument("--max-messages", type=int, default=None)
     daemon.add_argument("--run-seconds", type=float, default=None)
+    daemon.add_argument("--crypto-only", action="store_true")
+    daemon.add_argument("--heartbeat-role", default="daemon")
     daemon_trigger_group = daemon.add_mutually_exclusive_group()
     daemon_trigger_group.add_argument("--auto-trigger", action="store_true")
     daemon_trigger_group.add_argument("--no-auto-trigger", action="store_true")

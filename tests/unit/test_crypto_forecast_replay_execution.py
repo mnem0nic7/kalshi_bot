@@ -191,6 +191,25 @@ def _sizing_ticket(**overrides) -> TradeTicket:
     return TradeTicket(**values)
 
 
+def test_crypto_asset_control_blocks_disabled_hourly_frequency(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        crypto_1h_enabled=False,
+    )
+    service = CryptoAssetControlService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+
+    blockers = service.global_live_blockers(
+        control=SimpleNamespace(active_color=settings.app_color, kill_switch_enabled=False),
+        replay_gate=SimpleNamespace(status="passed"),
+        has_write_credentials=True,
+        frequency="1h",
+    )
+
+    assert "1-hour crypto is disabled." in blockers
+
+
 def test_crypto_dynamic_sizing_live_quality_yes_uses_position_budget(tmp_path) -> None:
     settings = _settings(tmp_path, risk_position_pct=0.10, crypto_dynamic_order_target_position_pct=0.10)
 

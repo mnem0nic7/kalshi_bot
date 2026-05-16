@@ -31,6 +31,20 @@ def test_asset_symbol_extraction_handles_x_prefix_and_future_assets() -> None:
     assert asset_symbol_from_series("KXHYPE15M") == "HYPE"
     assert asset_symbol_from_series("KXBCH15M") == "BCH"
     assert asset_symbol_from_series({"ticker": "KXADA15M", "tags": ["Crypto", "ADA"]}) == "ADA"
+    assert asset_symbol_from_series({"ticker": "KXSOLE", "title": "SOL Range", "category": "Crypto"}) == "SOL"
+    assert asset_symbol_from_series({"ticker": "KXRIPPLE", "title": "Ripple Range", "category": "Crypto"}) == "XRP"
+
+
+def test_crypto_series_discovery_accepts_hourly_crypto_frequency() -> None:
+    series = parse_crypto_series(
+        {"ticker": "KXBTC", "title": "Bitcoin range", "category": "Crypto", "frequency": "hourly"},
+        frequency="1h",
+    )
+
+    assert series is not None
+    assert series.series_ticker == "KXBTC"
+    assert series.asset_symbol == "BTC"
+    assert series.frequency == "1h"
 
 
 def test_crypto_market_parser_extracts_target_quotes_and_times() -> None:
@@ -64,6 +78,27 @@ def test_crypto_market_parser_extracts_target_quotes_and_times() -> None:
     assert market.mid_yes_dollars == Decimal("0.4850")
     assert market.volume == 5293
     assert market.close_time is not None
+
+
+def test_crypto_market_parser_infers_hourly_duration_and_ignores_title_dates() -> None:
+    market = parse_crypto_market(
+        {
+            "ticker": "KXBTC-26MAY16-T0900-B105000",
+            "series_ticker": "KXBTC",
+            "title": "Bitcoin price range on May 16",
+            "yes_sub_title": "Above $105,000 at 9am",
+            "open_time": "2026-05-16T15:00:00Z",
+            "close_time": "2026-05-16T16:00:00Z",
+            "yes_bid": 48,
+            "yes_ask": 52,
+            "status": "open",
+        }
+    )
+
+    assert market is not None
+    assert market.asset_symbol == "BTC"
+    assert market.frequency == "1h"
+    assert market.target_price_dollars == Decimal("105000.00000000")
 
 
 def test_candlestick_normalization_accepts_official_nested_shape() -> None:

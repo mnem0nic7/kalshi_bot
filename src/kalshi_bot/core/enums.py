@@ -128,4 +128,5 @@ class StrategyCode(StrEnum):
     CLEANUP = "C"  # Strategy C — resolution-lag cleanup
     MONOTONICITY_ARB = "ARB"  # Monotonicity arbitrage scanner
     CRYPTO_15M = "CRYPTO_15M"  # Kalshi 15-minute crypto microstructure strategy
+    CRYPTO_1H = "CRYPTO_1H"  # Kalshi 1-hour crypto microstructure strategy
     UNMANAGED = "UNMANAGED"  # Exchange-side/manual fills with no bot decision linkage
