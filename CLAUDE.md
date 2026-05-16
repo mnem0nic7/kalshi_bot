@@ -138,3 +138,4 @@ A DB-backed single-writer lock enforces that only the active color (`app_color` 
 - The app starts in shadow mode (`APP_SHADOW_MODE=true`) and with the kill switch enabled by default. Do not disable either until mappings, reconciliation, and restart recovery are validated.
 - LLM responses are inputs to human-readable transcripts only. Deterministic engines are authoritative for all trading decisions.
 - Kalshi write endpoints are only reachable through `ExecutionService`, which checks the kill switch and deployment lock before every order.
+- **Weather trading is currently paused** (`DEMO/PRODUCTION_TRIGGER_ENABLE_AUTO_ROOMS=false` in `.env`). Do not re-enable without operator instruction. See `docs/operations/weather-pause-2026-05-16.md` for restore steps.
