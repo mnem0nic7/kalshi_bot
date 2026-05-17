@@ -14,7 +14,13 @@ install_aiosqlite_wakeup_patch()
 
 
 def create_engine(settings: Settings) -> AsyncEngine:
-    return create_async_engine(settings.database_url, pool_pre_ping=True)
+    is_postgres = settings.database_url.startswith("postgresql")
+    connect_args = (
+        {"options": "-c idle_in_transaction_session_timeout=1800000"}  # 30 min
+        if is_postgres
+        else {}
+    )
+    return create_async_engine(settings.database_url, pool_pre_ping=True, connect_args=connect_args)
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
