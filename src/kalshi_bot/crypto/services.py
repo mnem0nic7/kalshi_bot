@@ -84,7 +84,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v4"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v5"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
 CRYPTO_EXPLORATORY_SHADOW = "exploratory_shadow"
@@ -2098,12 +2098,16 @@ class CryptoForecastService:
                 asset_symbols=requested_assets or None,
                 limit=500_000,
             )
+            funding_rate_rows = await repo.list_crypto_funding_rates_bulk(
+                asset_symbols=requested_assets or None,
+            )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             rows = _filter_crypto_snapshot_rows(rows, requested_assets)
             candles = _filter_crypto_snapshot_rows(candles, requested_assets)
             spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
-            decision_rows = _crypto_decision_rows(rows, candles, spot_rows, settings=self.settings)
+            rows = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, rows)
+            decision_rows = _crypto_decision_rows(rows, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
             sample_count = len(decision_rows)
             payload = _fit_crypto_calibration(decision_rows, settings=self.settings, crypto_policy=crypto_policy)
             metrics = _crypto_model_metrics(decision_rows, payload, settings=self.settings, crypto_policy=crypto_policy)
@@ -2135,6 +2139,7 @@ class CryptoForecastService:
                     "spot_target_distance_volatility",
                     "kalshi_mid_spot_gap",
                     "recent_same_asset_behavior",
+                    "funding_rate",
                 ],
                 "metrics_scope": metrics.get("validation_scope") or "walk_forward_time_ordered",
                 "candidate_registry_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
@@ -2199,13 +2204,17 @@ class CryptoForecastService:
                 artifact_type=_crypto_artifact_type("model", requested_assets),
                 kalshi_env=self.settings.kalshi_env,
             )
+            funding_rate_rows = await repo.list_crypto_funding_rates_bulk(
+                asset_symbols=requested_assets or None,
+            )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             await session.commit()
         rows = _filter_crypto_snapshot_rows(rows, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
         spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
-        decision_rows = _crypto_decision_rows(rows, candles, spot_rows, settings=self.settings)
+        rows = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, rows)
+        decision_rows = _crypto_decision_rows(rows, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
         model_payload = artifact.payload if artifact is not None else None
         candidate_report = _crypto_model_candidate_report(
             decision_rows,
@@ -2269,6 +2278,10 @@ class CryptoForecastService:
                     until=_now,
                     limit=10,
                 )
+            funding_rate_rows = await repo.list_crypto_funding_rates(
+                market.asset_symbol,
+                limit=5,
+            )
             backtest = await _latest_crypto_artifact_for_asset(
                 repo,
                 frequency=market.frequency,
@@ -2309,7 +2322,7 @@ class CryptoForecastService:
                 fair=mid,
             )
         payload = artifact.payload or {}
-        market_row = _crypto_live_market_row(market, spot_rows=spot_rows, cross_asset_spot=cross_asset_spot, settings=self.settings)
+        market_row = _crypto_live_market_row(market, spot_rows=spot_rows, cross_asset_spot=cross_asset_spot, funding_rate_rows=funding_rate_rows, settings=self.settings)
         features = {**features, "spot_features": _json_ready_spot_features(market_row)}
         fair = _predict_crypto_probability(market_row, payload)
         empirical_bucket_matrix = _crypto_empirical_bucket_matrix_from_artifacts(gate, backtest)
@@ -2609,13 +2622,17 @@ class CryptoReplayService:
                 since=cutoff,
                 limit=1_000_000,
             )
+            funding_rate_rows = await repo.list_crypto_funding_rates_bulk(
+                asset_symbols=requested_assets or None,
+            )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             await session.commit()
         snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
         spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
-        rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
+        snapshots = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, snapshots)
+        rows = _crypto_decision_rows(snapshots, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
         assets = requested_assets or sorted({normalize_asset_symbol(str(row.get("asset_symbol") or "")) for row in rows if row.get("asset_symbol")})
         asset_reports: list[dict[str, Any]] = []
@@ -2960,6 +2977,9 @@ class CryptoReplayService:
                 since=cutoff,
                 limit=1_000_000,
             )
+            funding_rate_rows = await repo.list_crypto_funding_rates_bulk(
+                asset_symbols=requested_assets or None,
+            )
             model = await repo.get_latest_crypto_model_artifact(
                 frequency=freq,
                 artifact_type=_crypto_artifact_type("model", requested_assets),
@@ -2976,7 +2996,8 @@ class CryptoReplayService:
         snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
         spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
-        rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
+        snapshots = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, snapshots)
+        rows = _crypto_decision_rows(snapshots, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
         if limit and limit > 0:
             rows = rows[-limit:]
@@ -4649,6 +4670,7 @@ def _crypto_live_market_row(
     *,
     spot_rows: list[CryptoSpotOHLCRecord] | None = None,
     cross_asset_spot: dict[str, list[CryptoSpotOHLCRecord]] | None = None,
+    funding_rate_rows: list[CryptoFundingRateRecord] | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
@@ -4701,6 +4723,12 @@ def _crypto_live_market_row(
         )
     )
     row.update(_cross_asset_context(cross_asset_spot or {}, decision_ts=now))
+    funding_by_asset: dict[str, list[CryptoFundingRateRecord]] = defaultdict(list)
+    for rate in funding_rate_rows or []:
+        funding_by_asset[rate.asset_symbol].append(rate)
+    for asset_rates in funding_by_asset.values():
+        asset_rates.sort(key=lambda r: r.settlement_ts)
+    row.update(_funding_rate_context_for_decision(funding_by_asset, market.asset_symbol, decision_ts=now))
     return row
 
 
@@ -5422,6 +5450,7 @@ def _crypto_decision_rows(
     candles: list[CryptoMarketCandlestickRecord],
     spot_rows: list[CryptoSpotOHLCRecord] | None = None,
     *,
+    funding_rate_rows: list[CryptoFundingRateRecord] | None = None,
     settings: Settings | None = None,
 ) -> list[dict[str, Any]]:
     candles_by_market: dict[str, list[CryptoMarketCandlestickRecord]] = defaultdict(list)
@@ -5436,6 +5465,12 @@ def _crypto_decision_rows(
         spot_by_asset[row.asset_symbol].append(row)
     for asset_rows in spot_by_asset.values():
         asset_rows.sort(key=lambda row: row.end_ts)
+    funding_by_asset: dict[str, list[CryptoFundingRateRecord]] = defaultdict(list)
+    for rate in funding_rate_rows or []:
+        funding_by_asset[rate.asset_symbol].append(rate)
+    # already oldest-first from list_crypto_funding_rates_bulk; sort to be safe
+    for asset_rates in funding_by_asset.values():
+        asset_rates.sort(key=lambda r: r.settlement_ts)
     spot_end_times_by_asset = {
         asset: [_as_utc_datetime(row.end_ts) for row in asset_rows]
         for asset, asset_rows in spot_by_asset.items()
@@ -5531,6 +5566,7 @@ def _crypto_decision_rows(
                 "candle_momentum_dollars": candle_momentum,
                 **spot_context,
                 **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
+                **_funding_rate_context_for_decision(funding_by_asset, snapshot.asset_symbol, decision_ts=decision_ts),
             }
         )
     for market_ticker, snapshot in settled_snapshots_by_market.items():
@@ -5594,6 +5630,7 @@ def _crypto_decision_rows(
                     "candle_momentum_dollars": candle_momentum,
                     **spot_context,
                     **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
+                    **_funding_rate_context_for_decision(funding_by_asset, snapshot.asset_symbol, decision_ts=decision_ts),
                 }
             )
     return _crypto_add_recent_asset_features(rows)
@@ -5875,6 +5912,49 @@ def _cross_asset_context(
     }
 
 
+def _funding_rate_context_for_decision(
+    funding_by_asset: dict[str, list[CryptoFundingRateRecord]],
+    asset_symbol: str,
+    *,
+    decision_ts: datetime,
+) -> dict[str, Any]:
+    decision_utc = _as_utc_datetime(decision_ts)
+    rows = funding_by_asset.get(asset_symbol) or []
+    # rows are pre-sorted oldest-first; find those settled at or before decision_ts
+    eligible = [r for r in rows if _as_utc_datetime(r.settlement_ts) <= decision_utc]
+    if not eligible:
+        return {"funding_rate_current": Decimal("0"), "funding_rate_delta": Decimal("0")}
+    current = eligible[-1].realized_rate
+    prior = eligible[-2].realized_rate if len(eligible) >= 2 else current
+    return {
+        "funding_rate_current": current,
+        "funding_rate_delta": current - prior,
+    }
+
+
+def _filter_snapshots_by_per_asset_funding_cutoff(
+    funding_rate_rows: list[CryptoFundingRateRecord],
+    snapshots: list,
+) -> list:
+    """Keep only snapshots at or after the earliest funding rate settlement for each asset.
+
+    Assets with no funding rate rows are excluded entirely, enforcing train/eval parity:
+    a row is included iff its asset has coverage AND observed_at >= that asset's first settlement.
+    """
+    cutoff_by_asset: dict[str, datetime] = {}
+    for _fr in funding_rate_rows:
+        _ts = _as_utc_datetime(_fr.settlement_ts)
+        if _fr.asset_symbol not in cutoff_by_asset or _ts < cutoff_by_asset[_fr.asset_symbol]:
+            cutoff_by_asset[_fr.asset_symbol] = _ts
+    if not cutoff_by_asset:
+        return snapshots
+    return [
+        s for s in snapshots
+        if cutoff_by_asset.get(s.asset_symbol) is not None
+        and _as_utc_datetime(s.observed_at) >= cutoff_by_asset[s.asset_symbol]
+    ]
+
+
 def _crypto_add_recent_asset_features(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ordered = sorted(rows, key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
     history: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -6001,6 +6081,8 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "btc_return_3_pct",
         "eth_return_1_pct",
         "eth_return_3_pct",
+        "funding_rate_current",
+        "funding_rate_delta",
     ]
     feature_names = [*numeric, *[f"asset={asset}" for asset in assets]]
     return {
@@ -6072,6 +6154,8 @@ def _crypto_raw_feature_vector(
     btc_return_3 = float(_decimal(row.get("btc_return_3_pct") or Decimal("0")))
     eth_return_1 = float(_decimal(row.get("eth_return_1_pct") or Decimal("0")))
     eth_return_3 = float(_decimal(row.get("eth_return_3_pct") or Decimal("0")))
+    funding_rate_current = float(_decimal(row.get("funding_rate_current") or Decimal("0")))
+    funding_rate_delta = float(_decimal(row.get("funding_rate_delta") or Decimal("0")))
     market_age_seconds = max(0.0, float(row.get("market_age_seconds") or 0))
     default_values = _crypto_default_values_for_asset(asset, defaults or {})
     recent_yes = row.get("asset_recent_yes_rate")
@@ -6129,6 +6213,8 @@ def _crypto_raw_feature_vector(
         "btc_return_3_pct": max(-0.10, min(0.10, btc_return_3)) * 10.0,
         "eth_return_1_pct": max(-0.05, min(0.05, eth_return_1)) * 20.0,
         "eth_return_3_pct": max(-0.10, min(0.10, eth_return_3)) * 10.0,
+        "funding_rate_current": max(-1.0, min(1.0, funding_rate_current / 0.003)),
+        "funding_rate_delta": max(-1.0, min(1.0, funding_rate_delta / 0.002)),
     }
     values: list[float] = [numeric_values[name] for name in schema.get("numeric_feature_names") or []]
     values.extend(1.0 if asset == category else 0.0 for category in schema.get("asset_categories") or [])

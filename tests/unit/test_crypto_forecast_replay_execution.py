@@ -2329,11 +2329,13 @@ def test_crypto_feature_vector_is_deterministic_and_point_in_time(tmp_path) -> N
     first = _crypto_raw_feature_vector(rows[0], schema)
     second = _crypto_raw_feature_vector(rows[0], schema)
 
-    assert schema["feature_schema_version"] == "crypto-rich-v4"
+    assert schema["feature_schema_version"] == "crypto-rich-v5"
     assert schema["asset_categories"] == ["BTC", "ETH"]
     assert "spot_return_3_pct" in schema["feature_names"]
     assert "time_to_close_bucket_0_5m" in schema["feature_names"]
     assert "quote_source_snapshot_quotes" in schema["feature_names"]
+    assert "funding_rate_current" in schema["feature_names"]
+    assert "funding_rate_delta" in schema["feature_names"]
     assert first == second
     assert len(first) == len(schema["feature_names"])
     proxy = _crypto_raw_feature_vector(rows[1], schema)
@@ -2385,7 +2387,7 @@ def test_crypto_serialized_logistic_prediction_is_stable(tmp_path) -> None:
         "calibrated_weighted_ensemble",
         "market_mid_baseline",
     }
-    assert model["feature_schema_version"] == "crypto-rich-v4"
+    assert model["feature_schema_version"] == "crypto-rich-v5"
     assert model["candidate_report"]["primary_metric"] == "oos_candidate_net_pnl"
     assert first == second
     assert Decimal("0.0100") <= first <= Decimal("0.9900")

@@ -201,7 +201,16 @@ python -m kalshi_bot.cli crypto-spot backfill-funding-rates --kalshi-env product
 python -m kalshi_bot.cli crypto-spot collect-funding-rates --kalshi-env production --json
 ```
 
-Funding rates are stored in the `crypto_funding_rates` table (migration `20260516_0032`). Features (`funding_rate_current`, `funding_rate_delta`) will be added to the model in v5 after backfill is verified.
+Funding rates are stored in the `crypto_funding_rates` table (migration `20260516_0032`). Two features are derived from these rates and included in the **v5** feature schema (`crypto-rich-v5`):
+
+| Feature | Description | Scale |
+| --- | --- | --- |
+| `funding_rate_current` | Most-recent settled `realized_rate` at or before `decision_ts` | Clamped to ±0.003, scaled ×333 → `[-1, 1]` |
+| `funding_rate_delta` | `funding_rate_current` minus the prior settlement's rate | Clamped to ±0.002, scaled ×500 → `[-1, 1]` |
+
+**Training cutoff**: Training rows are filtered per-asset to `observed_at >= earliest_settlement_ts` for that asset. Assets with no funding rate history are excluded from v5 training entirely. OKX coverage starts ~2026-02-12 for BTC/ETH/SOL/XRP/BNB/DOGE; HYPE may have a later start date — the per-asset filter handles this automatically.
+
+**Backward compatibility**: v4 artifacts (trained before this change) continue to work during the v5 rollout. `_predict_crypto_probability` reads `feature_names` from the stored artifact, not the global constant, so v4 models ignore the new features until retrained.
 
 ### Quote Evidence
 

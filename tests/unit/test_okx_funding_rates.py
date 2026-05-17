@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kalshi_bot.config import Settings
-from kalshi_bot.crypto.services import CryptoSpotService
+from kalshi_bot.crypto.services import CryptoSpotService, _filter_snapshots_by_per_asset_funding_cutoff, _funding_rate_context_for_decision
 from kalshi_bot.db.models import CryptoFundingRateRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -286,3 +286,159 @@ class TestListCryptoFundingRates:
 
         # SQLite strips tzinfo; compare as naive UTC datetimes
         assert rows[0].settlement_ts > rows[1].settlement_ts > rows[2].settlement_ts  # all naive from SQLite
+
+
+def _make_rate_record(asset: str, settlement_ts: datetime, realized_rate: str) -> CryptoFundingRateRecord:
+    record = MagicMock(spec=CryptoFundingRateRecord)
+    record.provider = "okx"
+    record.asset_symbol = asset
+    record.quote_currency = "USDT"
+    record.settlement_ts = settlement_ts
+    record.funding_rate = Decimal(realized_rate)
+    record.realized_rate = Decimal(realized_rate)
+    record.payload = {}
+    return record
+
+
+class TestFundingRateContextForDecision:
+    def _make_index(self, records: list[CryptoFundingRateRecord]) -> dict:
+        from collections import defaultdict
+        idx: dict = defaultdict(list)
+        for r in records:
+            idx[r.asset_symbol].append(r)
+        for v in idx.values():
+            v.sort(key=lambda r: r.settlement_ts)
+        return idx
+
+    def test_empty_rows_returns_zeros(self):
+        ts = datetime(2026, 5, 17, 9, 0, tzinfo=UTC)
+        result = _funding_rate_context_for_decision({}, "BTC", decision_ts=ts)
+        assert result["funding_rate_current"] == Decimal("0")
+        assert result["funding_rate_delta"] == Decimal("0")
+
+    def test_single_row_returns_current_and_zero_delta(self):
+        ts_settle = datetime(2026, 5, 17, 8, 0, tzinfo=UTC)
+        ts_decision = datetime(2026, 5, 17, 9, 0, tzinfo=UTC)
+        records = [_make_rate_record("BTC", ts_settle, "0.0001")]
+        idx = self._make_index(records)
+        result = _funding_rate_context_for_decision(idx, "BTC", decision_ts=ts_decision)
+        assert result["funding_rate_current"] == Decimal("0.0001")
+        assert result["funding_rate_delta"] == Decimal("0")
+
+    def test_two_rows_computes_delta(self):
+        t1 = datetime(2026, 5, 17, 0, 0, tzinfo=UTC)
+        t2 = datetime(2026, 5, 17, 8, 0, tzinfo=UTC)
+        t_decision = datetime(2026, 5, 17, 9, 0, tzinfo=UTC)
+        records = [
+            _make_rate_record("BTC", t1, "0.0001"),
+            _make_rate_record("BTC", t2, "0.0003"),
+        ]
+        idx = self._make_index(records)
+        result = _funding_rate_context_for_decision(idx, "BTC", decision_ts=t_decision)
+        assert result["funding_rate_current"] == Decimal("0.0003")
+        assert result["funding_rate_delta"] == Decimal("0.0002")
+
+    def test_negative_delta(self):
+        t1 = datetime(2026, 5, 17, 0, 0, tzinfo=UTC)
+        t2 = datetime(2026, 5, 17, 8, 0, tzinfo=UTC)
+        t_decision = datetime(2026, 5, 17, 10, 0, tzinfo=UTC)
+        records = [
+            _make_rate_record("BTC", t1, "0.0005"),
+            _make_rate_record("BTC", t2, "-0.0001"),
+        ]
+        idx = self._make_index(records)
+        result = _funding_rate_context_for_decision(idx, "BTC", decision_ts=t_decision)
+        assert result["funding_rate_current"] == Decimal("-0.0001")
+        assert result["funding_rate_delta"] == Decimal("-0.0006")
+
+    def test_decision_before_all_settlements_returns_zeros(self):
+        t_settle = datetime(2026, 5, 17, 8, 0, tzinfo=UTC)
+        t_decision = datetime(2026, 5, 17, 7, 59, tzinfo=UTC)
+        records = [_make_rate_record("BTC", t_settle, "0.0001")]
+        idx = self._make_index(records)
+        result = _funding_rate_context_for_decision(idx, "BTC", decision_ts=t_decision)
+        assert result["funding_rate_current"] == Decimal("0")
+        assert result["funding_rate_delta"] == Decimal("0")
+
+    def test_unknown_asset_returns_zeros(self):
+        t_settle = datetime(2026, 5, 17, 8, 0, tzinfo=UTC)
+        t_decision = datetime(2026, 5, 17, 9, 0, tzinfo=UTC)
+        records = [_make_rate_record("BTC", t_settle, "0.0001")]
+        idx = self._make_index(records)
+        result = _funding_rate_context_for_decision(idx, "ETH", decision_ts=t_decision)
+        assert result["funding_rate_current"] == Decimal("0")
+        assert result["funding_rate_delta"] == Decimal("0")
+
+    def test_uses_only_rows_at_or_before_decision_ts(self):
+        t1 = datetime(2026, 5, 17, 0, 0, tzinfo=UTC)
+        t2 = datetime(2026, 5, 17, 8, 0, tzinfo=UTC)
+        t3 = datetime(2026, 5, 17, 16, 0, tzinfo=UTC)
+        t_decision = datetime(2026, 5, 17, 9, 0, tzinfo=UTC)
+        records = [
+            _make_rate_record("BTC", t1, "0.0001"),
+            _make_rate_record("BTC", t2, "0.0002"),
+            _make_rate_record("BTC", t3, "0.9999"),  # future — must be excluded
+        ]
+        idx = self._make_index(records)
+        result = _funding_rate_context_for_decision(idx, "BTC", decision_ts=t_decision)
+        assert result["funding_rate_current"] == Decimal("0.0002")
+        assert result["funding_rate_delta"] == Decimal("0.0001")
+
+
+def _make_snapshot(asset: str, observed_at: datetime):
+    s = MagicMock()
+    s.asset_symbol = asset
+    s.observed_at = observed_at
+    return s
+
+
+class TestPerAssetFundingRateCutoff:
+    """Tests for the per-asset cutoff filter applied in train() and _build_report()."""
+
+    def test_assets_without_funding_rates_are_excluded(self):
+        btc_start = datetime(2026, 2, 12, 0, 0, tzinfo=UTC)
+        rate_rows = [_make_rate_record("BTC", btc_start, "0.0001")]
+        snapshots = [
+            _make_snapshot("BTC", btc_start + timedelta(days=1)),
+            _make_snapshot("ETH", btc_start + timedelta(days=1)),  # no rates for ETH
+        ]
+        result = _filter_snapshots_by_per_asset_funding_cutoff(rate_rows, snapshots)
+        assert all(s.asset_symbol == "BTC" for s in result)
+        assert len(result) == 1
+
+    def test_per_asset_cutoff_does_not_bleed_across_assets(self):
+        # BTC has earlier start than HYPE; BTC's cutoff must not trim HYPE rows
+        btc_start = datetime(2026, 2, 12, 0, 0, tzinfo=UTC)
+        hype_start = datetime(2026, 3, 1, 0, 0, tzinfo=UTC)
+        rate_rows = [
+            _make_rate_record("BTC", btc_start, "0.0001"),
+            _make_rate_record("HYPE", hype_start, "0.0002"),
+        ]
+        # HYPE snapshot at 2026-02-20 — before HYPE start, but after BTC start
+        hype_before_cutoff = _make_snapshot("HYPE", datetime(2026, 2, 20, 0, 0, tzinfo=UTC))
+        hype_after_cutoff = _make_snapshot("HYPE", datetime(2026, 3, 5, 0, 0, tzinfo=UTC))
+        btc_row = _make_snapshot("BTC", datetime(2026, 2, 15, 0, 0, tzinfo=UTC))
+        snapshots = [hype_before_cutoff, hype_after_cutoff, btc_row]
+        result = _filter_snapshots_by_per_asset_funding_cutoff(rate_rows, snapshots)
+        assert hype_before_cutoff not in result
+        assert hype_after_cutoff in result
+        assert btc_row in result
+
+    def test_rows_before_per_asset_cutoff_are_excluded(self):
+        start = datetime(2026, 2, 15, 0, 0, tzinfo=UTC)
+        rate_rows = [_make_rate_record("BTC", start, "0.0001")]
+        before = _make_snapshot("BTC", start - timedelta(hours=1))
+        at = _make_snapshot("BTC", start)
+        after = _make_snapshot("BTC", start + timedelta(days=1))
+        result = _filter_snapshots_by_per_asset_funding_cutoff(rate_rows, [before, at, after])
+        assert before not in result
+        assert at in result
+        assert after in result
+
+    def test_no_funding_rate_rows_returns_all_snapshots_unchanged(self):
+        snapshots = [
+            _make_snapshot("BTC", datetime(2026, 5, 1, 0, 0, tzinfo=UTC)),
+            _make_snapshot("ETH", datetime(2026, 5, 1, 0, 0, tzinfo=UTC)),
+        ]
+        result = _filter_snapshots_by_per_asset_funding_cutoff([], snapshots)
+        assert result == snapshots

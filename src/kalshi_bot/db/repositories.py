@@ -1248,6 +1248,19 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         stmt = stmt.order_by(CryptoFundingRateRecord.settlement_ts.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
+    async def list_crypto_funding_rates_bulk(
+        self,
+        *,
+        asset_symbols: list[str] | None = None,
+        limit: int = 50_000,
+    ) -> list[CryptoFundingRateRecord]:
+        """Return funding rates for multiple assets oldest-first, for bulk training use."""
+        stmt = select(CryptoFundingRateRecord)
+        if asset_symbols:
+            stmt = stmt.where(CryptoFundingRateRecord.asset_symbol.in_(asset_symbols))
+        stmt = stmt.order_by(CryptoFundingRateRecord.settlement_ts.asc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
     async def record_crypto_model_artifact(
         self,
         *,
