@@ -902,6 +902,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         asset_symbol: str | None = None,
         asset_symbols: list[str] | None = None,
         since: datetime | None = None,
+        settled_only: bool = False,
         limit: int = 1000,
     ) -> list[CryptoMarketSnapshotRecord]:
         stmt = select(CryptoMarketSnapshotRecord).where(
@@ -918,6 +919,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
+        if settled_only:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.settlement_result.isnot(None))
         stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 

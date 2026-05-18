@@ -2087,6 +2087,7 @@ class CryptoForecastService:
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbols=requested_assets or None,
+                settled_only=True,
                 limit=100_000,
             )
             candles = await repo.list_crypto_market_candlesticks(
