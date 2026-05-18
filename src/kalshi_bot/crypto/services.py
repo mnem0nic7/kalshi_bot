@@ -2078,6 +2078,9 @@ class CryptoForecastService:
     async def train(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
+
+        # Read phase — close session before heavy compute so the connection
+        # is not held idle in transaction during multi-hour fitting.
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             rows = await repo.list_crypto_market_snapshots(
@@ -2103,48 +2106,54 @@ class CryptoForecastService:
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
-            rows = _filter_crypto_snapshot_rows(rows, requested_assets)
-            candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-            spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
-            rows = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, rows)
-            decision_rows = _crypto_decision_rows(rows, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
-            sample_count = len(decision_rows)
-            payload = _fit_crypto_calibration(decision_rows, settings=self.settings, crypto_policy=crypto_policy)
-            metrics = _crypto_model_metrics(decision_rows, payload, settings=self.settings, crypto_policy=crypto_policy)
-            status = "trained" if sample_count >= self.settings.crypto_min_training_samples else "insufficient_data"
-            artifact_payload = {
-                **payload,
-                "frequency": freq,
-                "asset_symbols": requested_assets,
-                "trained_from": "point_in_time_crypto_snapshots_and_candles",
-                "feature_set": [
-                    "market_mid_logit",
-                    "asset",
-                    "time_to_close",
-                    "time_to_close_bucket",
-                    "market_age",
-                    "target_price",
-                    "execution_price",
-                    "spread",
-                    "quote_source",
-                    "proxy_quote_flag",
-                    "mid",
-                    "volume",
-                    "open_interest",
-                    "candlestick_momentum",
-                    "spot_moneyness",
-                    "spot_momentum",
-                    "spot_return_windows",
-                    "spot_realized_volatility",
-                    "spot_target_distance_volatility",
-                    "kalshi_mid_spot_gap",
-                    "recent_same_asset_behavior",
-                    "funding_rate",
-                ],
-                "metrics_scope": metrics.get("validation_scope") or "walk_forward_time_ordered",
-                "candidate_registry_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
-                "dependency_versions": _crypto_dependency_versions(),
-            }
+
+        # Compute phase — no DB connection held open.
+        rows = _filter_crypto_snapshot_rows(rows, requested_assets)
+        candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+        rows = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, rows)
+        decision_rows = _crypto_decision_rows(rows, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
+        sample_count = len(decision_rows)
+        payload = _fit_crypto_calibration(decision_rows, settings=self.settings, crypto_policy=crypto_policy)
+        metrics = _crypto_model_metrics(decision_rows, payload, settings=self.settings, crypto_policy=crypto_policy)
+        status = "trained" if sample_count >= self.settings.crypto_min_training_samples else "insufficient_data"
+        artifact_payload = {
+            **payload,
+            "frequency": freq,
+            "asset_symbols": requested_assets,
+            "trained_from": "point_in_time_crypto_snapshots_and_candles",
+            "feature_set": [
+                "market_mid_logit",
+                "asset",
+                "time_to_close",
+                "time_to_close_bucket",
+                "market_age",
+                "target_price",
+                "execution_price",
+                "spread",
+                "quote_source",
+                "proxy_quote_flag",
+                "mid",
+                "volume",
+                "open_interest",
+                "candlestick_momentum",
+                "spot_moneyness",
+                "spot_momentum",
+                "spot_return_windows",
+                "spot_realized_volatility",
+                "spot_target_distance_volatility",
+                "kalshi_mid_spot_gap",
+                "recent_same_asset_behavior",
+                "funding_rate",
+            ],
+            "metrics_scope": metrics.get("validation_scope") or "walk_forward_time_ordered",
+            "candidate_registry_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
+            "dependency_versions": _crypto_dependency_versions(),
+        }
+
+        # Write phase — fresh short-lived session for the artifact insert.
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
                 artifact_type=_crypto_artifact_type("model", requested_assets),
