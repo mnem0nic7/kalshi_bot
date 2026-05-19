@@ -807,3 +807,11 @@ async def test_crypto_spot_service_proxy_fallback_requires_explicit_opt_in(tmp_p
     assert result["proxy_fallback_enabled"] is True
     assert result["stored"] == 1
     assert result["providers"]["coingecko"]["stored"] == 1
+
+
+def test_ada_and_bch_have_spot_feed_entries() -> None:
+    from kalshi_bot.integrations.crypto_spot import COINBASE_PRODUCT_IDS, COINGECKO_IDS
+
+    for asset in ("ADA", "BCH"):
+        assert asset in COINBASE_PRODUCT_IDS, f"{asset} missing from COINBASE_PRODUCT_IDS"
+        assert asset in COINGECKO_IDS, f"{asset} missing from COINGECKO_IDS"

@@ -17,6 +17,8 @@ import httpx
 
 
 COINBASE_PRODUCT_IDS = {
+    "ADA": "ADA-USD",
+    "BCH": "BCH-USD",
     "BNB": "BNB-USD",
     "BTC": "BTC-USD",
     "DOGE": "DOGE-USD",
@@ -27,6 +29,8 @@ COINBASE_PRODUCT_IDS = {
 }
 
 COINGECKO_IDS = {
+    "ADA": "cardano",
+    "BCH": "bitcoin-cash",
     "BNB": "binancecoin",
     "BTC": "bitcoin",
     "DOGE": "dogecoin",
