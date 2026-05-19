@@ -20,7 +20,7 @@ from kalshi_bot.db.models import (
 )
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
-from kalshi_bot.services.overnight_readiness import OvernightReadinessService, OvernightWindow
+from kalshi_bot.services.overnight_readiness import CRYPTO_MARKET_PREFIXES, OvernightReadinessService, OvernightWindow
 
 
 NOW = datetime(2026, 5, 10, 14, 0, tzinfo=UTC)
@@ -320,3 +320,10 @@ async def test_crypto_readiness_scopes_blockers_to_live_assets(tmp_path) -> None
     assert "crypto_aggregate_replay_gate_not_passed" in warning_codes
     assert "crypto_asset_mode_not_live_eth" not in codes
     assert "crypto_replay_gate_not_passed" not in codes
+
+
+def test_new_series_tickers_recognized_as_crypto() -> None:
+    for ticker in ("KXADA15M", "KXADA15M-26MAY01-B0.5", "KXBCH15M", "BTCI", "BTCI-26MAY01-T50000"):
+        assert any(ticker.startswith(p) for p in CRYPTO_MARKET_PREFIXES), (
+            f"{ticker!r} not recognized as crypto by CRYPTO_MARKET_PREFIXES"
+        )
