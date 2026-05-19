@@ -237,7 +237,7 @@ class Settings(BaseSettings):
     crypto_last_minute_passive_enabled: bool = True
     crypto_last_minute_passive_assets: str = "live"
     crypto_last_minute_passive_max_seconds_to_close: int = 60
-    crypto_last_minute_passive_bid_by_asset: str = "BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84"
+    crypto_last_minute_passive_bid_by_asset: str = "BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84,ADA:0.54,BCH:0.54"
     crypto_last_minute_passive_require_no_cross: bool = True
     crypto_last_minute_passive_risk_mode: str = "normal_cap"
     crypto_last_minute_passive_price_matrix_enabled: bool = True
@@ -300,7 +300,7 @@ class Settings(BaseSettings):
     crypto_model_nightly_hour_local: int = 3
     crypto_model_nightly_min_new_strict_rows: int = 60
     crypto_model_nightly_max_age_hours: int = 24
-    crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE"
+    crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE,ADA,BCH"
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False
