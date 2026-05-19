@@ -116,3 +116,7 @@ def test_candlestick_normalization_accepts_official_nested_shape() -> None:
     assert candle["open_dollars"] == Decimal("0.4900")
     assert candle["close_dollars"] == Decimal("0.5100")
     assert candle["volume"] == 12
+
+
+def test_btci_ticker_resolves_to_btc_via_alias() -> None:
+    assert asset_symbol_from_series({"ticker": "BTCI", "category": "Crypto", "frequency": "hourly"}) == "BTC"
