@@ -1106,7 +1106,7 @@ class CryptoHistoryService:
                     repo,
                     market,
                     source_kind="historical" if market.market_ticker in historical_tickers else "live",
-                    observed_at=market.close_time or datetime.now(UTC),
+                    observed_at=_crypto_bootstrap_observed_at(market),
                 )
                 if index % commit_batch_size == 0:
                     await session.commit()
@@ -5541,6 +5541,14 @@ def _crypto_settlement_observed_at(market: CryptoMarket) -> datetime:
         if parsed is not None:
             return parsed
     return market.expected_expiration_time or market.close_time or datetime.now(UTC)
+
+
+def _crypto_bootstrap_observed_at(market: CryptoMarket, *, now: datetime | None = None) -> datetime:
+    current = now or datetime.now(UTC)
+    close_time = market.close_time
+    if close_time is None:
+        return current
+    return min(close_time, current)
 
 
 def _crypto_spot_max_stale_seconds(
