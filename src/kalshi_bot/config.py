@@ -175,7 +175,7 @@ class Settings(BaseSettings):
     kalshi_rest_rate_limit_per_second: float = 8.0
     kalshi_rest_rate_limit_burst: int = 16
     crypto_trading_enabled: bool = False
-    crypto_history_lookback_days: int = 180
+    crypto_history_lookback_days: int = 365
     crypto_collect_settled_candles_enabled: bool = True
     crypto_settled_pagination_stop_at_cutoff: bool = False
     crypto_historical_pagination_stop_at_cutoff: bool = False
