@@ -10,6 +10,7 @@ from kalshi_bot.crypto.models import CryptoMarket, CryptoSeries
 
 FIFTEEN_MIN_ALIASES = {"15m", "15min", "fifteen_min", "fifteen-minute", "fifteen_minute"}
 ASSET_SYMBOL_ALIASES = {
+    "BTCC": "BTC",
     "BTCI": "BTC",
     "RIPPLE": "XRP",
     "SOLE": "SOL",

@@ -120,3 +120,7 @@ def test_candlestick_normalization_accepts_official_nested_shape() -> None:
 
 def test_btci_ticker_resolves_to_btc_via_alias() -> None:
     assert asset_symbol_from_series({"ticker": "BTCI", "category": "Crypto", "frequency": "hourly"}) == "BTC"
+
+
+def test_kxbtcc_ticker_resolves_to_btc_via_alias() -> None:
+    assert asset_symbol_from_series({"ticker": "KXBTCC", "category": "Crypto", "frequency": "hourly"}) == "BTC"
