@@ -1801,7 +1801,10 @@ async def test_daemon_crypto_model_nightly_skips_fresh_assets(tmp_path) -> None:
                 frequency="15m",
                 artifact_type=f"model:{asset}",
                 version="v1",
-                status="ready",
+                # Real models are recorded with status "trained" (see
+                # CryptoForecastService), never "ready" — the gate must treat a
+                # fresh "trained" model as present and skip it.
+                status="trained",
                 sample_count=1000,
                 metrics={},
                 payload={},
@@ -1826,6 +1829,54 @@ async def test_daemon_crypto_model_nightly_skips_fresh_assets(tmp_path) -> None:
     assert len(forecast_svc.train_calls) == 0
     assert len(replay_svc.run_calls) == 0
     assert len(replay_svc.gate_calls) == 0
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_daemon_crypto_model_nightly_does_not_retry_data_starved_assets(tmp_path) -> None:
+    """A model that failed to train for lack of data (status "insufficient_data")
+    must stay dormant on subsequent nights — re-attempted only when genuinely new
+    strict-as-of rows arrive. This is what keeps assets like BNB 1h (no settled
+    markets) from failing training every single night."""
+    settings = _crypto_nightly_settings(tmp_path, db_name="crypto-nightly-starved.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    now = datetime(2026, 5, 17, 4, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        for asset in ("BTC", "ETH"):
+            await repo.record_crypto_model_artifact(
+                frequency="15m",
+                artifact_type=f"model:{asset}",
+                version="v1",
+                status="insufficient_data",
+                sample_count=0,
+                metrics={},
+                payload={},
+                kalshi_env="demo",
+                trained_at=now - timedelta(hours=48),  # well past max_age, but no data
+            )
+        await session.commit()
+
+    # BTC still has no new strict rows -> stays dormant; ETH crossed the threshold
+    # -> gets a fresh attempt.
+    history_svc = FakeCryptoHistoryServiceForNightly(strict_rows_by_asset={"BTC": 4, "ETH": 75})
+    forecast_svc = FakeCryptoForecastServiceForNightly()
+    replay_svc = FakeCryptoReplayServiceForNightly()
+
+    daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc)
+    daemon._utc_now = lambda: now  # type: ignore[method-assign]
+
+    payload = await daemon.heartbeat_once()
+
+    result = payload["crypto_model_nightly"]
+    # BTC dormant despite being "aged out" — no new data; ETH refreshed on new data.
+    assert result["asset_decisions"] == {"15m": {"BTC": "skipped_fresh", "ETH": "refreshed"}}
+    assert result["refreshed_count"] == 1
+    assert [c.get("asset_symbols") for c in forecast_svc.train_calls] == [["ETH"]]
 
     await engine.dispose()
 
