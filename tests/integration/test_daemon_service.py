@@ -1758,7 +1758,7 @@ async def test_daemon_crypto_model_nightly_refreshes_missing_assets(tmp_path) ->
     assert "crypto_model_nightly" in payload
     result = payload["crypto_model_nightly"]
     assert result["refreshed_count"] == 2
-    assert result["asset_decisions"] == {"BTC": "refreshed", "ETH": "refreshed"}
+    assert result["asset_decisions"] == {"15m": {"BTC": "refreshed", "ETH": "refreshed"}}
     assert len(history_svc.collect_settled_calls) == 2
     assert len(history_svc.bootstrap_calls) == 2
     assert len(forecast_svc.train_calls) == 2
@@ -1822,7 +1822,7 @@ async def test_daemon_crypto_model_nightly_skips_fresh_assets(tmp_path) -> None:
 
     result = payload["crypto_model_nightly"]
     assert result["refreshed_count"] == 0
-    assert result["asset_decisions"] == {"BTC": "skipped_fresh", "ETH": "skipped_fresh"}
+    assert result["asset_decisions"] == {"15m": {"BTC": "skipped_fresh", "ETH": "skipped_fresh"}}
     assert len(forecast_svc.train_calls) == 0
     assert len(replay_svc.run_calls) == 0
     assert len(replay_svc.gate_calls) == 0
@@ -1864,7 +1864,7 @@ async def test_daemon_crypto_model_nightly_aged_out_triggers_refresh(tmp_path) -
 
     payload = await daemon.heartbeat_once()
 
-    assert payload["crypto_model_nightly"]["asset_decisions"] == {"BTC": "refreshed"}
+    assert payload["crypto_model_nightly"]["asset_decisions"] == {"15m": {"BTC": "refreshed"}}
     assert len(forecast_svc.train_calls) == 1
 
     await engine.dispose()
@@ -1889,8 +1889,8 @@ async def test_daemon_crypto_model_nightly_error_isolation(tmp_path) -> None:
     payload = await daemon.heartbeat_once()
 
     result = payload["crypto_model_nightly"]
-    assert result["asset_decisions"]["BTC"] == "error"
-    assert result["asset_decisions"]["ETH"] == "refreshed"
+    assert result["asset_decisions"]["15m"]["BTC"] == "error"
+    assert result["asset_decisions"]["15m"]["ETH"] == "refreshed"
     assert result["refreshed_count"] == 1
     # Final pooled gate still runs for the refreshed asset
     assert len(replay_svc.gate_calls) >= 2

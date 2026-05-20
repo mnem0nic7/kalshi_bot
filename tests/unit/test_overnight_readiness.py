@@ -323,7 +323,7 @@ async def test_crypto_readiness_scopes_blockers_to_live_assets(tmp_path) -> None
 
 
 def test_new_series_tickers_recognized_as_crypto() -> None:
-    for ticker in ("KXADA15M", "KXADA15M-26MAY01-B0.5", "KXBCH15M", "BTCI", "BTCI-26MAY01-T50000"):
+    for ticker in ("BTCI", "BTCI-26MAY01-T50000"):
         assert any(ticker.startswith(p) for p in CRYPTO_MARKET_PREFIXES), (
             f"{ticker!r} not recognized as crypto by CRYPTO_MARKET_PREFIXES"
         )

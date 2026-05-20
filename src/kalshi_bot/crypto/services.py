@@ -7,6 +7,7 @@ import importlib.metadata as importlib_metadata
 import json
 import logging
 import math
+import os
 from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
@@ -1914,13 +1915,13 @@ class CryptoSpotService:
             return sorted({normalize_asset_symbol(symbol) for symbol in asset_symbols})
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
-            snapshots = await repo.list_crypto_market_snapshots(
+            symbols = await repo.list_crypto_snapshot_asset_symbols(
                 frequency=frequency,
                 kalshi_env=self.settings.kalshi_env,
-                limit=100_000,
+                since=datetime.now(UTC) - timedelta(days=7),
             )
             await session.commit()
-        discovered = {row.asset_symbol for row in snapshots}
+        discovered = set(symbols)
         discovered.update(COINBASE_PRODUCT_IDS)
         if self.settings.crypto_spot_proxy_fallback_enabled:
             discovered.update(COINGECKO_IDS)
@@ -1987,25 +1988,30 @@ class CryptoForecastService:
     async def train(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
+        lookback_days = max(1, int(self.settings.crypto_train_lookback_days))
+        since = datetime.now(UTC) - timedelta(days=lookback_days)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            rows = await repo.list_crypto_market_snapshots(
+            rows = await repo.list_crypto_settled_market_snapshots(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbols=requested_assets or None,
-                limit=100_000,
+                since=since,
+                limit=self.settings.crypto_train_max_snapshots,
             )
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbols=requested_assets or None,
-                limit=200_000,
+                since=since,
+                limit=self.settings.crypto_train_max_candlesticks,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbols=requested_assets or None,
-                limit=500_000,
+                since=since,
+                limit=self.settings.crypto_train_max_spot_rows,
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
@@ -2066,6 +2072,7 @@ class CryptoForecastService:
             "kalshi_env": self.settings.kalshi_env,
             "asset_symbols": requested_assets,
             "version": artifact.version,
+            "sample_count": sample_count,
             "metrics": metrics,
             "payload": artifact_payload,
         }
@@ -6394,6 +6401,7 @@ def _fit_crypto_xgboost_model(
         import xgboost as xgb
     except Exception as exc:
         return {"name": "xgboost_classifier", "status": "unavailable", "reason": f"xgboost_unavailable:{exc}", "dependency_version": None}
+    device = os.environ.get("CRYPTO_XGBOOST_DEVICE", "cuda").strip().lower() or "cuda"
     try:
         classifier = xgb.XGBClassifier(
             n_estimators=80,
@@ -6405,6 +6413,7 @@ def _fit_crypto_xgboost_model(
             random_state=17,
             n_jobs=1,
             tree_method="hist",
+            device=device,
         )
         classifier.fit(raw_matrix, labels)
         booster = classifier.get_booster()
@@ -6426,6 +6435,7 @@ def _fit_crypto_xgboost_model(
                 "estimator": "XGBClassifier",
                 "random_state": 17,
                 "tree_method": "hist",
+                "device": device,
             },
             "feature_defaults": defaults,
             "fallback_model": fallback,

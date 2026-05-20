@@ -920,6 +920,61 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
+    async def list_crypto_settled_market_snapshots(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
+        since: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[CryptoMarketSnapshotRecord]:
+        """Return snapshots only for markets that actually settled.
+
+        A market counts as settled when any of its snapshots carries a
+        ``settlement_result`` of ``yes``/``no``. Unlike ``list_crypto_market_snapshots``,
+        which caps the most-recent N *raw* snapshots (mostly still-open markets),
+        this scopes to settled markets first so the ``limit`` governs the number
+        of trainable decision points rather than raw rows.
+        """
+        env = self._resolved_kalshi_env(kalshi_env)
+        settled_markets = select(CryptoMarketSnapshotRecord.market_ticker).where(
+            CryptoMarketSnapshotRecord.kalshi_env == env,
+            CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
+        )
+        if frequency is not None:
+            settled_markets = settled_markets.where(CryptoMarketSnapshotRecord.frequency == frequency)
+        stmt = select(CryptoMarketSnapshotRecord).where(
+            CryptoMarketSnapshotRecord.kalshi_env == env,
+            CryptoMarketSnapshotRecord.market_ticker.in_(settled_markets),
+        )
+        if frequency is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        if symbols:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
+        if since is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
+        stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def list_crypto_snapshot_asset_symbols(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        since: datetime | None = None,
+    ) -> list[str]:
+        stmt = select(CryptoMarketSnapshotRecord.asset_symbol).distinct().where(
+            CryptoMarketSnapshotRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+        )
+        if frequency is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
+        if since is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return sorted({row for row in rows if row})
+
     async def list_latest_crypto_market_snapshots(
         self,
         *,
