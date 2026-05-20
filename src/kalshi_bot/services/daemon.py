@@ -1509,6 +1509,36 @@ class DaemonService:
             "target_local": target_local,
         }
 
+    @staticmethod
+    def _crypto_model_refresh_reason(
+        *,
+        artifact_status: str | None,
+        trained_at: datetime | None,
+        now: datetime,
+        max_age: timedelta,
+        new_rows: int,
+        min_new_rows: int,
+    ) -> str | None:
+        """Decide whether the nightly should (re)train a model for one asset.
+
+        Returns the refresh reason, or ``None`` to skip. Note that successfully
+        trained models are recorded with status ``"trained"`` (never ``"ready"``);
+        a non-trained artifact such as ``"insufficient_data"`` means a prior
+        attempt found nothing to learn from, so we stay dormant until genuinely
+        new strict-as-of rows arrive rather than failing training every night.
+        """
+        has_new_data = new_rows >= min_new_rows
+        if artifact_status is None:
+            return "missing"
+        if artifact_status == "trained":
+            if trained_at is not None:
+                if trained_at.tzinfo is None:
+                    trained_at = trained_at.replace(tzinfo=UTC)
+                if (now - trained_at.astimezone(UTC)) > max_age:
+                    return "aged_out"
+            return "new_data" if has_new_data else None
+        return "new_data" if has_new_data else None
+
     async def _run_crypto_model_nightly_for_env(self, checkpoint_name: str) -> dict[str, Any]:
         assets = [a.strip().upper() for a in self.settings.crypto_model_nightly_assets.split(",") if a.strip()]
         max_age_td = timedelta(hours=self.settings.crypto_model_nightly_max_age_hours)
@@ -1519,10 +1549,25 @@ class DaemonService:
         total_refreshed = 0
 
         for frequency in frequencies:
-            status = await self.crypto_history_service.status(days=1, frequency=frequency)
+            # status() scans the large snapshots table; bound it so a slow/hung
+            # query degrades to age-based refresh rather than aborting the whole
+            # nightly (which would also skip writing the completion checkpoint).
             by_asset_rows: dict[str, int] = {}
-            for asset, info in status.get("quote_evidence", {}).get("trade_candidate_support_by_asset", {}).items():
-                by_asset_rows[asset.upper()] = int(info.get("strict_trade_eligible_rows") or 0)
+            try:
+                status = await asyncio.wait_for(
+                    self.crypto_history_service.status(days=1, frequency=frequency),
+                    timeout=self.settings.crypto_model_nightly_status_timeout_seconds,
+                )
+                for asset, info in status.get("quote_evidence", {}).get("trade_candidate_support_by_asset", {}).items():
+                    by_asset_rows[asset.upper()] = int(info.get("strict_trade_eligible_rows") or 0)
+            except Exception:
+                # Includes asyncio.TimeoutError. Intentionally broad: this is an
+                # optional optimization input, never a reason to skip the regen.
+                logger.warning(
+                    "crypto_model_nightly status() unavailable freq=%s; using age-based refresh only",
+                    frequency,
+                    exc_info=True,
+                )
 
             freq_decisions: dict[str, str] = {}
             refreshed_assets: list[str] = []
@@ -1539,19 +1584,14 @@ class DaemonService:
                     )
                     await session.commit()
 
-                if artifact is None or artifact.status != "ready":
-                    refresh_reason = "missing_or_not_ready"
-                else:
-                    trained_at = artifact.trained_at
-                    if trained_at is not None:
-                        if trained_at.tzinfo is None:
-                            trained_at = trained_at.replace(tzinfo=UTC)
-                        if (now - trained_at.astimezone(UTC)) > max_age_td:
-                            refresh_reason = "aged_out"
-                    if refresh_reason is None:
-                        new_rows = by_asset_rows.get(asset, 0)
-                        if new_rows >= self.settings.crypto_model_nightly_min_new_strict_rows:
-                            refresh_reason = "new_data"
+                refresh_reason = self._crypto_model_refresh_reason(
+                    artifact_status=(artifact.status if artifact is not None else None),
+                    trained_at=(artifact.trained_at if artifact is not None else None),
+                    now=now,
+                    max_age=max_age_td,
+                    new_rows=by_asset_rows.get(asset, 0),
+                    min_new_rows=self.settings.crypto_model_nightly_min_new_strict_rows,
+                )
 
                 if refresh_reason is None:
                     freq_decisions[asset] = "skipped_fresh"

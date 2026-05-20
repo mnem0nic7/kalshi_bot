@@ -309,6 +309,11 @@ class Settings(BaseSettings):
     crypto_model_nightly_min_new_strict_rows: int = 60
     crypto_model_nightly_max_age_hours: int = 24
     crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE"
+    # Upper bound on the per-frequency status() precondition the nightly runs
+    # before deciding what to refresh. status() is an analytics-grade scan of the
+    # large crypto_market_snapshots table; bounding it keeps a slow/hung query
+    # from wedging the entire regen (it degrades to age-based refresh instead).
+    crypto_model_nightly_status_timeout_seconds: float = 120.0
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False
