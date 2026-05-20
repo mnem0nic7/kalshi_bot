@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import Select, case, func, or_, select
+from sqlalchemy.orm import defer
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -902,6 +903,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         asset_symbols: list[str] | None = None,
         since: datetime | None = None,
         limit: int = 1000,
+        defer_payload: bool = False,
     ) -> list[CryptoMarketSnapshotRecord]:
         stmt = select(CryptoMarketSnapshotRecord).where(
             CryptoMarketSnapshotRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
@@ -917,6 +919,10 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
+        if defer_payload:
+            # Skip the large raw-response JSON for analytics callers that never
+            # read it — it dominates row width and TOAST/heap I/O on this table.
+            stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
         stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
@@ -1099,6 +1105,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         asset_symbols: list[str] | None = None,
         since: datetime | None = None,
         limit: int = 1000,
+        defer_payload: bool = False,
     ) -> list[CryptoMarketCandlestickRecord]:
         stmt = select(CryptoMarketCandlestickRecord).where(
             CryptoMarketCandlestickRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
@@ -1114,6 +1121,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketCandlestickRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts >= since)
+        if defer_payload:
+            stmt = stmt.options(defer(CryptoMarketCandlestickRecord.payload))
         stmt = stmt.order_by(CryptoMarketCandlestickRecord.end_period_ts.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
@@ -1212,6 +1221,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         since: datetime | None = None,
         until: datetime | None = None,
         limit: int = 1000,
+        defer_payload: bool = False,
     ) -> list[CryptoSpotOHLCRecord]:
         stmt = select(CryptoSpotOHLCRecord).where(
             CryptoSpotOHLCRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
@@ -1229,6 +1239,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoSpotOHLCRecord.end_ts >= since)
         if until is not None:
             stmt = stmt.where(CryptoSpotOHLCRecord.end_ts <= until)
+        if defer_payload:
+            stmt = stmt.options(defer(CryptoSpotOHLCRecord.payload))
         stmt = stmt.order_by(CryptoSpotOHLCRecord.end_ts.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
