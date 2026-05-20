@@ -6444,8 +6444,9 @@ def _fit_crypto_xgboost_model(
             "fallback_model": fallback,
             "training_cutoff": _crypto_training_cutoff(rows),
         }
+        raw_preds = booster.predict(xgb.DMatrix(raw_matrix))
         model["probability_calibration"] = _fit_probability_calibration(
-            [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
+            [_clamp_price(Decimal(str(float(p)))) for p in raw_preds],
             labels,
         )
         return {"name": "xgboost_classifier", "status": "available", "model": model, "dependency_version": getattr(xgb, "__version__", None)}
@@ -6498,8 +6499,9 @@ def _fit_crypto_lightgbm_model(
             "fallback_model": fallback,
             "training_cutoff": _crypto_training_cutoff(rows),
         }
+        raw_preds = booster.predict(raw_matrix)
         model["probability_calibration"] = _fit_probability_calibration(
-            [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
+            [_clamp_price(Decimal(str(float(p)))) for p in raw_preds],
             labels,
         )
         return {"name": "lightgbm_classifier", "status": "available", "model": model, "dependency_version": getattr(lgb, "__version__", None)}
