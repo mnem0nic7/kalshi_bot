@@ -6992,13 +6992,10 @@ def _crypto_in_sample_candidate_report(
     }
     guarded_entries, ensemble_weights = _crypto_add_ensemble_candidate(rows, guarded_entries, model_map)
     if settings is not None and ensemble_weights:
-        for row in rows:
-            trade = _simulate_crypto_trade(
-                row,
-                _crypto_predict_ensemble_from_models(row, model_map, ensemble_weights),
-                settings=settings,
-                crypto_policy=crypto_policy,
-            )
+        _ens_model = {"model_type": "calibrated_weighted_ensemble", "ensemble_weights": ensemble_weights, "member_models": model_map}
+        _ens_preds = _batch_predict_rows(rows, _ens_model)
+        for row, pred in zip(rows, _ens_preds):
+            trade = _simulate_crypto_trade(row, pred, settings=settings, crypto_policy=crypto_policy)
             if trade["status"] == "fillable":
                 trade_rows_by_name["calibrated_weighted_ensemble"].append({**row, "simulation": trade})
     guarded_entries = _crypto_attach_candidate_policy_metrics(guarded_entries, trade_rows_by_name, settings=settings)
@@ -7073,8 +7070,9 @@ def _crypto_model_candidate_report(
         )
         weights = dict(train_report.get("ensemble_weights") or {})
         if len(weights) >= 2:
-            for row in test_rows:
-                prediction = _crypto_predict_ensemble_from_models(row, available_models, weights)
+            _fold_ens_model = {"model_type": "calibrated_weighted_ensemble", "ensemble_weights": weights, "member_models": available_models}
+            _fold_ens_preds = _batch_predict_rows(test_rows, _fold_ens_model)
+            for row, prediction in zip(test_rows, _fold_ens_preds):
                 predictions_by_candidate["calibrated_weighted_ensemble"].append((prediction, int(row["label_yes"])))
                 if settings is not None:
                     trade = _simulate_crypto_trade(row, prediction, settings=settings, crypto_policy=crypto_policy)
@@ -7088,8 +7086,8 @@ def _crypto_model_candidate_report(
             if status.get("status") != "available" or status.get("model") is None:
                 unavailable_reasons.setdefault(name, str(status.get("reason") or "unavailable"))
                 continue
-            for row in test_rows:
-                prediction = _predict_crypto_probability(row, status["model"])
+            _cand_preds = _batch_predict_rows(test_rows, status["model"])
+            for row, prediction in zip(test_rows, _cand_preds):
                 predictions_by_candidate[name].append((prediction, int(row["label_yes"])))
                 if settings is not None:
                     trade = _simulate_crypto_trade(row, prediction, settings=settings, crypto_policy=crypto_policy)
@@ -7178,7 +7176,8 @@ def _crypto_add_ensemble_candidate(
             )
         )
         return entries, {}
-    predictions = [(_crypto_predict_ensemble_from_models(row, model_map, weights), int(row["label_yes"])) for row in rows]
+    _ens_model_for_metrics = {"model_type": "calibrated_weighted_ensemble", "ensemble_weights": weights, "member_models": model_map}
+    predictions = list(zip(_batch_predict_rows(rows, _ens_model_for_metrics), [int(row["label_yes"]) for row in rows]))
     ensemble_metrics = _probability_metrics_decimal(predictions)
     market_metrics = _metrics_for_candidate(entries, "market_mid_baseline")
     logistic_metrics = _metrics_for_candidate(entries, "sklearn_logistic")

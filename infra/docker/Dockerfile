@@ -12,6 +12,8 @@ RUN mkdir -p src/kalshi_bot && touch src/kalshi_bot/__init__.py \
     && pip install --no-cache-dir -e . \
     && rm -rf src
 
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
+
 # Copy source after deps are cached
 COPY src ./src
 COPY alembic ./alembic
