@@ -185,6 +185,14 @@ class Settings(BaseSettings):
     crypto_taker_fallback_close_seconds: int = 0
     crypto_live_min_market_age_seconds: int = 180
     crypto_min_training_samples: int = 250
+    # Training data window + caps. Snapshots are scoped to settled markets first
+    # (see PlatformRepository.list_crypto_settled_market_snapshots), so the cap
+    # governs trainable decision points rather than raw recent rows. Lookback
+    # bounds all three sources to a time window to keep memory predictable.
+    crypto_train_lookback_days: int = 365
+    crypto_train_max_snapshots: int = 500_000
+    crypto_train_max_candlesticks: int = 500_000
+    crypto_train_max_spot_rows: int = 600_000
     crypto_replay_min_resolved_markets: int = 500
     crypto_replay_min_trade_candidates: int = 50
     crypto_replay_min_net_pl_dollars: float = 0.0
@@ -237,7 +245,7 @@ class Settings(BaseSettings):
     crypto_last_minute_passive_enabled: bool = True
     crypto_last_minute_passive_assets: str = "live"
     crypto_last_minute_passive_max_seconds_to_close: int = 60
-    crypto_last_minute_passive_bid_by_asset: str = "BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84,ADA:0.54,BCH:0.54"
+    crypto_last_minute_passive_bid_by_asset: str = "BTC:0.55,ETH:0.54,XRP:0.54,SOL:0.63,DOGE:0.65,BNB:0.77,HYPE:0.84"
     crypto_last_minute_passive_require_no_cross: bool = True
     crypto_last_minute_passive_risk_mode: str = "normal_cap"
     crypto_last_minute_passive_price_matrix_enabled: bool = True
@@ -300,7 +308,7 @@ class Settings(BaseSettings):
     crypto_model_nightly_hour_local: int = 3
     crypto_model_nightly_min_new_strict_rows: int = 60
     crypto_model_nightly_max_age_hours: int = 24
-    crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE,ADA,BCH"
+    crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE"
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False

@@ -35,8 +35,12 @@ kalshi-bot-cli <subcommand>   # see README for the full list
 
 No linter/formatter is configured in `pyproject.toml`. Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. The global `conftest.py` sets `WEB_AUTH_ENABLED=false` as an autouse fixture, so integration tests skip HTTP basic-auth without extra setup.
 
+Test tiers: `tests/unit/` is fast and runs on SQLite (no `pgvector`); `tests/integration/` exercises the supervisor, services, and `AppContainer` wiring; `tests/browser/` is Playwright-driven layout regression on the control room. Place new tests in the lowest tier that can exercise the behavior.
+
 ### Docker workflow
 The compose file lives at `infra/docker-compose.yml`. Copy `.env.example` to `.env` before first run. Postgres runs as two separate services (`postgres_demo` / `postgres_production`); migrations are separate `migrate_demo` / `migrate_production` services. App and daemon containers follow the pattern `{app|daemon}_{demo|production}_{blue|green}`.
+
+When force-recreating an app or daemon container, pass `--env-file .env` explicitly (e.g. `docker compose --env-file .env -f infra/docker-compose.yml up -d --force-recreate --no-deps app_production_blue`). Without it, the container boots with stale env from the original `up` invocation.
 
 ## Architecture
 
@@ -92,10 +96,12 @@ A self-contained parallel trading stack for crypto prediction markets, mirroring
 - `models.py` / `parsing.py` — `CryptoMarket`, `CryptoSeries`, candlestick normalization
 All crypto services are wired through `AppContainer` alongside weather services.
 
+`CryptoExecutionService` is the only path to Kalshi crypto write endpoints (parallel to weather's `ExecutionService`); it shares the same kill-switch + deployment-color checks. `CryptoAutonomyService` runs continuously on the active-color daemon at `CRYPTO_AUTONOMY_INTERVAL_SECONDS`. Crypto model regeneration runs nightly inside the daemon (`CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED`, fires at `CRYPTO_MODEL_NIGHTLY_HOUR_LOCAL` in `CRYPTO_MODEL_NIGHTLY_TIMEZONE`) and only retrains when at least `CRYPTO_MODEL_NIGHTLY_MIN_NEW_STRICT_ROWS` new strict-as-of rows are available.
+
 ### Persistence (`db/`)
 Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In tests, SQLite is used via a JSON-compatible type wrapper (no pgvector). Alembic migrations live in `alembic/`.
 
-`PlatformRepository` (in `db/repositories.py`) is the single repository surface passed to services. It is assembled from four mixin classes — `DeploymentControlRepositoryMixin`, `LearningRepositoryMixin`, `StrategyRepositoryMixin`, `WebAuthRepositoryMixin` — each in their own file under `db/`. Add new query methods to the appropriate mixin, not directly to `PlatformRepository`.
+`PlatformRepository` (in `db/repositories.py`) is the single repository surface passed to services. It is assembled from four mixin classes — `DeploymentControlRepositoryMixin`, `LearningRepositoryMixin`, `StrategyRepositoryMixin`, `WebAuthRepositoryMixin` — each in their own file under `db/`. Add new query methods to the appropriate mixin, not directly to `PlatformRepository`. The mixin chain order in `repositories.py` matters for MRO when mixins define overlapping helpers — keep the existing order unless you have a specific reason to change it, and add a test that exercises both methods if you do.
 
 ### Integrations (`integrations/`)
 - `kalshi.py` — REST (RSA-signed) + WebSocket client
@@ -133,6 +139,8 @@ A DB-backed single-writer lock enforces that only the active color (`app_color` 
 - `SELF_IMPROVE_CANARY_MAX_SECONDS` — max staged-canary lifetime before status becomes `stalled`
 - `AUTONOMOUS_GATE_TUNING_ENABLED=true` — after settlement reconciliation, lets backtesting/modeling stage and canary agent-pack threshold updates
 - `WEATHER_MARKET_MAP_PATH` — path to market config YAML (default: `docs/examples/weather_markets.example.yaml`); the YAML uses `series_templates` so the app auto-discovers current daily temperature contracts per configured city
+- `RISK_MIN_EDGE_BPS` — minimum required edge in basis points for any order to clear `DeterministicRiskEngine` (currently `500`; bumped from earlier defaults)
+- `CRYPTO_AUTONOMY_ENABLED` + `CRYPTO_TRADING_ENABLED` — both must be true for live crypto trading; `CRYPTO_AUTONOMY_ENABLED` alone only runs the decision loop in shadow
 
 ## Safety rules
 - The app starts in shadow mode (`APP_SHADOW_MODE=true`) and with the kill switch enabled by default. Do not disable either until mappings, reconciliation, and restart recovery are validated.

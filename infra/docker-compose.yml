@@ -142,6 +142,13 @@ x-demo-app-base: &demo-app-base
 
 x-production-app-base: &production-app-base
   <<: *app-common
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
   volumes:
     - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
     - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
@@ -173,6 +180,13 @@ x-demo-daemon-base: &demo-daemon-base
 
 x-production-daemon-base: &production-daemon-base
   <<: *daemon-common
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
   volumes:
     - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
     - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
@@ -434,13 +448,10 @@ services:
     image: caddy:2.9-alpine
     env_file: [../.env]
     environment:
-      WEB_DEMO_HOST: ${WEB_DEMO_HOST:-demo.ai-al.site}
-      WEB_PRODUCTION_HOST: ${WEB_PRODUCTION_HOST:-prod.ai-al.site}
-      WEB_STRATEGIES_HOST: ${WEB_STRATEGIES_HOST:-strategy.ai-al.site}
+      WEB_PUBLIC_HOST: ${WEB_PUBLIC_HOST:-home.kb-trade.trade}
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:-m7.ga.77@gmail.com}
     depends_on:
-      - web_demo
       - web_production
-      - web_strategies
     ports:
       - "${HTTP_PORT:-80}:80"
       - "${HTTPS_PORT:-443}:443"

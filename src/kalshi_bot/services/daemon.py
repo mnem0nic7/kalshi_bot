@@ -1513,78 +1513,102 @@ class DaemonService:
         assets = [a.strip().upper() for a in self.settings.crypto_model_nightly_assets.split(",") if a.strip()]
         max_age_td = timedelta(hours=self.settings.crypto_model_nightly_max_age_hours)
         now = self._utc_now()
+        frequencies = enabled_crypto_frequencies(self.settings) or ["15m"]
 
-        status = await self.crypto_history_service.status(days=1)
-        by_asset_rows: dict[str, int] = {}
-        for asset, info in status.get("quote_evidence", {}).get("trade_candidate_support_by_asset", {}).items():
-            by_asset_rows[asset.upper()] = int(info.get("strict_trade_eligible_rows") or 0)
+        asset_decisions: dict[str, dict[str, str]] = {}
+        total_refreshed = 0
 
-        asset_decisions: dict[str, str] = {}
-        refreshed_assets: list[str] = []
+        for frequency in frequencies:
+            status = await self.crypto_history_service.status(days=1, frequency=frequency)
+            by_asset_rows: dict[str, int] = {}
+            for asset, info in status.get("quote_evidence", {}).get("trade_candidate_support_by_asset", {}).items():
+                by_asset_rows[asset.upper()] = int(info.get("strict_trade_eligible_rows") or 0)
 
-        for asset in assets:
-            refresh_reason: str | None = None
+            freq_decisions: dict[str, str] = {}
+            refreshed_assets: list[str] = []
 
-            async with self.session_factory() as session:
-                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
-                artifact = await repo.get_latest_crypto_model_artifact(
-                    frequency="15m",
-                    artifact_type=f"model:{asset}",
-                    kalshi_env=self.settings.kalshi_env,
-                )
-                await session.commit()
+            for asset in assets:
+                refresh_reason: str | None = None
 
-            if artifact is None or artifact.status != "ready":
-                refresh_reason = "missing_or_not_ready"
-            else:
-                trained_at = artifact.trained_at
-                if trained_at is not None:
-                    if trained_at.tzinfo is None:
-                        trained_at = trained_at.replace(tzinfo=UTC)
-                    if (now - trained_at.astimezone(UTC)) > max_age_td:
-                        refresh_reason = "aged_out"
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                    artifact = await repo.get_latest_crypto_model_artifact(
+                        frequency=frequency,
+                        artifact_type=f"model:{asset}",
+                        kalshi_env=self.settings.kalshi_env,
+                    )
+                    await session.commit()
+
+                if artifact is None or artifact.status != "ready":
+                    refresh_reason = "missing_or_not_ready"
+                else:
+                    trained_at = artifact.trained_at
+                    if trained_at is not None:
+                        if trained_at.tzinfo is None:
+                            trained_at = trained_at.replace(tzinfo=UTC)
+                        if (now - trained_at.astimezone(UTC)) > max_age_td:
+                            refresh_reason = "aged_out"
+                    if refresh_reason is None:
+                        new_rows = by_asset_rows.get(asset, 0)
+                        if new_rows >= self.settings.crypto_model_nightly_min_new_strict_rows:
+                            refresh_reason = "new_data"
+
                 if refresh_reason is None:
-                    new_rows = by_asset_rows.get(asset, 0)
-                    if new_rows >= self.settings.crypto_model_nightly_min_new_strict_rows:
-                        refresh_reason = "new_data"
+                    freq_decisions[asset] = "skipped_fresh"
+                    logger.info(
+                        "crypto_model_nightly skip asset=%s freq=%s strict_rows_24h=%d",
+                        asset,
+                        frequency,
+                        by_asset_rows.get(asset, 0),
+                    )
+                    continue
 
-            if refresh_reason is None:
-                asset_decisions[asset] = "skipped_fresh"
-                logger.info(
-                    "crypto_model_nightly skip asset=%s strict_rows_24h=%d",
-                    asset,
-                    by_asset_rows.get(asset, 0),
-                )
-                continue
+                try:
+                    await self.crypto_history_service.collect_settled(frequency=frequency, asset_symbols=[asset])
+                    await self.crypto_history_service.bootstrap(frequency=frequency, asset_symbols=[asset])
+                    if self.crypto_spot_service is not None:
+                        try:
+                            await self.crypto_spot_service.collect_current(frequency=frequency, asset_symbols=[asset])
+                        except Exception:
+                            logger.warning(
+                                "crypto_model_nightly spot collect failed asset=%s freq=%s",
+                                asset,
+                                frequency,
+                                exc_info=True,
+                            )
+                    await self.crypto_forecast_service.train(frequency=frequency, asset_symbols=[asset])
+                    await self.crypto_replay_service.run(frequency=frequency, asset_symbols=[asset])
+                    await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=[asset])
+                    freq_decisions[asset] = "refreshed"
+                    refreshed_assets.append(asset)
+                    logger.info(
+                        "crypto_model_nightly refreshed asset=%s freq=%s reason=%s",
+                        asset,
+                        frequency,
+                        refresh_reason,
+                    )
+                except Exception:
+                    freq_decisions[asset] = "error"
+                    logger.warning(
+                        "crypto_model_nightly refresh error asset=%s freq=%s",
+                        asset,
+                        frequency,
+                        exc_info=True,
+                    )
 
-            try:
-                await self.crypto_history_service.collect_settled(frequency="15m", asset_symbols=[asset])
-                await self.crypto_history_service.bootstrap(frequency="15m", asset_symbols=[asset])
-                if self.crypto_spot_service is not None:
-                    try:
-                        await self.crypto_spot_service.collect_current(frequency="15m", asset_symbols=[asset])
-                    except Exception:
-                        logger.warning("crypto_model_nightly spot collect failed asset=%s", asset, exc_info=True)
-                await self.crypto_forecast_service.train(frequency="15m", asset_symbols=[asset])
-                await self.crypto_replay_service.run(frequency="15m", asset_symbols=[asset])
-                await self.crypto_replay_service.gate(frequency="15m", asset_symbols=[asset])
-                asset_decisions[asset] = "refreshed"
-                refreshed_assets.append(asset)
-                logger.info("crypto_model_nightly refreshed asset=%s reason=%s", asset, refresh_reason)
-            except Exception:
-                asset_decisions[asset] = "error"
-                logger.warning("crypto_model_nightly refresh error asset=%s", asset, exc_info=True)
+            if refreshed_assets:
+                try:
+                    await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=assets)
+                except Exception:
+                    logger.warning("crypto_model_nightly pooled gate error freq=%s", frequency, exc_info=True)
 
-        if refreshed_assets:
-            try:
-                await self.crypto_replay_service.gate(frequency="15m", asset_symbols=assets)
-            except Exception:
-                logger.warning("crypto_model_nightly pooled gate error", exc_info=True)
+            asset_decisions[frequency] = freq_decisions
+            total_refreshed += len(refreshed_assets)
 
         result: dict[str, Any] = {
             "ran_at": now.isoformat(),
             "asset_decisions": asset_decisions,
-            "refreshed_count": len(refreshed_assets),
+            "refreshed_count": total_refreshed,
         }
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)

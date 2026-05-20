@@ -7,18 +7,11 @@
 	}
 }
 
-{$WEB_DEMO_HOST} {
-	import shared_proxy web_demo:8000
-}
-
-{$WEB_PRODUCTION_HOST} {
+home.kb-trade.trade {
+	tls internal
 	import shared_proxy web_production:8000
 }
 
-{$WEB_STRATEGIES_HOST} {
-	import shared_proxy web_strategies:8000
-}
-
 http://localhost, http://127.0.0.1 {
-	import shared_proxy web_demo:8000
+	import shared_proxy web_production:8000
 }
