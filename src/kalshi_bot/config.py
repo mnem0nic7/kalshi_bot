@@ -275,6 +275,11 @@ class Settings(BaseSettings):
     crypto_empirical_late_override_max_count_fp: float = 1.0
     crypto_empirical_late_override_negative_pnl_enabled: bool = False
 
+    crypto_take_profit_enabled: bool = True
+    crypto_take_profit_threshold_pct: float = 0.20
+    crypto_take_profit_check_interval_seconds: int = 30
+    crypto_take_profit_stale_snapshot_seconds: int = 120
+
     stop_loss_enabled: bool = False
     stop_loss_threshold_pct: float = 0.10
     stop_loss_profit_protection_threshold_pct: float = 0.15

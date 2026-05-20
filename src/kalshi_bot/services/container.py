@@ -50,6 +50,7 @@ from kalshi_bot.services.signal_calibration import SignalCalibrationService
 from kalshi_bot.services.sigma_resolver import SigmaResolver
 from kalshi_bot.services.streaming import MarketStreamService
 from kalshi_bot.services.self_improve import SelfImproveService
+from kalshi_bot.services.crypto_take_profit import CryptoTakeProfitService
 from kalshi_bot.services.stop_loss import StopLossService
 from kalshi_bot.services.strategy_auto_evolve import StrategyAutoEvolveService
 from kalshi_bot.services.strategy_eval import StrategyEvaluationService
@@ -373,6 +374,7 @@ class AppContainer:
             kalshi,
         )
         stop_loss_service = StopLossService(settings, session_factory, execution_service)
+        crypto_take_profit_service = CryptoTakeProfitService(settings, session_factory, execution_service)
         strategy_eval_service = StrategyEvaluationService(settings, session_factory, agent_pack_service)
         strategy_regression_service = StrategyRegressionService(
             settings,
@@ -476,6 +478,7 @@ class AppContainer:
             strategy_dashboard_service=strategy_dashboard_service,
             strategy_auto_evolve_service=strategy_auto_evolve_service,
             stop_loss_service=stop_loss_service,
+            crypto_take_profit_service=crypto_take_profit_service,
             momentum_calibration_service=momentum_calibration_service,
             decision_corpus_service=decision_corpus_service,
             crypto_history_service=crypto_history_service,
