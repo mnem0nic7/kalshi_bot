@@ -1379,18 +1379,21 @@ class CryptoHistoryService:
                 kalshi_env=self.settings.kalshi_env,
                 since=cutoff,
                 limit=200_000,
+                defer_payload=True,
             )
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
                 since=cutoff,
                 limit=500_000,
+                defer_payload=True,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
                 since=cutoff,
                 limit=1_000_000,
+                defer_payload=True,
             )
             await session.commit()
         asset_symbols = _crypto_expected_spot_assets(
