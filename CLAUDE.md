@@ -98,6 +98,8 @@ All crypto services are wired through `AppContainer` alongside weather services.
 
 `CryptoExecutionService` is the only path to Kalshi crypto write endpoints (parallel to weather's `ExecutionService`); it shares the same kill-switch + deployment-color checks. `CryptoAutonomyService` runs continuously on the active-color daemon at `CRYPTO_AUTONOMY_INTERVAL_SECONDS`. Crypto model regeneration runs nightly inside the daemon (`CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED`, fires at `CRYPTO_MODEL_NIGHTLY_HOUR_LOCAL` in `CRYPTO_MODEL_NIGHTLY_TIMEZONE`) and only retrains when at least `CRYPTO_MODEL_NIGHTLY_MIN_NEW_STRICT_ROWS` new strict-as-of rows are available.
 
+Active crypto assets (as of 2026-05-20): **BTC, ETH, SOL, XRP, BNB, DOGE, HYPE**. ADA and BCH were removed from all active asset lists (`crypto_model_nightly_assets`, the CLI live-path default, passive-bid, overnight-readiness prefixes) because they have no backfilled spot history yet — configured-but-untrainable. Their inert lookup/parsing tables (Coinbase/CoinGecko product-id maps, ticker-recognition lists) are intentionally kept, so re-adding them after a backfill is a config-only change.
+
 ### Persistence (`db/`)
 Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In tests, SQLite is used via a JSON-compatible type wrapper (no pgvector). Alembic migrations live in `alembic/`.
 
@@ -120,6 +122,8 @@ FastAPI app with server-rendered Jinja2 templates, SSE transcript stream, and RE
 
 ### Blue/green deployment
 A DB-backed single-writer lock enforces that only the active color (`app_color` setting) can acquire the execution lock. The kill switch (`app_enable_kill_switch`) clears the execution lock and blocks new live orders. Self-improve staging is checkpoint-based: promotions write `pending_pack_promotion:{kalshi_env}:{color}`, and the target color's daemon applies it at startup so watchdog restarts or failovers do not strand an old pack assignment. Canary state has a max lifetime and becomes `stalled` after `SELF_IMPROVE_CANARY_MAX_SECONDS`.
+
+The active color lives in the `deployment_control` DB row, set via `kalshi-bot-cli promote <blue|green>` (a pure metadata update). For **zero-downtime redeploys**, recreate only the inactive color, wait for health, then `promote` to hand off the lock — use `scripts/blue_green_redeploy.sh` and `docs/operations/blue-green-redeploy.md`. A plain `docker compose up -d --force-recreate <all colors>` bounces the active color too (brief trading gap + ~74s daemon warmup) and is only for an intentional full bounce.
 
 ### Historical data layers (four separate concerns)
 1. `source_replay_coverage` — strict-as-of replay sources
@@ -146,4 +150,4 @@ A DB-backed single-writer lock enforces that only the active color (`app_color` 
 - The app starts in shadow mode (`APP_SHADOW_MODE=true`) and with the kill switch enabled by default. Do not disable either until mappings, reconciliation, and restart recovery are validated.
 - LLM responses are inputs to human-readable transcripts only. Deterministic engines are authoritative for all trading decisions.
 - Kalshi write endpoints are only reachable through `ExecutionService`, which checks the kill switch and deployment lock before every order.
-- **Weather trading is currently paused** (`DEMO/PRODUCTION_TRIGGER_ENABLE_AUTO_ROOMS=false` in `.env`). Do not re-enable without operator instruction. See `docs/operations/weather-pause-2026-05-16.md` for restore steps.
+- **Weather is fully disabled (crypto-only operation, as of 2026-05-20)** — escalated from the earlier auto-rooms pause. In `.env`: `*_TRIGGER_ENABLE_AUTO_ROOMS=false`, `*_WEATHER_PREDICTION_ENABLED=false`, `*_WEATHER_INTRADAY_MODEL_ENABLED=false`, residual models off, `WEATHER_RESEARCH_REFRESH_INTERVAL_SECONDS=0` (stops the daemon periodic weather loop + nested daily rejected-opportunity scorer), `WEATHER_REJECTED_OPPORTUNITY_SCORER_ENABLED=false`. Weather services stay constructed but inert; there is no weather nightly-training auto-toggle, so nothing reschedules it. Do not re-enable any weather flag without operator instruction. See `docs/operations/weather-disabled-2026-05-20.md` (full kill-set + restore) and the historical `docs/operations/weather-pause-2026-05-16.md`.
