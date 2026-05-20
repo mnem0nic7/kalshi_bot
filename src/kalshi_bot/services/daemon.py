@@ -41,6 +41,7 @@ from kalshi_bot.services.strategy_eval import StrategyEvaluationService
 from kalshi_bot.services.strategy_auto_evolve import StrategyAutoEvolveService
 from kalshi_bot.services.strategy_codex import StrategyCodexService
 from kalshi_bot.services.strategy_dashboard import StrategyDashboardService
+from kalshi_bot.services.crypto_take_profit import CryptoTakeProfitService
 from kalshi_bot.services.stop_loss import StopLossService
 from kalshi_bot.services.strategy_cleanup_service import StrategyCleanupService
 from kalshi_bot.services.momentum_calibration import MomentumCalibrationService
@@ -76,6 +77,7 @@ class DaemonService:
         autonomous_gate_tuning_service: AutonomousGateTuningService | None = None,
         strategy_regression_service: StrategyRegressionService | None = None,
         stop_loss_service: StopLossService | None = None,
+        crypto_take_profit_service: CryptoTakeProfitService | None = None,
         strategy_cleanup_service: StrategyCleanupService | None = None,
         monotonicity_arb_service: MonotonicityArbScannerService | None = None,
         strategy_codex_service: StrategyCodexService | None = None,
@@ -123,6 +125,7 @@ class DaemonService:
         self.crypto_replay_service = crypto_replay_service
         self.weather_live_service = weather_live_service
         self.stop_loss_service = stop_loss_service
+        self.crypto_take_profit_service = crypto_take_profit_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
         self._active_color_cache: tuple[float, bool] | None = None
@@ -383,6 +386,8 @@ class DaemonService:
                 )
             if self.settings.stop_loss_enabled:
                 periodic_tasks["stop_loss"] = asyncio.create_task(self._periodic_stop_loss_loop())
+            if self.settings.crypto_take_profit_enabled:
+                periodic_tasks["crypto_take_profit"] = asyncio.create_task(self._periodic_crypto_take_profit_loop())
             tasks.update(periodic_tasks)
             if run_seconds is not None:
                 tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
@@ -677,6 +682,18 @@ class DaemonService:
                 await self.stop_loss_service.check_once()
             except Exception:
                 logger.warning("stop_loss check failed", exc_info=True)
+
+    async def _periodic_crypto_take_profit_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.crypto_take_profit_check_interval_seconds)
+            if not self.settings.crypto_take_profit_enabled:
+                continue
+            if self.crypto_take_profit_service is None:
+                continue
+            try:
+                await self.crypto_take_profit_service.check_once()
+            except Exception:
+                logger.warning("crypto_take_profit check failed", exc_info=True)
 
     async def _periodic_market_history_loop(self) -> None:
         while True:
