@@ -308,7 +308,7 @@ class Settings(BaseSettings):
     momentum_calibration_recent_coverage_days: int = 7
     momentum_calibration_min_observations: int = 1000
     momentum_calibration_skip_critical_threshold: int = 4
-    crypto_model_nightly_auto_enabled: bool = True
+    crypto_model_nightly_auto_enabled: bool = False
     crypto_model_nightly_timezone: str = "America/Los_Angeles"
     crypto_model_nightly_hour_local: int = 3
     crypto_model_nightly_min_new_strict_rows: int = 60
