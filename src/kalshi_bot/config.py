@@ -189,7 +189,7 @@ class Settings(BaseSettings):
     # (see PlatformRepository.list_crypto_settled_market_snapshots), so the cap
     # governs trainable decision points rather than raw recent rows. Lookback
     # bounds all three sources to a time window to keep memory predictable.
-    crypto_train_lookback_days: int = 90
+    crypto_train_lookback_days: int = 60
     crypto_train_max_snapshots: int = 500_000
     crypto_train_max_candlesticks: int = 500_000
     crypto_train_max_spot_rows: int = 600_000
