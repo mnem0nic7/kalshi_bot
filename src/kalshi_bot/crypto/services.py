@@ -6391,6 +6391,51 @@ def _fit_crypto_logistic_model(
         return {"name": "sklearn_logistic", "status": "unavailable", "reason": f"sklearn_fit_failed:{exc}", "dependency_version": _package_version("scikit-learn")}
 
 
+_GPU_TREE_DEVICES = frozenset({"cuda", "gpu"})
+
+
+def _resolve_tree_device(
+    requested: str, n_rows: int, *, gpu_min_rows: int
+) -> tuple[str, str | None]:
+    """Pick the device to attempt for a tree model.
+
+    GPU carries a fixed per-fit overhead that only amortizes on large datasets
+    (measured crossover ~20k rows on our hardware), so a GPU request below
+    ``gpu_min_rows`` is downgraded to CPU. ``gpu_min_rows<=0`` disables the size
+    gate entirely (used by LightGBM, which has no size where GPU wins, so an
+    explicit operator request is honored as-is). Returns the device to try plus
+    an optional human-readable downgrade reason for logging/metadata.
+    """
+    requested = (requested or "").strip().lower() or "cpu"
+    if requested in _GPU_TREE_DEVICES and gpu_min_rows > 0 and n_rows < gpu_min_rows:
+        return "cpu", f"rows={n_rows} below gpu_min_rows={gpu_min_rows}"
+    return requested, None
+
+
+def _fit_tree_with_device_fallback(
+    build_and_fit: Callable[[str], Any], device: str, *, model_label: str
+) -> tuple[Any, str]:
+    """Run ``build_and_fit(device)``; on a GPU failure, retry once on CPU.
+
+    Keeps a candidate from being silently dropped when CUDA is unavailable (no
+    passthrough) or OOMs on the small 6 GB card. The fallback is logged, never
+    silent. Returns ``(result, device_actually_used)``. If CPU also fails (or the
+    request was already CPU), the exception propagates to the caller.
+    """
+    try:
+        return build_and_fit(device), device
+    except Exception as exc:
+        if device not in _GPU_TREE_DEVICES:
+            raise
+        logger.warning(
+            "crypto_%s_gpu_fit_failed device=%s falling back to cpu: %s",
+            model_label,
+            device,
+            exc,
+        )
+        return build_and_fit("cpu"), "cpu"
+
+
 def _fit_crypto_xgboost_model(
     rows: list[dict[str, Any]],
     raw_matrix: list[list[float]],
@@ -6404,9 +6449,14 @@ def _fit_crypto_xgboost_model(
         import xgboost as xgb
     except Exception as exc:
         return {"name": "xgboost_classifier", "status": "unavailable", "reason": f"xgboost_unavailable:{exc}", "dependency_version": None}
-    device = os.environ.get("CRYPTO_XGBOOST_DEVICE", "cuda").strip().lower() or "cuda"
-    try:
-        classifier = xgb.XGBClassifier(
+    requested_device = os.environ.get("CRYPTO_XGBOOST_DEVICE", "cuda")
+    gpu_min_rows = int(os.environ.get("CRYPTO_GPU_MIN_ROWS", "20000") or 20000)
+    device, downgrade = _resolve_tree_device(requested_device, len(labels), gpu_min_rows=gpu_min_rows)
+    if downgrade:
+        logger.debug("crypto_xgboost_device_downgraded cuda->cpu: %s", downgrade)
+
+    def _build(dev: str) -> "xgb.XGBClassifier":
+        clf = xgb.XGBClassifier(
             n_estimators=80,
             max_depth=3,
             learning_rate=0.05,
@@ -6416,9 +6466,13 @@ def _fit_crypto_xgboost_model(
             random_state=17,
             n_jobs=1,
             tree_method="hist",
-            device=device,
+            device=dev,
         )
-        classifier.fit(raw_matrix, labels)
+        clf.fit(raw_matrix, labels)
+        return clf
+
+    try:
+        classifier, device = _fit_tree_with_device_fallback(_build, device, model_label="xgboost")
         booster = classifier.get_booster()
         try:
             raw_booster = booster.save_raw(raw_format="json")
@@ -6467,10 +6521,15 @@ def _fit_crypto_lightgbm_model(
         import lightgbm as lgb
     except Exception as exc:
         return {"name": "lightgbm_classifier", "status": "unavailable", "reason": f"lightgbm_unavailable:{exc}", "dependency_version": None}
-    try:
-        lgb_device = os.environ.get("CRYPTO_LIGHTGBM_DEVICE", "cpu").strip().lower() or "cpu"
-        lgb_n_jobs = int(os.environ.get("CRYPTO_LIGHTGBM_N_JOBS", "-1") or -1)
-        classifier = lgb.LGBMClassifier(
+    lgb_n_jobs = int(os.environ.get("CRYPTO_LIGHTGBM_N_JOBS", "-1") or -1)
+    # gpu_min_rows=0: no size gate. LightGBM has no dataset size where its GPU
+    # path beats CPU here, so we honor an explicit operator request as-is rather
+    # than second-guessing it, while still falling back safely if GPU errors.
+    requested_device = os.environ.get("CRYPTO_LIGHTGBM_DEVICE", "cpu")
+    lgb_device, _ = _resolve_tree_device(requested_device, len(labels), gpu_min_rows=0)
+
+    def _build(dev: str) -> "lgb.LGBMClassifier":
+        clf = lgb.LGBMClassifier(
             n_estimators=80,
             max_depth=3,
             learning_rate=0.05,
@@ -6480,10 +6539,14 @@ def _fit_crypto_lightgbm_model(
             min_child_samples=1,
             random_state=17,
             n_jobs=lgb_n_jobs,
-            device=lgb_device,
+            device=dev,
             verbosity=-1,
         )
-        classifier.fit(raw_matrix, labels)
+        clf.fit(raw_matrix, labels)
+        return clf
+
+    try:
+        classifier, lgb_device = _fit_tree_with_device_fallback(_build, lgb_device, model_label="lightgbm")
         booster = classifier.booster_
         model = {
             "model_type": "lightgbm_classifier",
@@ -6497,6 +6560,7 @@ def _fit_crypto_lightgbm_model(
                 "version": getattr(lgb, "__version__", None),
                 "estimator": "LGBMClassifier",
                 "random_state": 17,
+                "device": lgb_device,
             },
             "feature_defaults": defaults,
             "fallback_model": fallback,
