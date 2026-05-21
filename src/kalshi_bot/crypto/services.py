@@ -1393,7 +1393,6 @@ class CryptoHistoryService:
                 kalshi_env=self.settings.kalshi_env,
                 since=cutoff,
                 limit=1_000_000,
-                defer_payload=True,
             )
             await session.commit()
         asset_symbols = _crypto_expected_spot_assets(
