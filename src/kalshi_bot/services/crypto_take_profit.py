@@ -86,6 +86,8 @@ class CryptoTakeProfitService:
         for position in positions:
             m = re.match(r"^KX([A-Z]+)(?:15M|1H)", position.market_ticker)
             asset = m.group(1) if m else None
+            if by_asset and asset not in by_asset:
+                continue
             threshold = by_asset.get(asset, global_threshold) if asset else global_threshold
             result = await self._evaluate(position, now, stale_cutoff, threshold)
             if result is not None:
