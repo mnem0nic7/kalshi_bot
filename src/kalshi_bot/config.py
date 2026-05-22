@@ -224,7 +224,10 @@ class Settings(BaseSettings):
     crypto_replay_min_spot_coverage_pct: float = 0.80
     crypto_autonomy_enabled: bool = False
     crypto_production_autonomy_enabled: bool = False
-    crypto_autonomy_interval_seconds: int = 30
+    # Sleep interval for idle/inactive-color states only. The active-color loop
+    # runs continuously (asyncio.sleep(0) between iterations) so this value has
+    # no effect on trading cadence.
+    crypto_autonomy_idle_interval_seconds: int = 5
     crypto_autonomy_min_seconds_to_close: int = 0
     # UTC hours (0-23) during which the autonomy loop should skip new entries.
     # Comma-separated string so it's easily set via env var, e.g. "12,13,14,15,16"

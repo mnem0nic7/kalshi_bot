@@ -845,7 +845,7 @@ class DaemonService:
                 logger.warning("monotonicity_arb sweep error", exc_info=True)
 
     async def _periodic_crypto_autonomy_loop(self) -> None:
-        idle_interval = max(1, int(self.settings.crypto_autonomy_interval_seconds))
+        idle_interval = max(1, int(self.settings.crypto_autonomy_idle_interval_seconds))
         while True:
             if self.crypto_autonomy_service is None:
                 await asyncio.sleep(idle_interval)
