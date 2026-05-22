@@ -1891,14 +1891,12 @@ async def _run_crypto_policy_command(args: argparse.Namespace, container: AppCon
         print(json.dumps({"asset": symbol, "override": updated_override.model_dump(exclude_none=True), "pack_version": _OVERRIDES_VERSION, "assigned_color": active_color}, indent=2))
         return 0
     if args.crypto_policy_command == "show":
-        from kalshi_bot.services.agent_packs import AgentPackService
-        from kalshi_bot.db.repositories import PlatformRepository
-
-        agent_pack_service = AgentPackService(container.settings)
+        from kalshi_bot.services.agent_packs import AgentPackService as _AgentPackService
+        _agent_pack_service = _AgentPackService(container.settings)
         async with container.session_factory() as session:
-            repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
-            pack = await agent_pack_service.get_active_pack(repo)
-        print(json.dumps(pack.crypto_policy.model_dump(mode="json"), indent=2, default=str))
+            _repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
+            _pack = await _agent_pack_service.get_active_pack(_repo)
+        print(json.dumps(_pack.crypto_policy.model_dump(mode="json"), indent=2, default=str))
         return 0
     raise ValueError(f"unknown crypto-policy command {args.crypto_policy_command}")
 
