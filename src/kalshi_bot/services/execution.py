@@ -153,6 +153,7 @@ class ExecutionService:
         threshold_bps = min_edge_bps if min_edge_bps is not None else self.settings.risk_min_edge_bps
         min_edge = Decimal(str(threshold_bps)) / Decimal("10000")
         current_ticket = ticket
+        already_filled_fp = Decimal("0")
 
         for attempt in range(1, _MAX_REQUOTES + 1):
             attempt_coid = f"{client_order_id}_q{attempt}"
@@ -196,6 +197,23 @@ class ExecutionService:
             except Exception:
                 logger.warning("cancel failed for %s order %s", ticket.market_ticker, order_id, exc_info=True)
 
+            # Guard against maker fills that landed during the cancel window.
+            # The cancel response drops remaining_count_fp to 0 regardless of partial fills,
+            # so we query the fills endpoint to learn the actual filled quantity.
+            already_filled_fp += await self._get_filled_fp(order_id)
+            remaining_fp = ticket.count_fp - already_filled_fp
+            if remaining_fp <= Decimal("0"):
+                logger.info(
+                    "limit order fully covered by race fill for %s attempt=%d filled=%.2f",
+                    ticket.market_ticker, attempt, float(already_filled_fp),
+                )
+                return ExecReceiptPayload(
+                    status="filled",
+                    external_order_id=order_id,
+                    client_order_id=client_order_id,
+                    details={"race_filled": True, "attempts": attempt},
+                )
+
             if attempt == _MAX_REQUOTES:
                 break
 
@@ -219,7 +237,7 @@ class ExecutionService:
                 settings=self.settings,
                 edge_dollars=new_edge,
                 contract_price_dollars=contract_price,
-                count_fp=current_ticket.count_fp,
+                count_fp=remaining_fp,
             )
 
             if fee_adjusted_edge < min_edge:
@@ -237,12 +255,16 @@ class ExecutionService:
                     },
                 )
 
-            current_ticket = current_ticket.model_copy(update={"yes_price_dollars": new_price})
+            current_ticket = current_ticket.model_copy(update={
+                "yes_price_dollars": new_price,
+                "count_fp": remaining_fp,
+            })
             logger.info(
-                "requoting %s attempt=%d new_price=%s edge=%.0fbps fee_adjusted=%.0fbps",
+                "requoting %s attempt=%d new_price=%s count=%.2f edge=%.0fbps fee_adjusted=%.0fbps",
                 ticket.market_ticker,
                 attempt + 1,
                 new_price,
+                float(remaining_fp),
                 float(new_edge) * 10000,
                 float(fee_adjusted_edge) * 10000,
             )
@@ -415,6 +437,18 @@ class ExecutionService:
             client_order_id=client_order_id,
             details=response,
         )
+
+    async def _get_filled_fp(self, order_id: str) -> Decimal:
+        """Return total filled quantity for a Kalshi order ID via the fills endpoint."""
+        try:
+            resp = await self.kalshi.get_fills(order_id=order_id)
+            return sum(
+                (Decimal(str(f.get("count_fp", "0"))) for f in resp.get("fills", [])),
+                Decimal("0"),
+            )
+        except Exception:
+            logger.warning("fill query failed for order %s", order_id, exc_info=True)
+            return Decimal("0")
 
     async def _wait_for_fill(self, order_id: str) -> bool:
         elapsed = 0
