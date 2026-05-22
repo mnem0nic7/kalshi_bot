@@ -1445,6 +1445,51 @@ async def test_crypto_history_status_reports_assets_missing_settled_labels(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_crypto_history_status_scopes_requested_assets(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    observed_at = datetime.now(UTC) - timedelta(minutes=10)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        for asset in ("BTC", "ETH"):
+            await repo.record_crypto_market_snapshot(
+                kalshi_env=settings.kalshi_env,
+                series_ticker=f"KX{asset}15M",
+                market_ticker=f"KX{asset}15M-SCOPED",
+                asset_symbol=asset,
+                frequency="15m",
+                status="active",
+                close_time=observed_at + timedelta(minutes=5),
+                target_price_dollars=Decimal("3000.00000000"),
+                yes_bid_dollars=Decimal("0.4200"),
+                yes_ask_dollars=Decimal("0.4500"),
+                no_ask_dollars=Decimal("0.5800"),
+                observed_at=observed_at,
+                source_kind="live_quote_evidence",
+                payload={"unit": True},
+            )
+        await session.commit()
+
+    history_status = await CryptoHistoryService(
+        settings=settings,
+        session_factory=session_factory,
+        kalshi=None,  # type: ignore[arg-type]
+        market_service=None,  # type: ignore[arg-type]
+    ).status(frequency="15m", days=1, asset_symbols=["BTC"])
+
+    quote_evidence = history_status["quote_evidence"]
+    assert sorted(quote_evidence["strict_quote_ingestion_audit_by_asset"]) == ["BTC"]
+    assert quote_evidence["assets_with_real_quotes"] == ["BTC"]
+    assert history_status["spot_quality"]["assets"]["BTC"]["row_count"] == 0
+    assert "ETH" not in history_status["spot_quality"]["assets"]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_crypto_history_bootstrap_scopes_requested_assets(tmp_path) -> None:
     settings = _settings(tmp_path)
     engine = create_engine(settings)

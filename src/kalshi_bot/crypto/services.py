@@ -1369,14 +1369,22 @@ class CryptoHistoryService:
             "recent_quote_evidence": _crypto_quote_evidence_summary(recent_snapshots, [], settings=self.settings),
         }
 
-    async def status(self, *, frequency: str = "15m", days: int | float | None = None) -> dict[str, Any]:
+    async def status(
+        self,
+        *,
+        frequency: str = "15m",
+        days: int | float | None = None,
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
+        assets = normalize_asset_symbols(asset_symbols)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             snapshots = await repo.list_crypto_market_snapshots(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=assets,
                 since=cutoff,
                 limit=200_000,
                 defer_payload=True,
@@ -1384,6 +1392,7 @@ class CryptoHistoryService:
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=assets,
                 since=cutoff,
                 limit=500_000,
                 defer_payload=True,
@@ -1391,13 +1400,18 @@ class CryptoHistoryService:
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=assets,
                 since=cutoff,
                 limit=1_000_000,
             )
             await session.commit()
-        asset_symbols = _crypto_expected_spot_assets(
-            self.settings,
-            observed_assets={row.asset_symbol for row in snapshots} | {row.asset_symbol for row in candles},
+        expected_assets = (
+            sorted(set(assets))
+            if assets
+            else _crypto_expected_spot_assets(
+                self.settings,
+                observed_assets={row.asset_symbol for row in snapshots} | {row.asset_symbol for row in candles},
+            )
         )
         quote_rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
         return {
@@ -1412,7 +1426,7 @@ class CryptoHistoryService:
             ),
             "spot_quality": _crypto_spot_quality(
                 spot_rows,
-                expected_assets=asset_symbols,
+                expected_assets=expected_assets,
                 min_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
                 settings=self.settings,
             ),

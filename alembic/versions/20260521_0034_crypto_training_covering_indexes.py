@@ -19,20 +19,28 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
-        CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_crypto_candles_training
-        ON crypto_market_candlesticks (kalshi_env, frequency, end_period_ts, asset_symbol)
-        """
-    )
-    op.execute(
-        """
-        CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_crypto_spot_ohlc_training
-        ON crypto_spot_ohlc (kalshi_env, frequency, end_ts, asset_symbol)
-        """
-    )
+    bind = op.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    with op.get_context().autocommit_block():
+        op.execute(
+            """
+            CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_crypto_candles_training
+            ON crypto_market_candlesticks (kalshi_env, frequency, end_period_ts, asset_symbol)
+            """
+        )
+        op.execute(
+            """
+            CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_crypto_spot_ohlc_training
+            ON crypto_spot_ohlc (kalshi_env, frequency, end_ts, asset_symbol)
+            """
+        )
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_crypto_candles_training")
-    op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_crypto_spot_ohlc_training")
+    bind = op.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    with op.get_context().autocommit_block():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_crypto_candles_training")
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_crypto_spot_ohlc_training")

@@ -689,6 +689,7 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
         result = await container.crypto_history_service.status(
             frequency=args.frequency,
             days=args.days if args.days and args.days > 0 else None,
+            asset_symbols=getattr(args, "assets", None),
         )
     else:
         raise ValueError(f"unknown crypto-history command {args.crypto_history_command}")
@@ -1180,7 +1181,11 @@ async def _crypto_live_path_strict_row_growth(
     windows = {"1h": 1 / 24, "6h": 6 / 24, "24h": 1}
     counts_by_window: dict[str, dict[str, int]] = {}
     for label, days in windows.items():
-        status = await container.crypto_history_service.status(frequency=frequency, days=days)
+        status = await container.crypto_history_service.status(
+            frequency=frequency,
+            days=days,
+            asset_symbols=assets,
+        )
         support = ((status.get("quote_evidence") or {}).get("trade_candidate_support_by_asset") or {})
         counts_by_window[label] = {
             asset: _int_or_zero((support.get(asset) or {}).get("strict_trade_eligible_rows"))
@@ -1548,7 +1553,11 @@ async def _crypto_live_path_status_payload(
     frequency = getattr(args, "frequency", "15m")
     assets, asset_discovery = await _crypto_live_path_asset_resolution(args, container, frequency=frequency)
     status_days = getattr(args, "status_days", 14)
-    history_status = await container.crypto_history_service.status(frequency=frequency, days=status_days)
+    history_status = await container.crypto_history_service.status(
+        frequency=frequency,
+        days=status_days,
+        asset_symbols=assets,
+    )
     spot_status = await container.crypto_spot_service.status(
         frequency=frequency,
         days=status_days,
@@ -4279,6 +4288,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_history_status)
     crypto_history_status.add_argument("--frequency", default="15m")
     crypto_history_status.add_argument("--days", type=int, default=0)
+    crypto_history_status.add_argument("--assets", nargs="*", default=None)
     crypto_history_status.add_argument("--json", action="store_true")
 
     crypto_spot = subparsers.add_parser("crypto-spot")
