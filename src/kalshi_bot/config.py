@@ -283,6 +283,7 @@ class Settings(BaseSettings):
 
     crypto_take_profit_enabled: bool = True
     crypto_take_profit_threshold_pct: float = 0.20
+    crypto_take_profit_threshold_pct_by_asset: dict[str, float] = Field(default_factory=dict)
     crypto_take_profit_check_interval_seconds: int = 30
     crypto_take_profit_stale_snapshot_seconds: int = 120
 

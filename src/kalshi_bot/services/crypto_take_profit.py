@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -79,9 +80,13 @@ class CryptoTakeProfitService:
 
         now = datetime.now(UTC)
         stale_cutoff = timedelta(seconds=self.settings.crypto_take_profit_stale_snapshot_seconds)
-        threshold = self.settings.crypto_take_profit_threshold_pct
+        global_threshold = self.settings.crypto_take_profit_threshold_pct
+        by_asset = self.settings.crypto_take_profit_threshold_pct_by_asset
 
         for position in positions:
+            m = re.match(r"^KX([A-Z]+)(?:15M|1H)", position.market_ticker)
+            asset = m.group(1) if m else None
+            threshold = by_asset.get(asset, global_threshold) if asset else global_threshold
             result = await self._evaluate(position, now, stale_cutoff, threshold)
             if result is not None:
                 triggered.append(result)
