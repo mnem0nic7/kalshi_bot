@@ -1854,14 +1854,26 @@ async def _run_crypto_policy_command(args: argparse.Namespace, container: AppCon
     if args.crypto_policy_command == "set-asset-override":
         from kalshi_bot.services.agent_packs import AgentPackService
         from kalshi_bot.core.schemas import AgentPackCryptoEntryPolicy
-        from kalshi_bot.db.repositories import PlatformRepository
+
+        # Asset overrides must live in a derived pack (not the builtin) because
+        # AgentPackService.ensure_initialized() resets builtin-deterministic-v1
+        # on every startup. We create a stable "overrides" version instead.
+        _OVERRIDES_VERSION = "builtin-deterministic-v1-overrides"
 
         agent_pack_service = AgentPackService(container.settings)
         async with container.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
-            pack = await agent_pack_service.get_active_pack(repo)
+            control = await repo.get_deployment_control(kalshi_env=container.settings.kalshi_env)
+            # Load the overrides pack if it exists; otherwise clone the active pack
+            existing_record = await repo.get_agent_pack(_OVERRIDES_VERSION)
+            if existing_record is not None:
+                from kalshi_bot.core.schemas import AgentPack
+                pack = AgentPack.model_validate(existing_record.payload)
+            else:
+                pack = await agent_pack_service.get_active_pack(repo)
+            pack = pack.model_copy(update={"version": _OVERRIDES_VERSION, "source": "operator_override", "description": "Operator asset-level entry overrides on top of builtin defaults"})
             symbol = args.asset.upper()
-            existing = pack.crypto_policy.asset_entry_overrides.get(symbol) or AgentPackCryptoEntryPolicy()
+            existing_override = pack.crypto_policy.asset_entry_overrides.get(symbol) or AgentPackCryptoEntryPolicy()
             updates: dict[str, Any] = {}
             if args.min_edge_bps is not None:
                 updates["min_fee_adjusted_edge_bps"] = int(args.min_edge_bps)
@@ -1869,11 +1881,14 @@ async def _run_crypto_policy_command(args: argparse.Namespace, container: AppCon
                 updates["min_contract_price_dollars"] = float(args.min_price)
             if args.max_spread_bps is not None:
                 updates["max_spread_bps"] = int(args.max_spread_bps)
-            updated = existing.model_copy(update=updates)
-            pack.crypto_policy.asset_entry_overrides[symbol] = updated
+            updated_override = existing_override.model_copy(update=updates)
+            pack.crypto_policy.asset_entry_overrides[symbol] = updated_override
             await repo.update_agent_pack(pack)
+            # Point the active color at the overrides pack
+            active_color = control.active_color
+            await agent_pack_service.assign_pack_to_color(repo, color=active_color, version=_OVERRIDES_VERSION)
             await session.commit()
-        print(json.dumps({"asset": symbol, "override": updated.model_dump(exclude_none=True)}, indent=2))
+        print(json.dumps({"asset": symbol, "override": updated_override.model_dump(exclude_none=True), "pack_version": _OVERRIDES_VERSION, "assigned_color": active_color}, indent=2))
         return 0
     if args.crypto_policy_command == "show":
         from kalshi_bot.services.agent_packs import AgentPackService
