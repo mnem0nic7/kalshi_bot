@@ -226,6 +226,9 @@ class Settings(BaseSettings):
     crypto_production_autonomy_enabled: bool = False
     crypto_autonomy_interval_seconds: int = 30
     crypto_autonomy_min_seconds_to_close: int = 0
+    # UTC hours (0-23) during which the autonomy loop should skip new entries.
+    # Comma-separated string so it's easily set via env var, e.g. "12,13,14,15,16"
+    crypto_autonomy_skip_hours_utc: str = ""
     crypto_late_sure_thing_enabled: bool = True
     crypto_late_sure_thing_max_seconds_to_close: int = 300
     crypto_late_sure_thing_standard_max_seconds_to_close: int = 180

@@ -3767,6 +3767,19 @@ class CryptoAutonomyService:
                 "app_color": self.settings.app_color,
             }
 
+        skip_hours_raw = str(self.settings.crypto_autonomy_skip_hours_utc or "").strip()
+        if skip_hours_raw:
+            skip_hours = {int(h.strip()) for h in skip_hours_raw.split(",") if h.strip().isdigit()}
+            current_utc_hour = datetime.now(UTC).hour
+            if current_utc_hour in skip_hours:
+                return {
+                    "status": "skipped_hour",
+                    "kalshi_env": self.settings.kalshi_env,
+                    "frequency": freq,
+                    "utc_hour": current_utc_hour,
+                    "reason": f"UTC hour {current_utc_hour} is in skip_hours list",
+                }
+
         discovered = await self.market_service.discover_markets(frequency=freq, status="open", persist=True)
         if requested_assets:
             discovered = [market for market in discovered if normalize_asset_symbol(market.asset_symbol) in requested_assets]

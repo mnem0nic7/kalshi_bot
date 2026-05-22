@@ -1843,15 +1843,49 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
 
 
 async def _run_crypto_policy_command(args: argparse.Namespace, container: AppContainer) -> int:
-    if args.crypto_policy_command != "optimize":
-        raise ValueError(f"unknown crypto-policy command {args.crypto_policy_command}")
-    result = await container.crypto_replay_service.optimize_entry_policy(
-        frequency=args.frequency,
-        days=args.days,
-        asset_symbols=args.assets,
-    )
-    print(json.dumps(result, indent=2, default=str))
-    return 0
+    if args.crypto_policy_command == "optimize":
+        result = await container.crypto_replay_service.optimize_entry_policy(
+            frequency=args.frequency,
+            days=args.days,
+            asset_symbols=args.assets,
+        )
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    if args.crypto_policy_command == "set-asset-override":
+        from kalshi_bot.services.agent_packs import AgentPackService
+        from kalshi_bot.core.schemas import AgentPackCryptoEntryPolicy
+        from kalshi_bot.db.repositories import PlatformRepository
+
+        agent_pack_service = AgentPackService(container.settings)
+        async with container.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
+            pack = await agent_pack_service.get_active_pack(repo)
+            symbol = args.asset.upper()
+            existing = pack.crypto_policy.asset_entry_overrides.get(symbol) or AgentPackCryptoEntryPolicy()
+            updates: dict[str, Any] = {}
+            if args.min_edge_bps is not None:
+                updates["min_fee_adjusted_edge_bps"] = int(args.min_edge_bps)
+            if args.min_price is not None:
+                updates["min_contract_price_dollars"] = float(args.min_price)
+            if args.max_spread_bps is not None:
+                updates["max_spread_bps"] = int(args.max_spread_bps)
+            updated = existing.model_copy(update=updates)
+            pack.crypto_policy.asset_entry_overrides[symbol] = updated
+            await repo.update_agent_pack(pack)
+            await session.commit()
+        print(json.dumps({"asset": symbol, "override": updated.model_dump(exclude_none=True)}, indent=2))
+        return 0
+    if args.crypto_policy_command == "show":
+        from kalshi_bot.services.agent_packs import AgentPackService
+        from kalshi_bot.db.repositories import PlatformRepository
+
+        agent_pack_service = AgentPackService(container.settings)
+        async with container.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=container.settings.kalshi_env)
+            pack = await agent_pack_service.get_active_pack(repo)
+        print(json.dumps(pack.crypto_policy.model_dump(mode="json"), indent=2, default=str))
+        return 0
+    raise ValueError(f"unknown crypto-policy command {args.crypto_policy_command}")
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:
@@ -2321,6 +2355,63 @@ async def _run_reconcile_command(
     )
     await session.commit()
     print(json.dumps(asdict(summary), indent=2))
+    return 0
+
+
+async def _run_reconcile_stale_fills_command(
+    args: argparse.Namespace,
+    container: AppContainer,
+    repo: PlatformRepository,
+    session: AsyncSession,
+) -> int:
+    """Backfill settlement_result for fills whose markets settled >48h ago."""
+    from kalshi_bot.crypto.parsing import parse_settlement_result
+    from kalshi_bot.db.models import FillRecord
+    from sqlalchemy import select, text as sa_text
+
+    cutoff = args.age_hours
+    stmt = sa_text(
+        "SELECT DISTINCT market_ticker FROM fills "
+        "WHERE settlement_result IS NULL "
+        "  AND kalshi_env = :env "
+        "  AND created_at < NOW() - MAKE_INTERVAL(hours => :hours)"
+    )
+    rows = (await session.execute(stmt, {"env": container.settings.kalshi_env, "hours": cutoff})).fetchall()
+    tickers = [row[0] for row in rows if row[0]]
+    print(f"Found {len(tickers)} tickers with unresolved fills older than {cutoff}h", flush=True)
+    if not tickers:
+        return 0
+
+    settlements: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for ticker in tickers:
+        try:
+            market_data = await container.kalshi.get_market(ticker)
+            market = market_data.get("market") or market_data
+            result = parse_settlement_result(market)
+            if result in ("yes", "no"):
+                settlements.append({"ticker": ticker, "market_result": result})
+                print(f"  {ticker}: {result}", flush=True)
+            else:
+                print(f"  {ticker}: no result yet ({result!r})", flush=True)
+        except Exception as exc:
+            errors.append(f"{ticker}: {exc}")
+            print(f"  {ticker}: error — {exc}", flush=True)
+
+    if not args.dry_run and settlements:
+        settled = await repo.settle_fills(settlements, kalshi_env=container.settings.kalshi_env)
+        await session.commit()
+        print(f"\nMarked {settled} fill records as settled.")
+    elif args.dry_run:
+        print(f"\nDry run — would settle {len(settlements)} tickers, skipping writes.")
+    else:
+        print("\nNothing to settle.")
+
+    if errors:
+        print(f"\nErrors ({len(errors)}):")
+        for err in errors:
+            print(f"  {err}")
+
     return 0
 
 
@@ -3949,6 +4040,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
             if args.command == "reconcile":
                 return await _run_reconcile_command(container, repo, session)
 
+            if args.command == "reconcile-stale-fills":
+                return await _run_reconcile_stale_fills_command(args, container, repo, session)
+
             if args.command == "promote":
                 return await _run_promote_command(args, repo, session)
 
@@ -4257,6 +4351,14 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_policy_optimize.add_argument("--days", type=int, default=30)
     crypto_policy_optimize.add_argument("--assets", nargs="*", default=None)
     crypto_policy_optimize.add_argument("--json", action="store_true")
+    crypto_policy_show = crypto_policy_subparsers.add_parser("show")
+    add_kalshi_env_argument(crypto_policy_show)
+    crypto_policy_override = crypto_policy_subparsers.add_parser("set-asset-override")
+    add_kalshi_env_argument(crypto_policy_override)
+    crypto_policy_override.add_argument("--asset", required=True, help="Asset symbol, e.g. HYPE")
+    crypto_policy_override.add_argument("--min-edge-bps", type=int, default=None, dest="min_edge_bps")
+    crypto_policy_override.add_argument("--min-price", type=float, default=None, dest="min_price")
+    crypto_policy_override.add_argument("--max-spread-bps", type=int, default=None, dest="max_spread_bps")
 
     crypto_live_path = subparsers.add_parser("crypto-live-path")
     crypto_live_path_subparsers = crypto_live_path.add_subparsers(dest="crypto_live_path_command", required=True)
@@ -4987,6 +5089,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_room.add_argument("--reason", default="cli_run")
 
     subparsers.add_parser("reconcile")
+
+    reconcile_stale = subparsers.add_parser("reconcile-stale-fills", help="Backfill settlement_result for old unsettled fills")
+    reconcile_stale.add_argument("--age-hours", type=int, default=48, dest="age_hours", help="Min fill age in hours (default 48)")
+    reconcile_stale.add_argument("--dry-run", action="store_true", dest="dry_run", help="Print what would be updated without writing")
 
     promote = subparsers.add_parser("promote")
     promote.add_argument("color", choices=["blue", "green"])
