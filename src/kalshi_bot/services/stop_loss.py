@@ -117,6 +117,8 @@ class StopLossService:
         self.settings = settings
         self.session_factory = session_factory
         self.execution_service = execution_service
+        # Keyed by position id → last 2 (mid, observed_at) readings for rapid-drop detection
+        self._prev_mids: dict[int, list[tuple[Decimal, datetime]]] = {}
 
     async def check_once(self) -> list[dict[str, Any]]:
         triggered: list[dict[str, Any]] = []
@@ -176,7 +178,13 @@ class StopLossService:
                 continue
 
             prices = price_histories.get(position.market_ticker, [])
-            result = await self._evaluate_and_submit(position, ms, mid, prices, now)
+            prev_readings = list(self._prev_mids.get(position.id, []))
+            result = await self._evaluate_and_submit(position, ms, mid, prices, now, prev_mids=prev_readings)
+            # Always update, even if trigger fired (orphaned key is harmless after position closes)
+            readings = self._prev_mids.setdefault(position.id, [])
+            readings.append((mid, now))
+            if len(readings) > 2:
+                readings.pop(0)
             if result is not None:
                 triggered.append(result)
 
@@ -189,6 +197,7 @@ class StopLossService:
         mid: Decimal,
         prices: list[MarketPriceHistory],
         now: datetime,
+        prev_mids: list[tuple[Decimal, datetime]] = (),
     ) -> dict[str, Any] | None:
         """Evaluate one position in its own committed transaction to make the cooldown checkpoint immediately visible."""
         async with self.session_factory() as session:
@@ -215,7 +224,12 @@ class StopLossService:
                         if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
                             return None
 
-            # Trigger 1: trailing stop — 10% drop from post-entry peak.
+            inferred_strategy = (
+                "CRYPTO_15M" if "15M" in position.market_ticker else
+                "CRYPTO_1H" if "1H" in position.market_ticker else None
+            )
+
+            # Trigger 1: trailing stop — drop from post-entry peak.
             # Filtering to prices after entry makes the stop entry-relative, not
             # intraday-relative (avoids firing immediately on a position entered below
             # the prior intraday high).
@@ -223,7 +237,11 @@ class StopLossService:
             trailing_ratio: float | None = None
             if peak is not None:
                 trailing_ratio = _trailing_loss_ratio(peak, mid)
-                if trailing_ratio >= self.settings.stop_loss_threshold_pct:
+                effective_threshold = (
+                    self.settings.stop_loss_threshold_pct_by_strategy.get(inferred_strategy)
+                    if inferred_strategy else None
+                ) or self.settings.stop_loss_threshold_pct
+                if trailing_ratio >= effective_threshold:
                     sell_px = _sell_price(ms, position.side)
                     if sell_px is not None and sell_px > 0:
                         result = await self._submit(
@@ -235,16 +253,33 @@ class StopLossService:
                         await session.commit()
                         return result
 
+            # Trigger 3: rapid adverse move — 2 consecutive per-check drops ≥ threshold,
+            # bypasses the hold gate to catch fast crashes inside the min-hold window.
+            if self.settings.stop_loss_rapid_adverse_enabled and len(prev_mids) >= 2:
+                threshold = Decimal(str(self.settings.stop_loss_rapid_adverse_dollars))
+                drop1 = prev_mids[-2][0] - prev_mids[-1][0]  # older→recent (adverse = positive)
+                drop2 = prev_mids[-1][0] - mid               # recent→current
+                if drop1 >= threshold and drop2 >= threshold:
+                    sell_px = _sell_price(ms, position.side)
+                    if sell_px is not None and sell_px > 0:
+                        result = await self._submit(
+                            repo, position, sell_px, mid, trailing_ratio, now,
+                            kill_switch_enabled=kill_switch_enabled,
+                            active_color=active_color,
+                            trigger="rapid_adverse_move",
+                            peak=peak,
+                            rapid_drop1=drop1,
+                            rapid_drop2=drop2,
+                        )
+                        await session.commit()
+                        return result
+
             # Trigger 2: adverse momentum (no P&L requirement — catches slow bleeds
             # that haven't yet hit the trailing stop threshold).
             created_at = position.created_at
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=UTC)
             hold_minutes = (now - created_at).total_seconds() / 60
-            inferred_strategy = (
-                "CRYPTO_15M" if "15M" in position.market_ticker else
-                "CRYPTO_1H" if "1H" in position.market_ticker else None
-            )
             min_hold = (
                 self.settings.stop_loss_momentum_min_hold_minutes_by_strategy.get(inferred_strategy)
                 if inferred_strategy else None
@@ -289,6 +324,8 @@ class StopLossService:
         trigger: str = "trailing_stop",
         slope: float | None = None,
         peak: Decimal | None = None,
+        rapid_drop1: Decimal | None = None,
+        rapid_drop2: Decimal | None = None,
     ) -> dict[str, Any]:
         market_ticker = position.market_ticker
         peak_display = str(peak) if peak is not None else "n/a"
@@ -373,6 +410,10 @@ class StopLossService:
         }
         if slope is not None:
             event_payload["momentum_slope_cents_per_min"] = round(slope, 4)
+        if rapid_drop1 is not None:
+            event_payload["rapid_adverse_drop1"] = str(rapid_drop1)
+        if rapid_drop2 is not None:
+            event_payload["rapid_adverse_drop2"] = str(rapid_drop2)
 
         submit_payload: dict[str, Any] = {
             "submitted_at": now.isoformat(),

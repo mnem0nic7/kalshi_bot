@@ -301,18 +301,24 @@ class Settings(BaseSettings):
     crypto_take_profit_threshold_pct_by_asset: dict[str, float] = Field(default_factory=dict)
     crypto_take_profit_check_interval_seconds: int = 30
     crypto_take_profit_stale_snapshot_seconds: int = 120
+    crypto_book_noise_gate_enabled: bool = False
+    crypto_book_noise_yes_range_threshold: float = 0.10
+    crypto_book_noise_lookback_seconds: int = 90
 
     stop_loss_enabled: bool = False
     stop_loss_threshold_pct: float = 0.10
+    stop_loss_threshold_pct_by_strategy: dict[str, float] = Field(default_factory=dict)
     stop_loss_profit_protection_threshold_pct: float = 0.15
     stop_loss_reentry_cooldown_seconds: int = 14400
     stop_loss_momentum_reentry_window_seconds: int = 300
     stop_loss_submit_cooldown_seconds: int = 300
-    stop_loss_check_interval_seconds: int = 60
+    stop_loss_check_interval_seconds: int = 30
     stop_loss_momentum_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_reentry_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_min_hold_minutes: int = 30
     stop_loss_momentum_min_hold_minutes_by_strategy: dict[str, int] = Field(default_factory=dict)
+    stop_loss_rapid_adverse_enabled: bool = True
+    stop_loss_rapid_adverse_dollars: float = 0.07
     momentum_weight_scale_cents_per_min: float = 1.0
     momentum_slope_veto_cents_per_min: float | None = None
     momentum_weight_floor: float = 0.3
