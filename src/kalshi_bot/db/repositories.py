@@ -941,6 +941,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         asset_symbols: list[str] | None = None,
         since: datetime | None = None,
         limit: int = 1000,
+        defer_payload: bool = False,
     ) -> list[CryptoMarketSnapshotRecord]:
         """Return settled_backfill snapshots for markets that actually settled.
 
@@ -967,6 +968,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
+        if defer_payload:
+            stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
         stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
@@ -978,6 +981,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         asset_symbols: list[str] | None = None,
         since: datetime | None = None,
         limit: int = 50000,
+        defer_payload: bool = False,
     ) -> list[CryptoMarketSnapshotRecord]:
         """Return the latest real-bid/ask live snapshot for each settled market.
 
@@ -1034,6 +1038,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 .order_by(CryptoMarketSnapshotRecord.market_ticker, CryptoMarketSnapshotRecord.observed_at.desc())
                 .limit(limit)
             )
+            if defer_payload:
+                stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
             records = list((await self.session.execute(stmt)).scalars())
             latest: list[CryptoMarketSnapshotRecord] = []
             seen: set[str] = set()
@@ -1061,6 +1067,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         stmt = select(CryptoMarketSnapshotRecord).where(
             CryptoMarketSnapshotRecord.id.in_(ids)
         )
+        if defer_payload:
+            stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
         return list((await self.session.execute(stmt)).scalars())
 
     async def update_crypto_snapshot_settlement_result(

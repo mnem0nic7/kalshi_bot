@@ -15,7 +15,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any, Awaitable, Callable
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect as sa_inspect, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -2209,6 +2209,7 @@ class CryptoTrainingBackfillService:
                 asset_symbols=requested_assets or None,
                 since=since,
                 limit=self.settings.crypto_train_max_snapshots,
+                defer_payload=True,
             )
             live_quote_snapshots = await repo.list_crypto_live_quote_snapshots(
                 frequency=freq,
@@ -2216,6 +2217,7 @@ class CryptoTrainingBackfillService:
                 asset_symbols=requested_assets or None,
                 since=since,
                 limit=self.settings.crypto_train_max_snapshots,
+                defer_payload=True,
             )
             if live_quote_snapshots:
                 snapshots = list(snapshots) + live_quote_snapshots
@@ -3473,6 +3475,7 @@ class CryptoReplayService:
                 asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=500_000,
+                defer_payload=True,
             )
             live_quote_snapshots = await repo.list_crypto_live_quote_snapshots(
                 frequency=freq,
@@ -3480,6 +3483,7 @@ class CryptoReplayService:
                 asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=500_000,
+                defer_payload=True,
             )
             if live_quote_snapshots:
                 snapshots = list(snapshots) + live_quote_snapshots
@@ -5201,6 +5205,11 @@ def _row_mid(row: CryptoMarketSnapshotRecord) -> Decimal | None:
 
 
 def _snapshot_payload_sources(row: CryptoMarketSnapshotRecord) -> list[dict[str, Any]]:
+    try:
+        if "payload" in sa_inspect(row).unloaded:
+            return []
+    except Exception:
+        pass
     payload = row.payload if isinstance(getattr(row, "payload", None), dict) else {}
     sources: list[dict[str, Any]] = []
     for source in (
