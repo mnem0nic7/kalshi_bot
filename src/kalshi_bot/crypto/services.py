@@ -1245,6 +1245,22 @@ class CryptoHistoryService:
         pending_settlements: dict[str, str] = {}
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            propagation_snapshots = await repo.list_crypto_market_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                since=cutoff,
+                limit=200_000,
+                defer_payload=True,
+            )
+            if requested_assets:
+                propagation_snapshots = [
+                    row for row in propagation_snapshots if normalize_asset_symbol(row.asset_symbol) in requested_assets
+                ]
+            propagation_tickers = {
+                row.market_ticker
+                for row in propagation_snapshots
+                if row.source_kind != "settled_backfill" and row.settlement_result is None
+            }
             for index, market in enumerate(settled_markets, start=1):
                 await self.market_service.record_market_snapshot(
                     repo,
@@ -1252,7 +1268,7 @@ class CryptoHistoryService:
                     source_kind="settled_backfill",
                     observed_at=_crypto_settlement_observed_at(market),
                 )
-                if market.settlement_result in ("yes", "no"):
+                if market.settlement_result in ("yes", "no") and market.market_ticker in propagation_tickers:
                     # Propagate settlement to live monitoring snapshots so that
                     # list_crypto_settled_market_snapshots returns them (enabling
                     # real bid/ask prices as strict_trade_eligible rows in replay).
@@ -1263,6 +1279,8 @@ class CryptoHistoryService:
                         await repo.update_crypto_snapshot_settlement_results(
                             pending_settlements,
                             kalshi_env=self.settings.kalshi_env,
+                            frequency=freq,
+                            observed_since=cutoff,
                         )
                         pending_settlements.clear()
                     await session.commit()
@@ -1270,6 +1288,8 @@ class CryptoHistoryService:
                 await repo.update_crypto_snapshot_settlement_results(
                     pending_settlements,
                     kalshi_env=self.settings.kalshi_env,
+                    frequency=freq,
+                    observed_since=cutoff,
                 )
             await session.commit()
             captures = []
@@ -1553,7 +1573,7 @@ class CryptoHistoryService:
                     continue
                 parsed_page.append(parsed)
                 close_time = parsed.close_time or parsed.expected_expiration_time
-                if close_time is None or close_time >= cutoff:
+                if close_time is not None and close_time >= cutoff:
                     markets.append(parsed)
             if parsed_page and all(
                 (market.close_time or market.expected_expiration_time) is not None

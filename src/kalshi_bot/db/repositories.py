@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Select, String, case, column, func, or_, select, update as sql_update, values as sql_values
+from sqlalchemy import Select, case, func, or_, select, update as sql_update
 from sqlalchemy.orm import defer
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -1035,10 +1035,14 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         market_ticker: str,
         settlement_result: str,
         kalshi_env: str | None = None,
+        frequency: str | None = None,
+        observed_since: datetime | None = None,
     ) -> int:
         return await self.update_crypto_snapshot_settlement_results(
             {market_ticker: settlement_result},
             kalshi_env=kalshi_env,
+            frequency=frequency,
+            observed_since=observed_since,
         )
 
     async def update_crypto_snapshot_settlement_results(
@@ -1046,6 +1050,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         settlements: dict[str, str],
         *,
         kalshi_env: str | None = None,
+        frequency: str | None = None,
+        observed_since: datetime | None = None,
     ) -> int:
         """Propagate a settled market's result to its live monitoring snapshots.
 
@@ -1053,7 +1059,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         the earlier live monitoring snapshots retain ``settlement_result=NULL``.
         Updating them here makes ``list_crypto_settled_market_snapshots`` include
         those rows, giving the replay access to real bid/ask prices
-        (``quote_source='snapshot_quotes'``) for strict-trade-eligible rows.
+        (``quote_source='snapshot_quotes'``) for strict-trade-eligible rows. When
+        a nightly/preflight window is supplied, scope the propagation to that
+        window so old historical rows do not dominate the training backfill.
         """
         rows = [
             (str(market_ticker).strip(), str(settlement_result).strip())
@@ -1063,23 +1071,26 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if not rows:
             return 0
         env = self._resolved_kalshi_env(kalshi_env)
-        settlement_values = sql_values(
-            column("market_ticker", String),
-            column("settlement_result", String),
-            name="settlements",
-        ).data(rows)
-        stmt = (
-            sql_update(CryptoMarketSnapshotRecord)
-            .where(
-                CryptoMarketSnapshotRecord.market_ticker == settlement_values.c.market_ticker,
-                CryptoMarketSnapshotRecord.kalshi_env == env,
-                CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
-                CryptoMarketSnapshotRecord.settlement_result.is_(None),
+        total = 0
+        for market_ticker, settlement_result in rows:
+            stmt = (
+                sql_update(CryptoMarketSnapshotRecord)
+                .where(
+                    CryptoMarketSnapshotRecord.market_ticker == market_ticker,
+                    CryptoMarketSnapshotRecord.kalshi_env == env,
+                    CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
+                    CryptoMarketSnapshotRecord.settlement_result.is_(None),
+                )
+                .values(settlement_result=settlement_result)
             )
-            .values(settlement_result=settlement_values.c.settlement_result)
-        )
-        result = await self.session.execute(stmt)
-        return result.rowcount
+            if frequency is not None:
+                stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
+            if observed_since is not None:
+                stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= observed_since)
+            result = await self.session.execute(stmt)
+            if result.rowcount is not None and result.rowcount > 0:
+                total += result.rowcount
+        return total
 
     async def list_crypto_snapshot_asset_symbols(
         self,
