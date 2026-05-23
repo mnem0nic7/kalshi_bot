@@ -8742,15 +8742,22 @@ def _evaluate_crypto_walk_forward(
         fold_calibrated: list[dict[str, Any]] = []
         fold_selection: list[dict[str, Any]] = []
         fold_exploratory: list[dict[str, Any]] = []
-        for row in fold["test_rows"]:
+        _test_rows = fold["test_rows"]
+        _heuristic_preds = _batch_predict_rows(_test_rows, heuristic_model)
+        _calibrated_preds = _batch_predict_rows(_test_rows, model)
+        _candidate_preds: dict[str, list[Decimal]] = {
+            name: _batch_predict_rows(_test_rows, candidate_model)
+            for name, candidate_model in available_candidate_models.items()
+        }
+        for _i, row in enumerate(_test_rows):
             baseline_predictions: dict[str, Decimal] = {
                 name: _crypto_baseline_probability(row, name, linear_model=linear_return_model)
                 for name in baseline_names
             }
-            heuristic = _predict_crypto_probability(row, heuristic_model)
-            calibrated = _predict_crypto_probability(row, model)
+            heuristic = _heuristic_preds[_i]
+            calibrated = _calibrated_preds[_i]
             for name, candidate_model in available_candidate_models.items():
-                candidate_prediction = _predict_crypto_probability(row, candidate_model)
+                candidate_prediction = _candidate_preds[name][_i]
                 model_candidate_predictions_by_name[name].append((candidate_prediction, int(row["label_yes"])))
                 candidate_trade = _simulate_crypto_trade(row, candidate_prediction, settings=settings, crypto_policy=crypto_policy)
                 if candidate_trade["status"] == "fillable":
