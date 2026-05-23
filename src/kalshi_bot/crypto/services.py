@@ -6236,7 +6236,11 @@ def _crypto_decision_rows(
                 "candle_momentum_dollars": candle_momentum,
                 **spot_context,
                 **settlement_context,
-                **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
+                **_cross_asset_context(
+                    spot_by_asset,
+                    spot_end_times_by_asset=spot_end_times_by_asset,
+                    decision_ts=decision_ts,
+                ),
             }
         )
     for market_ticker, snapshot in settled_snapshots_by_market.items():
@@ -6307,7 +6311,11 @@ def _crypto_decision_rows(
                     "candle_momentum_dollars": candle_momentum,
                     **spot_context,
                     **settlement_context,
-                    **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
+                    **_cross_asset_context(
+                        spot_by_asset,
+                        spot_end_times_by_asset=spot_end_times_by_asset,
+                        decision_ts=decision_ts,
+                    ),
                 }
             )
     return _crypto_add_recent_asset_features(_crypto_add_quote_history_features(rows))
@@ -6589,16 +6597,30 @@ def _spot_return_pct(spot_rows: list[CryptoSpotOHLCRecord], *, periods: int) -> 
 def _cross_asset_context(
     spot_by_asset: dict[str, list[CryptoSpotOHLCRecord]],
     *,
+    spot_end_times_by_asset: dict[str, list[datetime]] | None = None,
     decision_ts: datetime,
 ) -> dict[str, Any]:
     decision_utc = _as_utc_datetime(decision_ts)
 
     def _cross_return(asset: str, periods: int) -> Decimal | None:
         rows = spot_by_asset.get(asset) or []
-        eligible = sorted(
-            (r for r in rows if _as_utc_datetime(r.end_ts) <= decision_utc and r.close_dollars is not None),
-            key=lambda r: r.end_ts,
-        )
+        spot_end_times = (spot_end_times_by_asset or {}).get(asset)
+        if spot_end_times is not None:
+            end_index = bisect_right(spot_end_times, decision_utc)
+            eligible: list[CryptoSpotOHLCRecord] = []
+            for index in range(end_index - 1, -1, -1):
+                row = rows[index]
+                if row.close_dollars is None:
+                    continue
+                eligible.append(row)
+                if len(eligible) > periods:
+                    break
+            eligible.reverse()
+        else:
+            eligible = sorted(
+                (r for r in rows if _as_utc_datetime(r.end_ts) <= decision_utc and r.close_dollars is not None),
+                key=lambda r: r.end_ts,
+            )
         return _spot_return_pct(eligible, periods=periods)
 
     result: dict[str, Any] = {}
