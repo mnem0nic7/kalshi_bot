@@ -9158,15 +9158,22 @@ def _is_crypto_db_disconnect(exc: BaseException) -> bool:
 def _crypto_live_entry_window_reason(row: dict[str, Any], *, settings: Settings) -> str | None:
     market_age = _optional_int(row.get("market_age_seconds"))
     time_to_close = _optional_int(row.get("time_to_close_seconds"))
-    if market_age is None and time_to_close is not None and time_to_close <= 900:
-        market_age = max(0, 900 - time_to_close)
-    if time_to_close is None and market_age is not None and market_age <= 900:
-        time_to_close = max(0, 900 - market_age)
+    frequency = str(row.get("frequency") or "15m")
+    window_seconds = 3600 if "1h" in frequency else 900
+    if market_age is None and time_to_close is not None and time_to_close <= window_seconds:
+        market_age = max(0, window_seconds - time_to_close)
+    if time_to_close is None and market_age is not None and market_age <= window_seconds:
+        time_to_close = max(0, window_seconds - market_age)
     if market_age is None or time_to_close is None:
         return "crypto_entry_window_unknown"
     if market_age < max(0, int(settings.crypto_live_min_market_age_seconds)):
         return "crypto_market_too_early_for_live_entry"
-    if time_to_close < max(0, int(settings.crypto_autonomy_min_seconds_to_close)):
+    min_to_close = (
+        settings.crypto_1h_autonomy_min_seconds_to_close
+        if "1h" in frequency
+        else settings.crypto_autonomy_min_seconds_to_close
+    )
+    if time_to_close < max(0, int(min_to_close)):
         return "crypto_market_too_late_for_live_entry"
     return None
 
