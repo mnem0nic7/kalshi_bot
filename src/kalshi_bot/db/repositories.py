@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Select, case, func, or_, select, update as sql_update
+from sqlalchemy import Select, String, case, column, func, or_, select, update as sql_update, values as sql_values
 from sqlalchemy.orm import defer
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -942,13 +942,13 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         since: datetime | None = None,
         limit: int = 1000,
     ) -> list[CryptoMarketSnapshotRecord]:
-        """Return snapshots only for markets that actually settled.
+        """Return settled_backfill snapshots for markets that actually settled.
 
-        A market counts as settled when any of its snapshots carries a
-        ``settlement_result`` of ``yes``/``no``. Unlike ``list_crypto_market_snapshots``,
-        which caps the most-recent N *raw* snapshots (mostly still-open markets),
-        this scopes to settled markets first so the ``limit`` governs the number
-        of trainable decision points rather than raw rows.
+        Only returns ``source_kind='settled_backfill'`` records (one per market),
+        which carry the authoritative ``settlement_result`` used to build the
+        per-market settlement lookup dict in the replay.  Live monitoring
+        snapshots (with real bid/ask quotes) are fetched separately via
+        ``list_crypto_live_quote_snapshots``.
         """
         env = self._resolved_kalshi_env(kalshi_env)
         symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
@@ -959,6 +959,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         stmt = select(CryptoMarketSnapshotRecord).where(
             CryptoMarketSnapshotRecord.kalshi_env == env,
             CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
+            CryptoMarketSnapshotRecord.source_kind == "settled_backfill",
         )
         if frequency is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
@@ -969,11 +970,81 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
+    async def list_crypto_live_quote_snapshots(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
+        since: datetime | None = None,
+        limit: int = 50000,
+    ) -> list[CryptoMarketSnapshotRecord]:
+        """Return the latest real-bid/ask live snapshot for each settled market.
+
+        Uses ``DISTINCT ON (market_ticker)`` to return exactly one row per market:
+        the most recent live monitoring snapshot that has real bid/ask prices AND
+        ``settlement_result`` set (propagated by settlement backfill).  These rows
+        receive ``quote_source='snapshot_quotes'`` in the replay and are the source
+        of ``strict_trade_eligible`` decision points.
+
+        Keeps total row count at O(markets) rather than O(markets × snapshots),
+        avoiding the connection overload that returning all migrated live rows causes.
+        """
+        from sqlalchemy import text as sql_text
+
+        env = self._resolved_kalshi_env(kalshi_env)
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+
+        where_parts = [
+            "kalshi_env = :env",
+            "settlement_result IN ('yes', 'no')",
+            "source_kind != 'settled_backfill'",
+            "yes_bid_dollars IS NOT NULL",
+        ]
+        params: dict = {"env": env, "limit": limit}
+        if frequency is not None:
+            where_parts.append("frequency = :frequency")
+            params["frequency"] = frequency
+        if symbols:
+            where_parts.append("asset_symbol = ANY(:symbols)")
+            params["symbols"] = symbols
+        if since is not None:
+            where_parts.append("observed_at >= :since")
+            params["since"] = since
+
+        where_clause = " AND ".join(where_parts)
+        raw = sql_text(f"""
+            SELECT DISTINCT ON (market_ticker) id
+            FROM crypto_market_snapshots
+            WHERE {where_clause}
+            ORDER BY market_ticker, observed_at DESC
+            LIMIT :limit
+        """)
+        rows = (await self.session.execute(raw, params)).fetchall()
+        if not rows:
+            return []
+        ids = [r[0] for r in rows]
+        stmt = select(CryptoMarketSnapshotRecord).where(
+            CryptoMarketSnapshotRecord.id.in_(ids)
+        )
+        return list((await self.session.execute(stmt)).scalars())
+
     async def update_crypto_snapshot_settlement_result(
         self,
         *,
         market_ticker: str,
         settlement_result: str,
+        kalshi_env: str | None = None,
+    ) -> int:
+        return await self.update_crypto_snapshot_settlement_results(
+            {market_ticker: settlement_result},
+            kalshi_env=kalshi_env,
+        )
+
+    async def update_crypto_snapshot_settlement_results(
+        self,
+        settlements: dict[str, str],
+        *,
         kalshi_env: str | None = None,
     ) -> int:
         """Propagate a settled market's result to its live monitoring snapshots.
@@ -984,16 +1055,28 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         those rows, giving the replay access to real bid/ask prices
         (``quote_source='snapshot_quotes'``) for strict-trade-eligible rows.
         """
+        rows = [
+            (str(market_ticker).strip(), str(settlement_result).strip())
+            for market_ticker, settlement_result in settlements.items()
+            if str(market_ticker or "").strip() and str(settlement_result or "").strip() in {"yes", "no"}
+        ]
+        if not rows:
+            return 0
         env = self._resolved_kalshi_env(kalshi_env)
+        settlement_values = sql_values(
+            column("market_ticker", String),
+            column("settlement_result", String),
+            name="settlements",
+        ).data(rows)
         stmt = (
             sql_update(CryptoMarketSnapshotRecord)
             .where(
-                CryptoMarketSnapshotRecord.market_ticker == market_ticker,
+                CryptoMarketSnapshotRecord.market_ticker == settlement_values.c.market_ticker,
                 CryptoMarketSnapshotRecord.kalshi_env == env,
                 CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
                 CryptoMarketSnapshotRecord.settlement_result.is_(None),
             )
-            .values(settlement_result=settlement_result)
+            .values(settlement_result=settlement_values.c.settlement_result)
         )
         result = await self.session.execute(stmt)
         return result.rowcount

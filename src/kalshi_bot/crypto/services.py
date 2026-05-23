@@ -1242,6 +1242,7 @@ class CryptoHistoryService:
         }
         asset_counts: Counter[str] = Counter({asset: 0 for asset in expected_assets})
         commit_batch_size = 250
+        pending_settlements: dict[str, str] = {}
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             for index, market in enumerate(settled_markets, start=1):
@@ -1255,14 +1256,21 @@ class CryptoHistoryService:
                     # Propagate settlement to live monitoring snapshots so that
                     # list_crypto_settled_market_snapshots returns them (enabling
                     # real bid/ask prices as strict_trade_eligible rows in replay).
-                    await repo.update_crypto_snapshot_settlement_result(
-                        market_ticker=market.market_ticker,
-                        settlement_result=market.settlement_result,
-                        kalshi_env=self.settings.kalshi_env,
-                    )
+                    pending_settlements[market.market_ticker] = market.settlement_result
                 asset_counts[market.asset_symbol] += 1
                 if index % commit_batch_size == 0:
+                    if pending_settlements:
+                        await repo.update_crypto_snapshot_settlement_results(
+                            pending_settlements,
+                            kalshi_env=self.settings.kalshi_env,
+                        )
+                        pending_settlements.clear()
                     await session.commit()
+            if pending_settlements:
+                await repo.update_crypto_snapshot_settlement_results(
+                    pending_settlements,
+                    kalshi_env=self.settings.kalshi_env,
+                )
             await session.commit()
             captures = []
             if self.settings.crypto_collect_settled_candles_enabled:
@@ -3416,6 +3424,15 @@ class CryptoReplayService:
                 since=cutoff,
                 limit=500_000,
             )
+            live_quote_snapshots = await repo.list_crypto_live_quote_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
+                since=cutoff,
+                limit=500_000,
+            )
+            if live_quote_snapshots:
+                snapshots = list(snapshots) + live_quote_snapshots
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,

@@ -4,10 +4,12 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 from kalshi_bot.config import Settings
+from kalshi_bot.crypto import services as crypto_services
 from kalshi_bot.crypto.services import CryptoForecastService, CryptoTrainingBackfillService
-from kalshi_bot.db.models import CryptoMarketSnapshotRecord
+from kalshi_bot.db.models import CryptoMarketSnapshotRecord, CryptoSpotOHLCRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 
@@ -237,3 +239,108 @@ async def test_training_preflight_materializes_feature_rows_before_feature_store
     assert result["status"] == "trained"
     assert result["sample_count"] >= 2
     assert result["payload"]["trained_from"] == "crypto_training_feature_rows"
+
+
+class _RetrySession:
+    def __init__(self) -> None:
+        self.rollback_count = 0
+        self.commit_count = 0
+
+    async def rollback(self) -> None:
+        self.rollback_count += 1
+
+    async def commit(self) -> None:
+        self.commit_count += 1
+
+
+class _RetryRepo:
+    def __init__(self) -> None:
+        self.session = _RetrySession()
+        self.order_book_calls = 0
+
+    async def upsert_crypto_order_book_snapshot(self, **_values) -> None:
+        self.order_book_calls += 1
+        if self.order_book_calls == 1:
+            raise DBAPIError(
+                "insert",
+                {},
+                Exception("ConnectionDoesNotExistError: connection was closed in the middle of operation"),
+                connection_invalidated=True,
+            )
+
+    async def upsert_crypto_trade_tick(self, **_values) -> None:
+        raise AssertionError("no trade ticks expected")
+
+
+@pytest.mark.asyncio
+async def test_materialize_spot_microstructure_retries_dropped_db_connection() -> None:
+    service = CryptoTrainingBackfillService(
+        settings=Settings(kalshi_env="production"),
+        session_factory=object(),  # not used by the helper under test
+        history_service=object(),
+        spot_service=None,
+    )
+    row = CryptoSpotOHLCRecord(
+        id="spot-1",
+        kalshi_env="production",
+        provider="coinbase",
+        asset_symbol="BTC",
+        quote_currency="USD",
+        frequency="15m",
+        interval_seconds=900,
+        start_ts=NOW - timedelta(minutes=15),
+        end_ts=NOW,
+        observed_at=NOW,
+        source_kind="spot_tick",
+        source_id="BTC-USD",
+        payload={
+            "market_microstructure": {
+                "best_bid_ask": {
+                    "best_bid_dollars": "70000.00",
+                    "best_ask_dollars": "70000.01",
+                    "mid_dollars": "70000.005",
+                    "spread_bps": 0,
+                    "best_bid_size": "0.10",
+                    "best_ask_size": "0.20",
+                }
+            }
+        },
+    )
+    repo = _RetryRepo()
+
+    await service._materialize_spot_microstructure(repo, [row], frequency="15m")
+
+    assert repo.order_book_calls == 2
+    assert repo.session.rollback_count == 1
+    assert repo.session.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_materialize_retries_transient_database_restart(monkeypatch) -> None:
+    service = CryptoTrainingBackfillService(
+        settings=Settings(kalshi_env="production"),
+        session_factory=object(),  # patched helper avoids opening a real session
+        history_service=object(),
+        spot_service=None,
+    )
+    calls = 0
+    sleeps: list[float] = []
+
+    async def flaky_materialize_once(*, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionRefusedError("Connect call failed ('172.18.0.4', 5432)")
+        return {"status": "ok", "frequency": frequency, "asset_symbols": asset_symbols}
+
+    async def capture_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(service, "_materialize_once", flaky_materialize_once)
+    monkeypatch.setattr(crypto_services.asyncio, "sleep", capture_sleep)
+
+    result = await service.materialize(frequency="1h", asset_symbols=["BTC"])
+
+    assert result == {"status": "ok", "frequency": "1h", "asset_symbols": ["BTC"]}
+    assert calls == 2
+    assert sleeps == [2.0]
