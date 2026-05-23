@@ -120,6 +120,7 @@ CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_remaining_payout_bps": (0,),
 }
 CRYPTO_MICROSTRUCTURE_UPSERT_COMMIT_INTERVAL = 250
+CRYPTO_TRAINING_STEP_RETRY_DELAYS_SECONDS = (5.0, 15.0, 45.0)
 CRYPTO_TRAINING_DB_RETRY_DELAYS_SECONDS = (2.0, 5.0, 15.0, 30.0)
 CRYPTO_STRATEGY_CODES = {
     "15m": StrategyCode.CRYPTO_15M.value,
@@ -2078,12 +2079,12 @@ class CryptoTrainingBackfillService:
             steps["collect_open"] = await self._capture_step(
                 errors,
                 "collect_open",
-                self.history_service.collect_open(frequency=freq, asset_symbols=assets or None),
+                lambda: self.history_service.collect_open(frequency=freq, asset_symbols=assets or None),
             )
             steps["collect_settled"] = await self._capture_step(
                 errors,
                 "collect_settled",
-                self.history_service.collect_settled(
+                lambda: self.history_service.collect_settled(
                     frequency=freq,
                     days=settled_days or self.settings.crypto_training_preflight_settled_days,
                     asset_symbols=assets or None,
@@ -2092,7 +2093,7 @@ class CryptoTrainingBackfillService:
             steps["history_bootstrap"] = await self._capture_step(
                 errors,
                 "history_bootstrap",
-                self.history_service.bootstrap(
+                lambda: self.history_service.bootstrap(
                     frequency=freq,
                     days=history_days or self.settings.crypto_training_preflight_history_days,
                     asset_symbols=assets or None,
@@ -2102,7 +2103,7 @@ class CryptoTrainingBackfillService:
                 steps["spot_backfill"] = await self._capture_step(
                     errors,
                     "spot_backfill",
-                    self.spot_service.backfill(
+                    lambda: self.spot_service.backfill(
                         frequency=freq,
                         days=spot_days or self.settings.crypto_training_preflight_spot_days,
                         asset_symbols=assets or None,
@@ -2111,7 +2112,7 @@ class CryptoTrainingBackfillService:
                 steps["spot_current"] = await self._capture_step(
                     errors,
                     "spot_current",
-                    self.spot_service.collect_current(frequency=freq, asset_symbols=assets or None),
+                    lambda: self.spot_service.collect_current(frequency=freq, asset_symbols=assets or None),
                 )
 
         materialized = await self.materialize(frequency=freq, asset_symbols=assets or None)
@@ -2130,14 +2131,33 @@ class CryptoTrainingBackfillService:
             "errors": errors,
         }
 
-    async def _capture_step(self, errors: list[dict[str, Any]], step: str, awaitable: Any) -> dict[str, Any]:
-        try:
-            result = await awaitable
-            return _crypto_training_step_summary(result)
-        except Exception as exc:
-            logger.warning("crypto_training_preflight step failed step=%s", step, exc_info=True)
-            errors.append({"step": step, "error": str(exc)})
-            return {"status": "error", "error": str(exc)}
+    async def _capture_step(
+        self,
+        errors: list[dict[str, Any]],
+        step: str,
+        awaitable_factory: Callable[[], Awaitable[Any]],
+    ) -> dict[str, Any]:
+        for attempt, delay in enumerate((0.0, *CRYPTO_TRAINING_STEP_RETRY_DELAYS_SECONDS), start=1):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                result = await awaitable_factory()
+                return _crypto_training_step_summary(result)
+            except Exception as exc:
+                has_retry = attempt <= len(CRYPTO_TRAINING_STEP_RETRY_DELAYS_SECONDS)
+                if has_retry and _is_crypto_transient_network_error(exc):
+                    logger.warning(
+                        "crypto_training_preflight_step_retry step=%s attempt=%s next_delay_seconds=%s reason=%s",
+                        step,
+                        attempt,
+                        CRYPTO_TRAINING_STEP_RETRY_DELAYS_SECONDS[attempt - 1],
+                        exc,
+                    )
+                    continue
+                logger.warning("crypto_training_preflight step failed step=%s", step, exc_info=True)
+                errors.append({"step": step, "error": str(exc)})
+                return {"status": "error", "error": str(exc)}
+        raise RuntimeError("crypto training preflight retry loop exited unexpectedly")
 
     async def materialize(
         self,
@@ -2190,6 +2210,15 @@ class CryptoTrainingBackfillService:
                 since=since,
                 limit=self.settings.crypto_train_max_snapshots,
             )
+            live_quote_snapshots = await repo.list_crypto_live_quote_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
+                since=since,
+                limit=self.settings.crypto_train_max_snapshots,
+            )
+            if live_quote_snapshots:
+                snapshots = list(snapshots) + live_quote_snapshots
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
@@ -2277,6 +2306,7 @@ class CryptoTrainingBackfillService:
                 },
                 payload={
                     "snapshot_count": len(snapshots),
+                    "live_quote_snapshot_count": len(live_quote_snapshots),
                     "candlestick_count": len(candles),
                     "spot_row_count": len(spot_rows),
                     "asset_symbols": requested_assets,
@@ -9153,6 +9183,41 @@ def _is_crypto_db_disconnect(exc: BaseException) -> bool:
         "terminating connection",
     )
     return any(marker in text for marker in disconnect_markers)
+
+
+def _is_crypto_transient_network_error(exc: BaseException) -> bool:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    retryable_types = (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.NetworkError,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+        httpx.TimeoutException,
+        ConnectionError,
+        ConnectionResetError,
+        TimeoutError,
+    )
+    if any(isinstance(item, retryable_types) for item in chain):
+        return True
+    text = " ".join(f"{type(item).__name__}: {item}" for item in chain).lower()
+    transient_markers = (
+        "name resolution",
+        "temporary failure",
+        "connection reset",
+        "connection refused",
+        "network is unreachable",
+        "server disconnected",
+        "timed out",
+    )
+    return any(marker in text for marker in transient_markers)
 
 
 def _crypto_live_entry_window_reason(row: dict[str, Any], *, settings: Settings) -> str | None:

@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Select, case, func, or_, select, update as sql_update
+from sqlalchemy import Select, bindparam, case, func, or_, select, update as sql_update
 from sqlalchemy.orm import defer
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -1000,17 +1000,49 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             "settlement_result IN ('yes', 'no')",
             "source_kind != 'settled_backfill'",
             "yes_bid_dollars IS NOT NULL",
+            "yes_ask_dollars IS NOT NULL",
         ]
         params: dict = {"env": env, "limit": limit}
         if frequency is not None:
             where_parts.append("frequency = :frequency")
             params["frequency"] = frequency
         if symbols:
-            where_parts.append("asset_symbol = ANY(:symbols)")
+            where_parts.append("asset_symbol IN :symbols")
             params["symbols"] = symbols
         if since is not None:
             where_parts.append("observed_at >= :since")
             params["since"] = since
+
+        bind = self.session.get_bind()
+        if bind is not None and bind.dialect.name != "postgresql":
+            conditions = [
+                CryptoMarketSnapshotRecord.kalshi_env == env,
+                CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
+                CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
+                CryptoMarketSnapshotRecord.yes_bid_dollars.is_not(None),
+                CryptoMarketSnapshotRecord.yes_ask_dollars.is_not(None),
+            ]
+            if frequency is not None:
+                conditions.append(CryptoMarketSnapshotRecord.frequency == frequency)
+            if symbols:
+                conditions.append(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
+            if since is not None:
+                conditions.append(CryptoMarketSnapshotRecord.observed_at >= since)
+            stmt = (
+                select(CryptoMarketSnapshotRecord)
+                .where(*conditions)
+                .order_by(CryptoMarketSnapshotRecord.market_ticker, CryptoMarketSnapshotRecord.observed_at.desc())
+                .limit(limit)
+            )
+            records = list((await self.session.execute(stmt)).scalars())
+            latest: list[CryptoMarketSnapshotRecord] = []
+            seen: set[str] = set()
+            for record in records:
+                if record.market_ticker in seen:
+                    continue
+                seen.add(record.market_ticker)
+                latest.append(record)
+            return latest
 
         where_clause = " AND ".join(where_parts)
         raw = sql_text(f"""
@@ -1020,6 +1052,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             ORDER BY market_ticker, observed_at DESC
             LIMIT :limit
         """)
+        if symbols:
+            raw = raw.bindparams(bindparam("symbols", expanding=True))
         rows = (await self.session.execute(raw, params)).fetchall()
         if not rows:
             return []
