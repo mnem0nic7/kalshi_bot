@@ -233,6 +233,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
+    shm_size: 512m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-kalshi_bot}"]
       interval: 5s
