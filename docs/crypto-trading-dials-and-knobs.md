@@ -200,7 +200,15 @@ but it does not make a `live_quality` candidate.
 | Setting or CLI flag | Current default | Effect |
 | --- | ---: | --- |
 | `crypto_min_training_samples` | `250` | Minimum training sample count expected by crypto model training. |
+| `crypto_training_preflight_enabled` | `True` | Runs source backfill, feature materialization, and data-quality checks before crypto model training. |
+| `crypto_training_feature_store_enabled` | `True` | Enables persisted point-in-time feature rows for crypto training. |
+| `crypto_training_preflight_settled_days` | `2` | Settled-label collection window used by pre-training backfill. |
+| `crypto_training_preflight_history_days` | `2` | Kalshi history/bootstrap window used by pre-training backfill. |
+| `crypto_training_preflight_spot_days` | `2` | Spot OHLC backfill window used by pre-training backfill. |
+| `crypto_training_preflight_min_spot_coverage_pct` | `0.80` | Minimum feature-row spot coverage required before training proceeds. |
 | `crypto-model train --assets` | `None` | Limits training to selected assets. If omitted, trains all available rows for the requested frequency. |
+| `crypto-model train --skip-preflight` | `False` | Bypasses source backfill/materialization for operator recovery only. |
+| `crypto-model train --feature-store-only` | `False` | Trains only from materialized feature rows instead of raw source tables. |
 | `crypto-model candidates --days` | `30` | Candidate-analysis lookback. |
 | `crypto-model candidates --assets` | `None` | Limits candidate analysis to selected assets. |
 
@@ -633,8 +641,11 @@ global gate reflects all updated per-asset backtest slices.
 
 - Stream key: `daemon_crypto_model_nightly:{kalshi_env}:{app_color}`
 - Payload: `ran_at`, `refreshed_count`, `asset_decisions` map of asset → one of
-  `refreshed`, `skipped_fresh`, `missing_or_not_ready`, `aged_out`, `error`.
+  `refreshed`, `skipped_fresh`, `skipped_preflight_blocked`, `missing_or_not_ready`, `aged_out`, `error`.
 - Per-asset failures are caught and logged; they do not abort the loop for other assets.
+- When preflight is enabled, each asset/frequency refresh runs collection,
+  feature materialization, and data-quality gates before `crypto-model train`.
+  Blocked assets keep the existing model active.
 
 **Disable / rollback:**
 

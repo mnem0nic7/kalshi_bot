@@ -580,7 +580,9 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `crypto-spot backfill --kalshi-env --days --frequency --assets` | Backfills spot OHLC; default days `180`. |
 | `crypto-spot status --kalshi-env --days --frequency --assets` | Spot coverage status. |
 | `crypto-spot coinbase-products --kalshi-env --assets` | Verifies Coinbase product coverage. |
-| `crypto-model train --kalshi-env --frequency --assets` | Trains crypto forecast artifacts. |
+| `crypto-model train --kalshi-env --frequency --assets` | Runs pre-training backfill/materialization, then trains crypto forecast artifacts from feature-store rows. |
+| `crypto-model train --skip-preflight` | Operator recovery flag to bypass pre-training backfill/materialization. |
+| `crypto-model train --feature-store-only` | Trains from existing materialized feature rows only. |
 | `crypto-model candidates --kalshi-env --days --frequency --assets` | Lists candidate rows; default days `30`. |
 | `crypto-replay run --kalshi-env --days --limit --frequency --assets` | Runs strict replay/backtest; default days `30`, limit `0` means unbounded. |
 | `crypto-replay gate --kalshi-env --frequency --assets` | Persists replay gate result. |
