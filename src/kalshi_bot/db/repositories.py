@@ -1052,11 +1052,19 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
 
         where_clause = " AND ".join(where_parts)
         raw = sql_text(f"""
-            SELECT DISTINCT ON (market_ticker) id
-            FROM crypto_market_snapshots
-            WHERE {where_clause}
-            ORDER BY market_ticker, observed_at DESC
-            LIMIT :limit
+            WITH latest AS (
+                SELECT DISTINCT ON (market_ticker) market_ticker, observed_at
+                FROM crypto_market_snapshots
+                WHERE {where_clause}
+                ORDER BY market_ticker, observed_at DESC
+                LIMIT :limit
+            )
+            SELECT snapshot.id
+            FROM latest
+            JOIN crypto_market_snapshots AS snapshot
+              ON snapshot.kalshi_env = :env
+             AND snapshot.market_ticker = latest.market_ticker
+             AND snapshot.observed_at = latest.observed_at
         """)
         if symbols:
             raw = raw.bindparams(bindparam("symbols", expanding=True))
