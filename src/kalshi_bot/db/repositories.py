@@ -952,26 +952,13 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         """
         env = self._resolved_kalshi_env(kalshi_env)
         symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
-        # Phase 1: fetch the (small) list of settled market tickers.
-        # Filtering by asset_symbol and since here keeps the result set small and allows
-        # ix_crypto_market_snapshots_settled_asset (partial index) to do an index-only scan.
-        ticker_stmt = select(CryptoMarketSnapshotRecord.market_ticker).distinct().where(
-            CryptoMarketSnapshotRecord.kalshi_env == env,
-            CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
-        )
-        if frequency is not None:
-            ticker_stmt = ticker_stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
-        if symbols:
-            ticker_stmt = ticker_stmt.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
-        if since is not None:
-            ticker_stmt = ticker_stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
-        settled_tickers = list((await self.session.execute(ticker_stmt)).scalars())
-        if not settled_tickers:
-            return []
-        # Phase 2: fetch snapshots for the known-settled tickers only.
+        # Direct filter on settlement_result uses the partial index
+        # ix_crypto_market_snapshots_settled_asset (kalshi_env, frequency, asset_symbol,
+        # market_ticker WHERE settlement_result IN ('yes','no')), avoiding the asyncpg
+        # 32767-parameter limit that a two-phase IN-list approach hits for large datasets.
         stmt = select(CryptoMarketSnapshotRecord).where(
             CryptoMarketSnapshotRecord.kalshi_env == env,
-            CryptoMarketSnapshotRecord.market_ticker.in_(settled_tickers),
+            CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
         )
         if frequency is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)

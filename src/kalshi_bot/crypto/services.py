@@ -12,10 +12,11 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kalshi_bot.config import Settings
@@ -118,6 +119,8 @@ CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_contract_price_dollars": (0.50, 0.60, 0.70),
     "min_remaining_payout_bps": (0,),
 }
+CRYPTO_MICROSTRUCTURE_UPSERT_COMMIT_INTERVAL = 250
+CRYPTO_TRAINING_DB_RETRY_DELAYS_SECONDS = (2.0, 5.0, 15.0, 30.0)
 CRYPTO_STRATEGY_CODES = {
     "15m": StrategyCode.CRYPTO_15M.value,
     "1h": StrategyCode.CRYPTO_1H.value,
@@ -2105,6 +2108,29 @@ class CryptoTrainingBackfillService:
         frequency: str = "15m",
         asset_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
+        for attempt, delay in enumerate((0.0, *CRYPTO_TRAINING_DB_RETRY_DELAYS_SECONDS), start=1):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                return await self._materialize_once(frequency=frequency, asset_symbols=asset_symbols)
+            except Exception as exc:
+                if attempt > len(CRYPTO_TRAINING_DB_RETRY_DELAYS_SECONDS) or not _is_crypto_db_disconnect(exc):
+                    raise
+                logger.warning(
+                    "crypto_training_materialize_db_retry frequency=%s attempt=%s next_delay_seconds=%s reason=%s",
+                    frequency,
+                    attempt,
+                    CRYPTO_TRAINING_DB_RETRY_DELAYS_SECONDS[attempt - 1],
+                    exc,
+                )
+        raise RuntimeError("crypto training materialize retry loop exited unexpectedly")
+
+    async def _materialize_once(
+        self,
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
         lookback_days = max(1, int(self.settings.crypto_train_lookback_days))
@@ -2239,6 +2265,16 @@ class CryptoTrainingBackfillService:
         *,
         frequency: str,
     ) -> None:
+        ops_since_commit = 0
+
+        async def run_upsert(label: str, operation: Callable[[], Awaitable[None]]) -> None:
+            nonlocal ops_since_commit
+            await self._run_microstructure_upsert(repo, label, operation)
+            ops_since_commit += 1
+            if ops_since_commit >= CRYPTO_MICROSTRUCTURE_UPSERT_COMMIT_INTERVAL:
+                await repo.session.commit()
+                ops_since_commit = 0
+
         for row in spot_rows:
             payload = row.payload if isinstance(row.payload, dict) else {}
             microstructure = payload.get("market_microstructure") if isinstance(payload.get("market_microstructure"), dict) else {}
@@ -2249,45 +2285,87 @@ class CryptoTrainingBackfillService:
                 depth_imbalance = None
                 if bid_depth is not None and ask_depth is not None and bid_depth + ask_depth > 0:
                     depth_imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth)
-                await repo.upsert_crypto_order_book_snapshot(
-                    kalshi_env=self.settings.kalshi_env,
-                    provider=row.provider,
-                    asset_symbol=row.asset_symbol,
-                    frequency=frequency,
-                    market_ticker="",
-                    source_kind=row.source_kind,
-                    source_id=row.source_id,
-                    observed_at=_as_utc_datetime(row.end_ts),
-                    best_bid_dollars=_optional_decimal(best_bid_ask.get("best_bid_dollars")),
-                    best_ask_dollars=_optional_decimal(best_bid_ask.get("best_ask_dollars")),
-                    mid_dollars=_optional_decimal(best_bid_ask.get("mid_dollars")),
-                    spread_bps=int(best_bid_ask["spread_bps"]) if best_bid_ask.get("spread_bps") not in (None, "") else None,
-                    bid_depth=bid_depth,
-                    ask_depth=ask_depth,
-                    depth_imbalance=depth_imbalance,
-                    payload={"spot_ohlc_id": row.id, "raw": best_bid_ask},
-                )
+
+                async def upsert_order_book_snapshot(
+                    *,
+                    row: CryptoSpotOHLCRecord = row,
+                    best_bid_ask: dict[str, Any] = best_bid_ask,
+                    bid_depth: Decimal | None = bid_depth,
+                    ask_depth: Decimal | None = ask_depth,
+                    depth_imbalance: Decimal | None = depth_imbalance,
+                ) -> None:
+                    await repo.upsert_crypto_order_book_snapshot(
+                        kalshi_env=self.settings.kalshi_env,
+                        provider=row.provider,
+                        asset_symbol=row.asset_symbol,
+                        frequency=frequency,
+                        market_ticker="",
+                        source_kind=row.source_kind,
+                        source_id=row.source_id,
+                        observed_at=_as_utc_datetime(row.end_ts),
+                        best_bid_dollars=_optional_decimal(best_bid_ask.get("best_bid_dollars")),
+                        best_ask_dollars=_optional_decimal(best_bid_ask.get("best_ask_dollars")),
+                        mid_dollars=_optional_decimal(best_bid_ask.get("mid_dollars")),
+                        spread_bps=int(best_bid_ask["spread_bps"]) if best_bid_ask.get("spread_bps") not in (None, "") else None,
+                        bid_depth=bid_depth,
+                        ask_depth=ask_depth,
+                        depth_imbalance=depth_imbalance,
+                        payload={"spot_ohlc_id": row.id, "raw": best_bid_ask},
+                    )
+
+                await run_upsert("order_book_snapshot", upsert_order_book_snapshot)
             trades = microstructure.get("recent_trades") if isinstance(microstructure.get("recent_trades"), list) else []
             for idx, trade in enumerate(trades):
                 if not isinstance(trade, dict):
                     continue
                 observed = parse_datetime(trade.get("time")) or row.end_ts
                 trade_id = str(trade.get("trade_id") or f"{row.id}:{idx}")
-                await repo.upsert_crypto_trade_tick(
-                    kalshi_env=self.settings.kalshi_env,
-                    provider=row.provider,
-                    asset_symbol=row.asset_symbol,
-                    frequency=frequency,
-                    market_ticker="",
-                    source_kind=row.source_kind,
-                    source_id=row.source_id or "",
-                    trade_id=trade_id,
-                    observed_at=_as_utc_datetime(observed),
-                    side=str(trade.get("side") or "") or None,
-                    price_dollars=_optional_decimal(trade.get("price_dollars") or trade.get("price")),
-                    size=_optional_decimal(trade.get("size")),
-                    payload={"spot_ohlc_id": row.id, "raw": trade},
-                )
+
+                async def upsert_trade_tick(
+                    *,
+                    row: CryptoSpotOHLCRecord = row,
+                    trade: dict[str, Any] = trade,
+                    observed: datetime = observed,
+                    trade_id: str = trade_id,
+                ) -> None:
+                    await repo.upsert_crypto_trade_tick(
+                        kalshi_env=self.settings.kalshi_env,
+                        provider=row.provider,
+                        asset_symbol=row.asset_symbol,
+                        frequency=frequency,
+                        market_ticker="",
+                        source_kind=row.source_kind,
+                        source_id=row.source_id or "",
+                        trade_id=trade_id,
+                        observed_at=_as_utc_datetime(observed),
+                        side=str(trade.get("side") or "") or None,
+                        price_dollars=_optional_decimal(trade.get("price_dollars") or trade.get("price")),
+                        size=_optional_decimal(trade.get("size")),
+                        payload={"spot_ohlc_id": row.id, "raw": trade},
+                    )
+
+                await run_upsert("trade_tick", upsert_trade_tick)
+        if ops_since_commit:
+            await repo.session.commit()
+
+    async def _run_microstructure_upsert(
+        self,
+        repo: PlatformRepository,
+        label: str,
+        operation: Callable[[], Awaitable[None]],
+    ) -> None:
+        try:
+            await operation()
+        except Exception as exc:
+            if not _is_crypto_db_disconnect(exc):
+                raise
+            logger.warning(
+                "crypto_training_microstructure_upsert_retry label=%s reason=%s",
+                label,
+                exc,
+            )
+            await repo.session.rollback()
+            await operation()
 
     async def _materialize_settlement_windows(
         self,
@@ -3322,12 +3400,12 @@ class CryptoReplayService:
         cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            snapshots = await repo.list_crypto_market_snapshots(
+            snapshots = await repo.list_crypto_settled_market_snapshots(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbols=requested_assets or None,
                 since=cutoff,
-                limit=200_000,
+                limit=500_000,
             )
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
@@ -8996,6 +9074,39 @@ def _optional_int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _is_crypto_db_disconnect(exc: BaseException) -> bool:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    if any(bool(getattr(item, "connection_invalidated", False)) for item in chain):
+        return True
+    if any(isinstance(item, (BrokenPipeError, ConnectionRefusedError, ConnectionResetError, TimeoutError)) for item in chain):
+        return True
+
+    text = " ".join(
+        f"{type(item).__name__}:{getattr(item, 'orig', '')} {item}" for item in chain
+    ).lower()
+    disconnect_markers = (
+        "brokenpipeerror",
+        "connectiondoesnotexisterror",
+        "connection refused",
+        "connection was closed",
+        "connect call failed",
+        "could not connect to server",
+        "database system is shutting down",
+        "database system is starting up",
+        "not yet accepting connections",
+        "server closed the connection unexpectedly",
+        "terminating connection",
+    )
+    return any(marker in text for marker in disconnect_markers)
 
 
 def _crypto_live_entry_window_reason(row: dict[str, Any], *, settings: Settings) -> str | None:
