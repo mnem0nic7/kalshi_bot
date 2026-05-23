@@ -6127,6 +6127,10 @@ def _crypto_decision_rows(
         candles_by_market[candle.market_ticker].append(candle)
     for market_candles in candles_by_market.values():
         market_candles.sort(key=lambda row: row.end_period_ts)
+    candle_end_times_by_market = {
+        market_ticker: [_as_utc_datetime(row.end_period_ts) for row in market_candles]
+        for market_ticker, market_candles in candles_by_market.items()
+    }
     spot_by_asset: dict[str, list[CryptoSpotOHLCRecord]] = defaultdict(list)
     for row in spot_rows or []:
         if row.close_dollars is None:
@@ -6164,7 +6168,13 @@ def _crypto_decision_rows(
         if key in seen:
             continue
         seen.add(key)
-        candle = _nearest_candle(candles_by_market.get(snapshot.market_ticker, []), decision_ts)
+        market_candles = candles_by_market.get(snapshot.market_ticker, [])
+        market_candle_end_times = candle_end_times_by_market.get(snapshot.market_ticker, [])
+        candle = _nearest_candle(
+            market_candles,
+            decision_ts,
+            candle_end_times=market_candle_end_times,
+        )
         mid = _row_mid(snapshot) or (candle.close_dollars if candle is not None else None)
         if mid is None:
             continue
@@ -6179,7 +6189,11 @@ def _crypto_decision_rows(
             no_ask = Decimal("1") - mid
         elif no_ask is None:
             no_ask = Decimal("1") - yes_bid
-        prior_candle = _prior_candle(candles_by_market.get(snapshot.market_ticker, []), decision_ts)
+        prior_candle = _prior_candle(
+            market_candles,
+            decision_ts,
+            candle_end_times=market_candle_end_times,
+        )
         candle_momentum = None
         if candle is not None and prior_candle is not None and candle.close_dollars is not None and prior_candle.close_dollars is not None:
             candle_momentum = candle.close_dollars - prior_candle.close_dollars
@@ -6232,7 +6246,7 @@ def _crypto_decision_rows(
                 "settlement_result": settlement_result,
                 "settlement_label_source": "joined_settled_snapshot" if settlement_joined else "snapshot",
                 "label_yes": 1 if settlement_result == "yes" else 0,
-                "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
+                "candle_count": len(market_candles),
                 "candle_momentum_dollars": candle_momentum,
                 **spot_context,
                 **settlement_context,
@@ -6247,11 +6261,14 @@ def _crypto_decision_rows(
         close_time = snapshot.close_time or snapshot.expected_expiration_time
         if close_time is None:
             continue
-        replay_candles = [
-            candle
-            for candle in candles_by_market.get(market_ticker, [])
-            if candle.end_period_ts < close_time and candle.close_dollars is not None
-        ][-4:]
+        market_candles = candles_by_market.get(market_ticker, [])
+        market_candle_end_times = candle_end_times_by_market.get(market_ticker, [])
+        replay_candles = _recent_candles_before(
+            market_candles,
+            close_time,
+            candle_end_times=market_candle_end_times,
+            limit=4,
+        )
         for candle in replay_candles:
             decision_ts = candle.end_period_ts
             key = (snapshot.market_ticker, decision_ts)
@@ -6259,7 +6276,11 @@ def _crypto_decision_rows(
                 continue
             seen.add(key)
             mid = _clamp_price(candle.close_dollars)
-            prior_candle = _prior_candle(candles_by_market.get(snapshot.market_ticker, []), decision_ts)
+            prior_candle = _prior_candle(
+                market_candles,
+                decision_ts,
+                candle_end_times=market_candle_end_times,
+            )
             candle_momentum = None
             if prior_candle is not None and prior_candle.close_dollars is not None:
                 candle_momentum = candle.close_dollars - prior_candle.close_dollars
@@ -6307,7 +6328,7 @@ def _crypto_decision_rows(
                     "market_age_seconds": _crypto_market_age_seconds(decision_ts, getattr(snapshot, "open_time", None)),
                     "settlement_result": snapshot.settlement_result,
                     "label_yes": 1 if snapshot.settlement_result == "yes" else 0,
-                    "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
+                    "candle_count": len(market_candles),
                     "candle_momentum_dollars": candle_momentum,
                     **spot_context,
                     **settlement_context,
@@ -6958,7 +6979,12 @@ def _crypto_realized_fill_pnl(fills: list[FillRecord]) -> Decimal | None:
 def _nearest_candle(
     candles: list[CryptoMarketCandlestickRecord],
     decision_ts: datetime,
+    *,
+    candle_end_times: list[datetime] | None = None,
 ) -> CryptoMarketCandlestickRecord | None:
+    if candle_end_times is not None:
+        index = bisect_right(candle_end_times, _as_utc_datetime(decision_ts)) - 1
+        return candles[index] if index >= 0 else None
     eligible = [row for row in candles if row.end_period_ts <= decision_ts]
     return eligible[-1] if eligible else None
 
@@ -6966,9 +6992,42 @@ def _nearest_candle(
 def _prior_candle(
     candles: list[CryptoMarketCandlestickRecord],
     decision_ts: datetime,
+    *,
+    candle_end_times: list[datetime] | None = None,
 ) -> CryptoMarketCandlestickRecord | None:
+    if candle_end_times is not None:
+        eligible_count = bisect_left(candle_end_times, _as_utc_datetime(decision_ts))
+        return candles[eligible_count - 2] if eligible_count >= 2 else None
     eligible = [row for row in candles if row.end_period_ts < decision_ts]
     return eligible[-2] if len(eligible) >= 2 else None
+
+
+def _recent_candles_before(
+    candles: list[CryptoMarketCandlestickRecord],
+    close_time: datetime,
+    *,
+    candle_end_times: list[datetime] | None = None,
+    limit: int,
+) -> list[CryptoMarketCandlestickRecord]:
+    if limit <= 0:
+        return []
+    if candle_end_times is None:
+        return [
+            candle
+            for candle in candles
+            if candle.end_period_ts < close_time and candle.close_dollars is not None
+        ][-limit:]
+    end_index = bisect_left(candle_end_times, _as_utc_datetime(close_time))
+    replay_candles: list[CryptoMarketCandlestickRecord] = []
+    for index in range(end_index - 1, -1, -1):
+        candle = candles[index]
+        if candle.close_dollars is None:
+            continue
+        replay_candles.append(candle)
+        if len(replay_candles) >= limit:
+            break
+    replay_candles.reverse()
+    return replay_candles
 
 
 def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
