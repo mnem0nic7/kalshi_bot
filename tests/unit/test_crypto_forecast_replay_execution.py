@@ -54,6 +54,7 @@ from kalshi_bot.crypto.services import (
     _crypto_trade_candidates,
     _fit_crypto_calibration,
     _predict_crypto_probability,
+    crypto_pnl_sizing_target_pct,
 )
 from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.db.models import OrderRecord, RiskVerdictRecord, RoomMessage
@@ -371,6 +372,68 @@ def test_crypto_dynamic_sizing_subtracts_current_and_pending_notional(tmp_path) 
 
     assert count == Decimal("8.00")
     assert diagnostics["available_notional_dollars"] == "4.0000"
+
+
+def test_crypto_dynamic_sizing_uses_policy_target_with_hard_15_pct_cap(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_position_pct=1.0,
+        crypto_dynamic_order_target_position_pct=0.05,
+        crypto_dynamic_order_max_position_pct=0.50,
+    )
+    service = AgentPackService(settings)
+    policy = service.runtime_crypto_policy(
+        service.default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    entry=AgentPackCryptoEntryPolicy(target_position_pct=0.20),
+                )
+            }
+        )
+    )
+
+    count, diagnostics = _crypto_dynamic_order_count_fp(
+        settings=settings,
+        ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.5000")),
+        signal=_live_quality_signal(),
+        context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
+        crypto_policy=policy,
+        asset_symbol="BTC",
+    )
+
+    assert count == Decimal("30.00")
+    assert diagnostics["target_position_pct_source"] == "agent_pack"
+    assert diagnostics["effective_target_position_pct"] == 0.15
+    assert diagnostics["target_notional_dollars"] == "15.0000"
+
+
+def test_crypto_pnl_sizing_target_pct_scales_per_candidate_and_caps(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_dynamic_order_min_position_pct=0.05,
+        crypto_dynamic_order_max_position_pct=0.15,
+        crypto_dynamic_order_pnl_scale_per_candidate_dollars=0.20,
+    )
+
+    low = crypto_pnl_sizing_target_pct(
+        {"oos_net_simulated_pl_dollars": 0.0, "oos_trade_candidate_count": 10},
+        settings=settings,
+    )
+    mid = crypto_pnl_sizing_target_pct(
+        {"oos_net_simulated_pl_dollars": 1.0, "oos_trade_candidate_count": 10},
+        settings=settings,
+    )
+    high = crypto_pnl_sizing_target_pct(
+        {"oos_net_simulated_pl_dollars": 5.0, "oos_trade_candidate_count": 10},
+        settings=settings,
+    )
+
+    assert low["target_position_pct"] == 0.05
+    assert low["max_spread_bps"] == 100
+    assert mid["target_position_pct"] == 0.10
+    assert mid["max_spread_bps"] == 800
+    assert high["target_position_pct"] == 0.15
+    assert high["max_spread_bps"] == 1500
 
 
 def test_crypto_dynamic_sizing_non_live_quality_and_missing_capital_keep_default(tmp_path) -> None:
@@ -1933,6 +1996,34 @@ def test_crypto_replay_gate_uses_runtime_crypto_thresholds(tmp_path) -> None:
 
     assert passed["passed"] is True
     assert passed["requirements"]["min_resolved_markets"] == 2
+
+
+def test_crypto_replay_gate_blocks_low_pnl_per_candidate(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=2,
+        crypto_replay_min_trade_candidates=1,
+        crypto_replay_min_pnl_per_candidate_dollars=0.02,
+    )
+    service = CryptoReplayService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+
+    blocked = service.evaluate_gate(
+        {
+            "resolved_sample_count": 100,
+            "trade_candidate_count": 100,
+            "current_model_live_quality_candidate_count": 100,
+            "strict_trade_eligible_count": 100,
+            "net_simulated_pl_dollars": 1.0,
+            "market_mid_net_simulated_pl_dollars": 0.0,
+            "pnl_advantage_vs_market_mid_dollars": 1.0,
+            "hard_cap_breaches": 0,
+            "candle_count": 100,
+            "spot_feature_coverage_pct": 1.0,
+        }
+    )
+
+    assert blocked["passed"] is False
+    assert any("per candidate" in reason for reason in blocked["reasons"])
 
 
 def test_crypto_decision_rows_use_candle_proxy_when_snapshot_quotes_missing(tmp_path) -> None:

@@ -20,6 +20,7 @@ from kalshi_bot.crypto.services import (
     CryptoHistoryService,
     CryptoReplayService,
     CryptoSpotService,
+    crypto_pnl_sizing_target_pct,
     enabled_crypto_frequencies,
 )
 from kalshi_bot.db.repositories import PlatformRepository
@@ -1563,6 +1564,7 @@ class DaemonService:
         frequencies = enabled_crypto_frequencies(self.settings) or ["15m"]
 
         asset_decisions: dict[str, dict[str, str]] = {}
+        sizing_policy_results: dict[str, Any] = {}
         total_refreshed = 0
 
         for frequency in frequencies:
@@ -1659,12 +1661,23 @@ class DaemonService:
                 except Exception:
                     logger.warning("crypto_model_nightly pooled gate error freq=%s", frequency, exc_info=True)
 
+            try:
+                sizing_policy_results[frequency] = await self._update_crypto_pnl_sizing_policy(
+                    frequency=frequency,
+                    assets=assets,
+                    evaluated_at=now,
+                )
+            except Exception:
+                sizing_policy_results[frequency] = {"status": "error"}
+                logger.warning("crypto_model_nightly sizing policy update error freq=%s", frequency, exc_info=True)
+
             asset_decisions[frequency] = freq_decisions
             total_refreshed += len(refreshed_assets)
 
         result: dict[str, Any] = {
             "ran_at": now.isoformat(),
             "asset_decisions": asset_decisions,
+            "sizing_policy": sizing_policy_results,
             "refreshed_count": total_refreshed,
         }
         async with self.session_factory() as session:
@@ -1672,6 +1685,99 @@ class DaemonService:
             await repo.set_checkpoint(checkpoint_name, None, result)
             await session.commit()
         return result
+
+    async def _update_crypto_pnl_sizing_policy(
+        self,
+        *,
+        frequency: str,
+        assets: list[str],
+        evaluated_at: datetime,
+    ) -> dict[str, Any]:
+        if not self.settings.crypto_pnl_sizing_auto_enabled:
+            return {"status": "disabled"}
+
+        from kalshi_bot.core.schemas import AgentPack, AgentPackCryptoEntryPolicy
+        from kalshi_bot.services.agent_packs import (
+            AgentPackService,
+            DETERMINISTIC_AGENT_PACK_OVERRIDES_VERSION,
+        )
+
+        service = AgentPackService(self.settings)
+        per_asset: dict[str, Any] = {}
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+            existing_record = await repo.get_agent_pack(DETERMINISTIC_AGENT_PACK_OVERRIDES_VERSION)
+            if existing_record is not None:
+                pack = AgentPack.model_validate(existing_record.payload)
+            else:
+                pack = await service.get_pack_for_color(repo, control.active_color)
+            pack = pack.model_copy(
+                deep=True,
+                update={
+                    "version": DETERMINISTIC_AGENT_PACK_OVERRIDES_VERSION,
+                    "source": "operator_override",
+                    "description": "Operator and nightly crypto asset-level entry overrides on top of builtin defaults.",
+                },
+            )
+            overrides = dict(pack.crypto_policy.asset_entry_overrides or {})
+
+            for raw_asset in assets:
+                asset = raw_asset.strip().upper()
+                if not asset:
+                    continue
+                gate = await repo.get_latest_crypto_model_artifact(
+                    frequency=frequency,
+                    artifact_type=f"replay_gate:{asset}",
+                    kalshi_env=self.settings.kalshi_env,
+                )
+                gate_metrics = dict(getattr(gate, "metrics", None) or {}) if gate is not None else {}
+                sizing = crypto_pnl_sizing_target_pct(gate_metrics, settings=self.settings)
+                target_pct = float(sizing["target_position_pct"])
+                max_spread_bps = int(sizing["max_spread_bps"])
+                existing_override = overrides.get(asset) or AgentPackCryptoEntryPolicy()
+                overrides[asset] = existing_override.model_copy(
+                    update={
+                        "target_position_pct": target_pct,
+                        "max_spread_bps": max_spread_bps,
+                    }
+                )
+                per_asset[asset] = {
+                    "target_position_pct": target_pct,
+                    "max_spread_bps": max_spread_bps,
+                    "gate_status": getattr(gate, "status", "missing") if gate is not None else "missing",
+                    "gate_version": getattr(gate, "version", None),
+                    **sizing["diagnostics"],
+                }
+
+            pack.crypto_policy.asset_entry_overrides = overrides
+            pack.metadata = {
+                **dict(pack.metadata or {}),
+                "crypto_pnl_sizing": {
+                    "status": "updated",
+                    "frequency": frequency,
+                    "evaluated_at": evaluated_at.isoformat(),
+                    "assets": per_asset,
+                    "max_allocation_pct": min(max(float(self.settings.crypto_portfolio_max_allocation_pct), 0.0), 1.0),
+                    "max_market_target_pct": min(
+                        max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0),
+                        0.15,
+                    ),
+                },
+            }
+            await repo.update_agent_pack(pack)
+            await service.assign_pack_to_color(
+                repo,
+                color=control.active_color,
+                version=DETERMINISTIC_AGENT_PACK_OVERRIDES_VERSION,
+            )
+            await session.commit()
+
+        return {
+            "status": "updated",
+            "pack_version": DETERMINISTIC_AGENT_PACK_OVERRIDES_VERSION,
+            "assets": per_asset,
+        }
 
     async def _checkpoint_time(self, stream_name: str) -> datetime | None:
         async with self.session_factory() as session:

@@ -196,6 +196,7 @@ class Settings(BaseSettings):
     crypto_replay_min_resolved_markets: int = 500
     crypto_replay_min_trade_candidates: int = 50
     crypto_replay_min_net_pl_dollars: float = 0.0
+    crypto_replay_min_pnl_per_candidate_dollars: float = 0.02
     crypto_replay_max_hard_cap_breaches: int = 0
     crypto_replay_require_calibration_better_than_mid: bool = False
     crypto_replay_require_pnl_beats_market_mid: bool = True
@@ -204,6 +205,11 @@ class Settings(BaseSettings):
     crypto_dynamic_order_sizing_enabled: bool = True
     crypto_dynamic_order_sizing_scope: str = "live_quality"
     crypto_dynamic_order_target_position_pct: float = 0.10
+    crypto_dynamic_order_min_position_pct: float = 0.05
+    crypto_dynamic_order_max_position_pct: float = 0.15
+    crypto_dynamic_order_pnl_scale_per_candidate_dollars: float = 0.20
+    crypto_pnl_sizing_auto_enabled: bool = True
+    crypto_portfolio_max_allocation_pct: float = 1.0
     crypto_history_auto_enabled: bool = True
     crypto_history_auto_interval_seconds: int = 3600
     crypto_history_auto_lookback_days: int = 2
@@ -221,7 +227,7 @@ class Settings(BaseSettings):
     crypto_spot_current_interval_seconds: int = 30
     crypto_spot_history_auto_enabled: bool = True
     crypto_spot_history_auto_lookback_days: int = 2
-    crypto_replay_min_spot_coverage_pct: float = 0.80
+    crypto_replay_min_spot_coverage_pct: float = 0.95
     crypto_autonomy_enabled: bool = False
     crypto_production_autonomy_enabled: bool = False
     # Sleep interval for idle/inactive-color states only. The active-color loop
@@ -269,7 +275,7 @@ class Settings(BaseSettings):
     crypto_shadow_exploration_max_per_asset_per_run: int = 2
     crypto_shadow_exploration_min_expected_net_edge_dollars: float = -0.03
     crypto_shadow_exploration_max_spread_bps: int = 500
-    crypto_live_max_spread_bps: int = 1000
+    crypto_live_max_spread_bps: int = 500
     crypto_empirical_bucket_gate_enabled: bool = True
     crypto_empirical_bucket_gate_assets: str = "live"
     crypto_empirical_bucket_min_samples: int = 20

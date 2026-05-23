@@ -38,6 +38,8 @@ class RiskContext:
     current_position_side: str | None = None
     pending_order_count_fp: Decimal = Decimal("0")
     pending_order_notional_dollars: Decimal = Decimal("0")
+    portfolio_position_notional_dollars: Decimal = Decimal("0")
+    portfolio_pending_order_notional_dollars: Decimal = Decimal("0")
     portfolio_bucket_snapshot: PortfolioBucketSnapshot | None = None
     open_ticker_count: int = 0
     strategy_code: str | None = None
@@ -380,6 +382,11 @@ class DeterministicRiskEngine:
             strategy_min_abs_delta_f=self.settings.strategy_min_abs_delta_f,
             strategy_min_remaining_payout_bps=self.settings.strategy_min_remaining_payout_bps,
         )
+        effective_risk_position_pct = (
+            float(active_thresholds.risk_position_pct)
+            if active_thresholds.risk_position_pct is not None
+            else float(self.settings.risk_position_pct)
+        )
         capital_bucket = signal.capital_bucket or "safe"
         order_notional = _quantize_money(estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, ticket.count_fp))
         approved_count = ticket.count_fp
@@ -422,7 +429,8 @@ class DeterministicRiskEngine:
             "risk_min_contract_price_dollars": active_thresholds.risk_min_contract_price_dollars,
             "risk_max_order_notional_dollars": active_thresholds.risk_max_order_notional_dollars,
             "risk_max_position_notional_dollars": active_thresholds.risk_max_position_notional_dollars,
-            "risk_position_pct": self.settings.risk_position_pct,
+            "risk_position_pct": effective_risk_position_pct,
+            "settings_risk_position_pct": self.settings.risk_position_pct,
             "trigger_max_spread_bps": active_thresholds.trigger_max_spread_bps,
             "strategy_min_abs_delta_f": active_thresholds.strategy_min_abs_delta_f,
             "strategy_min_remaining_payout_bps": active_thresholds.strategy_min_remaining_payout_bps,
@@ -749,16 +757,16 @@ class DeterministicRiskEngine:
                 if is_buy_entry and crypto_strategy:
                     block("Total capital is non-positive; cannot enforce the crypto position capital cap.")
                     code("position_notional_cap_missing_capital")
-            elif self.settings.risk_position_pct > 0:
+            elif effective_risk_position_pct > 0:
                 dynamic_position_cap_dollars = _quantize_money(
-                    total_capital_dec * Decimal(str(self.settings.risk_position_pct))
+                    total_capital_dec * Decimal(str(effective_risk_position_pct))
                 )
         projected_position_notional = _quantize_money(
             current_position_notional + pending_position_notional + order_notional
         )
         diagnostics["position_notional_cap"] = {
             "total_capital_dollars": _decimal_text(total_capital),
-            "risk_position_pct": self.settings.risk_position_pct,
+            "risk_position_pct": effective_risk_position_pct,
             "dynamic_cap_dollars": _decimal_text(dynamic_position_cap_dollars),
             "configured_cap_dollars": _decimal_text(active_thresholds.risk_max_position_notional_dollars),
             "current_position_notional_dollars": _decimal_text(current_position_notional),
@@ -771,7 +779,7 @@ class DeterministicRiskEngine:
             if existing_and_pending_notional >= dynamic_position_cap_dollars:
                 block(
                     f"Position already uses {existing_and_pending_notional:.4f} of "
-                    f"the {self.settings.risk_position_pct:.0%} capital cap "
+                    f"the {effective_risk_position_pct:.0%} capital cap "
                     f"({dynamic_position_cap_dollars:.4f})."
                 )
                 code("position_notional_cap_reached")
@@ -811,9 +819,103 @@ class DeterministicRiskEngine:
                     note(
                         f"Ticket downsized from {original_count:.2f} to {approved_count:.2f} contracts "
                         f"so projected position notional stays within "
-                        f"{self.settings.risk_position_pct:.0%} of capital."
+                        f"{effective_risk_position_pct:.0%} of capital."
                     )
                     code("position_notional_cap_resized")
+        portfolio_position_notional = _quantize_money(context.portfolio_position_notional_dollars)
+        portfolio_pending_notional = _quantize_money(context.portfolio_pending_order_notional_dollars)
+        portfolio_cap_pct = min(max(float(self.settings.crypto_portfolio_max_allocation_pct), 0.0), 1.0)
+        crypto_portfolio_cap_dollars: Decimal | None = None
+        projected_portfolio_notional: Decimal | None = None
+        diagnostics["crypto_portfolio_allocation_cap"] = {
+            "enabled": is_buy_entry and crypto_strategy,
+            "portfolio_max_allocation_pct": portfolio_cap_pct,
+            "total_capital_dollars": _decimal_text(total_capital),
+            "portfolio_position_notional_dollars": _decimal_text(portfolio_position_notional),
+            "portfolio_pending_order_notional_dollars": _decimal_text(portfolio_pending_notional),
+            "approved_order_notional_dollars": _decimal_text(order_notional),
+            "dynamic_cap_dollars": None,
+            "projected_portfolio_notional_dollars": None,
+        }
+        if is_buy_entry and crypto_strategy:
+            if total_capital is None:
+                block("Total capital is unavailable; cannot enforce the crypto portfolio allocation cap.")
+                code("crypto_portfolio_allocation_cap_missing_capital")
+            else:
+                total_capital_dec = _quantize_money(total_capital)
+                if total_capital_dec <= Decimal("0"):
+                    block("Total capital is non-positive; cannot enforce the crypto portfolio allocation cap.")
+                    code("crypto_portfolio_allocation_cap_missing_capital")
+                elif portfolio_cap_pct > 0:
+                    crypto_portfolio_cap_dollars = _quantize_money(
+                        total_capital_dec * Decimal(str(portfolio_cap_pct))
+                    )
+                    existing_portfolio_notional = _quantize_money(
+                        portfolio_position_notional + portfolio_pending_notional
+                    )
+                    projected_portfolio_notional = _quantize_money(existing_portfolio_notional + order_notional)
+                    diagnostics["crypto_portfolio_allocation_cap"].update(
+                        {
+                            "dynamic_cap_dollars": _decimal_text(crypto_portfolio_cap_dollars),
+                            "projected_portfolio_notional_dollars": _decimal_text(projected_portfolio_notional),
+                        }
+                    )
+                    if existing_portfolio_notional >= crypto_portfolio_cap_dollars:
+                        block(
+                            f"Crypto portfolio already uses {existing_portfolio_notional:.4f} of "
+                            f"the {portfolio_cap_pct:.0%} allocation cap "
+                            f"({crypto_portfolio_cap_dollars:.4f})."
+                        )
+                        code("crypto_portfolio_allocation_cap_reached")
+                    elif projected_portfolio_notional > crypto_portfolio_cap_dollars:
+                        available_notional = _quantize_money(
+                            crypto_portfolio_cap_dollars - existing_portfolio_notional
+                        )
+                        fitted_count = _fit_count_for_notional(
+                            available_notional_dollars=available_notional,
+                            ticket=ticket,
+                            minimum_count_fp=Decimal("0.01"),
+                        )
+                        if fitted_count is None:
+                            block(
+                                f"Remaining crypto portfolio budget {available_notional:.4f} is below the minimum "
+                                f"0.01 count_fp at the current contract price."
+                            )
+                            code("crypto_portfolio_allocation_cap_no_fit")
+                        else:
+                            original_count = approved_count
+                            approved_count = fitted_count
+                            approved_notional = _quantize_money(
+                                estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, approved_count)
+                            )
+                            order_notional = approved_notional
+                            projected_portfolio_notional = _quantize_money(
+                                existing_portfolio_notional + order_notional
+                            )
+                            projected_position_notional = _quantize_money(
+                                current_position_notional + pending_position_notional + order_notional
+                            )
+                            diagnostics["crypto_portfolio_allocation_cap"].update(
+                                {
+                                    "available_notional_dollars": _decimal_text(available_notional),
+                                    "resized": True,
+                                    "original_count_fp": _decimal_text(original_count),
+                                    "approved_count_fp": _decimal_text(approved_count),
+                                    "approved_order_notional_dollars": _decimal_text(order_notional),
+                                    "projected_portfolio_notional_dollars": _decimal_text(projected_portfolio_notional),
+                                }
+                            )
+                            diagnostics["position_notional_cap"].update(
+                                {
+                                    "approved_order_notional_dollars": _decimal_text(order_notional),
+                                    "projected_position_notional_dollars": _decimal_text(projected_position_notional),
+                                }
+                            )
+                            note(
+                                f"Ticket downsized from {original_count:.2f} to {approved_count:.2f} contracts "
+                                f"so projected crypto allocation stays within {portfolio_cap_pct:.0%} of capital."
+                            )
+                            code("crypto_portfolio_allocation_cap_resized")
         if (
             is_buy_entry
             and active_thresholds.risk_max_position_notional_dollars is not None

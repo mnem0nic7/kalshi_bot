@@ -524,12 +524,14 @@ class AgentPackCryptoEntryPolicy(BaseModel):
     min_contract_price_dollars: float | None = None
     min_remaining_payout_bps: int | None = None
     max_credible_edge_bps: int | None = None
+    target_position_pct: float | None = None
 
 
 class AgentPackCryptoReplayPolicy(BaseModel):
     min_resolved_markets: int | None = None
     min_trade_candidates: int | None = None
     min_net_pl_dollars: float | None = None
+    min_pnl_per_candidate_dollars: float | None = None
     max_hard_cap_breaches: int | None = None
     min_spot_coverage_pct: float | None = None
     require_calibration_better_than_mid: bool | None = None

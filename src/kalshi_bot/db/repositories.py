@@ -2874,6 +2874,40 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         result = await self.session.execute(stmt)
         return Decimal(str(result.scalar() or 0))
 
+    async def get_pending_buy_notional_dollars(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        strategy_codes: list[str] | None = None,
+        market_ticker_prefixes: list[str] | None = None,
+    ) -> Decimal:
+        """Sum notional exposure of resting/submitted buy orders for portfolio caps."""
+        env = self._resolved_kalshi_env(kalshi_env)
+        unit_notional = case(
+            (OrderRecord.side == "yes", OrderRecord.yes_price_dollars),
+            else_=Decimal("1.0000") - OrderRecord.yes_price_dollars,
+        )
+        stmt = select(func.coalesce(func.sum(OrderRecord.count_fp * unit_notional), 0)).where(
+            OrderRecord.kalshi_env == env,
+            OrderRecord.action == "buy",
+            OrderRecord.status.in_(["resting", "submitted"]),
+        )
+        exposure_filters = []
+        if strategy_codes:
+            exposure_filters.append(OrderRecord.strategy_code.in_([str(code) for code in strategy_codes]))
+        if market_ticker_prefixes:
+            prefix_filters = [
+                OrderRecord.market_ticker.ilike(f"{str(prefix).upper()}%")
+                for prefix in market_ticker_prefixes
+                if str(prefix).strip()
+            ]
+            if prefix_filters:
+                exposure_filters.append(or_(*prefix_filters))
+        if exposure_filters:
+            stmt = stmt.where(or_(*exposure_filters))
+        result = await self.session.execute(stmt)
+        return _quantize_money(result.scalar() or 0)
+
     async def zero_settled_positions(
         self,
         *,

@@ -19,7 +19,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.constants import CRYPTO_MIN_REMAINING_PAYOUT_BPS
+from kalshi_bot.core.constants import CRYPTO_MAX_SPREAD_BPS, CRYPTO_MIN_REMAINING_PAYOUT_BPS, CRYPTO_MIN_SPREAD_BPS
 from kalshi_bot.core.enums import (
     AgentRole,
     ContractSide,
@@ -111,7 +111,7 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
 CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
 CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_fee_adjusted_edge_bps": (750, 1000, 1500, 2500, 5000),
-    "max_spread_bps": (80, 150, 250, 400, 600, 1000),
+    "max_spread_bps": (100, 150, 250, 400, 600, 1000, 1500),
     "min_contract_price_dollars": (0.50, 0.60, 0.70),
     "min_remaining_payout_bps": (0,),
 }
@@ -281,6 +281,7 @@ async def _latest_crypto_artifact_for_asset(
     artifact_type: str,
     kalshi_env: str,
     asset_symbol: str | None = None,
+    allow_generic_fallback: bool = True,
 ) -> Any | None:
     if asset_symbol:
         artifact = await repo.get_latest_crypto_model_artifact(
@@ -290,11 +291,18 @@ async def _latest_crypto_artifact_for_asset(
         )
         if artifact is not None:
             return artifact
+        if not allow_generic_fallback:
+            return None
     return await repo.get_latest_crypto_model_artifact(
         frequency=frequency,
         artifact_type=artifact_type,
         kalshi_env=kalshi_env,
     )
+
+
+def _is_crypto_market_ticker(market_ticker: str | None) -> bool:
+    ticker = str(market_ticker or "").upper()
+    return ticker.startswith("KX") and ("15M" in ticker or "1H" in ticker)
 
 
 def _filter_crypto_snapshot_rows(rows: list[Any], asset_symbols: list[str] | None) -> list[Any]:
@@ -658,6 +666,7 @@ class CryptoMarketService:
                     artifact_type="replay_gate",
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbol=asset_symbol,
+                    allow_generic_fallback=False,
                 )
             active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
@@ -779,6 +788,7 @@ class CryptoMarketService:
                 artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbol=market.asset_symbol,
+                allow_generic_fallback=False,
             )
             live_status = self.asset_control_service.market_live_status(
                 control=control,
@@ -902,6 +912,7 @@ class CryptoMarketService:
                     artifact_type="model",
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbol=requested_assets[0],
+                    allow_generic_fallback=False,
                 )
                 gate = await _latest_crypto_artifact_for_asset(
                     repo,
@@ -909,6 +920,7 @@ class CryptoMarketService:
                     artifact_type="replay_gate",
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbol=requested_assets[0],
+                    allow_generic_fallback=False,
                 )
                 backtest = await _latest_crypto_artifact_for_asset(
                     repo,
@@ -916,6 +928,7 @@ class CryptoMarketService:
                     artifact_type="backtest",
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbol=requested_assets[0],
+                    allow_generic_fallback=False,
                 )
                 await session.commit()
         asset_symbols = sorted({snapshot.asset_symbol for snapshot in snapshots})
@@ -2183,6 +2196,7 @@ class CryptoForecastService:
                 artifact_type="model",
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbol=market.asset_symbol,
+                allow_generic_fallback=False,
             )
             _now = datetime.now(UTC)
             spot_rows = await repo.list_crypto_spot_ohlc(
@@ -2207,6 +2221,7 @@ class CryptoForecastService:
                 artifact_type="backtest",
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbol=market.asset_symbol,
+                allow_generic_fallback=False,
             )
             gate = await _latest_crypto_artifact_for_asset(
                 repo,
@@ -2214,6 +2229,7 @@ class CryptoForecastService:
                 artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbol=market.asset_symbol,
+                allow_generic_fallback=False,
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
@@ -2844,6 +2860,7 @@ class CryptoReplayService:
                 "min_resolved_markets": runtime_policy.replay_min_resolved_markets,
                 "min_trade_candidates": runtime_policy.replay_min_trade_candidates,
                 "min_net_pl_dollars": runtime_policy.replay_min_net_pl_dollars,
+                "min_pnl_per_candidate_dollars": runtime_policy.replay_min_pnl_per_candidate_dollars,
                 "max_hard_cap_breaches": runtime_policy.replay_max_hard_cap_breaches,
                 "pnl_beats_market_mid": runtime_policy.replay_require_pnl_beats_market_mid,
                 "min_pnl_advantage_dollars": runtime_policy.replay_min_pnl_advantage_dollars,
@@ -3072,6 +3089,7 @@ class CryptoExecutionService:
                 artifact_type="replay_gate",
                 kalshi_env=room.kalshi_env,
                 asset_symbol=market.asset_symbol,
+                allow_generic_fallback=False,
             )
             await session.commit()
         if asset_mode != CRYPTO_ASSET_MODE_LIVE:
@@ -3354,6 +3372,7 @@ class CryptoWorkflowService:
                     artifact_type="replay_gate",
                     kalshi_env=room.kalshi_env,
                     asset_symbol=market.asset_symbol,
+                    allow_generic_fallback=False,
                 )
                 backtest = await _latest_crypto_artifact_for_asset(
                     repo,
@@ -3361,6 +3380,7 @@ class CryptoWorkflowService:
                     artifact_type="backtest",
                     kalshi_env=room.kalshi_env,
                     asset_symbol=market.asset_symbol,
+                    allow_generic_fallback=False,
                 )
                 live_status = self.asset_control_service.market_live_status(
                     control=control,
@@ -3485,6 +3505,8 @@ class CryptoWorkflowService:
                     ticket=base_ticket,
                     signal=signal,
                     context=risk_context,
+                    crypto_policy=crypto_policy,
+                    asset_symbol=market.asset_symbol,
                 )
                 ticket = base_ticket.model_copy(update={"count_fp": count_fp})
                 client_order_id = make_client_order_id(room.id, market.market_ticker, ticket.nonce)
@@ -3682,6 +3704,24 @@ class CryptoWorkflowService:
             strategy_code=strategy_code,
             kalshi_env=room.kalshi_env,
         )
+        portfolio_position_notional = sum(
+            (
+                abs(Decimal(str(position.count_fp))) * Decimal(str(position.average_price_dollars))
+                for position in all_positions
+                if _is_crypto_market_ticker(position.market_ticker)
+            ),
+            Decimal("0"),
+        ).quantize(Decimal("0.0001"))
+        portfolio_assets = {
+            normalize_asset_symbol(value)
+            for value in [market.asset_symbol, *str(self.settings.crypto_model_nightly_assets or "").split(",")]
+            if str(value or "").strip()
+        }
+        portfolio_pending_notional = await repo.get_pending_buy_notional_dollars(
+            kalshi_env=room.kalshi_env,
+            strategy_codes=list(CRYPTO_STRATEGY_CODES.values()),
+            market_ticker_prefixes=[f"KX{asset}" for asset in sorted(portfolio_assets)],
+        )
         current_position_notional = (
             abs(Decimal(str(open_position.count_fp))) * Decimal(str(open_position.average_price_dollars))
             if open_position is not None
@@ -3696,6 +3736,8 @@ class CryptoWorkflowService:
             current_position_side=open_position.side if open_position is not None else None,
             pending_order_count_fp=pending_order_count_fp,
             pending_order_notional_dollars=pending_order_notional,
+            portfolio_position_notional_dollars=portfolio_position_notional,
+            portfolio_pending_order_notional_dollars=portfolio_pending_notional,
             open_ticker_count=len({position.market_ticker for position in all_positions}),
             strategy_code=strategy_code,
             strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
@@ -3824,6 +3866,7 @@ class CryptoAutonomyService:
                         artifact_type="replay_gate",
                         kalshi_env=self.settings.kalshi_env,
                         asset_symbol=asset_symbol,
+                        allow_generic_fallback=False,
                     )
                 await session.commit()
 
@@ -4256,6 +4299,7 @@ def _runtime_crypto_policy_payload(
             "min_resolved_markets": crypto_policy.replay_min_resolved_markets,
             "min_trade_candidates": crypto_policy.replay_min_trade_candidates,
             "min_net_pl_dollars": crypto_policy.replay_min_net_pl_dollars,
+            "min_pnl_per_candidate_dollars": crypto_policy.replay_min_pnl_per_candidate_dollars,
             "max_hard_cap_breaches": crypto_policy.replay_max_hard_cap_breaches,
             "min_spot_coverage_pct": crypto_policy.replay_min_spot_coverage_pct,
             "require_calibration_better_than_mid": crypto_policy.replay_require_calibration_better_than_mid,
@@ -4376,6 +4420,16 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
         )
     if net_pl <= crypto_policy.replay_min_net_pl_dollars:
         reasons.append(f"Net simulated P/L ${net_pl:.2f} does not clear required positive threshold.")
+    pnl_candidate_denominator = oos_candidates if has_usable_oos and oos_candidates > 0 else current_model_candidates
+    pnl_per_candidate = net_pl / pnl_candidate_denominator if pnl_candidate_denominator > 0 else 0.0
+    if (
+        crypto_policy.replay_min_pnl_per_candidate_dollars > 0
+        and pnl_per_candidate < crypto_policy.replay_min_pnl_per_candidate_dollars
+    ):
+        reasons.append(
+            f"Net simulated P/L per candidate ${pnl_per_candidate:.4f} below minimum "
+            f"${crypto_policy.replay_min_pnl_per_candidate_dollars:.4f}."
+        )
     bucket_gated_market_mid_tie = (
         str(metrics.get("metrics_source") or "") == "empirical_bucket_gated"
         and float(crypto_policy.replay_min_pnl_advantage_dollars) == 0.0
@@ -4861,12 +4915,66 @@ def _floor_count_fp(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
 
+def crypto_pnl_sizing_target_pct(metrics: dict[str, Any], *, settings: Settings) -> dict[str, Any]:
+    """Convert nightly replay P&L into a per-market target position percent."""
+    hard_max_pct = Decimal("0.15")
+    configured_max_pct = Decimal(str(settings.crypto_dynamic_order_max_position_pct))
+    max_pct = min(hard_max_pct, max(Decimal("0"), configured_max_pct))
+    min_pct = min(
+        max(Decimal("0"), Decimal(str(settings.crypto_dynamic_order_min_position_pct))),
+        max_pct,
+    )
+    scale = max(
+        Decimal("0.000001"),
+        Decimal(str(settings.crypto_dynamic_order_pnl_scale_per_candidate_dollars)),
+    )
+    net_pl = Decimal(
+        str(metrics.get("oos_net_simulated_pl_dollars", metrics.get("net_simulated_pl_dollars") or 0) or 0)
+    )
+    candidate_count = int(
+        metrics.get(
+            "oos_trade_candidate_count",
+            metrics.get("current_model_live_quality_candidate_count", metrics.get("trade_candidate_count") or 0),
+        )
+        or 0
+    )
+    pnl_per_candidate = (net_pl / Decimal(candidate_count)) if candidate_count > 0 else Decimal("0")
+    ratio = Decimal("0")
+    if net_pl > Decimal("0") and candidate_count > 0:
+        ratio = min(Decimal("1"), max(Decimal("0"), pnl_per_candidate / scale))
+    target_pct = (min_pct + ((max_pct - min_pct) * ratio)).quantize(Decimal("0.000001"))
+    spread_bps = int(
+        (
+            Decimal(CRYPTO_MIN_SPREAD_BPS)
+            + ((Decimal(CRYPTO_MAX_SPREAD_BPS) - Decimal(CRYPTO_MIN_SPREAD_BPS)) * ratio)
+        ).to_integral_value()
+    )
+    return {
+        "target_position_pct": float(target_pct),
+        "max_spread_bps": spread_bps,
+        "diagnostics": {
+            "net_simulated_pl_dollars": float(net_pl),
+            "candidate_count": candidate_count,
+            "pnl_per_candidate_dollars": float(pnl_per_candidate),
+            "scale_per_candidate_dollars": float(scale),
+            "min_position_pct": float(min_pct),
+            "max_position_pct": float(max_pct),
+            "hard_max_position_pct": float(hard_max_pct),
+            "min_spread_bps": CRYPTO_MIN_SPREAD_BPS,
+            "max_spread_bps": CRYPTO_MAX_SPREAD_BPS,
+            "scale_ratio": float(ratio),
+        },
+    }
+
+
 def _crypto_dynamic_order_count_fp(
     *,
     settings: Settings,
     ticket: TradeTicket,
     signal: StrategySignal,
     context: RiskContext,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+    asset_symbol: str | None = None,
 ) -> tuple[Decimal, dict[str, Any]]:
     configured_default_count = quantize_count(Decimal(str(settings.crypto_default_order_count_fp)))
     candidate_status = _crypto_signal_candidate_status(signal)
@@ -4882,9 +4990,12 @@ def _crypto_dynamic_order_count_fp(
         default_cap_candidates.append(late_override_cap)
     default_count = min(default_cap_candidates)
     requested_count = default_count
-    target_pct = Decimal(str(settings.crypto_dynamic_order_target_position_pct))
-    risk_pct = Decimal(str(settings.risk_position_pct))
-    effective_target_pct = min(target_pct, risk_pct)
+    policy_entry = crypto_policy.entry_for_asset(asset_symbol) if crypto_policy is not None else {}
+    target_pct_source = "agent_pack" if policy_entry.get("target_position_pct") is not None else "settings"
+    target_pct = Decimal(str(policy_entry.get("target_position_pct") or settings.crypto_dynamic_order_target_position_pct))
+    hard_max_pct = Decimal("0.15")
+    configured_max_pct = max(Decimal("0"), Decimal(str(settings.crypto_dynamic_order_max_position_pct)))
+    effective_target_pct = min(max(Decimal("0"), target_pct), hard_max_pct, configured_max_pct)
     max_order_count = Decimal(str(settings.risk_max_order_count_fp))
     max_position_count = Decimal(str(settings.risk_max_position_count_fp_per_ticker))
     current_position_count = Decimal(str(context.current_position_count_fp or Decimal("0")))
@@ -4908,7 +5019,8 @@ def _crypto_dynamic_order_count_fp(
         "empirical_bucket_late_override_reason": late_override_gate.get("override_reason") if late_override_gate else None,
         "unit_cost_dollars": _money_text(unit_cost),
         "target_position_pct": float(target_pct),
-        "risk_position_pct": float(risk_pct),
+        "target_position_pct_source": target_pct_source,
+        "max_target_position_pct": float(min(hard_max_pct, configured_max_pct)),
         "effective_target_position_pct": float(effective_target_pct),
         "total_capital_dollars": _money_text(total_capital),
         "target_notional_dollars": None,
@@ -7536,9 +7648,11 @@ def _runtime_crypto_policy_with_asset_entry(
         min_contract_price_dollars=crypto_policy.min_contract_price_dollars,
         min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
         max_credible_edge_bps=crypto_policy.max_credible_edge_bps,
+        target_position_pct=crypto_policy.target_position_pct,
         replay_min_resolved_markets=crypto_policy.replay_min_resolved_markets,
         replay_min_trade_candidates=crypto_policy.replay_min_trade_candidates,
         replay_min_net_pl_dollars=crypto_policy.replay_min_net_pl_dollars,
+        replay_min_pnl_per_candidate_dollars=crypto_policy.replay_min_pnl_per_candidate_dollars,
         replay_max_hard_cap_breaches=crypto_policy.replay_max_hard_cap_breaches,
         replay_min_spot_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
         replay_require_calibration_better_than_mid=crypto_policy.replay_require_calibration_better_than_mid,
@@ -7566,9 +7680,11 @@ def _runtime_crypto_policy_with_asset_modes(
         min_contract_price_dollars=crypto_policy.min_contract_price_dollars,
         min_remaining_payout_bps=crypto_policy.min_remaining_payout_bps,
         max_credible_edge_bps=crypto_policy.max_credible_edge_bps,
+        target_position_pct=crypto_policy.target_position_pct,
         replay_min_resolved_markets=crypto_policy.replay_min_resolved_markets,
         replay_min_trade_candidates=crypto_policy.replay_min_trade_candidates,
         replay_min_net_pl_dollars=crypto_policy.replay_min_net_pl_dollars,
+        replay_min_pnl_per_candidate_dollars=crypto_policy.replay_min_pnl_per_candidate_dollars,
         replay_max_hard_cap_breaches=crypto_policy.replay_max_hard_cap_breaches,
         replay_min_spot_coverage_pct=crypto_policy.replay_min_spot_coverage_pct,
         replay_require_calibration_better_than_mid=crypto_policy.replay_require_calibration_better_than_mid,

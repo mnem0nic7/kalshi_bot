@@ -87,12 +87,14 @@ def test_agent_pack_runtime_crypto_policy_overrides_per_asset() -> None:
                     min_contract_price_dollars=0.08,
                     min_remaining_payout_bps=1500,
                     max_credible_edge_bps=7500,
+                    target_position_pct=0.12,
                 ),
                 asset_entry_overrides={
                     "btc": AgentPackCryptoEntryPolicy(
                         min_fee_adjusted_edge_bps=1500,
                         max_spread_bps=250,
                         min_contract_price_dollars=0.05,
+                        target_position_pct=0.20,
                     )
                 },
             )
@@ -109,9 +111,12 @@ def test_agent_pack_runtime_crypto_policy_overrides_per_asset() -> None:
     assert policy.entry_for_asset("ETH")["min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
     assert policy.entry_for_asset("BTC")["min_remaining_payout_bps"] == 0
     assert policy.entry_for_asset("ETH")["min_remaining_payout_bps"] == 0
+    assert policy.entry_for_asset("BTC")["target_position_pct"] == 0.15
+    assert policy.entry_for_asset("ETH")["target_position_pct"] == 0.12
     assert thresholds.risk_min_edge_bps == 1500
     assert thresholds.trigger_max_spread_bps == 250
     assert thresholds.risk_min_contract_price_dollars == settings.risk_min_contract_price_dollars
+    assert thresholds.risk_position_pct == 0.15
     assert thresholds.strategy_min_remaining_payout_bps == 0
 
 
@@ -202,22 +207,25 @@ def test_agent_pack_service_sanitizes_crypto_policy_bounds() -> None:
         "min_contract_price_dollars": 0.001,
         "min_remaining_payout_bps": 1,
         "max_credible_edge_bps": 99999,
+        "target_position_pct": 0.99,
     }
     payload["crypto_policy"]["live"]["asset_modes"] = {"btc": "live", "eth": "nonsense"}
     payload["crypto_policy"]["asset_entry_overrides"] = {
-        "btc": {"min_fee_adjusted_edge_bps": 9999, "max_spread_bps": 9999}
+        "btc": {"min_fee_adjusted_edge_bps": 9999, "max_spread_bps": 9999, "target_position_pct": 0.99}
     }
 
     sanitized = service.sanitize_candidate_pack(AgentPack(**payload), parent_version="builtin")
 
     assert sanitized.crypto_policy.entry.min_fee_adjusted_edge_bps == 5000
-    assert sanitized.crypto_policy.entry.max_spread_bps == 50
+    assert sanitized.crypto_policy.entry.max_spread_bps == 100
     assert sanitized.crypto_policy.entry.min_confidence == 0.50
     assert sanitized.crypto_policy.entry.min_contract_price_dollars == settings.risk_min_contract_price_dollars
     assert sanitized.crypto_policy.entry.min_remaining_payout_bps == 0
     assert sanitized.crypto_policy.entry.max_credible_edge_bps == 10000
+    assert sanitized.crypto_policy.entry.target_position_pct == 0.15
     assert sanitized.crypto_policy.live.asset_modes == {"BTC": "live", "ETH": "shadow"}
-    assert sanitized.crypto_policy.asset_entry_overrides["BTC"].max_spread_bps == 2500
+    assert sanitized.crypto_policy.asset_entry_overrides["BTC"].max_spread_bps == 1500
+    assert sanitized.crypto_policy.asset_entry_overrides["BTC"].target_position_pct == 0.15
 
 
 def test_agent_pack_service_sanitizes_weather_bootstrap_bounds() -> None:

@@ -1268,6 +1268,7 @@ async def _crypto_live_path_runtime_state(
                     artifact_type=artifact_type,
                     kalshi_env=container.settings.kalshi_env,
                     asset_symbol=asset,
+                    allow_generic_fallback=False,
                 )
                 payload = _crypto_artifact_payload(record)
                 if record is not None and artifact_type == "backtest":
@@ -1861,13 +1862,14 @@ async def _run_crypto_policy_command(args: argparse.Namespace, container: AppCon
         print(json.dumps(result, indent=2, default=str))
         return 0
     if args.crypto_policy_command == "set-asset-override":
-        from kalshi_bot.services.agent_packs import AgentPackService
+        from kalshi_bot.core.constants import CRYPTO_MAX_SPREAD_BPS, CRYPTO_MIN_SPREAD_BPS
+        from kalshi_bot.services.agent_packs import AgentPackService, DETERMINISTIC_AGENT_PACK_OVERRIDES_VERSION
         from kalshi_bot.core.schemas import AgentPackCryptoEntryPolicy
 
         # Asset overrides must live in a derived pack (not the builtin) because
         # AgentPackService.ensure_initialized() resets builtin-deterministic-v1
         # on every startup. We create a stable "overrides" version instead.
-        _OVERRIDES_VERSION = "builtin-deterministic-v1-overrides"
+        _OVERRIDES_VERSION = DETERMINISTIC_AGENT_PACK_OVERRIDES_VERSION
 
         agent_pack_service = AgentPackService(container.settings)
         async with container.session_factory() as session:
@@ -1889,7 +1891,12 @@ async def _run_crypto_policy_command(args: argparse.Namespace, container: AppCon
             if args.min_price is not None:
                 updates["min_contract_price_dollars"] = float(args.min_price)
             if args.max_spread_bps is not None:
-                updates["max_spread_bps"] = int(args.max_spread_bps)
+                updates["max_spread_bps"] = max(
+                    CRYPTO_MIN_SPREAD_BPS,
+                    min(CRYPTO_MAX_SPREAD_BPS, int(args.max_spread_bps)),
+                )
+            if args.target_position_pct is not None:
+                updates["target_position_pct"] = float(args.target_position_pct)
             updated_override = existing_override.model_copy(update=updates)
             pack.crypto_policy.asset_entry_overrides[symbol] = updated_override
             await repo.update_agent_pack(pack)
@@ -4382,6 +4389,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_policy_override.add_argument("--min-edge-bps", type=int, default=None, dest="min_edge_bps")
     crypto_policy_override.add_argument("--min-price", type=float, default=None, dest="min_price")
     crypto_policy_override.add_argument("--max-spread-bps", type=int, default=None, dest="max_spread_bps")
+    crypto_policy_override.add_argument("--target-position-pct", type=float, default=None, dest="target_position_pct")
 
     crypto_live_path = subparsers.add_parser("crypto-live-path")
     crypto_live_path_subparsers = crypto_live_path.add_subparsers(dest="crypto_live_path_command", required=True)

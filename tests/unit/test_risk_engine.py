@@ -919,6 +919,44 @@ def test_risk_engine_blocks_second_opposite_non_btc_and_oversized_crypto_add_ons
     assert oversized.diagnostics["crypto_position_add_on"]["reason"] == "ticket_count_above_crypto_add_on_cap"
 
 
+def test_risk_engine_resizes_crypto_entry_to_portfolio_allocation_cap() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_position_pct=1.0,
+        crypto_portfolio_max_allocation_pct=1.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-ALLOC",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("20.00"),
+        ),
+        signal=make_signal(edge_bps=300),
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("100.00"),
+            portfolio_position_notional_dollars=Decimal("95.0000"),
+            portfolio_pending_order_notional_dollars=Decimal("3.0000"),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("4.00")
+    assert verdict.approved_notional_dollars == Decimal("2.0000")
+    assert "crypto_portfolio_allocation_cap_resized" in verdict.reason_codes
+    assert verdict.diagnostics["crypto_portfolio_allocation_cap"]["projected_portfolio_notional_dollars"] == "100.0000"
+
+
 def test_risk_engine_blocks_high_cost_side_with_tiny_remaining_payout() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",

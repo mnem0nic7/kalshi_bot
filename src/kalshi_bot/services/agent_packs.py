@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.constants import CRYPTO_MIN_REMAINING_PAYOUT_BPS
+from kalshi_bot.core.constants import CRYPTO_MAX_SPREAD_BPS, CRYPTO_MIN_REMAINING_PAYOUT_BPS, CRYPTO_MIN_SPREAD_BPS
 from kalshi_bot.core.enums import AgentRole, DeploymentColor
 from kalshi_bot.core.schemas import (
     AgentPack,
@@ -30,6 +30,7 @@ from kalshi_bot.db.repositories import PlatformRepository
 
 LEGACY_BUILTIN_AGENT_PACK_VERSION = "builtin-gemini-v1"
 DETERMINISTIC_BUILTIN_AGENT_PACK_VERSION = "builtin-deterministic-v1"
+DETERMINISTIC_AGENT_PACK_OVERRIDES_VERSION = "builtin-deterministic-v1-overrides"
 
 
 @dataclass(slots=True)
@@ -41,6 +42,7 @@ class RuntimeThresholds:
     trigger_cooldown_seconds: int
     strategy_quality_edge_buffer_bps: int
     strategy_min_remaining_payout_bps: int
+    risk_position_pct: float | None = None
     risk_safe_capital_reserve_ratio: float = 0.70
     risk_risky_capital_max_ratio: float = 0.30
     risk_max_credible_edge_bps: int = 10000
@@ -57,9 +59,11 @@ class RuntimeCryptoPolicy:
     min_contract_price_dollars: float
     min_remaining_payout_bps: int
     max_credible_edge_bps: int
+    target_position_pct: float
     replay_min_resolved_markets: int
     replay_min_trade_candidates: int
     replay_min_net_pl_dollars: float
+    replay_min_pnl_per_candidate_dollars: float
     replay_max_hard_cap_breaches: int
     replay_min_spot_coverage_pct: float
     replay_require_calibration_better_than_mid: bool
@@ -79,6 +83,7 @@ class RuntimeCryptoPolicy:
             "min_contract_price_dollars": self.min_contract_price_dollars,
             "min_remaining_payout_bps": self.min_remaining_payout_bps,
             "max_credible_edge_bps": self.max_credible_edge_bps,
+            "target_position_pct": self.target_position_pct,
         }
         override = self.asset_entry_overrides.get(symbol) or {}
         return {**base, **{key: value for key, value in override.items() if value is not None}}
@@ -210,16 +215,18 @@ class AgentPackService:
             crypto_policy=AgentPackCryptoPolicy(
                 entry=AgentPackCryptoEntryPolicy(
                     min_fee_adjusted_edge_bps=self.settings.risk_min_edge_bps,
-                    max_spread_bps=self.settings.crypto_live_max_spread_bps,
+                    max_spread_bps=self._clamp_crypto_spread_bps(self.settings.crypto_live_max_spread_bps),
                     min_confidence=self.settings.risk_min_confidence,
                     min_contract_price_dollars=self.settings.risk_min_contract_price_dollars,
                     min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
                     max_credible_edge_bps=self.settings.risk_max_credible_edge_bps,
+                    target_position_pct=self.settings.crypto_dynamic_order_target_position_pct,
                 ),
                 replay=AgentPackCryptoReplayPolicy(
                     min_resolved_markets=self.settings.crypto_replay_min_resolved_markets,
                     min_trade_candidates=self.settings.crypto_replay_min_trade_candidates,
                     min_net_pl_dollars=self.settings.crypto_replay_min_net_pl_dollars,
+                    min_pnl_per_candidate_dollars=self.settings.crypto_replay_min_pnl_per_candidate_dollars,
                     max_hard_cap_breaches=self.settings.crypto_replay_max_hard_cap_breaches,
                     min_spot_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
                     require_calibration_better_than_mid=self.settings.crypto_replay_require_calibration_better_than_mid,
@@ -452,6 +459,7 @@ class AgentPackService:
             return fallback if value is None else value
 
         overrides: dict[str, dict[str, Any]] = {}
+        max_target_position_pct = min(max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0), 0.15)
         for raw_symbol, raw_entry in (policy.asset_entry_overrides or {}).items():
             override = {
                 "min_fee_adjusted_edge_bps": raw_entry.min_fee_adjusted_edge_bps,
@@ -460,6 +468,7 @@ class AgentPackService:
                 "min_contract_price_dollars": raw_entry.min_contract_price_dollars,
                 "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
                 "max_credible_edge_bps": raw_entry.max_credible_edge_bps,
+                "target_position_pct": raw_entry.target_position_pct,
             }
             if override["min_contract_price_dollars"] is not None:
                 override["min_contract_price_dollars"] = self._contract_price_floor(
@@ -470,6 +479,13 @@ class AgentPackService:
                     int(override["min_fee_adjusted_edge_bps"]),
                     int(self.settings.risk_min_edge_bps),
                 )
+            if override["max_spread_bps"] is not None:
+                override["max_spread_bps"] = self._clamp_crypto_spread_bps(override["max_spread_bps"])
+            if override["target_position_pct"] is not None:
+                override["target_position_pct"] = min(
+                    max(float(override["target_position_pct"]), 0.0),
+                    max_target_position_pct,
+                )
             overrides[_normalize_crypto_asset_symbol(raw_symbol)] = override
 
         return RuntimeCryptoPolicy(
@@ -477,7 +493,9 @@ class AgentPackService:
                 int(value_or_settings(entry.min_fee_adjusted_edge_bps, self.settings.risk_min_edge_bps)),
                 int(self.settings.risk_min_edge_bps),
             ),
-            max_spread_bps=int(value_or_settings(entry.max_spread_bps, self.settings.crypto_live_max_spread_bps)),
+            max_spread_bps=self._clamp_crypto_spread_bps(
+                value_or_settings(entry.max_spread_bps, self.settings.crypto_live_max_spread_bps)
+            ),
             min_confidence=float(value_or_settings(entry.min_confidence, self.settings.risk_min_confidence)),
             min_contract_price_dollars=self._contract_price_floor(
                 value_or_settings(entry.min_contract_price_dollars, self.settings.risk_min_contract_price_dollars)
@@ -485,6 +503,20 @@ class AgentPackService:
             min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
             max_credible_edge_bps=int(
                 value_or_settings(entry.max_credible_edge_bps, self.settings.risk_max_credible_edge_bps)
+            ),
+            target_position_pct=float(
+                min(
+                    max(
+                        float(
+                            value_or_settings(
+                                entry.target_position_pct,
+                                self.settings.crypto_dynamic_order_target_position_pct,
+                            )
+                        ),
+                        0.0,
+                    ),
+                    max_target_position_pct,
+                )
             ),
             replay_min_resolved_markets=int(
                 value_or_settings(replay.min_resolved_markets, self.settings.crypto_replay_min_resolved_markets)
@@ -494,6 +526,12 @@ class AgentPackService:
             ),
             replay_min_net_pl_dollars=float(
                 value_or_settings(replay.min_net_pl_dollars, self.settings.crypto_replay_min_net_pl_dollars)
+            ),
+            replay_min_pnl_per_candidate_dollars=float(
+                value_or_settings(
+                    replay.min_pnl_per_candidate_dollars,
+                    self.settings.crypto_replay_min_pnl_per_candidate_dollars,
+                )
             ),
             replay_max_hard_cap_breaches=int(
                 value_or_settings(replay.max_hard_cap_breaches, self.settings.crypto_replay_max_hard_cap_breaches)
@@ -539,6 +577,10 @@ class AgentPackService:
             risk_min_contract_price_dollars=float(entry["min_contract_price_dollars"]),
             risk_max_order_notional_dollars=self.settings.risk_max_order_notional_dollars,
             risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
+            risk_position_pct=min(
+                max(float(entry.get("target_position_pct") or self.settings.crypto_dynamic_order_target_position_pct), 0.0),
+                min(float(self.settings.crypto_dynamic_order_max_position_pct), 0.15),
+            ),
             risk_safe_capital_reserve_ratio=self.settings.risk_safe_capital_reserve_ratio,
             risk_risky_capital_max_ratio=self.settings.risk_risky_capital_max_ratio,
             trigger_max_spread_bps=int(entry["max_spread_bps"]),
@@ -583,6 +625,11 @@ class AgentPackService:
             min_resolved_markets=self._clamp_int(crypto_policy.replay.min_resolved_markets, 10, 5000),
             min_trade_candidates=self._clamp_int(crypto_policy.replay.min_trade_candidates, 1, 1000),
             min_net_pl_dollars=self._clamp_float(crypto_policy.replay.min_net_pl_dollars, 0.0, 1000.0),
+            min_pnl_per_candidate_dollars=self._clamp_float(
+                crypto_policy.replay.min_pnl_per_candidate_dollars,
+                0.0,
+                1000.0,
+            ),
             max_hard_cap_breaches=self._clamp_int(crypto_policy.replay.max_hard_cap_breaches, 0, 100),
             min_spot_coverage_pct=self._clamp_float(crypto_policy.replay.min_spot_coverage_pct, 0.50, 1.0),
             require_calibration_better_than_mid=crypto_policy.replay.require_calibration_better_than_mid,
@@ -636,9 +683,10 @@ class AgentPackService:
         return max(low, min(high, float(value)))
 
     def _sanitize_crypto_entry(self, entry: AgentPackCryptoEntryPolicy) -> AgentPackCryptoEntryPolicy:
+        max_target_position_pct = min(max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0), 0.15)
         return AgentPackCryptoEntryPolicy(
             min_fee_adjusted_edge_bps=self._clamp_int(entry.min_fee_adjusted_edge_bps, 250, 5000),
-            max_spread_bps=self._clamp_int(entry.max_spread_bps, 50, 2500),
+            max_spread_bps=self._clamp_crypto_spread_bps(entry.max_spread_bps),
             min_confidence=self._clamp_float(entry.min_confidence, 0.50, 0.99),
             min_contract_price_dollars=self._clamp_float(
                 entry.min_contract_price_dollars,
@@ -647,7 +695,14 @@ class AgentPackService:
             ),
             min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
             max_credible_edge_bps=self._clamp_int(entry.max_credible_edge_bps, 2500, 10000),
+            target_position_pct=self._clamp_float(entry.target_position_pct, 0.0, max_target_position_pct),
         )
+
+    @staticmethod
+    def _clamp_crypto_spread_bps(value: int | float | None) -> int | None:
+        if value is None:
+            return None
+        return max(CRYPTO_MIN_SPREAD_BPS, min(CRYPTO_MAX_SPREAD_BPS, int(value)))
 
     def _contract_price_floor(self, value: Any) -> float:
         if value is None:
