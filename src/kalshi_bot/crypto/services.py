@@ -8,7 +8,7 @@ import json
 import logging
 import math
 import os
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -6197,6 +6197,7 @@ def _crypto_decision_rows(
         target_price = snapshot.target_price_dollars or (settlement_snapshot.target_price_dollars if settlement_snapshot is not None else None)
         settlement_context = _settlement_benchmark_context(
             spot_by_asset.get(snapshot.asset_symbol, []),
+            spot_end_times=spot_end_times_by_asset.get(snapshot.asset_symbol),
             close_time=close_time,
             target_price=target_price,
             frequency=snapshot.frequency,
@@ -6269,6 +6270,7 @@ def _crypto_decision_rows(
             )
             settlement_context = _settlement_benchmark_context(
                 spot_by_asset.get(snapshot.asset_symbol, []),
+                spot_end_times=spot_end_times_by_asset.get(snapshot.asset_symbol),
                 close_time=close_time,
                 target_price=snapshot.target_price_dollars,
                 frequency=snapshot.frequency,
@@ -6419,13 +6421,33 @@ def _spot_context_for_decision(
 ) -> dict[str, Any]:
     decision_utc = _as_utc_datetime(decision_ts)
     if spot_end_times is not None:
-        eligible = [row for row in spot_rows[:bisect_right(spot_end_times, decision_utc)] if row.close_dollars is not None]
+        historical_mode = str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL
+        end_index = bisect_right(spot_end_times, decision_utc)
+        eligible: list[CryptoSpotOHLCRecord] = []
+        for index in range(end_index - 1, -1, -1):
+            row = spot_rows[index]
+            if row.close_dollars is None:
+                continue
+            if historical_mode and str(row.source_kind or "").strip().lower() == "spot_tick":
+                continue
+            eligible.append(row)
+            if len(eligible) >= 33:
+                break
+        eligible.reverse()
     else:
         eligible = [
             row
             for row in spot_rows
             if _as_utc_datetime(row.end_ts) <= decision_utc and row.close_dollars is not None
         ]
+        if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
+            historical_eligible = [
+                row
+                for row in eligible
+                if str(row.source_kind or "").strip().lower() != "spot_tick"
+            ]
+            if historical_eligible:
+                eligible = historical_eligible
     if not eligible:
         return {
             "spot_feature_status": "missing",
@@ -6456,14 +6478,6 @@ def _spot_context_for_decision(
             "spot_return_24_pct": None,
             "spot_realized_volatility_32": None,
         }
-    if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
-        historical_eligible = [
-            row
-            for row in eligible
-            if str(row.source_kind or "").strip().lower() != "spot_tick"
-        ]
-        if historical_eligible:
-            eligible = historical_eligible
     current = eligible[-1]
     close = _decimal(current.close_dollars)
     stale_seconds = int((decision_utc - _as_utc_datetime(current.end_ts)).total_seconds())
@@ -6794,6 +6808,7 @@ def _crypto_training_quality_blockers(
 def _settlement_benchmark_context(
     spot_rows: list[CryptoSpotOHLCRecord],
     *,
+    spot_end_times: list[datetime] | None = None,
     close_time: datetime | None,
     target_price: Decimal | None,
     frequency: str,
@@ -6820,11 +6835,17 @@ def _settlement_benchmark_context(
         interval = 900
     close_utc = _as_utc_datetime(close_time)
     start = close_utc - timedelta(seconds=interval)
-    eligible = [
-        row
-        for row in spot_rows
-        if row.close_dollars is not None and start <= _as_utc_datetime(row.end_ts) <= close_utc
-    ]
+    if spot_end_times is not None:
+        start_index = bisect_left(spot_end_times, start)
+        end_index = bisect_right(spot_end_times, close_utc)
+        window_rows = spot_rows[start_index:end_index]
+        eligible = [row for row in window_rows if row.close_dollars is not None]
+    else:
+        eligible = [
+            row
+            for row in spot_rows
+            if row.close_dollars is not None and start <= _as_utc_datetime(row.end_ts) <= close_utc
+        ]
     eligible.sort(key=lambda row: row.end_ts)
     if not eligible:
         return {
