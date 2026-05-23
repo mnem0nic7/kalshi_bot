@@ -309,6 +309,7 @@ class Settings(BaseSettings):
     stop_loss_momentum_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_reentry_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_min_hold_minutes: int = 30
+    stop_loss_momentum_min_hold_minutes_by_strategy: dict[str, int] = Field(default_factory=dict)
     momentum_weight_scale_cents_per_min: float = 1.0
     momentum_slope_veto_cents_per_min: float | None = None
     momentum_weight_floor: float = 0.3

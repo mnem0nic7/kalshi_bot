@@ -62,12 +62,15 @@ def _side_price(mid_yes: Decimal, side: str) -> Decimal:
     return mid_yes if side == "yes" else Decimal("1") - mid_yes
 
 
-def _peak_price_from_history(prices: list[MarketPriceHistory], side: str) -> Decimal | None:
-    """Return the day's highest side-appropriate mid price from price history."""
+def _peak_price_from_history(
+    prices: list[MarketPriceHistory], side: str, since: datetime | None = None
+) -> Decimal | None:
+    """Return highest side-appropriate mid price after `since` (post-entry peak)."""
     candidates = [
         _side_price(row.mid_dollars, side)
         for row in prices
         if row.mid_dollars is not None
+        and (since is None or _as_utc(row.observed_at) >= since)
     ]
     return max(candidates) if candidates else None
 
@@ -212,9 +215,11 @@ class StopLossService:
                         if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
                             return None
 
-            # Trigger 1: trailing stop — 10% drop from today's peak price.
-            # Uses day's price history so the stop trails upward as price rises.
-            peak = _peak_price_from_history(prices, position.side)
+            # Trigger 1: trailing stop — 10% drop from post-entry peak.
+            # Filtering to prices after entry makes the stop entry-relative, not
+            # intraday-relative (avoids firing immediately on a position entered below
+            # the prior intraday high).
+            peak = _peak_price_from_history(prices, position.side, since=_as_utc(position.created_at))
             trailing_ratio: float | None = None
             if peak is not None:
                 trailing_ratio = _trailing_loss_ratio(peak, mid)
@@ -236,7 +241,15 @@ class StopLossService:
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=UTC)
             hold_minutes = (now - created_at).total_seconds() / 60
-            if hold_minutes < self.settings.stop_loss_momentum_min_hold_minutes:
+            inferred_strategy = (
+                "CRYPTO_15M" if "15M" in position.market_ticker else
+                "CRYPTO_1H" if "1H" in position.market_ticker else None
+            )
+            min_hold = (
+                self.settings.stop_loss_momentum_min_hold_minutes_by_strategy.get(inferred_strategy)
+                if inferred_strategy else None
+            ) or self.settings.stop_loss_momentum_min_hold_minutes
+            if hold_minutes < min_hold:
                 return None
 
             slope = _momentum_slope(prices)
