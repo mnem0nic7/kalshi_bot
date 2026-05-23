@@ -1251,6 +1251,15 @@ class CryptoHistoryService:
                     source_kind="settled_backfill",
                     observed_at=_crypto_settlement_observed_at(market),
                 )
+                if market.settlement_result in ("yes", "no"):
+                    # Propagate settlement to live monitoring snapshots so that
+                    # list_crypto_settled_market_snapshots returns them (enabling
+                    # real bid/ask prices as strict_trade_eligible rows in replay).
+                    await repo.update_crypto_snapshot_settlement_result(
+                        market_ticker=market.market_ticker,
+                        settlement_result=market.settlement_result,
+                        kalshi_env=self.settings.kalshi_env,
+                    )
                 asset_counts[market.asset_symbol] += 1
                 if index % commit_batch_size == 0:
                     await session.commit()

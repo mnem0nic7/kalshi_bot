@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Select, case, func, or_, select
+from sqlalchemy import Select, case, func, or_, select, update as sql_update
 from sqlalchemy.orm import defer
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -968,6 +968,35 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
         stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
+
+    async def update_crypto_snapshot_settlement_result(
+        self,
+        *,
+        market_ticker: str,
+        settlement_result: str,
+        kalshi_env: str | None = None,
+    ) -> int:
+        """Propagate a settled market's result to its live monitoring snapshots.
+
+        The settlement backfill creates a separate ``settled_backfill`` record, but
+        the earlier live monitoring snapshots retain ``settlement_result=NULL``.
+        Updating them here makes ``list_crypto_settled_market_snapshots`` include
+        those rows, giving the replay access to real bid/ask prices
+        (``quote_source='snapshot_quotes'``) for strict-trade-eligible rows.
+        """
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = (
+            sql_update(CryptoMarketSnapshotRecord)
+            .where(
+                CryptoMarketSnapshotRecord.market_ticker == market_ticker,
+                CryptoMarketSnapshotRecord.kalshi_env == env,
+                CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
+                CryptoMarketSnapshotRecord.settlement_result.is_(None),
+            )
+            .values(settlement_result=settlement_result)
+        )
+        result = await self.session.execute(stmt)
+        return result.rowcount
 
     async def list_crypto_snapshot_asset_symbols(
         self,
