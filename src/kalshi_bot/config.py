@@ -193,6 +193,12 @@ class Settings(BaseSettings):
     crypto_train_max_snapshots: int = 500_000
     crypto_train_max_candlesticks: int = 500_000
     crypto_train_max_spot_rows: int = 600_000
+    crypto_training_preflight_enabled: bool = True
+    crypto_training_feature_store_enabled: bool = True
+    crypto_training_preflight_settled_days: int = 2
+    crypto_training_preflight_history_days: int = 2
+    crypto_training_preflight_spot_days: int = 2
+    crypto_training_preflight_min_spot_coverage_pct: float = 0.80
     crypto_replay_min_resolved_markets: int = 500
     crypto_replay_min_trade_candidates: int = 50
     crypto_replay_min_net_pl_dollars: float = 0.0

@@ -19,6 +19,7 @@ from kalshi_bot.crypto.services import (
     CryptoMarketService,
     CryptoReplayService,
     CryptoSpotService,
+    CryptoTrainingBackfillService,
     CryptoWorkflowService,
 )
 from kalshi_bot.db.repositories import PlatformRepository
@@ -133,6 +134,7 @@ class AppContainer:
     crypto_market_service: CryptoMarketService
     crypto_history_service: CryptoHistoryService
     crypto_spot_service: CryptoSpotService
+    crypto_training_backfill_service: CryptoTrainingBackfillService
     crypto_forecast_service: CryptoForecastService
     crypto_replay_service: CryptoReplayService
     crypto_execution_service: CryptoExecutionService
@@ -333,6 +335,12 @@ class AppContainer:
             kalshi=kalshi,
             market_service=crypto_market_service,
         )
+        crypto_training_backfill_service = CryptoTrainingBackfillService(
+            settings=settings,
+            session_factory=session_factory,
+            history_service=crypto_history_service,
+            spot_service=crypto_spot_service,
+        )
         crypto_workflow_service = CryptoWorkflowService(
             settings=settings,
             session_factory=session_factory,
@@ -483,6 +491,7 @@ class AppContainer:
             decision_corpus_service=decision_corpus_service,
             crypto_history_service=crypto_history_service,
             crypto_spot_service=crypto_spot_service,
+            crypto_training_backfill_service=crypto_training_backfill_service,
             crypto_autonomy_service=crypto_autonomy_service,
             crypto_forecast_service=crypto_forecast_service,
             crypto_replay_service=crypto_replay_service,
@@ -544,6 +553,7 @@ class AppContainer:
             crypto_market_service=crypto_market_service,
             crypto_history_service=crypto_history_service,
             crypto_spot_service=crypto_spot_service,
+            crypto_training_backfill_service=crypto_training_backfill_service,
             crypto_forecast_service=crypto_forecast_service,
             crypto_replay_service=crypto_replay_service,
             crypto_execution_service=crypto_execution_service,

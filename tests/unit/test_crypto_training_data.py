@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 
 from kalshi_bot.config import Settings
-from kalshi_bot.crypto.services import CryptoForecastService
+from kalshi_bot.crypto.services import CryptoForecastService, CryptoTrainingBackfillService
 from kalshi_bot.db.models import CryptoMarketSnapshotRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
@@ -161,3 +161,79 @@ async def test_train_includes_settled_markets_beyond_recent_snapshot_cap(tmp_pat
     # Old behavior: most-recent-5 raw snapshots are all open markets -> 0 samples.
     # New behavior: settled market is scoped in regardless -> its decision row survives.
     assert result["sample_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_training_preflight_materializes_feature_rows_before_feature_store_train(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/feature-store.db",
+        kalshi_env="production",
+        crypto_min_training_samples=1,
+        crypto_training_preflight_min_spot_coverage_pct=0.0,
+    )
+    engine = create_engine(settings)
+    await init_models(engine)
+    session_factory = create_session_factory(engine)
+
+    close_yes = NOW - timedelta(hours=2)
+    close_no = NOW - timedelta(hours=1)
+    async with session_factory() as session:
+        session.add(
+            _snapshot(
+                "KXBTC15M-FEATURE-YES",
+                observed_at=close_yes - timedelta(minutes=10),
+                settlement_result=None,
+                close_time=close_yes,
+            )
+        )
+        session.add(
+            _snapshot(
+                "KXBTC15M-FEATURE-YES",
+                observed_at=close_yes,
+                settlement_result="yes",
+                close_time=close_yes,
+            )
+        )
+        session.add(
+            _snapshot(
+                "KXBTC15M-FEATURE-NO",
+                observed_at=close_no - timedelta(minutes=10),
+                settlement_result=None,
+                close_time=close_no,
+            )
+        )
+        session.add(
+            _snapshot(
+                "KXBTC15M-FEATURE-NO",
+                observed_at=close_no,
+                settlement_result="yes",
+                close_time=close_no,
+            )
+        )
+        await session.commit()
+
+    preflight = CryptoTrainingBackfillService(
+        settings=settings,
+        session_factory=session_factory,
+        history_service=object(),  # materialize(run_source_backfill=False) does not call source services
+        spot_service=None,
+    )
+    materialized = await preflight.prepare(
+        frequency="15m",
+        asset_symbols=["BTC"],
+        run_source_backfill=False,
+    )
+
+    assert materialized["status"] == "ok"
+    assert materialized["materialized"]["rows_materialized"] >= 2
+
+    result = await CryptoForecastService(settings=settings, session_factory=session_factory).train(
+        frequency="15m",
+        asset_symbols=["BTC"],
+        use_feature_store=True,
+        feature_store_only=True,
+    )
+
+    assert result["status"] == "trained"
+    assert result["sample_count"] >= 2
+    assert result["payload"]["trained_from"] == "crypto_training_feature_rows"

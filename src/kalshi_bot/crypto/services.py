@@ -47,6 +47,8 @@ from kalshi_bot.db.models import (
     CryptoMarketCandlestickRecord,
     CryptoMarketSnapshotRecord,
     CryptoSpotOHLCRecord,
+    DecisionTraceRecord,
+    FillRecord,
     OrderRecord,
     RiskVerdictRecord,
     Room,
@@ -83,7 +85,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v4"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v5"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
 CRYPTO_EXPLORATORY_SHADOW = "exploratory_shadow"
@@ -109,6 +111,7 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
     "lightgbm_classifier",
 )
 CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
+CRYPTO_CROSS_ASSET_FEATURE_ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE")
 CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_fee_adjusted_edge_bps": (750, 1000, 1500, 2500, 5000),
     "max_spread_bps": (100, 150, 250, 400, 600, 1000, 1500),
@@ -2000,28 +2003,124 @@ class CryptoSpotService:
             stored += 1
         return stored
 
-class CryptoForecastService:
+
+class CryptoTrainingBackfillService:
+    """Materialize point-in-time crypto training data before model fitting."""
+
     def __init__(
         self,
         *,
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
-        agent_pack_service: AgentPackService | None = None,
+        history_service: CryptoHistoryService,
         spot_service: CryptoSpotService | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
-        self.agent_pack_service = agent_pack_service or AgentPackService(settings)
+        self.history_service = history_service
         self.spot_service = spot_service
 
-    async def train(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
+    async def prepare(
+        self,
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+        settled_days: int | None = None,
+        history_days: int | None = None,
+        spot_days: int | None = None,
+        run_source_backfill: bool = True,
+    ) -> dict[str, Any]:
+        freq = normalize_frequency(frequency) or "15m"
+        assets = normalize_asset_symbols(asset_symbols)
+        errors: list[dict[str, Any]] = []
+        steps: dict[str, Any] = {}
+        if run_source_backfill:
+            steps["collect_open"] = await self._capture_step(
+                errors,
+                "collect_open",
+                self.history_service.collect_open(frequency=freq, asset_symbols=assets or None),
+            )
+            steps["collect_settled"] = await self._capture_step(
+                errors,
+                "collect_settled",
+                self.history_service.collect_settled(
+                    frequency=freq,
+                    days=settled_days or self.settings.crypto_training_preflight_settled_days,
+                    asset_symbols=assets or None,
+                ),
+            )
+            steps["history_bootstrap"] = await self._capture_step(
+                errors,
+                "history_bootstrap",
+                self.history_service.bootstrap(
+                    frequency=freq,
+                    days=history_days or self.settings.crypto_training_preflight_history_days,
+                    asset_symbols=assets or None,
+                ),
+            )
+            if self.spot_service is not None:
+                steps["spot_backfill"] = await self._capture_step(
+                    errors,
+                    "spot_backfill",
+                    self.spot_service.backfill(
+                        frequency=freq,
+                        days=spot_days or self.settings.crypto_training_preflight_spot_days,
+                        asset_symbols=assets or None,
+                    ),
+                )
+                steps["spot_current"] = await self._capture_step(
+                    errors,
+                    "spot_current",
+                    self.spot_service.collect_current(frequency=freq, asset_symbols=assets or None),
+                )
+
+        materialized = await self.materialize(frequency=freq, asset_symbols=assets or None)
+        blockers = list(materialized.get("blockers") or [])
+        blockers.extend(f"backfill_{error['step']}_failed" for error in errors)
+        status = "ok" if not blockers else "blocked"
+        return {
+            "status": status,
+            "kalshi_env": self.settings.kalshi_env,
+            "frequency": freq,
+            "asset_symbols": assets,
+            "run_source_backfill": run_source_backfill,
+            "steps": steps,
+            "materialized": materialized,
+            "blockers": blockers,
+            "errors": errors,
+        }
+
+    async def _capture_step(self, errors: list[dict[str, Any]], step: str, awaitable: Any) -> dict[str, Any]:
+        try:
+            result = await awaitable
+            return _crypto_training_step_summary(result)
+        except Exception as exc:
+            logger.warning("crypto_training_preflight step failed step=%s", step, exc_info=True)
+            errors.append({"step": step, "error": str(exc)})
+            return {"status": "error", "error": str(exc)}
+
+    async def materialize(
+        self,
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
         lookback_days = max(1, int(self.settings.crypto_train_lookback_days))
         since = datetime.now(UTC) - timedelta(days=lookback_days)
+        build_id = _crypto_training_build_id(
+            {
+                "kalshi_env": self.settings.kalshi_env,
+                "frequency": freq,
+                "asset_symbols": requested_assets,
+                "since": since.isoformat(),
+                "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+            }
+        )
         async with self.session_factory() as session:
-            repo = PlatformRepository(session)
-            rows = await repo.list_crypto_settled_market_snapshots(
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            snapshots = await repo.list_crypto_settled_market_snapshots(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbols=requested_assets or None,
@@ -2042,12 +2141,343 @@ class CryptoForecastService:
                 since=since,
                 limit=self.settings.crypto_train_max_spot_rows,
             )
-            active_pack = await self.agent_pack_service.get_active_pack(repo)
-            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
-            rows = _filter_crypto_snapshot_rows(rows, requested_assets)
+            snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
             candles = _filter_crypto_snapshot_rows(candles, requested_assets)
             spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
-            decision_rows = _crypto_decision_rows(rows, candles, spot_rows, settings=self.settings)
+            decision_rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
+            await self._materialize_spot_microstructure(repo, spot_rows, frequency=freq)
+            benchmark_count = await self._materialize_settlement_windows(
+                repo,
+                snapshots=snapshots,
+                spot_rows=spot_rows,
+                frequency=freq,
+            )
+            for row in decision_rows:
+                payload = _crypto_training_json_ready(row)
+                feature_hash = _crypto_training_build_id(payload)
+                await repo.upsert_crypto_training_feature_row(
+                    kalshi_env=self.settings.kalshi_env,
+                    frequency=freq,
+                    market_ticker=str(row.get("market_ticker") or ""),
+                    asset_symbol=normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN")),
+                    row_id=str(row.get("row_id") or feature_hash),
+                    decision_time=_as_utc_datetime(row.get("decision_ts")),
+                    settlement_time=_as_utc_datetime(row.get("settlement_ts")) if row.get("settlement_ts") else None,
+                    label_yes=int(row["label_yes"]) if row.get("label_yes") in {0, 1} else None,
+                    strict_trade_eligible=bool(row.get("strict_trade_eligible")),
+                    feature_schema_version=CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+                    feature_hash=feature_hash,
+                    source_build_id=build_id,
+                    quality_score=_crypto_training_row_quality_score(row),
+                    payload={
+                        "schema_version": "crypto-training-feature-row-v1",
+                        "decision_row": payload,
+                    },
+                )
+            outcome_count = await self._materialize_decision_outcomes(
+                session,
+                repo,
+                frequency=freq,
+                asset_symbols=requested_assets,
+                since=since,
+                snapshots=snapshots,
+            )
+            strict_rows = sum(1 for row in decision_rows if row.get("strict_trade_eligible"))
+            spot_coverage = _spot_feature_coverage(decision_rows)
+            window_start = min((row.get("decision_ts") for row in decision_rows if row.get("decision_ts")), default=None)
+            window_end = max((row.get("decision_ts") for row in decision_rows if row.get("decision_ts")), default=None)
+            blockers = _crypto_training_quality_blockers(
+                decision_rows,
+                spot_coverage=spot_coverage,
+                settings=self.settings,
+            )
+            quality_status = "ok" if not blockers else "blocked"
+            quality = await repo.record_crypto_data_quality_run(
+                kalshi_env=self.settings.kalshi_env,
+                frequency=freq,
+                asset_symbol=requested_assets[0] if len(requested_assets) == 1 else ("MULTI" if requested_assets else "ALL"),
+                run_kind="pre_training",
+                status=quality_status,
+                source_build_id=build_id,
+                window_start_ts=window_start,
+                window_end_ts=window_end,
+                rows_materialized=len(decision_rows),
+                strict_trade_eligible_rows=strict_rows,
+                spot_coverage_pct=spot_coverage,
+                decision_outcome_count=outcome_count,
+                metrics={
+                    "sample_count": len(decision_rows),
+                    "strict_trade_eligible_rows": strict_rows,
+                    "spot_coverage_pct": spot_coverage,
+                    "benchmark_window_count": benchmark_count,
+                    "blockers": blockers,
+                },
+                payload={
+                    "snapshot_count": len(snapshots),
+                    "candlestick_count": len(candles),
+                    "spot_row_count": len(spot_rows),
+                    "asset_symbols": requested_assets,
+                },
+            )
+            await session.commit()
+        return {
+            "status": quality_status,
+            "source_build_id": build_id,
+            "quality_run_id": quality.id,
+            "rows_materialized": len(decision_rows),
+            "strict_trade_eligible_rows": strict_rows,
+            "spot_coverage_pct": spot_coverage,
+            "decision_outcome_count": outcome_count,
+            "benchmark_window_count": benchmark_count,
+            "blockers": blockers,
+        }
+
+    async def _materialize_spot_microstructure(
+        self,
+        repo: PlatformRepository,
+        spot_rows: list[CryptoSpotOHLCRecord],
+        *,
+        frequency: str,
+    ) -> None:
+        for row in spot_rows:
+            payload = row.payload if isinstance(row.payload, dict) else {}
+            microstructure = payload.get("market_microstructure") if isinstance(payload.get("market_microstructure"), dict) else {}
+            best_bid_ask = microstructure.get("best_bid_ask") if isinstance(microstructure.get("best_bid_ask"), dict) else {}
+            if best_bid_ask:
+                bid_depth = _optional_decimal(best_bid_ask.get("best_bid_size"))
+                ask_depth = _optional_decimal(best_bid_ask.get("best_ask_size"))
+                depth_imbalance = None
+                if bid_depth is not None and ask_depth is not None and bid_depth + ask_depth > 0:
+                    depth_imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth)
+                await repo.upsert_crypto_order_book_snapshot(
+                    kalshi_env=self.settings.kalshi_env,
+                    provider=row.provider,
+                    asset_symbol=row.asset_symbol,
+                    frequency=frequency,
+                    market_ticker="",
+                    source_kind=row.source_kind,
+                    source_id=row.source_id,
+                    observed_at=_as_utc_datetime(row.end_ts),
+                    best_bid_dollars=_optional_decimal(best_bid_ask.get("best_bid_dollars")),
+                    best_ask_dollars=_optional_decimal(best_bid_ask.get("best_ask_dollars")),
+                    mid_dollars=_optional_decimal(best_bid_ask.get("mid_dollars")),
+                    spread_bps=int(best_bid_ask["spread_bps"]) if best_bid_ask.get("spread_bps") not in (None, "") else None,
+                    bid_depth=bid_depth,
+                    ask_depth=ask_depth,
+                    depth_imbalance=depth_imbalance,
+                    payload={"spot_ohlc_id": row.id, "raw": best_bid_ask},
+                )
+            trades = microstructure.get("recent_trades") if isinstance(microstructure.get("recent_trades"), list) else []
+            for idx, trade in enumerate(trades):
+                if not isinstance(trade, dict):
+                    continue
+                observed = parse_datetime(trade.get("time")) or row.end_ts
+                trade_id = str(trade.get("trade_id") or f"{row.id}:{idx}")
+                await repo.upsert_crypto_trade_tick(
+                    kalshi_env=self.settings.kalshi_env,
+                    provider=row.provider,
+                    asset_symbol=row.asset_symbol,
+                    frequency=frequency,
+                    market_ticker="",
+                    source_kind=row.source_kind,
+                    source_id=row.source_id or "",
+                    trade_id=trade_id,
+                    observed_at=_as_utc_datetime(observed),
+                    side=str(trade.get("side") or "") or None,
+                    price_dollars=_optional_decimal(trade.get("price_dollars") or trade.get("price")),
+                    size=_optional_decimal(trade.get("size")),
+                    payload={"spot_ohlc_id": row.id, "raw": trade},
+                )
+
+    async def _materialize_settlement_windows(
+        self,
+        repo: PlatformRepository,
+        *,
+        snapshots: list[CryptoMarketSnapshotRecord],
+        spot_rows: list[CryptoSpotOHLCRecord],
+        frequency: str,
+    ) -> int:
+        spot_by_asset: dict[str, list[CryptoSpotOHLCRecord]] = defaultdict(list)
+        for row in spot_rows:
+            if row.close_dollars is not None:
+                spot_by_asset[row.asset_symbol].append(row)
+        for rows in spot_by_asset.values():
+            rows.sort(key=lambda item: item.end_ts)
+        settled = _crypto_settlement_snapshots_by_market(snapshots)
+        count = 0
+        for market_ticker, snapshot in settled.items():
+            close_time = snapshot.close_time or snapshot.expected_expiration_time
+            if close_time is None:
+                continue
+            context = _settlement_benchmark_context(
+                spot_by_asset.get(snapshot.asset_symbol, []),
+                close_time=close_time,
+                target_price=snapshot.target_price_dollars,
+                frequency=frequency,
+            )
+            await repo.upsert_crypto_settlement_benchmark_window(
+                kalshi_env=self.settings.kalshi_env,
+                market_ticker=market_ticker,
+                asset_symbol=snapshot.asset_symbol,
+                frequency=frequency,
+                target_price_dollars=snapshot.target_price_dollars,
+                window_start_ts=context.get("settlement_window_start_ts"),
+                window_end_ts=context.get("settlement_window_end_ts"),
+                sample_count=int(context.get("settlement_window_sample_count") or 0),
+                open_dollars=context.get("settlement_window_open_dollars"),
+                high_dollars=context.get("settlement_window_high_dollars"),
+                low_dollars=context.get("settlement_window_low_dollars"),
+                close_dollars=context.get("settlement_window_close_dollars"),
+                twap_dollars=context.get("settlement_window_twap_dollars"),
+                vwap_dollars=context.get("settlement_window_vwap_dollars"),
+                payload={"status": context.get("settlement_window_status")},
+            )
+            count += 1
+        return count
+
+    async def _materialize_decision_outcomes(
+        self,
+        session: AsyncSession,
+        repo: PlatformRepository,
+        *,
+        frequency: str,
+        asset_symbols: list[str],
+        since: datetime,
+        snapshots: list[CryptoMarketSnapshotRecord],
+    ) -> int:
+        snapshot_by_market = {row.market_ticker: row for row in snapshots}
+        stmt = select(DecisionTraceRecord).where(
+            DecisionTraceRecord.kalshi_env == self.settings.kalshi_env,
+            DecisionTraceRecord.decision_time >= since,
+        )
+        traces = list((await session.execute(stmt.limit(50_000))).scalars())
+        if asset_symbols:
+            traces = [
+                trace
+                for trace in traces
+                if normalize_asset_symbol(
+                    str(_trace_value(trace.trace, "asset_symbol", "asset") or getattr(snapshot_by_market.get(trace.market_ticker), "asset_symbol", ""))
+                )
+                in set(asset_symbols)
+            ]
+        count = 0
+        for trace in traces:
+            snapshot = snapshot_by_market.get(trace.market_ticker)
+            asset = normalize_asset_symbol(
+                str(_trace_value(trace.trace, "asset_symbol", "asset") or getattr(snapshot, "asset_symbol", "UNKNOWN"))
+            )
+            trace_frequency = normalize_frequency(
+                str(_trace_value(trace.trace, "frequency") or getattr(snapshot, "frequency", frequency))
+            ) or frequency
+            if trace_frequency != frequency:
+                continue
+            fills = list(
+                (
+                    await session.execute(
+                        select(FillRecord).where(
+                            FillRecord.kalshi_env == self.settings.kalshi_env,
+                            FillRecord.market_ticker == trace.market_ticker,
+                        )
+                    )
+                ).scalars()
+            )
+            realized = _crypto_realized_fill_pnl(fills)
+            await repo.upsert_crypto_decision_outcome(
+                kalshi_env=self.settings.kalshi_env,
+                frequency=frequency,
+                market_ticker=trace.market_ticker,
+                asset_symbol=asset,
+                decision_time=trace.decision_time,
+                decision_kind=trace.decision_kind,
+                input_hash=trace.input_hash or trace.trace_hash or trace.id,
+                trace_hash=trace.trace_hash,
+                model_version=str(_trace_value(trace.trace, "model_version", "version") or "") or None,
+                prediction_yes=_optional_decimal(_trace_value(trace.trace, "prediction_yes", "fair_yes_dollars", "probability", "p_yes")),
+                selected_side=str(_trace_value(trace.trace, "selected_side", "side") or "") or None,
+                selected_price_dollars=_optional_decimal(_trace_value(trace.trace, "selected_price_dollars", "yes_price_dollars", "price")),
+                selected_count_fp=_optional_decimal(_trace_value(trace.trace, "selected_count_fp", "count_fp")),
+                gate_status=str(_trace_value(trace.trace, "gate_status", "status") or "") or None,
+                settlement_result=getattr(snapshot, "settlement_result", None),
+                simulated_pnl_dollars=_optional_decimal(_trace_value(trace.trace, "simulated_pnl_dollars", "net_pnl")),
+                realized_pnl_dollars=realized,
+                fill_count=len(fills),
+                source_snapshot_ids=trace.source_snapshot_ids or {},
+                payload={"trace_id": trace.id, "trace": _crypto_training_json_ready(trace.trace or {})},
+            )
+            count += 1
+        return count
+
+class CryptoForecastService:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        session_factory: async_sessionmaker[AsyncSession],
+        agent_pack_service: AgentPackService | None = None,
+        spot_service: CryptoSpotService | None = None,
+    ) -> None:
+        self.settings = settings
+        self.session_factory = session_factory
+        self.agent_pack_service = agent_pack_service or AgentPackService(settings)
+        self.spot_service = spot_service
+
+    async def train(
+        self,
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+        use_feature_store: bool = False,
+        feature_store_only: bool = False,
+    ) -> dict[str, Any]:
+        freq = normalize_frequency(frequency) or "15m"
+        requested_assets = normalize_asset_symbols(asset_symbols)
+        lookback_days = max(1, int(self.settings.crypto_train_lookback_days))
+        since = datetime.now(UTC) - timedelta(days=lookback_days)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            feature_records = []
+            if use_feature_store or feature_store_only:
+                feature_records = await repo.list_crypto_training_feature_rows(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets or None,
+                    since=since,
+                    limit=self.settings.crypto_train_max_snapshots,
+                )
+            active_pack = await self.agent_pack_service.get_active_pack(repo)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+            trained_from = "crypto_training_feature_rows"
+            if feature_records:
+                decision_rows = [_crypto_training_row_payload(record) for record in reversed(feature_records)]
+            elif feature_store_only:
+                decision_rows = []
+            else:
+                rows = await repo.list_crypto_settled_market_snapshots(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets or None,
+                    since=since,
+                    limit=self.settings.crypto_train_max_snapshots,
+                )
+                candles = await repo.list_crypto_market_candlesticks(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets or None,
+                    since=since,
+                    limit=self.settings.crypto_train_max_candlesticks,
+                )
+                spot_rows = await repo.list_crypto_spot_ohlc(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets or None,
+                    since=since,
+                    limit=self.settings.crypto_train_max_spot_rows,
+                )
+                rows = _filter_crypto_snapshot_rows(rows, requested_assets)
+                candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+                spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+                decision_rows = _crypto_decision_rows(rows, candles, spot_rows, settings=self.settings)
+                trained_from = "point_in_time_crypto_snapshots_and_candles"
             sample_count = len(decision_rows)
             payload = _fit_crypto_calibration(decision_rows, settings=self.settings, crypto_policy=crypto_policy)
             metrics = _crypto_model_metrics(decision_rows, payload, settings=self.settings, crypto_policy=crypto_policy)
@@ -2056,7 +2486,8 @@ class CryptoForecastService:
                 **payload,
                 "frequency": freq,
                 "asset_symbols": requested_assets,
-                "trained_from": "point_in_time_crypto_snapshots_and_candles",
+                "trained_from": trained_from,
+                "feature_store_only": feature_store_only,
                 "feature_set": [
                     "market_mid_logit",
                     "asset",
@@ -2079,6 +2510,9 @@ class CryptoForecastService:
                     "spot_target_distance_volatility",
                     "kalshi_mid_spot_gap",
                     "recent_same_asset_behavior",
+                    "quote_velocity",
+                    "settlement_benchmark_window",
+                    "expanded_cross_asset_regime",
                 ],
                 "metrics_scope": metrics.get("validation_scope") or "walk_forward_time_ordered",
                 "candidate_registry_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
@@ -5554,6 +5988,12 @@ def _crypto_decision_rows(
         strict_trade_eligible = quote_source == "snapshot_quotes"
         market_age_seconds = _crypto_market_age_seconds(decision_ts, getattr(snapshot, "open_time", None))
         target_price = snapshot.target_price_dollars or (settlement_snapshot.target_price_dollars if settlement_snapshot is not None else None)
+        settlement_context = _settlement_benchmark_context(
+            spot_by_asset.get(snapshot.asset_symbol, []),
+            close_time=close_time,
+            target_price=target_price,
+            frequency=snapshot.frequency,
+        )
         settlement_joined = settlement_snapshot is not None and settlement_snapshot is not snapshot
         rows.append(
             {
@@ -5587,6 +6027,7 @@ def _crypto_decision_rows(
                 "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
                 "candle_momentum_dollars": candle_momentum,
                 **spot_context,
+                **settlement_context,
                 **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
             }
         )
@@ -5619,6 +6060,12 @@ def _crypto_decision_rows(
                 settings=settings,
                 mode=CRYPTO_SPOT_CONTEXT_HISTORICAL,
             )
+            settlement_context = _settlement_benchmark_context(
+                spot_by_asset.get(snapshot.asset_symbol, []),
+                close_time=close_time,
+                target_price=snapshot.target_price_dollars,
+                frequency=snapshot.frequency,
+            )
             rows.append(
                 {
                     "row_id": f"candle_proxy:{snapshot.market_ticker}:{decision_ts.isoformat()}",
@@ -5650,10 +6097,11 @@ def _crypto_decision_rows(
                     "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
                     "candle_momentum_dollars": candle_momentum,
                     **spot_context,
+                    **settlement_context,
                     **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
                 }
             )
-    return _crypto_add_recent_asset_features(rows)
+    return _crypto_add_recent_asset_features(_crypto_add_quote_history_features(rows))
 
 
 def _crypto_settlement_snapshots_by_market(
@@ -5932,12 +6380,44 @@ def _cross_asset_context(
         )
         return _spot_return_pct(eligible, periods=periods)
 
-    return {
-        "btc_return_1_pct": _cross_return("BTC", 1),
-        "btc_return_3_pct": _cross_return("BTC", 3),
-        "eth_return_1_pct": _cross_return("ETH", 1),
-        "eth_return_3_pct": _cross_return("ETH", 3),
-    }
+    result: dict[str, Any] = {}
+    for asset in CRYPTO_CROSS_ASSET_FEATURE_ASSETS:
+        key = asset.lower()
+        result[f"{key}_return_1_pct"] = _cross_return(asset, 1)
+        result[f"{key}_return_3_pct"] = _cross_return(asset, 3)
+    return result
+
+
+def _crypto_add_quote_history_features(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_market: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_market[str(row.get("market_ticker") or "")].append(row)
+    enriched: list[dict[str, Any]] = []
+    for market_rows in by_market.values():
+        market_rows.sort(key=lambda row: row.get("decision_ts") or datetime.max.replace(tzinfo=UTC))
+        previous: dict[str, Any] | None = None
+        for row in market_rows:
+            updated = dict(row)
+            updated["market_mid_change_1"] = None
+            updated["market_mid_velocity_per_min"] = None
+            updated["spread_change_bps_1"] = None
+            updated["quote_observation_gap_seconds"] = None
+            if previous is not None:
+                current_ts = row.get("decision_ts")
+                previous_ts = previous.get("decision_ts")
+                seconds = None
+                if isinstance(current_ts, datetime) and isinstance(previous_ts, datetime):
+                    seconds = max(1, int((_as_utc_datetime(current_ts) - _as_utc_datetime(previous_ts)).total_seconds()))
+                    updated["quote_observation_gap_seconds"] = seconds
+                mid_delta = _decimal(row.get("mid_yes_dollars")) - _decimal(previous.get("mid_yes_dollars"))
+                updated["market_mid_change_1"] = mid_delta
+                if seconds:
+                    updated["market_mid_velocity_per_min"] = mid_delta / Decimal(str(seconds / 60))
+                if row.get("spread_bps") is not None and previous.get("spread_bps") is not None:
+                    updated["spread_change_bps_1"] = int(row.get("spread_bps") or 0) - int(previous.get("spread_bps") or 0)
+            enriched.append(updated)
+            previous = row
+    return sorted(enriched, key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
 
 
 def _crypto_add_recent_asset_features(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -6006,6 +6486,225 @@ def _json_ready_spot_features(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+_CRYPTO_TRAINING_DATETIME_KEYS = {
+    "decision_ts",
+    "settlement_ts",
+    "spot_observed_end_ts",
+    "settlement_window_start_ts",
+    "settlement_window_end_ts",
+}
+
+
+def _crypto_training_step_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in result.items()
+        if key
+        in {
+            "status",
+            "kalshi_env",
+            "frequency",
+            "asset_symbols",
+            "lookback_days",
+            "stored",
+            "markets_stored",
+            "settled_markets_stored",
+            "stored_real_quote_snapshots",
+            "candles_stored",
+            "errors",
+            "data_quality",
+            "spot_quality",
+            "recent_quote_evidence",
+        }
+    }
+
+
+def _crypto_training_json_ready(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _crypto_training_json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_crypto_training_json_ready(item) for item in value]
+    if isinstance(value, tuple):
+        return [_crypto_training_json_ready(item) for item in value]
+    return value
+
+
+def _crypto_training_build_id(payload: Any) -> str:
+    normalized = _crypto_training_json_ready(payload)
+    raw = json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _crypto_training_row_payload(record: Any) -> dict[str, Any]:
+    payload = record.payload if isinstance(record.payload, dict) else {}
+    row = payload.get("decision_row") if isinstance(payload.get("decision_row"), dict) else dict(payload)
+    hydrated = dict(row)
+    for key in _CRYPTO_TRAINING_DATETIME_KEYS:
+        if isinstance(hydrated.get(key), str):
+            parsed = parse_datetime(hydrated.get(key))
+            if parsed is not None:
+                hydrated[key] = parsed
+    return hydrated
+
+
+def _crypto_training_row_quality_score(row: dict[str, Any]) -> float:
+    score = 1.0
+    if not row.get("strict_trade_eligible"):
+        score -= 0.25
+    if row.get("spot_feature_status") != "available":
+        score -= 0.25
+    if row.get("quote_source") != "snapshot_quotes":
+        score -= 0.15
+    if bool(row.get("spot_proxy_only")):
+        score -= 0.10
+    return max(0.0, min(1.0, score))
+
+
+def _crypto_training_quality_blockers(
+    rows: list[dict[str, Any]],
+    *,
+    spot_coverage: float,
+    settings: Settings,
+) -> list[str]:
+    blockers: list[str] = []
+    if len(rows) < settings.crypto_min_training_samples:
+        blockers.append(
+            f"feature_rows_below_min:{len(rows)}<{settings.crypto_min_training_samples}"
+        )
+    strict_rows = sum(1 for row in rows if row.get("strict_trade_eligible"))
+    if strict_rows <= 0:
+        blockers.append("missing_strict_trade_eligible_rows")
+    min_spot = max(0.0, float(settings.crypto_training_preflight_min_spot_coverage_pct))
+    if rows and spot_coverage < min_spot:
+        blockers.append(f"spot_coverage_below_min:{spot_coverage:.3f}<{min_spot:.3f}")
+    return blockers
+
+
+def _settlement_benchmark_context(
+    spot_rows: list[CryptoSpotOHLCRecord],
+    *,
+    close_time: datetime | None,
+    target_price: Decimal | None,
+    frequency: str,
+) -> dict[str, Any]:
+    if close_time is None:
+        return {
+            "settlement_window_status": "missing_close_time",
+            "settlement_window_sample_count": 0,
+            "settlement_window_start_ts": None,
+            "settlement_window_end_ts": None,
+            "settlement_window_open_dollars": None,
+            "settlement_window_high_dollars": None,
+            "settlement_window_low_dollars": None,
+            "settlement_window_close_dollars": None,
+            "settlement_window_twap_dollars": None,
+            "settlement_window_vwap_dollars": None,
+            "settlement_twap_target_distance_pct": None,
+            "settlement_window_return_pct": None,
+            "settlement_window_volatility": None,
+        }
+    try:
+        interval = interval_seconds_for_frequency(frequency)
+    except ValueError:
+        interval = 900
+    close_utc = _as_utc_datetime(close_time)
+    start = close_utc - timedelta(seconds=interval)
+    eligible = [
+        row
+        for row in spot_rows
+        if row.close_dollars is not None and start <= _as_utc_datetime(row.end_ts) <= close_utc
+    ]
+    eligible.sort(key=lambda row: row.end_ts)
+    if not eligible:
+        return {
+            "settlement_window_status": "missing_spot_window",
+            "settlement_window_sample_count": 0,
+            "settlement_window_start_ts": start,
+            "settlement_window_end_ts": close_utc,
+            "settlement_window_open_dollars": None,
+            "settlement_window_high_dollars": None,
+            "settlement_window_low_dollars": None,
+            "settlement_window_close_dollars": None,
+            "settlement_window_twap_dollars": None,
+            "settlement_window_vwap_dollars": None,
+            "settlement_twap_target_distance_pct": None,
+            "settlement_window_return_pct": None,
+            "settlement_window_volatility": None,
+        }
+    closes = [_decimal(row.close_dollars) for row in eligible]
+    highs = [_decimal(row.high_dollars if row.high_dollars is not None else row.close_dollars) for row in eligible]
+    lows = [_decimal(row.low_dollars if row.low_dollars is not None else row.close_dollars) for row in eligible]
+    volumes = [_optional_decimal(row.volume) or Decimal("0") for row in eligible]
+    twap = sum(closes, Decimal("0")) / Decimal(len(closes))
+    volume_sum = sum(volumes, Decimal("0"))
+    vwap = (
+        sum((close * volume for close, volume in zip(closes, volumes, strict=False)), Decimal("0")) / volume_sum
+        if volume_sum > 0
+        else None
+    )
+    target_distance = None
+    if target_price is not None and target_price > 0:
+        target_distance = (twap - target_price) / target_price
+    window_return = None
+    if closes[0] > 0:
+        window_return = (closes[-1] - closes[0]) / closes[0]
+    returns = [
+        (after - before) / before
+        for before, after in zip(closes, closes[1:], strict=False)
+        if before > 0
+    ]
+    volatility = None
+    if returns:
+        mean = sum(returns, Decimal("0")) / Decimal(len(returns))
+        variance = sum((item - mean) * (item - mean) for item in returns) / Decimal(len(returns))
+        volatility = Decimal(str(math.sqrt(float(variance))))
+    return {
+        "settlement_window_status": "available",
+        "settlement_window_sample_count": len(eligible),
+        "settlement_window_start_ts": _as_utc_datetime(eligible[0].end_ts),
+        "settlement_window_end_ts": _as_utc_datetime(eligible[-1].end_ts),
+        "settlement_window_open_dollars": _optional_decimal(eligible[0].open_dollars) or closes[0],
+        "settlement_window_high_dollars": max(highs),
+        "settlement_window_low_dollars": min(lows),
+        "settlement_window_close_dollars": closes[-1],
+        "settlement_window_twap_dollars": twap,
+        "settlement_window_vwap_dollars": vwap,
+        "settlement_twap_target_distance_pct": target_distance,
+        "settlement_window_return_pct": window_return,
+        "settlement_window_volatility": volatility,
+    }
+
+
+def _trace_value(payload: Any, *keys: str) -> Any:
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        if payload.get(key) not in (None, ""):
+            return payload.get(key)
+    for value in payload.values():
+        if isinstance(value, dict):
+            found = _trace_value(value, *keys)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _crypto_realized_fill_pnl(fills: list[FillRecord]) -> Decimal | None:
+    pnls = [
+        PlatformRepository._fill_pnl_metrics([fill]).get("total_pnl_dollars")
+        for fill in fills
+    ]
+    values = [_optional_decimal(value) for value in pnls if value not in (None, "")]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return sum(values, Decimal("0"))
+
+
 def _nearest_candle(
     candles: list[CryptoMarketCandlestickRecord],
     decision_ts: datetime,
@@ -6058,14 +6757,24 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "spot_return_12_pct",
         "spot_return_24_pct",
         "spot_realized_volatility_32",
+        "market_mid_change_1",
+        "market_mid_velocity_per_min",
+        "spread_change_bps_1",
+        "quote_observation_gap_ratio",
+        "settlement_window_available",
+        "settlement_window_sample_count",
+        "settlement_twap_target_distance_pct",
+        "settlement_window_return_pct",
+        "settlement_window_volatility",
         "close_hour_sin",
         "close_hour_cos",
         "close_dow_sin",
         "close_dow_cos",
-        "btc_return_1_pct",
-        "btc_return_3_pct",
-        "eth_return_1_pct",
-        "eth_return_3_pct",
+        *[
+            f"{asset.lower()}_return_{period}_pct"
+            for asset in CRYPTO_CROSS_ASSET_FEATURE_ASSETS
+            for period in (1, 3)
+        ],
     ]
     feature_names = [*numeric, *[f"asset={asset}" for asset in assets]]
     return {
@@ -6133,10 +6842,14 @@ def _crypto_raw_feature_vector(
     spot_stale_seconds = max(0.0, float(row.get("spot_stale_seconds") or 0))
     spot_exchange_spread = max(0.0, float(row.get("spot_exchange_spread_bps") or 0))
     spot_exchange_trade_count = max(0.0, float(row.get("spot_exchange_recent_trade_count") or 0))
-    btc_return_1 = float(_decimal(row.get("btc_return_1_pct") or Decimal("0")))
-    btc_return_3 = float(_decimal(row.get("btc_return_3_pct") or Decimal("0")))
-    eth_return_1 = float(_decimal(row.get("eth_return_1_pct") or Decimal("0")))
-    eth_return_3 = float(_decimal(row.get("eth_return_3_pct") or Decimal("0")))
+    market_mid_change = float(_decimal(row.get("market_mid_change_1") or Decimal("0")))
+    market_mid_velocity = float(_decimal(row.get("market_mid_velocity_per_min") or Decimal("0")))
+    spread_change = float(row.get("spread_change_bps_1") or 0)
+    quote_observation_gap = max(0.0, float(row.get("quote_observation_gap_seconds") or 0))
+    settlement_sample_count = max(0.0, float(row.get("settlement_window_sample_count") or 0))
+    settlement_target_distance = float(_decimal(row.get("settlement_twap_target_distance_pct") or Decimal("0")))
+    settlement_window_return = float(_decimal(row.get("settlement_window_return_pct") or Decimal("0")))
+    settlement_window_volatility = float(_decimal(row.get("settlement_window_volatility") or Decimal("0")))
     market_age_seconds = max(0.0, float(row.get("market_age_seconds") or 0))
     default_values = _crypto_default_values_for_asset(asset, defaults or {})
     recent_yes = row.get("asset_recent_yes_rate")
@@ -6186,15 +6899,26 @@ def _crypto_raw_feature_vector(
         "spot_return_12_pct": max(-0.20, min(0.20, spot_return_12)) * 5.0,
         "spot_return_24_pct": max(-0.30, min(0.30, spot_return_24)) * (10.0 / 3.0),
         "spot_realized_volatility_32": max(0.0, min(0.20, spot_volatility_32)) * 5.0,
+        "market_mid_change_1": max(-0.25, min(0.25, market_mid_change)) * 4.0,
+        "market_mid_velocity_per_min": max(-0.25, min(0.25, market_mid_velocity)) * 4.0,
+        "spread_change_bps_1": max(-500.0, min(500.0, spread_change)) / 500.0,
+        "quote_observation_gap_ratio": min(quote_observation_gap / 900.0, 4.0) / 4.0,
+        "settlement_window_available": 1.0 if row.get("settlement_window_status") == "available" else 0.0,
+        "settlement_window_sample_count": min(math.log1p(settlement_sample_count) / math.log1p(60), 1.0),
+        "settlement_twap_target_distance_pct": max(-0.25, min(0.25, settlement_target_distance)) * 4.0,
+        "settlement_window_return_pct": max(-0.10, min(0.10, settlement_window_return)) * 10.0,
+        "settlement_window_volatility": max(0.0, min(0.10, settlement_window_volatility)) * 10.0,
         "close_hour_sin": close_hour_sin,
         "close_hour_cos": close_hour_cos,
         "close_dow_sin": close_dow_sin,
         "close_dow_cos": close_dow_cos,
-        "btc_return_1_pct": max(-0.05, min(0.05, btc_return_1)) * 20.0,
-        "btc_return_3_pct": max(-0.10, min(0.10, btc_return_3)) * 10.0,
-        "eth_return_1_pct": max(-0.05, min(0.05, eth_return_1)) * 20.0,
-        "eth_return_3_pct": max(-0.10, min(0.10, eth_return_3)) * 10.0,
     }
+    for cross_asset in CRYPTO_CROSS_ASSET_FEATURE_ASSETS:
+        key = cross_asset.lower()
+        return_1 = float(_decimal(row.get(f"{key}_return_1_pct") or Decimal("0")))
+        return_3 = float(_decimal(row.get(f"{key}_return_3_pct") or Decimal("0")))
+        numeric_values[f"{key}_return_1_pct"] = max(-0.05, min(0.05, return_1)) * 20.0
+        numeric_values[f"{key}_return_3_pct"] = max(-0.10, min(0.10, return_3)) * 10.0
     values: list[float] = [numeric_values[name] for name in schema.get("numeric_feature_names") or []]
     values.extend(1.0 if asset == category else 0.0 for category in schema.get("asset_categories") or [])
     return values

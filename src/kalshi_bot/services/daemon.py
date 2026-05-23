@@ -20,9 +20,11 @@ from kalshi_bot.crypto.services import (
     CryptoHistoryService,
     CryptoReplayService,
     CryptoSpotService,
+    CryptoTrainingBackfillService,
     crypto_pnl_sizing_target_pct,
     enabled_crypto_frequencies,
 )
+from kalshi_bot.integrations.crypto_spot import COINBASE_PRODUCT_IDS
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.auto_trigger import AutoTriggerService
 from kalshi_bot.services.autonomous_gate_tuning import AutonomousGateTuningService
@@ -88,6 +90,7 @@ class DaemonService:
         decision_corpus_service: DecisionCorpusService | None = None,
         crypto_history_service: CryptoHistoryService | None = None,
         crypto_spot_service: CryptoSpotService | None = None,
+        crypto_training_backfill_service: CryptoTrainingBackfillService | None = None,
         crypto_autonomy_service: CryptoAutonomyService | None = None,
         crypto_forecast_service: CryptoForecastService | None = None,
         crypto_replay_service: CryptoReplayService | None = None,
@@ -121,6 +124,7 @@ class DaemonService:
         self.decision_corpus_service = decision_corpus_service
         self.crypto_history_service = crypto_history_service
         self.crypto_spot_service = crypto_spot_service
+        self.crypto_training_backfill_service = crypto_training_backfill_service
         self.crypto_autonomy_service = crypto_autonomy_service
         self.crypto_forecast_service = crypto_forecast_service
         self.crypto_replay_service = crypto_replay_service
@@ -903,8 +907,11 @@ class DaemonService:
             if self.crypto_spot_service is not None and self.settings.crypto_spot_current_auto_enabled:
                 if await self._is_active_color():
                     try:
+                        configured_assets = sorted(COINBASE_PRODUCT_IDS)
                         for frequency in enabled_crypto_frequencies(self.settings):
-                            await self.crypto_spot_service.collect_current(frequency=frequency)
+                            await self.crypto_spot_service.collect_current(
+                                frequency=frequency, asset_symbols=configured_assets
+                            )
                     except Exception:
                         logger.warning("crypto current spot loop error", exc_info=True)
             await asyncio.sleep(interval)
@@ -1623,19 +1630,41 @@ class DaemonService:
                     continue
 
                 try:
-                    await self.crypto_history_service.collect_settled(frequency=frequency, asset_symbols=[asset])
-                    await self.crypto_history_service.bootstrap(frequency=frequency, asset_symbols=[asset])
-                    if self.crypto_spot_service is not None:
-                        try:
-                            await self.crypto_spot_service.collect_current(frequency=frequency, asset_symbols=[asset])
-                        except Exception:
+                    preflight: dict[str, Any] | None = None
+                    if self.settings.crypto_training_preflight_enabled and self.crypto_training_backfill_service is not None:
+                        preflight = await self.crypto_training_backfill_service.prepare(
+                            frequency=frequency,
+                            asset_symbols=[asset],
+                            run_source_backfill=True,
+                        )
+                        if preflight.get("status") != "ok":
+                            freq_decisions[asset] = "skipped_preflight_blocked"
                             logger.warning(
-                                "crypto_model_nightly spot collect failed asset=%s freq=%s",
+                                "crypto_model_nightly preflight blocked asset=%s freq=%s blockers=%s",
                                 asset,
                                 frequency,
-                                exc_info=True,
+                                preflight.get("blockers"),
                             )
-                    await self.crypto_forecast_service.train(frequency=frequency, asset_symbols=[asset])
+                            continue
+                    else:
+                        await self.crypto_history_service.collect_settled(frequency=frequency, asset_symbols=[asset])
+                        await self.crypto_history_service.bootstrap(frequency=frequency, asset_symbols=[asset])
+                        if self.crypto_spot_service is not None:
+                            try:
+                                await self.crypto_spot_service.collect_current(frequency=frequency, asset_symbols=[asset])
+                            except Exception:
+                                logger.warning(
+                                    "crypto_model_nightly spot collect failed asset=%s freq=%s",
+                                    asset,
+                                    frequency,
+                                    exc_info=True,
+                                )
+                    await self.crypto_forecast_service.train(
+                        frequency=frequency,
+                        asset_symbols=[asset],
+                        use_feature_store=bool(preflight),
+                        feature_store_only=bool(preflight),
+                    )
                     await self.crypto_replay_service.run(frequency=frequency, asset_symbols=[asset])
                     await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=[asset])
                     freq_decisions[asset] = "refreshed"

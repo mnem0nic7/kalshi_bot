@@ -728,10 +728,31 @@ async def _run_crypto_spot_command(args: argparse.Namespace, container: AppConta
 
 async def _run_crypto_model_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.crypto_model_command == "train":
+        preflight = None
+        if container.settings.crypto_training_preflight_enabled and not getattr(args, "skip_preflight", False):
+            preflight = await container.crypto_training_backfill_service.prepare(
+                frequency=args.frequency,
+                asset_symbols=getattr(args, "assets", None),
+                run_source_backfill=True,
+            )
+            if preflight.get("status") != "ok":
+                result = {
+                    "status": "preflight_blocked",
+                    "kalshi_env": container.settings.kalshi_env,
+                    "frequency": args.frequency,
+                    "asset_symbols": getattr(args, "assets", None),
+                    "preflight": preflight,
+                }
+                print(json.dumps(result, indent=2, default=str))
+                return 1
         result = await container.crypto_forecast_service.train(
             frequency=args.frequency,
             asset_symbols=getattr(args, "assets", None),
+            use_feature_store=bool(preflight) or getattr(args, "feature_store_only", False),
+            feature_store_only=bool(preflight) or getattr(args, "feature_store_only", False),
         )
+        if preflight is not None:
+            result["preflight"] = preflight
     elif args.crypto_model_command == "candidates":
         result = await container.crypto_forecast_service.candidates(
             frequency=args.frequency,
@@ -1128,6 +1149,12 @@ def _crypto_live_path_step_summary(result: dict[str, Any]) -> dict[str, Any]:
         "issues",
         "asset_counts",
         "metrics",
+        "materialized",
+        "blockers",
+        "rows_materialized",
+        "strict_trade_eligible_rows",
+        "spot_coverage_pct",
+        "decision_outcome_count",
     )
     summary = {key: result[key] for key in keys if key in result}
     if "metrics" in summary and isinstance(summary["metrics"], dict):
@@ -1757,12 +1784,41 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
                 error = {"asset": asset, "step": "spot_current", "error": str(exc), "iteration": iteration}
                 result["errors"].append(error)
                 operation_errors.append(error)
+            preflight_ok = True
             try:
-                train = await container.crypto_forecast_service.train(
+                preflight = await container.crypto_training_backfill_service.prepare(
                     frequency=frequency,
                     asset_symbols=[asset],
+                    run_source_backfill=False,
                 )
-                result["steps"]["model_train"] = _crypto_live_path_step_summary(train)
+                result["steps"]["training_preflight"] = _crypto_live_path_step_summary(preflight)
+                preflight_ok = preflight.get("status") == "ok"
+                if not preflight_ok:
+                    error = {
+                        "asset": asset,
+                        "step": "training_preflight",
+                        "error": "blocked",
+                        "blockers": preflight.get("blockers") or [],
+                        "iteration": iteration,
+                    }
+                    result["errors"].append(error)
+                    operation_errors.append(error)
+            except Exception as exc:  # pragma: no cover
+                preflight_ok = False
+                error = {"asset": asset, "step": "training_preflight", "error": str(exc), "iteration": iteration}
+                result["errors"].append(error)
+                operation_errors.append(error)
+            try:
+                if preflight_ok:
+                    train = await container.crypto_forecast_service.train(
+                        frequency=frequency,
+                        asset_symbols=[asset],
+                        use_feature_store=True,
+                        feature_store_only=True,
+                    )
+                    result["steps"]["model_train"] = _crypto_live_path_step_summary(train)
+                else:
+                    result["steps"]["model_train"] = {"status": "skipped", "reason": "training_preflight_blocked"}
             except Exception as exc:  # pragma: no cover
                 error = {"asset": asset, "step": "model_train", "error": str(exc), "iteration": iteration}
                 result["errors"].append(error)
@@ -4328,6 +4384,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_model_train)
     crypto_model_train.add_argument("--frequency", default="15m")
     crypto_model_train.add_argument("--assets", nargs="*", default=None)
+    crypto_model_train.add_argument("--skip-preflight", action="store_true")
+    crypto_model_train.add_argument("--feature-store-only", action="store_true")
     crypto_model_candidates = crypto_model_subparsers.add_parser("candidates")
     add_kalshi_env_argument(crypto_model_candidates)
     crypto_model_candidates.add_argument("--frequency", default="15m")
