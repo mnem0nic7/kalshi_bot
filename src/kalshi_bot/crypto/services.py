@@ -2227,6 +2227,7 @@ class CryptoTrainingBackfillService:
                 asset_symbols=requested_assets or None,
                 since=since,
                 limit=self.settings.crypto_train_max_candlesticks,
+                defer_payload=True,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
@@ -3130,6 +3131,7 @@ class CryptoReplayService:
                 asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=500_000,
+                defer_payload=True,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
