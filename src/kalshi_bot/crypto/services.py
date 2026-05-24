@@ -2115,7 +2115,11 @@ class CryptoTrainingBackfillService:
                     lambda: self.spot_service.collect_current(frequency=freq, asset_symbols=assets or None),
                 )
 
-        materialized = await self.materialize(frequency=freq, asset_symbols=assets or None)
+        materialized = await self.materialize(
+            frequency=freq,
+            asset_symbols=assets or None,
+            materialize_microstructure=run_source_backfill,
+        )
         blockers = list(materialized.get("blockers") or [])
         blockers.extend(f"backfill_{error['step']}_failed" for error in errors)
         status = "ok" if not blockers else "blocked"
@@ -2164,12 +2168,17 @@ class CryptoTrainingBackfillService:
         *,
         frequency: str = "15m",
         asset_symbols: list[str] | None = None,
+        materialize_microstructure: bool = True,
     ) -> dict[str, Any]:
         for attempt, delay in enumerate((0.0, *CRYPTO_TRAINING_DB_RETRY_DELAYS_SECONDS), start=1):
             if delay > 0:
                 await asyncio.sleep(delay)
             try:
-                return await self._materialize_once(frequency=frequency, asset_symbols=asset_symbols)
+                return await self._materialize_once(
+                    frequency=frequency,
+                    asset_symbols=asset_symbols,
+                    materialize_microstructure=materialize_microstructure,
+                )
             except Exception as exc:
                 if attempt > len(CRYPTO_TRAINING_DB_RETRY_DELAYS_SECONDS) or not _is_crypto_db_disconnect(exc):
                     raise
@@ -2187,6 +2196,7 @@ class CryptoTrainingBackfillService:
         *,
         frequency: str = "15m",
         asset_symbols: list[str] | None = None,
+        materialize_microstructure: bool = True,
     ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
@@ -2240,7 +2250,8 @@ class CryptoTrainingBackfillService:
             candles = _filter_crypto_snapshot_rows(candles, requested_assets)
             spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
             decision_rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
-            await self._materialize_spot_microstructure(repo, spot_rows, frequency=freq)
+            if materialize_microstructure:
+                await self._materialize_spot_microstructure(repo, spot_rows, frequency=freq)
             benchmark_count = await self._materialize_settlement_windows(
                 repo,
                 snapshots=snapshots,
@@ -2305,6 +2316,7 @@ class CryptoTrainingBackfillService:
                     "strict_trade_eligible_rows": strict_rows,
                     "spot_coverage_pct": spot_coverage,
                     "benchmark_window_count": benchmark_count,
+                    "microstructure_materialized": materialize_microstructure,
                     "blockers": blockers,
                 },
                 payload={
@@ -2313,6 +2325,7 @@ class CryptoTrainingBackfillService:
                     "candlestick_count": len(candles),
                     "spot_row_count": len(spot_rows),
                     "asset_symbols": requested_assets,
+                    "microstructure_materialized": materialize_microstructure,
                 },
             )
             await session.commit()
@@ -2325,6 +2338,7 @@ class CryptoTrainingBackfillService:
             "spot_coverage_pct": spot_coverage,
             "decision_outcome_count": outcome_count,
             "benchmark_window_count": benchmark_count,
+            "microstructure_materialized": materialize_microstructure,
             "blockers": blockers,
         }
 

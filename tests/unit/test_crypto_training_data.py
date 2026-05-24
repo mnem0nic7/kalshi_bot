@@ -228,6 +228,7 @@ async def test_training_preflight_materializes_feature_rows_before_feature_store
 
     assert materialized["status"] == "ok"
     assert materialized["materialized"]["rows_materialized"] >= 2
+    assert materialized["materialized"]["microstructure_materialized"] is False
 
     result = await CryptoForecastService(settings=settings, session_factory=session_factory).train(
         frequency="15m",
@@ -270,6 +271,47 @@ class _RetryRepo:
 
     async def upsert_crypto_trade_tick(self, **_values) -> None:
         raise AssertionError("no trade ticks expected")
+
+
+@pytest.mark.asyncio
+async def test_training_preflight_skips_microstructure_when_source_backfill_is_skipped(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/preflight-skip.db",
+        kalshi_env="production",
+    )
+    service = CryptoTrainingBackfillService(
+        settings=settings,
+        session_factory=object(),
+        history_service=object(),
+        spot_service=None,
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_materialize(
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+        materialize_microstructure: bool = True,
+    ) -> dict[str, object]:
+        captured["frequency"] = frequency
+        captured["asset_symbols"] = asset_symbols
+        captured["materialize_microstructure"] = materialize_microstructure
+        return {"status": "ok", "blockers": []}
+
+    service.materialize = fake_materialize  # type: ignore[method-assign]
+
+    result = await service.prepare(
+        frequency="1h",
+        asset_symbols=["BTC"],
+        run_source_backfill=False,
+    )
+
+    assert result["status"] == "ok"
+    assert captured == {
+        "frequency": "1h",
+        "asset_symbols": ["BTC"],
+        "materialize_microstructure": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -326,12 +368,22 @@ async def test_materialize_retries_transient_database_restart(monkeypatch) -> No
     calls = 0
     sleeps: list[float] = []
 
-    async def flaky_materialize_once(*, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, object]:
+    async def flaky_materialize_once(
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+        materialize_microstructure: bool = True,
+    ) -> dict[str, object]:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise ConnectionRefusedError("Connect call failed ('172.18.0.4', 5432)")
-        return {"status": "ok", "frequency": frequency, "asset_symbols": asset_symbols}
+        return {
+            "status": "ok",
+            "frequency": frequency,
+            "asset_symbols": asset_symbols,
+            "materialize_microstructure": materialize_microstructure,
+        }
 
     async def capture_sleep(delay: float) -> None:
         sleeps.append(delay)
@@ -341,6 +393,11 @@ async def test_materialize_retries_transient_database_restart(monkeypatch) -> No
 
     result = await service.materialize(frequency="1h", asset_symbols=["BTC"])
 
-    assert result == {"status": "ok", "frequency": "1h", "asset_symbols": ["BTC"]}
+    assert result == {
+        "status": "ok",
+        "frequency": "1h",
+        "asset_symbols": ["BTC"],
+        "materialize_microstructure": True,
+    }
     assert calls == 2
     assert sleeps == [2.0]
