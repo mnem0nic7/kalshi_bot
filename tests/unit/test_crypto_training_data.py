@@ -229,6 +229,7 @@ async def test_training_preflight_materializes_feature_rows_before_feature_store
     assert materialized["status"] == "ok"
     assert materialized["materialized"]["rows_materialized"] >= 2
     assert materialized["materialized"]["microstructure_materialized"] is False
+    assert materialized["materialized"]["settlement_windows_materialized"] is False
 
     result = await CryptoForecastService(settings=settings, session_factory=session_factory).train(
         frequency="15m",
@@ -292,10 +293,12 @@ async def test_training_preflight_skips_microstructure_when_source_backfill_is_s
         frequency: str = "15m",
         asset_symbols: list[str] | None = None,
         materialize_microstructure: bool = True,
+        materialize_settlement_windows: bool = True,
     ) -> dict[str, object]:
         captured["frequency"] = frequency
         captured["asset_symbols"] = asset_symbols
         captured["materialize_microstructure"] = materialize_microstructure
+        captured["materialize_settlement_windows"] = materialize_settlement_windows
         return {"status": "ok", "blockers": []}
 
     service.materialize = fake_materialize  # type: ignore[method-assign]
@@ -311,6 +314,7 @@ async def test_training_preflight_skips_microstructure_when_source_backfill_is_s
         "frequency": "1h",
         "asset_symbols": ["BTC"],
         "materialize_microstructure": False,
+        "materialize_settlement_windows": False,
     }
 
 
@@ -373,6 +377,7 @@ async def test_materialize_retries_transient_database_restart(monkeypatch) -> No
         frequency: str = "15m",
         asset_symbols: list[str] | None = None,
         materialize_microstructure: bool = True,
+        materialize_settlement_windows: bool = True,
     ) -> dict[str, object]:
         nonlocal calls
         calls += 1
@@ -383,6 +388,7 @@ async def test_materialize_retries_transient_database_restart(monkeypatch) -> No
             "frequency": frequency,
             "asset_symbols": asset_symbols,
             "materialize_microstructure": materialize_microstructure,
+            "materialize_settlement_windows": materialize_settlement_windows,
         }
 
     async def capture_sleep(delay: float) -> None:
@@ -398,6 +404,7 @@ async def test_materialize_retries_transient_database_restart(monkeypatch) -> No
         "frequency": "1h",
         "asset_symbols": ["BTC"],
         "materialize_microstructure": True,
+        "materialize_settlement_windows": True,
     }
     assert calls == 2
     assert sleeps == [2.0]

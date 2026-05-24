@@ -2119,6 +2119,7 @@ class CryptoTrainingBackfillService:
             frequency=freq,
             asset_symbols=assets or None,
             materialize_microstructure=run_source_backfill,
+            materialize_settlement_windows=run_source_backfill,
         )
         blockers = list(materialized.get("blockers") or [])
         blockers.extend(f"backfill_{error['step']}_failed" for error in errors)
@@ -2169,6 +2170,7 @@ class CryptoTrainingBackfillService:
         frequency: str = "15m",
         asset_symbols: list[str] | None = None,
         materialize_microstructure: bool = True,
+        materialize_settlement_windows: bool = True,
     ) -> dict[str, Any]:
         for attempt, delay in enumerate((0.0, *CRYPTO_TRAINING_DB_RETRY_DELAYS_SECONDS), start=1):
             if delay > 0:
@@ -2178,6 +2180,7 @@ class CryptoTrainingBackfillService:
                     frequency=frequency,
                     asset_symbols=asset_symbols,
                     materialize_microstructure=materialize_microstructure,
+                    materialize_settlement_windows=materialize_settlement_windows,
                 )
             except Exception as exc:
                 if attempt > len(CRYPTO_TRAINING_DB_RETRY_DELAYS_SECONDS) or not _is_crypto_db_disconnect(exc):
@@ -2197,6 +2200,7 @@ class CryptoTrainingBackfillService:
         frequency: str = "15m",
         asset_symbols: list[str] | None = None,
         materialize_microstructure: bool = True,
+        materialize_settlement_windows: bool = True,
     ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
@@ -2252,12 +2256,14 @@ class CryptoTrainingBackfillService:
             decision_rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
             if materialize_microstructure:
                 await self._materialize_spot_microstructure(repo, spot_rows, frequency=freq)
-            benchmark_count = await self._materialize_settlement_windows(
-                repo,
-                snapshots=snapshots,
-                spot_rows=spot_rows,
-                frequency=freq,
-            )
+            benchmark_count = 0
+            if materialize_settlement_windows:
+                benchmark_count = await self._materialize_settlement_windows(
+                    repo,
+                    snapshots=snapshots,
+                    spot_rows=spot_rows,
+                    frequency=freq,
+                )
             for row in decision_rows:
                 payload = _crypto_training_json_ready(row)
                 feature_hash = _crypto_training_build_id(payload)
@@ -2317,6 +2323,7 @@ class CryptoTrainingBackfillService:
                     "spot_coverage_pct": spot_coverage,
                     "benchmark_window_count": benchmark_count,
                     "microstructure_materialized": materialize_microstructure,
+                    "settlement_windows_materialized": materialize_settlement_windows,
                     "blockers": blockers,
                 },
                 payload={
@@ -2326,6 +2333,7 @@ class CryptoTrainingBackfillService:
                     "spot_row_count": len(spot_rows),
                     "asset_symbols": requested_assets,
                     "microstructure_materialized": materialize_microstructure,
+                    "settlement_windows_materialized": materialize_settlement_windows,
                 },
             )
             await session.commit()
@@ -2339,6 +2347,7 @@ class CryptoTrainingBackfillService:
             "decision_outcome_count": outcome_count,
             "benchmark_window_count": benchmark_count,
             "microstructure_materialized": materialize_microstructure,
+            "settlement_windows_materialized": materialize_settlement_windows,
             "blockers": blockers,
         }
 
