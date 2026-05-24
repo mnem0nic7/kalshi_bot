@@ -620,7 +620,12 @@ class DaemonService:
             await asyncio.sleep(5)
 
     async def _select_stream_markets(self, markets: list[str] | None) -> list[str]:
-        selected_markets = list(dict.fromkeys(markets or await self.discovery_service.list_stream_markets()))
+        if markets is not None:
+            selected_markets = list(dict.fromkeys(markets))
+        elif self._weather_market_updates_enabled():
+            selected_markets = list(dict.fromkeys(await self.discovery_service.list_stream_markets()))
+        else:
+            selected_markets = []
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             positions = await repo.list_positions(
@@ -640,9 +645,25 @@ class DaemonService:
             return
         if not await self._is_active_color():
             return
+        if self._is_weather_market(market_ticker) and not self._weather_market_updates_enabled():
+            return
         await self.research_coordinator.handle_market_update(market_ticker)
         if self._auto_trigger_enabled_for_run:
             await self.auto_trigger_service.handle_market_update(market_ticker)
+
+    @staticmethod
+    def _is_weather_market(market_ticker: str) -> bool:
+        return str(market_ticker or "").upper().startswith("KXHIGH")
+
+    def _weather_market_updates_enabled(self) -> bool:
+        return bool(
+            getattr(self, "_auto_trigger_enabled_for_run", False)
+            or self.settings.weather_prediction_enabled
+            or self.settings.weather_residual_model_enabled
+            or self.settings.weather_intraday_model_enabled
+            or self.settings.weather_research_refresh_interval_seconds > 0
+            or self.settings.weather_rejected_opportunity_scorer_enabled
+        )
 
     async def _is_active_color(self) -> bool:
         cache_ttl = max(0.0, float(self.settings.daemon_active_color_cache_seconds))

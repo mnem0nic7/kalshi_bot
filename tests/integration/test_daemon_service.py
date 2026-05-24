@@ -87,6 +87,15 @@ class FakeDiscoveryService:
         return ["WX-DISCOVERED"]
 
 
+class CountingDiscoveryService:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def list_stream_markets(self) -> list[str]:
+        self.calls += 1
+        return ["WX-DISCOVERED"]
+
+
 class BlockingDiscoveryService:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -325,6 +334,89 @@ class BlockingShadowCampaignService:
         self.started.set()
         await self.release.wait()
         return {"status": "completed", "reason": request.reason}
+
+
+@pytest.mark.asyncio
+async def test_weather_market_update_is_ignored_when_weather_runtime_disabled(tmp_path) -> None:
+    research = FakeResearchCoordinator()
+    auto_trigger = FakeAutoTriggerService()
+    daemon = object.__new__(DaemonService)
+    daemon.settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-weather-disabled.db",
+        weather_prediction_enabled=False,
+        weather_residual_model_enabled=False,
+        weather_intraday_model_enabled=False,
+        weather_research_refresh_interval_seconds=0,
+        weather_rejected_opportunity_scorer_enabled=False,
+    )
+    daemon.research_coordinator = research
+    daemon.auto_trigger_service = auto_trigger
+    daemon._auto_trigger_enabled_for_run = False
+    daemon._market_update_dispatch_due = lambda market_ticker: True  # type: ignore[method-assign]
+
+    async def active_color() -> bool:
+        return True
+
+    daemon._is_active_color = active_color  # type: ignore[method-assign]
+
+    await daemon._handle_market_update("KXHIGHNY-26MAY24-T80")
+
+    assert research.market_updates == []
+    assert auto_trigger.market_updates == []
+
+
+@pytest.mark.asyncio
+async def test_non_weather_market_update_still_dispatches_when_weather_runtime_disabled(tmp_path) -> None:
+    research = FakeResearchCoordinator()
+    auto_trigger = FakeAutoTriggerService()
+    daemon = object.__new__(DaemonService)
+    daemon.settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-non-weather.db",
+        weather_prediction_enabled=False,
+        weather_residual_model_enabled=False,
+        weather_intraday_model_enabled=False,
+        weather_research_refresh_interval_seconds=0,
+        weather_rejected_opportunity_scorer_enabled=False,
+    )
+    daemon.research_coordinator = research
+    daemon.auto_trigger_service = auto_trigger
+    daemon._auto_trigger_enabled_for_run = False
+    daemon._market_update_dispatch_due = lambda market_ticker: True  # type: ignore[method-assign]
+
+    async def active_color() -> bool:
+        return True
+
+    daemon._is_active_color = active_color  # type: ignore[method-assign]
+
+    await daemon._handle_market_update("KXBTC-26MAY24-B100000")
+
+    assert research.market_updates == ["KXBTC-26MAY24-B100000"]
+    assert auto_trigger.market_updates == []
+
+
+@pytest.mark.asyncio
+async def test_stream_market_discovery_is_skipped_when_weather_runtime_disabled(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-discovery-disabled.db",
+        weather_prediction_enabled=False,
+        weather_residual_model_enabled=False,
+        weather_intraday_model_enabled=False,
+        weather_research_refresh_interval_seconds=0,
+        weather_rejected_opportunity_scorer_enabled=False,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    discovery = CountingDiscoveryService()
+    daemon = object.__new__(DaemonService)
+    daemon.settings = settings
+    daemon.session_factory = session_factory
+    daemon.discovery_service = discovery
+
+    selected = await daemon._select_stream_markets(None)
+
+    assert selected == []
+    assert discovery.calls == 0
 
 
 @pytest.mark.asyncio
