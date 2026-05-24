@@ -1824,8 +1824,10 @@ def _crypto_nightly_settings(tmp_path, *, db_name: str, assets: str = "BTC,ETH")
         crypto_model_nightly_timezone="UTC",
         crypto_model_nightly_hour_local=3,
         crypto_model_nightly_min_new_strict_rows=60,
-        crypto_model_nightly_max_age_hours=24,
+        crypto_model_nightly_max_age_hours=336,
         crypto_model_nightly_assets=assets,
+        crypto_auto_frequencies="15m",
+        crypto_entry_policy_optimizer_auto_enabled=False,
     )
 
 
@@ -1947,7 +1949,7 @@ async def test_daemon_crypto_model_nightly_does_not_retry_data_starved_assets(tm
                 metrics={},
                 payload={},
                 kalshi_env="demo",
-                trained_at=now - timedelta(hours=48),  # well past max_age, but no data
+                trained_at=now - timedelta(days=15),  # well past max_age, but no data
             )
         await session.commit()
 
@@ -1978,7 +1980,7 @@ async def test_daemon_crypto_model_nightly_aged_out_triggers_refresh(tmp_path) -
     await init_models(engine)
 
     now = datetime(2026, 5, 17, 4, 0, tzinfo=UTC)
-    stale_trained_at = now - timedelta(hours=30)
+    stale_trained_at = now - timedelta(days=15)
 
     async with session_factory() as session:
         repo = PlatformRepository(session, kalshi_env="demo")
@@ -1986,7 +1988,7 @@ async def test_daemon_crypto_model_nightly_aged_out_triggers_refresh(tmp_path) -
             frequency="15m",
             artifact_type="model:BTC",
             version="v1",
-            status="ready",
+            status="trained",
             sample_count=1000,
             metrics={},
             payload={},

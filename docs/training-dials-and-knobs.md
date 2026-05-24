@@ -678,7 +678,7 @@ The daemon runs a nightly per-asset model+backtest+gate refresh at a configured 
 | `CRYPTO_MODEL_NIGHTLY_TIMEZONE` | `America/Los_Angeles` | IANA timezone for local-date and hour checks. |
 | `CRYPTO_MODEL_NIGHTLY_HOUR_LOCAL` | `3` | Local clock hour (0–23) at which the job becomes eligible. |
 | `CRYPTO_MODEL_NIGHTLY_MIN_NEW_STRICT_ROWS` | `60` | Minimum strict-trade-eligible rows in the last 24 h to trigger a refresh. |
-| `CRYPTO_MODEL_NIGHTLY_MAX_AGE_HOURS` | `24` | Force-refresh if the model's `trained_at` is older than this. |
+| `CRYPTO_MODEL_NIGHTLY_MAX_AGE_HOURS` | `336` | Force-refresh if the model's `trained_at` is older than two weeks. |
 | `CRYPTO_MODEL_NIGHTLY_ASSETS` | `BTC,ETH,SOL,XRP,BNB,DOGE,HYPE` | Comma-separated ordered list of assets to evaluate. |
 
 ## Strategy C and Other Strategy Knobs

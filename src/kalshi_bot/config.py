@@ -346,7 +346,7 @@ class Settings(BaseSettings):
     crypto_model_nightly_timezone: str = "America/Los_Angeles"
     crypto_model_nightly_hour_local: int = 3
     crypto_model_nightly_min_new_strict_rows: int = 60
-    crypto_model_nightly_max_age_hours: int = 24
+    crypto_model_nightly_max_age_hours: int = 336
     crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE"
     # Upper bound on the per-frequency status() precondition the nightly runs
     # before deciding what to refresh. status() is an analytics-grade scan of the

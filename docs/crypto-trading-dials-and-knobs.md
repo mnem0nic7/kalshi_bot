@@ -634,7 +634,7 @@ global gate reflects all updated per-asset backtest slices.
 | `CRYPTO_MODEL_NIGHTLY_TIMEZONE` | `crypto_model_nightly_timezone` | `America/Los_Angeles` | IANA timezone for local-date and hour checks. |
 | `CRYPTO_MODEL_NIGHTLY_HOUR_LOCAL` | `crypto_model_nightly_hour_local` | `3` | Local clock hour (0–23) at which the job becomes eligible. Runs once per date per env+color. |
 | `CRYPTO_MODEL_NIGHTLY_MIN_NEW_STRICT_ROWS` | `crypto_model_nightly_min_new_strict_rows` | `60` | Minimum strict-trade-eligible rows in the last 24 h to trigger a refresh. Matches `CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET`. |
-| `CRYPTO_MODEL_NIGHTLY_MAX_AGE_HOURS` | `crypto_model_nightly_max_age_hours` | `24` | Force-refresh if the model's `trained_at` is older than this, even if there is no new data. |
+| `CRYPTO_MODEL_NIGHTLY_MAX_AGE_HOURS` | `crypto_model_nightly_max_age_hours` | `336` | Force-refresh if the model's `trained_at` is older than two weeks, even if there is no new data. |
 | `CRYPTO_MODEL_NIGHTLY_ASSETS` | `crypto_model_nightly_assets` | `BTC,ETH,SOL,XRP,BNB,DOGE,HYPE` | Comma-separated ordered list of assets to evaluate. Per-asset decisions are logged and written to the checkpoint payload. |
 
 **Checkpoint and observability:**

@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from kalshi_bot.services.daemon import DaemonService
 
 NOW = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
-MAX_AGE = timedelta(hours=24)
+MAX_AGE = timedelta(days=14)
 MIN_NEW = 60
 
 
@@ -35,8 +35,12 @@ def test_trained_and_fresh_is_skipped():
     assert reason(artifact_status="trained", trained_at=NOW - timedelta(hours=2), new_rows=5) is None
 
 
+def test_trained_inside_two_week_window_is_skipped():
+    assert reason(artifact_status="trained", trained_at=NOW - timedelta(days=13, hours=23), new_rows=5) is None
+
+
 def test_trained_but_aged_out_refreshes():
-    assert reason(artifact_status="trained", trained_at=NOW - timedelta(hours=48)) == "aged_out"
+    assert reason(artifact_status="trained", trained_at=NOW - timedelta(days=15)) == "aged_out"
 
 
 def test_trained_with_new_data_refreshes():
@@ -45,7 +49,7 @@ def test_trained_with_new_data_refreshes():
 
 def test_naive_trained_at_is_treated_as_utc():
     # tz-naive trained_at must not crash and should still detect age
-    assert reason(artifact_status="trained", trained_at=datetime(2026, 5, 18, 12, 0)) == "aged_out"
+    assert reason(artifact_status="trained", trained_at=datetime(2026, 5, 5, 12, 0)) == "aged_out"
 
 
 def test_data_starved_stays_dormant_even_when_aged():
