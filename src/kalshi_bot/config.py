@@ -297,6 +297,7 @@ class Settings(BaseSettings):
     crypto_empirical_late_override_negative_pnl_enabled: bool = False
 
     crypto_take_profit_enabled: bool = True
+    crypto_take_profit_frequencies: str = "15m,1h"
     crypto_take_profit_threshold_pct: float = 0.20
     crypto_take_profit_threshold_pct_by_asset: dict[str, float] = Field(default_factory=dict)
     crypto_take_profit_check_interval_seconds: int = 30

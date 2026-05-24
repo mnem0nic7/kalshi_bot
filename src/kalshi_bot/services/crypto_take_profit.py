@@ -24,6 +24,42 @@ from kalshi_bot.services.position_governance import (
 logger = logging.getLogger(__name__)
 
 
+def _crypto_market_identity(market_ticker: str) -> tuple[str | None, str | None]:
+    match = re.match(r"^KX([A-Z]+)(15M|1H)", str(market_ticker or "").upper())
+    if match is None:
+        return None, None
+    frequency = "15m" if match.group(2) == "15M" else "1h"
+    return match.group(1), frequency
+
+
+def _crypto_take_profit_frequencies(raw: str | None) -> set[str]:
+    aliases = {
+        "15": "15m",
+        "15m": "15m",
+        "15min": "15m",
+        "15minute": "15m",
+        "15minutes": "15m",
+        "1": "1h",
+        "1h": "1h",
+        "1hr": "1h",
+        "1hour": "1h",
+        "1hours": "1h",
+        "hour": "1h",
+        "hourly": "1h",
+    }
+    values: set[str] = set()
+    for item in str(raw or "").replace(";", ",").split(","):
+        normalized = item.strip().lower().replace("_", "").replace("-", "")
+        if not normalized:
+            continue
+        if normalized in {"all", "*"}:
+            return {"15m", "1h"}
+        value = aliases.get(normalized)
+        if value is not None:
+            values.add(value)
+    return values or {"15m", "1h"}
+
+
 def _crypto_mid(snapshot: CryptoMarketSnapshotRecord, side: str) -> Decimal | None:
     yes_bid = snapshot.yes_bid_dollars
     yes_ask = snapshot.yes_ask_dollars
@@ -82,10 +118,12 @@ class CryptoTakeProfitService:
         stale_cutoff = timedelta(seconds=self.settings.crypto_take_profit_stale_snapshot_seconds)
         global_threshold = self.settings.crypto_take_profit_threshold_pct
         by_asset = self.settings.crypto_take_profit_threshold_pct_by_asset
+        enabled_frequencies = _crypto_take_profit_frequencies(self.settings.crypto_take_profit_frequencies)
 
         for position in positions:
-            m = re.match(r"^KX([A-Z]+)(?:15M|1H)", position.market_ticker)
-            asset = m.group(1) if m else None
+            asset, frequency = _crypto_market_identity(position.market_ticker)
+            if frequency not in enabled_frequencies:
+                continue
             threshold = by_asset.get(asset, global_threshold) if asset else global_threshold
             result = await self._evaluate(position, now, stale_cutoff, threshold)
             if result is not None:

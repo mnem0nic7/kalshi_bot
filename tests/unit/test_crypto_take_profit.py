@@ -7,8 +7,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from kalshi_bot.services.crypto_take_profit import (
+    _crypto_market_identity,
     _crypto_mid,
     _crypto_sell_price,
+    _crypto_take_profit_frequencies,
     _profit_ratio,
 )
 
@@ -29,6 +31,19 @@ def _position(avg: str, count: str = "100.00") -> MagicMock:
 
 
 # --- _crypto_mid ---
+
+
+def test_crypto_market_identity_detects_1h_frequency():
+    assert _crypto_market_identity("KXBTC1H-26MAY24-B123456-T123456") == ("BTC", "1h")
+
+
+def test_crypto_market_identity_detects_15m_frequency():
+    assert _crypto_market_identity("KXHYPE15M-26MAY24-B123456-T123456") == ("HYPE", "15m")
+
+
+def test_take_profit_frequencies_accepts_hour_aliases():
+    assert _crypto_take_profit_frequencies("1hour") == {"1h"}
+    assert _crypto_take_profit_frequencies("15m,1h") == {"15m", "1h"}
 
 def test_mid_yes_side():
     snap = _snapshot("0.58", "0.62")
