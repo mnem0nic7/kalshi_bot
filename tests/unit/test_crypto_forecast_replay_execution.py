@@ -38,6 +38,7 @@ from kalshi_bot.crypto.services import (
     _crypto_decision_rows,
     _crypto_bucket_key,
     _crypto_bucket_matrix,
+    _crypto_empirical_bucket_gate_for_candidate,
     _evaluate_crypto_walk_forward,
     _crypto_feature_schema,
     _crypto_dynamic_order_count_fp,
@@ -51,6 +52,7 @@ from kalshi_bot.crypto.services import (
     _crypto_raw_feature_vector,
     _crypto_select_champion,
     _crypto_signal_payload_with_current_quote_metrics,
+    _crypto_time_to_close_bucket,
     _crypto_trade_candidates,
     _fit_crypto_calibration,
     _predict_crypto_probability,
@@ -210,6 +212,65 @@ def test_crypto_asset_control_blocks_disabled_hourly_frequency(tmp_path) -> None
     )
 
     assert "1-hour crypto is disabled." in blockers
+
+
+def test_crypto_time_to_close_bucket_is_frequency_aware() -> None:
+    assert _crypto_time_to_close_bucket(2700, "1h") == "30_45m"
+    assert _crypto_time_to_close_bucket(3300, "1h") == "45_60m"
+    assert _crypto_time_to_close_bucket(901, "15m") == "15m_plus"
+
+
+def test_crypto_empirical_bucket_gate_uses_broad_fallback_for_sparse_hourly_bucket(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_empirical_bucket_gate_assets="BTC",
+        crypto_empirical_bucket_min_samples=2,
+        crypto_empirical_bucket_min_win_rate=0.50,
+    )
+    trades = [
+        {
+            **_replay_row(
+                market_day=f"2026-05-0{idx + 1}",
+                frequency="1h",
+                time_to_close_seconds=seconds,
+                label_yes=1,
+                mid_yes_dollars=Decimal("0.5000"),
+                spread_bps=200,
+            ),
+            "simulation": {
+                "side": "yes",
+                "execution_price_dollars": Decimal("0.5000"),
+                "net_pnl": Decimal("0.5000"),
+                "gross_pnl": Decimal("0.5000"),
+                "fees": Decimal("0.0000"),
+            },
+        }
+        for idx, seconds in enumerate((600, 1200))
+    ]
+    matrix = _crypto_bucket_matrix(trades, settings=settings)
+    candidate = _replay_row(
+        frequency="1h",
+        time_to_close_seconds=2700,
+        mid_yes_dollars=Decimal("0.5000"),
+        spread_bps=200,
+    )
+    bucket_key = _crypto_bucket_key(
+        candidate,
+        {"side": "yes", "execution_price_dollars": Decimal("0.5000")},
+    )
+
+    gate = _crypto_empirical_bucket_gate_for_candidate(
+        candidate,
+        bucket_key=bucket_key,
+        settings=settings,
+        crypto_policy=None,
+        bucket_matrix=matrix,
+        enforce=True,
+    )
+
+    assert gate["allowed"] is True
+    assert gate["reason"] == "empirical_bucket_fallback_allowed"
+    assert gate["matched_bucket_scope"] == "asset_side_price_spread_any_time"
 
 
 def test_crypto_dynamic_sizing_live_quality_yes_uses_position_budget(tmp_path) -> None:
@@ -2473,11 +2534,12 @@ def test_crypto_entry_optimizer_stages_only_passing_policy(tmp_path) -> None:
         _replay_row(
             market_day=f"2026-05-0{day}",
             market_ticker=f"KXBTC15M-OPT-{day}",
-            mid_yes_dollars=Decimal("0.5000"),
+            mid_yes_dollars=Decimal("0.5800"),
             yes_bid_dollars=Decimal("0.4900"),
             yes_ask_dollars=Decimal("0.5000"),
             no_ask_dollars=Decimal("0.5100"),
             spread_bps=100,
+            time_to_close_seconds=600,
             label_yes=1,
         )
         for day in range(1, 5)
@@ -2486,7 +2548,7 @@ def test_crypto_entry_optimizer_stages_only_passing_policy(tmp_path) -> None:
     result = _crypto_optimize_asset_entry_policy("BTC", rows, settings=settings, crypto_policy=policy)
 
     assert result["status"] == "stageable"
-    assert result["winner"]["entry_policy"]["min_fee_adjusted_edge_bps"] in {750, 1000, 1500, 2500, 5000}
+    assert result["winner"]["entry_policy"]["min_fee_adjusted_edge_bps"] in {300, 500, 750, 1000, 1500, 2500}
     assert result["staged_override_payload"]["crypto_policy"]["asset_entry_overrides"]["BTC"]
 
 

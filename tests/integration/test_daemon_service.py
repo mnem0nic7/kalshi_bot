@@ -1753,10 +1753,9 @@ async def test_daemon_crypto_model_nightly_refreshes_missing_assets(tmp_path) ->
     daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc, spot_svc=spot_svc)
     daemon._utc_now = lambda: now  # type: ignore[method-assign]
 
-    payload = await daemon.heartbeat_once()
+    result = await daemon._maybe_run_crypto_model_nightly_if_active()
 
-    assert "crypto_model_nightly" in payload
-    result = payload["crypto_model_nightly"]
+    assert result is not None
     assert result["refreshed_count"] == 2
     assert result["asset_decisions"] == {"15m": {"BTC": "refreshed", "ETH": "refreshed"}}
     assert len(history_svc.collect_settled_calls) == 2
@@ -1776,9 +1775,9 @@ async def test_daemon_crypto_model_nightly_refreshes_missing_assets(tmp_path) ->
     assert checkpoint.payload["ran_at"] is not None
     assert checkpoint.payload["refreshed_count"] == 2
 
-    # Second heartbeat is idempotent
-    second_payload = await daemon.heartbeat_once()
-    assert "crypto_model_nightly" not in second_payload
+    # Second nightly check is idempotent.
+    second_result = await daemon._maybe_run_crypto_model_nightly_if_active()
+    assert second_result is None
     assert len(forecast_svc.train_calls) == 2
 
     await engine.dispose()
@@ -1821,9 +1820,8 @@ async def test_daemon_crypto_model_nightly_skips_fresh_assets(tmp_path) -> None:
     daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc)
     daemon._utc_now = lambda: now  # type: ignore[method-assign]
 
-    payload = await daemon.heartbeat_once()
-
-    result = payload["crypto_model_nightly"]
+    result = await daemon._maybe_run_crypto_model_nightly_if_active()
+    assert result is not None
     assert result["refreshed_count"] == 0
     assert result["asset_decisions"] == {"15m": {"BTC": "skipped_fresh", "ETH": "skipped_fresh"}}
     assert len(forecast_svc.train_calls) == 0
@@ -1870,9 +1868,8 @@ async def test_daemon_crypto_model_nightly_does_not_retry_data_starved_assets(tm
     daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc)
     daemon._utc_now = lambda: now  # type: ignore[method-assign]
 
-    payload = await daemon.heartbeat_once()
-
-    result = payload["crypto_model_nightly"]
+    result = await daemon._maybe_run_crypto_model_nightly_if_active()
+    assert result is not None
     # BTC dormant despite being "aged out" — no new data; ETH refreshed on new data.
     assert result["asset_decisions"] == {"15m": {"BTC": "skipped_fresh", "ETH": "refreshed"}}
     assert result["refreshed_count"] == 1
@@ -1913,9 +1910,9 @@ async def test_daemon_crypto_model_nightly_aged_out_triggers_refresh(tmp_path) -
     daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc)
     daemon._utc_now = lambda: now  # type: ignore[method-assign]
 
-    payload = await daemon.heartbeat_once()
-
-    assert payload["crypto_model_nightly"]["asset_decisions"] == {"15m": {"BTC": "refreshed"}}
+    result = await daemon._maybe_run_crypto_model_nightly_if_active()
+    assert result is not None
+    assert result["asset_decisions"] == {"15m": {"BTC": "refreshed"}}
     assert len(forecast_svc.train_calls) == 1
 
     await engine.dispose()
@@ -1937,9 +1934,8 @@ async def test_daemon_crypto_model_nightly_error_isolation(tmp_path) -> None:
     daemon = _make_crypto_nightly_daemon(settings, session_factory, history_svc=history_svc, forecast_svc=forecast_svc, replay_svc=replay_svc)
     daemon._utc_now = lambda: now  # type: ignore[method-assign]
 
-    payload = await daemon.heartbeat_once()
-
-    result = payload["crypto_model_nightly"]
+    result = await daemon._maybe_run_crypto_model_nightly_if_active()
+    assert result is not None
     assert result["asset_decisions"]["15m"]["BTC"] == "error"
     assert result["asset_decisions"]["15m"]["ETH"] == "refreshed"
     assert result["refreshed_count"] == 1

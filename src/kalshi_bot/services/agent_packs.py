@@ -74,7 +74,7 @@ class RuntimeCryptoPolicy:
     asset_modes: dict[str, str]
     asset_entry_overrides: dict[str, dict[str, Any]]
 
-    def entry_for_asset(self, asset_symbol: str | None) -> dict[str, Any]:
+    def entry_for_asset(self, asset_symbol: str | None, *, frequency: str | None = None) -> dict[str, Any]:
         symbol = _normalize_crypto_asset_symbol(asset_symbol or "")
         base = {
             "min_fee_adjusted_edge_bps": self.min_fee_adjusted_edge_bps,
@@ -85,8 +85,11 @@ class RuntimeCryptoPolicy:
             "max_credible_edge_bps": self.max_credible_edge_bps,
             "target_position_pct": self.target_position_pct,
         }
-        override = self.asset_entry_overrides.get(symbol) or {}
-        return {**base, **{key: value for key, value in override.items() if value is not None}}
+        merged = dict(base)
+        for key in (symbol, _crypto_entry_override_key(symbol, frequency)):
+            override = self.asset_entry_overrides.get(key) or {}
+            merged.update({name: value for name, value in override.items() if value is not None})
+        return merged
 
 
 class AgentPackService:
@@ -471,7 +474,7 @@ class AgentPackService:
                 "target_position_pct": raw_entry.target_position_pct,
             }
             if override["min_contract_price_dollars"] is not None:
-                override["min_contract_price_dollars"] = self._contract_price_floor(
+                override["min_contract_price_dollars"] = self._crypto_contract_price_floor(
                     override["min_contract_price_dollars"]
                 )
             if override["min_fee_adjusted_edge_bps"] is not None:
@@ -486,7 +489,7 @@ class AgentPackService:
                     max(float(override["target_position_pct"]), 0.0),
                     max_target_position_pct,
                 )
-            overrides[_normalize_crypto_asset_symbol(raw_symbol)] = override
+            overrides[_normalize_crypto_entry_override_key(raw_symbol)] = override
 
         return RuntimeCryptoPolicy(
             min_fee_adjusted_edge_bps=max(
@@ -568,8 +571,14 @@ class AgentPackService:
             asset_entry_overrides=overrides,
         )
 
-    def runtime_crypto_thresholds(self, policy: RuntimeCryptoPolicy, *, asset_symbol: str | None = None) -> RuntimeThresholds:
-        entry = policy.entry_for_asset(asset_symbol)
+    def runtime_crypto_thresholds(
+        self,
+        policy: RuntimeCryptoPolicy,
+        *,
+        asset_symbol: str | None = None,
+        frequency: str | None = None,
+    ) -> RuntimeThresholds:
+        entry = policy.entry_for_asset(asset_symbol, frequency=frequency)
         return RuntimeThresholds(
             risk_min_edge_bps=int(entry["min_fee_adjusted_edge_bps"]),
             risk_max_credible_edge_bps=int(entry["max_credible_edge_bps"]),
@@ -645,7 +654,10 @@ class AgentPackService:
             },
         )
         crypto_policy.asset_entry_overrides = {
-            _normalize_crypto_asset_symbol(symbol): self._sanitize_crypto_entry(entry)
+            _normalize_crypto_entry_override_key(symbol): self._sanitize_crypto_entry(
+                entry,
+                contract_price_floor=self.settings.crypto_min_contract_price_floor_dollars,
+            )
             for symbol, entry in (crypto_policy.asset_entry_overrides or {}).items()
         }
         weather_policy.policies = self._sanitize_weather_policies(weather_policy.policies)
@@ -682,15 +694,25 @@ class AgentPackService:
             return None
         return max(low, min(high, float(value)))
 
-    def _sanitize_crypto_entry(self, entry: AgentPackCryptoEntryPolicy) -> AgentPackCryptoEntryPolicy:
+    def _sanitize_crypto_entry(
+        self,
+        entry: AgentPackCryptoEntryPolicy,
+        *,
+        contract_price_floor: float | None = None,
+    ) -> AgentPackCryptoEntryPolicy:
         max_target_position_pct = min(max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0), 0.15)
+        min_contract_price = (
+            float(self.settings.risk_min_contract_price_dollars)
+            if contract_price_floor is None
+            else max(0.01, float(contract_price_floor))
+        )
         return AgentPackCryptoEntryPolicy(
             min_fee_adjusted_edge_bps=self._clamp_int(entry.min_fee_adjusted_edge_bps, 250, 5000),
             max_spread_bps=self._clamp_crypto_spread_bps(entry.max_spread_bps),
             min_confidence=self._clamp_float(entry.min_confidence, 0.50, 0.99),
             min_contract_price_dollars=self._clamp_float(
                 entry.min_contract_price_dollars,
-                self.settings.risk_min_contract_price_dollars,
+                min_contract_price,
                 0.99,
             ),
             min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
@@ -708,6 +730,12 @@ class AgentPackService:
         if value is None:
             return float(self.settings.risk_min_contract_price_dollars)
         return max(float(value), float(self.settings.risk_min_contract_price_dollars))
+
+    def _crypto_contract_price_floor(self, value: Any) -> float:
+        floor = max(0.01, float(self.settings.crypto_min_contract_price_floor_dollars))
+        if value is None:
+            return floor
+        return max(float(value), floor)
 
     def _floor_runtime_thresholds(self, thresholds: RuntimeThresholds) -> RuntimeThresholds:
         return replace(
@@ -843,6 +871,30 @@ class AgentPackService:
 def _normalize_crypto_asset_symbol(asset_symbol: str) -> str:
     normalized = "".join(ch for ch in str(asset_symbol or "").strip().upper() if ch.isalnum())
     return normalized or "UNKNOWN"
+
+
+def _normalize_crypto_frequency(frequency: Any) -> str | None:
+    normalized = str(frequency or "").strip().lower().replace("_", "").replace("-", "")
+    if normalized in {"15", "15m", "15min", "15mins", "15minute", "15minutes"}:
+        return "15m"
+    if normalized in {"1h", "60m", "60min", "60mins", "1hr", "1hour", "hour", "hourly"}:
+        return "1h"
+    return normalized or None
+
+
+def _crypto_entry_override_key(asset_symbol: str | None, frequency: str | None) -> str:
+    symbol = _normalize_crypto_asset_symbol(asset_symbol or "")
+    normalized_frequency = _normalize_crypto_frequency(frequency)
+    return f"{symbol}:{normalized_frequency}" if normalized_frequency else symbol
+
+
+def _normalize_crypto_entry_override_key(raw_key: Any) -> str:
+    value = str(raw_key or "").strip()
+    for separator in (":", "|", "/", "__"):
+        if separator in value:
+            asset, frequency = value.split(separator, 1)
+            return _crypto_entry_override_key(asset, frequency)
+    return _normalize_crypto_asset_symbol(value)
 
 
 def _normalize_crypto_asset_mode(mode: Any) -> str:

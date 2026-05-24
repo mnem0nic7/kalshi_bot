@@ -21,6 +21,7 @@ from kalshi_bot.crypto.services import (
     CryptoReplayService,
     CryptoSpotService,
     CryptoTrainingBackfillService,
+    crypto_entry_override_key,
     crypto_pnl_sizing_target_pct,
     enabled_crypto_frequencies,
 )
@@ -133,6 +134,7 @@ class DaemonService:
         self.crypto_take_profit_service = crypto_take_profit_service
         self._auto_trigger_enabled_for_run = settings.trigger_enable_auto_rooms
         self._heartbeat_follow_up_task: asyncio.Task[None] | None = None
+        self._crypto_model_nightly_lock = asyncio.Lock()
         self._active_color_cache: tuple[float, bool] | None = None
         self._last_market_update_dispatched_at: dict[str, float] = {}
         self._threaded_liveness_stop: threading.Event | None = None
@@ -385,6 +387,10 @@ class DaemonService:
                 "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
                 "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
             }
+            if self.settings.crypto_model_nightly_auto_enabled:
+                periodic_tasks["crypto_model_nightly"] = asyncio.create_task(
+                    self._periodic_crypto_model_nightly_loop()
+                )
             if self.settings.weather_research_refresh_interval_seconds > 0:
                 periodic_tasks["weather_research_refresh"] = asyncio.create_task(
                     self._periodic_weather_research_refresh_loop()
@@ -674,7 +680,8 @@ class DaemonService:
     async def _periodic_heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.daemon_heartbeat_interval_seconds)
-            await self.heartbeat_once(run_follow_up=False)
+            payload = await self.heartbeat_once(run_follow_up=False)
+            self._schedule_heartbeat_follow_up(payload)
 
     async def _periodic_stop_loss_loop(self) -> None:
         while True:
@@ -966,9 +973,6 @@ class DaemonService:
             momentum_calibration_nightly = await self._maybe_run_momentum_calibration_nightly()
             if momentum_calibration_nightly is not None:
                 payload["momentum_calibration_nightly"] = momentum_calibration_nightly
-            crypto_model_nightly = await self._maybe_run_crypto_model_nightly()
-            if crypto_model_nightly is not None:
-                payload["crypto_model_nightly"] = crypto_model_nightly
             historical_pipeline = await self._maybe_run_historical_pipeline()
             if historical_pipeline is not None:
                 payload["historical_pipeline"] = historical_pipeline
@@ -1022,6 +1026,28 @@ class DaemonService:
         if task is None:
             return
         await asyncio.gather(task, return_exceptions=True)
+
+    async def _periodic_crypto_model_nightly_loop(self) -> None:
+        interval = max(300, int(self.settings.daemon_heartbeat_interval_seconds))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._maybe_run_crypto_model_nightly_if_active()
+            except Exception:
+                logger.warning("crypto_model_nightly loop error", exc_info=True)
+
+    async def _maybe_run_crypto_model_nightly_if_active(self) -> dict[str, Any] | None:
+        if not self.settings.crypto_model_nightly_auto_enabled:
+            return None
+        if not await self._is_active_color():
+            return None
+        result = await self._maybe_run_crypto_model_nightly()
+        if result is not None:
+            logger.info(
+                "crypto_model_nightly completed refreshed_count=%s",
+                result.get("refreshed_count"),
+            )
+        return result
 
     async def _maybe_run_settlement_follow_up(self) -> dict[str, Any] | None:
         if self.training_corpus_service is None:
@@ -1485,6 +1511,8 @@ class DaemonService:
     async def _maybe_run_crypto_model_nightly(self) -> dict[str, Any] | None:
         if not self.settings.crypto_model_nightly_auto_enabled:
             return None
+        if self._crypto_model_nightly_lock.locked():
+            return None
         if (
             self.crypto_history_service is None
             or self.crypto_forecast_service is None
@@ -1492,30 +1520,36 @@ class DaemonService:
         ):
             return None
 
-        night_state = self._crypto_model_nightly_state()
-        if not night_state["due"]:
-            return None
+        async with self._crypto_model_nightly_lock:
+            night_state = self._crypto_model_nightly_state()
+            if not night_state["due"]:
+                return None
 
-        checkpoint_name = f"daemon_crypto_model_nightly:{self.settings.kalshi_env}:{self.settings.app_color}"
-        async with self.session_factory() as session:
-            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
-            checkpoint = await repo.get_checkpoint(checkpoint_name)
-            await session.commit()
-        if checkpoint is not None and isinstance(checkpoint.payload, dict):
-            if checkpoint.payload.get("ran_at"):
-                try:
-                    ran_at = datetime.fromisoformat(checkpoint.payload["ran_at"])
-                    local_ran = ran_at.astimezone(ZoneInfo(self.settings.crypto_model_nightly_timezone))
-                    if local_ran.date().isoformat() == night_state["local_date"]:
-                        return None
-                except (ValueError, TypeError):
-                    pass
+            checkpoint_name = f"daemon_crypto_model_nightly:{self.settings.kalshi_env}:{self.settings.app_color}"
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                checkpoint = await repo.get_checkpoint(checkpoint_name)
+                await session.commit()
+            if checkpoint is not None and isinstance(checkpoint.payload, dict):
+                if checkpoint.payload.get("ran_at"):
+                    try:
+                        ran_at = datetime.fromisoformat(checkpoint.payload["ran_at"])
+                        local_ran = ran_at.astimezone(ZoneInfo(self.settings.crypto_model_nightly_timezone))
+                        if local_ran.date().isoformat() == night_state["local_date"]:
+                            return None
+                    except (ValueError, TypeError):
+                        pass
 
-        try:
-            return await self._run_crypto_model_nightly_for_env(checkpoint_name)
-        except Exception:
-            logger.warning("crypto_model nightly run error", exc_info=True)
-            return None
+            try:
+                logger.info(
+                    "crypto_model_nightly starting local_date=%s target_local=%s",
+                    night_state["local_date"],
+                    night_state["target_local"].isoformat(),
+                )
+                return await self._run_crypto_model_nightly_for_env(checkpoint_name)
+            except Exception:
+                logger.warning("crypto_model nightly run error", exc_info=True)
+                return None
 
     def _crypto_model_nightly_state(self) -> dict[str, Any]:
         now = self._utc_now()
@@ -1733,6 +1767,23 @@ class DaemonService:
 
         service = AgentPackService(self.settings)
         per_asset: dict[str, Any] = {}
+        optimizer_result: dict[str, Any] | None = None
+        optimizer_error: str | None = None
+        optimizer_by_asset: dict[str, dict[str, Any]] = {}
+        if self.settings.crypto_entry_policy_optimizer_auto_enabled and self.crypto_replay_service is not None:
+            try:
+                optimizer_result = await self.crypto_replay_service.optimize_entry_policy(
+                    frequency=frequency,
+                    days=self.settings.crypto_entry_policy_optimizer_days,
+                    asset_symbols=assets,
+                )
+                for report in optimizer_result.get("asset_reports") or []:
+                    if isinstance(report, dict) and report.get("asset"):
+                        optimizer_by_asset[str(report["asset"]).upper()] = report
+            except Exception as exc:
+                optimizer_error = str(exc)
+                logger.warning("crypto_model_nightly entry policy optimizer error freq=%s", frequency, exc_info=True)
+
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
@@ -1750,6 +1801,7 @@ class DaemonService:
                 },
             )
             overrides = dict(pack.crypto_policy.asset_entry_overrides or {})
+            planned_updates: dict[str, dict[str, Any]] = {}
 
             for raw_asset in assets:
                 asset = raw_asset.strip().upper()
@@ -1762,21 +1814,81 @@ class DaemonService:
                 )
                 gate_metrics = dict(getattr(gate, "metrics", None) or {}) if gate is not None else {}
                 sizing = crypto_pnl_sizing_target_pct(gate_metrics, settings=self.settings)
-                target_pct = float(sizing["target_position_pct"])
-                max_spread_bps = int(sizing["max_spread_bps"])
-                existing_override = overrides.get(asset) or AgentPackCryptoEntryPolicy()
-                overrides[asset] = existing_override.model_copy(
-                    update={
-                        "target_position_pct": target_pct,
-                        "max_spread_bps": max_spread_bps,
-                    }
-                )
-                per_asset[asset] = {
-                    "target_position_pct": target_pct,
-                    "max_spread_bps": max_spread_bps,
+                optimizer_report = optimizer_by_asset.get(asset) or {}
+                winner = optimizer_report.get("winner") if isinstance(optimizer_report.get("winner"), dict) else None
+                winner_entry = dict(winner.get("entry_policy") or {}) if winner else {}
+                winner_metrics = dict(winner.get("metrics") or {}) if winner else {}
+                planned_updates[asset] = {
+                    "override_key": crypto_entry_override_key(asset, frequency),
+                    "raw_target_position_pct": float(sizing["target_position_pct"]),
+                    "sizing_max_spread_bps": int(sizing["max_spread_bps"]),
+                    "optimizer_entry_policy": winner_entry,
                     "gate_status": getattr(gate, "status", "missing") if gate is not None else "missing",
                     "gate_version": getattr(gate, "version", None),
-                    **sizing["diagnostics"],
+                    "sizing_diagnostics": sizing["diagnostics"],
+                    "optimizer": {
+                        "status": optimizer_report.get("status", "not_run") if optimizer_report else "not_run",
+                        "evaluated_policy_count": optimizer_report.get("evaluated_policy_count"),
+                        "oos_fold_count": optimizer_report.get("oos_fold_count"),
+                        "strict_trade_eligible_count": optimizer_report.get("strict_trade_eligible_count"),
+                        "spot_feature_coverage_pct": optimizer_report.get("spot_feature_coverage_pct"),
+                        "blockers": list(optimizer_report.get("blockers") or []),
+                        "winner_entry_policy": winner_entry or None,
+                        "winner_metrics": {
+                            "selected_count": winner_metrics.get("selected_count"),
+                            "net_pnl": winner_metrics.get("net_pnl"),
+                            "pnl_advantage_vs_market_mid": winner_metrics.get("pnl_advantage_vs_market_mid"),
+                            "hard_cap_breaches": winner_metrics.get("hard_cap_breaches"),
+                        }
+                        if winner_metrics
+                        else None,
+                    },
+                }
+
+            portfolio_cap = min(max(float(self.settings.crypto_portfolio_max_allocation_pct), 0.0), 1.0)
+            raw_total_target_pct = sum(float(item["raw_target_position_pct"]) for item in planned_updates.values())
+            allocation_scale = (
+                min(1.0, portfolio_cap / raw_total_target_pct)
+                if raw_total_target_pct > 0
+                else 1.0
+            )
+
+            for asset, plan in planned_updates.items():
+                override_key = str(plan["override_key"])
+                optimizer_entry = dict(plan.get("optimizer_entry_policy") or {})
+                target_pct = min(
+                    max(float(plan["raw_target_position_pct"]) * allocation_scale, 0.0),
+                    min(float(self.settings.crypto_dynamic_order_max_position_pct), 0.15),
+                )
+                entry_update: dict[str, Any] = {
+                    "target_position_pct": target_pct,
+                    "max_spread_bps": int(optimizer_entry.get("max_spread_bps") or plan["sizing_max_spread_bps"]),
+                }
+                for key in (
+                    "min_fee_adjusted_edge_bps",
+                    "min_confidence",
+                    "min_contract_price_dollars",
+                    "min_remaining_payout_bps",
+                    "max_credible_edge_bps",
+                ):
+                    if optimizer_entry.get(key) is not None:
+                        entry_update[key] = optimizer_entry[key]
+                existing_override = (
+                    overrides.get(override_key)
+                    or overrides.get(asset)
+                    or AgentPackCryptoEntryPolicy()
+                )
+                overrides[override_key] = existing_override.model_copy(update=entry_update)
+                per_asset[asset] = {
+                    "override_key": override_key,
+                    "target_position_pct": target_pct,
+                    "raw_target_position_pct": plan["raw_target_position_pct"],
+                    "allocation_scale": allocation_scale,
+                    "max_spread_bps": entry_update["max_spread_bps"],
+                    "gate_status": plan["gate_status"],
+                    "gate_version": plan["gate_version"],
+                    **dict(plan["sizing_diagnostics"]),
+                    "optimizer": plan["optimizer"],
                 }
 
             pack.crypto_policy.asset_entry_overrides = overrides
@@ -1787,11 +1899,24 @@ class DaemonService:
                     "frequency": frequency,
                     "evaluated_at": evaluated_at.isoformat(),
                     "assets": per_asset,
-                    "max_allocation_pct": min(max(float(self.settings.crypto_portfolio_max_allocation_pct), 0.0), 1.0),
+                    "max_allocation_pct": portfolio_cap,
+                    "raw_total_target_pct": raw_total_target_pct,
+                    "allocation_scale": allocation_scale,
                     "max_market_target_pct": min(
                         max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0),
                         0.15,
                     ),
+                    "entry_policy_optimizer": {
+                        "enabled": bool(self.settings.crypto_entry_policy_optimizer_auto_enabled),
+                        "status": (
+                            "error"
+                            if optimizer_error
+                            else (optimizer_result or {}).get("status", "not_run")
+                        ),
+                        "days": self.settings.crypto_entry_policy_optimizer_days,
+                        "error": optimizer_error,
+                        "stageable_assets": list((optimizer_result or {}).get("stageable_assets") or []),
+                    },
                 },
             }
             await repo.update_agent_pack(pack)

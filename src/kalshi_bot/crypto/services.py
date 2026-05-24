@@ -114,9 +114,9 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
 CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
 CRYPTO_CROSS_ASSET_FEATURE_ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE")
 CRYPTO_ENTRY_OPTIMIZER_GRID = {
-    "min_fee_adjusted_edge_bps": (750, 1000, 1500, 2500, 5000),
-    "max_spread_bps": (100, 150, 250, 400, 600, 1000, 1500),
-    "min_contract_price_dollars": (0.50, 0.60, 0.70),
+    "min_fee_adjusted_edge_bps": (300, 500, 750, 1000, 1500, 2500),
+    "max_spread_bps": (100, 500, 750, 1000, 1250, 1500),
+    "min_contract_price_dollars": (0.35, 0.40, 0.45, 0.50),
     "min_remaining_payout_bps": (0,),
 }
 CRYPTO_MICROSTRUCTURE_UPSERT_COMMIT_INTERVAL = 250
@@ -181,6 +181,12 @@ def normalize_asset_mode(mode: str) -> str:
 
 def normalize_asset_symbols(asset_symbols: list[str] | None) -> list[str]:
     return sorted({normalize_asset_symbol(symbol) for symbol in (asset_symbols or []) if str(symbol or "").strip()})
+
+
+def crypto_entry_override_key(asset_symbol: str, frequency: str | None = None) -> str:
+    asset = normalize_asset_symbol(asset_symbol)
+    normalized_frequency = normalize_frequency(frequency) if frequency else None
+    return f"{asset}:{normalized_frequency}" if normalized_frequency else asset
 
 
 def crypto_strategy_code_for_frequency(frequency: object) -> str:
@@ -2877,7 +2883,7 @@ class CryptoForecastService:
             last_minute_passive_price_matrix=last_minute_passive_price_matrix,
             enforce_empirical_bucket_gate=True,
         )
-        entry_policy = crypto_policy.entry_for_asset(market.asset_symbol)
+        entry_policy = crypto_policy.entry_for_asset(market.asset_symbol, frequency=market.frequency)
         runtime_trading_enabled = self.settings.crypto_trading_enabled or crypto_policy.trading_enabled
         trade_fair = _decimal(trace.get("fair_yes_dollars") or fair)
         confidence = min(0.95, max(float(entry_policy["min_confidence"]), 0.80 + abs(edge_bps) / 20000))
@@ -2989,7 +2995,11 @@ class CryptoForecastService:
                     "reason": trace.get("selection_reason") or ("crypto_live_trading_disabled" if not runtime_trading_enabled else None),
                     "backtest_version": backtest.version if backtest is not None else None,
                     "replay_gate_status": gate.status if gate is not None else "missing",
-                    "runtime_crypto_policy": _runtime_crypto_policy_payload(crypto_policy, asset_symbol=market.asset_symbol),
+                    "runtime_crypto_policy": _runtime_crypto_policy_payload(
+                        crypto_policy,
+                        asset_symbol=market.asset_symbol,
+                        frequency=market.frequency,
+                    ),
                 },
             },
             capital_bucket="safe",
@@ -3181,13 +3191,14 @@ class CryptoReplayService:
                 asset_rows,
                 settings=self.settings,
                 crypto_policy=crypto_policy,
+                frequency=freq,
             )
             asset_reports.append(report)
             winner = report.get("winner")
             if report.get("status") == "stageable" and isinstance(winner, dict):
                 entry = winner.get("entry_policy")
                 if isinstance(entry, dict):
-                    staged_overrides[asset] = entry
+                    staged_overrides[crypto_entry_override_key(asset, freq)] = entry
         return {
             "schema_version": "crypto-entry-policy-optimizer-v1",
             "status": "ok",
@@ -3633,7 +3644,7 @@ class CryptoReplayService:
             "data_quality": data_quality,
             "spot_quality": spot_quality,
             "model": _artifact_summary(model),
-            "runtime_crypto_policy": _runtime_crypto_policy_payload(crypto_policy),
+            "runtime_crypto_policy": _runtime_crypto_policy_payload(crypto_policy, frequency=freq),
             "walk_forward": backtest,
             "metrics": metrics,
             "promotion_gate": gate,
@@ -3771,6 +3782,7 @@ class CryptoExecutionService:
                     "runtime_crypto_policy": _runtime_crypto_policy_payload(
                         crypto_policy,
                         asset_symbol=market.asset_symbol,
+                        frequency=market.frequency,
                     )
                     if crypto_policy is not None
                     else None,
@@ -3832,7 +3844,12 @@ class CryptoExecutionService:
                     client_order_id=f"{client_order_id}:maker",
                     fair_yes_dollars=fair_yes_dollars,
                     min_edge_bps=(
-                        int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+                        int(
+                            crypto_policy.entry_for_asset(
+                                market.asset_symbol,
+                                frequency=market.frequency,
+                            )["min_fee_adjusted_edge_bps"]
+                        )
                         if crypto_policy is not None
                         else None
                     ),
@@ -3891,7 +3908,12 @@ class CryptoExecutionService:
             client_order_id=f"{client_order_id}:taker",
             fair_yes_dollars=fair_yes_dollars,
             min_edge_bps=(
-                int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+                int(
+                    crypto_policy.entry_for_asset(
+                        market.asset_symbol,
+                        frequency=market.frequency,
+                    )["min_fee_adjusted_edge_bps"]
+                )
                 if crypto_policy is not None
                 else None
             ),
@@ -3908,7 +3930,12 @@ class CryptoExecutionService:
             return False
         seconds_to_close = (market.close_time - datetime.now(UTC)).total_seconds()
         min_edge_bps = (
-            int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+            int(
+                crypto_policy.entry_for_asset(
+                    market.asset_symbol,
+                    frequency=market.frequency,
+                )["min_fee_adjusted_edge_bps"]
+            )
             if crypto_policy is not None
             else self.settings.risk_min_edge_bps
         )
@@ -4057,9 +4084,21 @@ class CryptoWorkflowService:
                             "runtime_crypto_policy": _runtime_crypto_policy_payload(
                                 crypto_policy,
                                 asset_symbol=market.asset_symbol,
+                                frequency=market.frequency,
                             ),
                         },
                     },
+                )
+                await repo.upsert_crypto_decision_outcome(
+                    **_crypto_decision_outcome_values_from_signal(
+                        settings=self.settings,
+                        room=room,
+                        market=market,
+                        signal=signal,
+                        signal_record=signal_record,
+                        market_artifact_id=market_artifact.id,
+                        strategy_code=strategy_code,
+                    )
                 )
                 await repo.append_message(
                     room.id,
@@ -4124,6 +4163,7 @@ class CryptoWorkflowService:
                     context=risk_context,
                     crypto_policy=crypto_policy,
                     asset_symbol=market.asset_symbol,
+                    frequency=market.frequency,
                 )
                 ticket = base_ticket.model_copy(update={"count_fp": count_fp})
                 client_order_id = make_client_order_id(room.id, market.market_ticker, ticket.nonce)
@@ -4166,6 +4206,7 @@ class CryptoWorkflowService:
                     thresholds=self.agent_pack_service.runtime_crypto_thresholds(
                         crypto_policy,
                         asset_symbol=market.asset_symbol,
+                        frequency=market.frequency,
                     ),
                 )
                 await repo.save_risk_verdict(
@@ -4932,9 +4973,10 @@ def _runtime_crypto_policy_payload(
     crypto_policy: RuntimeCryptoPolicy,
     *,
     asset_symbol: str | None = None,
+    frequency: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "entry": crypto_policy.entry_for_asset(asset_symbol),
+        "entry": crypto_policy.entry_for_asset(asset_symbol, frequency=frequency),
         "replay": {
             "min_resolved_markets": crypto_policy.replay_min_resolved_markets,
             "min_trade_candidates": crypto_policy.replay_min_trade_candidates,
@@ -5522,6 +5564,134 @@ def _signal_is_tradeable(signal: StrategySignal) -> bool:
     )
 
 
+def _crypto_selected_candidate_from_trace(trace: dict[str, Any]) -> dict[str, Any]:
+    candidates = [candidate for candidate in trace.get("candidates") or [] if isinstance(candidate, dict)]
+    selection = trace.get("trade_selection_model") if isinstance(trace.get("trade_selection_model"), dict) else {}
+    selected_side = str(
+        trace.get("selected_side")
+        or selection.get("selected_side")
+        or selection.get("side")
+        or ""
+    ).lower()
+    if selected_side:
+        for candidate in candidates:
+            if str(candidate.get("side") or "").lower() == selected_side:
+                return candidate
+    return candidates[0] if candidates else {}
+
+
+def _crypto_model_version_from_trace(trace: dict[str, Any]) -> str | None:
+    prediction_model = trace.get("prediction_model") if isinstance(trace.get("prediction_model"), dict) else {}
+    trade_selection_model = (
+        trace.get("trade_selection_model")
+        if isinstance(trace.get("trade_selection_model"), dict)
+        else {}
+    )
+    for source in (trace, prediction_model, trade_selection_model):
+        for key in ("model_version", "version", "calibration_version"):
+            value = source.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return None
+
+
+def _crypto_decision_outcome_values_from_signal(
+    *,
+    settings: Settings,
+    room: Room,
+    market: CryptoMarket,
+    signal: StrategySignal,
+    signal_record: Signal,
+    market_artifact_id: str | None = None,
+    strategy_code: str | None = None,
+) -> dict[str, Any]:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    selection = trace.get("trade_selection_model") if isinstance(trace.get("trade_selection_model"), dict) else {}
+    selected_candidate = _crypto_selected_candidate_from_trace(trace)
+    decision_time = signal_record.created_at or datetime.now(UTC)
+    selected_side = (
+        signal.recommended_side.value
+        if signal.recommended_side is not None
+        else str(
+            trace.get("selected_side")
+            or selection.get("selected_side")
+            or selection.get("side")
+            or selected_candidate.get("side")
+            or ""
+        )
+        or None
+    )
+    selected_price = (
+        signal.target_yes_price_dollars
+        or _optional_decimal(selection.get("selected_price_dollars"))
+        or _optional_decimal(selection.get("target_yes_price_dollars"))
+        or _optional_decimal(selected_candidate.get("execution_price_dollars"))
+        or _optional_decimal(selected_candidate.get("target_yes_price_dollars"))
+    )
+    eligibility_payload = signal.eligibility.model_dump(mode="json") if signal.eligibility is not None else None
+    eligible = bool(signal.eligibility is not None and signal.eligibility.eligible)
+    input_payload = {
+        "room_id": room.id,
+        "signal_id": signal_record.id,
+        "market_ticker": market.market_ticker,
+        "decision_time": decision_time.isoformat(),
+        "strategy_code": strategy_code,
+        "recommended_action": signal.recommended_action.value if signal.recommended_action else None,
+        "recommended_side": signal.recommended_side.value if signal.recommended_side else None,
+        "target_yes_price_dollars": _money_text(signal.target_yes_price_dollars),
+    }
+    blocker_reason = (
+        signal.stand_down_reason.value
+        if signal.stand_down_reason is not None
+        else trace.get("selection_reason")
+        or selection.get("reason")
+        or selected_candidate.get("reason")
+        or trace.get("outcome")
+    )
+    return {
+        "kalshi_env": settings.kalshi_env,
+        "frequency": normalize_frequency(market.frequency) or market.frequency,
+        "market_ticker": market.market_ticker,
+        "asset_symbol": normalize_asset_symbol(market.asset_symbol),
+        "decision_time": decision_time,
+        "decision_kind": "live_signal",
+        "input_hash": _crypto_training_build_id(input_payload),
+        "trace_hash": _crypto_training_build_id(trace) if trace else None,
+        "model_version": _crypto_model_version_from_trace(trace),
+        "prediction_yes": _optional_decimal(trace.get("fair_yes_dollars") or trace.get("raw_fair_yes_dollars"))
+        or signal.fair_yes_dollars,
+        "selected_side": selected_side,
+        "selected_price_dollars": selected_price,
+        "selected_count_fp": None,
+        "gate_status": "eligible" if eligible else "blocked",
+        "settlement_result": getattr(market, "settlement_result", None),
+        "simulated_pnl_dollars": _optional_decimal(selection.get("net_pnl") or selected_candidate.get("net_pnl")),
+        "realized_pnl_dollars": None,
+        "fill_count": 0,
+        "source_snapshot_ids": {
+            "signal_id": signal_record.id,
+            "market_artifact_id": market_artifact_id,
+        },
+        "payload": _crypto_training_json_ready(
+            {
+                "schema_version": "crypto-live-signal-decision-outcome-v1",
+                "room_id": room.id,
+                "signal_id": signal_record.id,
+                "market_artifact_id": market_artifact_id,
+                "strategy_code": strategy_code,
+                "entry_funnel_stage": "signal_saved",
+                "entry_funnel_blocked": not _signal_is_tradeable(signal),
+                "blocker_reason": blocker_reason,
+                "evaluation_outcome": signal.evaluation_outcome,
+                "stand_down_reason": signal.stand_down_reason.value if signal.stand_down_reason else None,
+                "eligibility": eligibility_payload,
+                "signal_payload": signal_record.payload or {},
+                "candidate_trace": trace,
+            }
+        ),
+    }
+
+
 def _crypto_signal_candidate_status(signal: StrategySignal) -> str | None:
     trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
     selection = trace.get("trade_selection_model") if isinstance(trace.get("trade_selection_model"), dict) else {}
@@ -5620,6 +5790,7 @@ def _crypto_dynamic_order_count_fp(
     context: RiskContext,
     crypto_policy: RuntimeCryptoPolicy | None = None,
     asset_symbol: str | None = None,
+    frequency: str | None = None,
 ) -> tuple[Decimal, dict[str, Any]]:
     configured_default_count = quantize_count(Decimal(str(settings.crypto_default_order_count_fp)))
     candidate_status = _crypto_signal_candidate_status(signal)
@@ -5635,7 +5806,7 @@ def _crypto_dynamic_order_count_fp(
         default_cap_candidates.append(late_override_cap)
     default_count = min(default_cap_candidates)
     requested_count = default_count
-    policy_entry = crypto_policy.entry_for_asset(asset_symbol) if crypto_policy is not None else {}
+    policy_entry = crypto_policy.entry_for_asset(asset_symbol, frequency=frequency) if crypto_policy is not None else {}
     target_pct_source = "agent_pack" if policy_entry.get("target_position_pct") is not None else "settings"
     target_pct = Decimal(str(policy_entry.get("target_position_pct") or settings.crypto_dynamic_order_target_position_pct))
     hard_max_pct = Decimal("0.15")
@@ -7186,7 +7357,7 @@ def _crypto_raw_feature_vector(
     default_values = _crypto_default_values_for_asset(asset, defaults or {})
     recent_yes = row.get("asset_recent_yes_rate")
     recent_error = row.get("asset_recent_mid_error")
-    time_to_close_bucket = _crypto_time_to_close_bucket(time_to_close)
+    time_to_close_bucket = _crypto_time_to_close_bucket(time_to_close, row.get("frequency"))
     settlement_ts = row.get("settlement_ts")
     if isinstance(settlement_ts, datetime):
         _close_hour = _as_utc_datetime(settlement_ts).hour
@@ -7256,7 +7427,19 @@ def _crypto_raw_feature_vector(
     return values
 
 
-def _crypto_time_to_close_bucket(seconds: float) -> str:
+def _crypto_time_to_close_bucket(seconds: float, frequency: str | None = None) -> str:
+    if normalize_frequency(frequency) == "1h":
+        if seconds <= 300:
+            return "0_5m"
+        if seconds <= 900:
+            return "5_15m"
+        if seconds <= 1800:
+            return "15_30m"
+        if seconds <= 2700:
+            return "30_45m"
+        if seconds <= 3600:
+            return "45_60m"
+        return "60m_plus"
     if seconds <= 300:
         return "0_5m"
     if seconds <= 600:
@@ -7510,7 +7693,7 @@ def _fit_crypto_spot_distance_residual_model(rows: list[dict[str, Any]], *, fall
 def _fit_crypto_asset_time_calibration_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:
     grouped: dict[str, list[Decimal]] = defaultdict(list)
     for row in rows:
-        bucket = _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0))
+        bucket = _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0), row.get("frequency"))
         key = "|".join([str(row.get("asset_symbol") or "unknown"), bucket])
         grouped[key].append(Decimal(int(row["label_yes"])) - _decimal(row.get("mid_yes_dollars")))
     adjustments = {
@@ -7834,7 +8017,7 @@ def _predict_crypto_probability(
         probability = _clamp_price(_predict_crypto_probability(row, model.get("fallback_model")) + adjustment)
         return _apply_probability_calibration(probability, model.get("probability_calibration")) if apply_calibration else probability
     if model_type == "asset_time_calibration":
-        bucket = _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0))
+        bucket = _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0), row.get("frequency"))
         key = "|".join([str(row.get("asset_symbol") or "unknown"), bucket])
         adjustment = Decimal(int((model.get("bucket_adjustments_bps") or {}).get(key, 0))) / Decimal("10000")
         return _clamp_price(_predict_crypto_probability(row, model.get("fallback_model")) + adjustment)
@@ -8688,12 +8871,14 @@ def _runtime_crypto_policy_with_asset_entry(
     crypto_policy: RuntimeCryptoPolicy,
     asset_symbol: str,
     entry_policy: dict[str, Any],
+    *,
+    frequency: str | None = None,
 ) -> RuntimeCryptoPolicy:
     overrides = {
         symbol: dict(values)
         for symbol, values in (crypto_policy.asset_entry_overrides or {}).items()
     }
-    overrides[normalize_asset_symbol(asset_symbol)] = {
+    overrides[crypto_entry_override_key(asset_symbol, frequency)] = {
         **dict(entry_policy),
         "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
     }
@@ -8880,9 +9065,12 @@ def _crypto_optimize_asset_entry_policy(
     *,
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy,
+    frequency: str | None = None,
 ) -> dict[str, Any]:
     asset = normalize_asset_symbol(asset_symbol)
-    base_entry = crypto_policy.entry_for_asset(asset)
+    normalized_frequency = normalize_frequency(frequency) if frequency else None
+    override_key = crypto_entry_override_key(asset, normalized_frequency)
+    base_entry = crypto_policy.entry_for_asset(asset, frequency=normalized_frequency)
     predicted_rows, folds = _crypto_oos_prediction_rows(rows, settings=settings, crypto_policy=crypto_policy)
     strict_rows = sum(1 for row in rows if row.get("strict_trade_eligible"))
     spot_coverage = _spot_feature_coverage(rows)
@@ -8903,7 +9091,12 @@ def _crypto_optimize_asset_entry_policy(
         }
     evaluations: list[dict[str, Any]] = []
     for entry_policy in _crypto_entry_policy_grid(base_entry):
-        candidate_policy = _runtime_crypto_policy_with_asset_entry(crypto_policy, asset, entry_policy)
+        candidate_policy = _runtime_crypto_policy_with_asset_entry(
+            crypto_policy,
+            asset,
+            entry_policy,
+            frequency=normalized_frequency,
+        )
         metrics, market_mid_metrics = _crypto_evaluate_oos_predictions_for_entry(
             predicted_rows,
             settings=settings,
@@ -8938,7 +9131,7 @@ def _crypto_optimize_asset_entry_policy(
         "blockers": [] if winner else list(best.get("blockers") or ["no_policy_passed"]) if best else ["no_policy_evaluated"],
         "top_policies": evaluations[:10],
         "staged_override_payload": (
-            {"crypto_policy": {"asset_entry_overrides": {asset: winner["entry_policy"]}}}
+            {"crypto_policy": {"asset_entry_overrides": {override_key: winner["entry_policy"]}}}
             if winner
             else None
         ),
@@ -9299,23 +9492,38 @@ def _crypto_entry_policy_for_row(
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy | None = None,
 ) -> dict[str, Any]:
+    raw_frequency = row.get("frequency")
+    frequency = normalize_frequency(raw_frequency) if raw_frequency not in (None, "") else None
+    crypto_price_floor = max(0.01, float(settings.crypto_min_contract_price_floor_dollars))
+    default_min_price = float(settings.risk_min_contract_price_dollars)
     if crypto_policy is not None:
-        entry = dict(crypto_policy.entry_for_asset(str(row.get("asset_symbol") or "")))
+        asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
+        entry = dict(crypto_policy.entry_for_asset(asset, frequency=frequency))
         entry["min_fee_adjusted_edge_bps"] = max(
             int(entry["min_fee_adjusted_edge_bps"]),
             int(settings.risk_min_edge_bps),
         )
-        entry["min_contract_price_dollars"] = max(
-            float(entry["min_contract_price_dollars"]),
-            float(settings.risk_min_contract_price_dollars),
+        override_keys = [asset]
+        if frequency:
+            override_keys.append(crypto_entry_override_key(asset, frequency))
+        explicit_min_price = any(
+            (crypto_policy.asset_entry_overrides.get(key) or {}).get("min_contract_price_dollars") is not None
+            for key in override_keys
         )
+        min_price = float(entry["min_contract_price_dollars"])
+        if frequency == "1h" and not explicit_min_price:
+            min_price = float(settings.crypto_1h_min_contract_price_dollars)
+        entry["min_contract_price_dollars"] = max(min_price, crypto_price_floor)
         entry["min_remaining_payout_bps"] = CRYPTO_MIN_REMAINING_PAYOUT_BPS
         return entry
+    min_price = default_min_price
+    if frequency == "1h":
+        min_price = float(settings.crypto_1h_min_contract_price_dollars)
     return {
         "min_fee_adjusted_edge_bps": int(settings.risk_min_edge_bps),
         "max_spread_bps": int(settings.crypto_live_max_spread_bps),
         "min_confidence": float(settings.risk_min_confidence),
-        "min_contract_price_dollars": float(settings.risk_min_contract_price_dollars),
+        "min_contract_price_dollars": max(min_price, crypto_price_floor),
         "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
         "max_credible_edge_bps": int(settings.risk_max_credible_edge_bps),
     }
@@ -9855,7 +10063,7 @@ def _crypto_last_minute_price_matrix_base_key(
         [
             normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN")),
             str(side).lower(),
-            _crypto_time_to_close_bucket(float(time_to_close)),
+            _crypto_time_to_close_bucket(float(time_to_close), row.get("frequency")),
             _price_band(_clamp_price(probability)),
             _spread_band(row.get("spread_bps")),
         ]
@@ -10542,16 +10750,30 @@ def _crypto_apply_empirical_bucket_gate_to_replay_metrics(
             "metrics_source": metrics_with_buckets.get("metrics_scope") or metrics.get("metrics_scope"),
         }
 
-    allowed = set(summary.get("allowed_bucket_keys") or [])
+    def trade_allowed(row: dict[str, Any]) -> bool:
+        simulation = row.get("simulation") if isinstance(row.get("simulation"), dict) else {}
+        bucket_key = str(simulation.get("bucket_key") or _crypto_bucket_key(row, simulation))
+        gate = _crypto_empirical_bucket_gate_for_candidate(
+            row,
+            bucket_key=bucket_key,
+            settings=settings,
+            crypto_policy=crypto_policy,
+            bucket_matrix=bucket_matrix,
+            enforce=True,
+            requested_asset_symbols=requested_asset_symbols,
+            force_requested_assets=force_requested_assets,
+        )
+        return gate.get("allowed") is True
+
     gated_selection_trades = [
         row
         for row in selection_trades
-        if str((row.get("simulation") or {}).get("bucket_key") or "") in allowed
+        if trade_allowed(row)
     ]
     gated_market_mid_trades = [
         row
         for row in market_mid_trades
-        if str((row.get("simulation") or {}).get("bucket_key") or "") in allowed
+        if trade_allowed(row)
     ]
     gated_market_mid_policy = _crypto_policy_metrics(
         "market_mid_baseline_bucket_gated",
@@ -10590,7 +10812,7 @@ def _crypto_apply_empirical_bucket_gate_to_replay_metrics(
             **bucket_metrics,
             "selection_policy": gated_selection_policy,
             "market_mid_policy": gated_market_mid_policy,
-            "allowed_bucket_keys": sorted(allowed),
+            "allowed_bucket_keys": sorted(summary.get("allowed_bucket_keys") or []),
         },
         "empirical_bucket_gate_applied_to_metrics": True,
         "metrics_source": "empirical_bucket_gated",
@@ -10841,30 +11063,101 @@ def _eligible_crypto_buckets(rows: list[dict[str, Any]], *, settings: Settings) 
     return set(_crypto_empirical_bucket_summary(matrix, settings=settings)["allowed_bucket_keys"])
 
 
+def _crypto_bucket_components(row: dict[str, Any], simulation: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
+    side = str(simulation.get("side") or "unknown")
+    price = _decimal(simulation.get("execution_price_dollars") or row.get("mid_yes_dollars"))
+    price_band = _price_band(price)
+    spread_band = _spread_band(row.get("spread_bps"))
+    time_bucket = _crypto_time_to_close_bucket(
+        float(row.get("time_to_close_seconds") or 0),
+        row.get("frequency"),
+    )
+    return asset, side, price_band, spread_band, time_bucket
+
+
+def _crypto_bucket_key_from_components(
+    asset: str,
+    side: str,
+    price_band: str,
+    spread_band: str,
+    time_bucket: str,
+) -> str:
+    return "|".join([asset, side, price_band, spread_band, time_bucket])
+
+
+def _crypto_bucket_key_parts(bucket_key: str) -> tuple[str, str, str, str, str] | None:
+    parts = str(bucket_key or "").split("|")
+    if len(parts) != 5:
+        return None
+    return parts[0], parts[1], parts[2], parts[3], parts[4]
+
+
+def _crypto_empirical_bucket_fallback_keys(bucket_key: str) -> list[tuple[str, str]]:
+    parts = _crypto_bucket_key_parts(bucket_key)
+    if parts is None:
+        return []
+    asset, side, price_band, spread_band, _time_bucket = parts
+    return [
+        (
+            "asset_side_price_spread_any_time",
+            _crypto_bucket_key_from_components(asset, side, price_band, spread_band, "any_time"),
+        ),
+        (
+            "asset_side_price_any_spread_any_time",
+            _crypto_bucket_key_from_components(asset, side, price_band, "any_spread", "any_time"),
+        ),
+        (
+            "all_assets_side_price_any_spread_any_time",
+            _crypto_bucket_key_from_components("ANY", side, price_band, "any_spread", "any_time"),
+        ),
+    ]
+
+
+def _crypto_bucket_group_keys(row: dict[str, Any], simulation: dict[str, Any]) -> list[tuple[str, str]]:
+    exact_key = _crypto_bucket_key(row, simulation)
+    return [("exact", exact_key), *_crypto_empirical_bucket_fallback_keys(exact_key)]
+
+
 def _crypto_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Settings) -> list[dict[str, Any]]:
     del settings
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in trade_rows:
-        key = _crypto_bucket_key(row, row.get("simulation") or {})
-        grouped[key].append(row)
+        simulation = row.get("simulation") or {}
+        for scope, key in _crypto_bucket_group_keys(row, simulation):
+            grouped[(scope, key)].append(row)
     matrix: list[dict[str, Any]] = []
-    for key, rows in grouped.items():
+    for (scope, key), rows in grouped.items():
         values = [_decimal((row.get("simulation") or {}).get("net_pnl")) for row in rows]
         fees = [_decimal((row.get("simulation") or {}).get("fees")) for row in rows]
         gross = [_decimal((row.get("simulation") or {}).get("gross_pnl")) for row in rows]
         net_positive = sum(1 for value in values if value > 0)
         outcome_wins = sum(1 for row in rows if _crypto_trade_outcome_won(row))
+        parts = _crypto_bucket_key_parts(key)
         first = rows[0]
+        asset, side, price_band, spread_band, time_bucket = parts or (
+            first.get("asset_symbol"),
+            (first.get("simulation") or {}).get("side"),
+            _price_band(
+                _decimal((first.get("simulation") or {}).get("execution_price_dollars") or first.get("mid_yes_dollars"))
+            ),
+            _spread_band(first.get("spread_bps")),
+            _crypto_time_to_close_bucket(
+                float(first.get("time_to_close_seconds") or 0),
+                first.get("frequency"),
+            ),
+        )
         net = sum(values, Decimal("0"))
         outcome_win_rate = _ratio(outcome_wins / len(values)) if values else None
         matrix.append(
             {
                 "bucket_key": key,
-                "asset_symbol": first.get("asset_symbol"),
-                "side": (first.get("simulation") or {}).get("side"),
-                "entry_price_band": _price_band(_decimal((first.get("simulation") or {}).get("execution_price_dollars") or first.get("mid_yes_dollars"))),
-                "spread_band": _spread_band(first.get("spread_bps")),
-                "time_to_close_bucket": _crypto_time_to_close_bucket(float(first.get("time_to_close_seconds") or 0)),
+                "bucket_scope": scope,
+                "asset_symbol": asset,
+                "side": side,
+                "entry_price_band": price_band,
+                "spread_band": spread_band,
+                "time_to_close_bucket": time_bucket,
                 "sample_count": len(values),
                 "win_rate": outcome_win_rate,
                 "outcome_win_rate": outcome_win_rate,
@@ -10875,7 +11168,13 @@ def _crypto_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Setting
                 "net_pnl": str(net.quantize(Decimal("0.0001"))),
             }
         )
-    matrix.sort(key=lambda item: (_decimal(item["net_pnl"]), item["bucket_key"]))
+    matrix.sort(
+        key=lambda item: (
+            _decimal(item["net_pnl"]),
+            0 if item.get("bucket_scope") == "exact" else 1,
+            item["bucket_key"],
+        )
+    )
     return matrix
 
 
@@ -10955,7 +11254,10 @@ def _crypto_last_minute_passive_price_matrix(rows: list[dict[str, Any]], *, sett
                             "matrix_base_key": base_key,
                             "asset_symbol": normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN")),
                             "side": side,
-                            "time_to_close_bucket": _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0)),
+                            "time_to_close_bucket": _crypto_time_to_close_bucket(
+                                float(row.get("time_to_close_seconds") or 0),
+                                row.get("frequency"),
+                            ),
                             "market_probability_band": _price_band(_clamp_price(market_side_probability)),
                             "spread_band": _spread_band(row.get("spread_bps")),
                             "bid_price_dollars": _money_text(bid),
@@ -11028,7 +11330,10 @@ def _crypto_bucket_diagnostics(trade_rows: list[dict[str, Any]]) -> dict[str, li
         ),
         "by_time_to_close_bucket": _crypto_dimension_bucket_diagnostics(
             trade_rows,
-            lambda row: _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0)),
+            lambda row: _crypto_time_to_close_bucket(
+                float(row.get("time_to_close_seconds") or 0),
+                row.get("frequency"),
+            ),
         ),
         "by_spread_bucket": _crypto_dimension_bucket_diagnostics(
             trade_rows,
@@ -11094,17 +11399,7 @@ def _crypto_dimension_bucket_diagnostics(
 
 
 def _crypto_bucket_key(row: dict[str, Any], simulation: dict[str, Any]) -> str:
-    side = simulation.get("side") or "unknown"
-    price = _decimal(simulation.get("execution_price_dollars") or row.get("mid_yes_dollars"))
-    return "|".join(
-        [
-            str(row.get("asset_symbol") or "unknown"),
-            str(side),
-            _price_band(price),
-            _spread_band(row.get("spread_bps")),
-            _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0)),
-        ]
-    )
+    return _crypto_bucket_key_from_components(*_crypto_bucket_components(row, simulation))
 
 
 def _crypto_empirical_bucket_gate_enabled_for_asset(
@@ -11208,7 +11503,7 @@ def _crypto_empirical_late_override_review(
 ) -> dict[str, Any]:
     time_to_close = _optional_int(row.get("time_to_close_seconds"))
     time_bucket = (
-        _crypto_time_to_close_bucket(float(time_to_close))
+        _crypto_time_to_close_bucket(float(time_to_close), row.get("frequency"))
         if time_to_close is not None
         else "unknown"
     )
@@ -11345,7 +11640,7 @@ def _crypto_empirical_bucket_gap_sample(
             else None
         ),
         "time_to_close_seconds": time_to_close,
-        "time_to_close_bucket": _crypto_time_to_close_bucket(float(time_to_close or 0)),
+        "time_to_close_bucket": _crypto_time_to_close_bucket(float(time_to_close or 0), row.get("frequency")),
         "spread_bps": spread_bps,
         "spread_band": _spread_band(spread_bps),
         "yes_bid_dollars": _money_text(row.get("yes_bid_dollars")),
@@ -11394,12 +11689,52 @@ def _crypto_empirical_bucket_gate_for_candidate(
             "bucket_key": bucket_key,
             "reason": "empirical_bucket_gate_not_enforced" if enabled_for_asset else "asset_not_configured_for_empirical_bucket_gate",
         }
-    bucket = _crypto_bucket_matrix_by_key(bucket_matrix).get(bucket_key)
+    buckets_by_key = _crypto_bucket_matrix_by_key(bucket_matrix)
+    bucket = buckets_by_key.get(bucket_key)
     review = _crypto_empirical_bucket_review(bucket, settings=settings)
+    exact_review = {
+        **review,
+        "bucket_key": bucket_key,
+        "bucket_scope": "exact",
+    }
+    if review.get("allowed") is True:
+        return {
+            **exact_review,
+            "enforced": True,
+        }
+    fallback_reviews: list[dict[str, Any]] = []
+    for scope, fallback_key in _crypto_empirical_bucket_fallback_keys(bucket_key):
+        fallback_bucket = buckets_by_key.get(fallback_key)
+        fallback_review = _crypto_empirical_bucket_review(fallback_bucket, settings=settings)
+        fallback_item = {
+            **fallback_review,
+            "bucket_key": fallback_key,
+            "bucket_scope": scope,
+        }
+        fallback_reviews.append(fallback_item)
+        if fallback_review.get("allowed") is True:
+            return {
+                **fallback_review,
+                "status": "allowed",
+                "allowed": True,
+                "enforced": True,
+                "bucket_key": bucket_key,
+                "bucket_scope": "exact",
+                "reason": "empirical_bucket_fallback_allowed",
+                "fallback_allowed": True,
+                "matched_bucket_key": fallback_key,
+                "matched_bucket_scope": scope,
+                "matched_bucket_reason": fallback_review.get("reason"),
+                "exact_bucket_review": exact_review,
+                "fallback_reviews": fallback_reviews,
+            }
     return {
         **review,
         "enforced": True,
         "bucket_key": bucket_key,
+        "bucket_scope": "exact",
+        "fallback_allowed": False,
+        "fallback_reviews": fallback_reviews,
     }
 
 
