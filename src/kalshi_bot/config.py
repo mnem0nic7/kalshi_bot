@@ -323,6 +323,13 @@ class Settings(BaseSettings):
     crypto_book_noise_yes_range_threshold: float = 0.10
     crypto_book_noise_lookback_seconds: int = 90
 
+    crypto_winrate_guard_enabled: bool = True
+    crypto_winrate_guard_window: int = 20
+    crypto_winrate_guard_breakeven_pct: float = 0.62
+    crypto_winrate_guard_consecutive_windows: int = 2
+    crypto_winrate_guard_check_interval_seconds: int = 300
+    crypto_winrate_guard_auto_resume: bool = False
+
     stop_loss_enabled: bool = False
     stop_loss_threshold_pct: float = 0.10
     stop_loss_threshold_pct_by_strategy: dict[str, float] = Field(default_factory=dict)

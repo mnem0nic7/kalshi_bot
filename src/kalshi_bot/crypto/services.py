@@ -523,6 +523,149 @@ class CryptoAssetControlService:
             "asset_modes": self.modes_from_notes(control.notes),
         }
 
+    @staticmethod
+    def _compute_win_rate(outcomes: list[Any]) -> tuple[int, int]:
+        """Return (wins, total) where a win is realized_pnl_dollars > 0.
+
+        None/zero/negative pnl rows count toward total but never as wins.
+        """
+        wins = 0
+        for outcome in outcomes:
+            pnl = getattr(outcome, "realized_pnl_dollars", None)
+            if pnl is None:
+                continue
+            try:
+                if float(pnl) > 0:
+                    wins += 1
+            except (TypeError, ValueError):
+                continue
+        return wins, len(outcomes)
+
+    async def evaluate_winrate_guard(
+        self,
+        *,
+        frequency: str,
+        kalshi_env: str | None = None,
+    ) -> dict[str, Any]:
+        """Rolling per-asset win-rate kill-switch.
+
+        For each asset currently explicitly LIVE in deployment-control notes,
+        compute the win rate over the last `window` traded+settled outcomes. When
+        the window is full AND the win rate is below breakeven, increment a
+        persisted per-asset consecutive-breach counter; when the win rate is OK,
+        reset it to 0; when the window is not yet full, leave it unchanged. After
+        `consecutive_windows` consecutive breaches, flip the asset to shadow and
+        reset its counter.
+
+        This guard only ever flips LIVE -> shadow. Auto-resume (shadow -> live)
+        is intentionally not implemented here even when
+        ``crypto_winrate_guard_auto_resume`` is True; resuming remains a manual
+        operator action by default per the safety spec.
+        """
+        env = kalshi_env or self.settings.kalshi_env
+        normalized_frequency = normalize_frequency(frequency) or "15m"
+        window = int(self.settings.crypto_winrate_guard_window)
+        breakeven = float(self.settings.crypto_winrate_guard_breakeven_pct)
+        consecutive_target = int(self.settings.crypto_winrate_guard_consecutive_windows)
+
+        assessed: dict[str, Any] = {}
+        paused: list[str] = []
+
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=env)
+            control = await repo.get_deployment_control(kalshi_env=env)
+            note_modes = self.modes_from_notes(control.notes)
+            live_assets = [
+                symbol for symbol, mode in note_modes.items() if mode == CRYPTO_ASSET_MODE_LIVE
+            ]
+
+            for symbol in sorted(live_assets):
+                stream_name = f"crypto_winrate_guard:{env}:{symbol}"
+                checkpoint = await repo.get_checkpoint(stream_name)
+                counter = int((checkpoint.payload or {}).get("consecutive_breaches", 0)) if checkpoint else 0
+
+                outcomes = await repo.list_recent_settled_crypto_outcomes(
+                    frequency=normalized_frequency,
+                    kalshi_env=env,
+                    asset_symbol=symbol,
+                    limit=window,
+                )
+                wins, total = self._compute_win_rate(outcomes)
+                window_full = total >= window
+                win_rate = (wins / total) if total else None
+                breached = window_full and win_rate is not None and win_rate < breakeven
+
+                action = "noop"
+                if window_full:
+                    if breached:
+                        counter += 1
+                    else:
+                        counter = 0
+                # window not full -> counter unchanged
+
+                trip = breached and counter >= consecutive_target
+                if trip:
+                    action = "paused"
+                    paused.append(symbol)
+
+                # Persist the (non-reset) counter now. We do NOT reset on trip here:
+                # if `set_asset_mode` (run after this session commits) were to fail,
+                # resetting first would leave a losing asset LIVE with counter=0 —
+                # the fail-OPEN direction, which is unsafe for a kill-switch. By
+                # keeping the counter at/above threshold until the flip succeeds, a
+                # failed flip re-trips next pass (fail-safe toward pausing). The
+                # counter is reset only after a confirmed flip (see below).
+                await repo.set_checkpoint(
+                    stream_name,
+                    None,
+                    {
+                        "consecutive_breaches": counter,
+                        "last_win_rate": win_rate,
+                        "last_window_size": total,
+                        "updated_at": datetime.now(UTC).isoformat(),
+                    },
+                )
+                assessed[symbol] = {
+                    "wins": wins,
+                    "total": total,
+                    "window_full": window_full,
+                    "win_rate": win_rate,
+                    "breached": breached,
+                    "consecutive_breaches": counter,
+                    "action": action,
+                }
+            await session.commit()
+
+        for symbol in paused:
+            await self.set_asset_mode(
+                symbol,
+                CRYPTO_ASSET_MODE_SHADOW,
+                kalshi_env=env,
+                actor="winrate_guard",
+            )
+            # Flip confirmed -> reset the breach counter so the now-shadow asset
+            # is not immediately re-evaluated/re-flipped on the next pass.
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=env)
+                stream_name = f"crypto_winrate_guard:{env}:{symbol}"
+                checkpoint = await repo.get_checkpoint(stream_name)
+                payload = dict(checkpoint.payload or {}) if checkpoint else {}
+                payload["consecutive_breaches"] = 0
+                payload["updated_at"] = datetime.now(UTC).isoformat()
+                await repo.set_checkpoint(stream_name, None, payload)
+                await session.commit()
+
+        return {
+            "status": "ok",
+            "frequency": normalized_frequency,
+            "kalshi_env": env,
+            "window": window,
+            "breakeven_pct": breakeven,
+            "consecutive_windows": consecutive_target,
+            "assessed": assessed,
+            "paused": paused,
+        }
+
 
 class CryptoMarketService:
     def __init__(

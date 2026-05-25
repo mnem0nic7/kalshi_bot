@@ -399,6 +399,10 @@ class DaemonService:
                 periodic_tasks["stop_loss"] = asyncio.create_task(self._periodic_stop_loss_loop())
             if self.settings.crypto_take_profit_enabled:
                 periodic_tasks["crypto_take_profit"] = asyncio.create_task(self._periodic_crypto_take_profit_loop())
+            if self.settings.crypto_winrate_guard_enabled:
+                periodic_tasks["crypto_winrate_guard"] = asyncio.create_task(
+                    self._periodic_crypto_winrate_guard_loop()
+                )
             tasks.update(periodic_tasks)
             if run_seconds is not None:
                 tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
@@ -468,6 +472,10 @@ class DaemonService:
                     "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
                 }
             )
+            if self.settings.crypto_winrate_guard_enabled:
+                tasks["crypto_winrate_guard"] = asyncio.create_task(
+                    self._periodic_crypto_winrate_guard_loop()
+                )
             if run_seconds is not None:
                 tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
 
@@ -727,6 +735,25 @@ class DaemonService:
                 await self.crypto_take_profit_service.check_once()
             except Exception:
                 logger.warning("crypto_take_profit check failed", exc_info=True)
+
+    async def _periodic_crypto_winrate_guard_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.crypto_winrate_guard_check_interval_seconds)
+            if not self.settings.crypto_winrate_guard_enabled:
+                continue
+            service = self.crypto_autonomy_service
+            if service is None:
+                continue
+            asset_control = getattr(service, "asset_control_service", None)
+            if asset_control is None:
+                continue
+            if not await self._is_active_color():
+                continue
+            try:
+                for frequency in enabled_crypto_frequencies(self.settings):
+                    await asset_control.evaluate_winrate_guard(frequency=frequency)
+            except Exception:
+                logger.warning("crypto_winrate_guard check failed", exc_info=True)
 
     async def _periodic_market_history_loop(self) -> None:
         while True:

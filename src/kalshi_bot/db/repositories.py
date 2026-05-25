@@ -1720,6 +1720,28 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoDecisionOutcomeRecord.decision_time >= since)
         return int((await self.session.execute(stmt)).scalar_one() or 0)
 
+    async def list_recent_settled_crypto_outcomes(
+        self,
+        *,
+        frequency: str,
+        kalshi_env: str | None = None,
+        asset_symbol: str,
+        limit: int,
+    ) -> list[CryptoDecisionOutcomeRecord]:
+        stmt = (
+            select(CryptoDecisionOutcomeRecord)
+            .where(
+                CryptoDecisionOutcomeRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+                CryptoDecisionOutcomeRecord.frequency == frequency,
+                CryptoDecisionOutcomeRecord.asset_symbol == asset_symbol,
+                CryptoDecisionOutcomeRecord.fill_count > 0,
+                CryptoDecisionOutcomeRecord.settlement_result.is_not(None),
+            )
+            .order_by(CryptoDecisionOutcomeRecord.decision_time.desc())
+            .limit(limit)
+        )
+        return list((await self.session.execute(stmt)).scalars())
+
     async def record_crypto_data_quality_run(self, **values: Any) -> CryptoDataQualityRunRecord:
         values["kalshi_env"] = self._resolved_kalshi_env(values.get("kalshi_env"))
         record = CryptoDataQualityRunRecord(**values)
