@@ -5,10 +5,11 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Select, case, func, or_, select
+from sqlalchemy import Select, bindparam, case, func, or_, select, update as sql_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import RiskStatus, RoomOrigin, RoomStage
@@ -32,11 +33,18 @@ from kalshi_bot.db.models import (
     Artifact,
     Checkpoint,
     ClimatologyPriorRecord,
+    CryptoDataQualityRunRecord,
+    CryptoDecisionOutcomeRecord,
+    CryptoExecutionExampleRecord,
     CryptoMarketCandlestickRecord,
     CryptoMarketSnapshotRecord,
     CryptoFundingRateRecord,
     CryptoModelArtifactRecord,
+    CryptoOrderBookSnapshotRecord,
+    CryptoSettlementBenchmarkWindowRecord,
     CryptoSpotOHLCRecord,
+    CryptoTradeTickRecord,
+    CryptoTrainingFeatureRowRecord,
     DecisionTraceRecord,
     FillRecord,
     ForecastSnapshotRecord,
@@ -1066,6 +1074,374 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         stmt = stmt.order_by(CryptoMarketCandlestickRecord.end_period_ts.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
+    async def list_crypto_settled_market_snapshots(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
+        since: datetime | None = None,
+        limit: int = 1000,
+        defer_payload: bool = False,
+    ) -> list[CryptoMarketSnapshotRecord]:
+        """Return snapshots belonging to markets that actually settled."""
+        env = self._resolved_kalshi_env(kalshi_env)
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        settled_markets = select(CryptoMarketSnapshotRecord.market_ticker).where(
+            CryptoMarketSnapshotRecord.kalshi_env == env,
+            CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
+        )
+        if frequency is not None:
+            settled_markets = settled_markets.where(CryptoMarketSnapshotRecord.frequency == frequency)
+        if symbols:
+            settled_markets = settled_markets.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
+        settled_markets = settled_markets.distinct().subquery()
+        stmt = select(CryptoMarketSnapshotRecord).where(
+            CryptoMarketSnapshotRecord.kalshi_env == env,
+            CryptoMarketSnapshotRecord.market_ticker.in_(select(settled_markets.c.market_ticker)),
+        )
+        if frequency is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
+        if symbols:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
+        if since is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
+        if defer_payload:
+            stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
+        stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def list_crypto_live_quote_snapshots(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
+        since: datetime | None = None,
+        limit: int = 50000,
+        defer_payload: bool = False,
+    ) -> list[CryptoMarketSnapshotRecord]:
+        """Return the latest real-bid/ask live snapshot for each settled market.
+
+        Uses ``DISTINCT ON (market_ticker)`` to return exactly one row per market:
+        the most recent live monitoring snapshot that has real bid/ask prices AND
+        ``settlement_result`` set (propagated by settlement backfill).  These rows
+        receive ``quote_source='snapshot_quotes'`` in the replay and are the source
+        of ``strict_trade_eligible`` decision points.
+
+        Keeps total row count at O(markets) rather than O(markets × snapshots),
+        avoiding the connection overload that returning all migrated live rows causes.
+        """
+        from sqlalchemy import text as sql_text
+
+        env = self._resolved_kalshi_env(kalshi_env)
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+
+        where_parts = [
+            "kalshi_env = :env",
+            "settlement_result IN ('yes', 'no')",
+            "source_kind != 'settled_backfill'",
+            "yes_bid_dollars IS NOT NULL",
+            "yes_ask_dollars IS NOT NULL",
+        ]
+        params: dict = {"env": env, "limit": limit}
+        if frequency is not None:
+            where_parts.append("frequency = :frequency")
+            params["frequency"] = frequency
+        if symbols:
+            where_parts.append("asset_symbol IN :symbols")
+            params["symbols"] = symbols
+        if since is not None:
+            where_parts.append("observed_at >= :since")
+            params["since"] = since
+
+        bind = self.session.get_bind()
+        if bind is not None and bind.dialect.name != "postgresql":
+            conditions = [
+                CryptoMarketSnapshotRecord.kalshi_env == env,
+                CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
+                CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
+                CryptoMarketSnapshotRecord.yes_bid_dollars.is_not(None),
+                CryptoMarketSnapshotRecord.yes_ask_dollars.is_not(None),
+            ]
+            if frequency is not None:
+                conditions.append(CryptoMarketSnapshotRecord.frequency == frequency)
+            if symbols:
+                conditions.append(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
+            if since is not None:
+                conditions.append(CryptoMarketSnapshotRecord.observed_at >= since)
+            stmt = (
+                select(CryptoMarketSnapshotRecord)
+                .where(*conditions)
+                .order_by(CryptoMarketSnapshotRecord.market_ticker, CryptoMarketSnapshotRecord.observed_at.desc())
+                .limit(limit)
+            )
+            if defer_payload:
+                stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
+            records = list((await self.session.execute(stmt)).scalars())
+            latest: list[CryptoMarketSnapshotRecord] = []
+            seen: set[str] = set()
+            for record in records:
+                if record.market_ticker in seen:
+                    continue
+                seen.add(record.market_ticker)
+                latest.append(record)
+            return latest
+
+        where_clause = " AND ".join(where_parts)
+        raw = sql_text(f"""
+            WITH latest AS (
+                SELECT DISTINCT ON (market_ticker) market_ticker, observed_at
+                FROM crypto_market_snapshots
+                WHERE {where_clause}
+                ORDER BY market_ticker, observed_at DESC
+                LIMIT :limit
+            )
+            SELECT snapshot.id
+            FROM latest
+            JOIN crypto_market_snapshots AS snapshot
+              ON snapshot.kalshi_env = :env
+             AND snapshot.market_ticker = latest.market_ticker
+             AND snapshot.observed_at = latest.observed_at
+        """)
+        if symbols:
+            raw = raw.bindparams(bindparam("symbols", expanding=True))
+        rows = (await self.session.execute(raw, params)).fetchall()
+        if not rows:
+            return []
+        ids = [r[0] for r in rows]
+        stmt = select(CryptoMarketSnapshotRecord).where(
+            CryptoMarketSnapshotRecord.id.in_(ids)
+        )
+        if defer_payload:
+            stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def update_crypto_snapshot_settlement_result(
+        self,
+        *,
+        market_ticker: str,
+        settlement_result: str,
+        kalshi_env: str | None = None,
+        frequency: str | None = None,
+        observed_since: datetime | None = None,
+    ) -> int:
+        return await self.update_crypto_snapshot_settlement_results(
+            {market_ticker: settlement_result},
+            kalshi_env=kalshi_env,
+            frequency=frequency,
+            observed_since=observed_since,
+        )
+
+    async def update_crypto_snapshot_settlement_results(
+        self,
+        settlements: dict[str, str],
+        *,
+        kalshi_env: str | None = None,
+        frequency: str | None = None,
+        observed_since: datetime | None = None,
+    ) -> int:
+        """Propagate a settled market's result to its live monitoring snapshots.
+
+        The settlement backfill creates a separate ``settled_backfill`` record, but
+        the earlier live monitoring snapshots retain ``settlement_result=NULL``.
+        Updating them here makes ``list_crypto_settled_market_snapshots`` include
+        those rows, giving the replay access to real bid/ask prices
+        (``quote_source='snapshot_quotes'``) for strict-trade-eligible rows. When
+        a nightly/preflight window is supplied, scope the propagation to that
+        window so old historical rows do not dominate the training backfill.
+        """
+        rows = [
+            (str(market_ticker).strip(), str(settlement_result).strip())
+            for market_ticker, settlement_result in settlements.items()
+            if str(market_ticker or "").strip() and str(settlement_result or "").strip() in {"yes", "no"}
+        ]
+        if not rows:
+            return 0
+        env = self._resolved_kalshi_env(kalshi_env)
+        total = 0
+        for market_ticker, settlement_result in rows:
+            stmt = (
+                sql_update(CryptoMarketSnapshotRecord)
+                .where(
+                    CryptoMarketSnapshotRecord.market_ticker == market_ticker,
+                    CryptoMarketSnapshotRecord.kalshi_env == env,
+                    CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
+                    CryptoMarketSnapshotRecord.settlement_result.is_(None),
+                )
+                .values(settlement_result=settlement_result)
+            )
+            if frequency is not None:
+                stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
+            if observed_since is not None:
+                stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= observed_since)
+            result = await self.session.execute(stmt)
+            if result.rowcount is not None and result.rowcount > 0:
+                total += result.rowcount
+        return total
+
+    async def list_crypto_snapshot_asset_symbols(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        since: datetime | None = None,
+    ) -> list[str]:
+        stmt = select(CryptoMarketSnapshotRecord.asset_symbol).distinct().where(
+            CryptoMarketSnapshotRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+        )
+        if frequency is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
+        if since is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return sorted({row for row in rows if row})
+
+    async def list_latest_crypto_market_snapshots(
+        self,
+        *,
+        frequency: str = "15m",
+        kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
+        limit: int = 200,
+    ) -> list[CryptoMarketSnapshotRecord]:
+        rows = await self.list_crypto_market_snapshots(
+            frequency=frequency,
+            kalshi_env=kalshi_env,
+            asset_symbols=asset_symbols,
+            limit=max(limit * 6, limit),
+        )
+        latest: list[CryptoMarketSnapshotRecord] = []
+        seen: set[str] = set()
+        for row in rows:
+            if row.market_ticker in seen:
+                continue
+            seen.add(row.market_ticker)
+            latest.append(row)
+            if len(latest) >= limit:
+                break
+        return latest
+
+    async def get_latest_crypto_market_snapshot(
+        self,
+        market_ticker: str,
+        *,
+        kalshi_env: str | None = None,
+    ) -> CryptoMarketSnapshotRecord | None:
+        stmt = (
+            select(CryptoMarketSnapshotRecord)
+            .where(
+                CryptoMarketSnapshotRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+                CryptoMarketSnapshotRecord.market_ticker == market_ticker,
+            )
+            .order_by(CryptoMarketSnapshotRecord.observed_at.desc(), CryptoMarketSnapshotRecord.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def upsert_crypto_market_candlestick(
+        self,
+        *,
+        series_ticker: str,
+        market_ticker: str,
+        asset_symbol: str,
+        end_period_ts: datetime,
+        frequency: str = "15m",
+        kalshi_env: str | None = None,
+        period_interval: int = 1,
+        open_dollars: Decimal | None = None,
+        high_dollars: Decimal | None = None,
+        low_dollars: Decimal | None = None,
+        close_dollars: Decimal | None = None,
+        volume: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> CryptoMarketCandlestickRecord:
+        now = datetime.now(UTC)
+        env = self._resolved_kalshi_env(kalshi_env)
+        insert_values = {
+            "id": str(uuid4()),
+            "kalshi_env": env,
+            "series_ticker": series_ticker,
+            "market_ticker": market_ticker,
+            "asset_symbol": asset_symbol,
+            "frequency": frequency,
+            "period_interval": period_interval,
+            "end_period_ts": end_period_ts,
+            "open_dollars": open_dollars,
+            "high_dollars": high_dollars,
+            "low_dollars": low_dollars,
+            "close_dollars": close_dollars,
+            "volume": volume,
+            "payload": payload or {},
+            "created_at": now,
+            "updated_at": now,
+        }
+        update_values = {key: value for key, value in insert_values.items() if key not in {"id", "created_at"}}
+        dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
+        if dialect_name == "postgresql":
+            stmt = pg_insert(CryptoMarketCandlestickRecord).values(**insert_values)
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(CryptoMarketCandlestickRecord).values(**insert_values)
+        else:
+            record = CryptoMarketCandlestickRecord(**insert_values)
+            self.session.add(record)
+            await self.session.flush()
+            return record
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoMarketCandlestickRecord.kalshi_env,
+                    CryptoMarketCandlestickRecord.market_ticker,
+                    CryptoMarketCandlestickRecord.period_interval,
+                    CryptoMarketCandlestickRecord.end_period_ts,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+        result = (
+            await self.session.execute(
+                select(CryptoMarketCandlestickRecord).where(
+                    CryptoMarketCandlestickRecord.kalshi_env == env,
+                    CryptoMarketCandlestickRecord.market_ticker == market_ticker,
+                    CryptoMarketCandlestickRecord.period_interval == period_interval,
+                    CryptoMarketCandlestickRecord.end_period_ts == end_period_ts,
+                )
+            )
+        ).scalar_one()
+        return result
+
+    async def list_crypto_market_candlesticks(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        market_ticker: str | None = None,
+        asset_symbol: str | None = None,
+        asset_symbols: list[str] | None = None,
+        since: datetime | None = None,
+        limit: int = 1000,
+        defer_payload: bool = False,
+    ) -> list[CryptoMarketCandlestickRecord]:
+        stmt = select(CryptoMarketCandlestickRecord).where(
+            CryptoMarketCandlestickRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
+        )
+        if frequency is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.frequency == frequency)
+        if market_ticker is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.market_ticker == market_ticker)
+        if asset_symbol is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.asset_symbol == asset_symbol)
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        if symbols:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.asset_symbol.in_(symbols))
+        if since is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts >= since)
+        if defer_payload:
+            stmt = stmt.options(defer(CryptoMarketCandlestickRecord.payload))
+        stmt = stmt.order_by(CryptoMarketCandlestickRecord.end_period_ts.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
     async def upsert_crypto_spot_ohlc(
         self,
         *,
@@ -1161,6 +1537,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         since: datetime | None = None,
         until: datetime | None = None,
         limit: int = 1000,
+        defer_payload: bool = False,
     ) -> list[CryptoSpotOHLCRecord]:
         stmt = select(CryptoSpotOHLCRecord).where(
             CryptoSpotOHLCRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
@@ -1178,8 +1555,199 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoSpotOHLCRecord.end_ts >= since)
         if until is not None:
             stmt = stmt.where(CryptoSpotOHLCRecord.end_ts <= until)
+        if defer_payload:
+            stmt = stmt.options(defer(CryptoSpotOHLCRecord.payload))
         stmt = stmt.order_by(CryptoSpotOHLCRecord.end_ts.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
+
+    def _upsert_stmt_for(self, model: type[Any], values: dict[str, Any]) -> Any | None:
+        dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
+        if dialect_name == "postgresql":
+            return pg_insert(model).values(**values)
+        if dialect_name == "sqlite":
+            return sqlite_insert(model).values(**values)
+        return None
+
+    async def upsert_crypto_order_book_snapshot(self, **values: Any) -> None:
+        values["kalshi_env"] = self._resolved_kalshi_env(values.get("kalshi_env"))
+        values["market_ticker"] = values.get("market_ticker") or ""
+        update_values = {key: value for key, value in values.items() if key not in {"id", "created_at"}}
+        stmt = self._upsert_stmt_for(CryptoOrderBookSnapshotRecord, values)
+        if stmt is None:
+            self.session.add(CryptoOrderBookSnapshotRecord(**values))
+            await self.session.flush()
+            return
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoOrderBookSnapshotRecord.kalshi_env,
+                    CryptoOrderBookSnapshotRecord.provider,
+                    CryptoOrderBookSnapshotRecord.asset_symbol,
+                    CryptoOrderBookSnapshotRecord.frequency,
+                    CryptoOrderBookSnapshotRecord.market_ticker,
+                    CryptoOrderBookSnapshotRecord.observed_at,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+
+    async def upsert_crypto_trade_tick(self, **values: Any) -> None:
+        values["kalshi_env"] = self._resolved_kalshi_env(values.get("kalshi_env"))
+        values["market_ticker"] = values.get("market_ticker") or ""
+        values["source_id"] = values.get("source_id") or ""
+        values["trade_id"] = values.get("trade_id") or ""
+        update_values = {key: value for key, value in values.items() if key not in {"id", "created_at"}}
+        stmt = self._upsert_stmt_for(CryptoTradeTickRecord, values)
+        if stmt is None:
+            self.session.add(CryptoTradeTickRecord(**values))
+            await self.session.flush()
+            return
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoTradeTickRecord.kalshi_env,
+                    CryptoTradeTickRecord.provider,
+                    CryptoTradeTickRecord.asset_symbol,
+                    CryptoTradeTickRecord.source_id,
+                    CryptoTradeTickRecord.trade_id,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+
+    async def upsert_crypto_settlement_benchmark_window(self, **values: Any) -> None:
+        values["kalshi_env"] = self._resolved_kalshi_env(values.get("kalshi_env"))
+        update_values = {key: value for key, value in values.items() if key not in {"id", "created_at"}}
+        stmt = self._upsert_stmt_for(CryptoSettlementBenchmarkWindowRecord, values)
+        if stmt is None:
+            self.session.add(CryptoSettlementBenchmarkWindowRecord(**values))
+            await self.session.flush()
+            return
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoSettlementBenchmarkWindowRecord.kalshi_env,
+                    CryptoSettlementBenchmarkWindowRecord.market_ticker,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+
+    async def upsert_crypto_training_feature_row(self, **values: Any) -> None:
+        values["kalshi_env"] = self._resolved_kalshi_env(values.get("kalshi_env"))
+        update_values = {key: value for key, value in values.items() if key not in {"id", "created_at"}}
+        stmt = self._upsert_stmt_for(CryptoTrainingFeatureRowRecord, values)
+        if stmt is None:
+            self.session.add(CryptoTrainingFeatureRowRecord(**values))
+            await self.session.flush()
+            return
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoTrainingFeatureRowRecord.kalshi_env,
+                    CryptoTrainingFeatureRowRecord.frequency,
+                    CryptoTrainingFeatureRowRecord.row_id,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+
+    async def list_crypto_training_feature_rows(
+        self,
+        *,
+        frequency: str,
+        kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[CryptoTrainingFeatureRowRecord]:
+        stmt = select(CryptoTrainingFeatureRowRecord).where(
+            CryptoTrainingFeatureRowRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+            CryptoTrainingFeatureRowRecord.frequency == frequency,
+        )
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        if symbols:
+            stmt = stmt.where(CryptoTrainingFeatureRowRecord.asset_symbol.in_(symbols))
+        if since is not None:
+            stmt = stmt.where(CryptoTrainingFeatureRowRecord.decision_time >= since)
+        if until is not None:
+            stmt = stmt.where(CryptoTrainingFeatureRowRecord.decision_time <= until)
+        stmt = stmt.order_by(CryptoTrainingFeatureRowRecord.decision_time.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def upsert_crypto_decision_outcome(self, **values: Any) -> None:
+        values["kalshi_env"] = self._resolved_kalshi_env(values.get("kalshi_env"))
+        update_values = {key: value for key, value in values.items() if key not in {"id", "created_at"}}
+        stmt = self._upsert_stmt_for(CryptoDecisionOutcomeRecord, values)
+        if stmt is None:
+            self.session.add(CryptoDecisionOutcomeRecord(**values))
+            await self.session.flush()
+            return
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoDecisionOutcomeRecord.kalshi_env,
+                    CryptoDecisionOutcomeRecord.market_ticker,
+                    CryptoDecisionOutcomeRecord.decision_time,
+                    CryptoDecisionOutcomeRecord.input_hash,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+
+    async def count_crypto_decision_outcomes(
+        self,
+        *,
+        frequency: str,
+        kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
+        since: datetime | None = None,
+    ) -> int:
+        stmt = select(func.count()).select_from(CryptoDecisionOutcomeRecord).where(
+            CryptoDecisionOutcomeRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+            CryptoDecisionOutcomeRecord.frequency == frequency,
+        )
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        if symbols:
+            stmt = stmt.where(CryptoDecisionOutcomeRecord.asset_symbol.in_(symbols))
+        if since is not None:
+            stmt = stmt.where(CryptoDecisionOutcomeRecord.decision_time >= since)
+        return int((await self.session.execute(stmt)).scalar_one() or 0)
+
+    async def record_crypto_data_quality_run(self, **values: Any) -> CryptoDataQualityRunRecord:
+        values["kalshi_env"] = self._resolved_kalshi_env(values.get("kalshi_env"))
+        record = CryptoDataQualityRunRecord(**values)
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def upsert_crypto_execution_example(self, **values: Any) -> None:
+        values["kalshi_env"] = self._resolved_kalshi_env(values.get("kalshi_env"))
+        values["order_id"] = values.get("order_id") or ""
+        update_values = {key: value for key, value in values.items() if key not in {"id", "created_at"}}
+        stmt = self._upsert_stmt_for(CryptoExecutionExampleRecord, values)
+        if stmt is None:
+            self.session.add(CryptoExecutionExampleRecord(**values))
+            await self.session.flush()
+            return
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoExecutionExampleRecord.kalshi_env,
+                    CryptoExecutionExampleRecord.market_ticker,
+                    CryptoExecutionExampleRecord.decision_time,
+                    CryptoExecutionExampleRecord.order_id,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
 
     async def upsert_crypto_funding_rate(
         self,
