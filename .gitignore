@@ -27,3 +27,4 @@ htmlcov/
 .claude/
 reports/
 docs/production-trade-mechanics-audit-*.md
+infra/docker-compose.train.yml
