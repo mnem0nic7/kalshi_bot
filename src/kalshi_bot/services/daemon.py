@@ -1620,10 +1620,28 @@ class DaemonService:
         return "new_data" if has_new_data else None
 
     async def _run_crypto_model_nightly_for_env(self, checkpoint_name: str) -> dict[str, Any]:
-        assets = [a.strip().upper() for a in self.settings.crypto_model_nightly_assets.split(",") if a.strip()]
+        configured_assets = [a.strip().upper() for a in self.settings.crypto_model_nightly_assets.split(",") if a.strip()]
         max_age_td = timedelta(hours=self.settings.crypto_model_nightly_max_age_hours)
         now = self._utc_now()
         frequencies = enabled_crypto_frequencies(self.settings) or ["15m"]
+
+        # Train exactly one asset per night, rotating by local calendar day so
+        # each configured asset retrains on a fixed weekly cadence. Bounds the
+        # nightly job (and the trading-loop pause it causes) to a single asset's
+        # train/replay/gate across all frequencies, instead of all assets at once.
+        if configured_assets:
+            local_date = now.astimezone(ZoneInfo(self.settings.crypto_model_nightly_timezone)).date()
+            rotation_index = local_date.toordinal() % len(configured_assets)
+            assets = [configured_assets[rotation_index]]
+            logger.info(
+                "crypto_model_nightly rotation selected asset=%s (index=%d of %d) for local_date=%s",
+                assets[0],
+                rotation_index,
+                len(configured_assets),
+                local_date.isoformat(),
+            )
+        else:
+            assets = []
 
         asset_decisions: dict[str, dict[str, str]] = {}
         sizing_policy_results: dict[str, Any] = {}
