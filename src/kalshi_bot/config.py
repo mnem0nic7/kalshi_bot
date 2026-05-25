@@ -198,6 +198,9 @@ class Settings(BaseSettings):
     crypto_training_preflight_settled_days: int = 2
     crypto_training_preflight_history_days: int = 2
     crypto_training_preflight_spot_days: int = 2
+    crypto_training_preflight_min_strict_rows: int = 1000
+    crypto_training_preflight_min_strict_rows_per_asset: int = 100
+    crypto_training_preflight_min_strict_row_ratio: float = 0.10
     crypto_training_preflight_min_spot_coverage_pct: float = 0.80
     crypto_replay_min_resolved_markets: int = 500
     crypto_replay_min_trade_candidates: int = 50

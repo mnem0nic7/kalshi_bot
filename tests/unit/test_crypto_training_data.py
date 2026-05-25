@@ -171,6 +171,8 @@ async def test_training_preflight_materializes_feature_rows_before_feature_store
         database_url=f"sqlite+aiosqlite:///{tmp_path}/feature-store.db",
         kalshi_env="production",
         crypto_min_training_samples=1,
+        crypto_training_preflight_min_strict_rows=1,
+        crypto_training_preflight_min_strict_rows_per_asset=1,
         crypto_training_preflight_min_spot_coverage_pct=0.0,
     )
     engine = create_engine(settings)
@@ -241,6 +243,42 @@ async def test_training_preflight_materializes_feature_rows_before_feature_store
     assert result["status"] == "trained"
     assert result["sample_count"] >= 2
     assert result["payload"]["trained_from"] == "crypto_training_feature_rows"
+
+    candidates = await CryptoForecastService(settings=settings, session_factory=session_factory).candidates(
+        frequency="15m",
+        asset_symbols=["BTC"],
+    )
+
+    assert candidates["dataset"]["source"] == "crypto_training_feature_rows"
+    assert candidates["dataset"]["feature_row_count"] >= 2
+
+
+def test_training_quality_blockers_require_pooled_ratio_and_per_asset_strict_rows(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/quality.db",
+        crypto_min_training_samples=1,
+        crypto_training_preflight_min_strict_rows=3,
+        crypto_training_preflight_min_strict_rows_per_asset=2,
+        crypto_training_preflight_min_strict_row_ratio=0.80,
+        crypto_training_preflight_min_spot_coverage_pct=0.0,
+    )
+    rows = [
+        {"asset_symbol": "BTC", "strict_trade_eligible": True, "spot_feature_status": "available"},
+        {"asset_symbol": "ETH", "strict_trade_eligible": True, "spot_feature_status": "available"},
+        {"asset_symbol": "ETH", "strict_trade_eligible": False, "spot_feature_status": "available"},
+    ]
+
+    blockers = crypto_services._crypto_training_quality_blockers(
+        rows,
+        spot_coverage=1.0,
+        settings=settings,
+        asset_symbols=["BTC", "ETH", "SOL"],
+    )
+
+    assert "strict_trade_eligible_rows_below_min:2<3" in blockers
+    assert "strict_trade_eligible_ratio_below_min:0.667<0.800" in blockers
+    assert "strict_trade_eligible_rows_below_min_by_asset:BTC:1<2" in blockers
+    assert "strict_trade_eligible_rows_below_min_by_asset:SOL:0<2" in blockers
 
 
 class _RetrySession:

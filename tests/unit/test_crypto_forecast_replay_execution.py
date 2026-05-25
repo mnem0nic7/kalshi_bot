@@ -2440,7 +2440,7 @@ def test_crypto_candidate_registry_reports_optional_rich_models(tmp_path) -> Non
     assert names["lightgbm_classifier"]["status"] in {"available", "unavailable", "guardrail_failed"}
 
 
-def test_crypto_model_selection_prefers_non_market_candidate_over_market_mid_baseline() -> None:
+def test_crypto_model_selection_does_not_promote_guardrail_failed_candidate() -> None:
     champion = _crypto_select_champion(
         [
             {
@@ -2462,7 +2462,7 @@ def test_crypto_model_selection_prefers_non_market_candidate_over_market_mid_bas
         ]
     )
 
-    assert champion == "spot_distance_residual"
+    assert champion == "market_mid_baseline"
 
 
 def test_crypto_model_selection_falls_back_to_market_mid_when_no_trade_model_is_usable() -> None:
@@ -2521,6 +2521,30 @@ def test_crypto_model_selection_prefers_positive_oos_pnl_over_brier() -> None:
     )
 
     assert champion == "spot_distance_residual"
+
+
+def test_crypto_model_selection_rejects_guardrail_failed_positive_pnl_candidate() -> None:
+    champion = _crypto_select_champion(
+        [
+            {
+                "name": "market_mid_baseline",
+                "status": "available",
+                "metrics": {"brier": 0.0300},
+            },
+            {
+                "name": "spot_distance_residual",
+                "status": "guardrail_failed",
+                "metrics": {"brier": 0.0900},
+                "policy_metrics": {
+                    "selected_count": 3,
+                    "net_pnl": "2.0000",
+                    "pnl_advantage_vs_market_mid_dollars": "2.0000",
+                },
+            },
+        ]
+    )
+
+    assert champion == "market_mid_baseline"
 
 
 def test_crypto_entry_optimizer_stages_only_passing_policy(tmp_path) -> None:
