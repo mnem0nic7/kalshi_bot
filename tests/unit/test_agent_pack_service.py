@@ -32,7 +32,7 @@ def test_agent_pack_service_builds_deterministic_default_pack() -> None:
     assert pack.thresholds.strategy_min_abs_delta_f == settings.strategy_min_abs_delta_f
     assert pack.thresholds.risk_max_credible_edge_bps == settings.risk_max_credible_edge_bps
     assert pack.crypto_policy.entry.min_fee_adjusted_edge_bps == settings.risk_min_edge_bps
-    assert pack.crypto_policy.entry.min_remaining_payout_bps == 0
+    assert pack.crypto_policy.entry.min_remaining_payout_bps == 300
     assert pack.crypto_policy.replay.min_resolved_markets == settings.crypto_replay_min_resolved_markets
     assert pack.crypto_policy.live.trading_enabled == settings.crypto_trading_enabled
     assert pack.weather_policy is not None
@@ -109,15 +109,15 @@ def test_agent_pack_runtime_crypto_policy_overrides_per_asset() -> None:
     assert policy.entry_for_asset("BTC")["max_spread_bps"] == 250
     assert policy.entry_for_asset("BTC")["min_contract_price_dollars"] == settings.crypto_min_contract_price_floor_dollars
     assert policy.entry_for_asset("ETH")["min_contract_price_dollars"] == settings.risk_min_contract_price_dollars
-    assert policy.entry_for_asset("BTC")["min_remaining_payout_bps"] == 0
-    assert policy.entry_for_asset("ETH")["min_remaining_payout_bps"] == 0
+    assert policy.entry_for_asset("BTC")["min_remaining_payout_bps"] == 300
+    assert policy.entry_for_asset("ETH")["min_remaining_payout_bps"] == 300
     assert policy.entry_for_asset("BTC")["target_position_pct"] == 0.15
     assert policy.entry_for_asset("ETH")["target_position_pct"] == 0.12
     assert thresholds.risk_min_edge_bps == 1500
     assert thresholds.trigger_max_spread_bps == 250
     assert thresholds.risk_min_contract_price_dollars == settings.crypto_min_contract_price_floor_dollars
     assert thresholds.risk_position_pct == 0.15
-    assert thresholds.strategy_min_remaining_payout_bps == 0
+    assert thresholds.strategy_min_remaining_payout_bps == 300
 
 
 def test_agent_pack_runtime_crypto_policy_supports_frequency_overrides() -> None:
@@ -145,12 +145,60 @@ def test_agent_pack_runtime_crypto_policy_supports_frequency_overrides() -> None
     policy = service.runtime_crypto_policy(pack)
     thresholds_1h = service.runtime_crypto_thresholds(policy, asset_symbol="BTC", frequency="1h")
 
+    # Change 1: max_spread is clamped to <= crypto_max_spread_to_edge_ratio (1.0) * min_edge.
+    # The "btc" override sets no edge, so it inherits the base entry edge (1000); 700 stays 700.
     assert policy.entry_for_asset("BTC")["max_spread_bps"] == 700
     assert policy.entry_for_asset("BTC", frequency="15m")["max_spread_bps"] == 700
-    assert policy.entry_for_asset("BTC", frequency="1h")["max_spread_bps"] == 1500
+    # The "btc:1h" override sets edge=500, so its 1500 spread clamps to 500.
+    assert policy.entry_for_asset("BTC", frequency="1h")["max_spread_bps"] == 500
     assert policy.entry_for_asset("BTC", frequency="1h")["min_contract_price_dollars"] == 0.40
-    assert thresholds_1h.trigger_max_spread_bps == 1500
+    assert thresholds_1h.trigger_max_spread_bps == 500
     assert thresholds_1h.risk_min_contract_price_dollars == 0.40
+
+
+def test_agent_pack_crypto_spread_clamped_to_edge_ratio_below_floor() -> None:
+    # Change 1: max_spread must be <= crypto_max_spread_to_edge_ratio (1.0) * min_edge, and
+    # this invariant wins over the 100bps floor. With edge=50 and K=1.0 the spread caps at 50.
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        crypto_max_spread_to_edge_ratio=1.0,
+    )
+    service = AgentPackService(settings)
+    pack = service.default_pack().model_copy(
+        update={
+            "crypto_policy": AgentPackCryptoPolicy(
+                entry=AgentPackCryptoEntryPolicy(min_fee_adjusted_edge_bps=50, max_spread_bps=1500),
+            )
+        }
+    )
+
+    policy = service.runtime_crypto_policy(pack)
+
+    # 1.0 * 50 = 50, which is below the 100bps floor, but the invariant wins.
+    assert policy.entry_for_asset("BTC")["max_spread_bps"] == 50
+
+
+def test_agent_pack_crypto_spread_clamped_by_edge_ratio_above_floor() -> None:
+    # Change 1: with a larger ratio the cap scales with edge. K=2.0, edge=300 -> cap 600,
+    # so a 1500bps request clamps to 600 (still <= the 1500 hard max).
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=300,
+        crypto_max_spread_to_edge_ratio=2.0,
+    )
+    service = AgentPackService(settings)
+    pack = service.default_pack().model_copy(
+        update={
+            "crypto_policy": AgentPackCryptoPolicy(
+                entry=AgentPackCryptoEntryPolicy(min_fee_adjusted_edge_bps=300, max_spread_bps=1500),
+            )
+        }
+    )
+
+    policy = service.runtime_crypto_policy(pack)
+
+    assert policy.entry_for_asset("BTC")["max_spread_bps"] == 600
 
 
 def test_agent_pack_runtime_crypto_policy_cannot_lower_operator_edge_floor() -> None:
@@ -258,7 +306,7 @@ def test_agent_pack_service_sanitizes_crypto_policy_bounds() -> None:
     assert sanitized.crypto_policy.entry.max_spread_bps == 100
     assert sanitized.crypto_policy.entry.min_confidence == 0.50
     assert sanitized.crypto_policy.entry.min_contract_price_dollars == settings.risk_min_contract_price_dollars
-    assert sanitized.crypto_policy.entry.min_remaining_payout_bps == 0
+    assert sanitized.crypto_policy.entry.min_remaining_payout_bps == 300
     assert sanitized.crypto_policy.entry.max_credible_edge_bps == 10000
     assert sanitized.crypto_policy.entry.target_position_pct == 0.15
     assert sanitized.crypto_policy.live.asset_modes == {"BTC": "live", "ETH": "shadow"}

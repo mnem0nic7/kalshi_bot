@@ -5087,6 +5087,67 @@ def _runtime_replay_gate_passed(replay_gate: Any | None, crypto_policy: RuntimeC
     return not _crypto_replay_gate_reasons(metrics, crypto_policy=crypto_policy)
 
 
+def _crypto_price_bucket_gate_reasons(
+    bucket_matrix: list[dict[str, Any]] | None,
+    *,
+    crypto_policy: RuntimeCryptoPolicy,
+) -> list[str]:
+    """Hard-fail any entry-price bucket that bleeds, even when pooled metrics pass.
+
+    Groups rows by ``entry_price_band``, summing ``sample_count`` and ``net_pnl`` and
+    reconstructing an aggregate win rate from per-row ``win_rate * sample_count``. Buckets
+    whose summed sample count is below the per-bucket floor are SKIPPED (safety valve so
+    small buckets cannot block promotion).
+    """
+    reasons: list[str] = []
+    grouped: dict[str, dict[str, Any]] = {}
+    for bucket in bucket_matrix or []:
+        if not isinstance(bucket, dict):
+            continue
+        band = bucket.get("entry_price_band")
+        if not band:
+            continue
+        try:
+            samples = int(bucket.get("sample_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if samples <= 0:
+            continue
+        win_rate = bucket.get("outcome_win_rate")
+        if win_rate is None:
+            win_rate = bucket.get("win_rate")
+        if win_rate is None:
+            continue
+        try:
+            net_pnl = float(Decimal(str(bucket.get("net_pnl") or "0")))
+        except Exception:
+            net_pnl = 0.0
+        agg = grouped.setdefault(str(band), {"samples": 0, "wins": 0.0, "net_pnl": 0.0})
+        agg["samples"] += samples
+        agg["wins"] += round(float(win_rate) * samples)
+        agg["net_pnl"] += net_pnl
+
+    min_samples = int(crypto_policy.replay_per_price_bucket_min_samples)
+    min_win_rate = float(crypto_policy.replay_per_price_bucket_min_win_rate)
+    min_net_pnl = float(crypto_policy.replay_per_price_bucket_min_net_pnl_dollars)
+    for band, agg in sorted(grouped.items()):
+        samples = int(agg["samples"])
+        if samples < min_samples:
+            continue
+        agg_win_rate = agg["wins"] / samples if samples > 0 else 0.0
+        if agg_win_rate < min_win_rate:
+            reasons.append(
+                f"Entry-price bucket {band} win rate {agg_win_rate:.1%} below minimum "
+                f"{min_win_rate:.1%} over {samples} samples."
+            )
+        if agg["net_pnl"] < min_net_pnl:
+            reasons.append(
+                f"Entry-price bucket {band} net P/L ${agg['net_pnl']:.2f} below minimum "
+                f"${min_net_pnl:.2f} over {samples} samples."
+            )
+    return reasons
+
+
 def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: RuntimeCryptoPolicy) -> list[str]:
     reasons: list[str] = []
     resolved = int(metrics.get("resolved_sample_count") or metrics.get("sample_count") or 0)
@@ -5185,6 +5246,20 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
             reasons.append("Calibration log-loss does not beat the market-mid baseline.")
         if calibration_ece is None or market_mid_ece is None or float(calibration_ece) >= float(market_mid_ece):
             reasons.append("Calibration ECE does not beat the market-mid baseline.")
+    if current_model_candidates >= crypto_policy.replay_min_trade_candidates:
+        pnl_per_candidate = net_pl / current_model_candidates if current_model_candidates > 0 else 0.0
+        if pnl_per_candidate < crypto_policy.replay_min_pnl_per_candidate_dollars:
+            reasons.append(
+                f"Net simulated P/L per candidate ${pnl_per_candidate:.4f} below minimum "
+                f"${crypto_policy.replay_min_pnl_per_candidate_dollars:.4f}."
+            )
+    if crypto_policy.replay_per_price_bucket_gate_enabled:
+        reasons.extend(
+            _crypto_price_bucket_gate_reasons(
+                metrics.get("bucket_matrix"),
+                crypto_policy=crypto_policy,
+            )
+        )
     return reasons
 
 
@@ -8971,6 +9046,10 @@ def _runtime_crypto_policy_with_asset_entry(
         replay_require_calibration_better_than_mid=crypto_policy.replay_require_calibration_better_than_mid,
         replay_require_pnl_beats_market_mid=crypto_policy.replay_require_pnl_beats_market_mid,
         replay_min_pnl_advantage_dollars=crypto_policy.replay_min_pnl_advantage_dollars,
+        replay_per_price_bucket_gate_enabled=crypto_policy.replay_per_price_bucket_gate_enabled,
+        replay_per_price_bucket_min_samples=crypto_policy.replay_per_price_bucket_min_samples,
+        replay_per_price_bucket_min_win_rate=crypto_policy.replay_per_price_bucket_min_win_rate,
+        replay_per_price_bucket_min_net_pnl_dollars=crypto_policy.replay_per_price_bucket_min_net_pnl_dollars,
         trading_enabled=crypto_policy.trading_enabled,
         production_autonomy_enabled=crypto_policy.production_autonomy_enabled,
         asset_modes=dict(crypto_policy.asset_modes or {}),
@@ -9003,6 +9082,10 @@ def _runtime_crypto_policy_with_asset_modes(
         replay_require_calibration_better_than_mid=crypto_policy.replay_require_calibration_better_than_mid,
         replay_require_pnl_beats_market_mid=crypto_policy.replay_require_pnl_beats_market_mid,
         replay_min_pnl_advantage_dollars=crypto_policy.replay_min_pnl_advantage_dollars,
+        replay_per_price_bucket_gate_enabled=crypto_policy.replay_per_price_bucket_gate_enabled,
+        replay_per_price_bucket_min_samples=crypto_policy.replay_per_price_bucket_min_samples,
+        replay_per_price_bucket_min_win_rate=crypto_policy.replay_per_price_bucket_min_win_rate,
+        replay_per_price_bucket_min_net_pnl_dollars=crypto_policy.replay_per_price_bucket_min_net_pnl_dollars,
         trading_enabled=crypto_policy.trading_enabled,
         production_autonomy_enabled=crypto_policy.production_autonomy_enabled,
         asset_modes=modes,

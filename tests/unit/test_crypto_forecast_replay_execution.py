@@ -38,6 +38,8 @@ from kalshi_bot.crypto.services import (
     _crypto_decision_rows,
     _crypto_bucket_key,
     _crypto_bucket_matrix,
+    _crypto_price_bucket_gate_reasons,
+    _crypto_replay_gate_reasons,
     _crypto_empirical_bucket_gate_for_candidate,
     _evaluate_crypto_walk_forward,
     _crypto_feature_schema,
@@ -2087,6 +2089,89 @@ def test_crypto_replay_gate_blocks_low_pnl_per_candidate(tmp_path) -> None:
     assert any("per candidate" in reason for reason in blocked["reasons"])
 
 
+def test_crypto_replay_gate_allows_pnl_per_candidate_below_floor_when_candidates_below_min(tmp_path) -> None:
+    # Change 3: per-candidate PnL gate only fires when candidate count >= min_trade_candidates.
+    # Here candidates (5) < min_trade_candidates (50), so the gate must NOT add a per-candidate reason.
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=2,
+        crypto_replay_min_trade_candidates=50,
+        crypto_replay_min_pnl_per_candidate_dollars=0.05,
+    )
+    policy = AgentPackService(settings).runtime_crypto_policy()
+    reasons = _crypto_replay_gate_reasons(
+        {
+            "resolved_sample_count": 100,
+            "trade_candidate_count": 5,
+            "current_model_live_quality_candidate_count": 5,
+            "strict_trade_eligible_count": 5,
+            "net_simulated_pl_dollars": 0.01,  # 0.002/candidate, far below 0.05 floor
+            "market_mid_net_simulated_pl_dollars": 0.0,
+            "pnl_advantage_vs_market_mid_dollars": 0.01,
+            "hard_cap_breaches": 0,
+            "candle_count": 100,
+            "spot_feature_coverage_pct": 1.0,
+        },
+        crypto_policy=policy,
+    )
+    assert not any("per candidate" in reason for reason in reasons)
+
+
+def test_crypto_price_bucket_gate_blocks_low_win_rate_bucket(tmp_path) -> None:
+    # Change 2: a price bucket with >= min_samples but a win rate below the floor must fail.
+    settings = _settings(tmp_path)
+    policy = AgentPackService(settings).runtime_crypto_policy()
+    bucket_matrix = [
+        {
+            "entry_price_band": "0.50-0.75",
+            "sample_count": 30,
+            "outcome_win_rate": 0.30,
+            "net_pnl": "5.0000",
+        },
+        {
+            "entry_price_band": "0.50-0.75",
+            "sample_count": 30,
+            "outcome_win_rate": 0.30,
+            "net_pnl": "5.0000",
+        },
+    ]
+    reasons = _crypto_price_bucket_gate_reasons(bucket_matrix, crypto_policy=policy)
+    # Two rows of 30 samples each aggregate to 60 (>= 40 floor) with a 30% win rate (< 0.45).
+    assert any("win rate" in reason and "0.50-0.75" in reason for reason in reasons)
+
+
+def test_crypto_price_bucket_gate_blocks_negative_net_pnl_bucket(tmp_path) -> None:
+    # Change 2: a price bucket above the sample floor with negative net PnL must fail.
+    settings = _settings(tmp_path)
+    policy = AgentPackService(settings).runtime_crypto_policy()
+    bucket_matrix = [
+        {
+            "entry_price_band": "0.25-0.50",
+            "sample_count": 50,
+            "outcome_win_rate": 0.90,  # high win rate, but PnL is negative
+            "net_pnl": "-12.5000",
+        },
+    ]
+    reasons = _crypto_price_bucket_gate_reasons(bucket_matrix, crypto_policy=policy)
+    assert any("net P/L" in reason and "0.25-0.50" in reason for reason in reasons)
+
+
+def test_crypto_price_bucket_gate_skips_buckets_below_sample_floor(tmp_path) -> None:
+    # Change 2 safety valve: a bleeding bucket below the sample floor is SKIPPED, not failed.
+    settings = _settings(tmp_path)
+    policy = AgentPackService(settings).runtime_crypto_policy()
+    bucket_matrix = [
+        {
+            "entry_price_band": "0.75-1.00",
+            "sample_count": 10,  # below the 40-sample floor
+            "outcome_win_rate": 0.10,
+            "net_pnl": "-50.0000",
+        },
+    ]
+    reasons = _crypto_price_bucket_gate_reasons(bucket_matrix, crypto_policy=policy)
+    assert reasons == []
+
+
 def test_crypto_decision_rows_use_candle_proxy_when_snapshot_quotes_missing(tmp_path) -> None:
     del tmp_path
     close = datetime(2026, 5, 1, 12, 15, tzinfo=UTC)
@@ -4087,7 +4172,7 @@ def test_crypto_candidate_quality_allows_high_cost_down_when_net_edge_positive(t
     assert candidates[0]["candidate_status"] == CRYPTO_LIVE_QUALITY
     assert candidates[0]["reason"] == "positive_fee_adjusted_live_quality_edge"
     assert candidates[0]["remaining_payout_dollars"] == "0.1500"
-    assert candidates[0]["runtime_thresholds"]["min_remaining_payout_bps"] == 0
+    assert candidates[0]["runtime_thresholds"]["min_remaining_payout_bps"] == 300
 
 
 def test_crypto_dashboard_signal_metrics_follow_current_quote(tmp_path) -> None:
@@ -4179,7 +4264,9 @@ def test_crypto_dashboard_quote_refresh_anchors_contrarian_low_price_prediction_
     assert trace["raw_predicted_winner_side"] == "no"
     assert trace["predicted_winner_side"] == "yes"
     assert trace["selected_side"] == "yes"
-    assert trace["selection_reason"] == "fee_adjusted_edge_below_live_min"
+    # Change 3: CRYPTO_MIN_REMAINING_PAYOUT_BPS raised 0 -> 300. The anchored YES winner at
+    # ask 0.98 leaves only 200bps remaining payout, so it now trips the remaining-payout floor.
+    assert trace["selection_reason"] == "remaining_payout_below_crypto_min"
     assert trace["raw_fair_yes_dollars"] == "0.3664"
     assert trace["market_anchored_fair_yes_dollars"] == "0.8229"
     no_candidate = next(candidate for candidate in trace["candidates"] if candidate["side"] == "no")
@@ -4371,7 +4458,9 @@ def test_crypto_replay_candidate_selection_does_not_require_empirical_bucket_mat
 
 def test_crypto_replay_uses_runtime_asset_entry_overrides_for_candidate_support(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=50)
-    rows = [_replay_row(market_day="2026-05-01", mid_yes_dollars=Decimal("0.6000"))]
+    # spread_bps kept within the K*edge spread clamp (Change 1) so the fee-adjusted edge
+    # override (3000bps) is the binding gate, not max_spread.
+    rows = [_replay_row(market_day="2026-05-01", mid_yes_dollars=Decimal("0.6000"), spread_bps=40)]
     service = AgentPackService(settings)
     policy = service.runtime_crypto_policy(
         service.default_pack().model_copy(
@@ -5038,7 +5127,7 @@ def test_crypto_production_runtime_live_policy_requires_control_live_note(tmp_pa
     assert status["asset_mode"] == "live"
     assert status["control_asset_mode"] == "shadow"
     assert status["live_eligible"] is False
-    assert "not explicitly live in deployment control" in status["live_blockers"][0]
+    assert any("not explicitly live in deployment control" in blocker for blocker in status["live_blockers"])
 
 
 def test_crypto_production_explicit_shadow_note_overrides_runtime_live_policy(tmp_path) -> None:

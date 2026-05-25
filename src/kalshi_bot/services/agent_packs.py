@@ -69,6 +69,10 @@ class RuntimeCryptoPolicy:
     replay_require_calibration_better_than_mid: bool
     replay_require_pnl_beats_market_mid: bool
     replay_min_pnl_advantage_dollars: float
+    replay_per_price_bucket_gate_enabled: bool
+    replay_per_price_bucket_min_samples: int
+    replay_per_price_bucket_min_win_rate: float
+    replay_per_price_bucket_min_net_pnl_dollars: float
     trading_enabled: bool
     production_autonomy_enabled: bool
     asset_modes: dict[str, str]
@@ -218,7 +222,10 @@ class AgentPackService:
             crypto_policy=AgentPackCryptoPolicy(
                 entry=AgentPackCryptoEntryPolicy(
                     min_fee_adjusted_edge_bps=self.settings.risk_min_edge_bps,
-                    max_spread_bps=self._clamp_crypto_spread_bps(self.settings.crypto_live_max_spread_bps),
+                    max_spread_bps=self._clamp_crypto_spread_bps(
+                        self.settings.crypto_live_max_spread_bps,
+                        min_edge_bps=self.settings.risk_min_edge_bps,
+                    ),
                     min_confidence=self.settings.risk_min_confidence,
                     min_contract_price_dollars=self.settings.risk_min_contract_price_dollars,
                     min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
@@ -461,6 +468,14 @@ class AgentPackService:
         def value_or_settings(value: Any, fallback: Any) -> Any:
             return fallback if value is None else value
 
+        # Resolve the base entry edge up front so per-asset overrides that do not set
+        # their own edge inherit the effective base edge when clamping max_spread
+        # (Change 1: max_spread <= crypto_max_spread_to_edge_ratio * min_edge).
+        resolved_min_edge_bps = max(
+            int(value_or_settings(entry.min_fee_adjusted_edge_bps, self.settings.risk_min_edge_bps)),
+            int(self.settings.risk_min_edge_bps),
+        )
+
         overrides: dict[str, dict[str, Any]] = {}
         max_target_position_pct = min(max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0), 0.15)
         for raw_symbol, raw_entry in (policy.asset_entry_overrides or {}).items():
@@ -483,7 +498,15 @@ class AgentPackService:
                     int(self.settings.risk_min_edge_bps),
                 )
             if override["max_spread_bps"] is not None:
-                override["max_spread_bps"] = self._clamp_crypto_spread_bps(override["max_spread_bps"])
+                # When the override does not set its own edge, the effective edge for this
+                # asset is inherited from the base entry (entry_for_asset merges only
+                # non-None override values), so clamp the spread against the base edge.
+                override_edge_bps = override["min_fee_adjusted_edge_bps"]
+                if override_edge_bps is None:
+                    override_edge_bps = resolved_min_edge_bps
+                override["max_spread_bps"] = self._clamp_crypto_spread_bps(
+                    override["max_spread_bps"], min_edge_bps=int(override_edge_bps)
+                )
             if override["target_position_pct"] is not None:
                 override["target_position_pct"] = min(
                     max(float(override["target_position_pct"]), 0.0),
@@ -492,12 +515,10 @@ class AgentPackService:
             overrides[_normalize_crypto_entry_override_key(raw_symbol)] = override
 
         return RuntimeCryptoPolicy(
-            min_fee_adjusted_edge_bps=max(
-                int(value_or_settings(entry.min_fee_adjusted_edge_bps, self.settings.risk_min_edge_bps)),
-                int(self.settings.risk_min_edge_bps),
-            ),
+            min_fee_adjusted_edge_bps=resolved_min_edge_bps,
             max_spread_bps=self._clamp_crypto_spread_bps(
-                value_or_settings(entry.max_spread_bps, self.settings.crypto_live_max_spread_bps)
+                value_or_settings(entry.max_spread_bps, self.settings.crypto_live_max_spread_bps),
+                min_edge_bps=resolved_min_edge_bps,
             ),
             min_confidence=float(value_or_settings(entry.min_confidence, self.settings.risk_min_confidence)),
             min_contract_price_dollars=self._contract_price_floor(
@@ -559,6 +580,18 @@ class AgentPackService:
                     replay.min_pnl_advantage_dollars,
                     self.settings.crypto_replay_min_pnl_advantage_dollars,
                 )
+            ),
+            replay_per_price_bucket_gate_enabled=bool(
+                self.settings.crypto_replay_per_price_bucket_gate_enabled
+            ),
+            replay_per_price_bucket_min_samples=int(
+                self.settings.crypto_replay_per_price_bucket_min_samples
+            ),
+            replay_per_price_bucket_min_win_rate=float(
+                self.settings.crypto_replay_per_price_bucket_min_win_rate
+            ),
+            replay_per_price_bucket_min_net_pnl_dollars=float(
+                self.settings.crypto_replay_per_price_bucket_min_net_pnl_dollars
             ),
             trading_enabled=bool(value_or_settings(live.trading_enabled, self.settings.crypto_trading_enabled)),
             production_autonomy_enabled=bool(
@@ -720,11 +753,18 @@ class AgentPackService:
             target_position_pct=self._clamp_float(entry.target_position_pct, 0.0, max_target_position_pct),
         )
 
-    @staticmethod
-    def _clamp_crypto_spread_bps(value: int | float | None) -> int | None:
+    def _clamp_crypto_spread_bps(
+        self, value: int | float | None, *, min_edge_bps: int | None = None
+    ) -> int | None:
         if value is None:
             return None
-        return max(CRYPTO_MIN_SPREAD_BPS, min(CRYPTO_MAX_SPREAD_BPS, int(value)))
+        clamped = max(CRYPTO_MIN_SPREAD_BPS, min(CRYPTO_MAX_SPREAD_BPS, int(value)))
+        if min_edge_bps is not None and min_edge_bps > 0:
+            ratio = float(self.settings.crypto_max_spread_to_edge_ratio)
+            edge_cap = int(ratio * int(min_edge_bps))
+            # Invariant must win over the 100bps floor: cap unconditionally last.
+            clamped = min(clamped, edge_cap)
+        return clamped
 
     def _contract_price_floor(self, value: Any) -> float:
         if value is None:
