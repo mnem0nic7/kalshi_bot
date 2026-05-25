@@ -112,6 +112,7 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
     "lightgbm_classifier",
 )
 CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
+CRYPTO_CROSS_ASSET_FEATURE_ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE")
 CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_fee_adjusted_edge_bps": (750, 1000, 1500, 2500, 5000),
     "max_spread_bps": (80, 150, 250, 400, 600, 1000),
