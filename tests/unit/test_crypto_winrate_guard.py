@@ -60,19 +60,23 @@ async def _seed_outcomes(
     frequency: str = "15m",
     fill_count: int = 1,
     settled: bool = True,
+    tag: str = "a",
 ) -> None:
-    base = datetime(2026, 5, 1, tzinfo=UTC)
+    # `tag` namespaces market_ticker/decision_time/input_hash so multiple seed
+    # calls for the same symbol produce distinct rows instead of upsert-colliding
+    # on (kalshi_env, market_ticker, decision_time, input_hash).
+    base = datetime(2026, 5, 1, tzinfo=UTC) + timedelta(hours=ord(tag[0]))
     async with session_factory() as session:
         repo = PlatformRepository(session, kalshi_env="demo")
         for idx, pnl in enumerate(pnls):
             await repo.upsert_crypto_decision_outcome(
                 kalshi_env="demo",
                 frequency=frequency,
-                market_ticker=f"{symbol}-{idx}",
+                market_ticker=f"{symbol}-{tag}-{idx}",
                 asset_symbol=symbol,
                 decision_time=base + timedelta(minutes=idx),
                 decision_kind="trade",
-                input_hash=f"{symbol}-hash-{idx}",
+                input_hash=f"{symbol}-{tag}-hash-{idx}",
                 settlement_result="yes" if settled else None,
                 realized_pnl_dollars=None if pnl is None else Decimal(str(pnl)),
                 fill_count=fill_count,
@@ -196,13 +200,14 @@ async def test_counter_resets_on_healthy_window(tmp_path):
 
 async def test_repo_excludes_unsettled_and_unfilled(tmp_path):
     _, session_factory, service = await _build(tmp_path)
-    # settled+filled: counts; unsettled: excluded; fill_count=0: excluded
-    await _seed_outcomes(session_factory, symbol="ETH", pnls=[5.0, -1.0])
+    # settled+filled: counts; unsettled: excluded; fill_count=0: excluded.
+    # Distinct tags keep these three sets from upsert-colliding on the conflict key.
+    await _seed_outcomes(session_factory, symbol="ETH", pnls=[5.0, -1.0], tag="a")
     await _seed_outcomes(
-        session_factory, symbol="ETH", pnls=[-1.0, -1.0], settled=False, fill_count=1
+        session_factory, symbol="ETH", pnls=[-1.0, -1.0], settled=False, fill_count=1, tag="b"
     )
     await _seed_outcomes(
-        session_factory, symbol="ETH", pnls=[-1.0, -1.0], fill_count=0
+        session_factory, symbol="ETH", pnls=[-1.0, -1.0], fill_count=0, tag="c"
     )
     async with session_factory() as session:
         repo = PlatformRepository(session, kalshi_env="demo")
