@@ -66,6 +66,60 @@ async def test_reconcile_checkpoint_records_live_tickers_and_time(tmp_path) -> N
         await engine.dispose()
 
 
+class CryptoFillKalshi(FakeKalshi):
+    """Models the order-write race: a crypto buy fill arrives with no pre-attributed
+    order, so attribution must come deterministically from the ticker."""
+
+    async def get_positions(self, *, subaccount: int = 0):
+        return {"market_positions": []}
+
+    async def get_orders(self):
+        return {"orders": []}
+
+    async def get_fills(self):
+        return {
+            "fills": [
+                {
+                    "market_ticker": "KXBTC15M-26MAY251800-00",
+                    "side": "no",
+                    "action": "buy",
+                    "yes_price_dollars": "0.4000",
+                    "count_fp": "5.00",
+                    "trade_id": "trade-crypto-1",
+                    "is_taker": True,
+                }
+            ]
+        }
+
+
+@pytest.mark.asyncio
+async def test_reconcile_attributes_crypto_buy_fill_from_ticker(tmp_path) -> None:
+    from sqlalchemy import select
+
+    from kalshi_bot.core.enums import StrategyCode
+    from kalshi_bot.db.models import FillRecord
+
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/reconcile_crypto.db")
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    try:
+        async with session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env="demo")
+            await ReconciliationService(CryptoFillKalshi(), settings).reconcile(
+                repo,
+                subaccount=0,
+                kalshi_env="demo",
+            )
+            await session.commit()
+            fill = (
+                await session.execute(select(FillRecord).where(FillRecord.trade_id == "trade-crypto-1"))
+            ).scalar_one()
+        assert fill.strategy_code == StrategyCode.CRYPTO_15M.value
+    finally:
+        await engine.dispose()
+
+
 class CutoffUnavailableKalshi(FakeKalshi):
     async def get_historical_cutoff(self):
         raise RuntimeError("historical cutoff unavailable")

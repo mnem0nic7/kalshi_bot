@@ -8,10 +8,28 @@ from decimal import Decimal
 from typing import Any
 
 from kalshi_bot.config import Settings, get_settings
+from kalshi_bot.core.enums import StrategyCode
 from kalshi_bot.core.fixed_point import as_decimal, quantize_count, quantize_price
+from kalshi_bot.crypto.parsing import _frequency_from_ticker
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.position_governance import refresh_stop_loss_checkpoints
+
+# Deterministic strategy attribution from a crypto market ticker. Reconcile creates
+# order/fill rows from Kalshi's API, where the workflow's attributed save_order may
+# not have landed yet (order-write race), leaving fills with strategy_code=None.
+# Deriving the strategy from the ticker is race-independent.
+_CRYPTO_FREQUENCY_STRATEGY_CODES = {
+    "15m": StrategyCode.CRYPTO_15M.value,
+    "1h": StrategyCode.CRYPTO_1H.value,
+}
+
+
+def _crypto_strategy_code_for_ticker(market_ticker: str) -> str | None:
+    frequency = _frequency_from_ticker(market_ticker)
+    if frequency is None:
+        return None
+    return _CRYPTO_FREQUENCY_STRATEGY_CODES.get(frequency)
 
 logger = logging.getLogger(__name__)
 
@@ -151,21 +169,31 @@ class ReconciliationService:
                 raw=order,
                 kalshi_order_id=order.get("order_id"),
                 kalshi_env=kalshi_env,
+                strategy_code=_crypto_strategy_code_for_ticker(market_ticker),
             )
 
         for fill in fills:
             yes_price = fill.get("yes_price_dollars") or fill.get("price_dollars") or "0.5000"
             count = fill.get("count_fp") or "1.00"
+            fill_market_ticker = _stringish(fill.get("market_ticker") or fill.get("ticker"), "unknown")
+            fill_action = _stringish(fill.get("action") or fill.get("user_action"), "buy")
+            # Attribute buys deterministically from the ticker (race-independent). Leave
+            # sells to the rich resolver so they inherit strategy + economic side from the
+            # now-attributed opening buy via _latest_attributed_buy_fill.
+            buy_strategy_code = (
+                _crypto_strategy_code_for_ticker(fill_market_ticker) if fill_action == "buy" else None
+            )
             await repo.upsert_fill(
-                market_ticker=_stringish(fill.get("market_ticker") or fill.get("ticker"), "unknown"),
+                market_ticker=fill_market_ticker,
                 side=_stringish(fill.get("side"), "yes"),
-                action=_stringish(fill.get("action") or fill.get("user_action"), "buy"),
+                action=fill_action,
                 yes_price_dollars=quantize_price(yes_price),
                 count_fp=quantize_count(count),
                 raw=fill,
                 trade_id=fill.get("trade_id"),
                 is_taker=bool(fill.get("is_taker", True)),
                 kalshi_env=kalshi_env,
+                strategy_code=buy_strategy_code,
             )
 
         await repo.settle_fills(settlements, kalshi_env=kalshi_env)
