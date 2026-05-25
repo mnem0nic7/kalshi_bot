@@ -259,6 +259,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
     ports:
       - "127.0.0.1:${POSTGRES_PRODUCTION_PORT:-5433}:5432"
     volumes:
