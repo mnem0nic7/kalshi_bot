@@ -148,6 +148,11 @@ class Settings(BaseSettings):
     risk_edge_scaled_sizing_enabled: bool = False
     risk_edge_scaled_kelly_multiplier: float = 0.25
     risk_daily_loss_dollars_by_strategy: dict[str, float] = Field(default_factory=dict)
+    # Fallback per-strategy daily realized-loss circuit breaker (dollars) for any
+    # strategy not explicitly listed in risk_daily_loss_dollars_by_strategy. Default 0
+    # preserves the historical "no configured cap = unlimited" semantics; production
+    # opts in via RISK_PER_STRATEGY_DAILY_LOSS_DEFAULT_DOLLARS. Tune to account size.
+    risk_per_strategy_daily_loss_default_dollars: float = 0.0
     weather_live_probe_min_loss_dollars: float = 1.0
     weather_live_probe_min_confidence: float = 0.90
     weather_live_probe_min_net_edge_bps: int = 5000

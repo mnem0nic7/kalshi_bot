@@ -2122,3 +2122,50 @@ def test_non_standard_regime_does_not_emit_zero_risky_bucket_noise() -> None:
     assert verdict.status == RiskStatus.BLOCKED
     assert "non_standard_regime" in verdict.reason_codes
     assert not any("Risky capital bucket is full" in reason for reason in verdict.reasons)
+
+
+def test_per_strategy_cap_fallback_default_blocks_unlisted_strategy() -> None:
+    """The fallback default applies to strategies absent from the explicit dict,
+    so an unlisted bleeding strategy is halted once the default is set."""
+    settings = _base_settings(risk_per_strategy_daily_loss_default_dollars=50.0)
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="B",
+        strategy_daily_realized_pnl_dollars=Decimal("-60.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.BLOCKED
+    assert any("daily cap" in reason for reason in verdict.reasons)
+
+
+def test_per_strategy_cap_explicit_overrides_fallback_default() -> None:
+    """An explicit per-strategy cap takes precedence over the fallback default."""
+    settings = _base_settings(
+        risk_daily_loss_dollars_by_strategy={"B": 200.0},
+        risk_per_strategy_daily_loss_default_dollars=50.0,
+    )
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="B",
+        strategy_daily_realized_pnl_dollars=Decimal("-60.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.APPROVED
+
+
+def test_per_strategy_cap_fallback_default_zero_is_unlimited() -> None:
+    """Default of 0 preserves the historical unlimited semantics for unlisted strategies."""
+    settings = _base_settings(risk_per_strategy_daily_loss_default_dollars=0.0)
+    engine = DeterministicRiskEngine(settings)
+    context = RiskContext(
+        market_observed_at=datetime.now(UTC),
+        research_observed_at=datetime.now(UTC),
+        strategy_code="B",
+        strategy_daily_realized_pnl_dollars=Decimal("-1000.00"),
+    )
+    verdict = _base_eval(engine, context)
+    assert verdict.status == RiskStatus.APPROVED

@@ -933,7 +933,8 @@ class DeterministicRiskEngine:
             and context.strategy_daily_realized_pnl_dollars is not None
         ):
             cap_dollars = self.settings.risk_daily_loss_dollars_by_strategy.get(
-                context.strategy_code
+                context.strategy_code,
+                self.settings.risk_per_strategy_daily_loss_default_dollars,
             )
             if cap_dollars is not None and cap_dollars > 0:
                 realized_loss_dollars = -float(context.strategy_daily_realized_pnl_dollars)
