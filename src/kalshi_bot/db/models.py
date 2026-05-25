@@ -587,6 +587,14 @@ class FillRecord(Base, IdMixin, TimestampMixin):
     settlement_result: Mapped[str | None] = mapped_column(String(8), nullable=True)
     strategy_code: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Decision-context lineage (reconcile-only, all nullable + additive). Enables
+    # per-bucket win/loss analysis and slippage = yes_price_dollars - decision_price.
+    decision_edge_bps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    decision_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    decision_spread_bps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    decision_fair_yes: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    decision_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    decision_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
 class WeatherBootstrapEventRecord(Base, IdMixin, TimestampMixin):

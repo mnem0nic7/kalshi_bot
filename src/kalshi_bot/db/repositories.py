@@ -2850,6 +2850,55 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
 
         return order_id, None, None
 
+    async def _resolve_fill_decision_context(self, *, order_id: str | None) -> dict[str, Any]:
+        """Resolve decision-time lineage for a fill.
+
+        Joins order_id -> OrderRecord -> trade_ticket_id -> TradeTicketRecord.room_id
+        -> latest Signal for that room. Returns the six decision_* fields, all None
+        when no order/ticket/signal can be resolved (never raises).
+        """
+        context: dict[str, Any] = {
+            "decision_edge_bps": None,
+            "decision_confidence": None,
+            "decision_spread_bps": None,
+            "decision_fair_yes": None,
+            "decision_price": None,
+            "decision_ts": None,
+        }
+        if order_id is None:
+            return context
+        order = (
+            await self.session.execute(select(OrderRecord).where(OrderRecord.id == order_id))
+        ).scalar_one_or_none()
+        if order is None:
+            return context
+        # decision_price = the price we decided to trade at (the order's yes price).
+        context["decision_price"] = order.yes_price_dollars
+        if order.trade_ticket_id is None:
+            return context
+        ticket = (
+            await self.session.execute(
+                select(TradeTicketRecord).where(TradeTicketRecord.id == order.trade_ticket_id)
+            )
+        ).scalar_one_or_none()
+        if ticket is None:
+            return context
+        signal = await self.get_latest_signal_for_room(ticket.room_id)
+        if signal is None:
+            return context
+        context["decision_edge_bps"] = signal.edge_bps
+        context["decision_confidence"] = signal.confidence
+        context["decision_fair_yes"] = signal.fair_yes_dollars
+        context["decision_ts"] = signal.created_at
+        payload = signal.payload if isinstance(signal.payload, dict) else {}
+        spread = payload.get("spread_bps")
+        if spread not in (None, ""):
+            try:
+                context["decision_spread_bps"] = int(spread)
+            except (TypeError, ValueError):
+                context["decision_spread_bps"] = None
+        return context
+
     async def upsert_fill(
         self,
         *,
@@ -2877,6 +2926,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             action=action,
         )
         economic_side = resolved_side or side
+        decision_context = await self._resolve_fill_decision_context(order_id=resolved_order_id)
         if trade_id is not None:
             observed_at = datetime.now(UTC)
             insert_values = {
@@ -2894,6 +2944,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 "is_taker": is_taker,
                 "created_at": observed_at,
                 "updated_at": observed_at,
+                **decision_context,
             }
             dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
             if dialect_name == "postgresql":
@@ -2918,6 +2969,12 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                             "raw": excluded.raw,
                             "is_taker": excluded.is_taker,
                             "updated_at": observed_at,
+                            "decision_edge_bps": func.coalesce(excluded.decision_edge_bps, FillRecord.decision_edge_bps),
+                            "decision_confidence": func.coalesce(excluded.decision_confidence, FillRecord.decision_confidence),
+                            "decision_spread_bps": func.coalesce(excluded.decision_spread_bps, FillRecord.decision_spread_bps),
+                            "decision_fair_yes": func.coalesce(excluded.decision_fair_yes, FillRecord.decision_fair_yes),
+                            "decision_price": func.coalesce(excluded.decision_price, FillRecord.decision_price),
+                            "decision_ts": func.coalesce(excluded.decision_ts, FillRecord.decision_ts),
                         },
                     )
                 )
@@ -2948,6 +3005,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 strategy_code=resolved_strategy,
                 raw=raw,
                 is_taker=is_taker,
+                **decision_context,
             )
             self.session.add(record)
         else:
@@ -2961,6 +3019,10 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 record.strategy_code = resolved_strategy
             record.raw = raw
             record.is_taker = is_taker
+            # Coalesce: only fill in decision_* that are still NULL (don't clobber).
+            for field, value in decision_context.items():
+                if value is not None and getattr(record, field) is None:
+                    setattr(record, field, value)
         await self.session.flush()
         return record
 
