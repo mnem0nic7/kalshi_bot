@@ -1308,6 +1308,15 @@ async def _crypto_live_path_runtime_state(
                     asset_symbol=asset,
                     allow_generic_fallback=False,
                 )
+                if record is None and artifact_type == "backtest":
+                    record = await _latest_crypto_artifact_for_asset(
+                        repo,
+                        frequency=frequency,
+                        artifact_type=artifact_type,
+                        kalshi_env=container.settings.kalshi_env,
+                        asset_symbol=asset,
+                        allow_generic_fallback=True,
+                    )
                 payload = _crypto_artifact_payload(record)
                 if record is not None and artifact_type == "backtest":
                     is_per_asset = record.artifact_type == f"backtest:{asset}"

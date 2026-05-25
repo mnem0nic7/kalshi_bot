@@ -294,6 +294,7 @@ async def _latest_crypto_artifact_for_asset(
     artifact_type: str,
     kalshi_env: str,
     asset_symbol: str | None = None,
+    allow_generic_fallback: bool = True,
 ) -> Any | None:
     if asset_symbol:
         artifact = await repo.get_latest_crypto_model_artifact(
@@ -303,6 +304,8 @@ async def _latest_crypto_artifact_for_asset(
         )
         if artifact is not None:
             return artifact
+    if not allow_generic_fallback:
+        return None
     return await repo.get_latest_crypto_model_artifact(
         frequency=frequency,
         artifact_type=artifact_type,
@@ -1382,31 +1385,41 @@ class CryptoHistoryService:
             "recent_quote_evidence": _crypto_quote_evidence_summary(recent_snapshots, [], settings=self.settings),
         }
 
-    async def status(self, *, frequency: str = "15m", days: int | float | None = None) -> dict[str, Any]:
+    async def status(
+        self,
+        *,
+        frequency: str = "15m",
+        days: int | float | None = None,
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
+        requested_assets = normalize_asset_symbols(asset_symbols)
         cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             snapshots = await repo.list_crypto_market_snapshots(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=200_000,
             )
             candles = await repo.list_crypto_market_candlesticks(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=500_000,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
                 since=cutoff,
                 limit=1_000_000,
             )
             await session.commit()
-        asset_symbols = _crypto_expected_spot_assets(
+        expected_assets = requested_assets or _crypto_expected_spot_assets(
             self.settings,
             observed_assets={row.asset_symbol for row in snapshots} | {row.asset_symbol for row in candles},
         )
@@ -1423,7 +1436,7 @@ class CryptoHistoryService:
             ),
             "spot_quality": _crypto_spot_quality(
                 spot_rows,
-                expected_assets=asset_symbols,
+                expected_assets=expected_assets,
                 min_coverage_pct=self.settings.crypto_replay_min_spot_coverage_pct,
                 settings=self.settings,
             ),
