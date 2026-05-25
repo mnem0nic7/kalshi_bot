@@ -1466,6 +1466,7 @@ class CryptoHistoryService:
                 asset_symbols=assets,
                 since=cutoff,
                 limit=1_000_000,
+                defer_payload=True,
             )
             await session.commit()
         expected_assets = (

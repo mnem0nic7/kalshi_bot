@@ -60,6 +60,7 @@ def _crypto_take_profit_frequencies(raw: str | None) -> set[str]:
     return values or {"15m", "1h"}
 
 
+
 def _crypto_mid(snapshot: CryptoMarketSnapshotRecord, side: str) -> Decimal | None:
     yes_bid = snapshot.yes_bid_dollars
     yes_ask = snapshot.yes_ask_dollars

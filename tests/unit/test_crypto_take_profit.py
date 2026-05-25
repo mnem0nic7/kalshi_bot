@@ -45,6 +45,7 @@ def test_take_profit_frequencies_accepts_hour_aliases():
     assert _crypto_take_profit_frequencies("1hour") == {"1h"}
     assert _crypto_take_profit_frequencies("15m,1h") == {"15m", "1h"}
 
+
 def test_mid_yes_side():
     snap = _snapshot("0.58", "0.62")
     assert _crypto_mid(snap, "yes") == Decimal("0.60")
