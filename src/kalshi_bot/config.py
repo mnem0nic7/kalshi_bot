@@ -232,10 +232,10 @@ class Settings(BaseSettings):
     crypto_entry_policy_optimizer_days: int = 30
     crypto_portfolio_max_allocation_pct: float = 1.0
     crypto_history_auto_enabled: bool = True
-    crypto_history_auto_interval_seconds: int = 3600
+    crypto_history_auto_interval_seconds: int = 900
     crypto_history_auto_lookback_days: int = 2
     crypto_quote_evidence_enabled: bool = True
-    crypto_quote_evidence_interval_seconds: int = 60
+    crypto_quote_evidence_interval_seconds: int = 15
     crypto_spot_request_timeout_seconds: float = 30.0
     coinbase_cdp_api_key_file: str | None = "cdp_api_key.json"
     coinbase_cdp_key_name: str | None = None
@@ -245,7 +245,7 @@ class Settings(BaseSettings):
     crypto_spot_coinbase_max_stale_seconds: int = 180
     crypto_spot_coingecko_max_stale_seconds: int = 90
     crypto_spot_current_auto_enabled: bool = True
-    crypto_spot_current_interval_seconds: int = 30
+    crypto_spot_current_interval_seconds: int = 15
     crypto_spot_history_auto_enabled: bool = True
     crypto_spot_history_auto_lookback_days: int = 2
     crypto_replay_min_spot_coverage_pct: float = 0.95

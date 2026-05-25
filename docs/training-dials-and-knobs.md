@@ -624,12 +624,12 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_DYNAMIC_ORDER_SIZING_SCOPE` | `live_quality` | Candidate scope for crypto dynamic sizing. |
 | `CRYPTO_DYNAMIC_ORDER_TARGET_POSITION_PCT` | `0.10` | Target crypto position allocation as a fraction of capital, capped by `RISK_POSITION_PCT`. |
 | `CRYPTO_HISTORY_AUTO_ENABLED` | `true` | Enables automatic history collection. |
-| `CRYPTO_HISTORY_AUTO_INTERVAL_SECONDS` | `3600` | History collection cadence. |
+| `CRYPTO_HISTORY_AUTO_INTERVAL_SECONDS` | `900` | History collection cadence. |
 | `CRYPTO_HISTORY_AUTO_LOOKBACK_DAYS` | `2` | Auto history lookback. |
 | `CRYPTO_QUOTE_EVIDENCE_ENABLED` | `true` | Enables quote evidence collection. |
-| `CRYPTO_QUOTE_EVIDENCE_INTERVAL_SECONDS` | `60` | Quote evidence cadence. |
+| `CRYPTO_QUOTE_EVIDENCE_INTERVAL_SECONDS` | `15` | Quote evidence cadence. |
 | `CRYPTO_SPOT_CURRENT_AUTO_ENABLED` | `true` | Enables current spot auto collection. |
-| `CRYPTO_SPOT_CURRENT_INTERVAL_SECONDS` | `30` | Current spot cadence. |
+| `CRYPTO_SPOT_CURRENT_INTERVAL_SECONDS` | `15` | Current spot cadence. |
 | `CRYPTO_SPOT_HISTORY_AUTO_ENABLED` | `true` | Enables spot history auto collection. |
 | `CRYPTO_SPOT_HISTORY_AUTO_LOOKBACK_DAYS` | `2` | Spot history auto lookback. |
 | `CRYPTO_SPOT_PROXY_FALLBACK_ENABLED` | `false` | Allows proxy spot fallback. Proxy-only data is not live-quality. |

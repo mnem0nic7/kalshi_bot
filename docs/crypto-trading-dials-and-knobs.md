@@ -141,7 +141,7 @@ Crypto has two data streams:
 | `crypto_historical_pagination_stop_at_cutoff` | `False` | Stops historical-market pagination when a full page is older than the requested cutoff; useful for bounded catch-ups after confirming Kalshi returns newest-first pages. |
 | `crypto_history_candle_concurrency` | `1` | Max concurrent Kalshi candlestick fetches during crypto history backfills. |
 | `crypto_history_auto_enabled` | `True` | Enables scheduled market-history collection. |
-| `crypto_history_auto_interval_seconds` | `3600` | Scheduled market-history collection cadence. |
+| `crypto_history_auto_interval_seconds` | `900` | Scheduled market-history collection cadence. |
 | `crypto_history_auto_lookback_days` | `2` | Lookback window for scheduled incremental collection. |
 | `crypto-history bootstrap --days` | `180` | Backfills market history for the requested horizon. |
 | `crypto-history collect-settled --days` | `2` | Collects recently settled crypto markets. |
@@ -169,7 +169,7 @@ python -m kalshi_bot.cli crypto-history status --kalshi-env production --frequen
 | `crypto_spot_coinbase_max_stale_seconds` | `180` | Max age for Coinbase spot data. |
 | `crypto_spot_coingecko_max_stale_seconds` | `90` | Max age for CoinGecko spot fallback data. |
 | `crypto_spot_current_auto_enabled` | `True` | Enables scheduled current-spot collection. |
-| `crypto_spot_current_interval_seconds` | `30` | Current-spot collection cadence. |
+| `crypto_spot_current_interval_seconds` | `15` | Current-spot collection cadence. |
 | `crypto_spot_history_auto_enabled` | `True` | Enables scheduled spot-history backfill. |
 | `crypto_spot_history_auto_lookback_days` | `2` | Scheduled spot-history lookback. |
 | `crypto-spot backfill --days` | `180` | Backfills spot history for training and replay. |
@@ -217,7 +217,7 @@ Funding rates are stored in the `crypto_funding_rates` table (migration `2026051
 | Setting | Current default | Effect |
 | --- | ---: | --- |
 | `crypto_quote_evidence_enabled` | `True` | Enables strict quote-evidence collection. Production can collect shadow evidence even when production autonomy is not live-enabled. |
-| `crypto_quote_evidence_interval_seconds` | `60` | Quote-evidence collection cadence. |
+| `crypto_quote_evidence_interval_seconds` | `15` | Quote-evidence collection cadence. |
 
 Quote evidence matters because replay promotion requires strict real-quote trade
 quality. Proxy-only or stale spot evidence can still be useful diagnostically,
