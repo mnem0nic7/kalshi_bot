@@ -762,6 +762,8 @@ class DaemonService:
                 continue
             if not await self._is_active_color():
                 continue
+            if not self._weather_market_updates_enabled():
+                continue
             try:
                 await self.market_history_service.snapshot_once()
                 await self.market_history_service.purge_once()
@@ -1177,6 +1179,8 @@ class DaemonService:
 
     async def _maybe_capture_checkpoint_archives(self) -> dict[str, Any] | None:
         if self.historical_training_service is None:
+            return None
+        if not self._weather_market_updates_enabled():
             return None
         result = await self.historical_training_service.capture_checkpoint_archives_once(
             due_only=True,
