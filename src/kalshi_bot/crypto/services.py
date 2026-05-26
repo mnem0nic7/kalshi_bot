@@ -3108,7 +3108,17 @@ class CryptoForecastService:
             ),
         )
         mid = market.mid_yes_dollars or market.last_price_dollars or Decimal("0.5000")
-        if artifact is None or artifact.status != "trained":
+        market_row = _crypto_live_market_row(market, spot_rows=spot_rows, cross_asset_spot=cross_asset_spot, funding_rate_rows=funding_rate_rows, settings=self.settings)
+        features = {**features, "spot_features": _json_ready_spot_features(market_row)}
+        empirical_bucket_matrix = _crypto_empirical_bucket_matrix_from_artifacts(gate, backtest)
+        last_minute_passive_price_matrix = _crypto_last_minute_passive_price_matrix_from_artifacts(gate, backtest)
+        if bool(self.settings.crypto_touch_strategy_enabled):
+            payload = {
+                "model_type": "deterministic_touch_strategy",
+                "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+            }
+            fair = _clamp_price(mid)
+        elif artifact is None or artifact.status != "trained":
             return self._stand_down(
                 market,
                 StandDownReason.CRYPTO_MODEL_UNAVAILABLE,
@@ -3116,12 +3126,9 @@ class CryptoForecastService:
                 features,
                 fair=mid,
             )
-        payload = artifact.payload or {}
-        market_row = _crypto_live_market_row(market, spot_rows=spot_rows, cross_asset_spot=cross_asset_spot, funding_rate_rows=funding_rate_rows, settings=self.settings)
-        features = {**features, "spot_features": _json_ready_spot_features(market_row)}
-        fair = _predict_crypto_probability(market_row, payload)
-        empirical_bucket_matrix = _crypto_empirical_bucket_matrix_from_artifacts(gate, backtest)
-        last_minute_passive_price_matrix = _crypto_last_minute_passive_price_matrix_from_artifacts(gate, backtest)
+        else:
+            payload = artifact.payload or {}
+            fair = _predict_crypto_probability(market_row, payload)
         action, side, target_yes, edge_bps, trace = _crypto_recommendation(
             market=market,
             fair_yes=fair,
@@ -3186,8 +3193,8 @@ class CryptoForecastService:
                 "frequency": market.frequency,
                 "strategy_code": strategy_code,
                 "features": features,
-                "model_version": artifact.version,
-                "model_metrics": artifact.metrics,
+                "model_version": artifact.version if artifact is not None else "deterministic-touch-strategy",
+                "model_metrics": artifact.metrics if artifact is not None else {},
                 "empirical_bucket_matrix_count": len(empirical_bucket_matrix),
                 "last_minute_passive_price_matrix_count": len(last_minute_passive_price_matrix),
                 "prediction_model": {
@@ -3195,15 +3202,15 @@ class CryptoForecastService:
                     "calibrated_probability": _money_text(fair),
                     "market_anchored_probability": _money_text(trade_fair),
                     "market_price_anchor": trace.get("market_price_anchor"),
-                    "calibration_version": artifact.version,
-                    "model_version": artifact.version,
+                    "calibration_version": artifact.version if artifact is not None else None,
+                    "model_version": artifact.version if artifact is not None else "deterministic-touch-strategy",
                     "feature_schema_version": payload.get("feature_schema_version"),
                     "model_type": payload.get("model_type"),
                     "candidate_registry_version": payload.get("candidate_registry_version"),
                     "candidate_champion": (payload.get("candidate_report") or {}).get("champion_name") if isinstance(payload.get("candidate_report"), dict) else None,
                     "ensemble_weights": payload.get("ensemble_weights"),
-                    "status": artifact.status,
-                    "metric_deltas": _crypto_metric_deltas(artifact.metrics or {}),
+                    "status": artifact.status if artifact is not None else "deterministic",
+                    "metric_deltas": _crypto_metric_deltas(artifact.metrics or {}) if artifact is not None else {},
                     "reason": None,
                 },
                 "trade_selection_model": {
@@ -4459,16 +4466,23 @@ class CryptoWorkflowService:
                     ),
                 )
                 await repo.update_room_stage(room.id, RoomStage.RISK)
+                runtime_thresholds = self.agent_pack_service.runtime_crypto_thresholds(
+                    crypto_policy,
+                    asset_symbol=market.asset_symbol,
+                    frequency=market.frequency,
+                )
+                if (signal.candidate_trace or {}).get("objective") == "touch_30pct_before_close":
+                    runtime_thresholds.risk_min_contract_price_dollars = min(
+                        float(runtime_thresholds.risk_min_contract_price_dollars),
+                        float(self.settings.crypto_touch_strategy_min_contract_price_dollars),
+                    )
                 verdict = self.risk_engine.evaluate(
                     room=room,
                     control=control,
                     ticket=ticket,
                     signal=signal,
                     context=risk_context,
-                    thresholds=self.agent_pack_service.runtime_crypto_thresholds(
-                        crypto_policy,
-                        asset_symbol=market.asset_symbol,
-                    ),
+                    thresholds=runtime_thresholds,
                 )
                 await repo.save_risk_verdict(
                     room_id=room.id,
@@ -5680,6 +5694,66 @@ def _crypto_recommendation(
     enforce_empirical_bucket_gate: bool = False,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
     row = row or _crypto_live_market_row(market, settings=settings)
+    if bool(settings.crypto_touch_strategy_enabled):
+        raw_fair_yes = _clamp_price(fair_yes)
+        entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
+        candidates = _crypto_touch_strategy_candidates(
+            row,
+            settings=settings,
+            crypto_policy=crypto_policy,
+            empirical_bucket_matrix=empirical_bucket_matrix,
+            enforce_empirical_bucket_gate=enforce_empirical_bucket_gate,
+        )
+        selected = next((candidate for candidate in candidates if candidate.get("candidate_status") == CRYPTO_LIVE_QUALITY), None)
+        best = selected or (candidates[0] if candidates else {})
+        selected_status = str(best.get("candidate_status") or "")
+        selected_side_raw = str(best.get("side") or "yes")
+        selected_side = ContractSide(selected_side_raw) if selected_side_raw in {"yes", "no"} else None
+        touch_probability = _decimal(best.get("model_probability") or Decimal("0.5000"))
+        trade_fair_yes = (
+            touch_probability
+            if selected_side == ContractSide.YES
+            else Decimal("1.0000") - touch_probability
+            if selected_side == ContractSide.NO
+            else raw_fair_yes
+        )
+        target_raw = best.get("target_yes_price_dollars")
+        target_yes = quantize_price(target_raw) if target_raw is not None else None
+        edge_bps = int(best.get("edge_bps") or 0)
+        live_quality = selected is not None and selected_side is not None and target_yes is not None
+        return (
+            TradeAction.BUY if live_quality else None,
+            selected_side if live_quality else None,
+            target_yes if live_quality else None,
+            edge_bps,
+            {
+                "outcome": "candidate_selected" if live_quality else "touch_strategy_blocked",
+                "fair_yes_dollars": _money_text(trade_fair_yes),
+                "raw_fair_yes_dollars": _money_text(raw_fair_yes),
+                "market_anchored_fair_yes_dollars": _money_text(trade_fair_yes),
+                "market_price_anchor": {"enabled": False, "reason": "touch_strategy_uses_bracket_probability"},
+                "raw_predicted_winner_side": selected_side_raw,
+                "predicted_winner_side": selected_side_raw,
+                "selected_side": selected_side.value if selected_side is not None else selected_side_raw,
+                "selected_edge_bps": edge_bps,
+                "candidate_status": selected_status,
+                "selection_reason": best.get("reason"),
+                "expected_net_edge": best.get("expected_net_edge"),
+                "rank": best.get("rank"),
+                "bucket_key": best.get("bucket_key"),
+                "empirical_bucket_gate": best.get("empirical_bucket_gate"),
+                "empirical_bucket_status": best.get("empirical_bucket_status"),
+                "target_yes_price_dollars": _money_text(target_yes) if target_yes is not None else None,
+                "min_edge_bps": entry_policy["min_fee_adjusted_edge_bps"],
+                "max_spread_bps": entry_policy["max_spread_bps"],
+                "spread_bps": market.spread_bps,
+                "candidates": candidates,
+                "gate_cascade": _crypto_candidate_gate_cascade(candidates, selected=selected if live_quality else None),
+                "touch_strategy": best.get("touch_strategy"),
+                "objective": "touch_30pct_before_close",
+                **_crypto_settlement_diagnostics(row),
+            },
+        )
     raw_fair_yes = _clamp_price(fair_yes)
     trade_fair_yes = _crypto_market_anchored_probability(row, raw_fair_yes, settings=settings)
     market_price_anchor = _crypto_market_price_anchor_trace(
@@ -10483,6 +10557,348 @@ def _crypto_settlement_diagnostics(row: dict[str, Any]) -> dict[str, Any]:
         "settlement_proxy_for_cfb_rti": settlement_proxy,
         "settlement_diagnostic_codes": [CRYPTO_SETTLEMENT_PROXY_REASON_CODE] if settlement_proxy else [],
     }
+
+
+def _touch_strategy_fee(price: Decimal, *, fee_rate: Decimal) -> Decimal:
+    return estimate_kalshi_taker_fee_dollars(
+        price_dollars=_clamp_price(price),
+        count=Decimal("1.00"),
+        fee_rate=fee_rate,
+    )
+
+
+def _touch_strategy_exit_price_for_net_profit(
+    entry_cost: Decimal,
+    *,
+    target_pct: Decimal,
+    fee_rate: Decimal,
+) -> Decimal | None:
+    entry_cost = _clamp_price(entry_cost)
+    entry_fee = _touch_strategy_fee(entry_cost, fee_rate=fee_rate)
+    denominator = entry_cost + entry_fee
+    if denominator <= Decimal("0"):
+        return None
+    required_net_profit = denominator * target_pct
+    low = entry_cost
+    high = Decimal("0.9999")
+    high_net = high - entry_cost - entry_fee - _touch_strategy_fee(high, fee_rate=fee_rate)
+    if high_net < required_net_profit:
+        return None
+    for _ in range(32):
+        mid = (low + high) / Decimal("2")
+        net_profit = mid - entry_cost - entry_fee - _touch_strategy_fee(mid, fee_rate=fee_rate)
+        if net_profit >= required_net_profit:
+            high = mid
+        else:
+            low = mid
+    return quantize_price(high)
+
+
+def _touch_strategy_exit_price_for_net_loss(
+    entry_cost: Decimal,
+    *,
+    stop_loss_pct: Decimal,
+    fee_rate: Decimal,
+) -> Decimal:
+    entry_cost = _clamp_price(entry_cost)
+    entry_fee = _touch_strategy_fee(entry_cost, fee_rate=fee_rate)
+    denominator = max(Decimal("0.0001"), entry_cost + entry_fee)
+    allowed_net_loss = -(denominator * stop_loss_pct)
+    low = Decimal("0.0001")
+    high = entry_cost
+    for _ in range(32):
+        mid = (low + high) / Decimal("2")
+        net_return = mid - entry_cost - entry_fee - _touch_strategy_fee(mid, fee_rate=fee_rate)
+        if net_return <= allowed_net_loss:
+            low = mid
+        else:
+            high = mid
+    return quantize_price(low)
+
+
+def _touch_strategy_entry_cost(row: dict[str, Any], side: str) -> Decimal | None:
+    if side == "yes":
+        value = row.get("yes_ask_dollars")
+    else:
+        value = row.get("no_ask_dollars")
+    if value in (None, ""):
+        return None
+    try:
+        cost = _clamp_price(_decimal(value))
+    except Exception:
+        return None
+    if cost <= Decimal("0") or cost >= Decimal("1"):
+        return None
+    return cost
+
+
+def _touch_strategy_target_yes_price(side: str, side_cost: Decimal) -> Decimal:
+    return side_cost if side == "yes" else Decimal("1.0000") - side_cost
+
+
+def _touch_strategy_allowed_spread(row: dict[str, Any], cost: Decimal, *, settings: Settings) -> tuple[bool, dict[str, Any]]:
+    spread_bps = _optional_int(row.get("spread_bps"))
+    max_spread_cents = Decimal(
+        str(
+            settings.crypto_touch_strategy_max_spread_cents_under_20c
+            if cost < Decimal("0.2000")
+            else settings.crypto_touch_strategy_max_spread_cents
+        )
+    )
+    max_spread_bps = int((max_spread_cents * Decimal("10000")).to_integral_value())
+    return (
+        spread_bps is not None and spread_bps <= max_spread_bps,
+        {
+            "spread_bps": spread_bps,
+            "max_spread_bps": max_spread_bps,
+            "max_spread_cents": str(max_spread_cents.quantize(Decimal("0.0001"))),
+            "tier": "under_20c" if cost < Decimal("0.2000") else "standard",
+        },
+    )
+
+
+def _bounded_decimal(value: Decimal, low: Decimal, high: Decimal) -> Decimal:
+    return max(low, min(high, value))
+
+
+def _touch_strategy_probability(
+    row: dict[str, Any],
+    *,
+    side: str,
+    current_side_mid: Decimal,
+    target_exit_price: Decimal,
+    stop_exit_price: Decimal,
+) -> Decimal:
+    target_gap = max(Decimal("0.0001"), target_exit_price - current_side_mid)
+    stop_gap = max(Decimal("0.0001"), current_side_mid - stop_exit_price)
+    bracket_probability = stop_gap / (target_gap + stop_gap)
+    time_to_close = max(0, _optional_int(row.get("time_to_close_seconds")) or 0)
+    frequency = normalize_frequency(str(row.get("frequency") or "15m")) or "15m"
+    interval_seconds = Decimal("3600") if frequency == "1h" else Decimal("900")
+    time_scale = Decimal(str(math.sqrt(max(Decimal("0"), Decimal(time_to_close) / interval_seconds))))
+    spot_vol = _decimal(row.get("spot_realized_volatility_32") or row.get("spot_realized_volatility") or Decimal("0"))
+    vol_bonus = _bounded_decimal(spot_vol * time_scale * Decimal("50"), Decimal("0"), Decimal("0.1800"))
+    side_multiplier = Decimal("1") if side == "yes" else Decimal("-1")
+    return_1 = _decimal(row.get("spot_return_1_pct") or Decimal("0"))
+    return_3 = _decimal(row.get("spot_return_3_pct") or Decimal("0"))
+    momentum_bonus = _bounded_decimal(
+        side_multiplier * ((return_1 * Decimal("30")) + (return_3 * Decimal("15"))),
+        Decimal("-0.1200"),
+        Decimal("0.1200"),
+    )
+    distance = _decimal(row.get("spot_target_distance_volatility") or Decimal("0"))
+    moneyness_bonus = _bounded_decimal(side_multiplier * distance / Decimal("40"), Decimal("-0.0800"), Decimal("0.0800"))
+    spread_penalty = Decimal(max(0, _optional_int(row.get("spread_bps")) or 0)) / Decimal("10000") / Decimal("4")
+    probability = bracket_probability + vol_bonus + momentum_bonus + moneyness_bonus - spread_penalty
+    return _bounded_decimal(probability, Decimal("0.0100"), Decimal("0.9900")).quantize(Decimal("0.0001"))
+
+
+def _crypto_touch_strategy_candidates(
+    row: dict[str, Any],
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+    empirical_bucket_matrix: list[dict[str, Any]] | None = None,
+    enforce_empirical_bucket_gate: bool = False,
+) -> list[dict[str, Any]]:
+    settlement_diagnostics = _crypto_settlement_diagnostics(row)
+    target_pct = Decimal(str(settings.crypto_touch_strategy_take_profit_pct))
+    stop_pct = Decimal(str(settings.crypto_touch_strategy_stop_loss_pct))
+    min_price = Decimal(str(settings.crypto_touch_strategy_min_contract_price_dollars))
+    min_probability = Decimal(str(settings.crypto_touch_strategy_min_touch_probability))
+    fee_rate = Decimal(str(settings.kalshi_taker_fee_rate))
+    entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
+    min_live_edge = Decimal(int(entry_policy["min_fee_adjusted_edge_bps"])) / Decimal("10000")
+    market_mid_probability = _crypto_market_mid_probability_text(row)
+    anchor_weight = _crypto_market_price_anchor_weight(row, settings=settings)
+    live_entry_window_reason = _crypto_live_entry_window_reason(row, settings=settings)
+    require_empirical = bool(settings.crypto_touch_strategy_require_empirical_bucket)
+    if row.get("strict_trade_eligible") is False:
+        return [
+            {
+                "side": side,
+                "status": "blocked",
+                "candidate_status": "prediction_only_proxy_quote",
+                "reason": row.get("execution_model_status") or "row_has_no_real_bid_ask_quotes",
+                "edge_bps": None,
+                "expected_net_edge": None,
+                "target_yes_price_dollars": None,
+                "rank": rank,
+                "live_eligible": False,
+                "objective": "touch_30pct_before_close",
+                **settlement_diagnostics,
+            }
+            for rank, side in enumerate(("yes", "no"), start=1)
+        ]
+    spot_status = str(row.get("spot_feature_status") or "").strip().lower()
+    spot_proxy_only = bool(row.get("spot_proxy_only")) or _crypto_spot_is_proxy(
+        row.get("spot_provider"),
+        row.get("spot_source_kind"),
+    )
+    if spot_status != "available" or spot_proxy_only:
+        reason = "spot_source_proxy_only" if spot_proxy_only else ("spot_data_stale" if spot_status == "stale" else "spot_data_missing_or_stale")
+        return [
+            {
+                "side": side,
+                "status": "blocked",
+                "candidate_status": "prediction_only_proxy_quote",
+                "reason": reason,
+                "edge_bps": None,
+                "expected_net_edge": None,
+                "target_yes_price_dollars": None,
+                "rank": rank,
+                "live_eligible": False,
+                "objective": "touch_30pct_before_close",
+                **settlement_diagnostics,
+            }
+            for rank, side in enumerate(("yes", "no"), start=1)
+        ]
+
+    candidates: list[dict[str, Any]] = []
+    for side in ("yes", "no"):
+        cost = _touch_strategy_entry_cost(row, side)
+        current_side_mid = _crypto_market_side_probability(row, side)
+        status = "blocked"
+        candidate_status = "blocked_touch_strategy"
+        reason = "missing_quote"
+        edge_bps: int | None = None
+        expected_net_edge: Decimal | None = None
+        target_exit_price: Decimal | None = None
+        stop_exit_price: Decimal | None = None
+        touch_probability: Decimal | None = None
+        spread_allowed = False
+        spread_review: dict[str, Any] = {}
+        empirical_bucket_gate: dict[str, Any] = {
+            "status": "not_evaluated",
+            "allowed": True,
+            "enforced": False,
+            "reason": "touch_strategy_empirical_bucket_not_required",
+        }
+        bucket_key = ""
+        if cost is not None and current_side_mid is not None:
+            spread_allowed, spread_review = _touch_strategy_allowed_spread(row, cost, settings=settings)
+            target_exit_price = _touch_strategy_exit_price_for_net_profit(
+                cost,
+                target_pct=target_pct,
+                fee_rate=fee_rate,
+            )
+            stop_exit_price = _touch_strategy_exit_price_for_net_loss(
+                cost,
+                stop_loss_pct=stop_pct,
+                fee_rate=fee_rate,
+            )
+            bucket_key = _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(cost)})
+            if require_empirical:
+                empirical_bucket_gate = _crypto_empirical_bucket_gate_for_candidate(
+                    row,
+                    bucket_key=bucket_key,
+                    settings=settings,
+                    crypto_policy=crypto_policy,
+                    bucket_matrix=empirical_bucket_matrix,
+                    enforce=enforce_empirical_bucket_gate,
+                )
+            if cost < min_price:
+                reason = "touch_contract_price_below_min"
+            elif target_exit_price is None:
+                reason = "touch_target_profit_impossible_after_fees"
+            elif target_exit_price >= Decimal("1.0000"):
+                reason = "touch_target_above_max_payout"
+            elif not spread_allowed:
+                reason = "touch_spread_above_tier_max"
+            elif live_entry_window_reason is not None:
+                reason = live_entry_window_reason
+            elif require_empirical and empirical_bucket_gate.get("status") not in {"allowed", "override_allowed"}:
+                reason = "touch_empirical_bucket_not_allowed"
+                candidate_status = "blocked_empirical_bucket"
+            else:
+                touch_probability = _touch_strategy_probability(
+                    row,
+                    side=side,
+                    current_side_mid=current_side_mid,
+                    target_exit_price=target_exit_price,
+                    stop_exit_price=stop_exit_price,
+                )
+                expected_return = (touch_probability * target_pct) - ((Decimal("1") - touch_probability) * stop_pct)
+                expected_net_edge = expected_return * cost
+                edge_bps = int((expected_return * Decimal("10000")).to_integral_value())
+                if touch_probability < min_probability:
+                    reason = "touch_probability_below_min"
+                elif expected_return < min_live_edge:
+                    reason = "touch_expected_edge_below_live_min"
+                else:
+                    status = "eligible"
+                    candidate_status = CRYPTO_LIVE_QUALITY
+                    reason = "touch_30pct_target_before_stop"
+        candidates.append(
+            {
+                "side": side,
+                "status": status,
+                "candidate_status": candidate_status,
+                "reason": reason,
+                "target_yes_price_dollars": _money_text(_touch_strategy_target_yes_price(side, cost)) if cost is not None else None,
+                "execution_price_dollars": _money_text(cost) if cost is not None else None,
+                "edge_bps": edge_bps,
+                "expected_net_edge": str(expected_net_edge.quantize(Decimal("0.0001"))) if expected_net_edge is not None else None,
+                "model_probability": str(touch_probability) if touch_probability is not None else None,
+                "raw_model_probability": str(touch_probability) if touch_probability is not None else None,
+                "market_anchored_probability": str(touch_probability) if touch_probability is not None else None,
+                "market_mid_probability": market_mid_probability,
+                "market_side_probability": str(current_side_mid.quantize(Decimal("0.0001"))) if current_side_mid is not None else None,
+                "market_price_anchor_weight": float(anchor_weight),
+                "model_winner": touch_probability is not None and touch_probability >= Decimal("0.5000"),
+                "raw_model_winner": touch_probability is not None and touch_probability >= Decimal("0.5000"),
+                "expected_fee": None,
+                "remaining_payout_dollars": str((Decimal("1") - cost).quantize(Decimal("0.0001"))) if cost is not None else None,
+                "bucket_key": bucket_key or None,
+                "empirical_bucket_gate": empirical_bucket_gate,
+                "empirical_bucket_status": empirical_bucket_gate.get("status"),
+                "spread_bps": row.get("spread_bps"),
+                "touch_strategy": {
+                    "enabled": True,
+                    "objective": "exitably_up_30pct_before_close",
+                    "take_profit_pct": float(target_pct),
+                    "stop_loss_pct": float(stop_pct),
+                    "min_contract_price_dollars": str(min_price.quantize(Decimal("0.0001"))),
+                    "entry_cost_dollars": _money_text(cost) if cost is not None else None,
+                    "current_side_mid_dollars": _money_text(current_side_mid) if current_side_mid is not None else None,
+                    "target_exit_side_price_dollars": _money_text(target_exit_price) if target_exit_price is not None else None,
+                    "stop_exit_side_price_dollars": _money_text(stop_exit_price) if stop_exit_price is not None else None,
+                    "target_exit_yes_price_dollars": (
+                        _money_text(_touch_strategy_target_yes_price(side, target_exit_price))
+                        if target_exit_price is not None
+                        else None
+                    ),
+                    "stop_exit_yes_price_dollars": (
+                        _money_text(_touch_strategy_target_yes_price(side, stop_exit_price))
+                        if stop_exit_price is not None
+                        else None
+                    ),
+                    "touch_probability": str(touch_probability) if touch_probability is not None else None,
+                    "min_touch_probability": str(min_probability.quantize(Decimal("0.0001"))),
+                    "spread_guard": spread_review,
+                    "empirical_bucket_required": require_empirical,
+                },
+                "runtime_thresholds": dict(entry_policy),
+                "time_to_close_seconds": row.get("time_to_close_seconds"),
+                "live_entry_window_reason": live_entry_window_reason,
+                "rank": None,
+                "live_eligible": candidate_status == CRYPTO_LIVE_QUALITY,
+                "objective": "touch_30pct_before_close",
+                **settlement_diagnostics,
+            }
+        )
+    candidates.sort(
+        key=lambda item: (
+            item.get("candidate_status") == CRYPTO_LIVE_QUALITY,
+            _decimal(item.get("model_probability") or Decimal("-1")),
+            _decimal(item.get("expected_net_edge") or Decimal("-999")),
+            item["side"],
+        ),
+        reverse=True,
+    )
+    for idx, candidate in enumerate(candidates, start=1):
+        candidate["rank"] = idx
+    return candidates
 
 
 def _crypto_trade_candidates(

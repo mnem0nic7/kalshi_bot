@@ -14,6 +14,7 @@ from kalshi_bot.core.enums import StrategyCode
 from kalshi_bot.db.models import CryptoMarketSnapshotRecord, PositionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.execution import ExecutionService
+from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED,
     STOP_LOSS_OUTCOME_FILLED_EXIT,
@@ -77,11 +78,44 @@ def _crypto_sell_price(snapshot: CryptoMarketSnapshotRecord, side: str) -> Decim
     return price
 
 
+def _side_value_from_yes_price(yes_price: Decimal, side: str) -> Decimal:
+    return yes_price if side == "yes" else Decimal("1") - yes_price
+
+
 def _profit_ratio(position: PositionRecord, mid: Decimal) -> float | None:
     avg = position.average_price_dollars
     if position.count_fp <= 0 or avg <= 0:
         return None
     return float((position.count_fp * mid - position.count_fp * avg) / (position.count_fp * avg))
+
+
+def _round_trip_net_profit_ratio(
+    position: PositionRecord,
+    *,
+    sell_yes_price: Decimal,
+    fee_rate: Decimal,
+) -> float | None:
+    avg = position.average_price_dollars
+    count = position.count_fp
+    if count <= 0 or avg <= 0:
+        return None
+    sell_value = _side_value_from_yes_price(sell_yes_price, position.side)
+    entry_notional = count * avg
+    entry_fee = estimate_kalshi_taker_fee_dollars(
+        price_dollars=avg,
+        count=count,
+        fee_rate=fee_rate,
+    )
+    exit_fee = estimate_kalshi_taker_fee_dollars(
+        price_dollars=sell_value,
+        count=count,
+        fee_rate=fee_rate,
+    )
+    denominator = entry_notional + entry_fee
+    if denominator <= 0:
+        return None
+    net_profit = (count * sell_value) - entry_notional - entry_fee - exit_fee
+    return float(net_profit / denominator)
 
 
 class CryptoTakeProfitService:
@@ -177,16 +211,20 @@ class CryptoTakeProfitService:
         if snapshot.status and snapshot.status not in {"open", "active"}:
             return None
 
+        sell_px = _crypto_sell_price(snapshot, position.side)
+        if sell_px is None or sell_px <= 0:
+            return None
+
         mid = _crypto_mid(snapshot, position.side)
         if mid is None:
             return None
 
-        profit = _profit_ratio(position, mid)
+        profit = _round_trip_net_profit_ratio(
+            position,
+            sell_yes_price=sell_px,
+            fee_rate=Decimal(str(self.settings.kalshi_taker_fee_rate)),
+        )
         if profit is None or profit < threshold:
-            return None
-
-        sell_px = _crypto_sell_price(snapshot, position.side)
-        if sell_px is None or sell_px <= 0:
             return None
 
         return await self._submit(

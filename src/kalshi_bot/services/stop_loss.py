@@ -14,6 +14,7 @@ from kalshi_bot.core.enums import StrategyCode
 from kalshi_bot.db.models import MarketPriceHistory, MarketState, PositionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.execution import ExecutionService
+from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
 from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED,
     STOP_LOSS_OUTCOME_FILLED_EXIT,
@@ -58,21 +59,57 @@ def _sell_price(market_state: MarketState, side: str) -> Decimal | None:
     return price
 
 
+def _side_value_from_yes_price(yes_price: Decimal, side: str) -> Decimal:
+    return yes_price if side == "yes" else Decimal("1") - yes_price
+
+
 def _side_price(mid_yes: Decimal, side: str) -> Decimal:
     return mid_yes if side == "yes" else Decimal("1") - mid_yes
 
 
 def _peak_price_from_history(
-    prices: list[MarketPriceHistory], side: str, since: datetime | None = None
+    prices: list[MarketPriceHistory],
+    side: str,
+    since: datetime | None = None,
+    opened_at: datetime | None = None,
 ) -> Decimal | None:
     """Return highest side-appropriate mid price after `since` (post-entry peak)."""
+    threshold = since if since is not None else opened_at
     candidates = [
         _side_price(row.mid_dollars, side)
         for row in prices
         if row.mid_dollars is not None
-        and (since is None or _as_utc(row.observed_at) >= since)
+        and (threshold is None or _as_utc(row.observed_at) >= threshold)
     ]
     return max(candidates) if candidates else None
+
+
+def _position_opened_at_from_fills(position: PositionRecord, fills: list[Any]) -> datetime | None:
+    running = Decimal("0")
+    opened_at: datetime | None = None
+    relevant = sorted(
+        (
+            fill
+            for fill in fills
+            if getattr(fill, "market_ticker", None) == position.market_ticker
+            and getattr(fill, "side", None) == position.side
+        ),
+        key=lambda fill: _as_utc(getattr(fill, "created_at", None)) or datetime.min.replace(tzinfo=UTC),
+    )
+    for fill in relevant:
+        count = Decimal(str(getattr(fill, "count_fp", Decimal("0")) or Decimal("0")))
+        action = str(getattr(fill, "action", "") or "").strip().lower()
+        created_at = _as_utc(getattr(fill, "created_at", None))
+        if action == "buy":
+            if running <= 0 and count > 0:
+                opened_at = created_at
+            running += count
+        elif action == "sell":
+            running -= count
+            if running <= 0:
+                running = Decimal("0")
+                opened_at = None
+    return opened_at
 
 
 def _trailing_loss_ratio(peak: Decimal, current: Decimal) -> float:
@@ -89,6 +126,35 @@ def _profit_ratio(position: PositionRecord, mid: Decimal) -> float | None:
     cost_basis = position.count_fp * avg
     mark_value = position.count_fp * mid
     return float((mark_value - cost_basis) / cost_basis)
+
+
+def _round_trip_net_return_ratio(
+    position: PositionRecord,
+    *,
+    sell_yes_price: Decimal,
+    fee_rate: Decimal,
+) -> float | None:
+    avg = position.average_price_dollars
+    count = position.count_fp
+    if count <= 0 or avg <= 0:
+        return None
+    sell_value = _side_value_from_yes_price(sell_yes_price, position.side)
+    entry_notional = count * avg
+    entry_fee = estimate_kalshi_taker_fee_dollars(
+        price_dollars=avg,
+        count=count,
+        fee_rate=fee_rate,
+    )
+    exit_fee = estimate_kalshi_taker_fee_dollars(
+        price_dollars=sell_value,
+        count=count,
+        fee_rate=fee_rate,
+    )
+    denominator = entry_notional + entry_fee
+    if denominator <= 0:
+        return None
+    net_return = (count * sell_value) - entry_notional - entry_fee - exit_fee
+    return float(net_return / denominator)
 
 
 def _momentum_slope(prices: list[MarketPriceHistory]) -> float | None:
@@ -228,6 +294,35 @@ class StopLossService:
                 "CRYPTO_15M" if "15M" in position.market_ticker else
                 "CRYPTO_1H" if "1H" in position.market_ticker else None
             )
+            effective_threshold = (
+                self.settings.stop_loss_threshold_pct_by_strategy.get(inferred_strategy)
+                if inferred_strategy else None
+            ) or self.settings.stop_loss_threshold_pct
+            sell_px = _sell_price(ms, position.side)
+            net_return_ratio = (
+                _round_trip_net_return_ratio(
+                    position,
+                    sell_yes_price=sell_px,
+                    fee_rate=Decimal(str(self.settings.kalshi_taker_fee_rate)),
+                )
+                if sell_px is not None
+                else None
+            )
+            if net_return_ratio is not None and net_return_ratio <= -effective_threshold:
+                result = await self._submit(
+                    repo, position, sell_px, mid, abs(net_return_ratio), now,
+                    kill_switch_enabled=kill_switch_enabled,
+                    active_color=active_color,
+                    trigger="hard_stop",
+                    net_return_ratio=net_return_ratio,
+                )
+                await session.commit()
+                return result
+            if (
+                self.settings.crypto_touch_strategy_enabled
+                and inferred_strategy in {"CRYPTO_15M", "CRYPTO_1H"}
+            ):
+                return None
 
             # Trigger 1: trailing stop — drop from post-entry peak.
             # Filtering to prices after entry makes the stop entry-relative, not
@@ -237,12 +332,7 @@ class StopLossService:
             trailing_ratio: float | None = None
             if peak is not None:
                 trailing_ratio = _trailing_loss_ratio(peak, mid)
-                effective_threshold = (
-                    self.settings.stop_loss_threshold_pct_by_strategy.get(inferred_strategy)
-                    if inferred_strategy else None
-                ) or self.settings.stop_loss_threshold_pct
                 if trailing_ratio >= effective_threshold:
-                    sell_px = _sell_price(ms, position.side)
                     if sell_px is not None and sell_px > 0:
                         result = await self._submit(
                             repo, position, sell_px, mid, trailing_ratio, now,
@@ -260,7 +350,6 @@ class StopLossService:
                 drop1 = prev_mids[-2][0] - prev_mids[-1][0]  # older→recent (adverse = positive)
                 drop2 = prev_mids[-1][0] - mid               # recent→current
                 if drop1 >= threshold and drop2 >= threshold:
-                    sell_px = _sell_price(ms, position.side)
                     if sell_px is not None and sell_px > 0:
                         result = await self._submit(
                             repo, position, sell_px, mid, trailing_ratio, now,
@@ -295,7 +384,6 @@ class StopLossService:
             if slope_against >= self.settings.stop_loss_momentum_slope_threshold_cents_per_min:
                 return None
 
-            sell_px = _sell_price(ms, position.side)
             if sell_px is None or sell_px <= 0:
                 return None
 
@@ -326,6 +414,7 @@ class StopLossService:
         peak: Decimal | None = None,
         rapid_drop1: Decimal | None = None,
         rapid_drop2: Decimal | None = None,
+        net_return_ratio: float | None = None,
     ) -> dict[str, Any]:
         market_ticker = position.market_ticker
         peak_display = str(peak) if peak is not None else "n/a"
@@ -399,6 +488,7 @@ class StopLossService:
             "mid_mark": str(mid),
             "sell_price": str(sell_price),
             "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+            "net_return_ratio": round(net_return_ratio, 4) if net_return_ratio is not None else None,
             "peak_price": str(peak) if peak is not None else None,
             "hold_minutes": round(hold_minutes, 1),
             "shadow_mode": shadow,
@@ -420,6 +510,7 @@ class StopLossService:
             "stopped_at": now.isoformat(),
             "stopped_side": position.side,
             "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+            "net_return_ratio": round(net_return_ratio, 4) if net_return_ratio is not None else None,
             "peak_price": str(peak) if peak is not None else None,
             "trigger": trigger,
         }
@@ -499,6 +590,7 @@ class StopLossService:
                     "kalshi_order_id": submit_payload.get("kalshi_order_id"),
                     "order_status": submit_payload.get("order_status"),
                     "trailing_loss_ratio": round(loss_ratio, 4) if loss_ratio is not None else None,
+                    "net_return_ratio": round(net_return_ratio, 4) if net_return_ratio is not None else None,
                     "peak_price": str(peak) if peak is not None else None,
                     "trigger": trigger,
                     "outcome_status": submit_payload.get("outcome_status"),

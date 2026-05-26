@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from datetime import UTC, datetime, timedelta
 
 
+from kalshi_bot.config import Settings
 from kalshi_bot.services.stop_loss import (
-    _midpoint, _momentum_slope, _peak_price_from_history,
-    _position_opened_at_from_fills, _sell_price, _trailing_loss_ratio,
+    StopLossService, _midpoint, _momentum_slope, _peak_price_from_history,
+    _position_opened_at_from_fills, _round_trip_net_return_ratio, _sell_price,
+    _trailing_loss_ratio,
 )
 
 
@@ -84,6 +86,84 @@ def test_sell_price_none_when_ask_missing_for_no():
 def test_sell_price_none_when_ask_boundary_for_no():
     assert _sell_price(_ms("0.00", "0.00"), "no") is None
     assert _sell_price(_ms("0.98", "1.00"), "no") is None
+
+
+# -- hard stop return math ----------------------------------------------------
+
+def test_round_trip_net_return_ratio_uses_executable_yes_bid():
+    pos = _pos("yes", "1.00", "0.5000")
+
+    ratio = _round_trip_net_return_ratio(
+        pos,
+        sell_yes_price=Decimal("0.3500"),
+        fee_rate=Decimal("0"),
+    )
+
+    assert ratio == pytest.approx(-0.30)
+
+
+def test_round_trip_net_return_ratio_converts_no_sell_yes_price():
+    pos = _pos("no", "1.00", "0.5000")
+
+    ratio = _round_trip_net_return_ratio(
+        pos,
+        sell_yes_price=Decimal("0.6500"),
+        fee_rate=Decimal("0"),
+    )
+
+    assert ratio == pytest.approx(-0.30)
+
+
+class _FakeStopLossSession:
+    async def __aenter__(self) -> "_FakeStopLossSession":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def commit(self) -> None:
+        return None
+
+
+class _FakeStopLossRepo:
+    def __init__(self, session) -> None:
+        self.session = session
+
+    async def get_deployment_control(self, *, kalshi_env: str):
+        return MagicMock(kill_switch_enabled=False, active_color="blue")
+
+    async def get_checkpoint(self, key: str):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_touch_strategy_crypto_stop_loss_is_hard_stop_only(monkeypatch):
+    monkeypatch.setattr("kalshi_bot.services.stop_loss.PlatformRepository", _FakeStopLossRepo)
+    settings = Settings(
+        app_color="blue",
+        crypto_touch_strategy_enabled=True,
+        kalshi_taker_fee_rate=0,
+        stop_loss_threshold_pct=0.30,
+        stop_loss_threshold_pct_by_strategy={"CRYPTO_15M": 0.30},
+    )
+    service = StopLossService(settings, lambda: _FakeStopLossSession(), MagicMock())
+    submit = AsyncMock()
+    monkeypatch.setattr(service, "_submit", submit)
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
+    position = _pos("yes", "1.00", "0.3000")
+    position.id = 1
+    position.market_ticker = "KXBTCD-26MAY261200-15M"
+    position.created_at = now - timedelta(minutes=10)
+    ms = _ms("0.2300", "0.3700")
+    prices = [
+        _ph("0.6000", now - timedelta(minutes=9)),
+        _ph("0.3000", now - timedelta(minutes=1)),
+    ]
+
+    result = await service._evaluate_and_submit(position, ms, Decimal("0.3000"), prices, now)
+
+    assert result is None
+    submit.assert_not_called()
 
 
 # ── trailing loss ratio ──────────────────────────────────────────────────────

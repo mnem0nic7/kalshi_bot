@@ -12,6 +12,7 @@ from kalshi_bot.services.crypto_take_profit import (
     _crypto_sell_price,
     _crypto_take_profit_frequencies,
     _profit_ratio,
+    _round_trip_net_profit_ratio,
 )
 
 
@@ -25,6 +26,7 @@ def _snapshot(yes_bid: str | None, yes_ask: str | None, status: str = "open") ->
 
 def _position(avg: str, count: str = "100.00") -> MagicMock:
     pos = MagicMock()
+    pos.side = "yes"
     pos.average_price_dollars = Decimal(avg)
     pos.count_fp = Decimal(count)
     return pos
@@ -133,3 +135,29 @@ def test_threshold_just_below_does_not_trigger():
     ratio = _profit_ratio(pos, mid)
     assert ratio is not None
     assert ratio < 0.20
+
+
+def test_round_trip_net_profit_ratio_uses_executable_sell_after_fees():
+    pos = _position("0.50", count="1.00")
+
+    ratio = _round_trip_net_profit_ratio(
+        pos,
+        sell_yes_price=Decimal("0.6500"),
+        fee_rate=Decimal("0.07"),
+    )
+
+    assert ratio is not None
+    assert ratio < 0.30
+
+
+def test_round_trip_net_profit_ratio_handles_no_side_sell_price():
+    pos = _position("0.40", count="1.00")
+    pos.side = "no"
+
+    ratio = _round_trip_net_profit_ratio(
+        pos,
+        sell_yes_price=Decimal("0.4700"),  # NO sell value = 0.5300
+        fee_rate=Decimal("0"),
+    )
+
+    assert ratio == pytest.approx(0.325)

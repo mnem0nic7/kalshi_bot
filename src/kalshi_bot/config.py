@@ -313,9 +313,18 @@ class Settings(BaseSettings):
     crypto_empirical_late_override_max_count_fp: float = 1.0
     crypto_empirical_late_override_negative_pnl_enabled: bool = False
 
+    crypto_touch_strategy_enabled: bool = False
+    crypto_touch_strategy_take_profit_pct: float = 0.30
+    crypto_touch_strategy_stop_loss_pct: float = 0.30
+    crypto_touch_strategy_min_contract_price_dollars: float = 0.10
+    crypto_touch_strategy_min_touch_probability: float = 0.60
+    crypto_touch_strategy_max_spread_cents_under_20c: float = 0.01
+    crypto_touch_strategy_max_spread_cents: float = 0.02
+    crypto_touch_strategy_require_empirical_bucket: bool = False
+
     crypto_take_profit_enabled: bool = True
     crypto_take_profit_frequencies: str = "15m,1h"
-    crypto_take_profit_threshold_pct: float = 0.20
+    crypto_take_profit_threshold_pct: float = 0.30
     crypto_take_profit_threshold_pct_by_asset: dict[str, float] = Field(default_factory=dict)
     crypto_take_profit_check_interval_seconds: int = 30
     crypto_take_profit_stale_snapshot_seconds: int = 120
