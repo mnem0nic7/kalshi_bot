@@ -47,6 +47,7 @@ from kalshi_bot.crypto.services import (
     _crypto_last_minute_passive_bid_by_asset,
     _crypto_last_minute_passive_price_ladder,
     _crypto_last_minute_passive_price_matrix,
+    _eligible_market_per_asset,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
     _crypto_recommendation,
@@ -58,6 +59,7 @@ from kalshi_bot.crypto.services import (
     _crypto_trade_candidates,
     _fit_crypto_calibration,
     _predict_crypto_probability,
+    crypto_autonomy_min_seconds_to_close_for_frequency,
     crypto_pnl_sizing_target_pct,
 )
 from kalshi_bot.services.agent_packs import AgentPackService
@@ -2806,6 +2808,36 @@ def test_crypto_candidate_quality_blocks_live_inside_final_window(tmp_path) -> N
     assert candidates[0]["candidate_status"] == CRYPTO_EXPLORATORY_SHADOW
     assert candidates[0]["reason"] == "crypto_market_too_late_for_live_entry"
     assert candidates[0]["live_eligible"] is False
+
+
+def test_crypto_candidate_quality_uses_1h_close_window_override(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=750,
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_1h_autonomy_min_seconds_to_close=60,
+        crypto_live_min_market_age_seconds=90,
+    )
+    row = {
+        "market_ticker": "KXBTC-1H-LATE",
+        "series_ticker": "KXBTC",
+        "frequency": "1h",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.5000"),
+        "yes_bid_dollars": Decimal("0.5000"),
+        "yes_ask_dollars": Decimal("0.5000"),
+        "no_ask_dollars": Decimal("0.5000"),
+        "spread_bps": 0,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 90,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.8000"), settings=settings)
+
+    assert candidates[0]["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert candidates[0]["live_eligible"] is True
 
 
 def test_crypto_candidate_quality_blocks_late_high_confidence_below_edge_floor(tmp_path) -> None:
@@ -6686,6 +6718,48 @@ async def test_crypto_autonomy_skips_markets_before_live_entry_window(tmp_path) 
     assert result["eligible_markets"] == 0
     assert result["skipped"][0]["reason"] == "crypto_market_too_early_for_live_entry"
     await engine.dispose()
+
+
+def test_crypto_autonomy_selector_uses_1h_close_window_override(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_autonomy_min_seconds_to_close=600,
+        crypto_1h_autonomy_min_seconds_to_close=60,
+        crypto_live_min_market_age_seconds=90,
+    )
+    now = datetime.now(UTC)
+    one_hour_market = _market(
+        market_ticker="KXBTC-1H-LATE",
+        series_ticker="KXBTC",
+        asset_symbol="BTC",
+        frequency="1h",
+        open_time=now - timedelta(seconds=3510),
+        close_time=now + timedelta(seconds=90),
+    )
+    fifteen_min_market = _market(
+        market_ticker="KXBTC15M-LATE",
+        series_ticker="KXBTC15M",
+        asset_symbol="BTC",
+        frequency="15m",
+        open_time=now - timedelta(seconds=810),
+        close_time=now + timedelta(seconds=90),
+    )
+
+    one_hour_selected, one_hour_skipped = _eligible_market_per_asset(
+        [one_hour_market],
+        min_seconds_to_close=crypto_autonomy_min_seconds_to_close_for_frequency(settings, "1h"),
+        min_market_age_seconds=settings.crypto_live_min_market_age_seconds,
+    )
+    fifteen_min_selected, fifteen_min_skipped = _eligible_market_per_asset(
+        [fifteen_min_market],
+        min_seconds_to_close=crypto_autonomy_min_seconds_to_close_for_frequency(settings, "15m"),
+        min_market_age_seconds=settings.crypto_live_min_market_age_seconds,
+    )
+
+    assert one_hour_selected == [one_hour_market]
+    assert one_hour_skipped == []
+    assert fifteen_min_selected == []
+    assert fifteen_min_skipped[0]["reason"] == "too_close_to_close"
 
 
 @pytest.mark.asyncio

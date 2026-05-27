@@ -215,6 +215,13 @@ def crypto_frequency_enabled(settings: Settings, frequency: object) -> bool:
     return crypto_frequency_switch_enabled(settings, frequency)
 
 
+def crypto_autonomy_min_seconds_to_close_for_frequency(settings: Settings, frequency: object) -> int:
+    normalized = normalize_frequency(frequency) or "15m"
+    if normalized == "1h":
+        return max(0, int(settings.crypto_1h_autonomy_min_seconds_to_close))
+    return max(0, int(settings.crypto_autonomy_min_seconds_to_close))
+
+
 def enabled_crypto_frequencies(settings: Settings) -> list[str]:
     frequencies: list[str] = []
     for raw in str(settings.crypto_auto_frequencies or "15m").replace(";", ",").split(","):
@@ -4743,7 +4750,7 @@ class CryptoAutonomyService:
         created: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
-        min_seconds = max(0, int(self.settings.crypto_autonomy_min_seconds_to_close))
+        min_seconds = crypto_autonomy_min_seconds_to_close_for_frequency(self.settings, freq)
         markets, ineligible = _eligible_market_per_asset(
             discovered,
             min_seconds_to_close=min_seconds,
@@ -9954,18 +9961,39 @@ def _is_crypto_transient_network_error(exc: BaseException) -> bool:
     return any(marker in text for marker in transient_markers)
 
 
+def _crypto_frequency_for_row(row: dict[str, Any]) -> str:
+    frequency = normalize_frequency(
+        row.get("frequency")
+        or row.get("market_frequency")
+        or row.get("settlement_frequency")
+        or row.get("prediction_frequency")
+    )
+    if frequency:
+        return frequency
+    series_ticker = str(row.get("series_ticker") or "").upper()
+    market_ticker = str(row.get("market_ticker") or "").upper()
+    if "15M" in series_ticker or "15M" in market_ticker:
+        return "15m"
+    return "15m"
+
+
 def _crypto_live_entry_window_reason(row: dict[str, Any], *, settings: Settings) -> str | None:
+    frequency = _crypto_frequency_for_row(row)
+    try:
+        interval_seconds = interval_seconds_for_frequency(frequency)
+    except ValueError:
+        interval_seconds = 900
     market_age = _optional_int(row.get("market_age_seconds"))
     time_to_close = _optional_int(row.get("time_to_close_seconds"))
-    if market_age is None and time_to_close is not None and time_to_close <= 900:
-        market_age = max(0, 900 - time_to_close)
-    if time_to_close is None and market_age is not None and market_age <= 900:
-        time_to_close = max(0, 900 - market_age)
+    if market_age is None and time_to_close is not None and time_to_close <= interval_seconds:
+        market_age = max(0, interval_seconds - time_to_close)
+    if time_to_close is None and market_age is not None and market_age <= interval_seconds:
+        time_to_close = max(0, interval_seconds - market_age)
     if market_age is None or time_to_close is None:
         return "crypto_entry_window_unknown"
     if market_age < max(0, int(settings.crypto_live_min_market_age_seconds)):
         return "crypto_market_too_early_for_live_entry"
-    if time_to_close < max(0, int(settings.crypto_autonomy_min_seconds_to_close)):
+    if time_to_close < crypto_autonomy_min_seconds_to_close_for_frequency(settings, frequency):
         return "crypto_market_too_late_for_live_entry"
     return None
 
