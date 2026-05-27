@@ -5,7 +5,7 @@ x-build: &build
     dockerfile: infra/docker/Dockerfile
 
 x-cpu-limits: &cpu-limits
-  cpuset: "1-7"
+  cpuset: "0-15"
 
 x-common-env-base: &common-env-base
   APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
