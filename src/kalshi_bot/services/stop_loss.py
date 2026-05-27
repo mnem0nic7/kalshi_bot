@@ -292,7 +292,7 @@ class StopLossService:
 
             inferred_strategy = (
                 "CRYPTO_15M" if "15M" in position.market_ticker else
-                "CRYPTO_1H" if "1H" in position.market_ticker else None
+                "CRYPTO_1H" if position.market_ticker.startswith("KX") else None
             )
             effective_threshold = (
                 self.settings.stop_loss_threshold_pct_by_strategy.get(inferred_strategy)

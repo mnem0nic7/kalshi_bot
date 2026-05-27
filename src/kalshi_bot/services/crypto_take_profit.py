@@ -26,11 +26,17 @@ logger = logging.getLogger(__name__)
 
 
 def _crypto_market_identity(market_ticker: str) -> tuple[str | None, str | None]:
-    match = re.match(r"^KX([A-Z]+)(15M|1H)", str(market_ticker or "").upper())
-    if match is None:
-        return None, None
-    frequency = "15m" if match.group(2) == "15M" else "1h"
-    return match.group(1), frequency
+    ticker = str(market_ticker or "").upper()
+    # 15m: KX{ASSET}15M-{date}-{strike}
+    m = re.match(r"^KX([A-Z]+)15M-", ticker)
+    if m:
+        return m.group(1), "15m"
+    # 1h: KX{ASSET}-{date}-{strike} or KX{ASSET}D-{date}-{strike} (daily-settled variant)
+    # Non-greedy asset match lets the optional trailing D be absorbed correctly (KXBTCD → BTC).
+    m = re.match(r"^KX([A-Z]+?)D?-\d{2}[A-Z]{3}", ticker)
+    if m:
+        return m.group(1), "1h"
+    return None, None
 
 
 def _crypto_take_profit_frequencies(raw: str | None) -> set[str]:
