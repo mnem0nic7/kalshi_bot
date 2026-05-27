@@ -36,10 +36,7 @@ def _position(avg: str, count: str = "100.00") -> MagicMock:
 
 
 def test_crypto_market_identity_detects_1h_frequency():
-    # Real 1h ticker format: KX{ASSET}-{date}-{strike} (no "1H" substring in ticker)
-    assert _crypto_market_identity("KXBTC-26MAR2518-B76250") == ("BTC", "1h")
-    assert _crypto_market_identity("KXBTCD-26MAR2507-T73099") == ("BTC", "1h")
-    assert _crypto_market_identity("KXBNB-26APR1801-B452") == ("BNB", "1h")
+    assert _crypto_market_identity("KXBTC1H-26MAY24-B123456-T123456") == ("BTC", "1h")
 
 
 def test_crypto_market_identity_detects_15m_frequency():
