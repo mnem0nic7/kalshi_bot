@@ -7,6 +7,7 @@ import importlib.metadata as importlib_metadata
 import json
 import logging
 import math
+import os
 from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
@@ -8281,6 +8282,10 @@ def _fit_crypto_xgboost_model(
     except Exception as exc:
         return {"name": "xgboost_classifier", "status": "unavailable", "reason": f"xgboost_unavailable:{exc}", "dependency_version": None}
     try:
+        _xgb_device = os.environ.get("CRYPTO_XGBOOST_DEVICE", "cpu").lower()
+        _xgb_kwargs: dict[str, Any] = {"tree_method": "hist"}
+        if _xgb_device not in ("", "cpu"):
+            _xgb_kwargs["device"] = _xgb_device
         classifier = xgb.XGBClassifier(
             n_estimators=80,
             max_depth=3,
@@ -8289,8 +8294,8 @@ def _fit_crypto_xgboost_model(
             colsample_bytree=0.9,
             eval_metric="logloss",
             random_state=17,
-            n_jobs=1,
-            tree_method="hist",
+            n_jobs=-1,
+            **_xgb_kwargs,
         )
         classifier.fit(raw_matrix, labels)
         booster = classifier.get_booster()
@@ -8340,6 +8345,7 @@ def _fit_crypto_lightgbm_model(
     except Exception as exc:
         return {"name": "lightgbm_classifier", "status": "unavailable", "reason": f"lightgbm_unavailable:{exc}", "dependency_version": None}
     try:
+        _lgb_n_jobs = int(os.environ.get("CRYPTO_LIGHTGBM_N_JOBS", "-1"))
         classifier = lgb.LGBMClassifier(
             n_estimators=80,
             max_depth=3,
@@ -8349,7 +8355,7 @@ def _fit_crypto_lightgbm_model(
             colsample_bytree=0.9,
             min_child_samples=1,
             random_state=17,
-            n_jobs=1,
+            n_jobs=_lgb_n_jobs,
             verbosity=-1,
         )
         classifier.fit(raw_matrix, labels)
