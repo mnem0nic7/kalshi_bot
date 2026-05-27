@@ -57,7 +57,11 @@ run() { if [[ "${DRY_RUN}" == 1 ]]; then echo "  DRY-RUN> $*"; else eval "$*"; f
 # services that participate in the color flip (per-color)
 color_services() {
   local color="$1"
-  echo "app_${ENV}_${color} daemon_${ENV}_${color} daemon_${ENV}_crypto_1h_${color}"
+  if [[ "${ENV}" == "production" ]]; then
+    echo "app_${ENV}_${color} daemon_${ENV}_${color} daemon_${ENV}_crypto_1h_${color}"
+  else
+    echo "app_${ENV}_${color} daemon_${ENV}_${color}"
+  fi
 }
 
 # --- discover the active color from the deployment_control row -------------

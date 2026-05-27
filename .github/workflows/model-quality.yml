@@ -26,6 +26,10 @@ name: Model Quality
       frequency:
         description: Crypto market frequency
         default: "15m"
+      run_training:
+        description: Run legacy model-training/replay steps
+        type: boolean
+        default: false
       persist:
         description: Store the model-quality trend checkpoint
         type: boolean
@@ -50,6 +54,7 @@ jobs:
       INPUT_DOMAIN: ${{ github.event.inputs.domain }}
       INPUT_DAYS: ${{ github.event.inputs.days }}
       INPUT_FREQUENCY: ${{ github.event.inputs.frequency }}
+      INPUT_RUN_TRAINING: ${{ github.event.inputs.run_training }}
       INPUT_PERSIST: ${{ github.event.inputs.persist }}
 
     steps:
@@ -99,6 +104,7 @@ jobs:
           domain="${INPUT_DOMAIN:-all}"
           days="${INPUT_DAYS:-180}"
           frequency="${INPUT_FREQUENCY:-15m}"
+          run_training="${INPUT_RUN_TRAINING:-false}"
           persist="${INPUT_PERSIST:-true}"
 
           case "${kalshi_env}" in
@@ -110,8 +116,12 @@ jobs:
             *) echo "Invalid domain: ${domain}" >&2; exit 1 ;;
           esac
           case "${frequency}" in
-            15m) ;;
+            15m|1h) ;;
             *) echo "Invalid frequency: ${frequency}" >&2; exit 1 ;;
+          esac
+          case "${run_training}" in
+            true|false) ;;
+            *) echo "Invalid run_training: ${run_training}" >&2; exit 1 ;;
           esac
           if ! [[ "${days}" =~ ^[0-9]+$ ]] || (( days < 1 || days > 3650 )); then
             echo "Invalid days: ${days}" >&2
@@ -176,18 +186,30 @@ jobs:
             run_remote_json "Crypto spot status" crypto-spot-status.json crypto-spot status --frequency "${frequency}" --days "${days}" --json
             run_remote_json "Crypto spot backfill" crypto-spot-backfill.json crypto-spot backfill --frequency "${frequency}" --days "${days}" --json
             run_remote_json "Crypto history status" crypto-history-status.json crypto-history status --frequency "${frequency}" --days "${days}" --json
-            run_remote_json "Crypto model train" crypto-model-train.json crypto-model train --frequency "${frequency}"
-            run_remote_json "Crypto candidate quality" crypto-model-candidates.json crypto-model candidates --frequency "${frequency}" --days "${days}" --json
-            run_remote_json "Crypto replay run" crypto-replay-run.json crypto-replay run --frequency "${frequency}" --days "${days}" --json
-            run_remote_json "Crypto replay validate" crypto-replay-validate.json crypto-replay validate --frequency "${frequency}" --days "${days}" --json
-            run_remote_json "Crypto replay gate" crypto-replay-gate.json crypto-replay gate --frequency "${frequency}"
+            if [[ "${run_training}" == "true" ]]; then
+              run_remote_json "Crypto model train" crypto-model-train.json crypto-model train --frequency "${frequency}"
+              run_remote_json "Crypto candidate quality" crypto-model-candidates.json crypto-model candidates --frequency "${frequency}" --days "${days}" --json
+              run_remote_json "Crypto replay run" crypto-replay-run.json crypto-replay run --frequency "${frequency}" --days "${days}" --json
+              run_remote_json "Crypto replay validate" crypto-replay-validate.json crypto-replay validate --frequency "${frequency}" --days "${days}" --json
+              run_remote_json "Crypto replay gate" crypto-replay-gate.json crypto-replay gate --frequency "${frequency}"
+            else
+              printf '{"status":"skipped","reason":"legacy_training_disabled","frequency":"%s"}\n' "${frequency}" > crypto-model-train.json
+              printf '{"status":"skipped","reason":"legacy_training_disabled","frequency":"%s"}\n' "${frequency}" > crypto-model-candidates.json
+              printf '{"status":"skipped","reason":"legacy_training_disabled","frequency":"%s"}\n' "${frequency}" > crypto-replay-run.json
+              printf '{"status":"skipped","reason":"legacy_training_disabled","frequency":"%s"}\n' "${frequency}" > crypto-replay-validate.json
+              printf '{"status":"skipped","reason":"legacy_training_disabled","frequency":"%s"}\n' "${frequency}" > crypto-replay-gate.json
+            fi
             if [[ "${kalshi_env}" == "demo" ]]; then
               run_remote_json "Crypto demo shadow run-once" crypto-autonomy-run-once.json crypto-autonomy run-once --frequency "${frequency}" --json
             fi
           fi
 
           if [[ "${domain}" == "all" || "${domain}" == "weather" ]]; then
-            run_remote_json "Weather modeling train-shadow" weather-modeling-train-shadow.json modeling train-shadow --kalshi-env "${kalshi_env}" --days "${days}" --json
+            if [[ "${run_training}" == "true" ]]; then
+              run_remote_json "Weather modeling train-shadow" weather-modeling-train-shadow.json modeling train-shadow --kalshi-env "${kalshi_env}" --days "${days}" --json
+            else
+              printf '{"status":"skipped","reason":"legacy_training_disabled"}\n' > weather-modeling-train-shadow.json
+            fi
             run_remote_json "Weather modeling validate" weather-modeling-validate.json modeling validate --kalshi-env "${kalshi_env}" --days "${days}" --json
             run_remote_json "Weather backtesting validate" weather-backtesting-validate.json backtesting validate --kalshi-env "${kalshi_env}" --days "${days}" --limit 200 --json
             run_remote_json "Weather trade-quality report" weather-trade-quality.json trade-behavior quality --kalshi-env "${kalshi_env}" --days "${days}" --limit 20 --json

@@ -674,7 +674,7 @@ The daemon runs a nightly per-asset model+backtest+gate refresh at a configured 
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED` | `true` | Master switch. |
+| `CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED` | `false` | Master switch for the legacy crypto train/replay/gate loop. |
 | `CRYPTO_MODEL_NIGHTLY_TIMEZONE` | `America/Los_Angeles` | IANA timezone for local-date and hour checks. |
 | `CRYPTO_MODEL_NIGHTLY_HOUR_LOCAL` | `3` | Local clock hour (0–23) at which the job becomes eligible. |
 | `CRYPTO_MODEL_NIGHTLY_MIN_NEW_STRICT_ROWS` | `60` | Minimum strict-trade-eligible rows in the last 24 h to trigger a refresh. |

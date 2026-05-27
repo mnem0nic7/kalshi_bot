@@ -252,6 +252,10 @@ Training depends on both market history and spot history. A model can be trained
 but still fail replay if the replay window does not produce enough strict
 real-quote candidates or does not beat the market-mid baseline.
 
+Production touch-strategy mode disables automatic legacy model training by
+default. Use `docs/crypto-touch-strategy-rollout.md` for the no-training 30%
+touch deployment settings.
+
 ## Replay Gate Knobs
 
 Replay is the promotion gate between trained models and live asset eligibility.
@@ -658,7 +662,7 @@ global gate reflects all updated per-asset backtest slices.
 
 | Env var | Python attr | Default | Effect |
 | --- | --- | ---: | --- |
-| `CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED` | `crypto_model_nightly_auto_enabled` | `true` | Master switch. Set to `false` to disable; GitHub Actions workflow continues running daily. |
+| `CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED` | `crypto_model_nightly_auto_enabled` | `false` | Master switch. Set to `true` only when intentionally running the legacy train/replay/gate loop. |
 | `CRYPTO_MODEL_NIGHTLY_TIMEZONE` | `crypto_model_nightly_timezone` | `America/Los_Angeles` | IANA timezone for local-date and hour checks. |
 | `CRYPTO_MODEL_NIGHTLY_HOUR_LOCAL` | `crypto_model_nightly_hour_local` | `3` | Local clock hour (0–23) at which the job becomes eligible. Runs once per date per env+color. |
 | `CRYPTO_MODEL_NIGHTLY_MIN_NEW_STRICT_ROWS` | `crypto_model_nightly_min_new_strict_rows` | `60` | Minimum strict-trade-eligible rows in the last 24 h to trigger a refresh. Matches `CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET`. |

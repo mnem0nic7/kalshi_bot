@@ -104,7 +104,7 @@ runtime_services=(
 if [[ "${ENABLE_CRYPTO_1H_CONTAINER:-false}" == "true" ]]; then
   runtime_services+=(crypto_1h_production)
 fi
-if [[ "${ENABLE_CRYPTO_1H_DAEMON:-false}" == "true" ]]; then
+if [[ "${ENABLE_CRYPTO_1H_DAEMON:-true}" == "true" ]]; then
   runtime_services+=(daemon_production_crypto_1h_blue daemon_production_crypto_1h_green)
 fi
 docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build \

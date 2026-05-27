@@ -69,6 +69,34 @@ def test_touch_strategy_selects_live_candidate_when_probability_and_spread_clear
     assert candidates[0]["touch_strategy"]["objective"] == "exitably_up_30pct_before_close"
 
 
+def test_touch_strategy_supports_one_hour_frequency_without_training_artifact():
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        crypto_touch_strategy_enabled=True,
+        crypto_touch_strategy_min_touch_probability=0.54,
+        risk_min_edge_bps=200,
+        crypto_live_min_market_age_seconds=180,
+        crypto_autonomy_min_seconds_to_close=0,
+    )
+
+    action, side, target_yes, _edge_bps, trace = _crypto_recommendation(
+        market=SimpleNamespace(spread_bps=100),
+        fair_yes=Decimal("0.5000"),
+        settings=settings,
+        row=_row(
+            market_ticker="KXBTC-26MAY2615-B100000-T100500",
+            frequency="1h",
+            time_to_close_seconds=2400,
+        ),
+    )
+
+    assert action is not None
+    assert side is not None
+    assert target_yes is not None
+    assert trace["objective"] == "touch_30pct_before_close"
+    assert trace["touch_strategy"]["objective"] == "exitably_up_30pct_before_close"
+
+
 def test_touch_strategy_blocks_wide_low_price_spreads():
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",

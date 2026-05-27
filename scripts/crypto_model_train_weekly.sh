@@ -16,6 +16,11 @@
 #   Sun 6am PDT / 1pm UTC  — HYPE (delayed to clear Sunday VACUUM FULL window)
 set -euo pipefail
 
+if [[ "${CRYPTO_LEGACY_TRAINING_ENABLED:-false}" != "true" ]]; then
+    echo "legacy crypto model training disabled; set CRYPTO_LEGACY_TRAINING_ENABLED=true to opt in"
+    exit 0
+fi
+
 ASSET="${1:?Usage: $0 ASSET}"
 LOG="/tmp/crypto_train_${ASSET}_$(date +%Y%m%d).log"
 
