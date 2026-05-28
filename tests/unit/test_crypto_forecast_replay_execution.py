@@ -34,6 +34,7 @@ from kalshi_bot.crypto.services import (
     CryptoForecastService,
     CryptoReplayService,
     _crypto_apply_empirical_bucket_gate_to_replay_metrics,
+    _crypto_autonomy_cycle_ops_payload,
     _crypto_data_quality,
     _crypto_decision_rows,
     _crypto_bucket_key,
@@ -6760,6 +6761,71 @@ def test_crypto_autonomy_selector_uses_1h_close_window_override(tmp_path) -> Non
     assert one_hour_skipped == []
     assert fifteen_min_selected == []
     assert fifteen_min_skipped[0]["reason"] == "too_close_to_close"
+
+
+def test_crypto_autonomy_cycle_ops_payload_groups_asset_skip_reasons() -> None:
+    now = datetime.now(UTC)
+    discovered = [
+        _market(
+            market_ticker="KXBTC15M-TEST",
+            asset_symbol="BTC",
+            close_time=now + timedelta(minutes=10),
+        ),
+        _market(
+            market_ticker="KXSOL15M-TEST",
+            asset_symbol="SOL",
+            close_time=now + timedelta(minutes=10),
+        ),
+    ]
+    result = {
+        "status": "ok",
+        "kalshi_env": "demo",
+        "frequency": "15m",
+        "forced": False,
+        "asset_symbols": ["BTC", "SOL"],
+        "shadow_evidence_mode": False,
+        "checked_markets": 2,
+        "eligible_markets": 1,
+        "caps": {"max_rooms_per_run": 7, "max_per_asset_per_run": 1},
+        "created": [
+            {
+                "market_ticker": "KXSOL15M-TEST",
+                "asset_symbol": "SOL",
+                "room_id": "room-sol",
+                "seconds_to_close": 600,
+                "requested_asset_mode": "shadow",
+            }
+        ],
+        "reevaluated": [],
+        "skipped": [
+            {
+                "market_ticker": "KXBTC15M-TEST",
+                "asset_symbol": "BTC",
+                "reason": "not_live_eligible",
+                "asset_mode": "live",
+                "live_blockers": ["Kalshi write credentials are missing."],
+            }
+        ],
+        "errors": [],
+    }
+
+    payload = _crypto_autonomy_cycle_ops_payload(
+        result,
+        discovered=discovered,
+        selected_markets=[discovered[1]],
+        min_seconds_to_close=600,
+        min_market_age_seconds=90,
+    )
+
+    assert payload["schema_version"] == "crypto-autonomy-cycle-v1"
+    assert payload["frequency"] == "15m"
+    assert payload["created_count"] == 1
+    assert payload["skipped_count"] == 1
+    assert payload["skip_reason_counts"] == {"not_live_eligible": 1}
+    assert payload["live_blocker_counts"] == {"Kalshi write credentials are missing.": 1}
+    assert payload["assets"]["BTC"]["skipped"][0]["reason"] == "not_live_eligible"
+    assert payload["assets"]["SOL"]["created"][0]["market_ticker"] == "KXSOL15M-TEST"
+    assert payload["assets"]["SOL"]["selected_market_tickers"] == ["KXSOL15M-TEST"]
 
 
 @pytest.mark.asyncio

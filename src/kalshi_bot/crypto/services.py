@@ -89,6 +89,7 @@ CRYPTO_ASSET_MODES = {
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
 CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v5"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
+CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
 CRYPTO_EXPLORATORY_SHADOW = "exploratory_shadow"
 CRYPTO_LIVE_QUALITY = "live_quality"
@@ -4888,7 +4889,7 @@ class CryptoAutonomyService:
                     }
                 )
 
-        return {
+        result = {
             "status": "ok",
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
@@ -4906,6 +4907,189 @@ class CryptoAutonomyService:
             "skipped": skipped,
             "errors": errors,
         }
+        await self._log_cycle(
+            result,
+            discovered=discovered,
+            selected_markets=markets,
+            min_seconds_to_close=min_seconds,
+            min_market_age_seconds=max(0, int(self.settings.crypto_live_min_market_age_seconds)),
+        )
+        return result
+
+    async def _log_cycle(
+        self,
+        result: dict[str, Any],
+        *,
+        discovered: list[CryptoMarket],
+        selected_markets: list[CryptoMarket],
+        min_seconds_to_close: int,
+        min_market_age_seconds: int,
+    ) -> None:
+        payload = _crypto_autonomy_cycle_ops_payload(
+            result,
+            discovered=discovered,
+            selected_markets=selected_markets,
+            min_seconds_to_close=min_seconds_to_close,
+            min_market_age_seconds=min_market_age_seconds,
+        )
+        severity = "warning" if payload["error_count"] else "info"
+        try:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                await repo.log_ops_event(
+                    severity=severity,
+                    source="crypto_autonomy",
+                    summary=_crypto_autonomy_cycle_ops_summary(payload),
+                    payload=payload,
+                    kalshi_env=self.settings.kalshi_env,
+                )
+                await session.commit()
+        except Exception:
+            logger.warning("failed to log crypto autonomy cycle telemetry", exc_info=True)
+
+
+def _crypto_autonomy_cycle_ops_payload(
+    result: dict[str, Any],
+    *,
+    discovered: list[CryptoMarket],
+    selected_markets: list[CryptoMarket],
+    min_seconds_to_close: int,
+    min_market_age_seconds: int,
+) -> dict[str, Any]:
+    assets: dict[str, dict[str, Any]] = {}
+
+    def asset_entry(asset_symbol: str | None) -> dict[str, Any]:
+        symbol = normalize_asset_symbol(asset_symbol or "UNKNOWN")
+        if symbol not in assets:
+            assets[symbol] = {
+                "discovered_market_count": 0,
+                "selected_market_tickers": [],
+                "created": [],
+                "reevaluated": [],
+                "skipped": [],
+                "errors": [],
+                "skip_reason_counts": {},
+                "error_count": 0,
+            }
+        return assets[symbol]
+
+    for symbol in result.get("asset_symbols") or []:
+        asset_entry(str(symbol))
+    for market in discovered:
+        entry = asset_entry(market.asset_symbol)
+        entry["discovered_market_count"] += 1
+    for market in selected_markets:
+        entry = asset_entry(market.asset_symbol)
+        _append_limited(entry["selected_market_tickers"], market.market_ticker)
+
+    for item in result.get("created") or []:
+        if not isinstance(item, dict):
+            continue
+        entry = asset_entry(item.get("asset_symbol"))
+        _append_limited(entry["created"], _crypto_autonomy_compact_cycle_item(item))
+
+    for item in result.get("reevaluated") or []:
+        if not isinstance(item, dict):
+            continue
+        entry = asset_entry(item.get("asset_symbol"))
+        _append_limited(entry["reevaluated"], _crypto_autonomy_compact_cycle_item(item))
+
+    reason_counts: Counter[str] = Counter()
+    live_blocker_counts: Counter[str] = Counter()
+    for item in result.get("skipped") or []:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("reason") or "unknown")
+        reason_counts[reason] += 1
+        entry = asset_entry(item.get("asset_symbol"))
+        entry["skip_reason_counts"][reason] = int(entry["skip_reason_counts"].get(reason, 0)) + 1
+        _append_limited(entry["skipped"], _crypto_autonomy_compact_cycle_item(item))
+        for blocker in item.get("live_blockers") or []:
+            live_blocker_counts[str(blocker)] += 1
+
+    for item in result.get("errors") or []:
+        if not isinstance(item, dict):
+            continue
+        entry = asset_entry(item.get("asset_symbol"))
+        entry["error_count"] += 1
+        _append_limited(entry["errors"], _crypto_autonomy_compact_cycle_item(item))
+
+    return {
+        "schema_version": CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION,
+        "kalshi_env": result.get("kalshi_env"),
+        "frequency": result.get("frequency"),
+        "forced": bool(result.get("forced")),
+        "shadow_evidence_mode": bool(result.get("shadow_evidence_mode")),
+        "requested_assets": list(result.get("asset_symbols") or []),
+        "checked_markets": int(result.get("checked_markets") or 0),
+        "eligible_markets": int(result.get("eligible_markets") or 0),
+        "created_count": len(result.get("created") or []),
+        "reevaluated_count": len(result.get("reevaluated") or []),
+        "skipped_count": len(result.get("skipped") or []),
+        "error_count": len(result.get("errors") or []),
+        "skip_reason_counts": dict(sorted(reason_counts.items())),
+        "live_blocker_counts": dict(sorted(live_blocker_counts.items())),
+        "caps": _crypto_json_safe(result.get("caps") or {}),
+        "min_seconds_to_close": int(min_seconds_to_close),
+        "min_market_age_seconds": int(min_market_age_seconds),
+        "assets": dict(sorted(assets.items())),
+    }
+
+
+def _crypto_autonomy_cycle_ops_summary(payload: dict[str, Any]) -> str:
+    reason_counts = payload.get("skip_reason_counts") or {}
+    top_reason = ""
+    if reason_counts:
+        reason, count = max(reason_counts.items(), key=lambda item: int(item[1]))
+        top_reason = f" top_skip={reason}:{count}"
+    return (
+        f"Crypto autonomy cycle {payload.get('frequency')}: "
+        f"created={payload.get('created_count', 0)} "
+        f"reevaluated={payload.get('reevaluated_count', 0)} "
+        f"skipped={payload.get('skipped_count', 0)} "
+        f"errors={payload.get('error_count', 0)}"
+        f"{top_reason}"
+    )
+
+
+def _crypto_autonomy_compact_cycle_item(item: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "market_ticker",
+        "asset_symbol",
+        "reason",
+        "room_id",
+        "seconds_to_close",
+        "market_age_seconds",
+        "min_market_age_seconds",
+        "asset_mode",
+        "requested_asset_mode",
+        "live_blockers",
+        "error",
+    )
+    return {
+        key: _crypto_json_safe(item[key])
+        for key in keys
+        if key in item and item[key] is not None
+    }
+
+
+def _append_limited(items: list[Any], item: Any, *, limit: int = 10) -> None:
+    if len(items) < limit:
+        items.append(item)
+
+
+def _crypto_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _crypto_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_crypto_json_safe(item) for item in value]
+    return str(value)
 
 
 def _market_from_snapshot(row: CryptoMarketSnapshotRecord) -> CryptoMarket:
