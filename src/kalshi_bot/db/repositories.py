@@ -909,6 +909,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         status: str | None = None,
         asset_symbol: str | None = None,
         asset_symbols: list[str] | None = None,
+        market_ticker: str | None = None,
         since: datetime | None = None,
         settled_only: bool = False,
         limit: int = 1000,
@@ -925,6 +926,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
         if symbols:
             stmt = stmt.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
+        if market_ticker is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.market_ticker == market_ticker)
         if since is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
         if settled_only:

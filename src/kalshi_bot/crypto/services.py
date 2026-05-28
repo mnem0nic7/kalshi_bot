@@ -4814,6 +4814,28 @@ class CryptoAutonomyService:
                     )
                     continue
 
+                if self.settings.crypto_book_noise_gate_enabled:
+                    async with self.session_factory() as session:
+                        repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                        lookback = datetime.now(UTC) - timedelta(seconds=self.settings.crypto_book_noise_lookback_seconds)
+                        recent_snaps = await repo.list_crypto_market_snapshots(
+                            market_ticker=market.market_ticker,
+                            since=lookback,
+                            kalshi_env=self.settings.kalshi_env,
+                            limit=10,
+                        )
+                        await session.commit()
+                    noise_reason = _crypto_book_noise_reason(recent_snaps, settings=self.settings)
+                    if noise_reason:
+                        skipped.append(
+                            {
+                                "market_ticker": market.market_ticker,
+                                "asset_symbol": market.asset_symbol,
+                                "reason": noise_reason,
+                            }
+                        )
+                        continue
+
                 async with self.session_factory() as session:
                     repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                     existing = await repo.get_latest_room_for_market(
@@ -9975,6 +9997,25 @@ def _crypto_frequency_for_row(row: dict[str, Any]) -> str:
     if "15M" in series_ticker or "15M" in market_ticker:
         return "15m"
     return "15m"
+
+
+def _crypto_book_noise_reason(
+    snapshots: list,
+    *,
+    settings: Settings,
+) -> str | None:
+    if not settings.crypto_book_noise_gate_enabled or len(snapshots) < 2:
+        return None
+    mids = [
+        (s.yes_bid_dollars + s.yes_ask_dollars) / Decimal("2")
+        for s in snapshots
+        if s.yes_bid_dollars is not None and s.yes_ask_dollars is not None
+    ]
+    if len(mids) < 2:
+        return None
+    if (max(mids) - min(mids)) >= Decimal(str(settings.crypto_book_noise_yes_range_threshold)):
+        return "crypto_market_book_noise"
+    return None
 
 
 def _crypto_live_entry_window_reason(row: dict[str, Any], *, settings: Settings) -> str | None:
