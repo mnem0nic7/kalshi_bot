@@ -10078,6 +10078,7 @@ def _crypto_entry_policy_for_row(
             float(entry["min_contract_price_dollars"]),
             float(settings.risk_min_contract_price_dollars),
         )
+        entry["max_entry_price_dollars"] = max(0.0, float(settings.crypto_max_entry_price_dollars))
         entry["min_remaining_payout_bps"] = CRYPTO_MIN_REMAINING_PAYOUT_BPS
         return entry
     return {
@@ -10085,6 +10086,7 @@ def _crypto_entry_policy_for_row(
         "max_spread_bps": int(settings.crypto_live_max_spread_bps),
         "min_confidence": float(settings.risk_min_confidence),
         "min_contract_price_dollars": float(settings.risk_min_contract_price_dollars),
+        "max_entry_price_dollars": max(0.0, float(settings.crypto_max_entry_price_dollars)),
         "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
         "max_credible_edge_bps": int(settings.risk_max_credible_edge_bps),
     }
@@ -11253,6 +11255,7 @@ def _crypto_trade_candidates(
     min_live_edge = Decimal(int(entry_policy["min_fee_adjusted_edge_bps"])) / Decimal("10000")
     max_live_spread = int(entry_policy["max_spread_bps"])
     min_contract_price = Decimal(str(entry_policy["min_contract_price_dollars"]))
+    max_entry_price = Decimal(str(entry_policy.get("max_entry_price_dollars") or "0"))
     min_remaining_payout = Decimal(int(entry_policy["min_remaining_payout_bps"])) / Decimal("10000")
     max_credible_edge_bps = int(entry_policy["max_credible_edge_bps"])
     min_shadow_edge = Decimal(str(settings.crypto_shadow_exploration_min_expected_net_edge_dollars))
@@ -11383,6 +11386,14 @@ def _crypto_trade_candidates(
         ):
             candidate_status = "blocked_last_minute_passive"
             reason = "last_minute_passive_would_cross_touch"
+        if (
+            max_entry_price > 0
+            and execution_cost > max_entry_price
+            and candidate_status in {CRYPTO_LIVE_QUALITY, CRYPTO_EXPLORATORY_SHADOW}
+        ):
+            status = "blocked"
+            candidate_status = "blocked_max_entry_price"
+            reason = "contract_price_above_crypto_max_entry"
         bucket_key = _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(execution_cost)})
         pre_empirical_status = candidate_status
         pre_empirical_reason = reason

@@ -301,6 +301,8 @@ class Settings(BaseSettings):
     crypto_shadow_exploration_max_spread_bps: int = 500
     crypto_live_max_spread_bps: int = 1500
     crypto_min_contract_price_floor_dollars: float = 0.35
+    # Optional live-entry ceiling. A value <= 0 disables this guard.
+    crypto_max_entry_price_dollars: float = 0.0
     crypto_1h_min_contract_price_dollars: float = 0.40
     crypto_empirical_bucket_gate_enabled: bool = True
     crypto_empirical_bucket_gate_assets: str = "live"

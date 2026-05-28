@@ -244,6 +244,7 @@
       broad_shadow_exploration: "net edge below live min; shadow only",
       fee_adjusted_edge_below_live_min: "net edge below live min",
       contract_price_below_crypto_min: "contract price below crypto min",
+      contract_price_above_crypto_max_entry: "contract price above max entry",
       remaining_payout_below_crypto_min: "remaining payout below crypto min",
       spread_above_live_max: "spread above live max",
       crypto_market_too_early_for_live_entry: "market too early for live entry",

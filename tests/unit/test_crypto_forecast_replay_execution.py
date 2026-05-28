@@ -4398,6 +4398,39 @@ def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
     assert candidates[0]["runtime_thresholds"]["min_contract_price_dollars"] == 0.5
 
 
+def test_crypto_candidate_quality_blocks_entry_above_max_price(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=50,
+        crypto_market_price_anchor_weight=0.0,
+        crypto_max_entry_price_dollars=0.75,
+        crypto_live_min_market_age_seconds=60,
+        crypto_autonomy_min_seconds_to_close=180,
+    )
+    row = {
+        "market_ticker": "KXBTC15M-MAXENTRY",
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.7950"),
+        "yes_bid_dollars": Decimal("0.7900"),
+        "yes_ask_dollars": Decimal("0.8000"),
+        "no_ask_dollars": Decimal("0.2100"),
+        "spread_bps": 100,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_ohlc",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
+    }
+
+    candidates = _crypto_trade_candidates(row, Decimal("0.9500"), settings=settings)
+
+    yes_candidate = next(candidate for candidate in candidates if candidate["side"] == "yes")
+    assert yes_candidate["candidate_status"] == "blocked_max_entry_price"
+    assert yes_candidate["reason"] == "contract_price_above_crypto_max_entry"
+    assert yes_candidate["execution_price_dollars"] == "0.8000"
+    assert yes_candidate["runtime_thresholds"]["max_entry_price_dollars"] == 0.75
+
+
 def test_crypto_candidate_quality_blocks_runtime_spread_over_asset_limit(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=50, trigger_max_spread_bps=1000)
     service = AgentPackService(settings)
