@@ -3094,7 +3094,7 @@ class CryptoForecastService:
                 limit=30,
             )
             cross_asset_spot: dict[str, list[CryptoSpotOHLCRecord]] = {}
-            for _ca in [a for a in ("BTC", "ETH") if a != market.asset_symbol]:
+            for _ca in [a for a in CRYPTO_CROSS_ASSET_FEATURE_ASSETS if a != market.asset_symbol]:
                 cross_asset_spot[_ca] = await repo.list_crypto_spot_ohlc(
                     frequency=market.frequency,
                     kalshi_env=self.settings.kalshi_env,
@@ -8080,6 +8080,8 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
             for asset in CRYPTO_CROSS_ASSET_FEATURE_ASSETS
             for period in (1, 3)
         ],
+        "funding_rate_current",
+        "funding_rate_delta",
     ]
     feature_names = [*numeric, *[f"asset={asset}" for asset in assets]]
     return {
@@ -8224,6 +8226,12 @@ def _crypto_raw_feature_vector(
         return_3 = float(_decimal(row.get(f"{key}_return_3_pct") or Decimal("0")))
         numeric_values[f"{key}_return_1_pct"] = max(-0.05, min(0.05, return_1)) * 20.0
         numeric_values[f"{key}_return_3_pct"] = max(-0.10, min(0.10, return_3)) * 10.0
+    # Funding rate features: already computed and stored in every training/inference row
+    # but were missing from v5 schema. OKX 8h rates are ~0.0001–0.0003; scale to [-1, 1].
+    funding_current = float(_decimal(row.get("funding_rate_current") or Decimal("0")))
+    funding_delta = float(_decimal(row.get("funding_rate_delta") or Decimal("0")))
+    numeric_values["funding_rate_current"] = max(-1.0, min(1.0, funding_current / 0.003))
+    numeric_values["funding_rate_delta"] = max(-1.0, min(1.0, funding_delta / 0.002))
     values: list[float] = [numeric_values[name] for name in schema.get("numeric_feature_names") or []]
     values.extend(1.0 if asset == category else 0.0 for category in schema.get("asset_categories") or [])
     return values
@@ -8589,17 +8597,22 @@ def _fit_crypto_xgboost_model(
         if _xgb_device not in ("", "cpu"):
             _xgb_kwargs["device"] = _xgb_device
         classifier = xgb.XGBClassifier(
-            n_estimators=80,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
+            n_estimators=150,
+            max_depth=4,
+            learning_rate=0.03,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=20,
+            reg_lambda=1.5,
             eval_metric="logloss",
             random_state=17,
             n_jobs=-1,
             **_xgb_kwargs,
         )
-        classifier.fit(raw_matrix, labels)
+        # Fit on full dataset; hold out most-recent 15% for isotonic calibration when
+        # there's enough data — prevents in-sample calibration overfitting.
+        _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
+        classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx])
         booster = classifier.get_booster()
         try:
             raw_booster = booster.save_raw(raw_format="json")
@@ -8624,9 +8637,11 @@ def _fit_crypto_xgboost_model(
             "fallback_model": fallback,
             "training_cutoff": _crypto_training_cutoff(rows),
         }
+        _cal_rows = rows[_cal_split_idx:] if _cal_split_idx < len(rows) else rows
+        _cal_labels = labels[_cal_split_idx:] if _cal_split_idx < len(labels) else labels
         model["probability_calibration"] = _fit_probability_calibration(
-            [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
-            labels,
+            [_predict_crypto_probability(row, model, apply_calibration=False) for row in _cal_rows],
+            _cal_labels,
         )
         return {"name": "xgboost_classifier", "status": "available", "model": model, "dependency_version": getattr(xgb, "__version__", None)}
     except Exception as exc:
@@ -8649,18 +8664,20 @@ def _fit_crypto_lightgbm_model(
     try:
         _lgb_n_jobs = int(os.environ.get("CRYPTO_LIGHTGBM_N_JOBS", "-1"))
         classifier = lgb.LGBMClassifier(
-            n_estimators=80,
-            max_depth=3,
-            learning_rate=0.05,
-            num_leaves=15,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            min_child_samples=1,
+            n_estimators=150,
+            max_depth=4,
+            learning_rate=0.03,
+            num_leaves=31,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_samples=20,
+            reg_lambda=1.5,
             random_state=17,
             n_jobs=_lgb_n_jobs,
             verbosity=-1,
         )
-        classifier.fit(raw_matrix, labels)
+        _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
+        classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx])
         booster = classifier.booster_
         model = {
             "model_type": "lightgbm_classifier",
@@ -8679,9 +8696,11 @@ def _fit_crypto_lightgbm_model(
             "fallback_model": fallback,
             "training_cutoff": _crypto_training_cutoff(rows),
         }
+        _cal_rows = rows[_cal_split_idx:] if _cal_split_idx < len(rows) else rows
+        _cal_labels = labels[_cal_split_idx:] if _cal_split_idx < len(labels) else labels
         model["probability_calibration"] = _fit_probability_calibration(
-            [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
-            labels,
+            [_predict_crypto_probability(row, model, apply_calibration=False) for row in _cal_rows],
+            _cal_labels,
         )
         return {"name": "lightgbm_classifier", "status": "available", "model": model, "dependency_version": getattr(lgb, "__version__", None)}
     except Exception as exc:
