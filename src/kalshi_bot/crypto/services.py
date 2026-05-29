@@ -8597,9 +8597,9 @@ def _fit_crypto_xgboost_model(
         if _xgb_device not in ("", "cpu"):
             _xgb_kwargs["device"] = _xgb_device
         classifier = xgb.XGBClassifier(
-            n_estimators=150,
-            max_depth=4,
-            learning_rate=0.03,
+            n_estimators=100,
+            max_depth=3,
+            learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
             min_child_weight=20,
@@ -8664,10 +8664,10 @@ def _fit_crypto_lightgbm_model(
     try:
         _lgb_n_jobs = int(os.environ.get("CRYPTO_LIGHTGBM_N_JOBS", "-1"))
         classifier = lgb.LGBMClassifier(
-            n_estimators=150,
-            max_depth=4,
-            learning_rate=0.03,
-            num_leaves=31,
+            n_estimators=100,
+            max_depth=3,
+            learning_rate=0.05,
+            num_leaves=15,
             subsample=0.8,
             colsample_bytree=0.8,
             min_child_samples=20,
