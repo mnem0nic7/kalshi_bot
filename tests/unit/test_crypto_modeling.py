@@ -110,3 +110,63 @@ def test_calibrated_ece_not_worse_than_raw_on_biased_data() -> None:
     cal_mse = sum((float(p) - l) ** 2 for p, l in zip(cal_preds, labels)) / len(labels)
     # Allow a small tolerance — isotonic may not always strictly improve on training data
     assert cal_mse <= raw_mse + 0.05, f"Calibrated MSE {cal_mse:.4f} much worse than raw {raw_mse:.4f}"
+
+
+# ── Market price anchor weight tests ─────────────────────────────────────────
+
+from kalshi_bot.config import Settings
+from kalshi_bot.crypto.services import (
+    _crypto_market_anchored_probability,
+    _crypto_market_price_anchor_weight,
+)
+
+
+def _anchor_settings(enabled: bool = True, weight: float = 0.75) -> Settings:
+    return Settings(
+        kalshi_env="demo",
+        crypto_market_price_anchor_enabled=enabled,
+        crypto_market_price_anchor_weight=weight,
+    )
+
+
+def test_anchor_weight_nonzero_at_50_50():
+    """Anchor weight must never be zero — prevents model from ignoring market price."""
+    settings = _anchor_settings()
+    row = {"mid_yes_dollars": Decimal("0.5000")}
+    weight = _crypto_market_price_anchor_weight(row, settings=settings)
+    assert weight > Decimal("0.10"), f"Weight at 50/50 must be >10%, got {weight}"
+
+
+def test_anchor_weight_increases_at_extremes():
+    """Anchor weight should be higher for extreme market prices than for near-50 prices."""
+    settings = _anchor_settings()
+    row_mid = {"mid_yes_dollars": Decimal("0.5000")}
+    row_extreme = {"mid_yes_dollars": Decimal("0.2000")}
+    weight_mid = _crypto_market_price_anchor_weight(row_mid, settings=settings)
+    weight_extreme = _crypto_market_price_anchor_weight(row_extreme, settings=settings)
+    assert weight_extreme > weight_mid, "Extreme prices should anchor more strongly"
+
+
+def test_anchor_prevents_catastrophic_btc_no_failure():
+    """At 49-cent market price, model predicting 12% should be pushed toward market."""
+    settings = _anchor_settings()
+    row = {"mid_yes_dollars": Decimal("0.4900")}
+    raw_model = Decimal("0.1200")
+    anchored = _crypto_market_anchored_probability(row, raw_model, settings=settings)
+    # After anchoring, fair_yes must be closer to market (0.49) than raw model (0.12)
+    dist_raw = abs(raw_model - Decimal("0.4900"))
+    dist_anchored = abs(anchored - Decimal("0.4900"))
+    assert dist_anchored < dist_raw, (
+        f"Anchored {anchored} should be closer to market 0.49 than raw {raw_model}"
+    )
+    # Anchored should be meaningfully above the raw model prediction
+    assert anchored > Decimal("0.15"), f"Anchored {anchored} still too low (raw={raw_model})"
+
+
+def test_anchor_disabled_passes_raw():
+    """When anchor is disabled, raw model prediction passes through unchanged."""
+    settings = _anchor_settings(enabled=False)
+    row = {"mid_yes_dollars": Decimal("0.5000")}
+    raw_model = Decimal("0.1200")
+    anchored = _crypto_market_anchored_probability(row, raw_model, settings=settings)
+    assert anchored == raw_model.quantize(Decimal("0.0001")), "Disabled anchor should pass raw"

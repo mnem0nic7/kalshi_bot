@@ -10639,9 +10639,13 @@ def _crypto_market_price_anchor_weight(row: dict[str, Any], *, settings: Setting
         market_probability = _clamp_price(_decimal(market_mid))
     except Exception:
         return Decimal("0")
-    # Near 50/50 the market has little directional information; at 75/25 and
-    # beyond, treat price as a strong prior against cheap contrarian buys.
-    extremity = min(Decimal("1"), abs(market_probability - Decimal("0.5000")) / Decimal("0.2500"))
+    # Scale anchor weight by how far the market is from 50/50: extremes get full
+    # weight, near-50 gets a floor (never zero) so the market still constrains
+    # model predictions that deviate wildly from a balanced market price.
+    # Floor of 0.30 ensures minimum 22.5% market anchoring at any price level,
+    # preventing the model from predicting 12% YES when market prices 50%.
+    raw_extremity = min(Decimal("1"), abs(market_probability - Decimal("0.5000")) / Decimal("0.2500"))
+    extremity = Decimal("0.30") + Decimal("0.70") * raw_extremity
     return configured_weight * extremity
 
 
