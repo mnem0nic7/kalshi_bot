@@ -110,6 +110,9 @@ jobs:
               "cd ${app_dir_quoted} && infra/scripts/restart-color.sh ${c}"
           done
 
+          "${ssh_cmd[@]}" \
+            "cd ${app_dir_quoted} && docker compose -f infra/docker-compose.yml --env-file .env up -d --no-build --no-deps --force-recreate crypto_current_production"
+
           {
             echo "## Redeploy"
             echo

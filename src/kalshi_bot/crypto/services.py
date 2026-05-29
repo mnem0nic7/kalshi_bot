@@ -1349,6 +1349,8 @@ class CryptoHistoryService:
         days: int | None = 2,
         frequency: str = "15m",
         asset_symbols: list[str] | None = None,
+        capture_candles: bool | None = None,
+        summarize_quality: bool = True,
     ) -> dict[str, Any]:
         """Collect recently settled crypto markets as immutable label snapshots."""
         freq = normalize_frequency(frequency) or "15m"
@@ -1380,13 +1382,18 @@ class CryptoHistoryService:
                 }
             )
 
+        capture_settled_candles = (
+            bool(self.settings.crypto_collect_settled_candles_enabled)
+            if capture_candles is None
+            else bool(capture_candles)
+        )
         candle_stats: dict[str, Any] = {
             "stored": 0,
             "markets_attempted": 0,
             "markets_skipped_existing": 0,
             "errors": [],
             "source_counts": {},
-            "enabled": bool(self.settings.crypto_collect_settled_candles_enabled),
+            "enabled": capture_settled_candles,
             "concurrency": max(1, int(self.settings.crypto_history_candle_concurrency)),
         }
         asset_counts: Counter[str] = Counter({asset: 0 for asset in expected_assets})
@@ -1405,7 +1412,7 @@ class CryptoHistoryService:
                     await session.commit()
             await session.commit()
             captures = []
-            if self.settings.crypto_collect_settled_candles_enabled:
+            if capture_settled_candles:
                 captures = await self._capture_candles_for_markets(
                     session,
                     repo,
@@ -1432,28 +1439,45 @@ class CryptoHistoryService:
                         }
                     )
             await session.commit()
-            snapshots = await repo.list_crypto_market_snapshots(
-                frequency=freq,
-                kalshi_env=self.settings.kalshi_env,
-                since=cutoff,
-                limit=200_000,
-            )
-            candles = await repo.list_crypto_market_candlesticks(
-                frequency=freq,
-                kalshi_env=self.settings.kalshi_env,
-                since=cutoff,
-                limit=500_000,
-            )
-            if requested_assets:
-                snapshots = [
-                    row for row in snapshots if normalize_asset_symbol(row.asset_symbol) in requested_assets
-                ]
-                candles = [row for row in candles if normalize_asset_symbol(row.asset_symbol) in requested_assets]
+            snapshots: list[CryptoMarketSnapshotRecord] = []
+            candles: list[CryptoMarketCandlestickRecord] = []
+            if summarize_quality:
+                snapshots = await repo.list_crypto_market_snapshots(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    since=cutoff,
+                    limit=200_000,
+                )
+                candles = await repo.list_crypto_market_candlesticks(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    since=cutoff,
+                    limit=500_000,
+                )
+                if requested_assets:
+                    snapshots = [
+                        row for row in snapshots if normalize_asset_symbol(row.asset_symbol) in requested_assets
+                    ]
+                    candles = [row for row in candles if normalize_asset_symbol(row.asset_symbol) in requested_assets]
             await session.commit()
-        assets_missing_settled = _crypto_assets_missing_settled_markets(
-            snapshots,
-            expected_assets=expected_assets,
-        )
+        if summarize_quality:
+            assets_missing_settled = _crypto_assets_missing_settled_markets(
+                snapshots,
+                expected_assets=expected_assets,
+            )
+            data_quality = _crypto_data_quality(
+                snapshots,
+                candles,
+                min_training_samples=self.settings.crypto_min_training_samples,
+            )
+        else:
+            assets_missing_settled = sorted(asset for asset in expected_assets if int(asset_counts.get(asset) or 0) <= 0)
+            data_quality = _crypto_lightweight_settled_data_quality(
+                expected_assets=expected_assets,
+                asset_counts=asset_counts,
+                settled_snapshot_count=len(settled_markets),
+                candle_count=candle_stats["stored"],
+            )
         return {
             "status": "ok" if settled_markets else "warn",
             "kalshi_env": self.settings.kalshi_env,
@@ -1472,11 +1496,7 @@ class CryptoHistoryService:
             "series": series_stats,
             "pages_fetched": sum(int(item["pages_fetched"]) for item in series_stats),
             "settled_rows_seen": sum(int(item["rows_seen"]) for item in series_stats),
-            "data_quality": _crypto_data_quality(
-                snapshots,
-                candles,
-                min_training_samples=self.settings.crypto_min_training_samples,
-            ),
+            "data_quality": data_quality,
             "errors": errors[:10],
         }
 
@@ -6356,6 +6376,26 @@ def _crypto_data_quality(
         "asset_count": len(assets),
         "assets": by_asset,
         "source_kind_counts": dict(Counter(row.source_kind for row in snapshots)),
+    }
+
+
+def _crypto_lightweight_settled_data_quality(
+    *,
+    expected_assets: list[str],
+    asset_counts: Counter[str],
+    settled_snapshot_count: int,
+    candle_count: int,
+) -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "reason": "quality_summary_disabled",
+        "settled_snapshot_count": settled_snapshot_count,
+        "candle_count": candle_count,
+        "asset_count": len(expected_assets),
+        "assets": {
+            asset: {"settled_snapshot_count": int(asset_counts.get(asset) or 0)}
+            for asset in expected_assets
+        },
     }
 
 

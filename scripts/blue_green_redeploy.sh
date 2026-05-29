@@ -139,6 +139,11 @@ run "docker exec $(container "app_${ENV}_${TARGET}") kalshi-bot-cli promote ${TA
 log "verifying"
 run "docker exec $(container "app_${ENV}_${TARGET}") kalshi-bot-cli status | python3 -c \"import sys,json; d=json.load(sys.stdin); print('active_color=%s kill_switch=%s lock=%s' % (d['active_color'], d['kill_switch_enabled'], d['execution_lock_holder']))\""
 
+if [[ "${ENV}" == "production" && "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
+  log "recreating production crypto current collector"
+  run "compose up -d --no-deps --force-recreate crypto_current_production"
+fi
+
 # --- 5. optionally recreate the now-idle old color -------------------------
 if [[ "${RECREATE_OLD}" == 1 ]]; then
   OLD_SVCS="$(color_services "${ACTIVE}")"

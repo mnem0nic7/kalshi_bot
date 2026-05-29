@@ -107,10 +107,16 @@ fi
 if [[ "${ENABLE_CRYPTO_1H_DAEMON:-true}" == "true" ]]; then
   runtime_services+=(daemon_production_crypto_1h_blue daemon_production_crypto_1h_green)
 fi
+if [[ "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
+  runtime_services+=(crypto_current_production)
+fi
 docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build \
   "${runtime_services[@]}"
 wait_for_services_health 180 \
   app_demo_blue app_demo_green app_production_blue app_production_green
+if [[ "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
+  wait_for_service_health crypto_current_production 60
+fi
 infra/scripts/sync-web-color.sh all
 # Stop and remove caddy explicitly before recreating to avoid Docker compose
 # removal-in-progress races during full machine recovery.

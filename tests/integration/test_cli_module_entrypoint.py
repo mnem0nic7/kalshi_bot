@@ -130,6 +130,23 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     history_settled_args = parser.parse_args(
         ["crypto-history", "collect-settled", "--kalshi-env", "production", "--frequency", "15m", "--days", "2", "--assets", "BTC", "--json"]
     )
+    history_settled_light_args = parser.parse_args(
+        [
+            "crypto-history",
+            "collect-settled",
+            "--kalshi-env",
+            "production",
+            "--frequency",
+            "1h",
+            "--days",
+            "2",
+            "--assets",
+            "BTC",
+            "--skip-candles",
+            "--skip-quality",
+            "--json",
+        ]
+    )
     spot_current_args = parser.parse_args(
         ["crypto-spot", "collect-current", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "--json"]
     )
@@ -207,6 +224,10 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert history_settled_args.crypto_history_command == "collect-settled"
     assert history_settled_args.days == 2
     assert history_settled_args.assets == ["BTC"]
+    assert history_settled_args.skip_candles is False
+    assert history_settled_args.skip_quality is False
+    assert history_settled_light_args.skip_candles is True
+    assert history_settled_light_args.skip_quality is True
     assert spot_current_args.command == "crypto-spot"
     assert spot_current_args.crypto_spot_command == "collect-current"
     assert spot_current_args.assets == ["BTC"]
@@ -304,7 +325,7 @@ def test_crypto_live_path_recommends_settled_backfill_when_labels_missing() -> N
     )
 
     assert report["next_command"] == (
-        "crypto-history collect-settled --kalshi-env production --frequency 1h --days 2 --assets ETH --json"
+        "crypto-history collect-settled --kalshi-env production --frequency 1h --days 2 --assets ETH --skip-candles --skip-quality --json"
     )
     assert report["quote_evidence"]["strict_quote_ingestion_audit"]["blocker_stage"] == "missing_settled_label"
 

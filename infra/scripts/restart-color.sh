@@ -106,6 +106,12 @@ for env_name in "${envs[@]}"; do
   wait_for_service_health "${app_service}" 180
 done
 
+if [[ ("${target_env}" == "all" || "${target_env}" == "production") && "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
+  docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps \
+    crypto_current_production
+  wait_for_service_health crypto_current_production 60
+fi
+
 infra/scripts/sync-web-color.sh "${target_env}"
 
 if [[ "${refresh_caddy}" == "true" ]]; then

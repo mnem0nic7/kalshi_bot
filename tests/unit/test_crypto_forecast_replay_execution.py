@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -48,6 +49,7 @@ from kalshi_bot.crypto.services import (
     _crypto_last_minute_passive_bid_by_asset,
     _crypto_last_minute_passive_price_ladder,
     _crypto_last_minute_passive_price_matrix,
+    _crypto_lightweight_settled_data_quality,
     _eligible_market_per_asset,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
@@ -1284,6 +1286,8 @@ async def test_crypto_history_collect_settled_appends_terminal_label_snapshot(tm
     class _FakeKalshi:
         async def list_markets(self, **params):
             assert params["status"] == "settled"
+            if params["series_ticker"] != "KXBTC15M":
+                return {"markets": []}
             return {
                 "markets": [
                     {
@@ -4809,6 +4813,28 @@ def test_crypto_data_quality_reports_per_asset_gaps(tmp_path) -> None:
     assert quality["status"] == "needs_data"
     assert quality["assets"]["BTC"]["settled_snapshot_count"] == 1
     assert quality["assets"]["BTC"]["markets_missing_candles"] == 1
+
+
+def test_crypto_lightweight_settled_data_quality_reports_requested_assets() -> None:
+    quality = _crypto_lightweight_settled_data_quality(
+        expected_assets=["BNB", "BTC", "ETH"],
+        asset_counts=Counter({"BTC": 2}),
+        settled_snapshot_count=2,
+        candle_count=5,
+    )
+
+    assert quality == {
+        "status": "skipped",
+        "reason": "quality_summary_disabled",
+        "settled_snapshot_count": 2,
+        "candle_count": 5,
+        "asset_count": 3,
+        "assets": {
+            "BNB": {"settled_snapshot_count": 0},
+            "BTC": {"settled_snapshot_count": 2},
+            "ETH": {"settled_snapshot_count": 0},
+        },
+    }
 
 
 @pytest.mark.asyncio

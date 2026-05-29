@@ -684,6 +684,8 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
             days=args.days,
             frequency=args.frequency,
             asset_symbols=getattr(args, "assets", None),
+            capture_candles=False if getattr(args, "skip_candles", False) else None,
+            summarize_quality=not getattr(args, "skip_quality", False),
         )
     elif args.crypto_history_command == "status":
         result = await container.crypto_history_service.status(
@@ -1513,6 +1515,8 @@ def _crypto_live_path_assess_asset(
             f"--frequency {frequency} "
             "--days 2 "
             f"--assets {asset} "
+            "--skip-candles "
+            "--skip-quality "
             "--json"
         )
     elif not ready and (asset in missing_assets or asset in stale_assets):
@@ -4366,6 +4370,8 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_history_collect_settled.add_argument("--days", type=int, default=2)
     crypto_history_collect_settled.add_argument("--frequency", default="15m")
     crypto_history_collect_settled.add_argument("--assets", nargs="*", default=None)
+    crypto_history_collect_settled.add_argument("--skip-candles", action="store_true")
+    crypto_history_collect_settled.add_argument("--skip-quality", action="store_true")
     crypto_history_collect_settled.add_argument("--json", action="store_true")
     crypto_history_status = crypto_history_subparsers.add_parser("status")
     add_kalshi_env_argument(crypto_history_status)
