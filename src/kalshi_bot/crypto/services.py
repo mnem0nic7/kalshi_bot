@@ -8907,6 +8907,36 @@ def _lightgbm_predict_batch(
         return [_predict_crypto_probability(row, model, apply_calibration=apply_calibration) for row in rows]
 
 
+def _crypto_batch_predict_ensemble(
+    rows: list[dict[str, Any]],
+    models: dict[str, dict[str, Any]],
+    weights: dict[str, float],
+) -> list[Decimal]:
+    total_weight = sum(w for name, w in weights.items() if name in models)
+    if not rows or total_weight <= 0:
+        return [_clamp_price(_decimal(row.get("mid_yes_dollars"))) for row in rows]
+    member_probs: dict[str, list[Decimal]] = {}
+    for name, weight in weights.items():
+        model = models.get(name)
+        if model is None:
+            continue
+        model_type = model.get("model_type")
+        if model_type == "xgboost_classifier":
+            member_probs[name] = _xgboost_predict_batch(rows, model)
+        elif model_type == "lightgbm_classifier":
+            member_probs[name] = _lightgbm_predict_batch(rows, model)
+        else:
+            member_probs[name] = [_predict_crypto_probability(row, model) for row in rows]
+    results = []
+    for i in range(len(rows)):
+        prob = Decimal("0")
+        for name, weight in weights.items():
+            if name in member_probs:
+                prob += member_probs[name][i] * Decimal(str(weight / total_weight))
+        results.append(_clamp_price(prob))
+    return results
+
+
 def _crypto_predictions_for_model(rows: list[dict[str, Any]], model: dict[str, Any] | None) -> list[tuple[Decimal, int]]:
     if not rows:
         return []
@@ -9254,10 +9284,11 @@ def _crypto_in_sample_candidate_report(
     }
     guarded_entries, ensemble_weights = _crypto_add_ensemble_candidate(rows, guarded_entries, model_map)
     if settings is not None and ensemble_weights:
-        for row in rows:
+        ensemble_preds = _crypto_batch_predict_ensemble(rows, model_map, ensemble_weights)
+        for row, prediction in zip(rows, ensemble_preds):
             trade = _simulate_crypto_trade(
                 row,
-                _crypto_predict_ensemble_from_models(row, model_map, ensemble_weights),
+                prediction,
                 settings=settings,
                 crypto_policy=crypto_policy,
             )
@@ -9335,8 +9366,8 @@ def _crypto_model_candidate_report(
         )
         weights = dict(train_report.get("ensemble_weights") or {})
         if len(weights) >= 2:
-            for row in test_rows:
-                prediction = _crypto_predict_ensemble_from_models(row, available_models, weights)
+            ensemble_test_preds = _crypto_batch_predict_ensemble(test_rows, available_models, weights)
+            for row, prediction in zip(test_rows, ensemble_test_preds):
                 predictions_by_candidate["calibrated_weighted_ensemble"].append((prediction, int(row["label_yes"])))
                 if settings is not None:
                     trade = _simulate_crypto_trade(row, prediction, settings=settings, crypto_policy=crypto_policy)
@@ -9544,14 +9575,22 @@ def _crypto_model_metrics(
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy | None = None,
 ) -> dict[str, Any]:
+    # Batch-predict once and reuse for both calibrated metrics and exploratory simulation.
+    model_type = (model or {}).get("model_type")
+    if model_type == "xgboost_classifier":
+        all_predicted = _xgboost_predict_batch(rows, model)
+    elif model_type == "lightgbm_classifier":
+        all_predicted = _lightgbm_predict_batch(rows, model)
+    else:
+        all_predicted = [_predict_crypto_probability(row, model) for row in rows]
+
     baseline_predictions: list[tuple[Decimal, int]] = []
     calibrated_predictions: list[tuple[Decimal, int]] = []
     baseline_simulated = []
     simulated = []
-    for row in rows:
+    for row, predicted in zip(rows, all_predicted):
         label = int(row["label_yes"])
         baseline = _decimal(row["mid_yes_dollars"])
-        predicted = _predict_crypto_probability(row, model)
         baseline_predictions.append((baseline, label))
         calibrated_predictions.append((predicted, label))
         baseline_simulated.append(_simulate_crypto_trade(row, baseline, settings=settings, crypto_policy=crypto_policy))
@@ -9559,12 +9598,12 @@ def _crypto_model_metrics(
     exploratory = [
         _simulate_crypto_trade(
             row,
-            _predict_crypto_probability(row, model),
+            predicted,
             settings=settings,
             crypto_policy=crypto_policy,
             policy=CRYPTO_EXPLORATORY_SHADOW,
         )
-        for row in rows
+        for row, predicted in zip(rows, all_predicted)
     ]
     fillable = [item for item in simulated if item["status"] == "fillable"]
     baseline_fillable = [item for item in baseline_simulated if item["status"] == "fillable"]
