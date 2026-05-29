@@ -8640,7 +8640,7 @@ def _fit_crypto_xgboost_model(
         _cal_rows = rows[_cal_split_idx:] if _cal_split_idx < len(rows) else rows
         _cal_labels = labels[_cal_split_idx:] if _cal_split_idx < len(labels) else labels
         model["probability_calibration"] = _fit_probability_calibration(
-            [_predict_crypto_probability(row, model, apply_calibration=False) for row in _cal_rows],
+            _xgboost_predict_batch(_cal_rows, model, apply_calibration=False),
             _cal_labels,
         )
         return {"name": "xgboost_classifier", "status": "available", "model": model, "dependency_version": getattr(xgb, "__version__", None)}
@@ -8699,7 +8699,7 @@ def _fit_crypto_lightgbm_model(
         _cal_rows = rows[_cal_split_idx:] if _cal_split_idx < len(rows) else rows
         _cal_labels = labels[_cal_split_idx:] if _cal_split_idx < len(labels) else labels
         model["probability_calibration"] = _fit_probability_calibration(
-            [_predict_crypto_probability(row, model, apply_calibration=False) for row in _cal_rows],
+            _lightgbm_predict_batch(_cal_rows, model, apply_calibration=False),
             _cal_labels,
         )
         return {"name": "lightgbm_classifier", "status": "available", "model": model, "dependency_version": getattr(lgb, "__version__", None)}
@@ -8850,7 +8850,73 @@ def _predict_crypto_probability(
     return _clamp_price(mid + adjustment + momentum - spread_penalty)
 
 
+def _xgboost_predict_batch(
+    rows: list[dict[str, Any]],
+    model: dict[str, Any],
+    *,
+    apply_calibration: bool = True,
+) -> list[Decimal]:
+    try:
+        import xgboost as xgb
+
+        schema = {
+            "feature_names": list(model.get("feature_names") or []),
+            "numeric_feature_names": list(model.get("numeric_feature_names") or []),
+            "asset_categories": list(model.get("asset_categories") or []),
+        }
+        defaults = model.get("feature_defaults") or {}
+        matrix = [_crypto_raw_feature_vector(row, schema, defaults=defaults) for row in rows]
+        booster = xgb.Booster()
+        booster.load_model(bytearray(base64.b64decode(str(model.get("booster_raw_base64") or ""))))
+        raw_probs = booster.predict(xgb.DMatrix(matrix))
+        cal = model.get("probability_calibration") if apply_calibration else None
+        results = []
+        for p in raw_probs:
+            prob = _clamp_price(Decimal(str(float(p))))
+            results.append(_apply_probability_calibration(prob, cal) if apply_calibration else prob)
+        return results
+    except Exception:
+        return [_predict_crypto_probability(row, model, apply_calibration=apply_calibration) for row in rows]
+
+
+def _lightgbm_predict_batch(
+    rows: list[dict[str, Any]],
+    model: dict[str, Any],
+    *,
+    apply_calibration: bool = True,
+) -> list[Decimal]:
+    try:
+        import lightgbm as lgb
+
+        schema = {
+            "feature_names": list(model.get("feature_names") or []),
+            "numeric_feature_names": list(model.get("numeric_feature_names") or []),
+            "asset_categories": list(model.get("asset_categories") or []),
+        }
+        defaults = model.get("feature_defaults") or {}
+        matrix = [_crypto_raw_feature_vector(row, schema, defaults=defaults) for row in rows]
+        booster = lgb.Booster(model_str=str(model.get("booster_model_string") or ""))
+        raw_probs = booster.predict(matrix)
+        cal = model.get("probability_calibration") if apply_calibration else None
+        results = []
+        for p in raw_probs:
+            prob = _clamp_price(Decimal(str(float(p))))
+            results.append(_apply_probability_calibration(prob, cal) if apply_calibration else prob)
+        return results
+    except Exception:
+        return [_predict_crypto_probability(row, model, apply_calibration=apply_calibration) for row in rows]
+
+
 def _crypto_predictions_for_model(rows: list[dict[str, Any]], model: dict[str, Any] | None) -> list[tuple[Decimal, int]]:
+    if not rows:
+        return []
+    model_type = (model or {}).get("model_type")
+    if model_type == "xgboost_classifier" and model is not None:
+        probs = _xgboost_predict_batch(rows, model)
+        return list(zip(probs, (int(row["label_yes"]) for row in rows)))
+    if model_type == "lightgbm_classifier" and model is not None:
+        probs = _lightgbm_predict_batch(rows, model)
+        return list(zip(probs, (int(row["label_yes"]) for row in rows)))
     return [(_predict_crypto_probability(row, model), int(row["label_yes"])) for row in rows]
 
 
@@ -9284,9 +9350,9 @@ def _crypto_model_candidate_report(
             if status.get("status") != "available" or status.get("model") is None:
                 unavailable_reasons.setdefault(name, str(status.get("reason") or "unavailable"))
                 continue
-            for row in test_rows:
-                prediction = _predict_crypto_probability(row, status["model"])
-                predictions_by_candidate[name].append((prediction, int(row["label_yes"])))
+            batch_preds = _crypto_predictions_for_model(test_rows, status["model"])
+            for row, (prediction, label) in zip(test_rows, batch_preds, strict=True):
+                predictions_by_candidate[name].append((prediction, label))
                 if settings is not None:
                     trade = _simulate_crypto_trade(row, prediction, settings=settings, crypto_policy=crypto_policy)
                     if trade["status"] == "fillable":
