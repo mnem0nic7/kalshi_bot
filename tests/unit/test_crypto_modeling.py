@@ -170,3 +170,122 @@ def test_anchor_disabled_passes_raw():
     raw_model = Decimal("0.1200")
     anchored = _crypto_market_anchored_probability(row, raw_model, settings=settings)
     assert anchored == raw_model.quantize(Decimal("0.0001")), "Disabled anchor should pass raw"
+
+
+# ── Model-spot direction check tests ─────────────────────────────────────────
+
+from kalshi_bot.crypto.services import _crypto_model_spot_direction_check  # noqa: E402
+
+
+def _direction_check_settings(
+    enabled: bool = True,
+    min_moneyness: float = 0.02,
+    max_fair_yes: float = 0.40,
+) -> Settings:
+    return Settings(
+        kalshi_env="demo",
+        crypto_model_spot_direction_check_enabled=enabled,
+        crypto_model_spot_direction_min_moneyness_pct=min_moneyness,
+        crypto_model_spot_direction_max_fair_yes=max_fair_yes,
+    )
+
+
+def test_direction_check_flags_inversion_when_spot_above_target():
+    """Model says YES=12% but spot is clearly above target — conflict detected."""
+    settings = _direction_check_settings()
+    row = {
+        "spot_feature_status": "available",
+        "spot_moneyness_pct": Decimal("0.05"),  # spot 5% above target (YES in the money)
+        "mid_yes_dollars": Decimal("0.3500"),
+    }
+    raw_fair = Decimal("0.1200")
+    corrected, mismatch = _crypto_model_spot_direction_check(row, raw_fair, settings=settings)
+    assert mismatch is not None, "Direction conflict must be flagged"
+    assert mismatch["reason"] == "model_spot_direction_conflict"
+    # Corrected fair must equal the market mid, not the raw model output
+    assert corrected == Decimal("0.3500"), f"Expected corrected=0.35, got {corrected}"
+    assert corrected > raw_fair, "Corrected fair must be higher than inverted model output"
+
+
+def test_direction_check_passes_through_low_price_yes_market():
+    """Spot below target + model says low YES = correct NO prediction, no conflict."""
+    settings = _direction_check_settings()
+    row = {
+        "spot_feature_status": "available",
+        "spot_moneyness_pct": Decimal("-0.04"),  # spot 4% BELOW target (YES out of the money)
+        "mid_yes_dollars": Decimal("0.2000"),
+    }
+    raw_fair = Decimal("0.1500")
+    corrected, mismatch = _crypto_model_spot_direction_check(row, raw_fair, settings=settings)
+    assert mismatch is None, "No conflict when model correctly predicts low YES with spot below target"
+    assert corrected == raw_fair, "Raw fair must pass through unchanged"
+
+
+def test_direction_check_passes_through_when_model_agrees():
+    """Spot above target and model also says high YES — no conflict."""
+    settings = _direction_check_settings()
+    row = {
+        "spot_feature_status": "available",
+        "spot_moneyness_pct": Decimal("0.05"),
+        "mid_yes_dollars": Decimal("0.6800"),
+    }
+    raw_fair = Decimal("0.7200")
+    corrected, mismatch = _crypto_model_spot_direction_check(row, raw_fair, settings=settings)
+    assert mismatch is None, "No conflict when model agrees with spot direction"
+    assert corrected == raw_fair
+
+
+def test_direction_check_ignores_small_moneyness():
+    """Spot barely above target (below threshold) does not trigger the check."""
+    settings = _direction_check_settings(min_moneyness=0.02)
+    row = {
+        "spot_feature_status": "available",
+        "spot_moneyness_pct": Decimal("0.01"),  # 1% < 2% threshold
+        "mid_yes_dollars": Decimal("0.4800"),
+    }
+    raw_fair = Decimal("0.1200")
+    corrected, mismatch = _crypto_model_spot_direction_check(row, raw_fair, settings=settings)
+    assert mismatch is None, "Small moneyness below threshold must not trigger correction"
+    assert corrected == raw_fair
+
+
+def test_direction_check_ignores_stale_spot():
+    """Stale spot features must not trigger the conflict check."""
+    settings = _direction_check_settings()
+    row = {
+        "spot_feature_status": "stale",  # stale — not trustworthy
+        "spot_moneyness_pct": Decimal("0.10"),
+        "mid_yes_dollars": Decimal("0.3500"),
+    }
+    raw_fair = Decimal("0.1200")
+    corrected, mismatch = _crypto_model_spot_direction_check(row, raw_fair, settings=settings)
+    assert mismatch is None, "Stale spot must not trigger direction correction"
+    assert corrected == raw_fair
+
+
+def test_direction_check_disabled_passes_through():
+    """When the check is disabled the raw model output is unchanged."""
+    settings = _direction_check_settings(enabled=False)
+    row = {
+        "spot_feature_status": "available",
+        "spot_moneyness_pct": Decimal("0.08"),
+        "mid_yes_dollars": Decimal("0.3500"),
+    }
+    raw_fair = Decimal("0.1200")
+    corrected, mismatch = _crypto_model_spot_direction_check(row, raw_fair, settings=settings)
+    assert mismatch is None, "Disabled check must not produce a mismatch trace"
+    assert corrected == raw_fair, "Disabled check must pass raw fair through unchanged"
+
+
+def test_direction_check_missing_spot_moneyness_skips():
+    """Missing spot_moneyness_pct (no target price) must not trigger the check."""
+    settings = _direction_check_settings()
+    row = {
+        "spot_feature_status": "available",
+        "spot_moneyness_pct": None,
+        "mid_yes_dollars": Decimal("0.3500"),
+    }
+    raw_fair = Decimal("0.1200")
+    corrected, mismatch = _crypto_model_spot_direction_check(row, raw_fair, settings=settings)
+    assert mismatch is None
+    assert corrected == raw_fair

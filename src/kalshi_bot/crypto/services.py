@@ -3158,6 +3158,22 @@ class CryptoForecastService:
         else:
             payload = artifact.payload or {}
             fair = _predict_crypto_probability(market_row, payload)
+            fair, _direction_mismatch = _crypto_model_spot_direction_check(
+                market_row, fair, settings=self.settings
+            )
+            if _direction_mismatch is not None:
+                logger.warning(
+                    "crypto model-spot direction conflict: %s asset=%s fair_raw=%s corrected=%s moneyness=%s",
+                    _direction_mismatch["reason"],
+                    market.asset_symbol,
+                    _direction_mismatch["raw_model_fair_yes"],
+                    _direction_mismatch["corrected_fair_yes"],
+                    _direction_mismatch["spot_moneyness_pct"],
+                )
+            features = {
+                **features,
+                "model_spot_direction_check": _direction_mismatch,
+            }
         action, side, target_yes, edge_bps, trace = _crypto_recommendation(
             market=market,
             fair_yes=fair,
@@ -8817,6 +8833,69 @@ def _predict_crypto_probability(
 
 def _crypto_predictions_for_model(rows: list[dict[str, Any]], model: dict[str, Any] | None) -> list[tuple[Decimal, int]]:
     return [(_predict_crypto_probability(row, model), int(row["label_yes"])) for row in rows]
+
+
+def _crypto_model_spot_direction_check(
+    market_row: dict[str, Any],
+    fair: Decimal,
+    *,
+    settings: Settings,
+) -> tuple[Decimal, dict[str, Any] | None]:
+    """Detect model-spot direction inversions and clip the output to the market mid.
+
+    Returns (corrected_fair, mismatch_trace_or_None).
+
+    A mismatch is declared when ALL three conditions hold:
+      1. spot_feature_status == "available"   — we have a fresh, non-stale spot price
+      2. spot_moneyness_pct > min_moneyness   — spot is clearly above the target
+                                                (YES-contract is in-the-money by a
+                                                meaningful margin)
+      3. fair < max_fair_yes_threshold        — the model predicts a low YES probability
+                                                (i.e., it thinks NO wins), contradicting
+                                                the spot evidence
+
+    In this case the raw model output is almost certainly an inversion artefact from
+    cap_strike-contaminated training rows where positive moneyness was paired with a
+    YES=0 label.  We replace `fair` with `mid` (the market price) — the safest neutral
+    fallback — so the downstream anchor and edge logic see a price consistent with the
+    available physical signal rather than an inverted model output.
+
+    The symmetric case (spot well below target, model predicts very high YES) is NOT
+    corrected here; that scenario is less likely to cause a live-loss trade because the
+    anchor system already constrains extreme high fair_yes values through the edge gate.
+    """
+    if not settings.crypto_model_spot_direction_check_enabled:
+        return fair, None
+    spot_status = str(market_row.get("spot_feature_status") or "")
+    if spot_status != "available":
+        return fair, None
+    moneyness_raw = market_row.get("spot_moneyness_pct")
+    if moneyness_raw is None:
+        return fair, None
+    try:
+        moneyness = float(_decimal(moneyness_raw))
+    except Exception:
+        return fair, None
+    min_moneyness = float(settings.crypto_model_spot_direction_min_moneyness_pct)
+    max_fair_yes = Decimal(str(settings.crypto_model_spot_direction_max_fair_yes))
+    if moneyness < min_moneyness:
+        return fair, None
+    if fair >= max_fair_yes:
+        return fair, None
+    # Conflict detected: spot is above target (YES should win) but model says low YES.
+    # Fallback to market mid so we neither buy the wrong side nor claim false edge.
+    mid_raw = market_row.get("mid_yes_dollars")
+    fallback = _clamp_price(_decimal(mid_raw)) if mid_raw is not None else Decimal("0.5000")
+    mismatch = {
+        "reason": "model_spot_direction_conflict",
+        "raw_model_fair_yes": _money_text(fair),
+        "corrected_fair_yes": _money_text(fallback),
+        "spot_moneyness_pct": str(moneyness),
+        "min_moneyness_threshold": str(min_moneyness),
+        "max_fair_yes_threshold": str(max_fair_yes),
+        "spot_feature_status": spot_status,
+    }
+    return fallback, mismatch
 
 
 def _crypto_candidate_metric_entry(

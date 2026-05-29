@@ -333,6 +333,17 @@ class Settings(BaseSettings):
     crypto_book_noise_gate_enabled: bool = False
     crypto_book_noise_yes_range_threshold: float = 0.10
     crypto_book_noise_lookback_seconds: int = 90
+    # Model-spot direction agreement check.  When the model predicts fair_yes
+    # below crypto_model_spot_direction_max_fair_yes (default 0.40) while spot
+    # moneyness is clearly positive (spot > target by at least
+    # crypto_model_spot_direction_min_moneyness_pct, default 0.02), the model
+    # is contradicting a strong physical signal.  In that case the raw model
+    # output is replaced with the market mid (safe fallback) and the mismatch
+    # is logged with reason "model_spot_direction_conflict".  Set
+    # crypto_model_spot_direction_check_enabled=false to disable.
+    crypto_model_spot_direction_check_enabled: bool = True
+    crypto_model_spot_direction_min_moneyness_pct: float = 0.02
+    crypto_model_spot_direction_max_fair_yes: float = 0.40
 
     crypto_winrate_guard_enabled: bool = True
     crypto_winrate_guard_window: int = 20
