@@ -16,6 +16,7 @@ from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.position_governance import (
     classify_position_health,
     latest_signal_fair_yes_dollars,
+    list_position_exit_submit_checkpoints,
     stop_loss_outcome_from_payloads,
     stop_loss_stopped_at_from_payloads,
 )
@@ -2780,7 +2781,7 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
             market_tickers=[position.market_ticker for position in positions],
             kalshi_env=kalshi_env,
         )
-        stop_loss_submit_checkpoints = await repo.list_checkpoints(prefix=f"stop_loss_submit:{kalshi_env}:")
+        position_exit_submit_checkpoints = await list_position_exit_submit_checkpoints(repo, kalshi_env=kalshi_env)
         stop_loss_reentry_checkpoints = await repo.list_checkpoints(prefix=f"stop_loss_reentry:{kalshi_env}:")
         total_capital = await repo.get_total_capital_dollars(kalshi_env=kalshi_env)
         daily_pnl_baseline = await repo.get_daily_portfolio_baseline_dollars(kalshi_env=kalshi_env)
@@ -2828,8 +2829,8 @@ async def build_env_dashboard(container: AppContainer, kalshi_env: str) -> dict[
         for position in positions
     }
     stop_loss_submit_by_ticker = {
-        checkpoint.stream_name.removeprefix(f"stop_loss_submit:{kalshi_env}:"): dict(checkpoint.payload or {})
-        for checkpoint in stop_loss_submit_checkpoints
+        ticker: dict(checkpoint.payload or {})
+        for ticker, checkpoint in position_exit_submit_checkpoints.items()
     }
     stop_loss_reentry_by_ticker = {
         checkpoint.stream_name.removeprefix(f"stop_loss_reentry:{kalshi_env}:"): dict(checkpoint.payload or {})

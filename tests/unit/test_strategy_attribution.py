@@ -8,7 +8,7 @@ Verifies:
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -507,6 +507,170 @@ async def test_daily_realized_pnl_by_strategy_nets_matched_buy_sell_pair(repo_fa
             strategy_code="A", kalshi_env="demo"
         )
         assert pnl == Decimal("1.50")
+
+
+@pytest.mark.asyncio
+async def test_daily_realized_pnl_by_strategy_matches_sell_to_prior_day_buy(repo_factory):
+    """A stop-loss/take-profit exit today must carry the entry cost basis even
+    when the opening BUY is older than the 24h daily-loss window."""
+    now = datetime.now(UTC)
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        buy = await repo.upsert_fill(
+            market_ticker="KXBTC15M-26MAY24-B75000-T76000",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.8000"),
+            count_fp=Decimal("10.00"),
+            raw={},
+            trade_id="old-buy",
+            kalshi_env="demo",
+            strategy_code="CRYPTO_15M",
+        )
+        buy.created_at = now - timedelta(hours=25)
+        sell = await repo.upsert_fill(
+            market_ticker="KXBTC15M-26MAY24-B75000-T76000",
+            side="yes",
+            action="sell",
+            yes_price_dollars=Decimal("0.3000"),
+            count_fp=Decimal("10.00"),
+            raw={},
+            trade_id="today-sell",
+            kalshi_env="demo",
+            strategy_code="CRYPTO_15M",
+        )
+        sell.created_at = now - timedelta(minutes=5)
+        await session.flush()
+
+        pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
+            strategy_code="CRYPTO_15M",
+            kalshi_env="demo",
+            now=now,
+        )
+
+    assert pnl == Decimal("-5.00")
+
+
+@pytest.mark.asyncio
+async def test_daily_realized_pnl_by_strategy_does_not_treat_unmatched_sell_as_profit(repo_factory):
+    now = datetime.now(UTC)
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        sell = await repo.upsert_fill(
+            market_ticker="KXBTC15M-26MAY24-B75000-T76000",
+            side="yes",
+            action="sell",
+            yes_price_dollars=Decimal("0.9000"),
+            count_fp=Decimal("10.00"),
+            raw={},
+            trade_id="unmatched-sell",
+            kalshi_env="demo",
+            strategy_code="CRYPTO_15M",
+        )
+        sell.created_at = now - timedelta(minutes=5)
+        await session.flush()
+
+        pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
+            strategy_code="CRYPTO_15M",
+            kalshi_env="demo",
+            now=now,
+        )
+
+    assert pnl == Decimal("0.00")
+
+
+@pytest.mark.asyncio
+async def test_crypto_portfolio_exposure_helpers_are_crypto_and_subaccount_scoped(repo_factory):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        await repo.upsert_position(
+            market_ticker="KXBTC15M-26MAY24-B75000-T76000",
+            subaccount=0,
+            kalshi_env="demo",
+            side="yes",
+            count_fp=Decimal("10.00"),
+            average_price_dollars=Decimal("0.4000"),
+            raw={},
+        )
+        await repo.upsert_position(
+            market_ticker="KXHIGHNY-26MAY24-T75",
+            subaccount=0,
+            kalshi_env="demo",
+            side="yes",
+            count_fp=Decimal("20.00"),
+            average_price_dollars=Decimal("0.5000"),
+            raw={},
+        )
+        await repo.upsert_position(
+            market_ticker="KXETH1H-26MAY24-B3000-T3100",
+            subaccount=1,
+            kalshi_env="demo",
+            side="yes",
+            count_fp=Decimal("8.00"),
+            average_price_dollars=Decimal("0.5000"),
+            raw={},
+        )
+        await repo.save_order(
+            ticket_id=None,
+            client_order_id="pending-crypto-sub0",
+            market_ticker="KXBTC15M-26MAY24-B75000-T76000",
+            status="resting",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.3000"),
+            count_fp=Decimal("4.00"),
+            raw={"request_payload": {"subaccount": 0}},
+            kalshi_env="demo",
+            strategy_code="CRYPTO_15M",
+        )
+        await repo.save_order(
+            ticket_id=None,
+            client_order_id="pending-crypto-sub1",
+            market_ticker="KXBTC15M-26MAY24-B75000-T76000",
+            status="resting",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("4.00"),
+            raw={"request_payload": {"subaccount": 1}},
+            kalshi_env="demo",
+            strategy_code="CRYPTO_15M",
+        )
+        await repo.save_order(
+            ticket_id=None,
+            client_order_id="pending-weather-sub0",
+            market_ticker="KXHIGHNY-26MAY24-T75",
+            status="resting",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("4.00"),
+            raw={"request_payload": {"subaccount": 0}},
+            kalshi_env="demo",
+            strategy_code="A",
+        )
+
+        position_notional = await repo.get_crypto_portfolio_position_notional_dollars(
+            kalshi_env="demo",
+            subaccount=0,
+        )
+        pending_notional = await repo.get_crypto_portfolio_pending_buy_notional_dollars(
+            kalshi_env="demo",
+            subaccount=0,
+        )
+        pending_count = await repo.get_pending_buy_count_fp(
+            "KXBTC15M-26MAY24-B75000-T76000",
+            "no",
+            kalshi_env="demo",
+            subaccount=0,
+        )
+
+    assert position_notional == Decimal("4.0000")
+    assert pending_notional == Decimal("2.8000")
+    assert pending_count == Decimal("4.00")
 
 
 @pytest.mark.asyncio

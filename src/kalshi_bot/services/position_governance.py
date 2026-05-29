@@ -17,6 +17,9 @@ STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL = "submitted_pending_fill"
 STOP_LOSS_OUTCOME_FILLED_EXIT = "filled_exit"
 STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED = "cancelled_or_unfilled"
 
+POSITION_EXIT_SUBMIT_PREFIX = "position_exit_submit"
+LEGACY_STOP_LOSS_SUBMIT_PREFIX = "stop_loss_submit"
+
 STOP_LOSS_OUTCOME_LABELS = {
     STOP_LOSS_OUTCOME_SUBMIT_FAILED: "Stop-Loss Failed",
     STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL: "Stop-Loss Pending",
@@ -40,6 +43,62 @@ POSITION_CLASSIFICATION_LABELS = {
 
 _TERMINAL_UNFILLED_ORDER_STATUSES = {"cancelled", "canceled", "expired", "rejected", "failed"}
 _TERMINAL_FILLED_ORDER_STATUSES = {"filled", "executed"}
+
+
+def position_exit_submit_key(kalshi_env: str, market_ticker: str) -> str:
+    return f"{POSITION_EXIT_SUBMIT_PREFIX}:{kalshi_env}:{market_ticker}"
+
+
+def legacy_stop_loss_submit_key(kalshi_env: str, market_ticker: str) -> str:
+    return f"{LEGACY_STOP_LOSS_SUBMIT_PREFIX}:{kalshi_env}:{market_ticker}"
+
+
+async def get_position_exit_submit_checkpoint(
+    repo: PlatformRepository,
+    *,
+    kalshi_env: str,
+    market_ticker: str,
+):
+    checkpoint = await repo.get_checkpoint(position_exit_submit_key(kalshi_env, market_ticker))
+    if checkpoint is not None:
+        return checkpoint
+    return await repo.get_checkpoint(legacy_stop_loss_submit_key(kalshi_env, market_ticker))
+
+
+async def list_position_exit_submit_checkpoints(
+    repo: PlatformRepository,
+    *,
+    kalshi_env: str,
+):
+    by_ticker = {}
+    legacy_prefix = f"{LEGACY_STOP_LOSS_SUBMIT_PREFIX}:{kalshi_env}:"
+    for checkpoint in await repo.list_checkpoints(prefix=legacy_prefix):
+        by_ticker[checkpoint.stream_name.removeprefix(legacy_prefix)] = checkpoint
+    current_prefix = f"{POSITION_EXIT_SUBMIT_PREFIX}:{kalshi_env}:"
+    for checkpoint in await repo.list_checkpoints(prefix=current_prefix):
+        by_ticker[checkpoint.stream_name.removeprefix(current_prefix)] = checkpoint
+    return by_ticker
+
+
+async def set_position_exit_submit_checkpoint(
+    repo: PlatformRepository,
+    *,
+    kalshi_env: str,
+    market_ticker: str,
+    payload: dict[str, Any],
+    cursor: str | None = None,
+):
+    checkpoint = await repo.set_checkpoint(
+        position_exit_submit_key(kalshi_env, market_ticker),
+        cursor=cursor,
+        payload=payload,
+    )
+    await repo.set_checkpoint(
+        legacy_stop_loss_submit_key(kalshi_env, market_ticker),
+        cursor=cursor,
+        payload=payload,
+    )
+    return checkpoint
 
 
 def _normalize_side(value: Any) -> str | None:
@@ -323,14 +382,9 @@ async def refresh_stop_loss_checkpoints(
     market_tickers: list[str] | None = None,
     log_repairs: bool = False,
 ) -> list[StopLossCheckpointRefresh]:
-    submit_prefix = f"stop_loss_submit:{kalshi_env}:"
     reentry_prefix = f"stop_loss_reentry:{kalshi_env}:"
-    submit_checkpoints = await repo.list_checkpoints(prefix=submit_prefix)
+    submit_by_ticker = await list_position_exit_submit_checkpoints(repo, kalshi_env=kalshi_env)
     reentry_checkpoints = await repo.list_checkpoints(prefix=reentry_prefix)
-    submit_by_ticker = {
-        checkpoint.stream_name.removeprefix(submit_prefix): checkpoint
-        for checkpoint in submit_checkpoints
-    }
     reentry_by_ticker = {
         checkpoint.stream_name.removeprefix(reentry_prefix): checkpoint
         for checkpoint in reentry_checkpoints

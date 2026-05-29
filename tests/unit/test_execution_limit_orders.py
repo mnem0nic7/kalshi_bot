@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -51,6 +52,7 @@ def _kalshi(*, order_statuses: list[str], market_ask: str = "0.5900", no_ask: st
     kalshi.write_credentials = object()
     kalshi.create_order = AsyncMock(return_value={"order": {"order_id": "ord-1", "status": "resting"}})
     kalshi.cancel_order = AsyncMock(return_value={})
+    kalshi.get_fills = AsyncMock(return_value={"fills": []})
     poll_responses = [{"order": {"status": s}} for s in order_statuses]
     kalshi.get_order = AsyncMock(side_effect=poll_responses)
     market_resp: dict = {"market": {"yes_ask_dollars": market_ask}}
@@ -206,6 +208,25 @@ async def test_limit_order_returns_unfilled_after_max_requotes():
     assert receipt.status == "unfilled_cancelled"
     assert kalshi.create_order.call_count == 3
     assert kalshi.cancel_order.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_fixed_limit_until_close_reports_partial_fill_after_cancel():
+    kalshi = _kalshi(order_statuses=[])
+    kalshi.get_fills = AsyncMock(return_value={"fills": [{"count_fp": "3.25"}]})
+    svc = ExecutionService(_settings(), kalshi)
+
+    receipt = await svc.execute_fixed_limit_until_close(
+        ticket=_ticket(tif=KALSHI_GTC_TIME_IN_FORCE),
+        client_order_id="coid-1",
+        close_time=datetime.now(UTC) - timedelta(seconds=1),
+        poll_interval_seconds=0.01,
+    )
+
+    assert receipt.status == "partially_filled_cancelled"
+    assert receipt.external_order_id == "ord-1"
+    assert receipt.details["filled_count_fp"] == "3.25"
+    assert receipt.details["partial_fill"] is True
 
 
 @pytest.mark.asyncio

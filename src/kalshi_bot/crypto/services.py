@@ -4313,9 +4313,11 @@ class CryptoWorkflowService:
                 await session.commit()
 
             market = await self.market_service.get_market(room.market_ticker, persist=True)
+            market_observed_at = datetime.now(UTC)
             frequency_label = crypto_frequency_label(market.frequency)
             strategy_code = crypto_strategy_code_for_frequency(market.frequency)
             signal = await self.forecast_service.forecast(market)
+            signal_observed_at = datetime.now(UTC)
 
             async with self.session_factory() as session:
                 repo = PlatformRepository(session)
@@ -4456,7 +4458,14 @@ class CryptoWorkflowService:
                         else f"{strategy_code} passive-first candidate"
                     ),
                 )
-                risk_context = await self._risk_context(repo, room, base_ticket, market)
+                risk_context = await self._risk_context(
+                    repo,
+                    room,
+                    base_ticket,
+                    market,
+                    market_observed_at=market_observed_at,
+                    research_observed_at=signal_observed_at,
+                )
                 count_fp, sizing_diagnostics = _crypto_dynamic_order_count_fp(
                     settings=self.settings,
                     ticket=base_ticket,
@@ -4642,6 +4651,9 @@ class CryptoWorkflowService:
         room: Room,
         ticket: TradeTicket,
         market: CryptoMarket,
+        *,
+        market_observed_at: datetime | None = None,
+        research_observed_at: datetime | None = None,
     ) -> RiskContext:
         strategy_code = crypto_strategy_code_for_frequency(market.frequency)
         positions = await repo.list_positions_for_ticker(
@@ -4655,6 +4667,7 @@ class CryptoWorkflowService:
             room.market_ticker,
             ticket.side.value,
             kalshi_env=room.kalshi_env,
+            subaccount=self.settings.kalshi_subaccount,
         )
         pending_order_notional = estimate_notional_dollars(
             ticket.side,
@@ -4662,6 +4675,23 @@ class CryptoWorkflowService:
             pending_order_count_fp,
         )
         total_capital = await repo.get_total_capital_dollars(kalshi_env=room.kalshi_env)
+        portfolio_position_notional = await repo.get_crypto_portfolio_position_notional_dollars(
+            kalshi_env=room.kalshi_env,
+            subaccount=self.settings.kalshi_subaccount,
+        )
+        portfolio_pending_notional = await repo.get_crypto_portfolio_pending_buy_notional_dollars(
+            kalshi_env=room.kalshi_env,
+            subaccount=self.settings.kalshi_subaccount,
+        )
+        portfolio_bucket_snapshot = None
+        if total_capital is not None and total_capital > Decimal("0"):
+            portfolio_bucket_snapshot = await repo.portfolio_bucket_snapshot(
+                kalshi_env=room.kalshi_env,
+                subaccount=self.settings.kalshi_subaccount,
+                total_capital_dollars=total_capital,
+                safe_capital_reserve_ratio=self.settings.risk_safe_capital_reserve_ratio,
+                risky_capital_max_ratio=self.settings.risk_risky_capital_max_ratio,
+            )
         strategy_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy(
             strategy_code=strategy_code,
             kalshi_env=room.kalshi_env,
@@ -4672,14 +4702,17 @@ class CryptoWorkflowService:
             else Decimal("0")
         )
         return RiskContext(
-            market_observed_at=datetime.now(UTC),
-            research_observed_at=datetime.now(UTC),
+            market_observed_at=market_observed_at,
+            research_observed_at=research_observed_at,
             total_capital_dollars=total_capital,
             current_position_notional_dollars=current_position_notional,
             current_position_count_fp=open_position.count_fp if open_position is not None else Decimal("0"),
             current_position_side=open_position.side if open_position is not None else None,
             pending_order_count_fp=pending_order_count_fp,
             pending_order_notional_dollars=pending_order_notional,
+            portfolio_position_notional_dollars=portfolio_position_notional,
+            portfolio_pending_order_notional_dollars=portfolio_pending_notional,
+            portfolio_bucket_snapshot=portfolio_bucket_snapshot,
             open_ticker_count=len({position.market_ticker for position in all_positions}),
             strategy_code=strategy_code,
             strategy_daily_realized_pnl_dollars=strategy_daily_pnl,

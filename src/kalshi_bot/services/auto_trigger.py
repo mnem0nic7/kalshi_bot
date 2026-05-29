@@ -18,6 +18,7 @@ from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_FILLED_EXIT,
     STOP_LOSS_OUTCOME_SUBMIT_FAILED,
     STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
+    get_position_exit_submit_checkpoint,
     refresh_stop_loss_checkpoints,
     stop_loss_outcome_from_payloads,
     stop_loss_reentry_blocked,
@@ -209,7 +210,11 @@ class AutoTriggerService:
                     market_tickers=[market_ticker],
                     log_repairs=True,
                 )
-                submit_cp = await repo.get_checkpoint(f"stop_loss_submit:{self.settings.kalshi_env}:{market_ticker}")
+                submit_cp = await get_position_exit_submit_checkpoint(
+                    repo,
+                    kalshi_env=self.settings.kalshi_env,
+                    market_ticker=market_ticker,
+                )
 
                 reentry_cp = await repo.get_checkpoint(f"stop_loss_reentry:{self.settings.kalshi_env}:{market_ticker}")
                 if reentry_cp is not None:

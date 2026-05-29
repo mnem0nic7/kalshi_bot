@@ -1717,6 +1717,7 @@ class WorkflowSupervisor:
                     room.market_ticker,
                     ticket.side.value,
                     kalshi_env=room.kalshi_env,
+                    subaccount=self.settings.kalshi_subaccount,
                 )
                 pending_order_notional = estimate_notional_dollars(
                     ticket.side,
@@ -3119,6 +3120,7 @@ class WorkflowSupervisor:
                             room.market_ticker,
                             ticket.side.value,
                             kalshi_env=room.kalshi_env,
+                            subaccount=self.settings.kalshi_subaccount,
                         )
                         pending_order_notional = estimate_notional_dollars(
                             ticket.side,

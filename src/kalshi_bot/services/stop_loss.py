@@ -20,6 +20,8 @@ from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_FILLED_EXIT,
     STOP_LOSS_OUTCOME_SUBMIT_FAILED,
     STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL,
+    get_position_exit_submit_checkpoint,
+    set_position_exit_submit_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -272,9 +274,12 @@ class StopLossService:
             kill_switch_enabled = bool(control.kill_switch_enabled)
             active_color = control.active_color
 
-            # shared submit cooldown — read with committed isolation
-            submit_key = f"stop_loss_submit:{self.settings.kalshi_env}:{position.market_ticker}"
-            submit_cp = await repo.get_checkpoint(submit_key)
+            # Shared exit-submit cooldown — read with committed isolation.
+            submit_cp = await get_position_exit_submit_checkpoint(
+                repo,
+                kalshi_env=self.settings.kalshi_env,
+                market_ticker=position.market_ticker,
+            )
             if submit_cp is not None:
                 outcome_status = str((submit_cp.payload or {}).get("outcome_status") or "")
                 if outcome_status == STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL:
@@ -574,9 +579,10 @@ class StopLossService:
             payload=event_payload,
         )
 
-        await repo.set_checkpoint(
-            f"stop_loss_submit:{self.settings.kalshi_env}:{market_ticker}",
-            cursor=None,
+        await set_position_exit_submit_checkpoint(
+            repo,
+            kalshi_env=self.settings.kalshi_env,
+            market_ticker=market_ticker,
             payload=submit_payload,
         )
         if not submit_failed:

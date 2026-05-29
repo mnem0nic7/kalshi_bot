@@ -139,7 +139,7 @@ class ExecutionService:
             status=order.get("status", "submitted"),
             external_order_id=order.get("order_id"),
             client_order_id=client_order_id,
-            details=response,
+            details={**response, "request_payload": payload},
         )
 
     async def _execute_limit(
@@ -154,11 +154,14 @@ class ExecutionService:
         min_edge = Decimal(str(threshold_bps)) / Decimal("10000")
         current_ticket = ticket
         already_filled_fp = Decimal("0")
+        order_ids: list[str] = []
+        last_receipt_details: dict[str, Any] = {}
 
         for attempt in range(1, _MAX_REQUOTES + 1):
             attempt_coid = f"{client_order_id}_q{attempt}"
             receipt = await self._place_order(current_ticket, attempt_coid)
             order_id = receipt.external_order_id
+            last_receipt_details = receipt.details if isinstance(receipt.details, dict) else {}
 
             if order_id is None:
                 if receipt.status.startswith("rejected_"):
@@ -177,6 +180,7 @@ class ExecutionService:
                     details=receipt.details,
                 )
 
+            order_ids.append(order_id)
             filled = await self._wait_for_fill(order_id)
 
             if filled:
@@ -188,7 +192,7 @@ class ExecutionService:
                     status="filled",
                     external_order_id=order_id,
                     client_order_id=client_order_id,
-                    details=receipt.details,
+                    details={**last_receipt_details, "order_ids": order_ids},
                 )
 
             # Timed out — cancel the resting order.
@@ -211,7 +215,13 @@ class ExecutionService:
                     status="filled",
                     external_order_id=order_id,
                     client_order_id=client_order_id,
-                    details={"race_filled": True, "attempts": attempt},
+                    details={
+                        **last_receipt_details,
+                        "race_filled": True,
+                        "attempts": attempt,
+                        "filled_count_fp": f"{already_filled_fp:.2f}",
+                        "order_ids": order_ids,
+                    },
                 )
 
             if attempt == _MAX_REQUOTES:
@@ -247,11 +257,15 @@ class ExecutionService:
                 )
                 return ExecReceiptPayload(
                     status="requote_edge_lost",
+                    external_order_id=order_ids[-1] if order_ids else None,
                     client_order_id=client_order_id,
                     details={
                         "attempts": attempt,
                         "new_edge_bps": round(float(new_edge) * 10000),
                         "fee_adjusted_edge_bps": round(float(fee_adjusted_edge) * 10000),
+                        "filled_count_fp": f"{already_filled_fp:.2f}",
+                        "partial_fill": already_filled_fp > Decimal("0"),
+                        "order_ids": order_ids,
                     },
                 )
 
@@ -270,9 +284,16 @@ class ExecutionService:
             )
 
         return ExecReceiptPayload(
-            status="unfilled_cancelled",
+            status="partially_filled_cancelled" if already_filled_fp > Decimal("0") else "unfilled_cancelled",
+            external_order_id=order_ids[-1] if order_ids else None,
             client_order_id=client_order_id,
-            details={"attempts": min(attempt, _MAX_REQUOTES)},
+            details={
+                **last_receipt_details,
+                "attempts": min(attempt, _MAX_REQUOTES),
+                "filled_count_fp": f"{already_filled_fp:.2f}",
+                "partial_fill": already_filled_fp > Decimal("0"),
+                "order_ids": order_ids,
+            },
         )
 
     async def execute_fixed_limit_until_close(
@@ -343,8 +364,14 @@ class ExecutionService:
             await self.kalshi.cancel_order(order_id)
         except Exception:
             logger.warning("cancel failed for %s order %s", ticket.market_ticker, order_id, exc_info=True)
+        filled_count_fp = await self._get_filled_fp(order_id)
+        status = "unfilled_cancelled"
+        if filled_count_fp >= ticket.count_fp:
+            status = "filled"
+        elif filled_count_fp > Decimal("0"):
+            status = "partially_filled_cancelled"
         return ExecReceiptPayload(
-            status="unfilled_cancelled",
+            status=status,
             external_order_id=order_id,
             client_order_id=client_order_id,
             details={
@@ -352,6 +379,8 @@ class ExecutionService:
                 "fixed_limit_until_close": True,
                 "cancel_after_close": True,
                 "last_order_status": (last_order or {}).get("status"),
+                "filled_count_fp": f"{filled_count_fp:.2f}",
+                "partial_fill": Decimal("0") < filled_count_fp < ticket.count_fp,
             },
         )
 
@@ -435,7 +464,7 @@ class ExecutionService:
             status=order.get("status", "submitted"),
             external_order_id=order.get("order_id"),
             client_order_id=client_order_id,
-            details=response,
+            details={**response, "request_payload": payload},
         )
 
     async def _get_filled_fp(self, order_id: str) -> Decimal:

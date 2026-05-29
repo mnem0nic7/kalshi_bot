@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -79,6 +80,102 @@ def _quantize_money(value: Any) -> Decimal:
     return as_decimal(value).quantize(Decimal("0.0001"))
 
 
+def _decimal_from_first_key(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
+    for key in keys:
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        try:
+            return Decimal(str(raw))
+        except (ArithmeticError, ValueError):
+            continue
+    return None
+
+
+def _total_capital_dollars_from_balance_payload(balance_payload: dict[str, Any]) -> Decimal | None:
+    cash_cents = _decimal_from_first_key(balance_payload, ("balance", "cash_balance", "cash"))
+    portfolio_cents = _decimal_from_first_key(
+        balance_payload,
+        ("portfolio_value", "portfolioValue", "portfolio"),
+    )
+    if cash_cents is None and portfolio_cents is None:
+        return None
+    if cash_cents is None:
+        return portfolio_cents / Decimal("100") if portfolio_cents is not None else None
+    if portfolio_cents is None:
+        return cash_cents / Decimal("100")
+    # Kalshi payloads in this codebase have represented portfolio_value two ways:
+    # when below cash, as positions market value; when above cash, as total equity.
+    total_cents = portfolio_cents if portfolio_cents >= cash_cents else cash_cents + portfolio_cents
+    return total_cents / Decimal("100")
+
+
+_PENDING_BUY_ORDER_STATUSES = {"resting", "submitted", "accepted", "open", "pending"}
+_CRYPTO_MARKET_TICKER_RE = re.compile(r"^KX[A-Z0-9]+(?:15M|1H)-")
+
+
+def _is_crypto_market_ticker(market_ticker: str | None) -> bool:
+    return bool(_CRYPTO_MARKET_TICKER_RE.match(str(market_ticker or "").upper()))
+
+
+def _as_utc_datetime(value: datetime | None, default: datetime | None = None) -> datetime:
+    resolved = value or default or datetime.min.replace(tzinfo=UTC)
+    if resolved.tzinfo is None:
+        return resolved.replace(tzinfo=UTC)
+    return resolved.astimezone(UTC)
+
+
+def _fill_created_at(fill: FillRecord, default: datetime | None = None) -> datetime:
+    return _as_utc_datetime(fill.created_at, default=default)
+
+
+def _contract_price_from_yes_price(side: str | None, yes_price_dollars: Decimal) -> Decimal:
+    yes_price = _quantize_money(yes_price_dollars)
+    return yes_price if str(side or "").lower() == "yes" else Decimal("1.0000") - yes_price
+
+
+def _fill_fee_for_count(fill: FillRecord, count_fp: Decimal) -> Decimal:
+    total_count = as_decimal(fill.count_fp)
+    if total_count <= Decimal("0") or count_fp <= Decimal("0"):
+        return Decimal("0")
+    return _fill_fee_dollars(fill) * count_fp / total_count
+
+
+def _raw_subaccount(raw: Any) -> int | None:
+    if not isinstance(raw, dict):
+        return None
+    candidates: list[Any] = [
+        raw.get("subaccount"),
+        raw.get("sub_account"),
+    ]
+    for key in ("order", "payload", "request_payload"):
+        nested = raw.get(key)
+        if isinstance(nested, dict):
+            candidates.extend([nested.get("subaccount"), nested.get("sub_account")])
+    for value in candidates:
+        if value in (None, ""):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _order_matches_subaccount(order: OrderRecord, subaccount: int | None) -> bool:
+    if subaccount is None:
+        return True
+    raw_subaccount = _raw_subaccount(order.raw)
+    if raw_subaccount is None:
+        return int(subaccount) == 0
+    return raw_subaccount == int(subaccount)
+
+
+def _order_notional_dollars(order: OrderRecord) -> Decimal:
+    contract_price = _contract_price_from_yes_price(order.side, order.yes_price_dollars)
+    return _quantize_money(contract_price * as_decimal(order.count_fp))
+
+
 def _fill_fee_dollars(fill: FillRecord) -> Decimal:
     raw = fill.raw if isinstance(fill.raw, dict) else {}
     for key in ("fee_cost", "fee_dollars", "fee"):
@@ -115,15 +212,9 @@ def _candidate_trade_ticket_client_order_ids(client_order_id: str) -> list[str]:
 def _settled_buy_fill_pnl(fill: FillRecord) -> Decimal | None:
     if fill.action != "buy" or fill.settlement_result not in {"win", "loss"}:
         return None
-    yes_price = _quantize_money(fill.yes_price_dollars)
+    contract_price = _contract_price_from_yes_price(fill.side, fill.yes_price_dollars)
     count = as_decimal(fill.count_fp)
     won = fill.settlement_result == "win"
-    if fill.side == "yes":
-        contract_price = yes_price
-    elif fill.side == "no":
-        contract_price = Decimal("1.0000") - yes_price
-    else:
-        return None
     gross = ((Decimal("1.0000") if won else Decimal("0")) - contract_price) * count
     return _quantize_money(gross - _fill_fee_dollars(fill))
 
@@ -2518,6 +2609,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 "expired",
                 "lock_denied",
                 "order_id_missing",
+                "partially_filled_cancelled",
                 "rejected",
                 "requote_edge_lost",
                 "unfilled_cancelled",
@@ -3399,78 +3491,94 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         kalshi_env: str | None = None,
         now: datetime | None = None,
     ) -> Decimal:
-        """Conservative realized daily P&L for one strategy in the last 24 hours.
+        """Realized daily P&L for one strategy in the last 24 hours.
 
-        Powers the per-strategy hard-loss cap. Intentionally narrow: counts only
-        BUY fills whose settlement is already known, matched-pair BUY→SELL
-        (stop-loss exits) on the same rolling window, and standalone SELL fills
-        (treated as pure proceeds — the offsetting BUY is assumed to be older
-        than the 24-hour window and therefore already accounted for).
-
-        Open unsettled BUYs contribute zero so the cap cannot be tripped by
-        unrealized marks. A negative return means losses; compare magnitude
-        against the configured cap.
+        Sells inside the window are matched against prior BUY fills for the same
+        ticker/side so exits from older positions keep their cost basis. If an
+        entry cannot be found, the sell contributes fees only instead of being
+        counted as pure profit.
         """
-        cutoff = (now or datetime.now(UTC)) - timedelta(hours=24)
+        reference_time = now or datetime.now(UTC)
+        cutoff = reference_time - timedelta(hours=24)
         env = self._resolved_kalshi_env(kalshi_env)
         stmt = select(FillRecord).where(
             FillRecord.kalshi_env == env,
             FillRecord.strategy_code == strategy_code,
             FillRecord.created_at >= cutoff,
+            FillRecord.created_at <= reference_time,
         )
         fills = list((await self.session.execute(stmt)).scalars())
         pnl = Decimal("0")
 
-        # Index sells per (ticker, side) so matched-pair exits can net against
-        # a buy from the same window.
-        sells_by_key: dict[tuple[str, str], list[FillRecord]] = {}
-        matched_sell_ids: set[str] = set()
-        for fill in fills:
-            if fill.action == "sell":
-                sells_by_key.setdefault((fill.market_ticker, fill.side), []).append(fill)
+        sell_fills = [fill for fill in fills if fill.action == "sell"]
+        sell_keys = {(fill.market_ticker, fill.side) for fill in sell_fills}
+        buys_by_key: dict[tuple[str, str], list[FillRecord]] = {key: [] for key in sell_keys}
+        if sell_keys:
+            latest_sell_time = max(
+                (_fill_created_at(sell, reference_time) for sell in sell_fills),
+                default=reference_time,
+            )
+            buy_stmt = select(FillRecord).where(
+                FillRecord.kalshi_env == env,
+                FillRecord.strategy_code == strategy_code,
+                FillRecord.action == "buy",
+                FillRecord.created_at <= latest_sell_time,
+            )
+            for buy in (await self.session.execute(buy_stmt)).scalars():
+                key = (buy.market_ticker, buy.side)
+                if key in buys_by_key:
+                    buys_by_key[key].append(buy)
+            for buys in buys_by_key.values():
+                buys.sort(key=lambda fill: (_fill_created_at(fill), fill.id))
+
+        buy_remaining: dict[str, Decimal] = {
+            buy.id: as_decimal(buy.count_fp)
+            for buys in buys_by_key.values()
+            for buy in buys
+        }
+        matched_buy_counts: dict[str, Decimal] = {}
+        for sell in sorted(sell_fills, key=lambda fill: (_fill_created_at(fill), fill.id)):
+            sell_remaining = as_decimal(sell.count_fp)
+            if sell_remaining <= Decimal("0"):
+                continue
+            sell_contract_price = _contract_price_from_yes_price(sell.side, sell.yes_price_dollars)
+            for buy in buys_by_key.get((sell.market_ticker, sell.side), []):
+                if (
+                    buy.created_at is not None
+                    and sell.created_at is not None
+                    and _fill_created_at(buy) > _fill_created_at(sell)
+                ):
+                    continue
+                available = buy_remaining.get(buy.id, Decimal("0"))
+                if available <= Decimal("0"):
+                    continue
+                matched = min(available, sell_remaining)
+                buy_contract_price = _contract_price_from_yes_price(buy.side, buy.yes_price_dollars)
+                pnl += sell_contract_price * matched
+                pnl -= buy_contract_price * matched
+                pnl -= _fill_fee_for_count(buy, matched)
+                pnl -= _fill_fee_for_count(sell, matched)
+                buy_remaining[buy.id] = available - matched
+                matched_buy_counts[buy.id] = matched_buy_counts.get(buy.id, Decimal("0")) + matched
+                sell_remaining -= matched
+                if sell_remaining <= Decimal("0"):
+                    break
+            if sell_remaining > Decimal("0"):
+                pnl -= _fill_fee_for_count(sell, sell_remaining)
 
         for buy in fills:
-            if buy.action != "buy":
+            if buy.action != "buy" or buy.settlement_result not in {"win", "loss"}:
                 continue
-            cost_per_contract = (
-                buy.yes_price_dollars
-                if buy.side == "yes"
-                else Decimal("1") - buy.yes_price_dollars
-            )
-            cost_total = cost_per_contract * buy.count_fp
-            buy_fee = _fill_fee_dollars(buy)
-
-            key = (buy.market_ticker, buy.side)
-            matched_sells = [s for s in sells_by_key.get(key, []) if s.id not in matched_sell_ids]
-            if matched_sells:
-                # Match the earliest unused sell. Partial matching is rare in practice
-                # and would only skew the figure by a fraction of a cent.
-                sell = matched_sells[0]
-                matched_sell_ids.add(sell.id)
-                sell_per_contract = (
-                    sell.yes_price_dollars
-                    if sell.side == "yes"
-                    else Decimal("1") - sell.yes_price_dollars
-                )
-                pnl += sell_per_contract * sell.count_fp - _fill_fee_dollars(sell) - cost_total - buy_fee
-            elif buy.settlement_result == "win":
-                pnl += buy.count_fp - cost_total - buy_fee
+            remaining_count = as_decimal(buy.count_fp) - matched_buy_counts.get(buy.id, Decimal("0"))
+            if remaining_count <= Decimal("0"):
+                continue
+            contract_price = _contract_price_from_yes_price(buy.side, buy.yes_price_dollars)
+            cost_total = contract_price * remaining_count
+            buy_fee = _fill_fee_for_count(buy, remaining_count)
+            if buy.settlement_result == "win":
+                pnl += remaining_count - cost_total - buy_fee
             elif buy.settlement_result == "loss":
                 pnl -= cost_total + buy_fee
-            # else: unsettled + unmatched buy → unrealized, contributes nothing
-
-        # Standalone sells whose corresponding buy fell out of the 24h window
-        # still produced proceeds today. Treat those as pure positive cashflow.
-        for sells in sells_by_key.values():
-            for sell in sells:
-                if sell.id in matched_sell_ids:
-                    continue
-                sell_per_contract = (
-                    sell.yes_price_dollars
-                    if sell.side == "yes"
-                    else Decimal("1") - sell.yes_price_dollars
-                )
-                pnl += sell_per_contract * sell.count_fp - _fill_fee_dollars(sell)
 
         return pnl.quantize(Decimal("0.01"))
 
@@ -3536,18 +3644,70 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         side: str,
         *,
         kalshi_env: str | None = None,
+        subaccount: int | None = None,
     ) -> Decimal:
         """Sum count_fp of resting/submitted buy orders for this ticker+side (in-flight exposure)."""
         env = self._resolved_kalshi_env(kalshi_env)
-        stmt = select(func.coalesce(func.sum(OrderRecord.count_fp), 0)).where(
+        stmt = select(OrderRecord).where(
             OrderRecord.kalshi_env == env,
             OrderRecord.market_ticker == market_ticker,
             OrderRecord.side == side,
             OrderRecord.action == "buy",
-            OrderRecord.status.in_(["resting", "submitted"]),
+            OrderRecord.status.in_(sorted(_PENDING_BUY_ORDER_STATUSES)),
         )
-        result = await self.session.execute(stmt)
-        return Decimal(str(result.scalar() or 0))
+        orders = list((await self.session.execute(stmt)).scalars())
+        return sum(
+            (as_decimal(order.count_fp) for order in orders if _order_matches_subaccount(order, subaccount)),
+            Decimal("0"),
+        )
+
+    async def get_crypto_portfolio_position_notional_dollars(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        subaccount: int | None = None,
+    ) -> Decimal:
+        """Return open notional for crypto positions in one env/subaccount."""
+        positions = await self.list_positions(
+            limit=5000,
+            kalshi_env=self._resolved_kalshi_env(kalshi_env),
+            subaccount=subaccount,
+        )
+        return _quantize_money(
+            sum(
+                (
+                    abs(as_decimal(position.count_fp)) * as_decimal(position.average_price_dollars)
+                    for position in positions
+                    if _is_crypto_market_ticker(position.market_ticker)
+                ),
+                Decimal("0"),
+            )
+        )
+
+    async def get_crypto_portfolio_pending_buy_notional_dollars(
+        self,
+        *,
+        kalshi_env: str | None = None,
+        subaccount: int | None = None,
+    ) -> Decimal:
+        """Return notional for resting/submitted crypto BUY orders in one env/subaccount."""
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = select(OrderRecord).where(
+            OrderRecord.kalshi_env == env,
+            OrderRecord.action == "buy",
+            OrderRecord.status.in_(sorted(_PENDING_BUY_ORDER_STATUSES)),
+        )
+        orders = list((await self.session.execute(stmt)).scalars())
+        return _quantize_money(
+            sum(
+                (
+                    _order_notional_dollars(order)
+                    for order in orders
+                    if _is_crypto_market_ticker(order.market_ticker) and _order_matches_subaccount(order, subaccount)
+                ),
+                Decimal("0"),
+            )
+        )
 
     async def zero_settled_positions(
         self,
@@ -4096,29 +4256,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if checkpoint is None:
             return None
         balance_payload = dict((checkpoint.payload or {}).get("balance") or {})
-        cash_cents = None
-        for key in ("balance", "cash_balance", "cash"):
-            raw = balance_payload.get(key)
-            if raw is not None:
-                try:
-                    cash_cents = Decimal(str(raw))
-                    break
-                except ArithmeticError:
-                    pass
-        positions_cents = None
-        for key in ("portfolio_value", "portfolioValue"):
-            raw = balance_payload.get(key)
-            if raw is not None:
-                try:
-                    positions_cents = Decimal(str(raw))
-                    break
-                except ArithmeticError:
-                    pass
-        if cash_cents is None:
-            return None
-        # Kalshi returns portfolio_value as positions market value when it's < cash
-        effective_positions = positions_cents if (positions_cents is not None and positions_cents < cash_cents) else Decimal("0")
-        return (cash_cents + effective_positions) / Decimal("100")
+        return _total_capital_dollars_from_balance_payload(balance_payload)
 
     @staticmethod
     def _pacific_today() -> str:
