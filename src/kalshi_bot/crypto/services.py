@@ -6475,10 +6475,10 @@ def _crypto_feature_row_data_quality(
         "snapshot_count": 0,
         "settled_snapshot_count": len(rows),
         "unresolved_snapshot_count": 0,
-        "candle_count": 0,
+        "candle_count": sum(1 for row in rows if "candlestick" in str(row.get("source_kind") or "")),
         "asset_count": len(assets),
         "assets": by_asset,
-        "source_kind_counts": {},
+        "source_kind_counts": dict(Counter(str(row.get("source_kind") or "") for row in rows)),
     }
 
 
