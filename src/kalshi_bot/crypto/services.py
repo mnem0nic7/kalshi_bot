@@ -87,7 +87,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v5"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v6"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -7793,6 +7793,14 @@ def _crypto_training_row_quality_score(row: dict[str, Any]) -> float:
         score -= 0.15
     if bool(row.get("spot_proxy_only")):
         score -= 0.10
+    # Time-proximity weight: rows made 30s–12min before settlement are most
+    # informative for our decision window; very-close (<30s) and very-early
+    # (>12min) rows are down-weighted by up to 30%.
+    ttc = max(0.0, float(row.get("time_to_close_seconds") or 0))
+    if ttc < 30:
+        score *= 0.70
+    elif ttc > 720:
+        score *= 0.80
     return max(0.0, min(1.0, score))
 
 
@@ -8082,6 +8090,10 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ],
         "funding_rate_current",
         "funding_rate_delta",
+        "bid_pressure",
+        "spread_vs_vol_ratio",
+        "is_us_session",
+        "is_asia_session",
     ]
     feature_names = [*numeric, *[f"asset={asset}" for asset in assets]]
     return {
@@ -8232,6 +8244,19 @@ def _crypto_raw_feature_vector(
     funding_delta = float(_decimal(row.get("funding_rate_delta") or Decimal("0")))
     numeric_values["funding_rate_current"] = max(-1.0, min(1.0, funding_current / 0.003))
     numeric_values["funding_rate_delta"] = max(-1.0, min(1.0, funding_delta / 0.002))
+    # v6 features: bid pressure, spread vs vol, session indicators
+    yes_bid = float(_decimal(row.get("yes_bid_dollars") or Decimal("0")))
+    bid_pressure = (yes_bid / mid) if mid > 1e-6 else 0.5
+    numeric_values["bid_pressure"] = max(0.0, min(2.0, bid_pressure)) - 1.0
+    spread_vs_vol = (spread_bps / 10000.0) / max(spot_volatility, 1e-6) if spot_volatility > 0 else 0.0
+    numeric_values["spread_vs_vol_ratio"] = max(0.0, min(10.0, spread_vs_vol)) / 10.0
+    if isinstance(settlement_ts, datetime):
+        _close_hour_utc = _as_utc_datetime(settlement_ts).hour + _as_utc_datetime(settlement_ts).minute / 60.0
+        numeric_values["is_us_session"] = 1.0 if 13.5 <= _close_hour_utc < 20.0 else 0.0
+        numeric_values["is_asia_session"] = 1.0 if _close_hour_utc < 8.0 or _close_hour_utc >= 23.0 else 0.0
+    else:
+        numeric_values["is_us_session"] = 0.0
+        numeric_values["is_asia_session"] = 0.0
     values: list[float] = [numeric_values[name] for name in schema.get("numeric_feature_names") or []]
     values.extend(1.0 if asset == category else 0.0 for category in schema.get("asset_categories") or [])
     return values
@@ -8612,7 +8637,8 @@ def _fit_crypto_xgboost_model(
         # Fit on full dataset; hold out most-recent 15% for isotonic calibration when
         # there's enough data — prevents in-sample calibration overfitting.
         _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
-        classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx])
+        _sample_weights = [float(_crypto_training_row_quality_score(row)) for row in rows[:_cal_split_idx]]
+        classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
         booster = classifier.get_booster()
         try:
             raw_booster = booster.save_raw(raw_format="json")
@@ -8677,7 +8703,8 @@ def _fit_crypto_lightgbm_model(
             verbosity=-1,
         )
         _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
-        classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx])
+        _sample_weights = [float(_crypto_training_row_quality_score(row)) for row in rows[:_cal_split_idx]]
+        classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
         booster = classifier.booster_
         model = {
             "model_type": "lightgbm_classifier",
