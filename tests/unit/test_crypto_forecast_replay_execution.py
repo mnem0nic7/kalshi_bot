@@ -6298,6 +6298,36 @@ def test_crypto_live_pnl_gate_allows_under_sampled_cell(tmp_path) -> None:
     assert not _crypto_live_pnl_gate_blocks(payload, settings=settings)
 
 
+def test_crypto_live_pnl_gate_blocks_large_negative_contract_sample(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_live_pnl_gate_enabled=True,
+        crypto_live_pnl_gate_mode="block",
+        crypto_live_pnl_gate_min_fills=5,
+        crypto_live_pnl_gate_min_contracts=20,
+        crypto_live_pnl_gate_min_net_pnl_dollars=0.0,
+    )
+    payload = _crypto_live_pnl_gate_payload(
+        {
+            "asset_symbol": "HYPE",
+            "frequency": "15m",
+            "side": "yes",
+            "liquidity": "taker",
+            "price_bucket": "0.75-1.00",
+            "fill_count": 4,
+            "contracts": "141.00",
+            "net_pnl_dollars": "-126.7417",
+            "pnl_per_contract_dollars": "-0.8989",
+        },
+        settings=settings,
+        contract_price_dollars=Decimal("0.9420"),
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["thresholds"]["evidence_rule"] == "min_fills_or_min_contracts"
+    assert _crypto_live_pnl_gate_blocks(payload, settings=settings)
+
+
 @pytest.mark.asyncio
 async def test_crypto_workflow_persists_last_minute_passive_ticket_as_gtc(tmp_path) -> None:
     settings = _settings(

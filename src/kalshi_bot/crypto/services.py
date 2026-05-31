@@ -5791,7 +5791,7 @@ def _crypto_live_pnl_gate_payload(
     contracts = Decimal(str(stats.get("contracts") or "0"))
     net_pnl = Decimal(str(stats.get("net_pnl_dollars") or "0"))
     pnl_per_contract = Decimal(str(stats.get("pnl_per_contract_dollars") or "0"))
-    evidence_ready = fill_count >= min_fills and contracts >= min_contracts
+    evidence_ready = fill_count >= min_fills or contracts >= min_contracts
     blockers: list[str] = []
     if enabled and evidence_ready:
         if net_pnl < min_net_pnl:
@@ -5811,6 +5811,7 @@ def _crypto_live_pnl_gate_payload(
         "blockers": blockers,
         "contract_price_dollars": str(contract_price_dollars.quantize(Decimal("0.0001"))),
         "thresholds": {
+            "evidence_rule": "min_fills_or_min_contracts",
             "min_fills": min_fills,
             "min_contracts": str(min_contracts.quantize(Decimal("0.01"))),
             "min_net_pnl_dollars": str(min_net_pnl.quantize(Decimal("0.0001"))),
