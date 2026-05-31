@@ -2428,6 +2428,8 @@ class CryptoTrainingBackfillService:
                 "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
             }
         )
+        # READ PHASE — close the session immediately after fetching so the
+        # connection is not held idle during the multi-hour compute phase.
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             snapshots = await repo.list_crypto_settled_market_snapshots(
@@ -2463,10 +2465,16 @@ class CryptoTrainingBackfillService:
                 since=since,
                 limit=self.settings.crypto_train_max_spot_rows,
             )
-            snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
-            candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-            spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
-            decision_rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
+        snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
+        candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+
+        # COMPUTE PHASE — pure in-memory; no DB connection held.
+        decision_rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
+
+        # WRITE PHASE — fresh session after compute so there is no stale connection.
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             if materialize_microstructure:
                 await self._materialize_spot_microstructure(repo, spot_rows, frequency=freq)
             benchmark_count = 0
