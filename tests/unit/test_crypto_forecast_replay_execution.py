@@ -57,6 +57,8 @@ from kalshi_bot.crypto.services import (
     _crypto_replay_gate_dashboard_summary,
     _crypto_raw_feature_vector,
     _crypto_select_champion,
+    _crypto_signal_stand_down_content,
+    _crypto_signal_stand_down_payload,
     _crypto_signal_payload_with_current_quote_metrics,
     _crypto_time_to_close_bucket,
     _crypto_trade_candidates,
@@ -220,6 +222,38 @@ def test_crypto_asset_control_blocks_disabled_hourly_frequency(tmp_path) -> None
     )
 
     assert "1-hour crypto is disabled." in blockers
+
+
+def test_crypto_asset_control_reports_runtime_replay_gate_reasons(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+    )
+    pack_service = AgentPackService(settings)
+    policy = pack_service.runtime_crypto_policy(pack_service.default_pack())
+    service = CryptoAssetControlService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+
+    blockers = service.global_live_blockers(
+        control=SimpleNamespace(active_color=settings.app_color, kill_switch_enabled=False),
+        replay_gate=SimpleNamespace(
+            status="passed",
+            metrics={
+                "resolved_sample_count": settings.crypto_replay_min_resolved_markets,
+                "trade_candidate_count": 0,
+                "strict_trade_eligible_count": settings.crypto_replay_min_trade_candidates,
+                "net_simulated_pl_dollars": 10.0,
+                "hard_cap_breaches": 0,
+                "candle_count": 1,
+                "spot_feature_coverage_pct": 1.0,
+            },
+        ),
+        has_write_credentials=True,
+        crypto_policy=policy,
+    )
+
+    assert not any(blocker == "Crypto replay gate is passed." for blocker in blockers)
+    assert any("Current model live-quality candidate count 0 below minimum" in blocker for blocker in blockers)
 
 
 def test_crypto_time_to_close_bucket_is_frequency_aware() -> None:
@@ -6144,6 +6178,64 @@ async def test_crypto_workflow_dynamic_sizing_saves_ticket_and_executes_approved
     assert verdict.approved_count_fp == Decimal("20.00")
     assert execution.calls[0]["ticket"].count_fp == Decimal("20.00")
     await engine.dispose()
+
+
+def test_crypto_signal_stand_down_payload_names_no_ticket_reason() -> None:
+    signal = StrategySignal(
+        fair_yes_dollars=Decimal("0.5648"),
+        confidence=0.81,
+        edge_bps=-152,
+        recommended_action=None,
+        recommended_side=None,
+        target_yes_price_dollars=None,
+        summary="BTC 1h market-anchored fair yes 0.5648; predict YES edge -152bps.",
+        stand_down_reason=StandDownReason.NO_ACTIONABLE_EDGE,
+        evaluation_outcome="predicted_winner_blocked",
+        eligibility=TradeEligibilityVerdict(
+            eligible=False,
+            stand_down_reason=StandDownReason.NO_ACTIONABLE_EDGE,
+            evaluation_outcome="predicted_winner_blocked",
+            candidate_trace={
+                "outcome": "predicted_winner_blocked",
+                "selected_side": "yes",
+                "selected_edge_bps": -152,
+                "candidate_status": "blocked_fee_edge",
+                "selection_reason": "fee_adjusted_edge_below_live_min",
+                "expected_net_edge": "-0.0352",
+                "trade_selection_model": {
+                    "candidate_status": "blocked_fee_edge",
+                    "reason": "fee_adjusted_edge_below_live_min",
+                    "expected_net_edge": "-0.0352",
+                },
+            },
+        ),
+        candidate_trace={
+            "outcome": "predicted_winner_blocked",
+            "selected_side": "yes",
+            "selected_edge_bps": -152,
+            "candidate_status": "blocked_fee_edge",
+            "selection_reason": "fee_adjusted_edge_below_live_min",
+            "expected_net_edge": "-0.0352",
+            "trade_selection_model": {
+                "candidate_status": "blocked_fee_edge",
+                "reason": "fee_adjusted_edge_below_live_min",
+                "expected_net_edge": "-0.0352",
+            },
+        },
+    )
+
+    payload = _crypto_signal_stand_down_payload(signal)
+
+    assert payload["reason"] == "signal_not_tradeable"
+    assert payload["stand_down_reason"] == "no_actionable_edge"
+    assert payload["evaluation_outcome"] == "predicted_winner_blocked"
+    assert payload["candidate_status"] == "blocked_fee_edge"
+    assert payload["selection_reason"] == "fee_adjusted_edge_below_live_min"
+    assert payload["expected_net_edge"] == "-0.0352"
+    assert _crypto_signal_stand_down_content(payload) == (
+        "No crypto trade ticket created: predicted_winner_blocked "
+        "(fee_adjusted_edge_below_live_min)."
+    )
 
 
 @pytest.mark.asyncio

@@ -428,9 +428,7 @@ class CryptoAssetControlService:
         active_color = str(getattr(control, "active_color", "") or "")
         if active_color and active_color != self.settings.app_color:
             blockers.append(f"Active color is {active_color}; this app is {self.settings.app_color}.")
-        if not _runtime_replay_gate_passed(replay_gate, crypto_policy):
-            gate_status = getattr(replay_gate, "status", None) if replay_gate is not None else None
-            blockers.append(f"Crypto replay gate is {gate_status or 'missing'}.")
+        blockers.extend(_runtime_replay_gate_blockers(replay_gate, crypto_policy))
         if not has_write_credentials:
             blockers.append("Kalshi write credentials are missing.")
         return blockers
@@ -4144,7 +4142,8 @@ class CryptoExecutionService:
                 client_order_id=client_order_id,
                 details={"reason": "crypto_trading_enabled is false"},
             )
-        if not _runtime_replay_gate_passed(gate, crypto_policy):
+        replay_gate_blockers = _runtime_replay_gate_blockers(gate, crypto_policy)
+        if replay_gate_blockers:
             return ExecReceiptPayload(
                 status="crypto_replay_gate_blocked",
                 client_order_id=client_order_id,
@@ -4152,6 +4151,7 @@ class CryptoExecutionService:
                     "reason": "crypto replay gate has not passed",
                     "gate_status": gate.status if gate is not None else "missing",
                     "gate_version": gate.version if gate is not None else None,
+                    "gate_runtime_blockers": replay_gate_blockers,
                     "runtime_crypto_policy": _runtime_crypto_policy_payload(
                         crypto_policy,
                         asset_symbol=market.asset_symbol,
@@ -4486,7 +4486,25 @@ class CryptoWorkflowService:
                     await session.commit()
                     return
                 if not _signal_is_tradeable(signal):
+                    stand_down_payload = _crypto_signal_stand_down_payload(signal)
                     await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+                    await repo.append_message(
+                        room.id,
+                        RoomMessageCreate(
+                            role=AgentRole.SYSTEM,
+                            kind=MessageKind.OBSERVATION,
+                            stage=RoomStage.COMPLETE,
+                            content=_crypto_signal_stand_down_content(stand_down_payload),
+                            payload={
+                                "market_domain": "crypto",
+                                "frequency": market.frequency,
+                                "strategy_code": strategy_code,
+                                "market_ticker": market.market_ticker,
+                                "no_order_submitted": True,
+                                **stand_down_payload,
+                            },
+                        ),
+                    )
                     await session.commit()
                     return
 
@@ -5552,15 +5570,82 @@ def _resolved_crypto_asset_modes(
     return resolved
 
 
-def _runtime_replay_gate_passed(replay_gate: Any | None, crypto_policy: RuntimeCryptoPolicy | None) -> bool:
+def _runtime_replay_gate_blockers(replay_gate: Any | None, crypto_policy: RuntimeCryptoPolicy | None) -> list[str]:
     if replay_gate is None:
-        return False
+        return ["Crypto replay gate is missing."]
     if crypto_policy is None:
-        return getattr(replay_gate, "status", None) == "passed"
+        gate_status = getattr(replay_gate, "status", None)
+        return [] if gate_status == "passed" else [f"Crypto replay gate is {gate_status or 'missing'}."]
     metrics = dict(getattr(replay_gate, "metrics", None) or {})
     if not metrics:
-        return getattr(replay_gate, "status", None) == "passed"
-    return not _crypto_replay_gate_reasons(metrics, crypto_policy=crypto_policy)
+        gate_status = getattr(replay_gate, "status", None)
+        return [] if gate_status == "passed" else [f"Crypto replay gate is {gate_status or 'missing'}."]
+    reasons = _crypto_replay_gate_reasons(metrics, crypto_policy=crypto_policy)
+    return [f"Crypto replay gate runtime policy blocked: {reason}" for reason in reasons]
+
+
+def _runtime_replay_gate_passed(replay_gate: Any | None, crypto_policy: RuntimeCryptoPolicy | None) -> bool:
+    return not _runtime_replay_gate_blockers(replay_gate, crypto_policy)
+
+
+def _crypto_signal_stand_down_payload(signal: StrategySignal) -> dict[str, Any]:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    eligibility = signal.eligibility
+    eligibility_trace = (
+        eligibility.candidate_trace
+        if eligibility is not None and isinstance(eligibility.candidate_trace, dict)
+        else {}
+    )
+    selection = trace.get("trade_selection_model") if isinstance(trace.get("trade_selection_model"), dict) else {}
+    if not selection and isinstance(eligibility_trace.get("trade_selection_model"), dict):
+        selection = eligibility_trace["trade_selection_model"]
+    stand_down_reason = signal.stand_down_reason
+    if stand_down_reason is None and eligibility is not None:
+        stand_down_reason = eligibility.stand_down_reason
+    return _crypto_json_safe(
+        {
+            "reason": "signal_not_tradeable",
+            "stand_down_reason": getattr(stand_down_reason, "value", stand_down_reason),
+            "evaluation_outcome": signal.evaluation_outcome
+            or (eligibility.evaluation_outcome if eligibility is not None else None)
+            or trace.get("outcome")
+            or eligibility_trace.get("outcome"),
+            "candidate_status": selection.get("candidate_status")
+            or trace.get("candidate_status")
+            or eligibility_trace.get("candidate_status"),
+            "selection_reason": selection.get("reason")
+            or trace.get("selection_reason")
+            or eligibility_trace.get("selection_reason"),
+            "pre_empirical_selection_reason": selection.get("pre_empirical_reason")
+            or trace.get("pre_empirical_selection_reason")
+            or eligibility_trace.get("pre_empirical_selection_reason"),
+            "expected_net_edge": selection.get("expected_net_edge") or trace.get("expected_net_edge"),
+            "selected_side": trace.get("selected_side") or eligibility_trace.get("selected_side"),
+            "selected_edge_bps": trace.get("selected_edge_bps") or signal.edge_bps,
+            "target_yes_price_dollars": trace.get("target_yes_price_dollars"),
+            "empirical_bucket_status": selection.get("empirical_bucket_status")
+            or trace.get("empirical_bucket_status"),
+            "empirical_bucket_reason": (
+                selection.get("empirical_bucket_gate") or {}
+            ).get("reason")
+            if isinstance(selection.get("empirical_bucket_gate"), dict)
+            else None,
+            "last_minute_passive_reason": (
+                selection.get("last_minute_passive") or {}
+            ).get("reason")
+            if isinstance(selection.get("last_minute_passive"), dict)
+            else None,
+            "gate_cascade": trace.get("gate_cascade") or eligibility_trace.get("gate_cascade"),
+        }
+    )
+
+
+def _crypto_signal_stand_down_content(payload: dict[str, Any]) -> str:
+    outcome = payload.get("evaluation_outcome") or "not_tradeable"
+    detail = payload.get("selection_reason") or payload.get("candidate_status") or payload.get("stand_down_reason")
+    if detail:
+        return f"No crypto trade ticket created: {outcome} ({detail})."
+    return f"No crypto trade ticket created: {outcome}."
 
 
 def _crypto_price_bucket_gate_reasons(
