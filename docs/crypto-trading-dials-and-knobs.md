@@ -227,6 +227,7 @@ but it does not make a `live_quality` candidate.
 
 | Setting or CLI flag | Current default | Effect |
 | --- | ---: | --- |
+| `crypto_model_trained_replay_only` | `True` | Requires the trained-model plus replay-gate path to be the live authority. Blocks deterministic touch recommendations and final-minute passive execution from becoming live trades. |
 | `crypto_min_training_samples` | `250` | Minimum training sample count expected by crypto model training. |
 | `crypto_training_preflight_enabled` | `True` | Runs source backfill, feature materialization, and data-quality checks before crypto model training. |
 | `crypto_training_feature_store_enabled` | `True` | Enables persisted point-in-time feature rows for crypto training. |
@@ -252,9 +253,9 @@ Training depends on both market history and spot history. A model can be trained
 but still fail replay if the replay window does not produce enough strict
 real-quote candidates or does not beat the market-mid baseline.
 
-Production touch-strategy mode disables automatic legacy model training by
-default. Use `docs/crypto-touch-strategy-rollout.md` for the no-training 30%
-touch deployment settings.
+Production is model-trained replay only by default. The old no-training 30%
+touch path is documented only as deprecated/offline research in
+`docs/crypto-touch-strategy-rollout.md`.
 
 ## Replay Gate Knobs
 
@@ -434,15 +435,18 @@ available target-distance features need a directional volatility cushion.
 | `crypto_last_minute_passive_price_matrix_fallback` | `fixed_bid` | Uses the old asset threshold when the learned row is immature. |
 | `crypto_last_minute_passive_price_ladder` | `0.01:0.99:0.01` | Passive bid ladder evaluated in replay. |
 
-This path is separate from late sure-thing. It uses market-implied side
-probability instead of model edge, records model probability only for
-diagnostics, bypasses the normal edge floors in risk, and submits one fixed GTC
-bid that rests until close. Replay stores a learned price matrix keyed by asset,
-side, final-minute time bucket, market probability band, spread band, and bid
-price; runtime chooses the mature row with the best fee-adjusted expected P/L
-per signal, then falls back to the fixed asset threshold if no row qualifies.
-Existing replay, asset-mode, kill-switch, active color, capital, position, and
-opposite-side gates still apply.
+This path is separate from late sure-thing. With
+`crypto_model_trained_replay_only=True`, it is blocked from live authority even
+if the individual last-minute passive knobs are enabled. If explicitly enabled
+for offline research, it uses market-implied side probability instead of model
+edge, records model probability only for diagnostics, bypasses the normal edge
+floors in risk, and submits one fixed GTC bid that rests until close. Replay
+stores a learned price matrix keyed by asset, side, final-minute time bucket,
+market probability band, spread band, and bid price; runtime chooses the mature
+row with the best fee-adjusted expected P/L per signal, then falls back to the
+fixed asset threshold if no row qualifies. Existing replay, asset-mode,
+kill-switch, active color, capital, position, and opposite-side gates still
+apply.
 
 ## Autonomy and Room Creation Knobs
 

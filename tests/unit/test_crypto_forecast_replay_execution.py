@@ -87,6 +87,7 @@ def _settings(tmp_path, **overrides) -> Settings:
         "crypto_autonomy_enabled": False,
         "crypto_production_autonomy_enabled": False,
         "crypto_trading_enabled": False,
+        "crypto_model_trained_replay_only": False,
     }
     values.update(overrides)
     return Settings(**values)
@@ -5586,6 +5587,87 @@ async def test_crypto_last_minute_passive_execution_uses_fixed_rest_to_close(tmp
     assert fixed_call["ticket"].yes_price_dollars == Decimal("0.5500")
     assert fixed_call["ticket"].time_in_force == "good_till_canceled"
     assert fixed_call["close_time"] == market.close_time
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_model_trained_replay_only_blocks_last_minute_passive_execution(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_trading_enabled=True,
+        crypto_model_trained_replay_only=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    fake_base = _FakeFixedLimitExecution()
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+    service = CryptoExecutionService(
+        settings=settings,
+        session_factory=session_factory,
+        base_execution_service=fake_base,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+    )
+    market = _market(close_time=datetime.now(UTC) + timedelta(seconds=45))
+    signal = _signal()
+    signal.candidate_trace = {
+        "candidate_status": CRYPTO_LIVE_QUALITY,
+        "last_minute_passive_market_confidence": True,
+        "last_minute_passive": {
+            "bid_threshold_dollars": "0.55",
+            "market_side_probability": "0.7000",
+        },
+    }
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        control = await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        room = await repo.create_room(
+            RoomCreate(name="BTC last-minute passive", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    receipt = await service.execute(
+        room=room,
+        control=control,
+        ticket=TradeTicket(
+            market_ticker=room.market_ticker,
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5500"),
+            count_fp=Decimal("1.00"),
+        ),
+        client_order_id="crypto-last-minute",
+        fair_yes_dollars=Decimal("0.2000"),
+        market=market,
+        signal=signal,
+    )
+
+    assert receipt.status == "crypto_candidate_not_live_eligible"
+    assert receipt.details["reason"] == "model_trained_replay_only_blocks_last_minute_passive"
+    assert fake_base.calls == []
+    assert fake_base.fixed_calls == []
     await engine.dispose()
 
 

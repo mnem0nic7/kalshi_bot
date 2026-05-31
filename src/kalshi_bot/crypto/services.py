@@ -3155,7 +3155,19 @@ class CryptoForecastService:
         features = {**features, "spot_features": _json_ready_spot_features(market_row)}
         empirical_bucket_matrix = _crypto_empirical_bucket_matrix_from_artifacts(gate, backtest)
         last_minute_passive_price_matrix = _crypto_last_minute_passive_price_matrix_from_artifacts(gate, backtest)
-        if bool(self.settings.crypto_touch_strategy_enabled):
+        touch_strategy_ignored = (
+            bool(self.settings.crypto_touch_strategy_enabled)
+            and bool(self.settings.crypto_model_trained_replay_only)
+        )
+        if touch_strategy_ignored:
+            features = {
+                **features,
+                "touch_strategy_ignored": {
+                    "enabled": True,
+                    "reason": "model_trained_replay_only",
+                },
+            }
+        if bool(self.settings.crypto_touch_strategy_enabled) and not bool(self.settings.crypto_model_trained_replay_only):
             payload = {
                 "model_type": "deterministic_touch_strategy",
                 "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
@@ -4156,6 +4168,16 @@ class CryptoExecutionService:
                     "reason": "market close time has passed",
                     "market_ticker": market.market_ticker,
                     "close_time": _datetime_text(market.close_time or market.expected_expiration_time),
+                    "no_order_submitted": True,
+                },
+            )
+        if bool(self.settings.crypto_model_trained_replay_only) and crypto_last_minute_passive_trace(signal.candidate_trace):
+            return ExecReceiptPayload(
+                status="crypto_candidate_not_live_eligible",
+                client_order_id=client_order_id,
+                details={
+                    "reason": "model_trained_replay_only_blocks_last_minute_passive",
+                    "candidate_status": candidate_status,
                     "no_order_submitted": True,
                 },
             )
@@ -5991,7 +6013,7 @@ def _crypto_recommendation(
     enforce_empirical_bucket_gate: bool = False,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
     row = row or _crypto_live_market_row(market, settings=settings)
-    if bool(settings.crypto_touch_strategy_enabled):
+    if bool(settings.crypto_touch_strategy_enabled) and not bool(settings.crypto_model_trained_replay_only):
         raw_fair_yes = _clamp_price(fair_yes)
         entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
         candidates = _crypto_touch_strategy_candidates(
@@ -10805,6 +10827,8 @@ def _crypto_last_minute_passive_review(
         "require_no_cross": bool(settings.crypto_last_minute_passive_require_no_cross),
         "risk_mode": str(settings.crypto_last_minute_passive_risk_mode or ""),
     }
+    if bool(settings.crypto_model_trained_replay_only):
+        return {**review, "reason": "model_trained_replay_only"}
     if not review["enabled"]:
         return {**review, "reason": "last_minute_passive_disabled"}
     if not _crypto_last_minute_passive_enabled_for_asset(

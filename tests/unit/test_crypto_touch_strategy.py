@@ -56,6 +56,7 @@ def test_touch_strategy_selects_live_candidate_when_probability_and_spread_clear
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         crypto_touch_strategy_enabled=True,
+        crypto_model_trained_replay_only=False,
         crypto_touch_strategy_min_touch_probability=0.54,
         risk_min_edge_bps=200,
         crypto_live_min_market_age_seconds=180,
@@ -73,6 +74,7 @@ def test_touch_strategy_supports_one_hour_frequency_without_training_artifact():
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         crypto_touch_strategy_enabled=True,
+        crypto_model_trained_replay_only=False,
         crypto_touch_strategy_min_touch_probability=0.54,
         risk_min_edge_bps=200,
         crypto_live_min_market_age_seconds=180,
@@ -101,6 +103,7 @@ def test_touch_strategy_blocks_wide_low_price_spreads():
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         crypto_touch_strategy_enabled=True,
+        crypto_model_trained_replay_only=False,
         crypto_touch_strategy_min_touch_probability=0.50,
         risk_min_edge_bps=0,
         crypto_live_min_market_age_seconds=180,
@@ -125,6 +128,7 @@ def test_touch_recommendation_blocked_trace_does_not_require_model_prediction():
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",
         crypto_touch_strategy_enabled=True,
+        crypto_model_trained_replay_only=False,
         crypto_touch_strategy_min_touch_probability=0.95,
         risk_min_edge_bps=0,
         crypto_live_min_market_age_seconds=180,
@@ -143,3 +147,27 @@ def test_touch_recommendation_blocked_trace_does_not_require_model_prediction():
     assert target_yes is None
     assert edge_bps >= 0
     assert trace["outcome"] == "touch_strategy_blocked"
+
+
+def test_model_trained_replay_only_ignores_touch_recommendation_flag():
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        crypto_touch_strategy_enabled=True,
+        risk_min_edge_bps=0,
+        crypto_live_min_market_age_seconds=180,
+        crypto_autonomy_min_seconds_to_close=0,
+    )
+
+    action, side, target_yes, edge_bps, trace = _crypto_recommendation(
+        market=SimpleNamespace(spread_bps=100),
+        fair_yes=Decimal("0.5000"),
+        settings=settings,
+        row=_row(),
+    )
+
+    assert action is not None
+    assert side is not None
+    assert target_yes is not None
+    assert edge_bps > 0
+    assert trace["objective"] != "touch_30pct_before_close"
+    assert "touch_strategy" not in trace

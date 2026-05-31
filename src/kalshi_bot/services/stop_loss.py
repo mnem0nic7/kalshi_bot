@@ -325,6 +325,7 @@ class StopLossService:
                 return result
             if (
                 self.settings.crypto_touch_strategy_enabled
+                and not self.settings.crypto_model_trained_replay_only
                 and inferred_strategy in {"CRYPTO_15M", "CRYPTO_1H"}
             ):
                 return None

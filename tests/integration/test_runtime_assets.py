@@ -78,6 +78,19 @@ def test_compose_uses_env_scoped_live_weather_switches() -> None:
     assert "MONOTONICITY_ARB_SHADOW_ONLY: ${MONOTONICITY_ARB_SHADOW_ONLY:-true}" in compose_text
 
 
+def test_compose_defaults_crypto_to_model_trained_replay_only() -> None:
+    compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
+
+    assert "CRYPTO_MODEL_TRAINED_REPLAY_ONLY: ${CRYPTO_MODEL_TRAINED_REPLAY_ONLY:-true}" in compose_text
+    assert "CRYPTO_TOUCH_STRATEGY_ENABLED: ${CRYPTO_TOUCH_STRATEGY_ENABLED:-false}" in compose_text
+    assert "CRYPTO_TOUCH_STRATEGY_ENABLED: ${PRODUCTION_CRYPTO_TOUCH_STRATEGY_ENABLED:-false}" in compose_text
+    assert "CRYPTO_TRAINING_PREFLIGHT_ENABLED: ${PRODUCTION_CRYPTO_TRAINING_PREFLIGHT_ENABLED:-true}" in compose_text
+    assert (
+        "CRYPTO_TRAINING_FEATURE_STORE_ENABLED: ${PRODUCTION_CRYPTO_TRAINING_FEATURE_STORE_ENABLED:-true}"
+        in compose_text
+    )
+
+
 def test_runtime_scripts_rebuild_migrate_image_before_using_it() -> None:
     start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
     watchdog = Path("infra/scripts/watchdog-run-once.sh").read_text(encoding="utf-8")

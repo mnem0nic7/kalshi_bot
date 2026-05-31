@@ -142,6 +142,7 @@ async def test_touch_strategy_crypto_stop_loss_is_hard_stop_only(monkeypatch):
     settings = Settings(
         app_color="blue",
         crypto_touch_strategy_enabled=True,
+        crypto_model_trained_replay_only=False,
         kalshi_taker_fee_rate=0,
         stop_loss_threshold_pct=0.30,
         stop_loss_threshold_pct_by_strategy={"CRYPTO_15M": 0.30},
@@ -164,6 +165,37 @@ async def test_touch_strategy_crypto_stop_loss_is_hard_stop_only(monkeypatch):
 
     assert result is None
     submit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_model_trained_replay_only_keeps_crypto_trailing_stop_active(monkeypatch):
+    monkeypatch.setattr("kalshi_bot.services.stop_loss.PlatformRepository", _FakeStopLossRepo)
+    settings = Settings(
+        app_color="blue",
+        crypto_touch_strategy_enabled=True,
+        kalshi_taker_fee_rate=0,
+        stop_loss_threshold_pct=0.30,
+        stop_loss_threshold_pct_by_strategy={"CRYPTO_15M": 0.30},
+    )
+    service = StopLossService(settings, lambda: _FakeStopLossSession(), MagicMock())
+    submit = AsyncMock(return_value={"submitted": True})
+    monkeypatch.setattr(service, "_submit", submit)
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
+    position = _pos("yes", "1.00", "0.3000")
+    position.id = 1
+    position.market_ticker = "KXBTCD-26MAY261200-15M"
+    position.created_at = now - timedelta(minutes=10)
+    ms = _ms("0.2300", "0.3700")
+    prices = [
+        _ph("0.6000", now - timedelta(minutes=9)),
+        _ph("0.3000", now - timedelta(minutes=1)),
+    ]
+
+    result = await service._evaluate_and_submit(position, ms, Decimal("0.3000"), prices, now)
+
+    assert result == {"submitted": True}
+    submit.assert_called_once()
+    assert submit.call_args.kwargs["trigger"] == "trailing_stop"
 
 
 # ── trailing loss ratio ──────────────────────────────────────────────────────

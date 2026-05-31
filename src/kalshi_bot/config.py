@@ -315,6 +315,7 @@ class Settings(BaseSettings):
     crypto_empirical_late_override_max_count_fp: float = 1.0
     crypto_empirical_late_override_negative_pnl_enabled: bool = False
 
+    crypto_model_trained_replay_only: bool = True
     crypto_touch_strategy_enabled: bool = False
     crypto_touch_strategy_take_profit_pct: float = 0.30
     crypto_touch_strategy_stop_loss_pct: float = 0.30

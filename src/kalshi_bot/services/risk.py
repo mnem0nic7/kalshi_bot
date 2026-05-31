@@ -393,7 +393,10 @@ class DeterministicRiskEngine:
         approved_notional = order_notional
         gross_edge_bps = signal.edge_bps
         candidate_trace = dict(signal.candidate_trace or {})
-        last_minute_passive_edge_bypass = _crypto_last_minute_passive_edge_bypass(signal, context)
+        last_minute_passive_edge_bypass = (
+            _crypto_last_minute_passive_edge_bypass(signal, context)
+            and not bool(self.settings.crypto_model_trained_replay_only)
+        )
         # Late high-confidence crypto entries still need to clear the normal edge
         # floors; only the explicit last-minute passive path can bypass them.
         edge_floor_bypass = last_minute_passive_edge_bypass

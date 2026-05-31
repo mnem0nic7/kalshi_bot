@@ -42,6 +42,10 @@ Use this as the candidate grid/search space for `CRYPTO_15M`.
 | `crypto_last_minute_passive_price_matrix_fallback` | `fixed_bid` | enum | Runtime fallback when no mature learned bid is available. |
 | `crypto_last_minute_passive_price_ladder` | `0.01:0.99:0.01` | range | Candidate passive bids evaluated in replay. |
 
+Production defaults to `crypto_model_trained_replay_only=True`, so final-minute
+passive settings should be treated as offline analysis knobs unless that guard is
+deliberately disabled in a non-production research run.
+
 ## Late Sure-Thing Path
 
 | Knob | Current default | Units | What to test |
