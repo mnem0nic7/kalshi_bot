@@ -2652,6 +2652,36 @@ def test_crypto_model_selection_prefers_positive_oos_pnl_over_brier() -> None:
     assert champion == "spot_distance_residual"
 
 
+def test_crypto_model_selection_requires_minimum_replay_support() -> None:
+    champion = _crypto_select_champion(
+        [
+            {
+                "name": "market_mid_baseline",
+                "status": "available",
+                "metrics": {"brier": 0.0300},
+                "policy_metrics": {
+                    "selected_count": 0,
+                    "net_pnl": "0.0000",
+                    "pnl_advantage_vs_market_mid_dollars": "0.0000",
+                },
+            },
+            {
+                "name": "spot_distance_residual",
+                "status": "available",
+                "metrics": {"brier": 0.0900},
+                "policy_metrics": {
+                    "selected_count": 1,
+                    "net_pnl": "0.4400",
+                    "pnl_advantage_vs_market_mid_dollars": "0.4400",
+                },
+            },
+        ],
+        min_selected_count=50,
+    )
+
+    assert champion == "market_mid_baseline"
+
+
 def test_crypto_model_selection_rejects_guardrail_failed_positive_pnl_candidate() -> None:
     champion = _crypto_select_champion(
         [

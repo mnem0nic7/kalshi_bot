@@ -9653,13 +9653,31 @@ def _crypto_candidate_has_profit_metrics(entry: dict[str, Any]) -> bool:
     return isinstance(entry.get("policy_metrics"), dict)
 
 
-def _crypto_candidate_is_profit_deployable(entry: dict[str, Any]) -> bool:
+def _crypto_model_min_policy_selected_count(
+    settings: Settings | None,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+) -> int:
+    if crypto_policy is not None:
+        return max(1, int(crypto_policy.replay_min_trade_candidates))
+    if settings is not None:
+        return max(1, int(settings.crypto_replay_min_trade_candidates))
+    return 1
+
+
+def _crypto_candidate_has_min_policy_support(entry: dict[str, Any], *, min_selected_count: int) -> bool:
+    policy = entry.get("policy_metrics") if isinstance(entry.get("policy_metrics"), dict) else None
+    if policy is None:
+        return True
+    return _candidate_policy_selected_count(policy) >= max(1, int(min_selected_count))
+
+
+def _crypto_candidate_is_profit_deployable(entry: dict[str, Any], *, min_selected_count: int = 1) -> bool:
     policy = entry.get("policy_metrics") if isinstance(entry.get("policy_metrics"), dict) else None
     return (
         policy is not None
         and entry.get("status") == "available"
         and entry.get("name") not in CRYPTO_MODEL_BASELINE_CANDIDATES
-        and _candidate_policy_selected_count(policy) > 0
+        and _candidate_policy_selected_count(policy) >= max(1, int(min_selected_count))
         and _candidate_policy_net(policy) > Decimal("0")
         and _candidate_policy_advantage(policy) > Decimal("0")
     )
@@ -9678,7 +9696,7 @@ def _crypto_candidate_profit_sort_key(entry: dict[str, Any]) -> tuple[Decimal, D
     )
 
 
-def _crypto_select_champion(candidates: list[dict[str, Any]]) -> str:
+def _crypto_select_champion(candidates: list[dict[str, Any]], *, min_selected_count: int = 1) -> str:
     profit_candidates = [
         candidate
         for candidate in candidates
@@ -9686,17 +9704,27 @@ def _crypto_select_champion(candidates: list[dict[str, Any]]) -> str:
         and _crypto_candidate_has_profit_metrics(candidate)
         and candidate.get("name") not in CRYPTO_MODEL_BASELINE_CANDIDATES
     ]
-    deployable = [candidate for candidate in profit_candidates if _crypto_candidate_is_profit_deployable(candidate)]
+    supported_profit_candidates = [
+        candidate
+        for candidate in profit_candidates
+        if _crypto_candidate_has_min_policy_support(candidate, min_selected_count=min_selected_count)
+    ]
+    deployable = [
+        candidate
+        for candidate in supported_profit_candidates
+        if _crypto_candidate_is_profit_deployable(candidate, min_selected_count=min_selected_count)
+    ]
     if deployable:
         deployable.sort(key=_crypto_candidate_profit_sort_key, reverse=True)
         return str(deployable[0]["name"])
-    if profit_candidates:
-        profit_candidates.sort(key=_crypto_candidate_profit_sort_key, reverse=True)
-        return str(profit_candidates[0]["name"])
+    if supported_profit_candidates:
+        supported_profit_candidates.sort(key=_crypto_candidate_profit_sort_key, reverse=True)
+        return str(supported_profit_candidates[0]["name"])
     deployable_by_probability = [
         candidate
         for candidate in candidates
         if _crypto_model_selection_usable(candidate)
+        and _crypto_candidate_has_min_policy_support(candidate, min_selected_count=min_selected_count)
     ]
     if deployable_by_probability:
         deployable_by_probability.sort(key=lambda item: (float((item.get("metrics") or {})["brier"]), str(item.get("name"))))
@@ -9819,7 +9847,8 @@ def _crypto_in_sample_candidate_report(
             if trade["status"] == "fillable":
                 trade_rows_by_name["calibrated_weighted_ensemble"].append({**row, "simulation": trade})
     guarded_entries = _crypto_attach_candidate_policy_metrics(guarded_entries, trade_rows_by_name, settings=settings)
-    champion = _crypto_select_champion(guarded_entries)
+    min_policy_selected_count = _crypto_model_min_policy_selected_count(settings, crypto_policy)
+    champion = _crypto_select_champion(guarded_entries, min_selected_count=min_policy_selected_count)
     champion_entry = _crypto_candidate_entry_by_name(guarded_entries, champion)
     return {
         "schema_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
@@ -9827,6 +9856,7 @@ def _crypto_in_sample_candidate_report(
         "selection_scope": "in_sample_training_fallback",
         "primary_metric": "oos_candidate_net_pnl",
         "selection_policy": "prefer_positive_oos_pnl_non_market_candidate_then_pnl_advantage",
+        "min_policy_selected_count": min_policy_selected_count,
         "selection_baselines": sorted(CRYPTO_MODEL_BASELINE_CANDIDATES),
         "guardrails": {
             "log_loss_ece_max_regression_pct": CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE,
@@ -9953,7 +9983,8 @@ def _crypto_model_candidate_report(
     entries = _crypto_apply_candidate_guardrails(entries, market_metrics=market_metrics, logistic_metrics=logistic_metrics)
     entries = _crypto_attach_candidate_policy_metrics(entries, trade_rows_by_candidate, settings=settings)
     ensemble_entry = next((entry for entry in entries if entry["name"] == "calibrated_weighted_ensemble"), None)
-    champion = _crypto_select_champion(entries)
+    min_policy_selected_count = _crypto_model_min_policy_selected_count(settings, crypto_policy)
+    champion = _crypto_select_champion(entries, min_selected_count=min_policy_selected_count)
     champion_entry = _crypto_candidate_entry_by_name(entries, champion)
     return {
         "schema_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
@@ -9961,6 +9992,7 @@ def _crypto_model_candidate_report(
         "selection_scope": "walk_forward_time_ordered",
         "primary_metric": "oos_candidate_net_pnl",
         "selection_policy": "prefer_positive_oos_pnl_non_market_candidate_then_pnl_advantage",
+        "min_policy_selected_count": min_policy_selected_count,
         "selection_baselines": sorted(CRYPTO_MODEL_BASELINE_CANDIDATES),
         "guardrails": {
             "log_loss_ece_max_regression_pct": CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE,
