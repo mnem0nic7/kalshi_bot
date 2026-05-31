@@ -2910,6 +2910,7 @@ class CryptoForecastService:
             "live_readiness_status": live_readiness_status,
             "training_quality_blockers": training_quality_blockers,
             "feature_store_only": feature_store_only,
+            "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
             "feature_set": [
                 "market_mid_logit",
                 "asset",
