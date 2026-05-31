@@ -80,6 +80,7 @@ def test_compose_uses_env_scoped_live_weather_switches() -> None:
 
 def test_compose_defaults_crypto_to_model_trained_replay_only() -> None:
     compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
+    env_example = Path(".env.example").read_text(encoding="utf-8")
 
     assert "CRYPTO_MODEL_TRAINED_REPLAY_ONLY: ${CRYPTO_MODEL_TRAINED_REPLAY_ONLY:-true}" in compose_text
     assert "CRYPTO_TOUCH_STRATEGY_ENABLED: ${CRYPTO_TOUCH_STRATEGY_ENABLED:-false}" in compose_text
@@ -89,6 +90,10 @@ def test_compose_defaults_crypto_to_model_trained_replay_only() -> None:
         "CRYPTO_TRAINING_FEATURE_STORE_ENABLED: ${PRODUCTION_CRYPTO_TRAINING_FEATURE_STORE_ENABLED:-true}"
         in compose_text
     )
+    assert "CRYPTO_MODEL_TRAINED_REPLAY_ONLY=true" in env_example
+    assert "PRODUCTION_CRYPTO_TOUCH_STRATEGY_ENABLED=false" in env_example
+    assert "PRODUCTION_CRYPTO_TRAINING_PREFLIGHT_ENABLED=true" in env_example
+    assert "PRODUCTION_CRYPTO_TRAINING_FEATURE_STORE_ENABLED=true" in env_example
 
 
 def test_runtime_scripts_rebuild_migrate_image_before_using_it() -> None:

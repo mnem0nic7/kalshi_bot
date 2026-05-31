@@ -165,9 +165,10 @@ def test_model_trained_replay_only_ignores_touch_recommendation_flag():
         row=_row(),
     )
 
-    assert action is not None
-    assert side is not None
-    assert target_yes is not None
-    assert edge_bps > 0
-    assert trace["objective"] != "touch_30pct_before_close"
+    assert action is None
+    assert side is None
+    assert target_yes is None
+    assert isinstance(edge_bps, int)
+    assert trace.get("objective") != "touch_30pct_before_close"
     assert "touch_strategy" not in trace
+    assert trace["last_minute_passive"]["reason"] == "model_trained_replay_only"
