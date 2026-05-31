@@ -47,6 +47,8 @@ class RiskContext:
     # Populated by the caller; risk engine gates on it against
     # Settings.risk_daily_loss_dollars_by_strategy[strategy_code].
     strategy_daily_realized_pnl_dollars: Decimal | None = None
+    strategy_asset_daily_realized_pnl_dollars: Decimal | None = None
+    signal_asset_symbol: str | None = None
 
 
 def _quantize_money(value: Any) -> Decimal:
@@ -643,6 +645,49 @@ class DeterministicRiskEngine:
                 )
                 code("crypto_late_empirical_override_count_cap")
 
+        if is_buy_entry and _is_crypto_strategy_code(context.strategy_code):
+            max_entry_loss = Decimal(str(self.settings.crypto_max_entry_loss_dollars or 0))
+            estimated_max_loss = _quantize_money(contract_price * approved_count)
+            diagnostics["crypto_max_entry_loss_cap"] = {
+                "enabled": max_entry_loss > Decimal("0"),
+                "max_entry_loss_dollars": _decimal_text(max_entry_loss),
+                "contract_price_dollars": _decimal_text(contract_price),
+                "original_count_fp": _decimal_text(approved_count),
+                "estimated_max_loss_dollars": _decimal_text(estimated_max_loss),
+            }
+            if max_entry_loss > Decimal("0") and estimated_max_loss > max_entry_loss:
+                fitted_count = _fit_count_for_notional(
+                    available_notional_dollars=max_entry_loss,
+                    ticket=ticket,
+                    minimum_count_fp=Decimal("0.01"),
+                )
+                if fitted_count is None or fitted_count <= Decimal("0"):
+                    block(
+                        f"Crypto max-entry-loss cap ${max_entry_loss:.2f} leaves no tradable size "
+                        f"at contract price {contract_price}."
+                    )
+                    code("crypto_max_entry_loss_cap_no_fit")
+                else:
+                    original_count = approved_count
+                    approved_count = min(approved_count, fitted_count)
+                    approved_notional = _quantize_money(
+                        estimate_notional_dollars(ticket.side, ticket.yes_price_dollars, approved_count)
+                    )
+                    order_notional = approved_notional
+                    diagnostics["crypto_max_entry_loss_cap"].update(
+                        {
+                            "resized": True,
+                            "approved_count_fp": _decimal_text(approved_count),
+                            "approved_order_notional_dollars": _decimal_text(order_notional),
+                            "estimated_approved_max_loss_dollars": _decimal_text(contract_price * approved_count),
+                        }
+                    )
+                    note(
+                        f"Crypto max-entry-loss cap downsized ticket from {original_count:.2f} "
+                        f"to {approved_count:.2f} contracts."
+                    )
+                    code("crypto_max_entry_loss_cap_resized")
+
         max_order_count_fp = weather_live_max_order_count_fp(
             control=control,
             strategy_code=context.strategy_code,
@@ -947,6 +992,28 @@ class DeterministicRiskEngine:
                         f"${realized_loss_dollars:.2f} has reached the "
                         f"${cap_dollars:.2f} daily cap."
                     )
+
+        if (
+            is_buy_entry
+            and _is_crypto_strategy_code(context.strategy_code)
+            and context.strategy_asset_daily_realized_pnl_dollars is not None
+        ):
+            asset_cap_dollars = float(self.settings.crypto_asset_daily_loss_limit_dollars or 0)
+            realized_asset_loss = -float(context.strategy_asset_daily_realized_pnl_dollars)
+            diagnostics["crypto_asset_daily_loss_cap"] = {
+                "enabled": asset_cap_dollars > 0,
+                "asset_symbol": context.signal_asset_symbol,
+                "strategy_code": context.strategy_code,
+                "realized_pnl_dollars": _decimal_text(context.strategy_asset_daily_realized_pnl_dollars),
+                "realized_loss_dollars": round(realized_asset_loss, 4),
+                "cap_dollars": asset_cap_dollars,
+            }
+            if asset_cap_dollars > 0 and realized_asset_loss >= asset_cap_dollars:
+                block(
+                    f"Crypto {context.strategy_code} {context.signal_asset_symbol or 'asset'} realized loss "
+                    f"${realized_asset_loss:.2f} has reached the ${asset_cap_dollars:.2f} asset daily cap."
+                )
+                code("crypto_asset_daily_loss_cap")
 
         snapshot = context.portfolio_bucket_snapshot
         if is_buy_entry and snapshot is not None:

@@ -128,6 +128,7 @@ CRYPTO_ENV_COMMANDS = {
     "crypto-asset-mode",
     "crypto-policy",
     "crypto-live-path",
+    "crypto-pnl-report",
     "weather-live",
 }
 
@@ -2425,6 +2426,64 @@ async def _run_funnel_report_command(args: argparse.Namespace, container: AppCon
     return 0
 
 
+def _format_crypto_pnl_report(report: dict[str, Any]) -> str:
+    totals = report.get("totals") or {}
+    lines = [
+        (
+            f"crypto-pnl-report env={report.get('kalshi_env')} days={report.get('days')} "
+            f"frequency={report.get('frequency') or 'all'}"
+        ),
+        (
+            f"total fills={totals.get('fills', 0)} contracts={totals.get('contracts')} "
+            f"net_pnl=${totals.get('net_pnl_dollars')} fees=${totals.get('fees_dollars')} "
+            f"pnl/contract=${totals.get('pnl_per_contract_dollars')}"
+        ),
+        f"missing_decision_lineage={totals.get('missing_decision_lineage', 0)}",
+        "primary_metric=net_pnl_dollars win_rate=diagnostic_only",
+    ]
+    worst_cells = report.get("worst_cells") or []
+    if worst_cells:
+        lines.append("")
+        lines.append("Worst cells:")
+        for cell in worst_cells[:10]:
+            lines.append(
+                "  "
+                f"{cell.get('asset_symbol')} {cell.get('frequency')} {cell.get('side')} "
+                f"{cell.get('liquidity')} bucket={cell.get('price_bucket')} "
+                f"fills={cell.get('fills')} contracts={cell.get('contracts')} "
+                f"net=${cell.get('net_pnl_dollars')} pnl/contract=${cell.get('pnl_per_contract_dollars')} "
+                f"win_rate={cell.get('win_rate')}"
+            )
+    worst_markets = report.get("worst_markets") or []
+    if worst_markets:
+        lines.append("")
+        lines.append("Worst markets:")
+        for market in worst_markets[:10]:
+            lines.append(
+                "  "
+                f"{market.get('market_ticker')} fills={market.get('fills')} "
+                f"contracts={market.get('contracts')} net=${market.get('net_pnl_dollars')}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+async def _run_crypto_pnl_report_command(args: argparse.Namespace, container: AppContainer) -> int:
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=args.kalshi_env)
+        report = await repo.build_crypto_pnl_attribution_report(
+            kalshi_env=args.kalshi_env,
+            days=args.days,
+            frequency=args.frequency,
+            asset_symbols=args.assets,
+        )
+        await session.commit()
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(_format_crypto_pnl_report(report), end="")
+    return 0
+
+
 async def _run_weather_live_command(args: argparse.Namespace, container: AppContainer) -> int:
     if args.weather_live_command == "status":
         result = await container.weather_live_service.status(
@@ -2902,6 +2961,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "crypto-policy":
             return await _run_crypto_policy_command(args, container)
+
+        if args.command == "crypto-pnl-report":
+            return await _run_crypto_pnl_report_command(args, container)
 
         if args.command == "funnel-report":
             return await _run_funnel_report_command(args, container)
@@ -4521,6 +4583,13 @@ def build_parser() -> argparse.ArgumentParser:
     funnel_report.add_argument("--frequency", default="15m")
     funnel_report.add_argument("--assets", nargs="*", default=None)
     funnel_report.add_argument("--json", action="store_true")
+
+    crypto_pnl_report = subparsers.add_parser("crypto-pnl-report")
+    crypto_pnl_report.add_argument("--kalshi-env", choices=["demo", "production"], default="production")
+    crypto_pnl_report.add_argument("--days", type=int, default=14)
+    crypto_pnl_report.add_argument("--frequency", default=None)
+    crypto_pnl_report.add_argument("--assets", nargs="*", default=None)
+    crypto_pnl_report.add_argument("--json", action="store_true")
 
     weather_live = subparsers.add_parser("weather-live")
     weather_live_subparsers = weather_live.add_subparsers(dest="weather_live_command", required=True)

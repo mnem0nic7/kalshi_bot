@@ -4070,6 +4070,7 @@ class CryptoExecutionService:
         market: CryptoMarket,
         signal: StrategySignal,
         crypto_policy: RuntimeCryptoPolicy | None = None,
+        decision_lineage: dict[str, Any] | None = None,
     ) -> ExecReceiptPayload:
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=room.kalshi_env)
@@ -4183,6 +4184,24 @@ class CryptoExecutionService:
             )
         if crypto_last_minute_passive_trace(signal.candidate_trace):
             fixed_ticket = ticket.model_copy(update={"time_in_force": KALSHI_GTC_TIME_IN_FORCE})
+            live_pnl_gate = await self._live_pnl_gate(
+                room=room,
+                ticket=fixed_ticket,
+                market=market,
+                liquidity="maker",
+                yes_price_dollars=fixed_ticket.yes_price_dollars,
+            )
+            if _crypto_live_pnl_gate_blocks(live_pnl_gate, settings=self.settings):
+                return ExecReceiptPayload(
+                    status="crypto_live_pnl_gate_blocked",
+                    client_order_id=client_order_id,
+                    details={
+                        "reason": "crypto_live_pnl_gate_blocked",
+                        "crypto_live_pnl_gate": live_pnl_gate,
+                        "decision_lineage": decision_lineage or {},
+                        "no_order_submitted": True,
+                    },
+                )
             receipt = await self.base_execution_service.execute_fixed_limit_until_close(
                 ticket=fixed_ticket,
                 client_order_id=f"{client_order_id}:maker",
@@ -4192,6 +4211,12 @@ class CryptoExecutionService:
                 **(receipt.details if isinstance(receipt.details, dict) else {}),
                 "crypto_order_mode": "last_minute_passive",
                 "fixed_limit_until_close": True,
+                "crypto_live_pnl_gate": live_pnl_gate,
+                "decision_lineage": _crypto_order_decision_lineage(
+                    decision_lineage,
+                    liquidity="maker",
+                    order_mode="last_minute_passive",
+                ),
                 "last_minute_passive": (
                     ((signal.candidate_trace or {}).get("last_minute_passive") or {})
                     if isinstance(signal.candidate_trace, dict)
@@ -4202,6 +4227,7 @@ class CryptoExecutionService:
             return receipt
         order_mode = str(self.settings.crypto_order_mode or CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER).strip().lower()
         passive_price = self.passive_yes_price(market, ticket.side)
+        passive_live_pnl_gate: dict[str, Any] | None = None
         taker_fallback_checked = False
         if order_mode in {CRYPTO_ORDER_MODE_PASSIVE_ONLY, CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER}:
             if passive_price is None:
@@ -4216,46 +4242,80 @@ class CryptoExecutionService:
                         },
                     )
             else:
-                passive_ticket = ticket.model_copy(
-                    update={"yes_price_dollars": passive_price, "time_in_force": KALSHI_GTC_TIME_IN_FORCE}
-                )
-                passive_receipt = await self.base_execution_service.execute(
+                passive_live_pnl_gate = await self._live_pnl_gate(
                     room=room,
-                    control=fresh_control,
-                    ticket=passive_ticket,
-                    client_order_id=f"{client_order_id}:maker",
-                    fair_yes_dollars=fair_yes_dollars,
-                    min_edge_bps=(
-                        int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
-                        if crypto_policy is not None
-                        else None
-                    ),
+                    ticket=ticket,
+                    market=market,
+                    liquidity="maker",
+                    yes_price_dollars=passive_price,
                 )
-                if passive_receipt.status not in {"unfilled_cancelled", "requote_edge_lost"}:
-                    passive_receipt.details = {**passive_receipt.details, "crypto_order_mode": order_mode}
-                    return passive_receipt
-                if order_mode == CRYPTO_ORDER_MODE_PASSIVE_ONLY:
-                    return ExecReceiptPayload(
-                        status="passive_unfilled_no_taker",
-                        client_order_id=client_order_id,
-                        details={
-                            "reason": "passive_order_unfilled_or_edge_lost",
-                            "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_ONLY,
-                            "passive_receipt": passive_receipt.model_dump(mode="json"),
-                            "no_taker_fallback": True,
-                        },
+                if _crypto_live_pnl_gate_blocks(passive_live_pnl_gate, settings=self.settings):
+                    if order_mode == CRYPTO_ORDER_MODE_PASSIVE_ONLY:
+                        return ExecReceiptPayload(
+                            status="crypto_live_pnl_gate_blocked",
+                            client_order_id=client_order_id,
+                            details={
+                                "reason": "crypto_live_pnl_gate_blocked",
+                                "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_ONLY,
+                                "crypto_live_pnl_gate": passive_live_pnl_gate,
+                                "decision_lineage": _crypto_order_decision_lineage(
+                                    decision_lineage,
+                                    liquidity="maker",
+                                    order_mode=order_mode,
+                                ),
+                                "no_order_submitted": True,
+                            },
+                        )
+                else:
+                    passive_ticket = ticket.model_copy(
+                        update={"yes_price_dollars": passive_price, "time_in_force": KALSHI_GTC_TIME_IN_FORCE}
                     )
-                taker_fallback_checked = True
-                if not self._allow_taker_fallback(market, signal, crypto_policy=crypto_policy):
-                    return ExecReceiptPayload(
-                        status="passive_unfilled_taker_blocked",
-                        client_order_id=client_order_id,
-                        details={
-                            "reason": "taker_fallback_not_allowed",
-                            "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER,
-                            "passive_receipt": passive_receipt.model_dump(mode="json"),
-                        },
+                    passive_receipt = await self.base_execution_service.execute(
+                        room=room,
+                        control=fresh_control,
+                        ticket=passive_ticket,
+                        client_order_id=f"{client_order_id}:maker",
+                        fair_yes_dollars=fair_yes_dollars,
+                        min_edge_bps=(
+                            int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+                            if crypto_policy is not None
+                            else None
+                        ),
                     )
+                    passive_receipt.details = {
+                        **(passive_receipt.details if isinstance(passive_receipt.details, dict) else {}),
+                        "crypto_live_pnl_gate": passive_live_pnl_gate,
+                        "decision_lineage": _crypto_order_decision_lineage(
+                            decision_lineage,
+                            liquidity="maker",
+                            order_mode=order_mode,
+                        ),
+                    }
+                    if passive_receipt.status not in {"unfilled_cancelled", "requote_edge_lost"}:
+                        passive_receipt.details = {**passive_receipt.details, "crypto_order_mode": order_mode}
+                        return passive_receipt
+                    if order_mode == CRYPTO_ORDER_MODE_PASSIVE_ONLY:
+                        return ExecReceiptPayload(
+                            status="passive_unfilled_no_taker",
+                            client_order_id=client_order_id,
+                            details={
+                                "reason": "passive_order_unfilled_or_edge_lost",
+                                "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_ONLY,
+                                "passive_receipt": passive_receipt.model_dump(mode="json"),
+                                "no_taker_fallback": True,
+                            },
+                        )
+                    taker_fallback_checked = True
+                    if not self._allow_taker_fallback(market, signal, crypto_policy=crypto_policy):
+                        return ExecReceiptPayload(
+                            status="passive_unfilled_taker_blocked",
+                            client_order_id=client_order_id,
+                            details={
+                                "reason": "taker_fallback_not_allowed",
+                                "crypto_order_mode": CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER,
+                                "passive_receipt": passive_receipt.model_dump(mode="json"),
+                            },
+                        )
         if order_mode == CRYPTO_ORDER_MODE_PASSIVE_ONLY:
             return ExecReceiptPayload(
                 status="passive_unfilled_no_taker",
@@ -4278,7 +4338,31 @@ class CryptoExecutionService:
                         "no_order_submitted": passive_price is None,
                     },
                 )
-        return await self.base_execution_service.execute(
+        taker_live_pnl_gate = await self._live_pnl_gate(
+            room=room,
+            ticket=ticket,
+            market=market,
+            liquidity="taker",
+            yes_price_dollars=ticket.yes_price_dollars,
+        )
+        if _crypto_live_pnl_gate_blocks(taker_live_pnl_gate, settings=self.settings):
+            return ExecReceiptPayload(
+                status="crypto_live_pnl_gate_blocked",
+                client_order_id=client_order_id,
+                details={
+                    "reason": "crypto_live_pnl_gate_blocked",
+                    "crypto_order_mode": order_mode,
+                    "crypto_live_pnl_gate": taker_live_pnl_gate,
+                    "passive_live_pnl_gate": passive_live_pnl_gate,
+                    "decision_lineage": _crypto_order_decision_lineage(
+                        decision_lineage,
+                        liquidity="taker",
+                        order_mode=order_mode,
+                    ),
+                    "no_order_submitted": True,
+                },
+            )
+        receipt = await self.base_execution_service.execute(
             room=room,
             control=fresh_control,
             ticket=ticket,
@@ -4289,6 +4373,48 @@ class CryptoExecutionService:
                 if crypto_policy is not None
                 else None
             ),
+        )
+        receipt.details = {
+            **(receipt.details if isinstance(receipt.details, dict) else {}),
+            "crypto_order_mode": order_mode,
+            "crypto_live_pnl_gate": taker_live_pnl_gate,
+            "passive_live_pnl_gate": passive_live_pnl_gate,
+            "decision_lineage": _crypto_order_decision_lineage(
+                decision_lineage,
+                liquidity="taker",
+                order_mode=order_mode,
+            ),
+        }
+        return receipt
+
+    async def _live_pnl_gate(
+        self,
+        *,
+        room: Room,
+        ticket: TradeTicket,
+        market: CryptoMarket,
+        liquidity: str,
+        yes_price_dollars: Decimal,
+    ) -> dict[str, Any]:
+        contract_price = yes_price_dollars if ticket.side == ContractSide.YES else Decimal("1.0000") - yes_price_dollars
+        strategy_code = crypto_strategy_code_for_frequency(market.frequency)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=room.kalshi_env)
+            stats = await repo.get_crypto_live_pnl_cell_stats(
+                kalshi_env=room.kalshi_env,
+                strategy_code=strategy_code,
+                asset_symbol=market.asset_symbol,
+                frequency=market.frequency,
+                side=ticket.side.value,
+                contract_price_dollars=contract_price,
+                liquidity=liquidity,
+                lookback_days=self.settings.crypto_live_pnl_gate_lookback_days,
+            )
+            await session.commit()
+        return _crypto_live_pnl_gate_payload(
+            stats,
+            settings=self.settings,
+            contract_price_dollars=contract_price,
         )
 
     def _allow_taker_fallback(
@@ -4465,6 +4591,24 @@ class CryptoWorkflowService:
                         payload={"signal_id": signal_record.id, **(signal_record.payload or {})},
                     ),
                 )
+                await _upsert_crypto_decision_outcome_for_signal(
+                    repo,
+                    room=room,
+                    market=market,
+                    signal=signal,
+                    signal_record=signal_record,
+                    decision_kind="selected" if _signal_is_tradeable(signal) else "stand_down",
+                    gate_status=(
+                        "eligible"
+                        if _signal_is_tradeable(signal)
+                        else str(
+                            ((signal.candidate_trace or {}).get("trade_selection_model") or {}).get("candidate_status")
+                            or (signal.candidate_trace or {}).get("candidate_status")
+                            or "blocked"
+                        )
+                    ),
+                    selected_count_fp=None,
+                )
                 if _crypto_market_closed_for_execution(market):
                     await repo.update_room_stage(room.id, RoomStage.COMPLETE)
                     await repo.append_message(
@@ -4544,6 +4688,18 @@ class CryptoWorkflowService:
                 )
                 ticket = base_ticket.model_copy(update={"count_fp": count_fp})
                 client_order_id = make_client_order_id(room.id, market.market_ticker, ticket.nonce)
+                decision_lineage = _crypto_decision_lineage_payload(
+                    room=room,
+                    market=market,
+                    signal=signal,
+                    signal_record=signal_record,
+                    strategy_code=strategy_code,
+                    gate=gate,
+                    backtest=backtest,
+                    live_status=live_status,
+                    proposed_count_fp=count_fp,
+                    sizing_diagnostics=sizing_diagnostics,
+                )
                 ticket_record = await repo.save_trade_ticket(
                     room.id,
                     ticket,
@@ -4562,7 +4718,13 @@ class CryptoWorkflowService:
                     "prediction_model": ((signal_record.payload or {}).get("crypto_modeling") or {}).get("prediction_model"),
                     "trade_selection_model": ((signal_record.payload or {}).get("crypto_modeling") or {}).get("trade_selection_model"),
                     "crypto_dynamic_sizing": sizing_diagnostics,
+                    "decision_lineage": {
+                        **decision_lineage,
+                        "trade_ticket_id": ticket_record.id,
+                        "client_order_id": client_order_id,
+                    },
                 }
+                decision_lineage = dict(ticket_record.payload["decision_lineage"])
                 await repo.append_message(
                     room.id,
                     RoomMessageCreate(
@@ -4601,6 +4763,20 @@ class CryptoWorkflowService:
                     approved_count_fp=verdict.approved_count_fp,
                     payload=verdict.model_dump(mode="json"),
                 )
+                decision_lineage = {
+                    **decision_lineage,
+                    "risk_status": verdict.status.value,
+                    "risk_reason_codes": verdict.reason_codes,
+                    "risk_reasons": verdict.reasons,
+                    "approved_count_fp": _count_text(verdict.approved_count_fp),
+                    "approved_notional_dollars": _money_text(verdict.approved_notional_dollars),
+                    "net_edge_bps": verdict.net_edge_bps,
+                    "fee_edge_bps": verdict.fee_edge_bps,
+                }
+                ticket_record.payload = {
+                    **(ticket_record.payload or {}),
+                    "decision_lineage": decision_lineage,
+                }
                 await repo.append_message(
                     room.id,
                     RoomMessageCreate(
@@ -4654,6 +4830,7 @@ class CryptoWorkflowService:
                     market=market,
                     signal=signal,
                     crypto_policy=crypto_policy,
+                    decision_lineage=decision_lineage,
                 )
                 no_order_statuses = {
                     "shadow_skipped",
@@ -4661,6 +4838,7 @@ class CryptoWorkflowService:
                     "crypto_asset_live_disabled",
                     "crypto_trading_disabled",
                     "crypto_replay_gate_blocked",
+                    "crypto_live_pnl_gate_blocked",
                     "crypto_candidate_not_live_eligible",
                     "crypto_market_closed",
                 }
@@ -4678,7 +4856,10 @@ class CryptoWorkflowService:
                         action=approved_ticket.action.value,
                         yes_price_dollars=approved_ticket.yes_price_dollars,
                         count_fp=approved_ticket.count_fp,
-                        raw=receipt.details,
+                        raw=_crypto_raw_with_decision_lineage(
+                            receipt.details if isinstance(receipt.details, dict) else {},
+                            decision_lineage,
+                        ),
                         kalshi_order_id=receipt.external_order_id,
                         kalshi_env=room.kalshi_env,
                         strategy_code=strategy_code,
@@ -4766,6 +4947,11 @@ class CryptoWorkflowService:
             strategy_code=strategy_code,
             kalshi_env=room.kalshi_env,
         )
+        strategy_asset_daily_pnl = await repo.get_daily_realized_pnl_dollars_by_strategy_asset(
+            strategy_code=strategy_code,
+            asset_symbol=market.asset_symbol,
+            kalshi_env=room.kalshi_env,
+        )
         current_position_notional = (
             abs(Decimal(str(open_position.count_fp))) * Decimal(str(open_position.average_price_dollars))
             if open_position is not None
@@ -4786,6 +4972,8 @@ class CryptoWorkflowService:
             open_ticker_count=len({position.market_ticker for position in all_positions}),
             strategy_code=strategy_code,
             strategy_daily_realized_pnl_dollars=strategy_daily_pnl,
+            strategy_asset_daily_realized_pnl_dollars=strategy_asset_daily_pnl,
+            signal_asset_symbol=market.asset_symbol,
         )
 
 
@@ -5586,6 +5774,193 @@ def _runtime_replay_gate_blockers(replay_gate: Any | None, crypto_policy: Runtim
 
 def _runtime_replay_gate_passed(replay_gate: Any | None, crypto_policy: RuntimeCryptoPolicy | None) -> bool:
     return not _runtime_replay_gate_blockers(replay_gate, crypto_policy)
+
+
+def _crypto_live_pnl_gate_payload(
+    stats: dict[str, Any],
+    *,
+    settings: Settings,
+    contract_price_dollars: Decimal,
+) -> dict[str, Any]:
+    enabled = bool(settings.crypto_live_pnl_gate_enabled)
+    min_fills = int(settings.crypto_live_pnl_gate_min_fills)
+    min_contracts = Decimal(str(settings.crypto_live_pnl_gate_min_contracts))
+    min_net_pnl = Decimal(str(settings.crypto_live_pnl_gate_min_net_pnl_dollars))
+    min_pnl_per_contract = Decimal(str(settings.crypto_live_pnl_gate_min_pnl_per_contract_dollars))
+    fill_count = int(stats.get("fill_count") or 0)
+    contracts = Decimal(str(stats.get("contracts") or "0"))
+    net_pnl = Decimal(str(stats.get("net_pnl_dollars") or "0"))
+    pnl_per_contract = Decimal(str(stats.get("pnl_per_contract_dollars") or "0"))
+    evidence_ready = fill_count >= min_fills and contracts >= min_contracts
+    blockers: list[str] = []
+    if enabled and evidence_ready:
+        if net_pnl < min_net_pnl:
+            blockers.append(
+                f"Live P&L cell net P/L ${net_pnl:.2f} below minimum ${min_net_pnl:.2f} "
+                f"over {fill_count} fills / {contracts:.2f} contracts."
+            )
+        if pnl_per_contract < min_pnl_per_contract:
+            blockers.append(
+                f"Live P&L cell P/L per contract ${pnl_per_contract:.4f} below minimum "
+                f"${min_pnl_per_contract:.4f}."
+            )
+    return {
+        "enabled": enabled,
+        "mode": str(settings.crypto_live_pnl_gate_mode or "block").strip().lower(),
+        "status": "blocked" if blockers else ("insufficient_evidence" if enabled and not evidence_ready else "passed"),
+        "blockers": blockers,
+        "contract_price_dollars": str(contract_price_dollars.quantize(Decimal("0.0001"))),
+        "thresholds": {
+            "min_fills": min_fills,
+            "min_contracts": str(min_contracts.quantize(Decimal("0.01"))),
+            "min_net_pnl_dollars": str(min_net_pnl.quantize(Decimal("0.0001"))),
+            "min_pnl_per_contract_dollars": str(min_pnl_per_contract.quantize(Decimal("0.0001"))),
+        },
+        "stats": stats,
+    }
+
+
+def _crypto_live_pnl_gate_blocks(payload: dict[str, Any], *, settings: Settings) -> bool:
+    if not bool(settings.crypto_live_pnl_gate_enabled):
+        return False
+    if str(settings.crypto_live_pnl_gate_mode or "block").strip().lower() not in {"block", "enforce", "live"}:
+        return False
+    return bool(payload.get("blockers"))
+
+
+def _crypto_order_decision_lineage(
+    lineage: dict[str, Any] | None,
+    *,
+    liquidity: str,
+    order_mode: str,
+) -> dict[str, Any]:
+    return {
+        **(lineage or {}),
+        "liquidity_policy": liquidity,
+        "crypto_order_mode": order_mode,
+    }
+
+
+def _crypto_raw_with_decision_lineage(raw: dict[str, Any], lineage: dict[str, Any]) -> dict[str, Any]:
+    receipt_lineage = raw.get("decision_lineage") if isinstance(raw, dict) else None
+    merged_lineage = {
+        **(lineage or {}),
+        **(receipt_lineage if isinstance(receipt_lineage, dict) else {}),
+    }
+    return {**(raw if isinstance(raw, dict) else {}), "decision_lineage": merged_lineage}
+
+
+def _crypto_decision_lineage_payload(
+    *,
+    room: Room,
+    market: CryptoMarket,
+    signal: StrategySignal,
+    signal_record: Signal,
+    strategy_code: str,
+    gate: Any | None,
+    backtest: Any | None,
+    live_status: dict[str, Any],
+    proposed_count_fp: Decimal,
+    sizing_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    prediction_model = trace.get("prediction_model") if isinstance(trace.get("prediction_model"), dict) else {}
+    selection = trace.get("trade_selection_model") if isinstance(trace.get("trade_selection_model"), dict) else {}
+    return {
+        "schema_version": "crypto-decision-lineage-v1",
+        "room_id": room.id,
+        "signal_id": signal_record.id,
+        "signal_created_at": signal_record.created_at.isoformat() if signal_record.created_at else None,
+        "market_ticker": market.market_ticker,
+        "asset_symbol": market.asset_symbol,
+        "frequency": market.frequency,
+        "strategy_code": strategy_code,
+        "fair_yes_dollars": _money_text(signal.fair_yes_dollars),
+        "target_yes_price_dollars": _money_text(signal.target_yes_price_dollars),
+        "selected_price_dollars": _money_text(signal.target_yes_price_dollars),
+        "selected_side": signal.recommended_side.value if signal.recommended_side else trace.get("selected_side"),
+        "edge_bps": signal.edge_bps,
+        "expected_net_edge_bps": _crypto_signal_expected_net_edge_bps(signal),
+        "confidence": signal.confidence,
+        "bucket_key": trace.get("bucket_key"),
+        "price_bucket": _price_band(
+            signal.target_yes_price_dollars
+            if signal.recommended_side == ContractSide.YES
+            else Decimal("1.0000") - signal.target_yes_price_dollars
+        )
+        if signal.target_yes_price_dollars is not None and signal.recommended_side is not None
+        else None,
+        "candidate_status": selection.get("candidate_status") or trace.get("candidate_status"),
+        "selection_reason": selection.get("selection_reason") or trace.get("selection_reason"),
+        "model_version": trace.get("model_version"),
+        "prediction_model": prediction_model,
+        "backtest_version": backtest.version if backtest is not None else None,
+        "replay_gate_status": gate.status if gate is not None else "missing",
+        "replay_gate_version": gate.version if gate is not None else None,
+        "asset_mode": live_status.get("asset_mode"),
+        "control_asset_mode": live_status.get("control_asset_mode"),
+        "live_eligible": live_status.get("live_eligible"),
+        "proposed_count_fp": _count_text(proposed_count_fp),
+        "sizing": sizing_diagnostics,
+    }
+
+
+async def _upsert_crypto_decision_outcome_for_signal(
+    repo: PlatformRepository,
+    *,
+    room: Room,
+    market: CryptoMarket,
+    signal: StrategySignal,
+    signal_record: Signal,
+    decision_kind: str,
+    gate_status: str | None,
+    selected_count_fp: Decimal | None,
+) -> None:
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    prediction_model = trace.get("prediction_model") if isinstance(trace.get("prediction_model"), dict) else {}
+    decision_time = signal_record.created_at or datetime.now(UTC)
+    input_payload = {
+        "signal_id": signal_record.id,
+        "room_id": room.id,
+        "market_ticker": market.market_ticker,
+        "decision_time": decision_time.isoformat(),
+        "decision_kind": decision_kind,
+    }
+    input_hash = hashlib.sha256(json.dumps(input_payload, sort_keys=True).encode("utf-8")).hexdigest()
+    await repo.upsert_crypto_decision_outcome(
+        kalshi_env=room.kalshi_env,
+        frequency=market.frequency,
+        market_ticker=market.market_ticker,
+        asset_symbol=market.asset_symbol,
+        decision_time=decision_time,
+        decision_kind=decision_kind,
+        input_hash=input_hash,
+        trace_hash=None,
+        model_version=str(trace.get("model_version") or "") or None,
+        prediction_yes=_optional_decimal(
+            prediction_model.get("calibrated_probability")
+            or prediction_model.get("raw_probability")
+            or signal.fair_yes_dollars
+        ),
+        selected_side=signal.recommended_side.value if signal.recommended_side else trace.get("selected_side"),
+        selected_price_dollars=signal.target_yes_price_dollars,
+        selected_count_fp=selected_count_fp,
+        gate_status=gate_status,
+        settlement_result=None,
+        simulated_pnl_dollars=_optional_decimal(
+            trace.get("expected_net_pnl")
+            or trace.get("last_minute_price_matrix_net_pnl")
+            or trace.get("simulated_pnl_dollars")
+        ),
+        realized_pnl_dollars=None,
+        fill_count=0,
+        source_snapshot_ids=trace.get("source_snapshot_ids") or {},
+        payload={
+            "signal_id": signal_record.id,
+            "room_id": room.id,
+            "candidate_trace": _crypto_training_json_ready(trace),
+        },
+    )
 
 
 def _crypto_signal_stand_down_payload(signal: StrategySignal) -> dict[str, Any]:

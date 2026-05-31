@@ -1131,6 +1131,87 @@ def test_risk_engine_caps_crypto_late_empirical_override_ticket_to_one_contract(
     assert verdict.diagnostics["crypto_empirical_late_override"]["approved_count_fp"] == "1.0000"
 
 
+def test_risk_engine_caps_crypto_entry_by_max_loss() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_max_order_notional_dollars=1000,
+        risk_max_position_notional_dollars=1000,
+        risk_position_pct=1.0,
+        strategy_min_remaining_payout_bps=0,
+        crypto_max_entry_loss_dollars=10.0,
+    )
+    signal = make_signal(edge_bps=5000)
+    signal.candidate_trace = {"strategy_code": StrategyCode.CRYPTO_15M.value, "candidate_status": "live_quality"}
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXBTC15M-LOSS-CAP",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.9000"),
+            count_fp=Decimal("50.00"),
+        ),
+        signal=signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("1000.00"),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        ),
+    )
+
+    assert verdict.status == RiskStatus.APPROVED
+    assert verdict.approved_count_fp == Decimal("11.11")
+    assert "crypto_max_entry_loss_cap_resized" in verdict.reason_codes
+    assert verdict.diagnostics["crypto_max_entry_loss_cap"]["estimated_max_loss_dollars"] == "45.0000"
+
+
+def test_risk_engine_blocks_crypto_asset_daily_loss_cap() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///./test.db",
+        risk_min_edge_bps=50,
+        risk_min_probability_extremity_pct=0.0,
+        risk_max_order_notional_dollars=1000,
+        risk_max_position_notional_dollars=1000,
+        risk_position_pct=1.0,
+        strategy_min_remaining_payout_bps=0,
+        crypto_asset_daily_loss_limit_dollars=10.0,
+    )
+    signal = make_signal(edge_bps=5000)
+    signal.candidate_trace = {"strategy_code": StrategyCode.CRYPTO_15M.value, "candidate_status": "live_quality"}
+    engine = DeterministicRiskEngine(settings)
+
+    verdict = engine.evaluate(
+        room=make_room(),
+        control=DeploymentControl(id="default", active_color="blue", kill_switch_enabled=False, notes={}),
+        ticket=TradeTicket(
+            market_ticker="KXHYPE15M-DAILY-LOSS",
+            action=TradeAction.BUY,
+            side=ContractSide.YES,
+            yes_price_dollars=Decimal("0.5000"),
+            count_fp=Decimal("1.00"),
+        ),
+        signal=signal,
+        context=RiskContext(
+            market_observed_at=datetime.now(UTC),
+            research_observed_at=datetime.now(UTC),
+            total_capital_dollars=Decimal("1000.00"),
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+            strategy_asset_daily_realized_pnl_dollars=Decimal("-12.00"),
+            signal_asset_symbol="HYPE",
+        ),
+    )
+
+    assert verdict.status == RiskStatus.BLOCKED
+    assert "crypto_asset_daily_loss_cap" in verdict.reason_codes
+    assert any("HYPE realized loss $12.00" in reason for reason in verdict.reasons)
+
+
 def test_risk_engine_late_high_confidence_uses_existing_position_caps() -> None:
     settings = Settings(
         database_url="sqlite+aiosqlite:///./test.db",

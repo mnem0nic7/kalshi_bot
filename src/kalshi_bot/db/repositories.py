@@ -112,10 +112,28 @@ def _total_capital_dollars_from_balance_payload(balance_payload: dict[str, Any])
 
 _PENDING_BUY_ORDER_STATUSES = {"resting", "submitted", "accepted", "open", "pending"}
 _CRYPTO_MARKET_TICKER_RE = re.compile(r"^KX[A-Z0-9]+(?:15M|1H)-")
+_CRYPTO_MARKET_ID_RE = re.compile(r"^KX([A-Z0-9]+)(15M|1H)-")
 
 
 def _is_crypto_market_ticker(market_ticker: str | None) -> bool:
     return bool(_CRYPTO_MARKET_TICKER_RE.match(str(market_ticker or "").upper()))
+
+
+def _crypto_market_identity(market_ticker: str | None) -> tuple[str | None, str | None]:
+    match = _CRYPTO_MARKET_ID_RE.match(str(market_ticker or "").upper())
+    if match is None:
+        return None, None
+    return match.group(1), "15m" if match.group(2) == "15M" else "1h"
+
+
+def _crypto_price_band(price: Decimal) -> str:
+    if price < Decimal("0.25"):
+        return "0.00-0.25"
+    if price < Decimal("0.50"):
+        return "0.25-0.50"
+    if price < Decimal("0.75"):
+        return "0.50-0.75"
+    return "0.75-1.00"
 
 
 def _as_utc_datetime(value: datetime | None, default: datetime | None = None) -> datetime:
@@ -134,11 +152,27 @@ def _contract_price_from_yes_price(side: str | None, yes_price_dollars: Decimal)
     return yes_price if str(side or "").lower() == "yes" else Decimal("1.0000") - yes_price
 
 
-def _fill_fee_for_count(fill: FillRecord, count_fp: Decimal) -> Decimal:
-    total_count = as_decimal(fill.count_fp)
+def _fill_fee_dollars_from_raw(raw: Any) -> Decimal:
+    payload = raw if isinstance(raw, dict) else {}
+    for key in ("fee_cost", "fee_dollars", "fee"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            try:
+                return _quantize_money(value)
+            except Exception:
+                return Decimal("0")
+    return Decimal("0")
+
+
+def _fill_fee_for_count_from_raw(raw: Any, total_count_fp: Any, count_fp: Decimal) -> Decimal:
+    total_count = as_decimal(total_count_fp)
     if total_count <= Decimal("0") or count_fp <= Decimal("0"):
         return Decimal("0")
-    return _fill_fee_dollars(fill) * count_fp / total_count
+    return _fill_fee_dollars_from_raw(raw) * count_fp / total_count
+
+
+def _fill_fee_for_count(fill: FillRecord, count_fp: Decimal) -> Decimal:
+    return _fill_fee_for_count_from_raw(fill.raw, fill.count_fp, count_fp)
 
 
 def _raw_subaccount(raw: Any) -> int | None:
@@ -177,15 +211,7 @@ def _order_notional_dollars(order: OrderRecord) -> Decimal:
 
 
 def _fill_fee_dollars(fill: FillRecord) -> Decimal:
-    raw = fill.raw if isinstance(fill.raw, dict) else {}
-    for key in ("fee_cost", "fee_dollars", "fee"):
-        value = raw.get(key)
-        if value not in (None, ""):
-            try:
-                return _quantize_money(value)
-            except Exception:
-                return Decimal("0")
-    return Decimal("0")
+    return _fill_fee_dollars_from_raw(fill.raw)
 
 
 def _candidate_trade_ticket_client_order_ids(client_order_id: str) -> list[str]:
@@ -209,14 +235,47 @@ def _candidate_trade_ticket_client_order_ids(client_order_id: str) -> list[str]:
     return candidates
 
 
-def _settled_buy_fill_pnl(fill: FillRecord) -> Decimal | None:
-    if fill.action != "buy" or fill.settlement_result not in {"win", "loss"}:
+def _settled_buy_fill_pnl_from_values(
+    *,
+    side: str | None,
+    action: str | None,
+    yes_price_dollars: Any,
+    count_fp: Any,
+    settlement_result: str | None,
+    raw: Any,
+) -> Decimal | None:
+    if action != "buy" or settlement_result not in {"win", "loss"}:
         return None
-    contract_price = _contract_price_from_yes_price(fill.side, fill.yes_price_dollars)
-    count = as_decimal(fill.count_fp)
-    won = fill.settlement_result == "win"
+    contract_price = _contract_price_from_yes_price(side, as_decimal(yes_price_dollars))
+    count = as_decimal(count_fp)
+    won = settlement_result == "win"
     gross = ((Decimal("1.0000") if won else Decimal("0")) - contract_price) * count
-    return _quantize_money(gross - _fill_fee_dollars(fill))
+    return _quantize_money(gross - _fill_fee_dollars_from_raw(raw))
+
+
+def _settled_buy_fill_pnl(fill: FillRecord) -> Decimal | None:
+    return _settled_buy_fill_pnl_from_values(
+        side=fill.side,
+        action=fill.action,
+        yes_price_dollars=fill.yes_price_dollars,
+        count_fp=fill.count_fp,
+        settlement_result=fill.settlement_result,
+        raw=fill.raw,
+    )
+
+
+def _raw_has_decision_lineage(raw: Any) -> bool:
+    payload = raw if isinstance(raw, dict) else {}
+    lineage = payload.get("decision_lineage")
+    if not isinstance(lineage, dict):
+        return False
+    required_groups = (
+        ("decision_edge_bps", "edge_bps", "expected_net_edge_bps"),
+        ("decision_fair_yes", "fair_yes_dollars"),
+        ("decision_price", "target_yes_price_dollars", "selected_price_dollars"),
+        ("decision_time", "signal_created_at"),
+    )
+    return all(any(lineage.get(key) not in (None, "") for key in keys) for keys in required_groups)
 
 
 class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixin, StrategyRepositoryMixin, LearningRepositoryMixin):
@@ -798,6 +857,27 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
 
     async def get_latest_signal_for_room(self, room_id: str) -> Signal | None:
         stmt = select(Signal).where(Signal.room_id == room_id).order_by(Signal.created_at.desc()).limit(1)
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def get_latest_signal_for_market(
+        self,
+        market_ticker: str,
+        *,
+        kalshi_env: str | None = None,
+        before: datetime | None = None,
+        max_age_seconds: int | None = None,
+    ) -> Signal | None:
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = (
+            select(Signal)
+            .join(Room, Signal.room_id == Room.id)
+            .where(Signal.market_ticker == market_ticker, Room.kalshi_env == env)
+        )
+        if before is not None:
+            stmt = stmt.where(Signal.created_at <= before)
+            if max_age_seconds is not None and max_age_seconds > 0:
+                stmt = stmt.where(Signal.created_at >= before - timedelta(seconds=max_age_seconds))
+        stmt = stmt.order_by(Signal.created_at.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def latest_signal_payloads_for_markets(
@@ -2806,6 +2886,14 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             action=action,
         )
         economic_side = resolved_side or side
+        fill_observed_at = datetime.now(UTC)
+        decision_context = await self._resolve_fill_decision_context(
+            order_id=resolved_order_id,
+            market_ticker=market_ticker,
+            kalshi_env=env,
+            before=fill_observed_at,
+        )
+        decision_lineage = decision_context.pop("_decision_lineage", {})
         record = FillRecord(
             order_id=resolved_order_id,
             trade_id=trade_id,
@@ -2816,8 +2904,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             yes_price_dollars=yes_price_dollars,
             count_fp=count_fp,
             strategy_code=resolved_strategy,
-            raw=raw,
+            raw=self._raw_with_decision_lineage(raw, decision_lineage),
             is_taker=is_taker,
+            **decision_context,
         )
         self.session.add(record)
         await self.session.flush()
@@ -2945,12 +3034,130 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
 
         return order_id, None, None
 
-    async def _resolve_fill_decision_context(self, *, order_id: str | None) -> dict[str, Any]:
+    @staticmethod
+    def _decision_context_from_signal(signal: Signal, *, decision_price: Decimal | None = None) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "decision_edge_bps": signal.edge_bps,
+            "decision_confidence": signal.confidence,
+            "decision_spread_bps": None,
+            "decision_fair_yes": signal.fair_yes_dollars,
+            "decision_price": decision_price,
+            "decision_ts": signal.created_at,
+        }
+        payload = signal.payload if isinstance(signal.payload, dict) else {}
+        spread = payload.get("spread_bps")
+        if spread in (None, ""):
+            candidate = payload.get("candidate_trace")
+            if isinstance(candidate, dict):
+                spread = candidate.get("spread_bps")
+        if spread not in (None, ""):
+            try:
+                context["decision_spread_bps"] = int(spread)
+            except (TypeError, ValueError):
+                context["decision_spread_bps"] = None
+        return context
+
+    @staticmethod
+    def _apply_raw_decision_lineage(context: dict[str, Any], lineage: dict[str, Any]) -> None:
+        field_map = {
+            "decision_edge_bps": ("decision_edge_bps", "edge_bps", "expected_net_edge_bps"),
+            "decision_confidence": ("decision_confidence", "confidence"),
+            "decision_spread_bps": ("decision_spread_bps", "spread_bps"),
+            "decision_fair_yes": ("decision_fair_yes", "fair_yes_dollars"),
+            "decision_price": ("decision_price", "target_yes_price_dollars", "selected_price_dollars"),
+            "decision_ts": ("decision_ts", "decision_time", "signal_created_at"),
+        }
+        for field, keys in field_map.items():
+            if context.get(field) not in (None, ""):
+                continue
+            for key in keys:
+                value = lineage.get(key)
+                if value in (None, ""):
+                    continue
+                try:
+                    if field in {"decision_edge_bps", "decision_spread_bps"}:
+                        context[field] = int(value)
+                    elif field == "decision_confidence":
+                        context[field] = float(value)
+                    elif field == "decision_ts":
+                        context[field] = _as_utc_datetime(datetime.fromisoformat(str(value)))
+                    else:
+                        context[field] = _quantize_money(value)
+                    break
+                except Exception:
+                    continue
+
+    @staticmethod
+    def _raw_with_decision_lineage(raw: dict[str, Any], lineage: dict[str, Any]) -> dict[str, Any]:
+        if not lineage:
+            return raw
+        existing = raw.get("decision_lineage") if isinstance(raw, dict) else None
+        merged = {**(existing if isinstance(existing, dict) else {}), **lineage}
+        return {**raw, "decision_lineage": merged}
+
+    def _lineage_from_context(
+        self,
+        context: dict[str, Any],
+        *,
+        source: str,
+        order: OrderRecord | None = None,
+        signal: Signal | None = None,
+    ) -> dict[str, Any]:
+        lineage = {
+            "source": source,
+            "decision_edge_bps": context.get("decision_edge_bps"),
+            "decision_confidence": context.get("decision_confidence"),
+            "decision_spread_bps": context.get("decision_spread_bps"),
+            "decision_fair_yes": str(context["decision_fair_yes"]) if context.get("decision_fair_yes") is not None else None,
+            "decision_price": str(context["decision_price"]) if context.get("decision_price") is not None else None,
+            "decision_time": context["decision_ts"].isoformat() if context.get("decision_ts") is not None else None,
+        }
+        if order is not None:
+            lineage.update(
+                {
+                    "order_id": order.id,
+                    "kalshi_order_id": order.kalshi_order_id,
+                    "client_order_id": order.client_order_id,
+                    "trade_ticket_id": order.trade_ticket_id,
+                    "order_strategy_code": order.strategy_code,
+                }
+            )
+            order_raw = order.raw if isinstance(order.raw, dict) else {}
+            raw_lineage = order_raw.get("decision_lineage")
+            if isinstance(raw_lineage, dict):
+                lineage.update(raw_lineage)
+        if signal is not None:
+            lineage.update({"signal_id": signal.id, "signal_room_id": signal.room_id})
+            payload = signal.payload if isinstance(signal.payload, dict) else {}
+            crypto_modeling = payload.get("crypto_modeling") if isinstance(payload.get("crypto_modeling"), dict) else {}
+            candidate_trace = payload.get("candidate_trace") if isinstance(payload.get("candidate_trace"), dict) else {}
+            lineage.update(
+                {
+                    "model_version": crypto_modeling.get("model_version") or candidate_trace.get("model_version"),
+                    "backtest_version": crypto_modeling.get("backtest_version"),
+                    "replay_gate_status": crypto_modeling.get("replay_gate_status"),
+                    "selected_side": candidate_trace.get("selected_side") or payload.get("recommended_side"),
+                    "bucket_key": candidate_trace.get("bucket_key"),
+                    "candidate_status": candidate_trace.get("candidate_status"),
+                }
+            )
+        return {key: value for key, value in lineage.items() if value not in (None, "")}
+
+    async def _resolve_fill_decision_context(
+        self,
+        *,
+        order_id: str | None,
+        market_ticker: str | None = None,
+        kalshi_env: str | None = None,
+        before: datetime | None = None,
+    ) -> dict[str, Any]:
         """Resolve decision-time lineage for a fill.
 
         Joins order_id -> OrderRecord -> trade_ticket_id -> TradeTicketRecord.room_id
         -> latest Signal for that room. Returns the six decision_* fields, all None
-        when no order/ticket/signal can be resolved (never raises).
+        when no order/ticket/signal can be resolved (never raises). The private
+        ``_decision_lineage`` key is stripped before model persistence and copied
+        into FillRecord.raw for richer audit/reporting.
         """
         context: dict[str, Any] = {
             "decision_edge_bps": None,
@@ -2960,38 +3167,50 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             "decision_price": None,
             "decision_ts": None,
         }
-        if order_id is None:
-            return context
-        order = (
-            await self.session.execute(select(OrderRecord).where(OrderRecord.id == order_id))
-        ).scalar_one_or_none()
-        if order is None:
-            return context
-        # decision_price = the price we decided to trade at (the order's yes price).
-        context["decision_price"] = order.yes_price_dollars
-        if order.trade_ticket_id is None:
-            return context
-        ticket = (
-            await self.session.execute(
-                select(TradeTicketRecord).where(TradeTicketRecord.id == order.trade_ticket_id)
+        order: OrderRecord | None = None
+        signal: Signal | None = None
+        lineage_source = "unresolved"
+        if order_id is not None:
+            order = (
+                await self.session.execute(select(OrderRecord).where(OrderRecord.id == order_id))
+            ).scalar_one_or_none()
+        if order is not None:
+            context["decision_price"] = order.yes_price_dollars
+            order_raw = order.raw if isinstance(order.raw, dict) else {}
+            raw_lineage = order_raw.get("decision_lineage")
+            if isinstance(raw_lineage, dict):
+                self._apply_raw_decision_lineage(context, raw_lineage)
+                lineage_source = "order_raw_decision_lineage"
+            if order.trade_ticket_id is not None:
+                ticket = (
+                    await self.session.execute(
+                        select(TradeTicketRecord).where(TradeTicketRecord.id == order.trade_ticket_id)
+                    )
+                ).scalar_one_or_none()
+                if ticket is not None:
+                    signal = await self.get_latest_signal_for_room(ticket.room_id)
+        if signal is None and market_ticker is not None:
+            signal = await self.get_latest_signal_for_market(
+                market_ticker,
+                kalshi_env=kalshi_env,
+                before=before,
+                max_age_seconds=30 * 60,
             )
-        ).scalar_one_or_none()
-        if ticket is None:
-            return context
-        signal = await self.get_latest_signal_for_room(ticket.room_id)
-        if signal is None:
-            return context
-        context["decision_edge_bps"] = signal.edge_bps
-        context["decision_confidence"] = signal.confidence
-        context["decision_fair_yes"] = signal.fair_yes_dollars
-        context["decision_ts"] = signal.created_at
-        payload = signal.payload if isinstance(signal.payload, dict) else {}
-        spread = payload.get("spread_bps")
-        if spread not in (None, ""):
-            try:
-                context["decision_spread_bps"] = int(spread)
-            except (TypeError, ValueError):
-                context["decision_spread_bps"] = None
+            if signal is not None and lineage_source == "unresolved":
+                lineage_source = "latest_market_signal_fallback"
+        if signal is not None:
+            signal_context = self._decision_context_from_signal(signal, decision_price=context.get("decision_price"))
+            for key, value in signal_context.items():
+                if context.get(key) in (None, "") and value not in (None, ""):
+                    context[key] = value
+            if lineage_source == "unresolved":
+                lineage_source = "ticket_signal"
+        context["_decision_lineage"] = self._lineage_from_context(
+            context,
+            source=lineage_source,
+            order=order,
+            signal=signal,
+        )
         return context
 
     async def upsert_fill(
@@ -3021,9 +3240,16 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             action=action,
         )
         economic_side = resolved_side or side
-        decision_context = await self._resolve_fill_decision_context(order_id=resolved_order_id)
+        fill_observed_at = datetime.now(UTC)
+        decision_context = await self._resolve_fill_decision_context(
+            order_id=resolved_order_id,
+            market_ticker=market_ticker,
+            kalshi_env=env,
+            before=fill_observed_at,
+        )
+        decision_lineage = decision_context.pop("_decision_lineage", {})
+        raw_with_lineage = self._raw_with_decision_lineage(raw, decision_lineage)
         if trade_id is not None:
-            observed_at = datetime.now(UTC)
             insert_values = {
                 "id": str(uuid4()),
                 "order_id": resolved_order_id,
@@ -3035,10 +3261,10 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 "yes_price_dollars": yes_price_dollars,
                 "count_fp": count_fp,
                 "strategy_code": resolved_strategy,
-                "raw": raw,
+                "raw": raw_with_lineage,
                 "is_taker": is_taker,
-                "created_at": observed_at,
-                "updated_at": observed_at,
+                "created_at": fill_observed_at,
+                "updated_at": fill_observed_at,
                 **decision_context,
             }
             dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
@@ -3063,7 +3289,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                             "strategy_code": func.coalesce(excluded.strategy_code, FillRecord.strategy_code),
                             "raw": excluded.raw,
                             "is_taker": excluded.is_taker,
-                            "updated_at": observed_at,
+                            "updated_at": fill_observed_at,
                             "decision_edge_bps": func.coalesce(excluded.decision_edge_bps, FillRecord.decision_edge_bps),
                             "decision_confidence": func.coalesce(excluded.decision_confidence, FillRecord.decision_confidence),
                             "decision_spread_bps": func.coalesce(excluded.decision_spread_bps, FillRecord.decision_spread_bps),
@@ -3098,7 +3324,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 yes_price_dollars=yes_price_dollars,
                 count_fp=count_fp,
                 strategy_code=resolved_strategy,
-                raw=raw,
+                raw=raw_with_lineage,
                 is_taker=is_taker,
                 **decision_context,
             )
@@ -3112,7 +3338,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             record.count_fp = count_fp
             if resolved_strategy and not record.strategy_code:
                 record.strategy_code = resolved_strategy
-            record.raw = raw
+            record.raw = raw_with_lineage
             record.is_taker = is_taker
             # Coalesce: only fill in decision_* that are still NULL (don't clobber).
             for field, value in decision_context.items():
@@ -3501,86 +3727,428 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         reference_time = now or datetime.now(UTC)
         cutoff = reference_time - timedelta(hours=24)
         env = self._resolved_kalshi_env(kalshi_env)
-        stmt = select(FillRecord).where(
+        fill_columns = (
+            FillRecord.id,
+            FillRecord.market_ticker,
+            FillRecord.side,
+            FillRecord.action,
+            FillRecord.yes_price_dollars,
+            FillRecord.count_fp,
+            FillRecord.raw,
+            FillRecord.settlement_result,
+            FillRecord.created_at,
+        )
+        stmt = select(*fill_columns).where(
             FillRecord.kalshi_env == env,
             FillRecord.strategy_code == strategy_code,
             FillRecord.created_at >= cutoff,
             FillRecord.created_at <= reference_time,
         )
-        fills = list((await self.session.execute(stmt)).scalars())
+        fills = list((await self.session.execute(stmt)).mappings())
         pnl = Decimal("0")
 
-        sell_fills = [fill for fill in fills if fill.action == "sell"]
-        sell_keys = {(fill.market_ticker, fill.side) for fill in sell_fills}
-        buys_by_key: dict[tuple[str, str], list[FillRecord]] = {key: [] for key in sell_keys}
+        sell_fills = [fill for fill in fills if fill["action"] == "sell"]
+        sell_keys = {(fill["market_ticker"], fill["side"]) for fill in sell_fills}
+        buys_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {key: [] for key in sell_keys}
         if sell_keys:
             latest_sell_time = max(
-                (_fill_created_at(sell, reference_time) for sell in sell_fills),
+                (_as_utc_datetime(sell["created_at"], default=reference_time) for sell in sell_fills),
                 default=reference_time,
             )
-            buy_stmt = select(FillRecord).where(
+            buy_stmt = select(*fill_columns).where(
                 FillRecord.kalshi_env == env,
                 FillRecord.strategy_code == strategy_code,
                 FillRecord.action == "buy",
                 FillRecord.created_at <= latest_sell_time,
             )
-            for buy in (await self.session.execute(buy_stmt)).scalars():
-                key = (buy.market_ticker, buy.side)
+            for buy in (await self.session.execute(buy_stmt)).mappings():
+                key = (buy["market_ticker"], buy["side"])
                 if key in buys_by_key:
-                    buys_by_key[key].append(buy)
+                    buys_by_key[key].append(dict(buy))
             for buys in buys_by_key.values():
-                buys.sort(key=lambda fill: (_fill_created_at(fill), fill.id))
+                buys.sort(
+                    key=lambda fill: (
+                        _as_utc_datetime(fill["created_at"]),
+                        str(fill["id"]),
+                    )
+                )
 
         buy_remaining: dict[str, Decimal] = {
-            buy.id: as_decimal(buy.count_fp)
+            str(buy["id"]): as_decimal(buy["count_fp"])
             for buys in buys_by_key.values()
             for buy in buys
         }
         matched_buy_counts: dict[str, Decimal] = {}
-        for sell in sorted(sell_fills, key=lambda fill: (_fill_created_at(fill), fill.id)):
-            sell_remaining = as_decimal(sell.count_fp)
+        for sell in sorted(
+            sell_fills,
+            key=lambda fill: (
+                _as_utc_datetime(fill["created_at"]),
+                str(fill["id"]),
+            ),
+        ):
+            sell_remaining = as_decimal(sell["count_fp"])
             if sell_remaining <= Decimal("0"):
                 continue
-            sell_contract_price = _contract_price_from_yes_price(sell.side, sell.yes_price_dollars)
-            for buy in buys_by_key.get((sell.market_ticker, sell.side), []):
+            sell_contract_price = _contract_price_from_yes_price(
+                sell["side"],
+                as_decimal(sell["yes_price_dollars"]),
+            )
+            for buy in buys_by_key.get((sell["market_ticker"], sell["side"]), []):
                 if (
-                    buy.created_at is not None
-                    and sell.created_at is not None
-                    and _fill_created_at(buy) > _fill_created_at(sell)
+                    buy["created_at"] is not None
+                    and sell["created_at"] is not None
+                    and _as_utc_datetime(buy["created_at"]) > _as_utc_datetime(sell["created_at"])
                 ):
                     continue
-                available = buy_remaining.get(buy.id, Decimal("0"))
+                buy_id = str(buy["id"])
+                available = buy_remaining.get(buy_id, Decimal("0"))
                 if available <= Decimal("0"):
                     continue
                 matched = min(available, sell_remaining)
-                buy_contract_price = _contract_price_from_yes_price(buy.side, buy.yes_price_dollars)
+                buy_contract_price = _contract_price_from_yes_price(
+                    buy["side"],
+                    as_decimal(buy["yes_price_dollars"]),
+                )
                 pnl += sell_contract_price * matched
                 pnl -= buy_contract_price * matched
-                pnl -= _fill_fee_for_count(buy, matched)
-                pnl -= _fill_fee_for_count(sell, matched)
-                buy_remaining[buy.id] = available - matched
-                matched_buy_counts[buy.id] = matched_buy_counts.get(buy.id, Decimal("0")) + matched
+                pnl -= _fill_fee_for_count_from_raw(buy["raw"], buy["count_fp"], matched)
+                pnl -= _fill_fee_for_count_from_raw(sell["raw"], sell["count_fp"], matched)
+                buy_remaining[buy_id] = available - matched
+                matched_buy_counts[buy_id] = matched_buy_counts.get(buy_id, Decimal("0")) + matched
                 sell_remaining -= matched
                 if sell_remaining <= Decimal("0"):
                     break
             if sell_remaining > Decimal("0"):
-                pnl -= _fill_fee_for_count(sell, sell_remaining)
+                pnl -= _fill_fee_for_count_from_raw(sell["raw"], sell["count_fp"], sell_remaining)
 
         for buy in fills:
-            if buy.action != "buy" or buy.settlement_result not in {"win", "loss"}:
+            if buy["action"] != "buy" or buy["settlement_result"] not in {"win", "loss"}:
                 continue
-            remaining_count = as_decimal(buy.count_fp) - matched_buy_counts.get(buy.id, Decimal("0"))
+            remaining_count = as_decimal(buy["count_fp"]) - matched_buy_counts.get(str(buy["id"]), Decimal("0"))
             if remaining_count <= Decimal("0"):
                 continue
-            contract_price = _contract_price_from_yes_price(buy.side, buy.yes_price_dollars)
+            contract_price = _contract_price_from_yes_price(
+                buy["side"],
+                as_decimal(buy["yes_price_dollars"]),
+            )
             cost_total = contract_price * remaining_count
-            buy_fee = _fill_fee_for_count(buy, remaining_count)
-            if buy.settlement_result == "win":
+            buy_fee = _fill_fee_for_count_from_raw(buy["raw"], buy["count_fp"], remaining_count)
+            if buy["settlement_result"] == "win":
                 pnl += remaining_count - cost_total - buy_fee
-            elif buy.settlement_result == "loss":
+            elif buy["settlement_result"] == "loss":
                 pnl -= cost_total + buy_fee
 
         return pnl.quantize(Decimal("0.01"))
+
+    async def get_daily_realized_pnl_dollars_by_strategy_asset(
+        self,
+        *,
+        strategy_code: str,
+        asset_symbol: str,
+        kalshi_env: str | None = None,
+        now: datetime | None = None,
+    ) -> Decimal:
+        reference_time = now or datetime.now(UTC)
+        cutoff = reference_time - timedelta(hours=24)
+        env = self._resolved_kalshi_env(kalshi_env)
+        asset = str(asset_symbol or "").upper()
+        stmt = select(
+            FillRecord.market_ticker,
+            FillRecord.side,
+            FillRecord.action,
+            FillRecord.yes_price_dollars,
+            FillRecord.count_fp,
+            FillRecord.raw,
+            FillRecord.settlement_result,
+        ).where(
+            FillRecord.kalshi_env == env,
+            FillRecord.strategy_code == strategy_code,
+            FillRecord.action == "buy",
+            FillRecord.settlement_result.in_(["win", "loss"]),
+            FillRecord.created_at >= cutoff,
+            FillRecord.created_at <= reference_time,
+            FillRecord.market_ticker.like(f"KX{asset}%"),
+        )
+        pnl = Decimal("0")
+        for fill in (await self.session.execute(stmt)).mappings():
+            fill_asset, _frequency = _crypto_market_identity(fill["market_ticker"])
+            if fill_asset != asset:
+                continue
+            fill_pnl = _settled_buy_fill_pnl_from_values(
+                side=fill["side"],
+                action=fill["action"],
+                yes_price_dollars=fill["yes_price_dollars"],
+                count_fp=fill["count_fp"],
+                settlement_result=fill["settlement_result"],
+                raw=fill["raw"],
+            )
+            if fill_pnl is not None:
+                pnl += fill_pnl
+        return pnl.quantize(Decimal("0.01"))
+
+    async def get_crypto_live_pnl_cell_stats(
+        self,
+        *,
+        kalshi_env: str | None,
+        strategy_code: str,
+        asset_symbol: str,
+        frequency: str,
+        side: str,
+        contract_price_dollars: Decimal,
+        liquidity: str,
+        lookback_days: int,
+    ) -> dict[str, Any]:
+        env = self._resolved_kalshi_env(kalshi_env)
+        asset = str(asset_symbol or "").upper()
+        normalized_frequency = "1h" if str(frequency).lower() in {"1h", "1hr", "hour"} else "15m"
+        target_bucket = _crypto_price_band(_quantize_money(contract_price_dollars))
+        cutoff = datetime.now(UTC) - timedelta(days=max(1, int(lookback_days)))
+        stmt = select(
+            FillRecord.market_ticker,
+            FillRecord.side,
+            FillRecord.action,
+            FillRecord.yes_price_dollars,
+            FillRecord.count_fp,
+            FillRecord.raw,
+            FillRecord.settlement_result,
+            FillRecord.created_at,
+            FillRecord.is_taker,
+        ).where(
+            FillRecord.kalshi_env == env,
+            FillRecord.strategy_code == strategy_code,
+            FillRecord.action == "buy",
+            FillRecord.side == side,
+            FillRecord.settlement_result.in_(["win", "loss"]),
+            FillRecord.created_at >= cutoff,
+            FillRecord.market_ticker.like(f"KX{asset}%"),
+        )
+        normalized_liquidity = str(liquidity or "any").strip().lower()
+        if normalized_liquidity == "maker":
+            stmt = stmt.where(FillRecord.is_taker.is_(False))
+        elif normalized_liquidity == "taker":
+            stmt = stmt.where(FillRecord.is_taker.is_(True))
+        fills = list((await self.session.execute(stmt)).mappings())
+        pnl = Decimal("0")
+        fees = Decimal("0")
+        contracts = Decimal("0")
+        fill_count = 0
+        wins = 0
+        losses = 0
+        latest_fill_at: datetime | None = None
+        for fill in fills:
+            fill_asset, fill_frequency = _crypto_market_identity(fill["market_ticker"])
+            if fill_asset != asset or fill_frequency != normalized_frequency:
+                continue
+            contract_price = _contract_price_from_yes_price(
+                fill["side"],
+                as_decimal(fill["yes_price_dollars"]),
+            )
+            if _crypto_price_band(contract_price) != target_bucket:
+                continue
+            fill_pnl = _settled_buy_fill_pnl_from_values(
+                side=fill["side"],
+                action=fill["action"],
+                yes_price_dollars=fill["yes_price_dollars"],
+                count_fp=fill["count_fp"],
+                settlement_result=fill["settlement_result"],
+                raw=fill["raw"],
+            )
+            if fill_pnl is None:
+                continue
+            fill_count += 1
+            contracts += as_decimal(fill["count_fp"])
+            fees += _fill_fee_dollars_from_raw(fill["raw"])
+            pnl += fill_pnl
+            if fill["settlement_result"] == "win":
+                wins += 1
+            else:
+                losses += 1
+            if fill["created_at"] is not None:
+                created_at = _as_utc_datetime(fill["created_at"])
+                latest_fill_at = max(latest_fill_at or created_at, created_at)
+        pnl_per_contract = pnl / contracts if contracts > Decimal("0") else Decimal("0")
+        return {
+            "kalshi_env": env,
+            "strategy_code": strategy_code,
+            "asset_symbol": asset,
+            "frequency": normalized_frequency,
+            "side": side,
+            "liquidity": normalized_liquidity,
+            "price_bucket": target_bucket,
+            "lookback_days": int(lookback_days),
+            "fill_count": fill_count,
+            "contracts": str(contracts.quantize(Decimal("0.01"))),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / fill_count) if fill_count else None,
+            "net_pnl_dollars": str(pnl.quantize(Decimal("0.0001"))),
+            "fees_dollars": str(fees.quantize(Decimal("0.0001"))),
+            "pnl_per_contract_dollars": str(pnl_per_contract.quantize(Decimal("0.0001"))),
+            "latest_fill_at": latest_fill_at.isoformat() if latest_fill_at is not None else None,
+        }
+
+    async def build_crypto_pnl_attribution_report(
+        self,
+        *,
+        kalshi_env: str | None,
+        days: int,
+        frequency: str | None = None,
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        env = self._resolved_kalshi_env(kalshi_env)
+        cutoff = datetime.now(UTC) - timedelta(days=max(1, int(days)))
+        assets = {str(asset).upper() for asset in (asset_symbols or []) if str(asset or "").strip()}
+        normalized_frequency = None
+        if frequency:
+            normalized_frequency = "1h" if str(frequency).lower() in {"1h", "1hr", "hour"} else "15m"
+        stmt = select(
+            FillRecord.market_ticker,
+            FillRecord.side,
+            FillRecord.action,
+            FillRecord.yes_price_dollars,
+            FillRecord.count_fp,
+            FillRecord.raw,
+            FillRecord.settlement_result,
+            FillRecord.is_taker,
+        ).where(
+            FillRecord.kalshi_env == env,
+            FillRecord.action == "buy",
+            FillRecord.settlement_result.in_(["win", "loss"]),
+            FillRecord.created_at >= cutoff,
+        )
+        if normalized_frequency == "15m":
+            stmt = stmt.where(FillRecord.strategy_code == "CRYPTO_15M")
+        elif normalized_frequency == "1h":
+            stmt = stmt.where(FillRecord.strategy_code == "CRYPTO_1H")
+        else:
+            stmt = stmt.where(FillRecord.strategy_code.in_(["CRYPTO_15M", "CRYPTO_1H"]))
+        totals = {
+            "fills": 0,
+            "contracts": Decimal("0"),
+            "net_pnl": Decimal("0"),
+            "fees": Decimal("0"),
+            "missing_decision_lineage": 0,
+        }
+        by_cell: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+        by_market: dict[str, dict[str, Any]] = {}
+
+        def add_row(bucket: dict[str, Any], fill: dict[str, Any], pnl: Decimal) -> None:
+            bucket["fills"] += 1
+            bucket["contracts"] += as_decimal(fill["count_fp"])
+            bucket["net_pnl"] += pnl
+            bucket["fees"] += _fill_fee_dollars_from_raw(fill["raw"])
+            if fill["settlement_result"] == "win":
+                bucket["wins"] += 1
+            else:
+                bucket["losses"] += 1
+
+        for row in (await self.session.execute(stmt)).mappings():
+            fill = dict(row)
+            asset, fill_frequency = _crypto_market_identity(fill["market_ticker"])
+            if asset is None or fill_frequency is None:
+                continue
+            if assets and asset not in assets:
+                continue
+            if normalized_frequency and fill_frequency != normalized_frequency:
+                continue
+            pnl = _settled_buy_fill_pnl_from_values(
+                side=fill["side"],
+                action=fill["action"],
+                yes_price_dollars=fill["yes_price_dollars"],
+                count_fp=fill["count_fp"],
+                settlement_result=fill["settlement_result"],
+                raw=fill["raw"],
+            )
+            if pnl is None:
+                continue
+            side_price = _contract_price_from_yes_price(fill["side"], as_decimal(fill["yes_price_dollars"]))
+            liquidity = "taker" if fill["is_taker"] else "maker"
+            price_bucket = _crypto_price_band(side_price)
+            side = str(fill["side"] or "").lower()
+            key = (asset, fill_frequency, side, liquidity, price_bucket)
+            cell = by_cell.setdefault(
+                key,
+                {
+                    "asset_symbol": asset,
+                    "frequency": fill_frequency,
+                    "side": side,
+                    "liquidity": liquidity,
+                    "price_bucket": price_bucket,
+                    "fills": 0,
+                    "contracts": Decimal("0"),
+                    "net_pnl": Decimal("0"),
+                    "fees": Decimal("0"),
+                    "wins": 0,
+                    "losses": 0,
+                },
+            )
+            market = by_market.setdefault(
+                fill["market_ticker"],
+                {
+                    "market_ticker": fill["market_ticker"],
+                    "asset_symbol": asset,
+                    "frequency": fill_frequency,
+                    "fills": 0,
+                    "contracts": Decimal("0"),
+                    "net_pnl": Decimal("0"),
+                    "fees": Decimal("0"),
+                    "wins": 0,
+                    "losses": 0,
+                },
+            )
+            add_row(cell, fill, pnl)
+            add_row(market, fill, pnl)
+            totals["fills"] += 1
+            totals["contracts"] += as_decimal(fill["count_fp"])
+            totals["net_pnl"] += pnl
+            totals["fees"] += _fill_fee_dollars_from_raw(fill["raw"])
+            if not _raw_has_decision_lineage(fill["raw"]):
+                totals["missing_decision_lineage"] += 1
+
+        def finalize(row: dict[str, Any]) -> dict[str, Any]:
+            contracts = row["contracts"]
+            fills = int(row["fills"])
+            win_rate = (row["wins"] / fills) if fills else None
+            pnl_per_contract = row["net_pnl"] / contracts if contracts > Decimal("0") else Decimal("0")
+            return {
+                **{key: value for key, value in row.items() if key not in {"contracts", "net_pnl", "fees"}},
+                "contracts": str(contracts.quantize(Decimal("0.01"))),
+                "net_pnl_dollars": str(row["net_pnl"].quantize(Decimal("0.0001"))),
+                "fees_dollars": str(row["fees"].quantize(Decimal("0.0001"))),
+                "pnl_per_contract_dollars": str(pnl_per_contract.quantize(Decimal("0.0001"))),
+                "win_rate": win_rate,
+            }
+
+        cells = [finalize(row) for row in by_cell.values()]
+        cells.sort(key=lambda item: Decimal(str(item["net_pnl_dollars"])))
+        worst_markets = [finalize(row) for row in by_market.values()]
+        worst_markets.sort(key=lambda item: Decimal(str(item["net_pnl_dollars"])))
+        return {
+            "schema_version": "crypto-pnl-attribution-v1",
+            "kalshi_env": env,
+            "days": int(days),
+            "frequency": normalized_frequency,
+            "asset_symbols": sorted(assets),
+            "primary_metric": "net_pnl_dollars",
+            "win_rate_role": "diagnostic_only",
+            "totals": {
+                "fills": totals["fills"],
+                "contracts": str(totals["contracts"].quantize(Decimal("0.01"))),
+                "net_pnl_dollars": str(totals["net_pnl"].quantize(Decimal("0.0001"))),
+                "fees_dollars": str(totals["fees"].quantize(Decimal("0.0001"))),
+                "pnl_per_contract_dollars": str(
+                    (
+                        totals["net_pnl"] / totals["contracts"]
+                        if totals["contracts"] > Decimal("0")
+                        else Decimal("0")
+                    ).quantize(Decimal("0.0001"))
+                ),
+                "missing_decision_lineage": totals["missing_decision_lineage"],
+            },
+            "cells": cells,
+            "worst_cells": cells[:20],
+            "worst_markets": worst_markets[:20],
+        }
 
     async def get_broken_book_rate_30d(self, *, kalshi_env: str | None = None) -> dict[str, Any]:
         cutoff = datetime.now(UTC) - timedelta(days=30)

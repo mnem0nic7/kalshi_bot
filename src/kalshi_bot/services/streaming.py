@@ -36,6 +36,15 @@ def _is_transient_websocket_keepalive_disconnect(error_type: str, message: str) 
     return "keepalive ping timeout" in text and ("no close frame" in text or "1011" in text)
 
 
+def _crypto_strategy_code_for_ticker(market_ticker: str | None) -> str | None:
+    ticker = str(market_ticker or "").upper()
+    if ticker.startswith("KX") and "15M-" in ticker:
+        return "CRYPTO_15M"
+    if ticker.startswith("KX") and "1H-" in ticker:
+        return "CRYPTO_1H"
+    return None
+
+
 class SequenceGapError(RuntimeError):
     pass
 
@@ -350,6 +359,7 @@ class MarketStreamService:
             raw=msg,
             kalshi_order_id=msg.get("order_id"),
             kalshi_env=self.settings.kalshi_env,
+            strategy_code=_crypto_strategy_code_for_ticker(msg.get("ticker") or msg.get("market_ticker")),
         )
 
     async def _handle_fill(self, repo: PlatformRepository, message: dict[str, Any]) -> None:
@@ -372,6 +382,11 @@ class MarketStreamService:
             trade_id=msg.get("trade_id"),
             is_taker=bool(msg.get("is_taker", True)),
             kalshi_env=self.settings.kalshi_env,
+            strategy_code=(
+                _crypto_strategy_code_for_ticker(msg.get("market_ticker") or msg.get("ticker"))
+                if str(msg.get("action") or "buy") == "buy"
+                else None
+            ),
         )
 
     async def _persist_market_state(

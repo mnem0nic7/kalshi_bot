@@ -228,6 +228,15 @@ class Settings(BaseSettings):
     crypto_dynamic_order_max_position_pct: float = 0.15
     crypto_dynamic_order_pnl_scale_per_candidate_dollars: float = 0.20
     crypto_pnl_sizing_auto_enabled: bool = True
+    crypto_max_entry_loss_dollars: float = 20.0
+    crypto_asset_daily_loss_limit_dollars: float = 20.0
+    crypto_live_pnl_gate_enabled: bool = True
+    crypto_live_pnl_gate_mode: str = "block"
+    crypto_live_pnl_gate_lookback_days: int = 14
+    crypto_live_pnl_gate_min_fills: int = 5
+    crypto_live_pnl_gate_min_contracts: float = 20.0
+    crypto_live_pnl_gate_min_net_pnl_dollars: float = 0.0
+    crypto_live_pnl_gate_min_pnl_per_contract_dollars: float = 0.0
     crypto_entry_policy_optimizer_auto_enabled: bool = True
     crypto_entry_policy_optimizer_days: int = 30
     crypto_portfolio_max_allocation_pct: float = 1.0

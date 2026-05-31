@@ -50,6 +50,8 @@ from kalshi_bot.crypto.services import (
     _crypto_last_minute_passive_price_ladder,
     _crypto_last_minute_passive_price_matrix,
     _crypto_lightweight_settled_data_quality,
+    _crypto_live_pnl_gate_blocks,
+    _crypto_live_pnl_gate_payload,
     _eligible_market_per_asset,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
@@ -6236,6 +6238,64 @@ def test_crypto_signal_stand_down_payload_names_no_ticket_reason() -> None:
         "No crypto trade ticket created: predicted_winner_blocked "
         "(fee_adjusted_edge_below_live_min)."
     )
+
+
+def test_crypto_live_pnl_gate_blocks_negative_evidence_cell(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_live_pnl_gate_enabled=True,
+        crypto_live_pnl_gate_mode="block",
+        crypto_live_pnl_gate_min_fills=5,
+        crypto_live_pnl_gate_min_contracts=20,
+        crypto_live_pnl_gate_min_net_pnl_dollars=0.0,
+    )
+    payload = _crypto_live_pnl_gate_payload(
+        {
+            "asset_symbol": "HYPE",
+            "frequency": "15m",
+            "side": "yes",
+            "liquidity": "taker",
+            "price_bucket": "0.75-1.00",
+            "fill_count": 5,
+            "contracts": "20.00",
+            "net_pnl_dollars": "-10.0000",
+            "pnl_per_contract_dollars": "-0.5000",
+        },
+        settings=settings,
+        contract_price_dollars=Decimal("0.9300"),
+    )
+
+    assert payload["status"] == "blocked"
+    assert _crypto_live_pnl_gate_blocks(payload, settings=settings)
+    assert "Live P&L cell net P/L" in payload["blockers"][0]
+
+
+def test_crypto_live_pnl_gate_allows_under_sampled_cell(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_live_pnl_gate_enabled=True,
+        crypto_live_pnl_gate_mode="block",
+        crypto_live_pnl_gate_min_fills=5,
+        crypto_live_pnl_gate_min_contracts=20,
+    )
+    payload = _crypto_live_pnl_gate_payload(
+        {
+            "asset_symbol": "SOL",
+            "frequency": "15m",
+            "side": "yes",
+            "liquidity": "maker",
+            "price_bucket": "0.50-0.75",
+            "fill_count": 2,
+            "contracts": "5.00",
+            "net_pnl_dollars": "-2.0000",
+            "pnl_per_contract_dollars": "-0.4000",
+        },
+        settings=settings,
+        contract_price_dollars=Decimal("0.6300"),
+    )
+
+    assert payload["status"] == "insufficient_evidence"
+    assert not _crypto_live_pnl_gate_blocks(payload, settings=settings)
 
 
 @pytest.mark.asyncio
