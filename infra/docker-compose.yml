@@ -7,6 +7,9 @@ x-build: &build
 x-cpu-limits: &cpu-limits
   cpuset: "0-15"
 
+x-gpu-access: &gpu-access
+  gpus: ${KALSHI_BOT_GPUS:-all}
+
 x-common-env-base: &common-env-base
   APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
   APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
@@ -303,35 +306,35 @@ services:
     restart: "no"
 
   app_demo_blue:
-    <<: *demo-app-base
+    <<: [*demo-app-base, *gpu-access]
     environment:
       <<: *demo-env
       KALSHI_ENV: demo
       APP_COLOR: blue
 
   app_demo_green:
-    <<: *demo-app-base
+    <<: [*demo-app-base, *gpu-access]
     environment:
       <<: *demo-env
       KALSHI_ENV: demo
       APP_COLOR: green
 
   app_production_blue:
-    <<: *production-app-base
+    <<: [*production-app-base, *gpu-access]
     environment:
       <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: blue
 
   app_production_green:
-    <<: *production-app-base
+    <<: [*production-app-base, *gpu-access]
     environment:
       <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: green
 
   daemon_demo_blue:
-    <<: *demo-daemon-base
+    <<: [*demo-daemon-base, *gpu-access]
     environment:
       <<: *demo-env
       KALSHI_ENV: demo
@@ -344,7 +347,7 @@ services:
       start_period: 120s
 
   daemon_demo_green:
-    <<: *demo-daemon-base
+    <<: [*demo-daemon-base, *gpu-access]
     environment:
       <<: *demo-env
       KALSHI_ENV: demo
@@ -357,7 +360,7 @@ services:
       start_period: 120s
 
   daemon_production_blue:
-    <<: *production-daemon-base
+    <<: [*production-daemon-base, *gpu-access]
     environment:
       <<: *production-env
       KALSHI_ENV: production
@@ -372,7 +375,7 @@ services:
       start_period: 120s
 
   daemon_production_green:
-    <<: *production-daemon-base
+    <<: [*production-daemon-base, *gpu-access]
     environment:
       <<: *production-env
       KALSHI_ENV: production
@@ -387,7 +390,7 @@ services:
       start_period: 120s
 
   daemon_production_crypto_1h_blue:
-    <<: *production-daemon-base
+    <<: [*production-daemon-base, *gpu-access]
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
@@ -410,7 +413,7 @@ services:
       start_period: 120s
 
   daemon_production_crypto_1h_green:
-    <<: *production-daemon-base
+    <<: [*production-daemon-base, *gpu-access]
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
