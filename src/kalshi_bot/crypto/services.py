@@ -2469,8 +2469,13 @@ class CryptoTrainingBackfillService:
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
         spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
 
-        # COMPUTE PHASE — pure in-memory; no DB connection held.
-        decision_rows = _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings)
+        # COMPUTE PHASE — pure in-memory; no DB connection held. Run in a thread
+        # so the asyncio event loop is not blocked during the multi-hour CPU pass.
+        loop = asyncio.get_event_loop()
+        decision_rows = await loop.run_in_executor(
+            None,
+            lambda: _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings),
+        )
 
         # WRITE PHASE — fresh session after compute so there is no stale connection.
         async with self.session_factory() as session:
