@@ -884,7 +884,7 @@ def _evaluate_replay(
         "status": "ok" if trades else "warn",
         "metrics": metrics,
         "bucket_matrix": bucket_matrix,
-        "trades": trades[:100],
+        "trade_sample": trades[:100],
     }
 
 
@@ -1193,9 +1193,9 @@ class CryptoNonModelTouch20Service:
             "metrics": metrics,
             "requirements": _gate_requirements(self.settings),
             "gate_reasons": reasons,
-            "trade_sample": replay["trades"][:100],
-            "trade_sample_count": min(100, len(replay["trades"])),
-            "trade_count": len(replay["trades"]),
+            "trade_sample": replay["trade_sample"],
+            "trade_sample_count": len(replay["trade_sample"]),
+            "trade_count": int(metrics.get("trade_candidate_count") or 0),
         }
         if persist:
             async with self.session_factory() as session:
