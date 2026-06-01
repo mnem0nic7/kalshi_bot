@@ -296,6 +296,35 @@ def _crypto_artifact_type(base: str, asset_symbols: list[str] | None = None) -> 
     return base
 
 
+def _crypto_replay_gate_note_updates(
+    *,
+    frequency: str,
+    asset_symbols: list[str] | None,
+    status: str,
+    version: str,
+    reasons: list[str],
+    updated_at: datetime,
+) -> dict[str, dict[str, Any]]:
+    freq = normalize_frequency(frequency) or str(frequency or "15m").strip().lower() or "15m"
+    symbols = normalize_asset_symbols(asset_symbols)
+    note = {
+        "status": status,
+        "version": version,
+        "updated_at": updated_at.isoformat(),
+        "reasons": list(reasons),
+        "frequency": freq,
+        "asset_symbols": symbols,
+    }
+    updates: dict[str, dict[str, Any]] = {f"crypto_replay_gate:{freq}": dict(note)}
+    if symbols:
+        updates[f"crypto_replay_gate:{freq}:{','.join(symbols)}"] = dict(note)
+    if freq == "15m":
+        updates["crypto_replay_gate"] = dict(note)
+        if symbols:
+            updates[f"crypto_replay_gate:{','.join(symbols)}"] = dict(note)
+    return updates
+
+
 async def _latest_crypto_artifact_for_asset(
     repo: PlatformRepository,
     *,
@@ -3614,19 +3643,16 @@ class CryptoReplayService:
             )
             control = await repo.ensure_deployment_control(self.settings.app_color)
             notes = dict(control.notes or {})
-            notes["crypto_replay_gate"] = {
-                "status": artifact.status,
-                "version": artifact.version,
-                "updated_at": datetime.now(UTC).isoformat(),
-                "reasons": gate["reasons"],
-            }
-            if requested_assets:
-                notes[f"crypto_replay_gate:{','.join(requested_assets)}"] = {
-                    "status": artifact.status,
-                    "version": artifact.version,
-                    "updated_at": datetime.now(UTC).isoformat(),
-                    "reasons": gate["reasons"],
-                }
+            notes.update(
+                _crypto_replay_gate_note_updates(
+                    frequency=freq,
+                    asset_symbols=requested_assets,
+                    status=artifact.status,
+                    version=artifact.version,
+                    updated_at=datetime.now(UTC),
+                    reasons=list(gate["reasons"]),
+                )
+            )
             control.notes = notes
             await session.commit()
         return {

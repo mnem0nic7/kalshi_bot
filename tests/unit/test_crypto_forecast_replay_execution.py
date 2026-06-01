@@ -56,6 +56,7 @@ from kalshi_bot.crypto.services import (
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
     _crypto_recommendation,
+    _crypto_replay_gate_note_updates,
     _crypto_replay_gate_dashboard_summary,
     _crypto_raw_feature_vector,
     _crypto_select_champion,
@@ -205,6 +206,49 @@ def _sizing_ticket(**overrides) -> TradeTicket:
     }
     values.update(overrides)
     return TradeTicket(**values)
+
+
+def test_crypto_replay_gate_notes_are_frequency_scoped() -> None:
+    updated_at = datetime(2026, 6, 1, tzinfo=UTC)
+
+    hourly = _crypto_replay_gate_note_updates(
+        frequency="1h",
+        asset_symbols=["BTC"],
+        status="passed",
+        version="crypto-1h-gate-test",
+        reasons=[],
+        updated_at=updated_at,
+    )
+    fifteen = _crypto_replay_gate_note_updates(
+        frequency="15m",
+        asset_symbols=["BTC"],
+        status="blocked",
+        version="crypto-15m-gate-test",
+        reasons=["support below floor"],
+        updated_at=updated_at,
+    )
+
+    assert hourly == {
+        "crypto_replay_gate:1h": {
+            "status": "passed",
+            "version": "crypto-1h-gate-test",
+            "updated_at": "2026-06-01T00:00:00+00:00",
+            "reasons": [],
+            "frequency": "1h",
+            "asset_symbols": ["BTC"],
+        },
+        "crypto_replay_gate:1h:BTC": {
+            "status": "passed",
+            "version": "crypto-1h-gate-test",
+            "updated_at": "2026-06-01T00:00:00+00:00",
+            "reasons": [],
+            "frequency": "1h",
+            "asset_symbols": ["BTC"],
+        },
+    }
+    assert fifteen["crypto_replay_gate:15m:BTC"]["status"] == "blocked"
+    assert fifteen["crypto_replay_gate:BTC"]["frequency"] == "15m"
+    assert fifteen["crypto_replay_gate"]["version"] == "crypto-15m-gate-test"
 
 
 def test_crypto_asset_control_blocks_disabled_hourly_frequency(tmp_path) -> None:
