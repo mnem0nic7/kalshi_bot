@@ -6,6 +6,7 @@ import logging
 import math
 from bisect import bisect_right
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
@@ -31,6 +32,31 @@ BTC15M_TOUCH20_RULES_GATE_ARTIFACT = "btc15m_touch20_rules_gate"
 BTC15M_TOUCH20_RULES_FREQ = "15m"
 BTC15M_TOUCH20_RULES_ASSET = "BTC"
 BTC15M_TOUCH20_RULES_INTERVAL_SECONDS = 900
+TOUCH20_RULES_SUPPORTED_ASSETS = frozenset({"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"})
+
+
+@dataclass(frozen=True)
+class Touch20AssetSettings:
+    rules_enabled: bool
+    trading_enabled: bool
+    take_profit_pct: Decimal
+    stop_loss_pct: Decimal
+    min_market_age_seconds: int
+    min_seconds_to_close: int
+    replay_min_candidates: int
+    replay_min_touch_rate: Decimal
+    replay_min_net_pnl_dollars: Decimal
+    replay_min_pnl_per_candidate_dollars: Decimal
+    replay_max_hard_cap_breaches: int
+    max_open_notional_dollars: Decimal
+    daily_loss_limit_dollars: Decimal
+    profit_protection_threshold_pct: Decimal
+    profit_protection_floor_pct: Decimal
+    loop_interval_seconds: int
+    min_contract_price_dollars: Decimal
+    min_rule_score: Decimal
+    quote_fresh_seconds: int
+    spot_fresh_seconds: int
 
 
 def _version(prefix: str, payload: dict[str, Any]) -> str:
@@ -42,6 +68,96 @@ def _normalize_asset_symbol(asset_symbol: str | None) -> str:
     return "".join(ch for ch in str(asset_symbol or "").strip().upper() if ch.isalnum())
 
 
+def _configured_assets(settings: Settings) -> list[str]:
+    raw = str(getattr(settings, "crypto_15m_touch20_rules_assets", "") or "").replace(";", ",")
+    assets = [_normalize_asset_symbol(item) for item in raw.split(",") if _normalize_asset_symbol(item)]
+    return assets or [BTC15M_TOUCH20_RULES_ASSET]
+
+
+def _strategy_code(asset_symbol: str | None) -> str:
+    asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
+    if asset == BTC15M_TOUCH20_RULES_ASSET:
+        return BTC15M_TOUCH20_RULES_STRATEGY
+    return f"{asset.lower()}15m_touch20_rules"
+
+
+def _order_prefix(asset_symbol: str | None) -> str:
+    asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
+    if asset == BTC15M_TOUCH20_RULES_ASSET:
+        return BTC15M_TOUCH20_RULES_ORDER_PREFIX
+    return f"{asset.lower()}15t20r"
+
+
+def _artifact_base(kind: str, asset_symbol: str | None) -> str:
+    asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
+    if asset == BTC15M_TOUCH20_RULES_ASSET:
+        return BTC15M_TOUCH20_RULES_GATE_ARTIFACT if kind == "gate" else BTC15M_TOUCH20_RULES_BACKTEST_ARTIFACT
+    return f"{_strategy_code(asset)}_{kind}"
+
+
+def _asset_overrides(settings: Settings, asset_symbol: str | None) -> dict[str, Any]:
+    raw = getattr(settings, "crypto_15m_touch20_asset_settings", {}) or {}
+    if not isinstance(raw, dict):
+        return {}
+    asset = _normalize_asset_symbol(asset_symbol)
+    for key, value in raw.items():
+        if _normalize_asset_symbol(str(key)) == asset and isinstance(value, dict):
+            return dict(value)
+    return {}
+
+
+def _bool_override(overrides: dict[str, Any], key: str, default: bool) -> bool:
+    if key not in overrides:
+        return default
+    value = overrides.get(key)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "live", "enabled"}
+
+
+def _decimal_override(overrides: dict[str, Any], key: str, default: Decimal) -> Decimal:
+    return _decimal(overrides.get(key), default) if key in overrides else default
+
+
+def _int_override(overrides: dict[str, Any], key: str, default: int) -> int:
+    if key not in overrides:
+        return default
+    try:
+        return int(float(overrides[key]))
+    except (TypeError, ValueError):
+        return default
+
+
+def _asset_settings(settings: Settings, asset_symbol: str | None) -> Touch20AssetSettings:
+    asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
+    overrides = _asset_overrides(settings, asset)
+    is_btc = asset == BTC15M_TOUCH20_RULES_ASSET
+    enabled_default = bool(settings.crypto_btc15m_touch20_rules_enabled) if is_btc else False
+    trading_default = bool(settings.crypto_btc15m_touch20_rules_trading_enabled) if is_btc else False
+    return Touch20AssetSettings(
+        rules_enabled=_bool_override(overrides, "rules_enabled", enabled_default),
+        trading_enabled=_bool_override(overrides, "trading_enabled", trading_default),
+        take_profit_pct=_decimal_override(overrides, "take_profit_pct", Decimal(str(settings.crypto_btc15m_touch20_take_profit_pct))),
+        stop_loss_pct=_decimal_override(overrides, "stop_loss_pct", Decimal(str(settings.crypto_btc15m_touch20_stop_loss_pct))),
+        min_market_age_seconds=_int_override(overrides, "min_market_age_seconds", int(settings.crypto_btc15m_touch20_min_market_age_seconds)),
+        min_seconds_to_close=_int_override(overrides, "min_seconds_to_close", int(settings.crypto_btc15m_touch20_min_seconds_to_close)),
+        replay_min_candidates=_int_override(overrides, "replay_min_candidates", int(settings.crypto_btc15m_touch20_replay_min_candidates)),
+        replay_min_touch_rate=_decimal_override(overrides, "replay_min_touch_rate", Decimal(str(settings.crypto_btc15m_touch20_replay_min_touch_rate))),
+        replay_min_net_pnl_dollars=_decimal_override(overrides, "replay_min_net_pnl_dollars", Decimal(str(settings.crypto_btc15m_touch20_replay_min_net_pnl_dollars))),
+        replay_min_pnl_per_candidate_dollars=_decimal_override(overrides, "replay_min_pnl_per_candidate_dollars", Decimal(str(settings.crypto_btc15m_touch20_replay_min_pnl_per_candidate_dollars))),
+        replay_max_hard_cap_breaches=_int_override(overrides, "replay_max_hard_cap_breaches", int(settings.crypto_btc15m_touch20_replay_max_hard_cap_breaches)),
+        max_open_notional_dollars=_decimal_override(overrides, "max_open_notional_dollars", Decimal(str(settings.crypto_btc15m_touch20_max_open_notional_dollars))),
+        daily_loss_limit_dollars=_decimal_override(overrides, "daily_loss_limit_dollars", Decimal(str(settings.crypto_btc15m_touch20_daily_loss_limit_dollars))),
+        profit_protection_threshold_pct=_decimal_override(overrides, "profit_protection_threshold_pct", Decimal(str(settings.crypto_btc15m_touch20_profit_protection_threshold_pct))),
+        profit_protection_floor_pct=_decimal_override(overrides, "profit_protection_floor_pct", Decimal(str(settings.crypto_btc15m_touch20_profit_protection_floor_pct))),
+        loop_interval_seconds=_int_override(overrides, "loop_interval_seconds", int(settings.crypto_btc15m_touch20_loop_interval_seconds)),
+        min_contract_price_dollars=_decimal_override(overrides, "min_contract_price_dollars", Decimal(str(settings.crypto_btc15m_touch20_min_contract_price_dollars))),
+        min_rule_score=_decimal_override(overrides, "min_rule_score", Decimal(str(settings.crypto_btc15m_touch20_min_rule_score))),
+        quote_fresh_seconds=_int_override(overrides, "quote_fresh_seconds", int(settings.crypto_btc15m_touch20_quote_fresh_seconds)),
+        spot_fresh_seconds=_int_override(overrides, "spot_fresh_seconds", int(settings.crypto_btc15m_touch20_spot_fresh_seconds)),
+    )
+
+
 def _artifact_type(base: str, *, frequency: str = BTC15M_TOUCH20_RULES_FREQ, asset_symbol: str = BTC15M_TOUCH20_RULES_ASSET) -> str:
     freq = normalize_frequency(frequency) or BTC15M_TOUCH20_RULES_FREQ
     asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
@@ -49,11 +165,13 @@ def _artifact_type(base: str, *, frequency: str = BTC15M_TOUCH20_RULES_FREQ, ass
 
 
 def _approval_stream(kalshi_env: str, asset_symbol: str, frequency: str) -> str:
-    return f"{BTC15M_TOUCH20_RULES_STRATEGY}_approval:{kalshi_env}:{_normalize_asset_symbol(asset_symbol)}:{normalize_frequency(frequency) or frequency}"
+    asset = _normalize_asset_symbol(asset_symbol)
+    return f"{_strategy_code(asset)}_approval:{kalshi_env}:{asset}:{normalize_frequency(frequency) or frequency}"
 
 
 def _ledger_stream(kalshi_env: str, asset_symbol: str, frequency: str) -> str:
-    return f"{BTC15M_TOUCH20_RULES_STRATEGY}:{kalshi_env}:{_normalize_asset_symbol(asset_symbol)}:{normalize_frequency(frequency) or frequency}"
+    asset = _normalize_asset_symbol(asset_symbol)
+    return f"{_strategy_code(asset)}:{kalshi_env}:{asset}:{normalize_frequency(frequency) or frequency}"
 
 
 def _money_text(value: Decimal | None) -> str | None:
@@ -108,7 +226,7 @@ def _ratio(value: float | Decimal | None) -> float | None:
 
 
 def _scope_supported(frequency: str, asset_symbol: str) -> bool:
-    return (normalize_frequency(frequency) or frequency) == BTC15M_TOUCH20_RULES_FREQ and _normalize_asset_symbol(asset_symbol) == BTC15M_TOUCH20_RULES_ASSET
+    return (normalize_frequency(frequency) or frequency) == BTC15M_TOUCH20_RULES_FREQ and _normalize_asset_symbol(asset_symbol) in TOUCH20_RULES_SUPPORTED_ASSETS
 
 
 def _snapshot_decision_time(snapshot: CryptoMarketSnapshotRecord) -> datetime:
@@ -316,11 +434,16 @@ def _spot_time(row: CryptoSpotOHLCRecord) -> datetime | None:
     return _as_utc(row.observed_at or row.end_ts)
 
 
-def _prepare_spot_index(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[str, list[Any]]:
+def _prepare_spot_index(
+    spot_rows: list[CryptoSpotOHLCRecord],
+    *,
+    asset_symbol: str = BTC15M_TOUCH20_RULES_ASSET,
+) -> dict[str, list[Any]]:
+    asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
     entries: list[tuple[datetime, datetime, Decimal, CryptoSpotOHLCRecord]] = []
     for row in spot_rows:
         if (
-            _normalize_asset_symbol(row.asset_symbol) != BTC15M_TOUCH20_RULES_ASSET
+            _normalize_asset_symbol(row.asset_symbol) != asset
             or not _non_proxy_spot(row)
             or row.close_dollars is None
         ):
@@ -421,9 +544,10 @@ def _spot_features(
     decision_ts: datetime,
     freshness_reference: datetime,
     max_age_seconds: int,
+    asset_symbol: str = BTC15M_TOUCH20_RULES_ASSET,
 ) -> dict[str, Any]:
     return _spot_features_from_index(
-        _prepare_spot_index(spot_rows),
+        _prepare_spot_index(spot_rows, asset_symbol=asset_symbol),
         decision_ts=decision_ts,
         freshness_reference=freshness_reference,
         max_age_seconds=max_age_seconds,
@@ -505,9 +629,10 @@ def rules_candidates_for_snapshot(
     allowed_keys = _allowed_bucket_keys(gate_metrics)
     buckets = _bucket_map(gate_metrics)
     fee_rate = Decimal(str(settings.kalshi_taker_fee_rate))
-    target_pct = Decimal(str(settings.crypto_btc15m_touch20_take_profit_pct))
-    min_price = Decimal(str(settings.crypto_btc15m_touch20_min_contract_price_dollars))
-    min_score = Decimal(str(settings.crypto_btc15m_touch20_min_rule_score))
+    cfg = _asset_settings(settings, snapshot.asset_symbol)
+    target_pct = cfg.take_profit_pct
+    min_price = cfg.min_contract_price_dollars
+    min_score = cfg.min_rule_score
     candidates: list[dict[str, Any]] = []
     for side in ("yes", "no"):
         entry = _side_entry_price(snapshot, side)
@@ -530,9 +655,9 @@ def rules_candidates_for_snapshot(
             reason = "missing_real_bid_ask"
         elif market_age is None or time_to_close is None:
             reason = "entry_window_unknown"
-        elif market_age < int(settings.crypto_btc15m_touch20_min_market_age_seconds):
+        elif market_age < cfg.min_market_age_seconds:
             reason = "market_too_early"
-        elif time_to_close < int(settings.crypto_btc15m_touch20_min_seconds_to_close):
+        elif time_to_close < cfg.min_seconds_to_close:
             reason = "market_too_late"
         elif entry < min_price:
             reason = "entry_price_below_min"
@@ -567,7 +692,7 @@ def rules_candidates_for_snapshot(
                     or (
                         {
                             "sample_count": 1,
-                            "touch_rate": max(float(settings.crypto_btc15m_touch20_replay_min_touch_rate), 0.25),
+                            "touch_rate": max(float(cfg.replay_min_touch_rate), 0.25),
                             "net_pnl": "0.0500",
                         }
                         if not require_allowed_bucket
@@ -684,7 +809,7 @@ def _simulate_replay_trade(
     }
 
 
-def _bucket_matrix(trades: list[dict[str, Any]], *, settings: Settings) -> list[dict[str, Any]]:
+def _bucket_matrix(trades: list[dict[str, Any]], *, settings: Settings, asset_symbol: str) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for trade in trades:
         simulation = trade.get("simulation") if isinstance(trade.get("simulation"), dict) else {}
@@ -692,8 +817,10 @@ def _bucket_matrix(trades: list[dict[str, Any]], *, settings: Settings) -> list[
         if key:
             grouped[key].append(trade)
     matrix: list[dict[str, Any]] = []
-    min_touch_rate = Decimal(str(settings.crypto_btc15m_touch20_replay_min_touch_rate))
-    min_pnl_per = Decimal(str(settings.crypto_btc15m_touch20_replay_min_pnl_per_candidate_dollars))
+    asset = _normalize_asset_symbol(asset_symbol)
+    cfg = _asset_settings(settings, asset)
+    min_touch_rate = cfg.replay_min_touch_rate
+    min_pnl_per = cfg.replay_min_pnl_per_candidate_dollars
     for key, rows in grouped.items():
         values = [_decimal((row.get("simulation") or {}).get("net_pnl")) for row in rows]
         touch_count = sum(1 for row in rows if (row.get("simulation") or {}).get("touched") is True)
@@ -707,7 +834,7 @@ def _bucket_matrix(trades: list[dict[str, Any]], *, settings: Settings) -> list[
         matrix.append(
             {
                 "bucket_key": key,
-                "asset_symbol": BTC15M_TOUCH20_RULES_ASSET,
+                "asset_symbol": asset,
                 "side": candidate.get("side"),
                 "sample_count": sample_count,
                 "touch_count": touch_count,
@@ -721,54 +848,59 @@ def _bucket_matrix(trades: list[dict[str, Any]], *, settings: Settings) -> list[
     return matrix
 
 
-def _gate_requirements(settings: Settings) -> dict[str, Any]:
+def _gate_requirements(settings: Settings, *, asset_symbol: str = BTC15M_TOUCH20_RULES_ASSET) -> dict[str, Any]:
+    cfg = _asset_settings(settings, asset_symbol)
     return {
-        "min_trade_candidates": settings.crypto_btc15m_touch20_replay_min_candidates,
-        "min_net_pl_dollars": settings.crypto_btc15m_touch20_replay_min_net_pnl_dollars,
-        "min_pnl_per_candidate_dollars": settings.crypto_btc15m_touch20_replay_min_pnl_per_candidate_dollars,
-        "max_hard_cap_breaches": settings.crypto_btc15m_touch20_replay_max_hard_cap_breaches,
-        "min_touch_rate": settings.crypto_btc15m_touch20_replay_min_touch_rate,
+        "asset_symbol": _normalize_asset_symbol(asset_symbol),
+        "min_trade_candidates": cfg.replay_min_candidates,
+        "min_net_pl_dollars": float(cfg.replay_min_net_pnl_dollars),
+        "min_pnl_per_candidate_dollars": float(cfg.replay_min_pnl_per_candidate_dollars),
+        "max_hard_cap_breaches": cfg.replay_max_hard_cap_breaches,
+        "min_touch_rate": float(cfg.replay_min_touch_rate),
         "requires_allowed_bucket_support": True,
         "requires_real_quote_path_evidence": True,
         "uses_trained_model": False,
     }
 
 
-def gate_reasons(metrics: dict[str, Any], *, settings: Settings) -> list[str]:
+def gate_reasons(metrics: dict[str, Any], *, settings: Settings, asset_symbol: str = BTC15M_TOUCH20_RULES_ASSET) -> list[str]:
+    asset = _normalize_asset_symbol(asset_symbol)
+    cfg = _asset_settings(settings, asset)
+    label = f"{asset} 15m touch20 rules"
     if not metrics:
-        return ["BTC 15m touch20 rules replay artifact is missing."]
+        return [f"{label} replay artifact is missing."]
     reasons: list[str] = []
     if metrics.get("backtest_missing"):
-        reasons.append("BTC 15m touch20 rules replay artifact is missing.")
+        reasons.append(f"{label} replay artifact is missing.")
     if metrics.get("uses_trained_model") is True:
-        reasons.append("BTC 15m touch20 rules replay must not use trained model predictions.")
+        reasons.append(f"{label} replay must not use trained model predictions.")
     real_quote_rows = int(metrics.get("real_quote_path_row_count") or 0)
     if not metrics.get("backtest_missing") and real_quote_rows <= 0:
-        reasons.append("BTC 15m touch20 rules replay has no settled real quote-path evidence.")
+        reasons.append(f"{label} replay has no settled real quote-path evidence.")
     candidates = int(metrics.get("trade_candidate_count") or 0)
-    min_candidates = int(settings.crypto_btc15m_touch20_replay_min_candidates)
+    min_candidates = cfg.replay_min_candidates
     net_pl = Decimal(str(metrics.get("net_simulated_pl_dollars") or "0"))
-    min_net = Decimal(str(settings.crypto_btc15m_touch20_replay_min_net_pnl_dollars))
+    min_net = cfg.replay_min_net_pnl_dollars
     pnl_per = Decimal(str(metrics.get("pnl_per_candidate_dollars") or "0"))
-    min_pnl_per = Decimal(str(settings.crypto_btc15m_touch20_replay_min_pnl_per_candidate_dollars))
+    min_pnl_per = cfg.replay_min_pnl_per_candidate_dollars
     hard_cap_breaches = int(metrics.get("hard_cap_breaches") or 0)
-    max_hard_cap = int(settings.crypto_btc15m_touch20_replay_max_hard_cap_breaches)
+    max_hard_cap = cfg.replay_max_hard_cap_breaches
     touch_rate = Decimal(str(metrics.get("touch_rate") or "0"))
-    min_touch_rate = Decimal(str(settings.crypto_btc15m_touch20_replay_min_touch_rate))
+    min_touch_rate = cfg.replay_min_touch_rate
     if candidates < min_candidates:
-        reasons.append(f"BTC 15m touch20 rules replay candidate count {candidates} below minimum {min_candidates}.")
+        reasons.append(f"{label} replay candidate count {candidates} below minimum {min_candidates}.")
     if net_pl <= min_net:
-        reasons.append(f"BTC 15m touch20 rules replay net P/L ${float(net_pl):.2f} does not clear required positive threshold.")
+        reasons.append(f"{label} replay net P/L ${float(net_pl):.2f} does not clear required positive threshold.")
     if pnl_per < min_pnl_per:
         reasons.append(
-            f"BTC 15m touch20 rules replay P/L per candidate ${float(pnl_per):.4f} below minimum ${float(min_pnl_per):.4f}."
+            f"{label} replay P/L per candidate ${float(pnl_per):.4f} below minimum ${float(min_pnl_per):.4f}."
         )
     if hard_cap_breaches > max_hard_cap:
-        reasons.append(f"BTC 15m touch20 rules replay hard-cap breaches {hard_cap_breaches} exceed limit {max_hard_cap}.")
+        reasons.append(f"{label} replay hard-cap breaches {hard_cap_breaches} exceed limit {max_hard_cap}.")
     if touch_rate < min_touch_rate:
-        reasons.append(f"BTC 15m touch20 rules replay touch rate {float(touch_rate):.1%} below minimum {float(min_touch_rate):.1%}.")
+        reasons.append(f"{label} replay touch rate {float(touch_rate):.1%} below minimum {float(min_touch_rate):.1%}.")
     if not (metrics.get("allowed_bucket_keys") or []):
-        reasons.append("BTC 15m touch20 rules replay has no allowed bucket support.")
+        reasons.append(f"{label} replay has no allowed bucket support.")
     return reasons
 
 
@@ -777,11 +909,14 @@ def _evaluate_replay(
     spot_rows: list[CryptoSpotOHLCRecord],
     *,
     settings: Settings,
+    asset_symbol: str = BTC15M_TOUCH20_RULES_ASSET,
 ) -> dict[str, Any]:
+    asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
+    cfg = _asset_settings(settings, asset)
     scoped_rows = [
         row
         for row in snapshots
-        if _normalize_asset_symbol(row.asset_symbol) == BTC15M_TOUCH20_RULES_ASSET
+        if _normalize_asset_symbol(row.asset_symbol) == asset
         and (normalize_frequency(row.frequency) or row.frequency) == BTC15M_TOUCH20_RULES_FREQ
         and str(row.settlement_result or "").lower() in {"yes", "no"}
         and all(
@@ -792,7 +927,7 @@ def _evaluate_replay(
     rows_by_market: dict[str, list[CryptoMarketSnapshotRecord]] = defaultdict(list)
     for row in scoped_rows:
         rows_by_market[row.market_ticker].append(row)
-    spot_index = _prepare_spot_index(spot_rows)
+    spot_index = _prepare_spot_index(spot_rows, asset_symbol=asset)
     trades: list[dict[str, Any]] = []
     reason_counts: Counter[str] = Counter()
     status_counts: Counter[str] = Counter()
@@ -804,7 +939,7 @@ def _evaluate_replay(
                 spot_index,
                 decision_ts=decision_ts,
                 freshness_reference=decision_ts,
-                max_age_seconds=max(int(settings.crypto_btc15m_touch20_spot_fresh_seconds), BTC15M_TOUCH20_RULES_INTERVAL_SECONDS),
+                max_age_seconds=max(cfg.spot_fresh_seconds, BTC15M_TOUCH20_RULES_INTERVAL_SECONDS),
             )
             # Replay candidate generation is two-pass: first derive the bucket key
             # without bucket enforcement, then score with the bucket once matrix
@@ -816,7 +951,7 @@ def _evaluate_replay(
                     {
                         "bucket_key": "bootstrap",
                         "sample_count": 1,
-                        "touch_rate": max(float(settings.crypto_btc15m_touch20_replay_min_touch_rate), 0.25),
+                        "touch_rate": max(float(cfg.replay_min_touch_rate), 0.25),
                         "net_pnl": "0.0500",
                     }
                 ],
@@ -850,7 +985,7 @@ def _evaluate_replay(
                     "simulation": simulation,
                 }
             )
-    bucket_matrix = _bucket_matrix(trades, settings=settings)
+    bucket_matrix = _bucket_matrix(trades, settings=settings, asset_symbol=asset)
     allowed_keys = [bucket["bucket_key"] for bucket in bucket_matrix if bucket.get("allowed")]
     blocked_keys = [bucket["bucket_key"] for bucket in bucket_matrix if not bucket.get("allowed")]
     values = [_decimal((trade.get("simulation") or {}).get("net_pnl")) for trade in trades]
@@ -860,9 +995,9 @@ def _evaluate_replay(
     trade_count = len(trades)
     metrics = {
         "objective": "touch_20pct_before_close",
-        "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+        "strategy": _strategy_code(asset),
         "uses_trained_model": False,
-        "asset_symbols": [BTC15M_TOUCH20_RULES_ASSET],
+        "asset_symbols": [asset],
         "sample_count": len(scoped_rows),
         "real_quote_path_row_count": len(scoped_rows),
         "trade_candidate_count": trade_count,
@@ -937,8 +1072,8 @@ def _ledger_payload(
     payload = dict(getattr(checkpoint, "payload", None) or {})
     positions = payload.get("positions") if isinstance(payload.get("positions"), dict) else {}
     return {
-        "schema_version": "btc15m-touch20-rules-ledger-v2",
-        "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+        "schema_version": "crypto15m-touch20-rules-ledger-v2",
+        "strategy": _strategy_code(asset_symbol),
         "kalshi_env": kalshi_env,
         "asset_symbol": _normalize_asset_symbol(asset_symbol),
         "frequency": normalize_frequency(frequency) or frequency,
@@ -950,8 +1085,9 @@ def _ledger_payload(
 def _open_entries(ledger: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     positions = ledger.get("positions") if isinstance(ledger.get("positions"), dict) else {}
     entries: list[tuple[str, dict[str, Any]]] = []
+    prefix = _order_prefix(str(ledger.get("asset_symbol") or ""))
     for client_order_id, entry in positions.items():
-        if not str(client_order_id).startswith(f"{BTC15M_TOUCH20_RULES_ORDER_PREFIX}:"):
+        if not str(client_order_id).startswith(f"{prefix}:"):
             continue
         if isinstance(entry, dict) and str(entry.get("status") or "") in {"open", "exit_submitted"}:
             entries.append((str(client_order_id), entry))
@@ -961,8 +1097,9 @@ def _open_entries(ledger: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 def _open_pending_notional(ledger: dict[str, Any]) -> Decimal:
     positions = ledger.get("positions") if isinstance(ledger.get("positions"), dict) else {}
     total = Decimal("0")
+    prefix = _order_prefix(str(ledger.get("asset_symbol") or ""))
     for client_order_id, entry in positions.items():
-        if not str(client_order_id).startswith(f"{BTC15M_TOUCH20_RULES_ORDER_PREFIX}:"):
+        if not str(client_order_id).startswith(f"{prefix}:"):
             continue
         if not isinstance(entry, dict):
             continue
@@ -974,8 +1111,9 @@ def _open_pending_notional(ledger: dict[str, Any]) -> Decimal:
 def _daily_realized_pnl(ledger: dict[str, Any], now: datetime) -> Decimal:
     positions = ledger.get("positions") if isinstance(ledger.get("positions"), dict) else {}
     total = Decimal("0")
+    prefix = _order_prefix(str(ledger.get("asset_symbol") or ""))
     for client_order_id, entry in positions.items():
-        if not str(client_order_id).startswith(f"{BTC15M_TOUCH20_RULES_ORDER_PREFIX}:"):
+        if not str(client_order_id).startswith(f"{prefix}:"):
             continue
         if not isinstance(entry, dict) or not entry.get("closed_at"):
             continue
@@ -1001,10 +1139,11 @@ def _count_for_cap(remaining_cap: Decimal, entry_side_price: Decimal) -> Decimal
         return None
 
 
-def _client_order_id(action: str, *, market_ticker: str, side: str, now: datetime) -> str:
-    basis = f"{BTC15M_TOUCH20_RULES_STRATEGY}:{action}:{market_ticker}:{side}:{now.isoformat()}".encode("utf-8")
+def _client_order_id(action: str, *, market_ticker: str, side: str, now: datetime, asset_symbol: str) -> str:
+    strategy = _strategy_code(asset_symbol)
+    basis = f"{strategy}:{action}:{market_ticker}:{side}:{now.isoformat()}".encode("utf-8")
     digest = hashlib.blake2b(basis, digest_size=10).hexdigest()
-    return f"{BTC15M_TOUCH20_RULES_ORDER_PREFIX}:{action[:1]}:{digest}"
+    return f"{_order_prefix(asset_symbol)}:{action[:1]}:{digest}"
 
 
 def _selection_summary(item: dict[str, Any]) -> dict[str, Any]:
@@ -1048,14 +1187,16 @@ def _entry_payload(
     now: datetime,
     settings: Settings,
 ) -> dict[str, Any]:
+    asset = _normalize_asset_symbol(market.asset_symbol)
+    cfg = _asset_settings(settings, asset)
     fee_rate = Decimal(str(settings.kalshi_taker_fee_rate))
     entry_fee = estimate_kalshi_taker_fee_dollars(price_dollars=entry_side_price, count=count_fp, fee_rate=fee_rate)
     return {
         "status": status,
-        "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+        "strategy": _strategy_code(asset),
         "client_order_id": client_order_id,
         "market_ticker": market.market_ticker,
-        "asset_symbol": market.asset_symbol,
+        "asset_symbol": asset,
         "frequency": market.frequency,
         "side": side,
         "count_fp": _count_text(count_fp),
@@ -1069,9 +1210,10 @@ def _entry_payload(
         "bucket": candidate.get("bucket") or {},
         "candidate": _selection_summary({"market": market, "candidate": candidate}),
         "target_exit_side_price_dollars": candidate.get("target_exit_side_price_dollars"),
-        "take_profit_pct": float(settings.crypto_btc15m_touch20_take_profit_pct),
-        "profit_protection_threshold_pct": float(settings.crypto_btc15m_touch20_profit_protection_threshold_pct),
-        "profit_protection_floor_pct": float(settings.crypto_btc15m_touch20_profit_protection_floor_pct),
+        "take_profit_pct": float(cfg.take_profit_pct),
+        "stop_loss_pct": float(cfg.stop_loss_pct),
+        "profit_protection_threshold_pct": float(cfg.profit_protection_threshold_pct),
+        "profit_protection_floor_pct": float(cfg.profit_protection_floor_pct),
         "profit_protection_armed": False,
         "max_net_profit_pct": "0.0000",
         "quote_history": [],
@@ -1100,6 +1242,21 @@ def _entry_ledger_decision(order_status: str, filled_count_fp: Decimal | None) -
     return True, "entry_submitted"
 
 
+def _exit_trigger_for_profit(
+    profit_pct: Decimal,
+    *,
+    asset_symbol: str,
+    settings: Settings,
+    protection_trigger: str | None,
+) -> str | None:
+    cfg = _asset_settings(settings, asset_symbol)
+    if profit_pct >= cfg.take_profit_pct:
+        return "take_profit"
+    if cfg.stop_loss_pct > Decimal("0") and profit_pct <= -cfg.stop_loss_pct:
+        return "stop_loss"
+    return protection_trigger
+
+
 def profit_protection_review(
     entry: dict[str, Any],
     *,
@@ -1108,8 +1265,9 @@ def profit_protection_review(
     settings: Settings,
     now: datetime,
 ) -> dict[str, Any]:
-    threshold = Decimal(str(settings.crypto_btc15m_touch20_profit_protection_threshold_pct))
-    floor = Decimal(str(settings.crypto_btc15m_touch20_profit_protection_floor_pct))
+    cfg = _asset_settings(settings, entry.get("asset_symbol"))
+    threshold = cfg.profit_protection_threshold_pct
+    floor = cfg.profit_protection_floor_pct
     history = list(entry.get("quote_history") or [])
     previous_profit = _decimal(history[-1].get("net_profit_pct")) if history and isinstance(history[-1], dict) else None
     armed = bool(entry.get("profit_protection_armed")) or net_profit >= threshold
@@ -1170,6 +1328,8 @@ class CryptoNonModelTouch20Service:
         asset = _normalize_asset_symbol(asset_symbol)
         if not _scope_supported(freq, asset):
             return {"status": "unsupported_scope", "frequency": freq, "asset_symbol": asset}
+        strategy = _strategy_code(asset)
+        backtest_artifact_type = _artifact_type(_artifact_base("backtest", asset), frequency=freq, asset_symbol=asset)
         cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -1188,10 +1348,10 @@ class CryptoNonModelTouch20Service:
                 limit=1_000_000,
             )
             await session.commit()
-        replay = _evaluate_replay(snapshots, spot_rows, settings=self.settings)
+        replay = _evaluate_replay(snapshots, spot_rows, settings=self.settings, asset_symbol=asset)
         metrics = dict(replay["metrics"])
         metrics["dataset_source"] = "settled_live_quote_paths"
-        reasons = gate_reasons(metrics, settings=self.settings)
+        reasons = gate_reasons(metrics, settings=self.settings, asset_symbol=asset)
         report = {
             "schema_version": "btc15m-touch20-rules-backtest-v1",
             "status": "pass" if not reasons else "warn",
@@ -1199,11 +1359,11 @@ class CryptoNonModelTouch20Service:
             "frequency": freq,
             "asset_symbol": asset,
             "objective": "touch_20pct_before_close",
-            "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+            "strategy": strategy,
             "uses_trained_model": False,
             "days": days,
             "metrics": metrics,
-            "requirements": _gate_requirements(self.settings),
+            "requirements": _gate_requirements(self.settings, asset_symbol=asset),
             "gate_reasons": reasons,
             "trade_sample": replay["trade_sample"],
             "trade_sample_count": len(replay["trade_sample"]),
@@ -1214,7 +1374,7 @@ class CryptoNonModelTouch20Service:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                 artifact = await repo.record_crypto_model_artifact(
                     frequency=freq,
-                    artifact_type=_artifact_type(BTC15M_TOUCH20_RULES_BACKTEST_ARTIFACT, frequency=freq, asset_symbol=asset),
+                    artifact_type=backtest_artifact_type,
                     version=_version(f"btc15m-touch20-rules-backtest-{freq}-{asset}", report),
                     status=report["status"],
                     sample_count=int(metrics.get("trade_candidate_count") or 0),
@@ -1232,29 +1392,32 @@ class CryptoNonModelTouch20Service:
         asset = _normalize_asset_symbol(asset_symbol)
         if not _scope_supported(freq, asset):
             return {"status": "unsupported_scope", "frequency": freq, "asset_symbol": asset}
+        strategy = _strategy_code(asset)
+        backtest_artifact_type = _artifact_type(_artifact_base("backtest", asset), frequency=freq, asset_symbol=asset)
+        gate_artifact_type = _artifact_type(_artifact_base("gate", asset), frequency=freq, asset_symbol=asset)
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             backtest = await repo.get_latest_crypto_model_artifact(
                 frequency=freq,
-                artifact_type=_artifact_type(BTC15M_TOUCH20_RULES_BACKTEST_ARTIFACT, frequency=freq, asset_symbol=asset),
+                artifact_type=backtest_artifact_type,
                 kalshi_env=self.settings.kalshi_env,
             )
             metrics = dict(getattr(backtest, "metrics", None) or {})
             if backtest is None:
                 metrics["backtest_missing"] = True
-            reasons = gate_reasons(metrics, settings=self.settings)
+            reasons = gate_reasons(metrics, settings=self.settings, asset_symbol=asset)
             payload = {
                 "passed": not reasons,
                 "reasons": reasons,
-                "requirements": _gate_requirements(self.settings),
+                "requirements": _gate_requirements(self.settings, asset_symbol=asset),
                 "objective": "touch_20pct_before_close",
-                "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                "strategy": strategy,
                 "uses_trained_model": False,
                 "backtest_version": getattr(backtest, "version", None),
             }
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
-                artifact_type=_artifact_type(BTC15M_TOUCH20_RULES_GATE_ARTIFACT, frequency=freq, asset_symbol=asset),
+                artifact_type=gate_artifact_type,
                 version=_version(f"btc15m-touch20-rules-gate-{freq}-{asset}", payload),
                 status="passed" if payload["passed"] else "blocked",
                 sample_count=int(metrics.get("trade_candidate_count") or 0),
@@ -1286,11 +1449,13 @@ class CryptoNonModelTouch20Service:
         asset = _normalize_asset_symbol(asset_symbol)
         if not _scope_supported(freq, asset):
             return {"status": "unsupported_scope", "frequency": freq, "asset_symbol": asset}
+        strategy = _strategy_code(asset)
+        cfg = _asset_settings(self.settings, asset)
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             gate = await repo.get_latest_crypto_model_artifact(
                 frequency=freq,
-                artifact_type=_artifact_type(BTC15M_TOUCH20_RULES_GATE_ARTIFACT, frequency=freq, asset_symbol=asset),
+                artifact_type=_artifact_type(_artifact_base("gate", asset), frequency=freq, asset_symbol=asset),
                 kalshi_env=self.settings.kalshi_env,
             )
             if not _gate_passed(gate):
@@ -1298,11 +1463,11 @@ class CryptoNonModelTouch20Service:
                 return {
                     "status": "gate_not_passed",
                     "gate": _artifact_summary(gate),
-                    "reason": "latest btc15m touch20 rules gate is missing or blocked",
+                    "reason": f"latest {asset} 15m touch20 rules gate is missing or blocked",
                 }
             payload = {
                 "schema_version": "btc15m-touch20-rules-approval-v1",
-                "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                "strategy": strategy,
                 "kalshi_env": self.settings.kalshi_env,
                 "asset_symbol": asset,
                 "frequency": freq,
@@ -1310,14 +1475,14 @@ class CryptoNonModelTouch20Service:
                 "gate_version": gate.version,
                 "approved_by": approved_by,
                 "approved_at": datetime.now(UTC).isoformat(),
-                "max_notional_dollars": _money_text(max_notional_dollars or Decimal(str(self.settings.crypto_btc15m_touch20_max_open_notional_dollars))),
+                "max_notional_dollars": _money_text(max_notional_dollars or cfg.max_open_notional_dollars),
                 "note": note,
             }
             await repo.set_checkpoint(_approval_stream(self.settings.kalshi_env, asset, freq), gate.version, payload)
             await repo.log_ops_event(
                 severity="info",
                 source="crypto_non_model_btc15m_touch20",
-                summary=f"BTC 15m touch20 rules approved for gate {gate.version}",
+                summary=f"{asset} 15m touch20 rules approved for gate {gate.version}",
                 payload=payload,
                 kalshi_env=self.settings.kalshi_env,
             )
@@ -1344,7 +1509,7 @@ class CryptoNonModelTouch20Service:
             await repo.log_ops_event(
                 severity="warning",
                 source="crypto_non_model_btc15m_touch20",
-                summary="BTC 15m touch20 rules approval revoked",
+                summary=f"{asset} 15m touch20 rules approval revoked",
                 payload=payload,
                 kalshi_env=self.settings.kalshi_env,
             )
@@ -1355,12 +1520,14 @@ class CryptoNonModelTouch20Service:
         freq = normalize_frequency(frequency) or "15m"
         asset = _normalize_asset_symbol(asset_symbol)
         if not _scope_supported(freq, asset):
-            return {"status": "unsupported_scope", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "frequency": freq, "asset_symbol": asset}
+            return {"status": "unsupported_scope", "strategy": _strategy_code(asset), "frequency": freq, "asset_symbol": asset}
+        strategy = _strategy_code(asset)
+        cfg = _asset_settings(self.settings, asset)
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             gate = await repo.get_latest_crypto_model_artifact(
                 frequency=freq,
-                artifact_type=_artifact_type(BTC15M_TOUCH20_RULES_GATE_ARTIFACT, frequency=freq, asset_symbol=asset),
+                artifact_type=_artifact_type(_artifact_base("gate", asset), frequency=freq, asset_symbol=asset),
                 kalshi_env=self.settings.kalshi_env,
             )
             approval = _approval_payload(await repo.get_checkpoint(_approval_stream(self.settings.kalshi_env, asset, freq)))
@@ -1374,12 +1541,21 @@ class CryptoNonModelTouch20Service:
         approval_valid, approval_reason = _approval_valid(approval, gate)
         return {
             "status": "ok",
-            "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+            "strategy": strategy,
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
             "asset_symbol": asset,
-            "enabled": bool(self.settings.crypto_btc15m_touch20_rules_enabled),
-            "trading_enabled": bool(self.settings.crypto_btc15m_touch20_rules_trading_enabled),
+            "enabled": cfg.rules_enabled,
+            "trading_enabled": cfg.trading_enabled,
+            "settings": {
+                "take_profit_pct": str(cfg.take_profit_pct),
+                "stop_loss_pct": str(cfg.stop_loss_pct),
+                "max_open_notional_dollars": _money_text(cfg.max_open_notional_dollars),
+                "daily_loss_limit_dollars": _money_text(cfg.daily_loss_limit_dollars),
+                "min_rule_score": str(cfg.min_rule_score),
+                "quote_fresh_seconds": cfg.quote_fresh_seconds,
+                "spot_fresh_seconds": cfg.spot_fresh_seconds,
+            },
             "gate": _artifact_summary(gate),
             "approval": approval,
             "approval_valid": approval_valid,
@@ -1391,15 +1567,17 @@ class CryptoNonModelTouch20Service:
     async def run_once(self, *, frequency: str = "15m", asset_symbol: str = "BTC") -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         asset = _normalize_asset_symbol(asset_symbol)
+        strategy = _strategy_code(asset)
         if not _scope_supported(freq, asset):
-            return {"status": "unsupported_scope", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "frequency": freq, "asset_symbol": asset}
-        if not bool(self.settings.crypto_btc15m_touch20_rules_enabled):
+            return {"status": "unsupported_scope", "strategy": strategy, "frequency": freq, "asset_symbol": asset}
+        cfg = _asset_settings(self.settings, asset)
+        if not cfg.rules_enabled:
             return {
                 "status": "disabled",
-                "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                "strategy": strategy,
                 "frequency": freq,
                 "asset_symbol": asset,
-                "reason": "CRYPTO_BTC15M_TOUCH20_RULES_ENABLED is false",
+                "reason": f"{strategy} rules_enabled is false",
             }
 
         now = datetime.now(UTC)
@@ -1408,7 +1586,7 @@ class CryptoNonModelTouch20Service:
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             gate = await repo.get_latest_crypto_model_artifact(
                 frequency=freq,
-                artifact_type=_artifact_type(BTC15M_TOUCH20_RULES_GATE_ARTIFACT, frequency=freq, asset_symbol=asset),
+                artifact_type=_artifact_type(_artifact_base("gate", asset), frequency=freq, asset_symbol=asset),
                 kalshi_env=self.settings.kalshi_env,
             )
             approval = _approval_payload(await repo.get_checkpoint(_approval_stream(self.settings.kalshi_env, asset, freq)))
@@ -1435,21 +1613,21 @@ class CryptoNonModelTouch20Service:
 
         gate_summary = _artifact_summary(gate)
         if control.active_color != self.settings.app_color:
-            return {"status": "inactive_color", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "active_color": control.active_color, "app_color": self.settings.app_color, "gate": gate_summary}
+            return {"status": "inactive_color", "strategy": strategy, "active_color": control.active_color, "app_color": self.settings.app_color, "gate": gate_summary}
         if control.kill_switch_enabled:
-            return {"status": "kill_switch_enabled", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "gate": gate_summary}
+            return {"status": "kill_switch_enabled", "strategy": strategy, "gate": gate_summary}
         if not _gate_passed(gate):
-            return {"status": "gate_blocked", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "gate": gate_summary, "reason": "btc15m touch20 rules gate missing or blocked"}
+            return {"status": "gate_blocked", "strategy": strategy, "gate": gate_summary, "reason": f"{asset} 15m touch20 rules gate missing or blocked"}
         approval_valid, approval_reason = _approval_valid(approval, gate)
         if not approval_valid:
-            return {"status": "approval_blocked", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "gate": gate_summary, "approval": approval, "reason": approval_reason}
+            return {"status": "approval_blocked", "strategy": strategy, "gate": gate_summary, "approval": approval, "reason": approval_reason}
 
         daily_pnl = _daily_realized_pnl(ledger, now)
-        daily_loss_limit = Decimal(str(self.settings.crypto_btc15m_touch20_daily_loss_limit_dollars))
+        daily_loss_limit = cfg.daily_loss_limit_dollars
         if daily_loss_limit > Decimal("0") and daily_pnl <= -daily_loss_limit:
             return {
                 "status": "daily_loss_limit_blocked",
-                "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                "strategy": strategy,
                 "daily_realized_pnl_dollars": _money_text(daily_pnl),
                 "daily_loss_limit_dollars": _money_text(daily_loss_limit),
             }
@@ -1458,7 +1636,7 @@ class CryptoNonModelTouch20Service:
         skipped: list[dict[str, Any]] = []
         candidates: list[dict[str, Any]] = []
         gate_metrics = dict(getattr(gate, "metrics", None) or {})
-        quote_fresh_seconds = max(1, int(self.settings.crypto_btc15m_touch20_quote_fresh_seconds))
+        quote_fresh_seconds = max(1, cfg.quote_fresh_seconds)
         for snapshot in snapshots:
             funnel["market_seen"] += 1
             observed_at = _snapshot_decision_time(snapshot)
@@ -1470,7 +1648,8 @@ class CryptoNonModelTouch20Service:
                 spot_rows,
                 decision_ts=observed_at,
                 freshness_reference=now,
-                max_age_seconds=int(self.settings.crypto_btc15m_touch20_spot_fresh_seconds),
+                max_age_seconds=cfg.spot_fresh_seconds,
+                asset_symbol=asset,
             )
             if spot.get("available"):
                 funnel["spot_fresh"] += 1
@@ -1500,7 +1679,7 @@ class CryptoNonModelTouch20Service:
             reverse=True,
         )
         open_pending_notional = _open_pending_notional(ledger)
-        cap = Decimal(str(self.settings.crypto_btc15m_touch20_max_open_notional_dollars))
+        cap = cfg.max_open_notional_dollars
         approval_cap = _decimal(approval.get("max_notional_dollars"), cap)
         if approval_cap > Decimal("0"):
             cap = min(cap, approval_cap)
@@ -1508,7 +1687,8 @@ class CryptoNonModelTouch20Service:
         if not candidates:
             result = {
                 "status": "no_candidate",
-                "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                "strategy": strategy,
+                "asset_symbol": asset,
                 "gate": gate_summary,
                 "approval": approval,
                 "funnel": dict(funnel),
@@ -1520,7 +1700,8 @@ class CryptoNonModelTouch20Service:
         if remaining_cap <= Decimal("0"):
             result = {
                 "status": "strategy_cap_blocked",
-                "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                "strategy": strategy,
+                "asset_symbol": asset,
                 "selected": _selection_summary(candidates[0]),
                 "open_pending_notional_dollars": _money_text(open_pending_notional),
                 "max_open_notional_dollars": _money_text(cap),
@@ -1538,18 +1719,20 @@ class CryptoNonModelTouch20Service:
         if count_fp is None:
             result = {
                 "status": "strategy_cap_too_small",
-                "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                "strategy": strategy,
+                "asset_symbol": asset,
                 "selected": _selection_summary(selected_item),
                 "remaining_cap_dollars": _money_text(remaining_cap),
             }
             await self._log_cycle(result)
             return result
         target_yes = quantize_price(selected["target_yes_price_dollars"])
-        client_order_id = _client_order_id("entry", market_ticker=market.market_ticker, side=side_text, now=now)
-        if not bool(self.settings.crypto_btc15m_touch20_rules_trading_enabled):
+        client_order_id = _client_order_id("entry", market_ticker=market.market_ticker, side=side_text, now=now, asset_symbol=asset)
+        if not cfg.trading_enabled:
             result = {
                 "status": "trading_disabled",
-                "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                "strategy": strategy,
+                "asset_symbol": asset,
                 "selected": _selection_summary(selected_item),
                 "client_order_id": client_order_id,
                 "funnel": dict(funnel),
@@ -1566,10 +1749,10 @@ class CryptoNonModelTouch20Service:
             side=side,
             yes_price_dollars=target_yes,
             count_fp=count_fp,
-            capital_bucket=BTC15M_TOUCH20_RULES_STRATEGY,
-            note="btc15m_touch20_rules isolated non-model entry",
+            capital_bucket=strategy,
+            note=f"{strategy} isolated non-model entry",
         )
-        room = Room(name=f"BTC 15m touch20 rules {market.market_ticker}", market_ticker=market.market_ticker, kalshi_env=self.settings.kalshi_env, shadow_mode=False)
+        room = Room(name=f"{asset} 15m touch20 rules {market.market_ticker}", market_ticker=market.market_ticker, kalshi_env=self.settings.kalshi_env, shadow_mode=False)
         receipt = await self.base_execution_service.execute(room=room, control=control, ticket=ticket, client_order_id=client_order_id, fair_yes_dollars=None)
         order_status = str(receipt.status or "")
         filled_count_fp = await self._filled_count_fp(receipt.external_order_id)
@@ -1591,7 +1774,7 @@ class CryptoNonModelTouch20Service:
                     raw=receipt.details if isinstance(receipt.details, dict) else {},
                     kalshi_order_id=receipt.external_order_id,
                     kalshi_env=self.settings.kalshi_env,
-                    strategy_code=BTC15M_TOUCH20_RULES_STRATEGY,
+                    strategy_code=strategy,
                 )
             if should_update_ledger:
                 ledger["positions"][client_order_id] = _entry_payload(
@@ -1614,9 +1797,9 @@ class CryptoNonModelTouch20Service:
             await repo.log_ops_event(
                 severity="info" if order_status in {"filled", "executed", "submitted"} else "warning",
                 source="crypto_non_model_btc15m_touch20",
-                summary=f"BTC 15m touch20 rules entry {order_status}: {market.market_ticker} {side_text}",
+                summary=f"{asset} 15m touch20 rules entry {order_status}: {market.market_ticker} {side_text}",
                 payload={
-                    "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                    "strategy": strategy,
                     "client_order_id": client_order_id,
                     "ledger_recorded": should_update_ledger,
                     "ledger_status": ledger_status,
@@ -1628,7 +1811,8 @@ class CryptoNonModelTouch20Service:
             await session.commit()
         return {
             "status": order_status,
-            "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+            "strategy": strategy,
+            "asset_symbol": asset,
             "client_order_id": client_order_id,
             "external_order_id": receipt.external_order_id,
             "filled_count_fp": _count_text(filled_count_fp) if filled_count_fp is not None else None,
@@ -1643,8 +1827,10 @@ class CryptoNonModelTouch20Service:
     async def exit_once(self, *, frequency: str = "15m", asset_symbol: str = "BTC") -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         asset = _normalize_asset_symbol(asset_symbol)
+        strategy = _strategy_code(asset)
+        cfg = _asset_settings(self.settings, asset)
         if not _scope_supported(freq, asset):
-            return {"status": "unsupported_scope", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "frequency": freq, "asset_symbol": asset}
+            return {"status": "unsupported_scope", "strategy": strategy, "frequency": freq, "asset_symbol": asset}
         now = datetime.now(UTC)
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -1658,9 +1844,9 @@ class CryptoNonModelTouch20Service:
             await session.commit()
         open_entries = _open_entries(ledger)
         if not open_entries:
-            return {"status": "no_open_strategy_positions", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "frequency": freq, "asset_symbol": asset}
+            return {"status": "no_open_strategy_positions", "strategy": strategy, "frequency": freq, "asset_symbol": asset}
         if control.active_color != self.settings.app_color:
-            return {"status": "inactive_color", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "active_color": control.active_color, "app_color": self.settings.app_color, "open_entries": len(open_entries)}
+            return {"status": "inactive_color", "strategy": strategy, "active_color": control.active_color, "app_color": self.settings.app_color, "open_entries": len(open_entries)}
 
         evaluated: list[dict[str, Any]] = []
         exits: list[dict[str, Any]] = []
@@ -1709,19 +1895,21 @@ class CryptoNonModelTouch20Service:
                 spot_rows,
                 decision_ts=_snapshot_decision_time(snapshot),
                 freshness_reference=now,
-                max_age_seconds=int(self.settings.crypto_btc15m_touch20_spot_fresh_seconds),
+                max_age_seconds=cfg.spot_fresh_seconds,
+                asset_symbol=asset,
             )
             protection = profit_protection_review(entry, spot=spot, net_profit=profit_pct, settings=self.settings, now=now)
             entry.update(protection["entry_updates"])
-            trigger = None
-            if profit_pct >= Decimal(str(self.settings.crypto_btc15m_touch20_take_profit_pct)):
-                trigger = "take_profit"
-            elif protection["trigger"]:
-                trigger = protection["trigger"]
+            trigger = _exit_trigger_for_profit(
+                profit_pct,
+                asset_symbol=asset,
+                settings=self.settings,
+                protection_trigger=protection["trigger"],
+            )
             evaluated.append({"client_order_id": client_order_id, "market_ticker": market_ticker, "status": "evaluated", "net_profit_pct": str(profit_pct), "trigger": trigger, "profit_protection": protection["review"]})
             if trigger is None:
                 continue
-            exit_client_order_id = _client_order_id("exit", market_ticker=market_ticker, side=side, now=now)
+            exit_client_order_id = _client_order_id("exit", market_ticker=market_ticker, side=side, now=now, asset_symbol=asset)
             receipt = await self.base_execution_service.close_position(
                 market_ticker=market_ticker,
                 side=side,
@@ -1771,15 +1959,15 @@ class CryptoNonModelTouch20Service:
                         raw=receipt.details if isinstance(receipt.details, dict) else {},
                         kalshi_order_id=receipt.external_order_id,
                         kalshi_env=self.settings.kalshi_env,
-                        strategy_code=BTC15M_TOUCH20_RULES_STRATEGY,
+                        strategy_code=strategy,
                     )
                 ledger["updated_at"] = datetime.now(UTC).isoformat()
                 await repo.set_checkpoint(_ledger_stream(self.settings.kalshi_env, asset, freq), None, ledger)
                 await repo.log_ops_event(
                     severity="info" if status in {"filled", "executed", "submitted"} else "warning",
                     source="crypto_non_model_btc15m_touch20",
-                    summary=f"BTC 15m touch20 rules exit {status}: {market_ticker} {side} {trigger}",
-                    payload={"strategy": BTC15M_TOUCH20_RULES_STRATEGY, "entry_client_order_id": client_order_id, "exit_client_order_id": exit_client_order_id, "trigger": trigger, "net_profit_pct": str(profit_pct), "receipt": receipt.model_dump(mode="json")},
+                    summary=f"{asset} 15m touch20 rules exit {status}: {market_ticker} {side} {trigger}",
+                    payload={"strategy": strategy, "entry_client_order_id": client_order_id, "exit_client_order_id": exit_client_order_id, "trigger": trigger, "net_profit_pct": str(profit_pct), "receipt": receipt.model_dump(mode="json")},
                     kalshi_env=self.settings.kalshi_env,
                 )
                 await session.commit()
@@ -1790,22 +1978,23 @@ class CryptoNonModelTouch20Service:
                 ledger["updated_at"] = datetime.now(UTC).isoformat()
                 await repo.set_checkpoint(_ledger_stream(self.settings.kalshi_env, asset, freq), None, ledger)
                 await session.commit()
-        return {"status": "ok", "strategy": BTC15M_TOUCH20_RULES_STRATEGY, "frequency": freq, "asset_symbol": asset, "evaluated": evaluated, "exits": exits}
+        return {"status": "ok", "strategy": strategy, "frequency": freq, "asset_symbol": asset, "evaluated": evaluated, "exits": exits}
 
     async def _log_cycle(self, result: dict[str, Any]) -> None:
         try:
+            asset = str(result.get("asset_symbol") or "").upper() or "UNKNOWN"
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                 await repo.log_ops_event(
                     severity="info" if result.get("status") in {"trading_disabled", "no_candidate"} else "warning",
                     source="crypto_non_model_btc15m_touch20",
-                    summary=f"BTC 15m touch20 rules cycle: {result.get('status')}",
+                    summary=f"{asset} 15m touch20 rules cycle: {result.get('status')}",
                     payload=result,
                     kalshi_env=self.settings.kalshi_env,
                 )
                 await session.commit()
         except Exception:
-            logger.warning("failed to log BTC 15m touch20 rules cycle telemetry", exc_info=True)
+            logger.warning("failed to log 15m touch20 rules cycle telemetry", exc_info=True)
 
     async def _filled_count_fp(self, external_order_id: str | None) -> Decimal | None:
         if not external_order_id:
@@ -1813,7 +2002,7 @@ class CryptoNonModelTouch20Service:
         try:
             return await self.base_execution_service._get_filled_fp(external_order_id)
         except Exception:
-            logger.warning("failed to fetch filled count for BTC 15m touch20 order %s", external_order_id, exc_info=True)
+            logger.warning("failed to fetch filled count for 15m touch20 order %s", external_order_id, exc_info=True)
             return None
 
 

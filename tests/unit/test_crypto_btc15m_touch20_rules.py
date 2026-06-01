@@ -133,6 +133,27 @@ def test_spot_feature_index_matches_latest_non_proxy_row():
     assert spot["return_3"] == Decimal("0")
 
 
+def test_spot_feature_index_is_asset_scoped_for_non_btc_lanes():
+    now = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
+    rows = [
+        _spot_row(now - timedelta(minutes=15), Decimal("100.00"), asset_symbol="BTC"),
+        _spot_row(now - timedelta(minutes=15), Decimal("3000.00"), asset_symbol="ETH"),
+        _spot_row(now, Decimal("3030.00"), asset_symbol="ETH"),
+    ]
+
+    spot = rules._spot_features(
+        rows,
+        decision_ts=now,
+        freshness_reference=now,
+        max_age_seconds=180,
+        asset_symbol="ETH",
+    )
+
+    assert spot["available"] is True
+    assert spot["close_dollars"] == "3030.00"
+    assert spot["return_1"] == Decimal("0.0100")
+
+
 def test_rules_candidate_uses_explicit_score_and_20pct_objective():
     candidates = rules.rules_candidates_for_snapshot(
         _snapshot(),
@@ -147,6 +168,51 @@ def test_rules_candidate_uses_explicit_score_and_20pct_objective():
     assert selected["uses_trained_model"] is False
     assert selected["rule_score"] is not None
     assert selected["score_components"]["replay_touch"] == "0.4000"
+
+
+def test_non_btc_assets_have_independent_identity_and_disabled_defaults():
+    settings = _settings(
+        crypto_btc15m_touch20_rules_enabled=True,
+        crypto_btc15m_touch20_rules_trading_enabled=True,
+    )
+
+    assert rules._scope_supported("15m", "ETH") is True
+    assert rules._strategy_code("ETH") == "eth15m_touch20_rules"
+    assert rules._order_prefix("ETH") == "eth15t20r"
+    assert rules._artifact_type(rules._artifact_base("gate", "ETH"), frequency="15m", asset_symbol="ETH") == "eth15m_touch20_rules_gate:15m:ETH"
+    assert rules._asset_settings(settings, "BTC").rules_enabled is True
+    assert rules._asset_settings(settings, "BTC").trading_enabled is True
+    assert rules._asset_settings(settings, "ETH").rules_enabled is False
+    assert rules._asset_settings(settings, "ETH").trading_enabled is False
+
+
+def test_non_btc_asset_settings_override_candidate_rules():
+    settings = _settings(
+        crypto_15m_touch20_asset_settings={
+            "ETH": {
+                "rules_enabled": True,
+                "trading_enabled": False,
+                "min_rule_score": 0.50,
+                "max_open_notional_dollars": 7,
+                "daily_loss_limit_dollars": 3,
+            }
+        }
+    )
+
+    cfg = rules._asset_settings(settings, "ETH")
+    candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(asset_symbol="ETH", series_ticker="KXETH15M", market_ticker="KXETH15M-26JUN011200-B1000-T1005"),
+        settings=settings,
+        spot=_spot(),
+        gate_metrics=_gate("ETH|yes|20_30c|le_1c|10_15m"),
+    )
+
+    assert cfg.rules_enabled is True
+    assert cfg.trading_enabled is False
+    assert cfg.max_open_notional_dollars == Decimal("7")
+    assert cfg.daily_loss_limit_dollars == Decimal("3")
+    assert candidates[0]["candidate_status"] == "live_quality"
+    assert candidates[0]["bucket_key"] == "ETH|yes|20_30c|le_1c|10_15m"
 
 
 def test_entry_window_blocks_final_five_minutes_and_allows_boundary():
@@ -295,6 +361,53 @@ def test_profit_protection_arms_only_after_threshold_then_exits_on_floor():
     assert second["trigger"] is None
     assert second["entry_updates"]["profit_protection_armed"] is True
     assert third["trigger"] == "profit_protection_floor"
+
+
+def test_exit_trigger_includes_20pct_stop_loss_after_fees():
+    settings = _settings()
+
+    assert rules._exit_trigger_for_profit(
+        Decimal("0.2000"),
+        asset_symbol="BTC",
+        settings=settings,
+        protection_trigger=None,
+    ) == "take_profit"
+    assert rules._exit_trigger_for_profit(
+        Decimal("-0.1999"),
+        asset_symbol="BTC",
+        settings=settings,
+        protection_trigger=None,
+    ) is None
+    assert rules._exit_trigger_for_profit(
+        Decimal("-0.2000"),
+        asset_symbol="BTC",
+        settings=settings,
+        protection_trigger=None,
+    ) == "stop_loss"
+
+
+def test_exit_trigger_uses_asset_specific_stop_loss_override():
+    settings = _settings(
+        crypto_15m_touch20_asset_settings={
+            "ETH": {
+                "rules_enabled": True,
+                "stop_loss_pct": 0.15,
+            }
+        }
+    )
+
+    assert rules._exit_trigger_for_profit(
+        Decimal("-0.1499"),
+        asset_symbol="ETH",
+        settings=settings,
+        protection_trigger=None,
+    ) is None
+    assert rules._exit_trigger_for_profit(
+        Decimal("-0.1500"),
+        asset_symbol="ETH",
+        settings=settings,
+        protection_trigger=None,
+    ) == "stop_loss"
 
 
 def test_strategy_cap_uses_only_strategy_ledger_entries():

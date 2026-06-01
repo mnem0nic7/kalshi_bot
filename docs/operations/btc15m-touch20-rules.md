@@ -1,14 +1,16 @@
-# BTC 15m Touch20 Rules Runbook
+# Crypto 15m Touch20 Rules Runbook
 
 Last updated: 2026-06-01
 
-This runbook covers the independent non-model BTC 15-minute Touch20 strategy,
-`btc15m_touch20_rules`. The path is additive. It must not disable or retune the
-model-trained crypto bot.
+This runbook covers the independent non-model 15-minute Touch20 rules strategy.
+BTC keeps the legacy strategy code `btc15m_touch20_rules`; other supported
+assets use their own lanes, settings, gates, approvals, ledgers, and order
+prefixes. The path is additive. It must not disable or retune the model-trained
+crypto bot.
 
 ## Core Trading Logic
 
-The strategy buys a BTC 15-minute YES or NO contract only when deterministic
+The strategy buys a supported 15-minute YES or NO contract only when deterministic
 rules and replay-bucket evidence indicate the contract has a good chance to
 touch a +20% net executable profit before close.
 
@@ -20,28 +22,30 @@ outcome is:
 3. sell from the executable bid when net profit is at least +20% after estimated
    entry and exit taker fees
 
-If the +20% touch never occurs, replay assumes settlement hold. Live v1 uses
-profit protection after the position first moves in our favor, but it does not
-use an initial hard stop.
+If the +20% touch never occurs, replay assumes settlement hold. Live exits are
+strategy-owned and trigger on +20% net executable take-profit, -20% net
+executable stop loss, or armed profit protection.
 
 ## Scope
 
 Allowed:
 
-- asset: BTC only
+- assets: BTC, ETH, SOL, XRP, BNB, DOGE, HYPE
 - frequency: 15m only
 - market type: Kalshi crypto contracts
 - sides: YES buy or NO buy
 - entry: executable ask
 - exit: executable bid
 - process: `crypto_non_model_btc15m_touch20_production`
-- strategy code: `btc15m_touch20_rules`
-- order ID prefix: `b15t20r`
+- strategy code: `btc15m_touch20_rules` for BTC; `<asset>15m_touch20_rules` for
+  non-BTC assets, such as `eth15m_touch20_rules`
+- order ID prefix: `b15t20r` for BTC; `<asset>15t20r` for non-BTC assets, such
+  as `eth15t20r`
 
 Not allowed:
 
-- ETH, SOL, XRP, BNB, DOGE, HYPE, or other assets
-- 1h BTC markets
+- assets outside BTC, ETH, SOL, XRP, BNB, DOGE, HYPE
+- 1h crypto markets
 - trained crypto model calls
 - trained model artifact loading as entry authority
 - model settlement replay gates
@@ -58,6 +62,7 @@ All live flags are disabled by default.
 | `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED` | `false` | Enables the rules path to evaluate candidates. |
 | `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED` | `false` | Allows the rules path to submit entry orders. |
 | `CRYPTO_BTC15M_TOUCH20_TAKE_PROFIT_PCT` | `0.20` | Net executable take-profit target. |
+| `CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT` | `0.20` | Net executable stop-loss trigger for strategy-owned positions. |
 | `CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS` | `10` | Strategy-local open plus pending notional cap. |
 | `CRYPTO_BTC15M_TOUCH20_DAILY_LOSS_LIMIT_DOLLARS` | `10` | Strategy-local daily realized loss stop. |
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_THRESHOLD_PCT` | `0.10` | Profit level that arms profit protection. |
@@ -66,17 +71,38 @@ All live flags are disabled by default.
 | `CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS` | `0.10` | Strategy-owned minimum entry ask. |
 | `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE` | `0.60` | Minimum standalone rules score for entry. |
 | `CRYPTO_BTC15M_TOUCH20_QUOTE_FRESH_SECONDS` | `30` | Maximum age for live Kalshi quote snapshots. |
-| `CRYPTO_BTC15M_TOUCH20_SPOT_FRESH_SECONDS` | `180` | Maximum age for live BTC spot rows. |
+| `CRYPTO_BTC15M_TOUCH20_SPOT_FRESH_SECONDS` | `180` | Maximum age for live asset spot rows. |
+| `CRYPTO_15M_TOUCH20_RULES_ASSETS` | `BTC` | Comma-separated assets for the Docker loop to evaluate. |
+| `CRYPTO_15M_TOUCH20_ASSET_SETTINGS` | `{}` | JSON object with per-asset overrides for non-BTC lanes. |
 
 Production uses the `PRODUCTION_` prefixed versions in `.env`, mapped into the
 container as the runtime names above.
+
+BTC uses the legacy `CRYPTO_BTC15M_TOUCH20_*` flags. Non-BTC lanes are disabled
+by default and must be enabled through `CRYPTO_15M_TOUCH20_ASSET_SETTINGS`.
+Example:
+
+```json
+{
+  "ETH": {
+    "rules_enabled": true,
+    "trading_enabled": false,
+    "max_open_notional_dollars": 10,
+    "daily_loss_limit_dollars": 10,
+    "take_profit_pct": 0.20,
+    "stop_loss_pct": 0.20,
+    "min_rule_score": 0.60
+  }
+}
+```
 
 ## Entry Checklist
 
 An entry can be submitted only when all of the following are true:
 
-1. The command scope is BTC 15m.
-2. `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true`.
+1. The command scope is a supported 15m asset.
+2. The asset lane has `rules_enabled=true`; BTC uses
+   `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true`.
 3. The running container color is the active deployment color.
 4. The kill switch is off.
 5. The separate rules replay gate has status `passed`.
@@ -84,18 +110,20 @@ An entry can be submitted only when all of the following are true:
 7. The latest market quote snapshot is fresh.
 8. Market status is open or active.
 9. YES bid, YES ask, NO bid, and NO ask are present.
-10. BTC spot features are fresh and non-proxy.
+10. Asset spot features are fresh and non-proxy.
 11. Market age is at least 60 seconds.
 12. Time to close is at least 300 seconds.
 13. Entry ask is at least the configured minimum contract price, default `$0.10`.
 14. The +20% fee-aware target exit price is below `$1.00`.
 15. Spread is within tier limits: 1 cent under 20c, otherwise 2 cents.
 16. Standalone rule score clears the configured minimum.
-17. Candidate replay bucket is allowed by `btc15m_touch20_rules_gate:15m:BTC`.
+17. Candidate replay bucket is allowed by the asset-owned gate, such as
+    `btc15m_touch20_rules_gate:15m:BTC` or `eth15m_touch20_rules_gate:15m:ETH`.
 18. Strategy-owned open plus pending notional remains within the `$10` cap.
 19. Operator approval checkpoint exists and references the latest passed gate
     version.
-20. `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
+20. The asset lane has `trading_enabled=true`; BTC uses
+    `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
 
 If the final trading flag is false, the process can still produce
 `trading_disabled` telemetry with the selected candidate and no order.
@@ -156,6 +184,12 @@ Gate artifact:
 btc15m_touch20_rules_gate:15m:BTC
 ```
 
+Non-BTC lanes use their own artifact type, for example:
+
+```text
+eth15m_touch20_rules_gate:15m:ETH
+```
+
 Gate requirements:
 
 - at least 50 candidates
@@ -171,6 +205,12 @@ Approval checkpoint:
 
 ```text
 btc15m_touch20_rules_approval:<kalshi_env>:BTC:15m
+```
+
+Non-BTC approvals are separate, for example:
+
+```text
+eth15m_touch20_rules_approval:<kalshi_env>:ETH:15m
 ```
 
 A new gate version invalidates old approval until the operator approves again.
@@ -215,9 +255,10 @@ Before tiny-live:
 
 1. Confirm active color and kill switch.
 2. Confirm production write credentials are present.
-3. Confirm BTC 15m quote collection is current.
-4. Confirm BTC spot rows are fresh and non-proxy.
-5. Confirm `btc15m_touch20_rules_gate:15m:BTC` is passed.
+3. Confirm the asset's 15m quote collection is current.
+4. Confirm the asset spot rows are fresh and non-proxy.
+5. Confirm the asset-owned gate, such as `btc15m_touch20_rules_gate:15m:BTC`, is
+   passed.
 6. Confirm the selected dry-run candidate is in an allowed replay bucket.
 7. Confirm the strategy ledger has no stale pending notional.
 8. Confirm max strategy notional remains `$10`.
@@ -229,9 +270,14 @@ Then enable:
 ```bash
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT=0.20
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS=10
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_DAILY_LOSS_LIMIT_DOLLARS=10
 ```
+
+For non-BTC lanes, run the same replay, gate, approve, status, run-once, and
+exit-once commands with that asset symbol. Do not set a non-BTC lane's
+`trading_enabled` override to `true` until its own gate and approval are valid.
 
 Start or recreate the process:
 
@@ -253,15 +299,17 @@ kalshi-bot-cli crypto-non-model-touch20 exit-once \
 ```
 
 The exit loop evaluates only strategy-ledger positions with the `b15t20r:`
-prefix. It exits on:
+prefix for BTC, or the asset lane's own prefix for non-BTC. It exits on:
 
 - `take_profit`: net executable profit is at least +20%
+- `stop_loss`: net executable profit is at or below -20%
 - `profit_protection_floor`: armed profit falls to 5% or lower
 - `profit_protection_adverse_momentum`: armed profit is declining and spot
   momentum is adverse
 
 Profit protection arms only after net executable profit first reaches +10%.
-There is no initial hard stop in v1.
+The stop loss is not a resting exchange order; it is evaluated by the dedicated
+exit loop from current executable quotes.
 
 ## Ledger
 
@@ -269,6 +317,12 @@ Checkpoint stream:
 
 ```text
 btc15m_touch20_rules:<kalshi_env>:BTC:15m
+```
+
+Non-BTC lanes use separate streams, for example:
+
+```text
+eth15m_touch20_rules:<kalshi_env>:ETH:15m
 ```
 
 The ledger records:
@@ -286,8 +340,8 @@ The ledger records:
 - realized P/L when closed
 
 Manual trades and model-bot trades can overlap the same Kalshi market, but they
-must not be counted as strategy-owned unless they are in this ledger under the
-`b15t20r:` prefix.
+must not be counted as strategy-owned unless they are in that asset lane's
+ledger under that lane's order prefix.
 
 ## Monitoring
 
@@ -303,7 +357,7 @@ Watch these first:
   profit-protection exits, settlement holds
 - risk: strategy open notional, pending notional, daily loss, cap blocks,
   overlap with model-bot positions
-- market regime: BTC spot volatility, short-term momentum, distance to target,
+- market regime: asset spot volatility, short-term momentum, distance to target,
   liquidity by price band, time-to-close bucket
 
 Ops events are logged with source:
@@ -320,9 +374,12 @@ The fastest safe rollback is to disable entries:
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=false
 ```
 
+For non-BTC lanes, set that asset's `trading_enabled` override to `false`.
+
 Keep the process running if it owns open positions, because the exit loop is the
-strategy-specific take-profit and profit-protection path. If the process itself
-must be stopped, manually inspect and manage any open `b15t20r:` positions first.
+strategy-specific take-profit, stop-loss, and profit-protection path. If the
+process itself must be stopped, manually inspect and manage any open
+strategy-prefixed positions first, such as `b15t20r:` for BTC.
 
 For a hard stop of new evaluation:
 
@@ -334,11 +391,11 @@ Global kill switch also blocks entries and still allows risk-reducing exits.
 
 ## Important Caveats
 
-- This is a tiny-live path, not a broad BTC 15m replacement.
+- This is a tiny-live path, not a broad 15m crypto replacement.
 - The replay gate is necessary, not sufficient. Live spread and fill quality can
   differ from historical quote-path snapshots.
 - The ledger is strategy-local. If an exchange fill happens after initial order
   submission, reconciliation must keep the strategy ledger accurate before
   sizing up.
-- No initial hard stop means losses can still settle to full contract loss if
-  neither take-profit nor profit protection exits fill.
+- The stop loss only works when the process has a fresh quote and can submit a
+  risk-reducing close; it is not a guaranteed exchange-side stop.

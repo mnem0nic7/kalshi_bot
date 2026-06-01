@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from pydantic import AliasChoices, Field, model_validator
@@ -346,6 +347,7 @@ class Settings(BaseSettings):
     crypto_btc15m_touch20_rules_enabled: bool = False
     crypto_btc15m_touch20_rules_trading_enabled: bool = False
     crypto_btc15m_touch20_take_profit_pct: float = 0.20
+    crypto_btc15m_touch20_stop_loss_pct: float = 0.20
     crypto_btc15m_touch20_min_market_age_seconds: int = 60
     crypto_btc15m_touch20_min_seconds_to_close: int = 300
     crypto_btc15m_touch20_replay_min_candidates: int = 50
@@ -362,6 +364,8 @@ class Settings(BaseSettings):
     crypto_btc15m_touch20_min_rule_score: float = 0.60
     crypto_btc15m_touch20_quote_fresh_seconds: int = 30
     crypto_btc15m_touch20_spot_fresh_seconds: int = 180
+    crypto_15m_touch20_rules_assets: str = "BTC"
+    crypto_15m_touch20_asset_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     crypto_take_profit_enabled: bool = True
     crypto_take_profit_frequencies: str = "15m,1h"

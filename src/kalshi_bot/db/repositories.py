@@ -78,6 +78,12 @@ from kalshi_bot.db.models import (
 _GENERIC_CRYPTO_STRATEGY_CODES = {"CRYPTO_15M", "CRYPTO_1H"}
 _CLIENT_ORDER_STRATEGY_PREFIXES = {
     "b15t20r:": "btc15m_touch20_rules",
+    "eth15t20r:": "eth15m_touch20_rules",
+    "sol15t20r:": "sol15m_touch20_rules",
+    "xrp15t20r:": "xrp15m_touch20_rules",
+    "bnb15t20r:": "bnb15m_touch20_rules",
+    "doge15t20r:": "doge15m_touch20_rules",
+    "hype15t20r:": "hype15m_touch20_rules",
 }
 
 

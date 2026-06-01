@@ -14,10 +14,12 @@ deterministic trading on Kalshi crypto markets using live Kalshi quotes,
 spot/candle evidence, a per-asset prediction model, and a fee-aware candidate
 selector.
 
-There is also a separate non-model BTC 15-minute rules path,
-`btc15m_touch20_rules`. It does not load trained predictive model artifacts and
-does not call the crypto probability model. It can only trade BTC 15-minute
-markets after its own quote-path replay gate passes.
+There is also a separate non-model 15-minute Touch20 rules path. BTC keeps the
+legacy strategy code `btc15m_touch20_rules`; ETH, SOL, XRP, BNB, DOGE, and HYPE
+use separate asset lanes such as `eth15m_touch20_rules`. These lanes do not load
+trained predictive model artifacts and do not call the crypto probability model.
+Each lane can trade only after its own quote-path replay gate and matching
+operator approval pass.
 
 Crypto is not a single global live switch. It is promoted per asset. BTC can be
 approved without approving ETH, and deployment-note asset mode `off` wins over
@@ -33,7 +35,7 @@ own replay, P/L, and asset-mode gates pass.
 |---|---:|---|---|
 | `CRYPTO_15M` live-quality | Active shadow | Predict fair YES for 15-minute crypto markets and select the best fee-adjusted YES/NO buy candidate. | Per-asset live only after replay, asset-mode, risk, and execution gates pass. |
 | `CRYPTO_1H` live-quality | Active shadow | Predict fair YES for 1-hour crypto markets and select the best fee-adjusted YES/NO buy candidate. | Same per-asset live gates as `CRYPTO_15M`; ongoing collection runs in the crypto-only 1h daemon with `CRYPTO_AUTO_FREQUENCIES=1h`. |
-| `btc15m_touch20_rules` | Disabled by default | Independent BTC-only, 15-minute, non-model Touch20 path. It enters on a standalone rules score plus replay bucket evidence and exits at +20% net executable profit. | Requires `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true`, a passed `btc15m_touch20_rules_gate:15m:BTC`, gate-version-matched operator approval, active color, kill switch off, fresh real quotes and spot, strategy cap room, and `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true` before live order submission. |
+| `*_15m_touch20_rules` | Disabled by default except explicitly enabled lanes | Independent 15-minute, non-model Touch20 path for BTC, ETH, SOL, XRP, BNB, DOGE, and HYPE. It enters on a standalone rules score plus replay bucket evidence, exits at +20% net executable profit, and cuts at -20% net executable loss. | Requires the asset lane enabled, a passed asset-owned gate such as `btc15m_touch20_rules_gate:15m:BTC` or `eth15m_touch20_rules_gate:15m:ETH`, gate-version-matched operator approval, active color, kill switch off, fresh real quotes and spot, strategy cap room, and asset-lane `trading_enabled=true` before live order submission. |
 | Crypto exploratory shadow | Active shadow | Collect candidate and quote evidence even when live edge is not present. | Never live eligible; evidence only. |
 | Per-asset policy promotion | Active control path | Stage asset-specific crypto policy in the active agent pack. | One asset at a time after live-path readiness passes. |
 | Crypto market making | Out of scope | Posting two-sided liquidity. | Not supported. |
@@ -111,11 +113,13 @@ Every crypto decision should persist enough candidate trace data to recover the
 model version, backtest version, replay-gate status, runtime crypto policy,
 asset mode, selected side, expected fee, expected net edge, and live eligibility.
 
-## BTC 15m Non-Model Touch20 Rules Path
+## Crypto 15m Non-Model Touch20 Rules Path
 
-`btc15m_touch20_rules` is an additive process. It runs beside the existing crypto
-daemons and must not disable, retune, or gate the model-trained crypto paths. The
-path is scoped to BTC 15-minute markets only.
+The non-model 15m Touch20 rules process is additive. It runs beside the existing
+crypto daemons and must not disable, retune, or gate the model-trained crypto
+paths. It is scoped to supported 15-minute crypto assets only: BTC, ETH, SOL,
+XRP, BNB, DOGE, and HYPE. BTC uses `btc15m_touch20_rules`; non-BTC lanes use
+their own strategy codes, such as `eth15m_touch20_rules`.
 
 ### Objective
 
@@ -133,7 +137,7 @@ target before close and the dedicated exit loop fills.
 The path may use:
 
 - live Kalshi bid/ask quote snapshots
-- fresh non-proxy BTC spot features
+- fresh non-proxy asset spot features
 - standalone deterministic rules scoring
 - replay-derived bucket evidence from settled quote paths
 - deployment control, active color, kill switch, credentials, and execution
@@ -155,10 +159,10 @@ authority.
 ### Runtime Process
 
 The Docker service is `crypto_non_model_btc15m_touch20_production`. Each loop
-runs:
+runs over `CRYPTO_15M_TOUCH20_RULES_ASSETS`, default `BTC`:
 
-1. `crypto-non-model-touch20 exit-once`
-2. `crypto-non-model-touch20 run-once`
+1. `crypto-non-model-touch20 exit-once` for each configured asset
+2. `crypto-non-model-touch20 run-once` for each configured asset
 3. sleep for `CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS`, default 15 seconds
 
 The exit pass runs first so existing strategy-owned positions get a chance to
@@ -169,21 +173,21 @@ take profit before the process considers a new entry.
 The entry loop returns without submitting an order unless every required gate
 passes:
 
-1. CLI scope is exactly `--frequency 15m --asset BTC`.
-2. `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true`.
+1. CLI scope is a supported `--frequency 15m` asset.
+2. The asset lane has `rules_enabled=true`; BTC uses
+   `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true`.
 3. The running app color equals deployment control `active_color`.
 4. Deployment kill switch is off.
-5. The latest `btc15m_touch20_rules_gate:15m:BTC` artifact exists and is
-   passed.
+5. The latest asset-owned gate artifact exists and is passed.
 6. The operator approval checkpoint exists and references that exact gate
    version.
 7. Strategy-only realized P/L for the current UTC day is above the daily loss
    limit. Default loss limit is `$10`.
-8. At least one latest BTC 15m snapshot is fresh under
+8. At least one latest asset 15m snapshot is fresh under
    `CRYPTO_BTC15M_TOUCH20_QUOTE_FRESH_SECONDS`.
 9. Market status is open or active.
 10. YES bid, YES ask, NO bid, and NO ask are all present.
-11. BTC spot data is fresh under `CRYPTO_BTC15M_TOUCH20_SPOT_FRESH_SECONDS`
+11. Asset spot data is fresh under `CRYPTO_BTC15M_TOUCH20_SPOT_FRESH_SECONDS`
     and the spot source is not proxy-only.
 12. Candidate status is `live_quality` under the standalone rules engine.
 13. Candidate replay bucket is present in the gate artifact's
@@ -191,7 +195,8 @@ passes:
 14. Candidate `rule_score` is at least `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE`.
 15. Strategy-owned open plus pending notional is below
    `CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS`, default `$10`.
-16. `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
+16. The asset lane has `trading_enabled=true`; BTC uses
+    `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
 
 If the first rules flag is true but the trading flag is false, the path can
 select and log a candidate but returns `trading_disabled` and submits no order.
@@ -212,15 +217,15 @@ For each side the entry selector computes:
 - fee-aware exit price required for +20% net profit
 - price-band, spread-band, and time-to-close bucket
 - standalone rules score
-- expected return using +20% upside and no initial hard-stop downside
+- expected return using +20% touch upside and the configured risk settings
 - bucket key used to match replay evidence
 
 The standalone rules score combines:
 
 - replay bucket touch rate
 - replay bucket P/L per candidate
-- short-term BTC spot momentum in the candidate side's direction
-- recent BTC spot volatility
+- short-term asset spot momentum in the candidate side's direction
+- recent asset spot volatility
 - remaining time
 - target-gap closeness
 - spread quality
@@ -275,12 +280,20 @@ Only the top ranked candidate is submitted in a single `run-once` cycle.
 ### Order And Ledger Attribution
 
 Entry orders use strategy prefix `b15t20r:e:` and strategy code
-`btc15m_touch20_rules`. Exit orders use prefix `b15t20r:x:`.
+`btc15m_touch20_rules` for BTC. Non-BTC lanes use their own prefixes and
+strategy codes, such as `eth15t20r:e:` and `eth15m_touch20_rules`. Exit orders
+use the same lane prefix with `:x:`.
 
 The strategy maintains its own checkpoint ledger:
 
 ```text
 btc15m_touch20_rules:<kalshi_env>:BTC:15m
+```
+
+Non-BTC lanes maintain separate ledgers, for example:
+
+```text
+eth15m_touch20_rules:<kalshi_env>:ETH:15m
 ```
 
 That ledger is the source of truth for strategy-owned open notional, pending
@@ -289,6 +302,8 @@ aggregated by market, so this path must not infer ownership from aggregate
 exchange position alone. Manual trades and current model-bot trades may overlap
 the same market, but they should not count against this path's `$10` cap unless
 they are recorded under the `b15t20r:` prefix in the strategy ledger.
+For non-BTC lanes, the equivalent asset prefix, such as `eth15t20r:`, is the
+ownership boundary.
 
 ### Sizing And Risk
 
@@ -320,12 +335,14 @@ Exit triggers:
 | Trigger | Rule |
 |---|---|
 | `take_profit` | net executable profit is at least `CRYPTO_BTC15M_TOUCH20_TAKE_PROFIT_PCT`, default `0.20` |
+| `stop_loss` | net executable profit is at or below negative `CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT`; default setting `0.20` triggers at `-0.20` |
 | `profit_protection_floor` | profit protection is armed and profit falls to or below `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_FLOOR_PCT`, default `0.05` |
-| `profit_protection_adverse_momentum` | profit protection is armed, quote profit declines from the prior observation, and BTC spot momentum is adverse across short windows |
+| `profit_protection_adverse_momentum` | profit protection is armed, quote profit declines from the prior observation, and asset spot momentum is adverse across short windows |
 
 Profit protection arms only after net executable profit first reaches
 `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_THRESHOLD_PCT`, default `0.10`.
-There is no initial hard stop in v1.
+The stop loss is evaluated by the dedicated exit loop from current executable
+quotes; it is not a resting exchange-side stop order.
 
 Exit submissions use the existing close-position path with
 `allow_risk_reducing_exit=True`. If an exit order is cancelled, expired, or
@@ -347,16 +364,28 @@ candidate row it scans future same-market quote snapshots before close:
 2. If no touch occurs before close, replay simulates holding to settlement.
 3. Results are grouped into replay buckets used by live selection.
 
-The gate artifact is separate from model and 1-hour Touch20 gates:
+Each lane's gate artifact is separate from model and 1-hour Touch20 gates:
 
 ```text
 btc15m_touch20_rules_gate:15m:BTC
 ```
 
-Live entry also requires:
+Non-BTC example:
+
+```text
+eth15m_touch20_rules_gate:15m:ETH
+```
+
+Live entry also requires the lane's own approval checkpoint:
 
 ```text
 btc15m_touch20_rules_approval:<kalshi_env>:BTC:15m
+```
+
+Non-BTC example:
+
+```text
+eth15m_touch20_rules_approval:<kalshi_env>:ETH:15m
 ```
 
 The approval checkpoint must reference the latest passed gate version. A new
@@ -366,7 +395,7 @@ Gate pass requirements:
 
 | Gate | Requirement |
 |---|---:|
-| Strategy | `btc15m_touch20_rules` |
+| Strategy | asset-specific, for example `btc15m_touch20_rules` or `eth15m_touch20_rules` |
 | Uses trained model | false |
 | Real quote-path evidence | present |
 | Minimum candidates | 50 |
@@ -882,7 +911,7 @@ Before enabling live crypto for any asset:
 ## Related Docs
 
 - [Operations](../operations.md)
-- [BTC 15m Touch20 Rules Runbook](../operations/btc15m-touch20-rules.md)
+- [Crypto 15m Touch20 Rules Runbook](../operations/btc15m-touch20-rules.md)
 - [Self Improve](../self_improve.md)
 - [Weather Trading Strategy](weather-trading-strategy.md)
 - [Strategy Page](strategy_page.md)

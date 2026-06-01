@@ -161,6 +161,28 @@ async def test_btc15m_touch20_prefix_overrides_generic_crypto_order_attribution(
 
 
 @pytest.mark.asyncio
+async def test_non_btc_touch20_prefix_overrides_generic_crypto_order_attribution(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        order = await repo.upsert_order(
+            client_order_id="eth15t20r:e:abc123",
+            market_ticker="KXETH15M-26JUN011800-00",
+            status="canceled",
+            side="yes",
+            action="buy",
+            yes_price_dollars=Decimal("0.5200"),
+            count_fp=Decimal("10.00"),
+            raw={"source": "stream"},
+            kalshi_order_id="kalshi-eth15-order",
+            kalshi_env="demo",
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        )
+
+        assert order.strategy_code == "eth15m_touch20_rules"
+
+
+@pytest.mark.asyncio
 async def test_btc15m_touch20_fill_keeps_matched_order_attribution_over_generic_crypto(repo_factory, room_id):
     session_ctx = await repo_factory()
     async with session_ctx as session:
