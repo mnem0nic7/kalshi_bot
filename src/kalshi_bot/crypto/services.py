@@ -9645,13 +9645,14 @@ def _fit_crypto_xgboost_model(
         _xgb_kwargs: dict[str, Any] = {"tree_method": "hist"}
         if _xgb_device not in ("", "cpu"):
             _xgb_kwargs["device"] = _xgb_device
+        _xgb_min_child = 20 if len(raw_matrix) > 20000 else 10 if len(raw_matrix) > 5000 else 5
         classifier = xgb.XGBClassifier(
             n_estimators=100,
             max_depth=3,
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            min_child_weight=20,
+            min_child_weight=_xgb_min_child,
             reg_lambda=1.5,
             eval_metric="logloss",
             random_state=17,
@@ -9713,6 +9714,7 @@ def _fit_crypto_lightgbm_model(
         return {"name": "lightgbm_classifier", "status": "unavailable", "reason": f"lightgbm_unavailable:{exc}", "dependency_version": None}
     try:
         _lgb_n_jobs = int(os.environ.get("CRYPTO_LIGHTGBM_N_JOBS", "-1"))
+        _lgb_min_child = 20 if len(raw_matrix) > 20000 else 10 if len(raw_matrix) > 5000 else 5
         classifier = lgb.LGBMClassifier(
             n_estimators=100,
             max_depth=3,
@@ -9720,7 +9722,7 @@ def _fit_crypto_lightgbm_model(
             num_leaves=15,
             subsample=0.8,
             colsample_bytree=0.8,
-            min_child_samples=20,
+            min_child_samples=_lgb_min_child,
             reg_lambda=1.5,
             random_state=17,
             n_jobs=_lgb_n_jobs,
