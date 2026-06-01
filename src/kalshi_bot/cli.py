@@ -125,6 +125,7 @@ CRYPTO_ENV_COMMANDS = {
     "crypto-replay",
     "crypto-status",
     "crypto-autonomy",
+    "crypto-non-model-touch20",
     "crypto-asset-mode",
     "crypto-policy",
     "crypto-live-path",
@@ -861,6 +862,23 @@ async def _run_crypto_autonomy_command(args: argparse.Namespace, container: AppC
     )
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("status") in {"ok", "inactive_color"} else 1
+
+
+async def _run_crypto_non_model_touch20_command(args: argparse.Namespace, container: AppContainer) -> int:
+    if args.crypto_non_model_touch20_command == "run-once":
+        result = await container.crypto_non_model_touch20_service.run_once(
+            frequency=args.frequency,
+            asset_symbol=args.asset,
+        )
+    elif args.crypto_non_model_touch20_command == "exit-once":
+        result = await container.crypto_non_model_touch20_service.exit_once(
+            frequency=args.frequency,
+            asset_symbol=args.asset,
+        )
+    else:
+        raise ValueError(f"unknown crypto-non-model-touch20 command {args.crypto_non_model_touch20_command}")
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("status") not in {"unsupported_scope", "error"} else 1
 
 
 async def _run_crypto_asset_mode_command(args: argparse.Namespace, container: AppContainer) -> int:
@@ -2956,6 +2974,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if args.command == "crypto-autonomy":
             return await _run_crypto_autonomy_command(args, container)
 
+        if args.command == "crypto-non-model-touch20":
+            return await _run_crypto_non_model_touch20_command(args, container)
+
         if args.command == "crypto-asset-mode":
             return await _run_crypto_asset_mode_command(args, container)
 
@@ -4499,7 +4520,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_replay_gate)
     crypto_replay_gate.add_argument("--frequency", default="15m")
     crypto_replay_gate.add_argument("--assets", nargs="*", default=None)
-    crypto_replay_gate.add_argument("--objective", choices=["settlement", "touch20"], default="settlement")
+    crypto_replay_gate.add_argument("--objective", choices=["settlement", "touch20", "touch20_rules"], default="settlement")
     for name in ("run", "validate"):
         crypto_replay_command = crypto_replay_subparsers.add_parser(name)
         add_kalshi_env_argument(crypto_replay_command)
@@ -4507,7 +4528,7 @@ def build_parser() -> argparse.ArgumentParser:
         crypto_replay_command.add_argument("--days", type=int, default=30)
         crypto_replay_command.add_argument("--limit", type=int, default=0)
         crypto_replay_command.add_argument("--assets", nargs="*", default=None)
-        crypto_replay_command.add_argument("--objective", choices=["settlement", "touch20"], default="settlement")
+        crypto_replay_command.add_argument("--objective", choices=["settlement", "touch20", "touch20_rules"], default="settlement")
         crypto_replay_command.add_argument("--json", action="store_true")
 
     crypto_status = subparsers.add_parser("crypto-status")
@@ -4522,6 +4543,18 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_autonomy_run_once.add_argument("--frequency", default="15m")
     crypto_autonomy_run_once.add_argument("--assets", nargs="*", default=None)
     crypto_autonomy_run_once.add_argument("--json", action="store_true")
+
+    crypto_non_model_touch20 = subparsers.add_parser("crypto-non-model-touch20")
+    crypto_non_model_touch20_subparsers = crypto_non_model_touch20.add_subparsers(
+        dest="crypto_non_model_touch20_command",
+        required=True,
+    )
+    for name in ("run-once", "exit-once"):
+        command = crypto_non_model_touch20_subparsers.add_parser(name)
+        add_kalshi_env_argument(command)
+        command.add_argument("--frequency", default="15m")
+        command.add_argument("--asset", default="BTC")
+        command.add_argument("--json", action="store_true")
 
     crypto_asset_mode = subparsers.add_parser("crypto-asset-mode")
     crypto_asset_mode_subparsers = crypto_asset_mode.add_subparsers(dest="crypto_asset_mode_command", required=True)

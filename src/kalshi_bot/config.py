@@ -343,6 +343,21 @@ class Settings(BaseSettings):
     crypto_1h_touch_replay_min_net_pnl_dollars: float = 0.0
     crypto_1h_touch_replay_min_pnl_per_candidate_dollars: float = 0.02
     crypto_1h_touch_replay_max_hard_cap_breaches: int = 0
+    crypto_btc15m_touch20_rules_enabled: bool = False
+    crypto_btc15m_touch20_rules_trading_enabled: bool = False
+    crypto_btc15m_touch20_take_profit_pct: float = 0.20
+    crypto_btc15m_touch20_min_market_age_seconds: int = 60
+    crypto_btc15m_touch20_min_seconds_to_close: int = 300
+    crypto_btc15m_touch20_replay_min_candidates: int = 50
+    crypto_btc15m_touch20_replay_min_touch_rate: float = 0.25
+    crypto_btc15m_touch20_replay_min_net_pnl_dollars: float = 0.0
+    crypto_btc15m_touch20_replay_min_pnl_per_candidate_dollars: float = 0.01
+    crypto_btc15m_touch20_replay_max_hard_cap_breaches: int = 0
+    crypto_btc15m_touch20_max_open_notional_dollars: float = 10.0
+    crypto_btc15m_touch20_daily_loss_limit_dollars: float = 10.0
+    crypto_btc15m_touch20_profit_protection_threshold_pct: float = 0.10
+    crypto_btc15m_touch20_profit_protection_floor_pct: float = 0.05
+    crypto_btc15m_touch20_loop_interval_seconds: int = 15
 
     crypto_take_profit_enabled: bool = True
     crypto_take_profit_frequencies: str = "15m,1h"

@@ -67,6 +67,11 @@ Crypto policy is separate from weather thresholds and promotes per asset. A BTC 
 
 Use `crypto-live-path` to collect production evidence and show the exact blockers before any crypto asset is promoted out of shadow mode. The command does not relax replay gates, promote assets, or enable production crypto switches.
 
+The independent BTC 15-minute non-model Touch20 path has its own runbook:
+[BTC 15m Touch20 Rules](operations/btc15m-touch20-rules.md). It is additive to
+the model-trained crypto path and uses a separate replay gate,
+`replay_gate_touch20_rules:15m:BTC`.
+
 Read-only status:
 
 ```bash

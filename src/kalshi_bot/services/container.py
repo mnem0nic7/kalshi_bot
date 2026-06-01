@@ -17,6 +17,7 @@ from kalshi_bot.crypto.services import (
     CryptoForecastService,
     CryptoHistoryService,
     CryptoMarketService,
+    CryptoNonModelTouch20Service,
     CryptoReplayService,
     CryptoSpotService,
     CryptoTrainingBackfillService,
@@ -136,6 +137,7 @@ class AppContainer:
     crypto_spot_service: CryptoSpotService
     crypto_training_backfill_service: CryptoTrainingBackfillService
     crypto_forecast_service: CryptoForecastService
+    crypto_non_model_touch20_service: CryptoNonModelTouch20Service
     crypto_replay_service: CryptoReplayService
     crypto_execution_service: CryptoExecutionService
     crypto_workflow_service: CryptoWorkflowService
@@ -229,6 +231,13 @@ class AppContainer:
         crypto_replay_service = CryptoReplayService(
             settings=settings,
             session_factory=session_factory,
+            agent_pack_service=agent_pack_service,
+        )
+        crypto_non_model_touch20_service = CryptoNonModelTouch20Service(
+            settings=settings,
+            session_factory=session_factory,
+            market_service=crypto_market_service,
+            base_execution_service=execution_service,
             agent_pack_service=agent_pack_service,
         )
         crypto_execution_service = CryptoExecutionService(
@@ -494,6 +503,7 @@ class AppContainer:
             crypto_training_backfill_service=crypto_training_backfill_service,
             crypto_autonomy_service=crypto_autonomy_service,
             crypto_forecast_service=crypto_forecast_service,
+            crypto_non_model_touch20_service=crypto_non_model_touch20_service,
             crypto_replay_service=crypto_replay_service,
             weather_live_service=weather_live_service,
         )
@@ -555,6 +565,7 @@ class AppContainer:
             crypto_spot_service=crypto_spot_service,
             crypto_training_backfill_service=crypto_training_backfill_service,
             crypto_forecast_service=crypto_forecast_service,
+            crypto_non_model_touch20_service=crypto_non_model_touch20_service,
             crypto_replay_service=crypto_replay_service,
             crypto_execution_service=crypto_execution_service,
             crypto_workflow_service=crypto_workflow_service,
