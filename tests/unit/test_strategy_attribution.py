@@ -139,6 +139,63 @@ async def test_upsert_order_matches_crypto_execution_client_order_suffix(repo_fa
 
 
 @pytest.mark.asyncio
+async def test_btc15m_touch20_prefix_overrides_generic_crypto_order_attribution(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        order = await repo.upsert_order(
+            client_order_id="b15t20r:e:abc123",
+            market_ticker="KXBTC15M-26JUN011800-00",
+            status="canceled",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.6200"),
+            count_fp=Decimal("26.31"),
+            raw={"source": "stream"},
+            kalshi_order_id="kalshi-b15-order",
+            kalshi_env="demo",
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        )
+
+        assert order.strategy_code == "btc15m_touch20_rules"
+
+
+@pytest.mark.asyncio
+async def test_btc15m_touch20_fill_keeps_matched_order_attribution_over_generic_crypto(repo_factory, room_id):
+    session_ctx = await repo_factory()
+    async with session_ctx as session:
+        repo = PlatformRepository(session, kalshi_env="demo")
+        order = await repo.upsert_order(
+            client_order_id="b15t20r:e:def456",
+            market_ticker="KXBTC15M-26JUN011800-00",
+            status="executed",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.6200"),
+            count_fp=Decimal("5.00"),
+            raw={"source": "execution"},
+            kalshi_order_id="kalshi-b15-fill",
+            kalshi_env="demo",
+            strategy_code="btc15m_touch20_rules",
+        )
+
+        fill = await repo.upsert_fill(
+            market_ticker="KXBTC15M-26JUN011800-00",
+            side="no",
+            action="buy",
+            yes_price_dollars=Decimal("0.6200"),
+            count_fp=Decimal("5.00"),
+            raw={"order_id": "kalshi-b15-fill"},
+            trade_id="trade-b15-fill",
+            kalshi_env="demo",
+            strategy_code=StrategyCode.CRYPTO_15M.value,
+        )
+
+        assert fill.order_id == order.id
+        assert fill.strategy_code == "btc15m_touch20_rules"
+
+
+@pytest.mark.asyncio
 async def test_save_order_repairs_stream_placeholder_with_ticket_attribution(repo_factory, room_id):
     """Execution persistence can race websocket/reconcile order ingestion.
 

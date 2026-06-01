@@ -75,6 +75,20 @@ from kalshi_bot.db.models import (
     WeatherBootstrapHistoricalEvidenceRecord,
 )
 
+_GENERIC_CRYPTO_STRATEGY_CODES = {"CRYPTO_15M", "CRYPTO_1H"}
+_CLIENT_ORDER_STRATEGY_PREFIXES = {
+    "b15t20r:": "btc15m_touch20_rules",
+}
+
+
+def _strategy_code_for_client_order_prefix(client_order_id: str | None) -> str | None:
+    if not client_order_id:
+        return None
+    for prefix, strategy_code in _CLIENT_ORDER_STRATEGY_PREFIXES.items():
+        if client_order_id.startswith(prefix):
+            return strategy_code
+    return None
+
 
 def _quantize_money(value: Any) -> Decimal:
     return as_decimal(value).quantize(Decimal("0.0001"))
@@ -2688,6 +2702,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         client_order_id: str | None,
     ) -> str | None:
         """Strategy code flows from the ticket if caller didn't specify one."""
+        prefix_strategy = _strategy_code_for_client_order_prefix(client_order_id)
+        if prefix_strategy is not None and (strategy_code is None or strategy_code in _GENERIC_CRYPTO_STRATEGY_CODES):
+            return prefix_strategy
         if strategy_code is not None:
             return strategy_code
         if ticket_id is not None:
@@ -3043,6 +3060,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 kalshi_order_id=kalshi_order_id,
                 kalshi_env=kalshi_env,
             )
+            if matched is not None and matched.strategy_code and strategy_code in _GENERIC_CRYPTO_STRATEGY_CODES:
+                return matched.id, matched.strategy_code, matched.side
             return (
                 order_id or (matched.id if matched is not None else None),
                 strategy_code,
