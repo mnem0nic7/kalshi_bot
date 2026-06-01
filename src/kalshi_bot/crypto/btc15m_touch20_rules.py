@@ -1088,6 +1088,18 @@ def _entry_payload(
     }
 
 
+def _entry_ledger_decision(order_status: str, filled_count_fp: Decimal | None) -> tuple[bool, str]:
+    filled_fp = filled_count_fp or Decimal("0")
+    normalized = order_status.strip().lower()
+    if normalized in {"shadow_skipped", "kill_switch_blocked", "inactive_color_skipped", "write_credentials_missing"}:
+        return False, "not_recorded"
+    if normalized in {"cancelled", "canceled", "expired", "unfilled_cancelled"} and filled_fp <= Decimal("0"):
+        return False, "entry_canceled_zero_fill"
+    if normalized in {"filled", "executed"} or filled_fp > Decimal("0"):
+        return True, "open"
+    return True, "entry_submitted"
+
+
 def profit_protection_review(
     entry: dict[str, Any],
     *,
@@ -1561,8 +1573,9 @@ class CryptoNonModelTouch20Service:
         receipt = await self.base_execution_service.execute(room=room, control=control, ticket=ticket, client_order_id=client_order_id, fair_yes_dollars=None)
         order_status = str(receipt.status or "")
         filled_count_fp = await self._filled_count_fp(receipt.external_order_id)
-        ledger_count_fp = filled_count_fp if filled_count_fp is not None and filled_count_fp > Decimal("0") else count_fp
-        ledger_status = "open" if order_status in {"filled", "executed"} or (filled_count_fp or Decimal("0")) > Decimal("0") else "entry_submitted"
+        filled_fp = filled_count_fp or Decimal("0")
+        should_update_ledger, ledger_status = _entry_ledger_decision(order_status, filled_count_fp)
+        ledger_count_fp = filled_fp if filled_fp > Decimal("0") else count_fp
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             if receipt.external_order_id or order_status not in {"shadow_skipped", "kill_switch_blocked", "inactive_color_skipped", "write_credentials_missing"}:
@@ -1580,7 +1593,7 @@ class CryptoNonModelTouch20Service:
                     kalshi_env=self.settings.kalshi_env,
                     strategy_code=BTC15M_TOUCH20_RULES_STRATEGY,
                 )
-            if order_status not in {"shadow_skipped", "kill_switch_blocked", "inactive_color_skipped", "write_credentials_missing"}:
+            if should_update_ledger:
                 ledger["positions"][client_order_id] = _entry_payload(
                     market=market,
                     candidate=selected,
@@ -1602,7 +1615,14 @@ class CryptoNonModelTouch20Service:
                 severity="info" if order_status in {"filled", "executed", "submitted"} else "warning",
                 source="crypto_non_model_btc15m_touch20",
                 summary=f"BTC 15m touch20 rules entry {order_status}: {market.market_ticker} {side_text}",
-                payload={"strategy": BTC15M_TOUCH20_RULES_STRATEGY, "client_order_id": client_order_id, "receipt": receipt.model_dump(mode="json"), "selected": _selection_summary(selected_item)},
+                payload={
+                    "strategy": BTC15M_TOUCH20_RULES_STRATEGY,
+                    "client_order_id": client_order_id,
+                    "ledger_recorded": should_update_ledger,
+                    "ledger_status": ledger_status,
+                    "receipt": receipt.model_dump(mode="json"),
+                    "selected": _selection_summary(selected_item),
+                },
                 kalshi_env=self.settings.kalshi_env,
             )
             await session.commit()
@@ -1612,6 +1632,8 @@ class CryptoNonModelTouch20Service:
             "client_order_id": client_order_id,
             "external_order_id": receipt.external_order_id,
             "filled_count_fp": _count_text(filled_count_fp) if filled_count_fp is not None else None,
+            "ledger_recorded": should_update_ledger,
+            "ledger_status": ledger_status,
             "selected": _selection_summary(selected_item),
             "funnel": dict(funnel),
             "gate": gate_summary,

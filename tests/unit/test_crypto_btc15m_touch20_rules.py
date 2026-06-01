@@ -309,6 +309,35 @@ def test_strategy_cap_uses_only_strategy_ledger_entries():
     assert rules._open_pending_notional(ledger) == Decimal("6.0000")
 
 
+def test_zero_fill_terminal_entry_status_does_not_reserve_strategy_cap():
+    assert rules._entry_ledger_decision("canceled", Decimal("0")) == (
+        False,
+        "entry_canceled_zero_fill",
+    )
+    assert rules._entry_ledger_decision("cancelled", None) == (
+        False,
+        "entry_canceled_zero_fill",
+    )
+    assert rules._entry_ledger_decision("expired", Decimal("0.00")) == (
+        False,
+        "entry_canceled_zero_fill",
+    )
+
+
+def test_filled_or_pending_entry_status_updates_strategy_ledger():
+    assert rules._entry_ledger_decision("canceled", Decimal("0.25")) == (True, "open")
+    assert rules._entry_ledger_decision("filled", Decimal("1.00")) == (True, "open")
+    assert rules._entry_ledger_decision("executed", None) == (True, "open")
+    assert rules._entry_ledger_decision("submitted", None) == (True, "entry_submitted")
+
+
+def test_noop_execution_status_does_not_update_strategy_ledger():
+    assert rules._entry_ledger_decision("shadow_skipped", None) == (False, "not_recorded")
+    assert rules._entry_ledger_decision("kill_switch_blocked", Decimal("0")) == (False, "not_recorded")
+    assert rules._entry_ledger_decision("inactive_color_skipped", None) == (False, "not_recorded")
+    assert rules._entry_ledger_decision("write_credentials_missing", None) == (False, "not_recorded")
+
+
 def test_operator_approval_must_match_gate_version():
     gate = type("Gate", (), {"version": "gate-v1", "status": "passed", "payload": {"passed": True}})()
 
