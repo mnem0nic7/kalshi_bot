@@ -95,6 +95,7 @@ class DaemonService:
         crypto_autonomy_service: CryptoAutonomyService | None = None,
         crypto_forecast_service: CryptoForecastService | None = None,
         crypto_replay_service: CryptoReplayService | None = None,
+        crypto_non_model_touch20_service: Any | None = None,
         weather_live_service: Any | None = None,
     ) -> None:
         self.settings = settings
@@ -129,6 +130,7 @@ class DaemonService:
         self.crypto_autonomy_service = crypto_autonomy_service
         self.crypto_forecast_service = crypto_forecast_service
         self.crypto_replay_service = crypto_replay_service
+        self.crypto_non_model_touch20_service = crypto_non_model_touch20_service
         self.weather_live_service = weather_live_service
         self.stop_loss_service = stop_loss_service
         self.crypto_take_profit_service = crypto_take_profit_service
