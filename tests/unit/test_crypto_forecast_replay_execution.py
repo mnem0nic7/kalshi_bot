@@ -132,6 +132,7 @@ def _replay_row(**overrides) -> dict[str, object]:
         "mid_yes_dollars": Decimal("0.7000"),
         "yes_bid_dollars": Decimal("0.4800"),
         "yes_ask_dollars": Decimal("0.5000"),
+        "no_bid_dollars": Decimal("0.4800"),
         "no_ask_dollars": Decimal("0.5000"),
         "spread_bps": 200,
         "spot_feature_status": "available",
@@ -268,6 +269,7 @@ def test_crypto_touch20_replay_gate_blocks_missing_negative_and_undersampled(tmp
             "hard_cap_breaches": 0,
             "touch_rate": 1.0,
             "allowed_bucket_keys": [],
+            "real_quote_path_row_count": 1,
         },
         settings=settings,
     )
@@ -275,6 +277,22 @@ def test_crypto_touch20_replay_gate_blocks_missing_negative_and_undersampled(tmp
     assert any("candidate count 1 below minimum 2" in reason for reason in reasons)
     assert any("net P/L $-0.10" in reason for reason in reasons)
     assert any("no allowed bucket support" in reason for reason in reasons)
+
+    missing_quote_path_reasons = _crypto_touch_replay_gate_reasons(
+        {
+            "trade_candidate_count": 0,
+            "current_model_live_quality_candidate_count": 0,
+            "net_simulated_pl_dollars": 0.0,
+            "hard_cap_breaches": 0,
+            "touch_rate": 0.0,
+            "allowed_bucket_keys": [],
+            "real_quote_path_row_count": 0,
+            "touch_replay_data_missing_reason": "missing_real_quote_path_evidence",
+        },
+        settings=settings,
+    )
+
+    assert any("no settled real quote-path evidence" in reason for reason in missing_quote_path_reasons)
 
 
 def test_crypto_touch20_replay_gate_passes_positive_allowed_bucket_support(tmp_path) -> None:
@@ -292,6 +310,7 @@ def test_crypto_touch20_replay_gate_passes_positive_allowed_bucket_support(tmp_p
             "hard_cap_breaches": 0,
             "touch_rate": 0.50,
             "allowed_bucket_keys": ["BTC|yes|0.20-0.35|tight|30m+"],
+            "real_quote_path_row_count": 2,
         },
         settings=settings,
     )

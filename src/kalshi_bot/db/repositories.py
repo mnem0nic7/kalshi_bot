@@ -1391,6 +1391,50 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
         return list((await self.session.execute(stmt)).scalars())
 
+    async def list_crypto_settled_live_quote_path_snapshots(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
+        since: datetime | None = None,
+        limit: int = 200000,
+        defer_payload: bool = False,
+    ) -> list[CryptoMarketSnapshotRecord]:
+        """Return real bid/ask quote paths for settled markets.
+
+        Unlike ``list_crypto_live_quote_snapshots``, this preserves every real
+        quote row in the replay window so touch-target scans can observe the
+        intra-market path before settlement.  Rows must already have a settled
+        label propagated onto the live quote snapshot.
+        """
+        env = self._resolved_kalshi_env(kalshi_env)
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        conditions = [
+            CryptoMarketSnapshotRecord.kalshi_env == env,
+            CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
+            CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
+            CryptoMarketSnapshotRecord.yes_bid_dollars.is_not(None),
+            CryptoMarketSnapshotRecord.yes_ask_dollars.is_not(None),
+            CryptoMarketSnapshotRecord.no_bid_dollars.is_not(None),
+            CryptoMarketSnapshotRecord.no_ask_dollars.is_not(None),
+        ]
+        if frequency is not None:
+            conditions.append(CryptoMarketSnapshotRecord.frequency == frequency)
+        if symbols:
+            conditions.append(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
+        if since is not None:
+            conditions.append(CryptoMarketSnapshotRecord.observed_at >= since)
+        stmt = (
+            select(CryptoMarketSnapshotRecord)
+            .where(*conditions)
+            .order_by(CryptoMarketSnapshotRecord.observed_at.desc(), CryptoMarketSnapshotRecord.market_ticker)
+            .limit(limit)
+        )
+        if defer_payload:
+            stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
+        return list((await self.session.execute(stmt)).scalars())
+
     async def update_crypto_snapshot_settlement_result(
         self,
         *,

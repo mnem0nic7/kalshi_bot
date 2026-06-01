@@ -4177,59 +4177,50 @@ class CryptoReplayService:
         cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
-            feature_decision_rows = (
-                await _crypto_training_feature_decision_rows(
-                    repo,
-                    frequency=freq,
-                    kalshi_env=self.settings.kalshi_env,
-                    asset_symbols=requested_assets,
-                    since=cutoff,
-                    limit=limit or 200_000,
-                )
-                if self.settings.crypto_training_feature_store_enabled
-                else []
+            snapshots = await repo.list_crypto_settled_live_quote_path_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets,
+                since=cutoff,
+                limit=limit or 200_000,
             )
-            snapshots: list[CryptoMarketSnapshotRecord] = []
-            candles: list[CryptoMarketCandlestickRecord] = []
-            spot_rows: list[CryptoSpotOHLCRecord] = []
-            if not feature_decision_rows:
-                snapshots = await repo.list_crypto_market_snapshots(
-                    frequency=freq,
-                    kalshi_env=self.settings.kalshi_env,
-                    asset_symbols=requested_assets,
-                    since=cutoff,
-                    settled_only=True,
-                    limit=200_000,
-                )
-                candles = await repo.list_crypto_market_candlesticks(
-                    frequency=freq,
-                    kalshi_env=self.settings.kalshi_env,
-                    asset_symbols=requested_assets,
-                    since=cutoff,
-                    limit=500_000,
-                )
-                spot_rows = await repo.list_crypto_spot_ohlc(
-                    frequency=freq,
-                    kalshi_env=self.settings.kalshi_env,
-                    asset_symbols=requested_assets,
-                    since=cutoff,
-                    limit=1_000_000,
-                )
+            candles = await repo.list_crypto_market_candlesticks(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets,
+                since=cutoff,
+                limit=500_000,
+            )
+            spot_rows = await repo.list_crypto_spot_ohlc(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets,
+                since=cutoff,
+                limit=1_000_000,
+            )
             funding_rate_rows = await repo.list_crypto_funding_rates_bulk(
                 asset_symbols=requested_assets,
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             await session.commit()
-        dataset_source = "crypto_training_feature_rows" if feature_decision_rows else "settled_snapshots_rebuilt"
-        if feature_decision_rows:
-            rows = _filter_crypto_dict_rows(feature_decision_rows, requested_assets)
-        else:
-            snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
-            candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-            spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
-            snapshots = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, snapshots)
-            rows = _crypto_decision_rows(snapshots, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
+        dataset_source = "settled_live_quote_paths"
+        snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
+        candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+        snapshots = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, snapshots)
+        rebuilt_rows = _crypto_decision_rows(snapshots, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
+        proxy_quote_row_count = sum(1 for row in rebuilt_rows if row.get("quote_source") != "snapshot_quotes")
+        rows = [
+            row
+            for row in rebuilt_rows
+            if row.get("quote_source") == "snapshot_quotes"
+            and row.get("strict_trade_eligible") is True
+            and row.get("yes_bid_dollars") is not None
+            and row.get("yes_ask_dollars") is not None
+            and row.get("no_bid_dollars") is not None
+            and row.get("no_ask_dollars") is not None
+        ]
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
         if limit and limit > 0:
             rows = rows[-limit:]
@@ -4239,6 +4230,12 @@ class CryptoReplayService:
             crypto_policy=crypto_policy,
         )
         metrics = replay.get("metrics") or {}
+        metrics["dataset_source"] = dataset_source
+        metrics["real_quote_path_snapshot_count"] = len(snapshots)
+        metrics["real_quote_path_row_count"] = len(rows)
+        metrics["proxy_quote_row_count"] = proxy_quote_row_count
+        if len(rows) <= 0:
+            metrics["touch_replay_data_missing_reason"] = "missing_real_quote_path_evidence"
         reasons = _crypto_touch_replay_gate_reasons(metrics, settings=self.settings)
         gate = {
             "passed": not reasons,
@@ -4277,7 +4274,9 @@ class CryptoReplayService:
             "dataset": {
                 "source": dataset_source,
                 "row_count": len(rows),
-                "feature_row_count": len(feature_decision_rows),
+                "rebuilt_row_count": len(rebuilt_rows),
+                "real_quote_path_row_count": len(rows),
+                "proxy_quote_row_count": proxy_quote_row_count,
                 "snapshot_count": len(snapshots),
                 "settled_snapshot_count": sum(1 for row in snapshots if row.settlement_result in {"yes", "no"}),
                 "candlestick_count": len(candles),
@@ -8017,15 +8016,20 @@ def _crypto_decision_rows(
             continue
         yes_bid = _snapshot_price(snapshot, attr="yes_bid_dollars", dollar_keys=("yes_bid_dollars",), cent_keys=("yes_bid",))
         yes_ask = _snapshot_price(snapshot, attr="yes_ask_dollars", dollar_keys=("yes_ask_dollars",), cent_keys=("yes_ask",))
+        no_bid = _snapshot_price(snapshot, attr="no_bid_dollars", dollar_keys=("no_bid_dollars",), cent_keys=("no_bid",))
         no_ask = _snapshot_price(snapshot, attr="no_ask_dollars", dollar_keys=("no_ask_dollars",), cent_keys=("no_ask",))
         quote_source = "snapshot_quotes"
         if yes_bid is None or yes_ask is None:
             quote_source = "candlestick_close_proxy"
             yes_bid = mid
             yes_ask = mid
+            no_bid = Decimal("1") - mid
             no_ask = Decimal("1") - mid
-        elif no_ask is None:
-            no_ask = Decimal("1") - yes_bid
+        else:
+            if no_bid is None:
+                no_bid = Decimal("1") - yes_ask
+            if no_ask is None:
+                no_ask = Decimal("1") - yes_bid
         prior_candle = _prior_candle(candles_by_market.get(snapshot.market_ticker, []), decision_ts)
         candle_momentum = None
         if candle is not None and prior_candle is not None and candle.close_dollars is not None and prior_candle.close_dollars is not None:
@@ -8063,6 +8067,7 @@ def _crypto_decision_rows(
                 "mid_yes_dollars": _clamp_price(mid),
                 "yes_bid_dollars": _clamp_price(yes_bid),
                 "yes_ask_dollars": _clamp_price(yes_ask),
+                "no_bid_dollars": _clamp_price(no_bid) if no_bid is not None else None,
                 "no_ask_dollars": _clamp_price(no_ask) if no_ask is not None else None,
                 "spread_bps": int(((yes_ask - yes_bid) * Decimal("10000")).to_integral_value()) if yes_bid is not None and yes_ask is not None else None,
                 "volume": snapshot.volume,
@@ -8128,6 +8133,7 @@ def _crypto_decision_rows(
                     "mid_yes_dollars": mid,
                     "yes_bid_dollars": mid,
                     "yes_ask_dollars": mid,
+                    "no_bid_dollars": _clamp_price(Decimal("1") - mid),
                     "no_ask_dollars": _clamp_price(Decimal("1") - mid),
                     "spread_bps": 0,
                     "volume": candle.volume if candle.volume is not None else snapshot.volume,
@@ -13302,6 +13308,11 @@ def _crypto_touch_replay_gate_reasons(metrics: dict[str, Any], *, settings: Sett
         return ["BTC 1h touch replay artifact is missing."]
     if metrics.get("backtest_missing"):
         reasons.append("BTC 1h touch replay artifact is missing.")
+    real_quote_path_rows = int(metrics.get("real_quote_path_row_count", metrics.get("strict_trade_eligible_count")) or 0)
+    if not metrics.get("backtest_missing") and (
+        metrics.get("touch_replay_data_missing_reason") == "missing_real_quote_path_evidence" or real_quote_path_rows <= 0
+    ):
+        reasons.append("BTC 1h touch replay has no settled real quote-path evidence.")
     candidates = int(metrics.get("current_model_live_quality_candidate_count", metrics.get("trade_candidate_count")) or 0)
     min_candidates = max(1, int(settings.crypto_1h_touch_replay_min_candidates))
     net_pl = float(metrics.get("net_simulated_pl_dollars") or 0.0)

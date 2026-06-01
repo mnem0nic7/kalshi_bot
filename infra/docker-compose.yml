@@ -533,6 +533,58 @@ services:
       CRYPTO_PRODUCTION_AUTONOMY_ENABLED: "false"
       CRYPTO_TRADING_ENABLED: "false"
 
+  crypto_current_btc_1h_production:
+    <<: *production-daemon-base
+    command:
+      - bash
+      - -lc
+      - |
+        cycle=0
+        while true; do
+          cycle=$((cycle + 1))
+          echo "starting BTC 1h current quote-path collection" >&2
+          if ! kalshi-bot-cli crypto-history collect-open \
+            --kalshi-env production \
+            --frequency 1h \
+            --assets BTC \
+            --json; then
+            echo "BTC 1h current quote collection failed" >&2
+          fi
+          if ! kalshi-bot-cli crypto-spot collect-current \
+            --kalshi-env production \
+            --frequency 1h \
+            --assets BTC \
+            --json; then
+            echo "BTC 1h current spot collection failed" >&2
+          fi
+          settled_every="${CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES:-20}"
+          if [[ "$$settled_every" =~ ^[0-9]+$ ]] && (( settled_every > 0 )) && { (( cycle == 1 )) || (( cycle % settled_every == 0 )); }; then
+            if ! kalshi-bot-cli crypto-history collect-settled \
+              --kalshi-env production \
+              --frequency 1h \
+              --assets BTC \
+              --days "${CRYPTO_1H_CURRENT_SETTLED_DAYS:-7}" \
+              --skip-candles \
+              --skip-quality \
+              --json; then
+              echo "BTC 1h settlement label propagation failed" >&2
+            fi
+          fi
+          sleep "${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-15}"
+        done
+    environment:
+      <<: *production-env
+      KALSHI_ENV: production
+      APP_COLOR: ${CRYPTO_1H_CURRENT_APP_COLOR:-blue}
+      CRYPTO_AUTO_FREQUENCIES: "1h"
+      CRYPTO_1H_ENABLED: ${CRYPTO_1H_ENABLED:-true}
+      CRYPTO_HISTORY_AUTO_ENABLED: "false"
+      CRYPTO_SPOT_HISTORY_AUTO_ENABLED: "false"
+      CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED: "false"
+      CRYPTO_AUTONOMY_ENABLED: "false"
+      CRYPTO_PRODUCTION_AUTONOMY_ENABLED: "false"
+      CRYPTO_TRADING_ENABLED: "false"
+
   web_demo:
     <<: *demo-app-base
     environment:
