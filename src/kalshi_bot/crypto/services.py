@@ -355,6 +355,32 @@ def _crypto_touch_replay_gate_passed(replay_gate: Any | None) -> bool:
     return True
 
 
+def _crypto_signal_uses_btc_1h_touch20_gate(
+    signal: StrategySignal,
+    market: CryptoMarket,
+    *,
+    settings: Settings,
+) -> bool:
+    if not _crypto_btc_1h_touch_policy_configured_for_market(market, settings=settings):
+        return False
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    selection = trace.get("trade_selection_model") if isinstance(trace.get("trade_selection_model"), dict) else {}
+    touch_strategy = trace.get("touch_strategy") if isinstance(trace.get("touch_strategy"), dict) else {}
+    selection_touch_strategy = (
+        selection.get("touch_strategy") if isinstance(selection.get("touch_strategy"), dict) else {}
+    )
+    objective = str(selection.get("objective") or trace.get("objective") or "").strip()
+    touch_objective = str(touch_strategy.get("objective") or selection_touch_strategy.get("objective") or "").strip()
+    touch_policy = str(touch_strategy.get("policy") or selection_touch_strategy.get("policy") or "").strip()
+    return (
+        objective == "touch_20pct_before_close"
+        or touch_objective == "exitably_up_20pct_before_close"
+        or touch_policy == "btc_1h_touch20"
+        or isinstance(trace.get("touch_replay_gate"), dict)
+        or isinstance(selection.get("touch_replay_gate"), dict)
+    )
+
+
 def _crypto_last_minute_passive_bid_by_asset(settings: Settings) -> dict[str, Decimal]:
     bids: dict[str, Decimal] = {}
     for raw in str(settings.crypto_last_minute_passive_bid_by_asset or "").replace(";", ",").split(","):
@@ -4522,6 +4548,15 @@ class CryptoExecutionService:
                 kalshi_env=room.kalshi_env,
                 asset_symbol=market.asset_symbol,
             )
+            if _crypto_signal_uses_btc_1h_touch20_gate(signal, market, settings=self.settings):
+                gate = await _latest_crypto_artifact_for_asset(
+                    repo,
+                    frequency=market.frequency,
+                    artifact_type="replay_gate_touch20",
+                    kalshi_env=room.kalshi_env,
+                    asset_symbol=market.asset_symbol,
+                    allow_generic_fallback=False,
+                )
             await session.commit()
         if asset_mode != CRYPTO_ASSET_MODE_LIVE:
             if self.settings.app_shadow_mode or room.shadow_mode:
@@ -4583,6 +4618,7 @@ class CryptoExecutionService:
                     "reason": "crypto replay gate has not passed",
                     "gate_status": gate.status if gate is not None else "missing",
                     "gate_version": gate.version if gate is not None else None,
+                    "gate_artifact_type": gate.artifact_type if gate is not None else None,
                     "gate_runtime_blockers": replay_gate_blockers,
                     "runtime_crypto_policy": _runtime_crypto_policy_payload(
                         crypto_policy,
@@ -4950,6 +4986,23 @@ class CryptoWorkflowService:
                     kalshi_env=room.kalshi_env,
                     asset_symbol=market.asset_symbol,
                 )
+                if _crypto_signal_uses_btc_1h_touch20_gate(signal, market, settings=self.settings):
+                    gate = await _latest_crypto_artifact_for_asset(
+                        repo,
+                        frequency=market.frequency,
+                        artifact_type="replay_gate_touch20",
+                        kalshi_env=room.kalshi_env,
+                        asset_symbol=market.asset_symbol,
+                        allow_generic_fallback=False,
+                    )
+                    backtest = await _latest_crypto_artifact_for_asset(
+                        repo,
+                        frequency=market.frequency,
+                        artifact_type="backtest_touch20",
+                        kalshi_env=room.kalshi_env,
+                        asset_symbol=market.asset_symbol,
+                        allow_generic_fallback=False,
+                    )
                 live_status = self.asset_control_service.market_live_status(
                     control=control,
                     replay_gate=gate,
@@ -4998,6 +5051,7 @@ class CryptoWorkflowService:
                             "model_version": (signal.candidate_trace or {}).get("model_version"),
                             "backtest_version": backtest.version if backtest is not None else None,
                             "replay_gate_status": gate.status if gate is not None else "missing",
+                            "replay_gate_artifact_type": gate.artifact_type if gate is not None else None,
                             "data_quality_status": (
                                 ((backtest.payload or {}).get("data_quality") or {}).get("status")
                                 if backtest is not None
@@ -6350,6 +6404,7 @@ def _crypto_decision_lineage_payload(
         "backtest_version": backtest.version if backtest is not None else None,
         "replay_gate_status": gate.status if gate is not None else "missing",
         "replay_gate_version": gate.version if gate is not None else None,
+        "replay_gate_artifact_type": gate.artifact_type if gate is not None else None,
         "asset_mode": live_status.get("asset_mode"),
         "control_asset_mode": live_status.get("control_asset_mode"),
         "live_eligible": live_status.get("live_eligible"),
