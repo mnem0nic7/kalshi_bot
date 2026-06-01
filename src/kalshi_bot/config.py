@@ -266,8 +266,8 @@ class Settings(BaseSettings):
     crypto_autonomy_idle_interval_seconds: int = 5
     crypto_autonomy_min_seconds_to_close: int = 0
     # Per-frequency override: minimum time-to-close for 1h markets.
-    # The 1h edge has historically appeared late, so keep only a final-minute guard.
-    crypto_1h_autonomy_min_seconds_to_close: int = 60
+    # The final 0-5m bucket is vulnerable to sharp settlement reversals.
+    crypto_1h_autonomy_min_seconds_to_close: int = 300
     # UTC hours (0-23) during which the autonomy loop should skip new entries.
     # Comma-separated string so it's easily set via env var, e.g. "12,13,14,15,16"
     crypto_autonomy_skip_hours_utc: str = ""

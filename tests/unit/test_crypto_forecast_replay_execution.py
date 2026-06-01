@@ -7124,7 +7124,7 @@ def test_crypto_autonomy_selector_uses_1h_close_window_override(tmp_path) -> Non
     settings = _settings(
         tmp_path,
         crypto_autonomy_min_seconds_to_close=600,
-        crypto_1h_autonomy_min_seconds_to_close=60,
+        crypto_1h_autonomy_min_seconds_to_close=300,
         crypto_live_min_market_age_seconds=90,
     )
     now = datetime.now(UTC)
@@ -7133,8 +7133,8 @@ def test_crypto_autonomy_selector_uses_1h_close_window_override(tmp_path) -> Non
         series_ticker="KXBTC",
         asset_symbol="BTC",
         frequency="1h",
-        open_time=now - timedelta(seconds=3510),
-        close_time=now + timedelta(seconds=90),
+        open_time=now - timedelta(seconds=3299),
+        close_time=now + timedelta(seconds=301),
     )
     fifteen_min_market = _market(
         market_ticker="KXBTC15M-LATE",
@@ -7160,6 +7160,32 @@ def test_crypto_autonomy_selector_uses_1h_close_window_override(tmp_path) -> Non
     assert one_hour_skipped == []
     assert fifteen_min_selected == []
     assert fifteen_min_skipped[0]["reason"] == "too_close_to_close"
+
+
+def test_crypto_autonomy_selector_blocks_1h_final_five_minutes_by_default(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_autonomy_min_seconds_to_close=0,
+        crypto_live_min_market_age_seconds=90,
+    )
+    now = datetime.now(UTC)
+    one_hour_market = _market(
+        market_ticker="KXBTC-1H-FINAL-FIVE",
+        series_ticker="KXBTC",
+        asset_symbol="BTC",
+        frequency="1h",
+        open_time=now - timedelta(seconds=3510),
+        close_time=now + timedelta(seconds=90),
+    )
+
+    one_hour_selected, one_hour_skipped = _eligible_market_per_asset(
+        [one_hour_market],
+        min_seconds_to_close=crypto_autonomy_min_seconds_to_close_for_frequency(settings, "1h"),
+        min_market_age_seconds=settings.crypto_live_min_market_age_seconds,
+    )
+
+    assert one_hour_selected == []
+    assert one_hour_skipped[0]["reason"] == "too_close_to_close"
 
 
 def test_crypto_autonomy_cycle_ops_payload_groups_asset_skip_reasons() -> None:

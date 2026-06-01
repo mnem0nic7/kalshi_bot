@@ -639,6 +639,7 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_PRODUCTION_AUTONOMY_ENABLED` | `false` | Enables production autonomy. |
 | `CRYPTO_AUTONOMY_INTERVAL_SECONDS` | `30` | Idle retry interval when autonomy cannot run because the service is missing or the color is inactive. Active autonomy runs continuously: the next pass starts as soon as the prior pass finishes. |
 | `CRYPTO_AUTONOMY_MIN_SECONDS_TO_CLOSE` | `0` | Minimum seconds to close; `0` keeps evaluating until close. |
+| `CRYPTO_1H_AUTONOMY_MIN_SECONDS_TO_CLOSE` | `300` | Per-frequency no-entry buffer for 1h crypto. Keeps BTC 1h out of the final 0-5m settlement-reversal bucket. |
 | `CRYPTO_LATE_SURE_THING_ENABLED` | `true` | Allows the late high-confidence market-confirmed bypass path. |
 | `CRYPTO_LATE_SURE_THING_MAX_SECONDS_TO_CLOSE` | `300` | Outer cap for late high-confidence entries. |
 | `CRYPTO_LATE_SURE_THING_STANDARD_MAX_SECONDS_TO_CLOSE` | `180` | Standard late window; entries inside it use the normal probability floor. |
