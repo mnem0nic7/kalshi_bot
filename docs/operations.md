@@ -70,7 +70,8 @@ Use `crypto-live-path` to collect production evidence and show the exact blocker
 The independent BTC 15-minute non-model Touch20 path has its own runbook:
 [BTC 15m Touch20 Rules](operations/btc15m-touch20-rules.md). It is additive to
 the model-trained crypto path and uses a separate replay gate,
-`replay_gate_touch20_rules:15m:BTC`.
+`btc15m_touch20_rules_gate:15m:BTC`, plus a gate-version-matched operator
+approval checkpoint.
 
 Read-only status:
 

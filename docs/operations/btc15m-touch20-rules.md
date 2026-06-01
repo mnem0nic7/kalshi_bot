@@ -63,6 +63,10 @@ All live flags are disabled by default.
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_THRESHOLD_PCT` | `0.10` | Profit level that arms profit protection. |
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_FLOOR_PCT` | `0.05` | Armed profit-protection floor. |
 | `CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS` | `15` | Docker process loop sleep. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS` | `0.10` | Strategy-owned minimum entry ask. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE` | `0.60` | Minimum standalone rules score for entry. |
+| `CRYPTO_BTC15M_TOUCH20_QUOTE_FRESH_SECONDS` | `30` | Maximum age for live Kalshi quote snapshots. |
+| `CRYPTO_BTC15M_TOUCH20_SPOT_FRESH_SECONDS` | `180` | Maximum age for live BTC spot rows. |
 
 Production uses the `PRODUCTION_` prefixed versions in `.env`, mapped into the
 container as the runtime names above.
@@ -86,10 +90,11 @@ An entry can be submitted only when all of the following are true:
 13. Entry ask is at least the configured minimum contract price, default `$0.10`.
 14. The +20% fee-aware target exit price is below `$1.00`.
 15. Spread is within tier limits: 1 cent under 20c, otherwise 2 cents.
-16. Deterministic touch probability clears the configured minimum.
-17. Expected return clears the active runtime edge threshold.
-18. Candidate replay bucket is allowed by `replay_gate_touch20_rules:15m:BTC`.
-19. Strategy-owned open plus pending notional remains within the `$10` cap.
+16. Standalone rule score clears the configured minimum.
+17. Candidate replay bucket is allowed by `btc15m_touch20_rules_gate:15m:BTC`.
+18. Strategy-owned open plus pending notional remains within the `$10` cap.
+19. Operator approval checkpoint exists and references the latest passed gate
+    version.
 20. `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
 
 If the final trading flag is false, the process can still produce
@@ -102,36 +107,24 @@ entry cycle using this ranking:
 
 1. higher replay bucket P/L per candidate
 2. higher replay bucket touch rate
-3. higher deterministic touch probability
+3. higher standalone rule score
 4. tighter spread
 5. more remaining time
 
-The deterministic touch probability is a heuristic score based on target gap,
-remaining time, realized spot volatility, short-term spot momentum, moneyness,
-and spread penalty. It is not a trained model prediction.
+The standalone rule score is a deterministic weighted score based on replay
+touch rate, replay P/L per candidate, target gap, remaining time, realized spot
+volatility, short-term spot momentum, and spread quality. It is not a trained
+model prediction.
 
 ## Replay And Gate
 
 Build the non-model replay artifact:
 
 ```bash
-kalshi-bot-cli crypto-replay run \
+kalshi-bot-cli crypto-non-model-touch20 replay \
   --kalshi-env production \
   --frequency 15m \
-  --assets BTC \
-  --objective touch20_rules \
-  --days 30 \
-  --json
-```
-
-Validate without persisting a gate:
-
-```bash
-kalshi-bot-cli crypto-replay validate \
-  --kalshi-env production \
-  --frequency 15m \
-  --assets BTC \
-  --objective touch20_rules \
+  --asset BTC \
   --days 30 \
   --json
 ```
@@ -139,18 +132,28 @@ kalshi-bot-cli crypto-replay validate \
 Persist the separate live gate:
 
 ```bash
-kalshi-bot-cli crypto-replay gate \
+kalshi-bot-cli crypto-non-model-touch20 gate \
   --kalshi-env production \
   --frequency 15m \
-  --assets BTC \
-  --objective touch20_rules \
+  --asset BTC \
+  --json
+```
+
+Approve the exact passed gate version:
+
+```bash
+kalshi-bot-cli crypto-non-model-touch20 approve \
+  --kalshi-env production \
+  --frequency 15m \
+  --asset BTC \
+  --approved-by <operator> \
   --json
 ```
 
 Gate artifact:
 
 ```text
-replay_gate_touch20_rules:15m:BTC
+btc15m_touch20_rules_gate:15m:BTC
 ```
 
 Gate requirements:
@@ -163,6 +166,14 @@ Gate requirements:
 - touch rate at least 25%
 - hard-cap breaches equal 0
 - at least one allowed bucket
+
+Approval checkpoint:
+
+```text
+btc15m_touch20_rules_approval:<kalshi_env>:BTC:15m
+```
+
+A new gate version invalidates old approval until the operator approves again.
 
 ## Dry Run
 
@@ -189,6 +200,7 @@ Expected safe statuses include:
 - `inactive_color`
 - `kill_switch_enabled`
 - `gate_blocked`
+- `approval_blocked`
 - `daily_loss_limit_blocked`
 - `no_candidate`
 - `strategy_cap_blocked`
@@ -205,11 +217,12 @@ Before tiny-live:
 2. Confirm production write credentials are present.
 3. Confirm BTC 15m quote collection is current.
 4. Confirm BTC spot rows are fresh and non-proxy.
-5. Confirm `replay_gate_touch20_rules:15m:BTC` is passed.
+5. Confirm `btc15m_touch20_rules_gate:15m:BTC` is passed.
 6. Confirm the selected dry-run candidate is in an allowed replay bucket.
 7. Confirm the strategy ledger has no stale pending notional.
 8. Confirm max strategy notional remains `$10`.
 9. Confirm the existing model-trained crypto bot remains unchanged.
+10. Approve the latest gate with `crypto-non-model-touch20 approve`.
 
 Then enable:
 

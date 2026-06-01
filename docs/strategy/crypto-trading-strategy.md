@@ -33,7 +33,7 @@ own replay, P/L, and asset-mode gates pass.
 |---|---:|---|---|
 | `CRYPTO_15M` live-quality | Active shadow | Predict fair YES for 15-minute crypto markets and select the best fee-adjusted YES/NO buy candidate. | Per-asset live only after replay, asset-mode, risk, and execution gates pass. |
 | `CRYPTO_1H` live-quality | Active shadow | Predict fair YES for 1-hour crypto markets and select the best fee-adjusted YES/NO buy candidate. | Same per-asset live gates as `CRYPTO_15M`; ongoing collection runs in the crypto-only 1h daemon with `CRYPTO_AUTO_FREQUENCIES=1h`. |
-| `btc15m_touch20_rules` | Disabled by default | Independent BTC-only, 15-minute, non-model Touch20 path. It enters on deterministic touch-probability heuristics plus replay bucket evidence and exits at +20% net executable profit. | Requires `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true`, a passed `replay_gate_touch20_rules:15m:BTC`, active color, kill switch off, fresh real quotes and spot, strategy cap room, and `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true` before live order submission. |
+| `btc15m_touch20_rules` | Disabled by default | Independent BTC-only, 15-minute, non-model Touch20 path. It enters on a standalone rules score plus replay bucket evidence and exits at +20% net executable profit. | Requires `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true`, a passed `btc15m_touch20_rules_gate:15m:BTC`, gate-version-matched operator approval, active color, kill switch off, fresh real quotes and spot, strategy cap room, and `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true` before live order submission. |
 | Crypto exploratory shadow | Active shadow | Collect candidate and quote evidence even when live edge is not present. | Never live eligible; evidence only. |
 | Per-asset policy promotion | Active control path | Stage asset-specific crypto policy in the active agent pack. | One asset at a time after live-path readiness passes. |
 | Crypto market making | Out of scope | Posting two-sided liquidity. | Not supported. |
@@ -134,7 +134,7 @@ The path may use:
 
 - live Kalshi bid/ask quote snapshots
 - fresh non-proxy BTC spot features
-- deterministic touch-probability heuristics
+- standalone deterministic rules scoring
 - replay-derived bucket evidence from settled quote paths
 - deployment control, active color, kill switch, credentials, and execution
   safety already used by production
@@ -148,9 +148,9 @@ The path must not use:
 - BTC 1-hour Touch20 gates
 - global crypto take-profit exits for attribution
 
-The candidate payload still has compatibility fields named `model_probability`
-and `raw_model_probability`; in this path those fields contain the deterministic
-touch-probability score, not a trained model output.
+The candidate payload uses standalone `rule_score` and `score_components`
+fields. It does not populate trained-model probability fields as entry
+authority.
 
 ### Runtime Process
 
@@ -173,21 +173,25 @@ passes:
 2. `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true`.
 3. The running app color equals deployment control `active_color`.
 4. Deployment kill switch is off.
-5. The latest `replay_gate_touch20_rules:15m:BTC` artifact exists and is
+5. The latest `btc15m_touch20_rules_gate:15m:BTC` artifact exists and is
    passed.
-6. Strategy-only realized P/L for the current UTC day is above the daily loss
+6. The operator approval checkpoint exists and references that exact gate
+   version.
+7. Strategy-only realized P/L for the current UTC day is above the daily loss
    limit. Default loss limit is `$10`.
-7. At least one latest BTC 15m snapshot is fresh. Freshness uses
-   `max(30s, CRYPTO_TAKE_PROFIT_STALE_SNAPSHOT_SECONDS)`.
-8. Market status is open or active.
-9. YES bid, YES ask, NO bid, and NO ask are all present.
-10. Spot feature status is available and the spot source is not proxy-only.
-11. Candidate status is `live_quality` under the Touch20 rules policy.
-12. Candidate replay bucket is present in the gate artifact's
+8. At least one latest BTC 15m snapshot is fresh under
+   `CRYPTO_BTC15M_TOUCH20_QUOTE_FRESH_SECONDS`.
+9. Market status is open or active.
+10. YES bid, YES ask, NO bid, and NO ask are all present.
+11. BTC spot data is fresh under `CRYPTO_BTC15M_TOUCH20_SPOT_FRESH_SECONDS`
+    and the spot source is not proxy-only.
+12. Candidate status is `live_quality` under the standalone rules engine.
+13. Candidate replay bucket is present in the gate artifact's
    `allowed_bucket_keys`.
-13. Strategy-owned open plus pending notional is below
+14. Candidate `rule_score` is at least `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE`.
+15. Strategy-owned open plus pending notional is below
    `CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS`, default `$10`.
-14. `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
+16. `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
 
 If the first rules flag is true but the trading flag is false, the path can
 select and log a candidate but returns `trading_disabled` and submits no order.
@@ -207,20 +211,21 @@ For each side the entry selector computes:
 - executable entry cost
 - fee-aware exit price required for +20% net profit
 - price-band, spread-band, and time-to-close bucket
-- deterministic touch-probability score
+- standalone rules score
 - expected return using +20% upside and no initial hard-stop downside
 - bucket key used to match replay evidence
 
-The deterministic touch-probability score combines:
+The standalone rules score combines:
 
-- bracket position: how far the current side mid is from the target exit price
-- remaining time scaled by the market interval
-- recent realized spot volatility
+- replay bucket touch rate
+- replay bucket P/L per candidate
 - short-term BTC spot momentum in the candidate side's direction
-- distance-to-target volatility/moneyness
-- spread penalty
+- recent BTC spot volatility
+- remaining time
+- target-gap closeness
+- spread quality
 
-It is clamped to `[0.01, 0.99]`.
+The default minimum score is `0.60`.
 
 ### Entry Candidate Blocks
 
@@ -235,8 +240,7 @@ A candidate is blocked when any of these are true:
 - spread is above the tier limit
 - market age is below 60 seconds
 - time to close is below 300 seconds
-- deterministic touch probability is below the configured minimum
-- expected return is below the active runtime edge threshold
+- standalone rule score is below the configured minimum
 - replay bucket is not allowed by the separate rules gate
 - strategy cap or daily loss cap is exhausted
 
@@ -245,7 +249,7 @@ The current entry window intentionally preserves the final 5-minute entry block:
 
 ### Spread And Price Limits
 
-Default spread limits are inherited from the touch strategy settings:
+Default spread limits are strategy-local hard limits:
 
 | Contract price | Max spread |
 |---:|---:|
@@ -253,7 +257,7 @@ Default spread limits are inherited from the touch strategy settings:
 | `$0.20` and above | 2 cents |
 
 The entry ask must be at least `$0.10` by default through
-`CRYPTO_TOUCH_STRATEGY_MIN_CONTRACT_PRICE_DOLLARS`. The calculated fee-aware
+`CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS`. The calculated fee-aware
 target exit side price must be below `$1.00`.
 
 ### Candidate Ranking
@@ -262,7 +266,7 @@ After filtering, candidates are ranked by:
 
 1. replay bucket P/L per candidate
 2. replay bucket touch rate
-3. deterministic touch probability
+3. standalone rule score
 4. tighter spread
 5. more remaining time
 
@@ -331,7 +335,8 @@ retrying. If an exit is submitted but not immediately closed, the status becomes
 
 ### Replay Gate
 
-The separate rules replay objective is `touch20_rules`.
+Replay, gate, and approval are owned by `crypto-non-model-touch20`, not the
+generic `crypto-replay` command.
 
 Replay uses settled real quote-path rows only. It does not use proxy rows,
 trained model features, or trained model predictions. For each historical
@@ -345,8 +350,17 @@ candidate row it scans future same-market quote snapshots before close:
 The gate artifact is separate from model and 1-hour Touch20 gates:
 
 ```text
-replay_gate_touch20_rules:15m:BTC
+btc15m_touch20_rules_gate:15m:BTC
 ```
+
+Live entry also requires:
+
+```text
+btc15m_touch20_rules_approval:<kalshi_env>:BTC:15m
+```
+
+The approval checkpoint must reference the latest passed gate version. A new
+gate version invalidates old approval.
 
 Gate pass requirements:
 

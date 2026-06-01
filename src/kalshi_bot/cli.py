@@ -865,7 +865,39 @@ async def _run_crypto_autonomy_command(args: argparse.Namespace, container: AppC
 
 
 async def _run_crypto_non_model_touch20_command(args: argparse.Namespace, container: AppContainer) -> int:
-    if args.crypto_non_model_touch20_command == "run-once":
+    if args.crypto_non_model_touch20_command == "replay":
+        result = await container.crypto_non_model_touch20_service.replay(
+            frequency=args.frequency,
+            asset_symbol=args.asset,
+            days=args.days,
+            limit=args.limit,
+            persist=True,
+        )
+    elif args.crypto_non_model_touch20_command == "gate":
+        result = await container.crypto_non_model_touch20_service.gate(
+            frequency=args.frequency,
+            asset_symbol=args.asset,
+        )
+    elif args.crypto_non_model_touch20_command == "approve":
+        result = await container.crypto_non_model_touch20_service.approve(
+            frequency=args.frequency,
+            asset_symbol=args.asset,
+            approved_by=args.approved_by,
+            note=args.note,
+            max_notional_dollars=Decimal(str(args.max_notional_dollars)) if args.max_notional_dollars is not None else None,
+        )
+    elif args.crypto_non_model_touch20_command == "revoke":
+        result = await container.crypto_non_model_touch20_service.revoke(
+            frequency=args.frequency,
+            asset_symbol=args.asset,
+            note=args.note,
+        )
+    elif args.crypto_non_model_touch20_command == "status":
+        result = await container.crypto_non_model_touch20_service.status(
+            frequency=args.frequency,
+            asset_symbol=args.asset,
+        )
+    elif args.crypto_non_model_touch20_command == "run-once":
         result = await container.crypto_non_model_touch20_service.run_once(
             frequency=args.frequency,
             asset_symbol=args.asset,
@@ -4520,7 +4552,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_replay_gate)
     crypto_replay_gate.add_argument("--frequency", default="15m")
     crypto_replay_gate.add_argument("--assets", nargs="*", default=None)
-    crypto_replay_gate.add_argument("--objective", choices=["settlement", "touch20", "touch20_rules"], default="settlement")
+    crypto_replay_gate.add_argument("--objective", choices=["settlement", "touch20"], default="settlement")
     for name in ("run", "validate"):
         crypto_replay_command = crypto_replay_subparsers.add_parser(name)
         add_kalshi_env_argument(crypto_replay_command)
@@ -4528,7 +4560,7 @@ def build_parser() -> argparse.ArgumentParser:
         crypto_replay_command.add_argument("--days", type=int, default=30)
         crypto_replay_command.add_argument("--limit", type=int, default=0)
         crypto_replay_command.add_argument("--assets", nargs="*", default=None)
-        crypto_replay_command.add_argument("--objective", choices=["settlement", "touch20", "touch20_rules"], default="settlement")
+        crypto_replay_command.add_argument("--objective", choices=["settlement", "touch20"], default="settlement")
         crypto_replay_command.add_argument("--json", action="store_true")
 
     crypto_status = subparsers.add_parser("crypto-status")
@@ -4549,12 +4581,33 @@ def build_parser() -> argparse.ArgumentParser:
         dest="crypto_non_model_touch20_command",
         required=True,
     )
-    for name in ("run-once", "exit-once"):
+    for name in ("status", "gate", "run-once", "exit-once"):
         command = crypto_non_model_touch20_subparsers.add_parser(name)
         add_kalshi_env_argument(command)
         command.add_argument("--frequency", default="15m")
         command.add_argument("--asset", default="BTC")
         command.add_argument("--json", action="store_true")
+    crypto_non_model_touch20_replay = crypto_non_model_touch20_subparsers.add_parser("replay")
+    add_kalshi_env_argument(crypto_non_model_touch20_replay)
+    crypto_non_model_touch20_replay.add_argument("--frequency", default="15m")
+    crypto_non_model_touch20_replay.add_argument("--asset", default="BTC")
+    crypto_non_model_touch20_replay.add_argument("--days", type=int, default=30)
+    crypto_non_model_touch20_replay.add_argument("--limit", type=int, default=0)
+    crypto_non_model_touch20_replay.add_argument("--json", action="store_true")
+    crypto_non_model_touch20_approve = crypto_non_model_touch20_subparsers.add_parser("approve")
+    add_kalshi_env_argument(crypto_non_model_touch20_approve)
+    crypto_non_model_touch20_approve.add_argument("--frequency", default="15m")
+    crypto_non_model_touch20_approve.add_argument("--asset", default="BTC")
+    crypto_non_model_touch20_approve.add_argument("--approved-by", required=True)
+    crypto_non_model_touch20_approve.add_argument("--max-notional-dollars", type=float, default=None)
+    crypto_non_model_touch20_approve.add_argument("--note", default=None)
+    crypto_non_model_touch20_approve.add_argument("--json", action="store_true")
+    crypto_non_model_touch20_revoke = crypto_non_model_touch20_subparsers.add_parser("revoke")
+    add_kalshi_env_argument(crypto_non_model_touch20_revoke)
+    crypto_non_model_touch20_revoke.add_argument("--frequency", default="15m")
+    crypto_non_model_touch20_revoke.add_argument("--asset", default="BTC")
+    crypto_non_model_touch20_revoke.add_argument("--note", default=None)
+    crypto_non_model_touch20_revoke.add_argument("--json", action="store_true")
 
     crypto_asset_mode = subparsers.add_parser("crypto-asset-mode")
     crypto_asset_mode_subparsers = crypto_asset_mode.add_subparsers(dest="crypto_asset_mode_command", required=True)

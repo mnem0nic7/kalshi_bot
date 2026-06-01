@@ -17,12 +17,12 @@ from kalshi_bot.crypto.services import (
     CryptoForecastService,
     CryptoHistoryService,
     CryptoMarketService,
-    CryptoNonModelTouch20Service,
     CryptoReplayService,
     CryptoSpotService,
     CryptoTrainingBackfillService,
     CryptoWorkflowService,
 )
+from kalshi_bot.crypto.btc15m_touch20_rules import CryptoNonModelTouch20Service
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory, init_models
 from kalshi_bot.integrations.forecast_archive import OpenMeteoForecastArchiveClient
@@ -236,9 +236,7 @@ class AppContainer:
         crypto_non_model_touch20_service = CryptoNonModelTouch20Service(
             settings=settings,
             session_factory=session_factory,
-            market_service=crypto_market_service,
             base_execution_service=execution_service,
-            agent_pack_service=agent_pack_service,
         )
         crypto_execution_service = CryptoExecutionService(
             settings=settings,

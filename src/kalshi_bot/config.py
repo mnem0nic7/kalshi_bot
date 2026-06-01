@@ -358,6 +358,10 @@ class Settings(BaseSettings):
     crypto_btc15m_touch20_profit_protection_threshold_pct: float = 0.10
     crypto_btc15m_touch20_profit_protection_floor_pct: float = 0.05
     crypto_btc15m_touch20_loop_interval_seconds: int = 15
+    crypto_btc15m_touch20_min_contract_price_dollars: float = 0.10
+    crypto_btc15m_touch20_min_rule_score: float = 0.60
+    crypto_btc15m_touch20_quote_fresh_seconds: int = 30
+    crypto_btc15m_touch20_spot_fresh_seconds: int = 180
 
     crypto_take_profit_enabled: bool = True
     crypto_take_profit_frequencies: str = "15m,1h"
