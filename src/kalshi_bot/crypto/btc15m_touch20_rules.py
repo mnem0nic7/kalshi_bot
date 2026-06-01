@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -315,23 +316,38 @@ def _spot_time(row: CryptoSpotOHLCRecord) -> datetime | None:
     return _as_utc(row.observed_at or row.end_ts)
 
 
-def _spot_features(
-    spot_rows: list[CryptoSpotOHLCRecord],
+def _prepare_spot_index(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[str, list[Any]]:
+    entries: list[tuple[datetime, datetime, Decimal, CryptoSpotOHLCRecord]] = []
+    for row in spot_rows:
+        if (
+            _normalize_asset_symbol(row.asset_symbol) != BTC15M_TOUCH20_RULES_ASSET
+            or not _non_proxy_spot(row)
+            or row.close_dollars is None
+        ):
+            continue
+        eligibility_ts = _as_utc(row.end_ts) or _spot_time(row)
+        observed_ts = _spot_time(row) or _as_utc(row.end_ts)
+        if eligibility_ts is None or observed_ts is None:
+            continue
+        entries.append((eligibility_ts, observed_ts, _decimal(row.close_dollars), row))
+    entries.sort(key=lambda item: item[0])
+    return {
+        "eligibility_times": [item[0] for item in entries],
+        "observed_times": [item[1] for item in entries],
+        "closes": [item[2] for item in entries],
+        "rows": [item[3] for item in entries],
+    }
+
+
+def _spot_features_from_index(
+    spot_index: dict[str, list[Any]],
     *,
     decision_ts: datetime,
     freshness_reference: datetime,
     max_age_seconds: int,
 ) -> dict[str, Any]:
-    eligible = [
-        row
-        for row in spot_rows
-        if _normalize_asset_symbol(row.asset_symbol) == BTC15M_TOUCH20_RULES_ASSET
-        and _non_proxy_spot(row)
-        and row.close_dollars is not None
-        and (_as_utc(row.end_ts) or _spot_time(row) or datetime.min.replace(tzinfo=UTC)) <= decision_ts
-    ]
-    eligible.sort(key=lambda row: _as_utc(row.end_ts) or _spot_time(row) or datetime.min.replace(tzinfo=UTC))
-    if not eligible:
+    eligibility_times = spot_index.get("eligibility_times") or []
+    if not eligibility_times:
         return {
             "available": False,
             "reason": "spot_data_missing_or_proxy_only",
@@ -339,29 +355,42 @@ def _spot_features(
             "return_3": Decimal("0"),
             "volatility": Decimal("0"),
         }
-    latest = eligible[-1]
-    latest_time = _spot_time(latest) or _as_utc(latest.end_ts)
-    age_seconds = int((freshness_reference - latest_time).total_seconds()) if latest_time is not None else None
-    if age_seconds is None or age_seconds < 0 or age_seconds > max_age_seconds:
+    idx = bisect_right(eligibility_times, decision_ts) - 1
+    if idx < 0:
         return {
             "available": False,
-            "reason": "spot_data_stale",
-            "age_seconds": age_seconds,
-            "latest_observed_at": latest_time.isoformat() if latest_time else None,
+            "reason": "spot_data_missing_or_proxy_only",
             "return_1": Decimal("0"),
             "return_3": Decimal("0"),
             "volatility": Decimal("0"),
         }
-    closes = [_decimal(row.close_dollars) for row in eligible if row.close_dollars is not None]
-    latest_close = closes[-1]
+    observed_times = spot_index["observed_times"]
+    closes = spot_index["closes"]
+    rows = spot_index["rows"]
+    latest = rows[idx]
+    latest_time = observed_times[idx]
+    age_seconds = int((freshness_reference - latest_time).total_seconds())
+    if age_seconds < 0 or age_seconds > max_age_seconds:
+        return {
+            "available": False,
+            "reason": "spot_data_stale",
+            "age_seconds": age_seconds,
+            "latest_observed_at": latest_time.isoformat(),
+            "return_1": Decimal("0"),
+            "return_3": Decimal("0"),
+            "volatility": Decimal("0"),
+        }
+    latest_close = closes[idx]
 
     def calc_return(back: int) -> Decimal:
-        if len(closes) <= back or closes[-1 - back] <= Decimal("0"):
+        prior_idx = idx - back
+        if prior_idx < 0 or closes[prior_idx] <= Decimal("0"):
             return Decimal("0")
-        return ((latest_close / closes[-1 - back]) - Decimal("1")).quantize(Decimal("0.0001"))
+        return ((latest_close / closes[prior_idx]) - Decimal("1")).quantize(Decimal("0.0001"))
 
+    window = closes[max(0, idx - 8) : idx + 1]
     step_returns: list[Decimal] = []
-    for left, right in zip(closes[-9:-1], closes[-8:]):
+    for left, right in zip(window[:-1], window[1:]):
         if left > Decimal("0"):
             step_returns.append((right / left) - Decimal("1"))
     if len(step_returns) >= 2:
@@ -376,7 +405,7 @@ def _spot_features(
         "available": True,
         "reason": "available",
         "age_seconds": age_seconds,
-        "latest_observed_at": latest_time.isoformat() if latest_time else None,
+        "latest_observed_at": latest_time.isoformat(),
         "provider": latest.provider,
         "source_kind": latest.source_kind,
         "close_dollars": str(latest_close),
@@ -384,6 +413,21 @@ def _spot_features(
         "return_3": calc_return(3),
         "volatility": volatility,
     }
+
+
+def _spot_features(
+    spot_rows: list[CryptoSpotOHLCRecord],
+    *,
+    decision_ts: datetime,
+    freshness_reference: datetime,
+    max_age_seconds: int,
+) -> dict[str, Any]:
+    return _spot_features_from_index(
+        _prepare_spot_index(spot_rows),
+        decision_ts=decision_ts,
+        freshness_reference=freshness_reference,
+        max_age_seconds=max_age_seconds,
+    )
 
 
 def _bucket_map(gate_metrics: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -748,6 +792,7 @@ def _evaluate_replay(
     rows_by_market: dict[str, list[CryptoMarketSnapshotRecord]] = defaultdict(list)
     for row in scoped_rows:
         rows_by_market[row.market_ticker].append(row)
+    spot_index = _prepare_spot_index(spot_rows)
     trades: list[dict[str, Any]] = []
     reason_counts: Counter[str] = Counter()
     status_counts: Counter[str] = Counter()
@@ -755,8 +800,8 @@ def _evaluate_replay(
         market_rows.sort(key=_snapshot_decision_time)
         for idx, row in enumerate(market_rows):
             decision_ts = _snapshot_decision_time(row)
-            spot = _spot_features(
-                spot_rows,
+            spot = _spot_features_from_index(
+                spot_index,
                 decision_ts=decision_ts,
                 freshness_reference=decision_ts,
                 max_age_seconds=max(int(settings.crypto_btc15m_touch20_spot_fresh_seconds), BTC15M_TOUCH20_RULES_INTERVAL_SECONDS),
@@ -1148,7 +1193,9 @@ class CryptoNonModelTouch20Service:
             "metrics": metrics,
             "requirements": _gate_requirements(self.settings),
             "gate_reasons": reasons,
-            "trades": replay["trades"],
+            "trade_sample": replay["trades"][:100],
+            "trade_sample_count": min(100, len(replay["trades"])),
+            "trade_count": len(replay["trades"]),
         }
         if persist:
             async with self.session_factory() as session:

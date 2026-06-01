@@ -6,7 +6,7 @@ from pathlib import Path
 
 from kalshi_bot.config import Settings
 from kalshi_bot.crypto import btc15m_touch20_rules as rules
-from kalshi_bot.db.models import CryptoMarketSnapshotRecord
+from kalshi_bot.db.models import CryptoMarketSnapshotRecord, CryptoSpotOHLCRecord
 
 
 def _settings(**overrides):
@@ -73,6 +73,27 @@ def _gate(bucket_key: str = "BTC|yes|20_30c|le_1c|10_15m"):
     }
 
 
+def _spot_row(ts: datetime, close: Decimal, **overrides):
+    values = {
+        "kalshi_env": "production",
+        "provider": "coinbase",
+        "asset_symbol": "BTC",
+        "quote_currency": "USD",
+        "frequency": "15m",
+        "interval_seconds": 900,
+        "start_ts": ts - timedelta(minutes=15),
+        "end_ts": ts,
+        "observed_at": ts,
+        "open_dollars": close,
+        "high_dollars": close,
+        "low_dollars": close,
+        "close_dollars": close,
+        "source_kind": "ohlc",
+    }
+    values.update(overrides)
+    return CryptoSpotOHLCRecord(**values)
+
+
 def test_standalone_module_does_not_import_prohibited_strategy_dependencies():
     source = Path(rules.__file__).read_text()
 
@@ -87,6 +108,29 @@ def test_standalone_module_does_not_import_prohibited_strategy_dependencies():
     )
     for token in prohibited:
         assert token not in source
+
+
+def test_spot_feature_index_matches_latest_non_proxy_row():
+    now = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
+    rows = [
+        _spot_row(now - timedelta(minutes=45), Decimal("100.00")),
+        _spot_row(now - timedelta(minutes=30), Decimal("101.00")),
+        _spot_row(now - timedelta(minutes=15), Decimal("103.00"), provider="coingecko", source_kind="proxy"),
+        _spot_row(now, Decimal("102.00")),
+    ]
+
+    spot = rules._spot_features_from_index(
+        rules._prepare_spot_index(rows),
+        decision_ts=now,
+        freshness_reference=now,
+        max_age_seconds=180,
+    )
+
+    assert spot["available"] is True
+    assert spot["provider"] == "coinbase"
+    assert spot["close_dollars"] == "102.00"
+    assert spot["return_1"] == Decimal("0.0099")
+    assert spot["return_3"] == Decimal("0")
 
 
 def test_rules_candidate_uses_explicit_score_and_20pct_objective():
