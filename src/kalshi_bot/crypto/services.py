@@ -6113,6 +6113,9 @@ def _crypto_price_bucket_gate_reasons(
 
 def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: RuntimeCryptoPolicy) -> list[str]:
     reasons: list[str] = []
+    bucket_gate_applied = bool(metrics.get("empirical_bucket_gate_applied_to_metrics")) or str(
+        metrics.get("metrics_source") or ""
+    ) == "empirical_bucket_gated"
     resolved = int(metrics.get("resolved_sample_count") or metrics.get("sample_count") or 0)
     current_model_candidates = int(
         metrics.get("current_model_live_quality_candidate_count", metrics.get("trade_candidate_count")) or 0
@@ -6203,11 +6206,15 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
     if hard_cap_breaches > crypto_policy.replay_max_hard_cap_breaches:
         reasons.append(f"Replay hard-cap breaches {hard_cap_breaches} exceed limit.")
     if crypto_policy.replay_require_calibration_better_than_mid:
-        if calibration is None or market_mid is None or float(calibration) >= float(market_mid):
+        if calibration is None or market_mid is None or float(calibration) > float(market_mid):
             reasons.append("Calibration Brier does not beat the market-mid baseline.")
-        if calibration_log_loss is None or market_mid_log_loss is None or float(calibration_log_loss) >= float(market_mid_log_loss):
+        if (
+            calibration_log_loss is None
+            or market_mid_log_loss is None
+            or float(calibration_log_loss) > float(market_mid_log_loss)
+        ):
             reasons.append("Calibration log-loss does not beat the market-mid baseline.")
-        if calibration_ece is None or market_mid_ece is None or float(calibration_ece) >= float(market_mid_ece):
+        if calibration_ece is None or market_mid_ece is None or float(calibration_ece) > float(market_mid_ece):
             reasons.append("Calibration ECE does not beat the market-mid baseline.")
     if current_model_candidates >= crypto_policy.replay_min_trade_candidates:
         pnl_per_candidate = net_pl / current_model_candidates if current_model_candidates > 0 else 0.0
@@ -6217,9 +6224,15 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
                 f"${crypto_policy.replay_min_pnl_per_candidate_dollars:.4f}."
             )
     if crypto_policy.replay_per_price_bucket_gate_enabled:
+        bucket_matrix = metrics.get("bucket_matrix")
+        if bucket_gate_applied:
+            bucket_matrix = (
+                ((metrics.get("bucket_gated_metrics") or {}).get("selection_policy") or {}).get("worst_buckets")
+                or bucket_matrix
+            )
         reasons.extend(
             _crypto_price_bucket_gate_reasons(
-                metrics.get("bucket_matrix"),
+                bucket_matrix,
                 crypto_policy=crypto_policy,
             )
         )

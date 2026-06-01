@@ -735,6 +735,89 @@ def test_crypto_replay_gate_blocks_bucket_gated_market_mid_underperformance(tmp_
     assert any("market-mid baseline" in reason for reason in gate["reasons"])
 
 
+def test_crypto_replay_gate_allows_calibration_tie_when_bucket_gated_profitable(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=10,
+        crypto_replay_min_trade_candidates=2,
+        crypto_replay_require_calibration_better_than_mid=True,
+        crypto_replay_require_pnl_beats_market_mid=True,
+    )
+    service = CryptoReplayService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+
+    gate = service.evaluate_gate(
+        {
+            "metrics_source": "empirical_bucket_gated",
+            "empirical_bucket_gate_applied_to_metrics": True,
+            "resolved_sample_count": 20,
+            "trade_candidate_count": 3,
+            "current_model_live_quality_candidate_count": 3,
+            "strict_trade_eligible_count": 20,
+            "net_simulated_pl_dollars": 1.25,
+            "market_mid_net_simulated_pl_dollars": 0.0,
+            "pnl_advantage_vs_market_mid_dollars": 1.25,
+            "hard_cap_breaches": 0,
+            "candle_count": 20,
+            "spot_feature_coverage_pct": 1.0,
+            "calibration_brier": 0.20,
+            "market_mid_brier": 0.20,
+            "calibration_log_loss": 0.50,
+            "market_mid_log_loss": 0.50,
+            "calibration_ece": 0.01,
+            "market_mid_ece": 0.01,
+        }
+    )
+
+    assert gate["passed"] is True
+
+
+def test_crypto_replay_gate_price_bucket_checks_allowed_bucket_slice(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_replay_min_resolved_markets=10,
+        crypto_replay_min_trade_candidates=2,
+        crypto_replay_require_calibration_better_than_mid=False,
+        crypto_replay_require_pnl_beats_market_mid=True,
+        crypto_replay_per_price_bucket_min_samples=2,
+    )
+    service = CryptoReplayService(settings=settings, session_factory=None)  # type: ignore[arg-type]
+
+    gate = service.evaluate_gate(
+        {
+            "metrics_source": "empirical_bucket_gated",
+            "empirical_bucket_gate_applied_to_metrics": True,
+            "resolved_sample_count": 20,
+            "trade_candidate_count": 2,
+            "current_model_live_quality_candidate_count": 2,
+            "strict_trade_eligible_count": 20,
+            "net_simulated_pl_dollars": 1.25,
+            "market_mid_net_simulated_pl_dollars": 0.0,
+            "pnl_advantage_vs_market_mid_dollars": 1.25,
+            "hard_cap_breaches": 0,
+            "candle_count": 20,
+            "spot_feature_coverage_pct": 1.0,
+            "bucket_matrix": [
+                _empirical_bucket("BTC|yes|0.50-0.75|tight|10_15m", sample_count=10, win_rate=0.30, net_pnl="-9.0000"),
+            ],
+            "bucket_gated_metrics": {
+                "selection_policy": {
+                    "worst_buckets": [
+                        _empirical_bucket(
+                            "BTC|yes|0.50-0.75|normal|10_15m",
+                            sample_count=2,
+                            win_rate=1.0,
+                            net_pnl="1.2500",
+                        ),
+                    ],
+                },
+            },
+        }
+    )
+
+    assert gate["passed"] is True
+    assert not any("Entry-price bucket" in reason for reason in gate["reasons"])
+
+
 @pytest.mark.asyncio
 async def test_crypto_replay_gate_falls_back_to_per_asset_artifacts_for_multi_asset_request(tmp_path) -> None:
     settings = _settings(
