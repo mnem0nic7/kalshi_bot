@@ -39,6 +39,10 @@ def test_crypto_market_identity_detects_1h_frequency():
     assert _crypto_market_identity("KXBTC1H-26MAY24-B123456-T123456") == ("BTC", "1h")
 
 
+def test_crypto_market_identity_detects_hourly_d_suffix_ticker():
+    assert _crypto_market_identity("KXBTCD-26MAY3121-T73799.99") == ("BTC", "1h")
+
+
 def test_crypto_market_identity_detects_15m_frequency():
     assert _crypto_market_identity("KXHYPE15M-26MAY24-B123456-T123456") == ("HYPE", "15m")
 
@@ -148,6 +152,31 @@ def test_round_trip_net_profit_ratio_uses_executable_sell_after_fees():
 
     assert ratio is not None
     assert ratio < 0.30
+
+
+def test_round_trip_net_profit_ratio_triggers_at_net_20pct_without_fees():
+    pos = _position("0.50", count="1.00")
+
+    ratio = _round_trip_net_profit_ratio(
+        pos,
+        sell_yes_price=Decimal("0.6000"),
+        fee_rate=Decimal("0"),
+    )
+
+    assert ratio == pytest.approx(0.20)
+
+
+def test_round_trip_net_profit_ratio_stays_below_net_20pct_after_fees():
+    pos = _position("0.50", count="1.00")
+
+    ratio = _round_trip_net_profit_ratio(
+        pos,
+        sell_yes_price=Decimal("0.6000"),
+        fee_rate=Decimal("0.07"),
+    )
+
+    assert ratio is not None
+    assert ratio < 0.20
 
 
 def test_round_trip_net_profit_ratio_handles_no_side_sell_price():

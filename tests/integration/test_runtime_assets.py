@@ -85,6 +85,9 @@ def test_compose_defaults_crypto_to_model_trained_replay_only() -> None:
     assert "CRYPTO_MODEL_TRAINED_REPLAY_ONLY: ${CRYPTO_MODEL_TRAINED_REPLAY_ONLY:-true}" in compose_text
     assert "CRYPTO_TOUCH_STRATEGY_ENABLED: ${CRYPTO_TOUCH_STRATEGY_ENABLED:-false}" in compose_text
     assert "CRYPTO_TOUCH_STRATEGY_ENABLED: ${PRODUCTION_CRYPTO_TOUCH_STRATEGY_ENABLED:-false}" in compose_text
+    assert "CRYPTO_1H_TOUCH_STRATEGY_ENABLED: ${PRODUCTION_CRYPTO_1H_TOUCH_STRATEGY_ENABLED:-false}" in compose_text
+    assert "CRYPTO_1H_TOUCH_TAKE_PROFIT_PCT: ${PRODUCTION_CRYPTO_1H_TOUCH_TAKE_PROFIT_PCT:-0.20}" in compose_text
+    assert "CRYPTO_TAKE_PROFIT_THRESHOLD_PCT: ${PRODUCTION_CRYPTO_TAKE_PROFIT_THRESHOLD_PCT:-0.20}" in compose_text
     assert "CRYPTO_TRAINING_PREFLIGHT_ENABLED: ${PRODUCTION_CRYPTO_TRAINING_PREFLIGHT_ENABLED:-true}" in compose_text
     assert (
         "CRYPTO_TRAINING_FEATURE_STORE_ENABLED: ${PRODUCTION_CRYPTO_TRAINING_FEATURE_STORE_ENABLED:-true}"
@@ -92,6 +95,8 @@ def test_compose_defaults_crypto_to_model_trained_replay_only() -> None:
     )
     assert "CRYPTO_MODEL_TRAINED_REPLAY_ONLY=true" in env_example
     assert "PRODUCTION_CRYPTO_TOUCH_STRATEGY_ENABLED=false" in env_example
+    assert "PRODUCTION_CRYPTO_1H_TOUCH_STRATEGY_ENABLED=false" in env_example
+    assert "PRODUCTION_CRYPTO_TAKE_PROFIT_THRESHOLD_PCT=0.20" in env_example
     assert "PRODUCTION_CRYPTO_TRAINING_PREFLIGHT_ENABLED=true" in env_example
     assert "PRODUCTION_CRYPTO_TRAINING_FEATURE_STORE_ENABLED=true" in env_example
 

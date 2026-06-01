@@ -64,7 +64,10 @@ from kalshi_bot.crypto.services import (
     _crypto_signal_stand_down_payload,
     _crypto_signal_payload_with_current_quote_metrics,
     _crypto_time_to_close_bucket,
+    _crypto_touch_replay_first_touch,
+    _crypto_touch_replay_gate_reasons,
     _crypto_trade_candidates,
+    _evaluate_crypto_touch20_replay,
     _fit_crypto_calibration,
     _predict_crypto_probability,
     crypto_autonomy_min_seconds_to_close_for_frequency,
@@ -150,6 +153,150 @@ def _replay_row(**overrides) -> dict[str, object]:
     }
     values.update(overrides)
     return values
+
+
+def test_crypto_touch_replay_future_scan_detects_yes_and_no_touches() -> None:
+    future_rows = [
+        _replay_row(yes_bid_dollars=Decimal("0.2400"), no_bid_dollars=Decimal("0.7000")),
+        _replay_row(yes_bid_dollars=Decimal("0.2600"), no_bid_dollars=Decimal("0.8300")),
+    ]
+
+    yes_touch = _crypto_touch_replay_first_touch(
+        future_rows,
+        side="yes",
+        target_exit_side_price=Decimal("0.2500"),
+    )
+    no_touch = _crypto_touch_replay_first_touch(
+        future_rows,
+        side="no",
+        target_exit_side_price=Decimal("0.8000"),
+    )
+
+    assert yes_touch is not None
+    assert yes_touch[1] == Decimal("0.2600")
+    assert no_touch is not None
+    assert no_touch[1] == Decimal("0.8300")
+
+
+def test_crypto_touch20_replay_simulates_touch_exit_and_settlement_hold(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=0,
+        crypto_touch_strategy_min_touch_probability=0.50,
+        crypto_1h_touch_replay_min_candidates=1,
+        crypto_empirical_bucket_min_samples=1,
+        crypto_empirical_bucket_min_win_rate=0.0,
+    )
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    touch_market = "KXBTCD-26MAY0112-T100500"
+    hold_market = "KXBTCD-26MAY0113-T100500"
+    rows = [
+        _replay_row(
+            market_ticker=touch_market,
+            frequency="1h",
+            market_day="2026-05-01",
+            decision_ts=start,
+            settlement_ts=start + timedelta(minutes=40),
+            time_to_close_seconds=2400,
+            market_age_seconds=1200,
+            yes_bid_dollars=Decimal("0.1900"),
+            yes_ask_dollars=Decimal("0.2000"),
+            no_bid_dollars=Decimal("0.7900"),
+            no_ask_dollars=Decimal("0.8100"),
+            mid_yes_dollars=Decimal("0.1950"),
+            spread_bps=100,
+            label_yes=1,
+        ),
+        _replay_row(
+            market_ticker=touch_market,
+            frequency="1h",
+            market_day="2026-05-01",
+            decision_ts=start + timedelta(minutes=5),
+            settlement_ts=start + timedelta(minutes=40),
+            time_to_close_seconds=2100,
+            market_age_seconds=1500,
+            yes_bid_dollars=Decimal("0.3000"),
+            yes_ask_dollars=Decimal("0.3200"),
+            no_bid_dollars=Decimal("0.6800"),
+            no_ask_dollars=Decimal("0.7000"),
+            mid_yes_dollars=Decimal("0.3100"),
+            spread_bps=200,
+            label_yes=1,
+            strict_trade_eligible=False,
+        ),
+        _replay_row(
+            market_ticker=hold_market,
+            frequency="1h",
+            market_day="2026-05-01",
+            decision_ts=start + timedelta(hours=1),
+            settlement_ts=start + timedelta(hours=1, minutes=40),
+            time_to_close_seconds=2400,
+            market_age_seconds=1200,
+            yes_bid_dollars=Decimal("0.1900"),
+            yes_ask_dollars=Decimal("0.2000"),
+            no_bid_dollars=Decimal("0.7900"),
+            no_ask_dollars=Decimal("0.8100"),
+            mid_yes_dollars=Decimal("0.1950"),
+            spread_bps=100,
+            label_yes=0,
+        ),
+    ]
+
+    report = _evaluate_crypto_touch20_replay(rows, settings=settings)
+    metrics = report["metrics"]
+    exit_modes = {(row["simulation"] or {})["exit_mode"] for row in report["trades"]}
+
+    assert metrics["touch_count"] == 1
+    assert metrics["settlement_hold_count"] == 1
+    assert "take_profit_touch" in exit_modes
+    assert "settlement_hold" in exit_modes
+
+
+def test_crypto_touch20_replay_gate_blocks_missing_negative_and_undersampled(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_1h_touch_replay_min_candidates=2,
+        crypto_1h_touch_replay_min_pnl_per_candidate_dollars=0.02,
+    )
+
+    assert "missing" in _crypto_touch_replay_gate_reasons({}, settings=settings)[0]
+    reasons = _crypto_touch_replay_gate_reasons(
+        {
+            "trade_candidate_count": 1,
+            "current_model_live_quality_candidate_count": 1,
+            "net_simulated_pl_dollars": -0.10,
+            "hard_cap_breaches": 0,
+            "touch_rate": 1.0,
+            "allowed_bucket_keys": [],
+        },
+        settings=settings,
+    )
+
+    assert any("candidate count 1 below minimum 2" in reason for reason in reasons)
+    assert any("net P/L $-0.10" in reason for reason in reasons)
+    assert any("no allowed bucket support" in reason for reason in reasons)
+
+
+def test_crypto_touch20_replay_gate_passes_positive_allowed_bucket_support(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_1h_touch_replay_min_candidates=2,
+        crypto_1h_touch_replay_min_pnl_per_candidate_dollars=0.02,
+    )
+
+    reasons = _crypto_touch_replay_gate_reasons(
+        {
+            "trade_candidate_count": 2,
+            "current_model_live_quality_candidate_count": 2,
+            "net_simulated_pl_dollars": 0.10,
+            "hard_cap_breaches": 0,
+            "touch_rate": 0.50,
+            "allowed_bucket_keys": ["BTC|yes|0.20-0.35|tight|30m+"],
+        },
+        settings=settings,
+    )
+
+    assert reasons == []
 
 
 def _signal() -> StrategySignal:

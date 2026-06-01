@@ -242,6 +242,119 @@ def _normalize_asset_csv(value: str | None) -> set[str]:
     return symbols
 
 
+def _safe_normalize_asset_symbol(value: object, default: str = "UNKNOWN") -> str:
+    try:
+        return normalize_asset_symbol(str(value or default))
+    except ValueError:
+        return default
+
+
+def _pct_objective_label(value: Decimal) -> str:
+    pct = (value * Decimal("100")).quantize(Decimal("0.0001"))
+    if pct == pct.to_integral_value():
+        return f"{int(pct)}pct"
+    return f"{str(pct).rstrip('0').rstrip('.').replace('.', '_')}pct"
+
+
+def _crypto_touch_objective(value: Decimal) -> str:
+    return f"touch_{_pct_objective_label(value)}_before_close"
+
+
+def _crypto_touch_exit_objective(value: Decimal) -> str:
+    return f"exitably_up_{_pct_objective_label(value)}_before_close"
+
+
+def _crypto_btc_1h_touch_policy_configured_for_row(row: dict[str, Any], *, settings: Settings) -> bool:
+    if not bool(settings.crypto_1h_touch_strategy_enabled):
+        return False
+    if _crypto_frequency_for_row(row) != "1h":
+        return False
+    asset = _safe_normalize_asset_symbol(row.get("asset_symbol"))
+    return asset in (_normalize_asset_csv(settings.crypto_1h_touch_assets) or {"BTC"})
+
+
+def _crypto_btc_1h_touch_policy_configured_for_market(market: CryptoMarket, *, settings: Settings) -> bool:
+    if not bool(settings.crypto_1h_touch_strategy_enabled):
+        return False
+    if (normalize_frequency(market.frequency) or "15m") != "1h":
+        return False
+    asset = _safe_normalize_asset_symbol(market.asset_symbol)
+    return asset in (_normalize_asset_csv(settings.crypto_1h_touch_assets) or {"BTC"})
+
+
+def _crypto_touch_policy_context(
+    row: dict[str, Any],
+    *,
+    settings: Settings,
+    btc_1h_touch_policy: bool = False,
+) -> dict[str, Any]:
+    target_pct = Decimal(str(settings.crypto_touch_strategy_take_profit_pct))
+    stop_pct = Decimal(str(settings.crypto_touch_strategy_stop_loss_pct))
+    min_market_age_seconds: int | None = None
+    min_seconds_to_close: int | None = None
+    policy_name = "legacy_touch"
+    no_initial_hard_stop = False
+    if btc_1h_touch_policy:
+        target_pct = Decimal(str(settings.crypto_1h_touch_take_profit_pct))
+        stop_pct = Decimal("1.0000")
+        min_market_age_seconds = max(0, int(settings.crypto_1h_touch_min_market_age_seconds))
+        min_seconds_to_close = max(0, int(settings.crypto_1h_touch_min_seconds_to_close))
+        policy_name = "btc_1h_touch20"
+        no_initial_hard_stop = True
+    return {
+        "policy_name": policy_name,
+        "target_pct": target_pct,
+        "stop_pct": stop_pct,
+        "objective": _crypto_touch_objective(target_pct),
+        "exit_objective": _crypto_touch_exit_objective(target_pct),
+        "min_market_age_seconds": min_market_age_seconds,
+        "min_seconds_to_close": min_seconds_to_close,
+        "no_initial_hard_stop": no_initial_hard_stop,
+    }
+
+
+def _crypto_touch_entry_window_reason(
+    row: dict[str, Any],
+    *,
+    settings: Settings,
+    policy_context: dict[str, Any],
+) -> str | None:
+    min_market_age = policy_context.get("min_market_age_seconds")
+    min_seconds_to_close = policy_context.get("min_seconds_to_close")
+    if min_market_age is None and min_seconds_to_close is None:
+        return _crypto_live_entry_window_reason(row, settings=settings)
+
+    frequency = _crypto_frequency_for_row(row)
+    try:
+        interval_seconds = interval_seconds_for_frequency(frequency)
+    except ValueError:
+        interval_seconds = 3600 if frequency == "1h" else 900
+    market_age = _optional_int(row.get("market_age_seconds"))
+    time_to_close = _optional_int(row.get("time_to_close_seconds"))
+    if market_age is None and time_to_close is not None and time_to_close <= interval_seconds:
+        market_age = max(0, interval_seconds - time_to_close)
+    if time_to_close is None and market_age is not None and market_age <= interval_seconds:
+        time_to_close = max(0, interval_seconds - market_age)
+    if market_age is None or time_to_close is None:
+        return "crypto_entry_window_unknown"
+    if min_market_age is not None and market_age < int(min_market_age):
+        return "crypto_market_too_early_for_live_entry"
+    if min_seconds_to_close is not None and time_to_close < int(min_seconds_to_close):
+        return "crypto_market_too_late_for_live_entry"
+    return None
+
+
+def _crypto_touch_replay_gate_passed(replay_gate: Any | None) -> bool:
+    if replay_gate is None:
+        return False
+    if str(getattr(replay_gate, "status", "") or "").strip().lower() != "passed":
+        return False
+    payload = getattr(replay_gate, "payload", None)
+    if isinstance(payload, dict) and "passed" in payload:
+        return payload.get("passed") is True
+    return True
+
+
 def _crypto_last_minute_passive_bid_by_asset(settings: Settings) -> dict[str, Decimal]:
     bids: dict[str, Decimal] = {}
     for raw in str(settings.crypto_last_minute_passive_bid_by_asset or "").replace(";", ",").split(","):
@@ -322,6 +435,32 @@ def _crypto_replay_gate_note_updates(
         updates["crypto_replay_gate"] = dict(note)
         if symbols:
             updates[f"crypto_replay_gate:{','.join(symbols)}"] = dict(note)
+    return updates
+
+
+def _crypto_touch_replay_gate_note_updates(
+    *,
+    frequency: str,
+    asset_symbols: list[str] | None,
+    status: str,
+    version: str,
+    reasons: list[str],
+    updated_at: datetime,
+) -> dict[str, dict[str, Any]]:
+    freq = normalize_frequency(frequency) or str(frequency or "1h").strip().lower() or "1h"
+    symbols = normalize_asset_symbols(asset_symbols)
+    note = {
+        "status": status,
+        "version": version,
+        "updated_at": updated_at.isoformat(),
+        "reasons": list(reasons),
+        "frequency": freq,
+        "asset_symbols": symbols,
+        "objective": "touch_20pct_before_close",
+    }
+    updates: dict[str, dict[str, Any]] = {f"crypto_replay_gate_touch20:{freq}": dict(note)}
+    if symbols:
+        updates[f"crypto_replay_gate_touch20:{freq}:{','.join(symbols)}"] = dict(note)
     return updates
 
 
@@ -3161,6 +3300,14 @@ class CryptoForecastService:
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbol=market.asset_symbol,
             )
+            touch_gate = await _latest_crypto_artifact_for_asset(
+                repo,
+                frequency=market.frequency,
+                artifact_type="replay_gate_touch20",
+                kalshi_env=self.settings.kalshi_env,
+                asset_symbol=market.asset_symbol,
+                allow_generic_fallback=False,
+            )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
@@ -3182,9 +3329,30 @@ class CryptoForecastService:
         features = {**features, "spot_features": _json_ready_spot_features(market_row)}
         empirical_bucket_matrix = _crypto_empirical_bucket_matrix_from_artifacts(gate, backtest)
         last_minute_passive_price_matrix = _crypto_last_minute_passive_price_matrix_from_artifacts(gate, backtest)
+        btc_1h_touch_configured = _crypto_btc_1h_touch_policy_configured_for_row(market_row, settings=self.settings)
+        btc_1h_touch_allowed = btc_1h_touch_configured and _crypto_touch_replay_gate_passed(touch_gate)
+        if btc_1h_touch_configured and not btc_1h_touch_allowed:
+            features = {
+                **features,
+                "touch_strategy_ignored": {
+                    "enabled": True,
+                    "policy": "btc_1h_touch20",
+                    "reason": "touch20_replay_gate_missing_or_blocked",
+                    "gate_status": getattr(touch_gate, "status", None) if touch_gate is not None else "missing",
+                    "gate_version": getattr(touch_gate, "version", None) if touch_gate is not None else None,
+                },
+            }
+            return self._stand_down(
+                market,
+                StandDownReason.CRYPTO_MODEL_UNAVAILABLE,
+                "BTC 1h touch strategy is enabled, but the touch +20% replay gate is missing or blocked; stand down.",
+                features,
+                fair=mid,
+            )
         touch_strategy_ignored = (
             bool(self.settings.crypto_touch_strategy_enabled)
             and bool(self.settings.crypto_model_trained_replay_only)
+            and not btc_1h_touch_allowed
         )
         if touch_strategy_ignored:
             features = {
@@ -3194,7 +3362,11 @@ class CryptoForecastService:
                     "reason": "model_trained_replay_only",
                 },
             }
-        if bool(self.settings.crypto_touch_strategy_enabled) and not bool(self.settings.crypto_model_trained_replay_only):
+        touch_strategy_allowed = (
+            (bool(self.settings.crypto_touch_strategy_enabled) and not bool(self.settings.crypto_model_trained_replay_only))
+            or btc_1h_touch_allowed
+        )
+        if touch_strategy_allowed:
             payload = {
                 "model_type": "deterministic_touch_strategy",
                 "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
@@ -3236,6 +3408,7 @@ class CryptoForecastService:
             empirical_bucket_matrix=empirical_bucket_matrix,
             last_minute_passive_price_matrix=last_minute_passive_price_matrix,
             enforce_empirical_bucket_gate=True,
+            touch_replay_gate=touch_gate,
         )
         entry_policy = crypto_policy.entry_for_asset(market.asset_symbol)
         runtime_trading_enabled = self.settings.crypto_trading_enabled or crypto_policy.trading_enabled
@@ -3349,6 +3522,7 @@ class CryptoForecastService:
                     "reason": trace.get("selection_reason") or ("crypto_live_trading_disabled" if not runtime_trading_enabled else None),
                     "backtest_version": backtest.version if backtest is not None else None,
                     "replay_gate_status": gate.status if gate is not None else "missing",
+                    "touch_replay_gate_status": touch_gate.status if touch_gate is not None else "missing",
                     "runtime_crypto_policy": _runtime_crypto_policy_payload(crypto_policy, asset_symbol=market.asset_symbol),
                 },
             },
@@ -3434,7 +3608,35 @@ class CryptoReplayService:
         limit: int | None = None,
         persist: bool = True,
         asset_symbols: list[str] | None = None,
+        objective: str = "settlement",
     ) -> dict[str, Any]:
+        normalized_objective = str(objective or "settlement").strip().lower().replace("_", "-")
+        if normalized_objective in {"touch20", "touch-20", "touch-20pct", "touch20-before-close"}:
+            report = await self._build_touch20_report(
+                frequency=frequency,
+                days=days,
+                limit=limit,
+                command="run",
+                asset_symbols=asset_symbols,
+            )
+            if persist:
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    artifact = await repo.record_crypto_model_artifact(
+                        frequency=report["frequency"],
+                        artifact_type=_crypto_artifact_type("backtest_touch20", report.get("asset_symbols") or []),
+                        version=_version(f"crypto-{report['frequency']}-touch20-backtest", report),
+                        status=report["status"],
+                        sample_count=int((report.get("metrics") or {}).get("trade_candidate_count") or 0),
+                        metrics=report.get("metrics") or {},
+                        payload=report,
+                        kalshi_env=self.settings.kalshi_env,
+                        trained_at=datetime.now(UTC),
+                    )
+                    await session.commit()
+                report["version"] = artifact.version
+            return report
+
         report = await self._build_report(
             frequency=frequency,
             days=days,
@@ -3480,7 +3682,17 @@ class CryptoReplayService:
         days: int | None = None,
         limit: int | None = None,
         asset_symbols: list[str] | None = None,
+        objective: str = "settlement",
     ) -> dict[str, Any]:
+        normalized_objective = str(objective or "settlement").strip().lower().replace("_", "-")
+        if normalized_objective in {"touch20", "touch-20", "touch-20pct", "touch20-before-close"}:
+            return await self._build_touch20_report(
+                frequency=frequency,
+                days=days,
+                limit=limit,
+                command="validate",
+                asset_symbols=asset_symbols,
+            )
         return await self._build_report(
             frequency=frequency,
             days=days,
@@ -3595,9 +3807,74 @@ class CryptoReplayService:
             ),
         }
 
-    async def gate(self, *, frequency: str = "15m", asset_symbols: list[str] | None = None) -> dict[str, Any]:
+    async def gate(
+        self,
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+        objective: str = "settlement",
+    ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
+        normalized_objective = str(objective or "settlement").strip().lower().replace("_", "-")
+        if normalized_objective in {"touch20", "touch-20", "touch-20pct", "touch20-before-close"}:
+            touch_assets = requested_assets or ["BTC"]
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                backtest = await repo.get_latest_crypto_model_artifact(
+                    frequency=freq,
+                    artifact_type=_crypto_artifact_type("backtest_touch20", touch_assets),
+                    kalshi_env=self.settings.kalshi_env,
+                )
+                metrics = dict((backtest.metrics if backtest is not None else None) or {})
+                if backtest is None:
+                    metrics["backtest_missing"] = True
+                reasons = _crypto_touch_replay_gate_reasons(metrics, settings=self.settings)
+                gate = {
+                    "passed": not reasons,
+                    "reasons": reasons,
+                    "requirements": {
+                        "min_trade_candidates": self.settings.crypto_1h_touch_replay_min_candidates,
+                        "min_net_pl_dollars": self.settings.crypto_1h_touch_replay_min_net_pnl_dollars,
+                        "min_pnl_per_candidate_dollars": self.settings.crypto_1h_touch_replay_min_pnl_per_candidate_dollars,
+                        "max_hard_cap_breaches": self.settings.crypto_1h_touch_replay_max_hard_cap_breaches,
+                        "min_touch_rate": self.settings.crypto_1h_touch_replay_min_touch_rate,
+                        "requires_allowed_bucket_support": True,
+                    },
+                    "objective": "touch_20pct_before_close",
+                }
+                artifact = await repo.record_crypto_model_artifact(
+                    frequency=freq,
+                    artifact_type=_crypto_artifact_type("replay_gate_touch20", touch_assets),
+                    version=_version(f"crypto-{freq}-touch20-gate", gate),
+                    status="passed" if gate["passed"] else "blocked",
+                    sample_count=int(metrics.get("trade_candidate_count") or 0),
+                    metrics=metrics,
+                    payload=gate,
+                    kalshi_env=self.settings.kalshi_env,
+                    trained_at=datetime.now(UTC),
+                )
+                control = await repo.ensure_deployment_control(self.settings.app_color)
+                notes = dict(control.notes or {})
+                notes.update(
+                    _crypto_touch_replay_gate_note_updates(
+                        frequency=freq,
+                        asset_symbols=touch_assets,
+                        status=artifact.status,
+                        version=artifact.version,
+                        updated_at=datetime.now(UTC),
+                        reasons=list(gate["reasons"]),
+                    )
+                )
+                control.notes = notes
+                await session.commit()
+            return {
+                "status": artifact.status,
+                "kalshi_env": self.settings.kalshi_env,
+                "asset_symbols": touch_assets,
+                "version": artifact.version,
+                **gate,
+            }
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             model = await repo.get_latest_crypto_model_artifact(
@@ -3857,6 +4134,134 @@ class CryptoReplayService:
                 "min_spot_coverage_pct": runtime_policy.replay_min_spot_coverage_pct,
                 "requires_real_quotes_for_strict_trade_quality": True,
             },
+        }
+
+    async def _build_touch20_report(
+        self,
+        *,
+        frequency: str,
+        days: int | None,
+        limit: int | None,
+        command: str,
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        freq = normalize_frequency(frequency) or "1h"
+        requested_assets = normalize_asset_symbols(asset_symbols) or ["BTC"]
+        requested_assets = [asset for asset in requested_assets if asset == "BTC"] or ["BTC"]
+        cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            feature_decision_rows = (
+                await _crypto_training_feature_decision_rows(
+                    repo,
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets,
+                    since=cutoff,
+                    limit=limit or 200_000,
+                )
+                if self.settings.crypto_training_feature_store_enabled
+                else []
+            )
+            snapshots: list[CryptoMarketSnapshotRecord] = []
+            candles: list[CryptoMarketCandlestickRecord] = []
+            spot_rows: list[CryptoSpotOHLCRecord] = []
+            if not feature_decision_rows:
+                snapshots = await repo.list_crypto_market_snapshots(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets,
+                    since=cutoff,
+                    settled_only=True,
+                    limit=200_000,
+                )
+                candles = await repo.list_crypto_market_candlesticks(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets,
+                    since=cutoff,
+                    limit=500_000,
+                )
+                spot_rows = await repo.list_crypto_spot_ohlc(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets,
+                    since=cutoff,
+                    limit=1_000_000,
+                )
+            funding_rate_rows = await repo.list_crypto_funding_rates_bulk(
+                asset_symbols=requested_assets,
+            )
+            active_pack = await self.agent_pack_service.get_active_pack(repo)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+            await session.commit()
+        dataset_source = "crypto_training_feature_rows" if feature_decision_rows else "settled_snapshots_rebuilt"
+        if feature_decision_rows:
+            rows = _filter_crypto_dict_rows(feature_decision_rows, requested_assets)
+        else:
+            snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
+            candles = _filter_crypto_snapshot_rows(candles, requested_assets)
+            spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+            snapshots = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, snapshots)
+            rows = _crypto_decision_rows(snapshots, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
+        rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
+        if limit and limit > 0:
+            rows = rows[-limit:]
+        replay = _evaluate_crypto_touch20_replay(
+            rows,
+            settings=self.settings,
+            crypto_policy=crypto_policy,
+        )
+        metrics = replay.get("metrics") or {}
+        reasons = _crypto_touch_replay_gate_reasons(metrics, settings=self.settings)
+        gate = {
+            "passed": not reasons,
+            "reasons": reasons,
+            "objective": "touch_20pct_before_close",
+            "requirements": {
+                "min_trade_candidates": self.settings.crypto_1h_touch_replay_min_candidates,
+                "min_net_pl_dollars": self.settings.crypto_1h_touch_replay_min_net_pnl_dollars,
+                "min_pnl_per_candidate_dollars": self.settings.crypto_1h_touch_replay_min_pnl_per_candidate_dollars,
+                "max_hard_cap_breaches": self.settings.crypto_1h_touch_replay_max_hard_cap_breaches,
+                "min_touch_rate": self.settings.crypto_1h_touch_replay_min_touch_rate,
+                "requires_allowed_bucket_support": True,
+            },
+        }
+        issues: list[dict[str, Any]] = []
+        for reason in reasons:
+            issues.append({
+                "severity": "fail" if command == "validate" else "warn",
+                "code": _issue_code(reason),
+                "message": reason,
+            })
+        status = "pass"
+        if any(issue["severity"] == "fail" for issue in issues):
+            status = "fail"
+        elif any(issue["severity"] == "warn" for issue in issues):
+            status = "warn"
+        return {
+            "schema_version": "crypto-touch20-backtest-report-v1",
+            "status": status,
+            "command": command,
+            "kalshi_env": self.settings.kalshi_env,
+            "frequency": freq,
+            "days": days,
+            "asset_symbols": requested_assets,
+            "objective": "touch_20pct_before_close",
+            "dataset": {
+                "source": dataset_source,
+                "row_count": len(rows),
+                "feature_row_count": len(feature_decision_rows),
+                "snapshot_count": len(snapshots),
+                "settled_snapshot_count": sum(1 for row in snapshots if row.settlement_result in {"yes", "no"}),
+                "candlestick_count": len(candles),
+                "spot_row_count": len(spot_rows),
+                "assets": sorted({str(row.get("asset_symbol")) for row in rows}),
+            },
+            "touch_replay": replay,
+            "metrics": metrics,
+            "promotion_gate": gate,
+            "issues": issues,
         }
 
     async def _build_report(
@@ -4767,7 +5172,7 @@ class CryptoWorkflowService:
                     asset_symbol=market.asset_symbol,
                     frequency=market.frequency,
                 )
-                if (signal.candidate_trace or {}).get("objective") == "touch_30pct_before_close":
+                if str((signal.candidate_trace or {}).get("objective") or "").startswith("touch_"):
                     runtime_thresholds.risk_min_contract_price_dollars = min(
                         float(runtime_thresholds.risk_min_contract_price_dollars),
                         float(self.settings.crypto_touch_strategy_min_contract_price_dollars),
@@ -5102,23 +5507,41 @@ class CryptoAutonomyService:
         skipped.extend(cap_skips)
 
         replay_gates_by_asset: dict[str, Any] = {}
+        touch_replay_gates_by_asset: dict[str, Any] = {}
         if markets:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                 for asset_symbol in sorted({market.asset_symbol for market in markets}):
-                    replay_gates_by_asset[normalize_asset_symbol(asset_symbol)] = await _latest_crypto_artifact_for_asset(
+                    asset_key = normalize_asset_symbol(asset_symbol)
+                    replay_gates_by_asset[asset_key] = await _latest_crypto_artifact_for_asset(
                         repo,
                         frequency=freq,
                         artifact_type="replay_gate",
                         kalshi_env=self.settings.kalshi_env,
                         asset_symbol=asset_symbol,
                     )
+                    if freq == "1h" and asset_key in (_normalize_asset_csv(self.settings.crypto_1h_touch_assets) or {"BTC"}):
+                        touch_replay_gates_by_asset[asset_key] = await _latest_crypto_artifact_for_asset(
+                            repo,
+                            frequency=freq,
+                            artifact_type="replay_gate_touch20",
+                            kalshi_env=self.settings.kalshi_env,
+                            asset_symbol=asset_symbol,
+                            allow_generic_fallback=False,
+                        )
                 await session.commit()
 
         for market in markets:
             try:
                 seconds_to_close = int((market.close_time - datetime.now(UTC)).total_seconds())
-                market_gate = replay_gates_by_asset.get(normalize_asset_symbol(market.asset_symbol), gate)
+                asset_key = normalize_asset_symbol(market.asset_symbol)
+                touch_gate = touch_replay_gates_by_asset.get(asset_key)
+                market_gate = replay_gates_by_asset.get(asset_key, gate)
+                if (
+                    _crypto_btc_1h_touch_policy_configured_for_market(market, settings=self.settings)
+                    and _crypto_touch_replay_gate_passed(touch_gate)
+                ):
+                    market_gate = touch_gate
 
                 live_status = self.asset_control_service.market_live_status(
                     control=control,
@@ -5787,6 +6210,9 @@ def _resolved_crypto_asset_modes(
 def _runtime_replay_gate_blockers(replay_gate: Any | None, crypto_policy: RuntimeCryptoPolicy | None) -> list[str]:
     if replay_gate is None:
         return ["Crypto replay gate is missing."]
+    if str(getattr(replay_gate, "artifact_type", "") or "").startswith("replay_gate_touch20"):
+        gate_status = getattr(replay_gate, "status", None)
+        return [] if gate_status == "passed" else [f"BTC 1h touch replay gate is {gate_status or 'missing'}."]
     if crypto_policy is None:
         gate_status = getattr(replay_gate, "status", None)
         return [] if gate_status == "passed" else [f"Crypto replay gate is {gate_status or 'missing'}."]
@@ -6511,9 +6937,56 @@ def _crypto_recommendation(
     empirical_bucket_matrix: list[dict[str, Any]] | None = None,
     last_minute_passive_price_matrix: list[dict[str, Any]] | None = None,
     enforce_empirical_bucket_gate: bool = False,
+    touch_replay_gate: Any | None = None,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
     row = row or _crypto_live_market_row(market, settings=settings)
-    if bool(settings.crypto_touch_strategy_enabled) and not bool(settings.crypto_model_trained_replay_only):
+    btc_1h_touch_configured = _crypto_btc_1h_touch_policy_configured_for_row(row, settings=settings)
+    btc_1h_touch_gate_passed = _crypto_touch_replay_gate_passed(touch_replay_gate)
+    btc_1h_touch_allowed = btc_1h_touch_configured and btc_1h_touch_gate_passed
+    legacy_touch_allowed = bool(settings.crypto_touch_strategy_enabled) and not bool(settings.crypto_model_trained_replay_only)
+    if btc_1h_touch_configured and not btc_1h_touch_gate_passed:
+        target_pct = Decimal(str(settings.crypto_1h_touch_take_profit_pct))
+        objective = _crypto_touch_objective(target_pct)
+        return (
+            None,
+            None,
+            None,
+            0,
+            {
+                "outcome": "touch_strategy_blocked",
+                "fair_yes_dollars": _money_text(_clamp_price(fair_yes)),
+                "raw_fair_yes_dollars": _money_text(_clamp_price(fair_yes)),
+                "market_anchored_fair_yes_dollars": _money_text(_clamp_price(fair_yes)),
+                "selected_side": None,
+                "selected_edge_bps": 0,
+                "candidate_status": "blocked_touch_strategy",
+                "selection_reason": "touch20_replay_gate_missing_or_blocked",
+                "expected_net_edge": None,
+                "rank": None,
+                "bucket_key": None,
+                "target_yes_price_dollars": None,
+                "min_edge_bps": _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)["min_fee_adjusted_edge_bps"],
+                "spread_bps": market.spread_bps,
+                "candidates": [],
+                "gate_cascade": [],
+                "touch_strategy": {
+                    "enabled": True,
+                    "policy": "btc_1h_touch20",
+                    "objective": _crypto_touch_exit_objective(target_pct),
+                    "take_profit_pct": float(target_pct),
+                    "gate_required": True,
+                    "gate_status": getattr(touch_replay_gate, "status", None) if touch_replay_gate is not None else "missing",
+                },
+                "touch_replay_gate": {
+                    "status": getattr(touch_replay_gate, "status", None) if touch_replay_gate is not None else "missing",
+                    "version": getattr(touch_replay_gate, "version", None) if touch_replay_gate is not None else None,
+                    "artifact_type": getattr(touch_replay_gate, "artifact_type", None) if touch_replay_gate is not None else "replay_gate_touch20:BTC",
+                },
+                "objective": objective,
+                **_crypto_settlement_diagnostics(row),
+            },
+        )
+    if legacy_touch_allowed or btc_1h_touch_allowed:
         raw_fair_yes = _clamp_price(fair_yes)
         entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
         candidates = _crypto_touch_strategy_candidates(
@@ -6522,9 +6995,15 @@ def _crypto_recommendation(
             crypto_policy=crypto_policy,
             empirical_bucket_matrix=empirical_bucket_matrix,
             enforce_empirical_bucket_gate=enforce_empirical_bucket_gate,
+            btc_1h_touch_policy=btc_1h_touch_allowed,
         )
         selected = next((candidate for candidate in candidates if candidate.get("candidate_status") == CRYPTO_LIVE_QUALITY), None)
         best = selected or (candidates[0] if candidates else {})
+        objective = str(best.get("objective") or _crypto_touch_policy_context(
+            row,
+            settings=settings,
+            btc_1h_touch_policy=btc_1h_touch_allowed,
+        )["objective"])
         selected_status = str(best.get("candidate_status") or "")
         selected_side_raw = str(best.get("side") or "yes")
         selected_side = ContractSide(selected_side_raw) if selected_side_raw in {"yes", "no"} else None
@@ -6569,7 +7048,16 @@ def _crypto_recommendation(
                 "candidates": candidates,
                 "gate_cascade": _crypto_candidate_gate_cascade(candidates, selected=selected if live_quality else None),
                 "touch_strategy": best.get("touch_strategy"),
-                "objective": "touch_30pct_before_close",
+                "touch_replay_gate": (
+                    {
+                        "status": getattr(touch_replay_gate, "status", None),
+                        "version": getattr(touch_replay_gate, "version", None),
+                        "artifact_type": getattr(touch_replay_gate, "artifact_type", None),
+                    }
+                    if btc_1h_touch_allowed
+                    else None
+                ),
+                "objective": objective,
                 **_crypto_settlement_diagnostics(row),
             },
         )
@@ -11053,6 +11541,10 @@ def _crypto_frequency_for_row(row: dict[str, Any]) -> str:
     market_ticker = str(row.get("market_ticker") or "").upper()
     if "15M" in series_ticker or "15M" in market_ticker:
         return "15m"
+    if "1H" in series_ticker or "1H" in market_ticker:
+        return "1h"
+    if series_ticker.endswith("D") or "-T" in market_ticker:
+        return "1h"
     return "15m"
 
 
@@ -11518,6 +12010,17 @@ def _crypto_side_ask(row: dict[str, Any], side: str) -> Decimal | None:
         return None
 
 
+def _crypto_side_bid(row: dict[str, Any], side: str) -> Decimal | None:
+    key = "yes_bid_dollars" if str(side).lower() == "yes" else "no_bid_dollars"
+    raw = row.get(key)
+    if raw in (None, ""):
+        return None
+    try:
+        return _clamp_price(_decimal(raw))
+    except Exception:
+        return None
+
+
 def _crypto_last_minute_price_matrix_base_key(
     row: dict[str, Any],
     *,
@@ -11838,10 +12341,18 @@ def _crypto_touch_strategy_candidates(
     crypto_policy: RuntimeCryptoPolicy | None = None,
     empirical_bucket_matrix: list[dict[str, Any]] | None = None,
     enforce_empirical_bucket_gate: bool = False,
+    btc_1h_touch_policy: bool = False,
 ) -> list[dict[str, Any]]:
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
-    target_pct = Decimal(str(settings.crypto_touch_strategy_take_profit_pct))
-    stop_pct = Decimal(str(settings.crypto_touch_strategy_stop_loss_pct))
+    policy_context = _crypto_touch_policy_context(
+        row,
+        settings=settings,
+        btc_1h_touch_policy=btc_1h_touch_policy,
+    )
+    target_pct = Decimal(str(policy_context["target_pct"]))
+    stop_pct = Decimal(str(policy_context["stop_pct"]))
+    objective = str(policy_context["objective"])
+    exit_objective = str(policy_context["exit_objective"])
     min_price = Decimal(str(settings.crypto_touch_strategy_min_contract_price_dollars))
     min_probability = Decimal(str(settings.crypto_touch_strategy_min_touch_probability))
     fee_rate = Decimal(str(settings.kalshi_taker_fee_rate))
@@ -11849,7 +12360,11 @@ def _crypto_touch_strategy_candidates(
     min_live_edge = Decimal(int(entry_policy["min_fee_adjusted_edge_bps"])) / Decimal("10000")
     market_mid_probability = _crypto_market_mid_probability_text(row)
     anchor_weight = _crypto_market_price_anchor_weight(row, settings=settings)
-    live_entry_window_reason = _crypto_live_entry_window_reason(row, settings=settings)
+    live_entry_window_reason = _crypto_touch_entry_window_reason(
+        row,
+        settings=settings,
+        policy_context=policy_context,
+    )
     require_empirical = bool(settings.crypto_touch_strategy_require_empirical_bucket)
     if row.get("strict_trade_eligible") is False:
         return [
@@ -11863,7 +12378,7 @@ def _crypto_touch_strategy_candidates(
                 "target_yes_price_dollars": None,
                 "rank": rank,
                 "live_eligible": False,
-                "objective": "touch_30pct_before_close",
+                "objective": objective,
                 **settlement_diagnostics,
             }
             for rank, side in enumerate(("yes", "no"), start=1)
@@ -11886,7 +12401,7 @@ def _crypto_touch_strategy_candidates(
                 "target_yes_price_dollars": None,
                 "rank": rank,
                 "live_eligible": False,
-                "objective": "touch_30pct_before_close",
+                "objective": objective,
                 **settlement_diagnostics,
             }
             for rank, side in enumerate(("yes", "no"), start=1)
@@ -11956,7 +12471,10 @@ def _crypto_touch_strategy_candidates(
                     target_exit_price=target_exit_price,
                     stop_exit_price=stop_exit_price,
                 )
-                expected_return = (touch_probability * target_pct) - ((Decimal("1") - touch_probability) * stop_pct)
+                downside_return = stop_pct
+                if bool(policy_context.get("no_initial_hard_stop")):
+                    downside_return = Decimal("0")
+                expected_return = (touch_probability * target_pct) - ((Decimal("1") - touch_probability) * downside_return)
                 expected_net_edge = expected_return * cost
                 edge_bps = int((expected_return * Decimal("10000")).to_integral_value())
                 if touch_probability < min_probability:
@@ -11966,7 +12484,7 @@ def _crypto_touch_strategy_candidates(
                 else:
                     status = "eligible"
                     candidate_status = CRYPTO_LIVE_QUALITY
-                    reason = "touch_30pct_target_before_stop"
+                    reason = f"{objective}_target"
         candidates.append(
             {
                 "side": side,
@@ -11993,35 +12511,47 @@ def _crypto_touch_strategy_candidates(
                 "spread_bps": row.get("spread_bps"),
                 "touch_strategy": {
                     "enabled": True,
-                    "objective": "exitably_up_30pct_before_close",
+                    "policy": policy_context.get("policy_name"),
+                    "objective": exit_objective,
                     "take_profit_pct": float(target_pct),
-                    "stop_loss_pct": float(stop_pct),
+                    "stop_loss_pct": None if policy_context.get("no_initial_hard_stop") else float(stop_pct),
+                    "no_initial_hard_stop": bool(policy_context.get("no_initial_hard_stop")),
                     "min_contract_price_dollars": str(min_price.quantize(Decimal("0.0001"))),
                     "entry_cost_dollars": _money_text(cost) if cost is not None else None,
                     "current_side_mid_dollars": _money_text(current_side_mid) if current_side_mid is not None else None,
                     "target_exit_side_price_dollars": _money_text(target_exit_price) if target_exit_price is not None else None,
-                    "stop_exit_side_price_dollars": _money_text(stop_exit_price) if stop_exit_price is not None else None,
+                    "stop_exit_side_price_dollars": (
+                        None
+                        if policy_context.get("no_initial_hard_stop")
+                        else _money_text(stop_exit_price) if stop_exit_price is not None else None
+                    ),
                     "target_exit_yes_price_dollars": (
                         _money_text(_touch_strategy_target_yes_price(side, target_exit_price))
                         if target_exit_price is not None
                         else None
                     ),
                     "stop_exit_yes_price_dollars": (
-                        _money_text(_touch_strategy_target_yes_price(side, stop_exit_price))
-                        if stop_exit_price is not None
-                        else None
+                        None
+                        if policy_context.get("no_initial_hard_stop")
+                        else (
+                            _money_text(_touch_strategy_target_yes_price(side, stop_exit_price))
+                            if stop_exit_price is not None
+                            else None
+                        )
                     ),
                     "touch_probability": str(touch_probability) if touch_probability is not None else None,
                     "min_touch_probability": str(min_probability.quantize(Decimal("0.0001"))),
                     "spread_guard": spread_review,
                     "empirical_bucket_required": require_empirical,
+                    "min_market_age_seconds": policy_context.get("min_market_age_seconds"),
+                    "min_seconds_to_close": policy_context.get("min_seconds_to_close"),
                 },
                 "runtime_thresholds": dict(entry_policy),
                 "time_to_close_seconds": row.get("time_to_close_seconds"),
                 "live_entry_window_reason": live_entry_window_reason,
                 "rank": None,
                 "live_eligible": candidate_status == CRYPTO_LIVE_QUALITY,
-                "objective": "touch_30pct_before_close",
+                "objective": objective,
                 **settlement_diagnostics,
             }
         )
@@ -12484,6 +13014,263 @@ def _simulate_crypto_trade(
         "empirical_bucket_gate": selected.get("empirical_bucket_gate"),
         "candidates": candidates,
     }
+
+
+def _crypto_touch_replay_first_touch(
+    future_rows: list[dict[str, Any]],
+    *,
+    side: str,
+    target_exit_side_price: Decimal,
+) -> tuple[dict[str, Any], Decimal] | None:
+    for future in future_rows:
+        bid = _crypto_side_bid(future, side)
+        if bid is None:
+            continue
+        if bid >= target_exit_side_price:
+            return future, bid
+    return None
+
+
+def _simulate_crypto_touch_trade(
+    row: dict[str, Any],
+    future_rows: list[dict[str, Any]],
+    selected: dict[str, Any],
+    *,
+    settings: Settings,
+) -> dict[str, Any]:
+    side = str(selected["side"])
+    cost = _decimal(selected["execution_price_dollars"])
+    label_yes = int(row["label_yes"])
+    fee_rate = Decimal(str(settings.kalshi_taker_fee_rate))
+    entry_fee = estimate_kalshi_taker_fee_dollars(
+        price_dollars=cost,
+        count=Decimal("1.00"),
+        fee_rate=fee_rate,
+    )
+    touch = selected.get("touch_strategy") if isinstance(selected.get("touch_strategy"), dict) else {}
+    target_exit = _decimal(touch.get("target_exit_side_price_dollars"))
+    touched = _crypto_touch_replay_first_touch(
+        future_rows,
+        side=side,
+        target_exit_side_price=target_exit,
+    )
+    if touched is not None:
+        touch_row, exit_value = touched
+        exit_fee = estimate_kalshi_taker_fee_dollars(
+            price_dollars=exit_value,
+            count=Decimal("1.00"),
+            fee_rate=fee_rate,
+        )
+        gross = exit_value - cost
+        net = gross - entry_fee - exit_fee
+        return {
+            "status": "fillable",
+            "exit_mode": "take_profit_touch",
+            "touched": True,
+            "side": side,
+            "candidate_status": selected.get("candidate_status"),
+            "reason": selected.get("reason"),
+            "execution_price_dollars": str(cost.quantize(Decimal("0.0001"))),
+            "target_exit_side_price_dollars": str(target_exit.quantize(Decimal("0.0001"))),
+            "exit_side_price_dollars": str(exit_value.quantize(Decimal("0.0001"))),
+            "exit_decision_ts": touch_row.get("decision_ts"),
+            "gross_pnl": str(gross.quantize(Decimal("0.0001"))),
+            "fees": str((entry_fee + exit_fee).quantize(Decimal("0.0001"))),
+            "net_pnl": str(net.quantize(Decimal("0.0001"))),
+            "expected_net_edge": selected.get("expected_net_edge"),
+            "bucket_key": selected.get("bucket_key"),
+            "touch_strategy": touch,
+        }
+    payoff = Decimal(label_yes) if side == "yes" else Decimal(1 - label_yes)
+    gross = payoff - cost
+    net = gross - entry_fee
+    return {
+        "status": "fillable",
+        "exit_mode": "settlement_hold",
+        "touched": False,
+        "side": side,
+        "candidate_status": selected.get("candidate_status"),
+        "reason": selected.get("reason"),
+        "execution_price_dollars": str(cost.quantize(Decimal("0.0001"))),
+        "target_exit_side_price_dollars": str(target_exit.quantize(Decimal("0.0001"))),
+        "exit_side_price_dollars": None,
+        "gross_pnl": str(gross.quantize(Decimal("0.0001"))),
+        "fees": str(entry_fee.quantize(Decimal("0.0001"))),
+        "net_pnl": str(net.quantize(Decimal("0.0001"))),
+        "expected_net_edge": selected.get("expected_net_edge"),
+        "bucket_key": selected.get("bucket_key"),
+        "touch_strategy": touch,
+    }
+
+
+def _crypto_touch_bucket_matrix(trade_rows: list[dict[str, Any]], *, settings: Settings) -> list[dict[str, Any]]:
+    del settings
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in trade_rows:
+        key = _crypto_bucket_key(row, row.get("simulation") or {})
+        grouped[key].append(row)
+    matrix: list[dict[str, Any]] = []
+    for key, rows in grouped.items():
+        values = [_decimal((row.get("simulation") or {}).get("net_pnl")) for row in rows]
+        fees = [_decimal((row.get("simulation") or {}).get("fees")) for row in rows]
+        gross = [_decimal((row.get("simulation") or {}).get("gross_pnl")) for row in rows]
+        touch_count = sum(1 for row in rows if (row.get("simulation") or {}).get("touched") is True)
+        net_positive = sum(1 for value in values if value > 0)
+        first = rows[0]
+        net = sum(values, Decimal("0"))
+        touch_rate = _ratio(touch_count / len(values)) if values else None
+        matrix.append(
+            {
+                "bucket_key": key,
+                "asset_symbol": first.get("asset_symbol"),
+                "side": (first.get("simulation") or {}).get("side"),
+                "entry_price_band": _price_band(_decimal((first.get("simulation") or {}).get("execution_price_dollars") or first.get("mid_yes_dollars"))),
+                "spread_band": _spread_band(first.get("spread_bps")),
+                "time_to_close_bucket": _crypto_time_to_close_bucket(float(first.get("time_to_close_seconds") or 0)),
+                "sample_count": len(values),
+                "touch_count": touch_count,
+                "touch_rate": touch_rate,
+                "win_rate": touch_rate,
+                "outcome_win_rate": touch_rate,
+                "net_positive_rate": _ratio(net_positive / len(values)) if values else None,
+                "win_rate_basis": "touch_20pct_before_close",
+                "gross_pnl": str(sum(gross, Decimal("0")).quantize(Decimal("0.0001"))),
+                "fees": str(sum(fees, Decimal("0")).quantize(Decimal("0.0001"))),
+                "net_pnl": str(net.quantize(Decimal("0.0001"))),
+            }
+        )
+    matrix.sort(key=lambda item: (_decimal(item["net_pnl"]), item["bucket_key"]), reverse=True)
+    return matrix
+
+
+def _evaluate_crypto_touch20_replay(
+    rows: list[dict[str, Any]],
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+) -> dict[str, Any]:
+    asset = "BTC"
+    scoped_rows = [
+        row
+        for row in rows
+        if _safe_normalize_asset_symbol(row.get("asset_symbol")) == asset
+        and _crypto_frequency_for_row(row) == "1h"
+        and row.get("label_yes") in {0, 1}
+        and isinstance(row.get("decision_ts"), datetime)
+        and isinstance(row.get("settlement_ts"), datetime)
+    ]
+    scoped_rows.sort(key=lambda row: (row.get("market_ticker") or "", row.get("decision_ts") or datetime.max.replace(tzinfo=UTC)))
+    rows_by_market: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in scoped_rows:
+        rows_by_market[str(row.get("market_ticker") or "")].append(row)
+    trades: list[dict[str, Any]] = []
+    status_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    for market_rows in rows_by_market.values():
+        market_rows.sort(key=lambda row: row.get("decision_ts") or datetime.max.replace(tzinfo=UTC))
+        for idx, row in enumerate(market_rows):
+            candidates = _crypto_touch_strategy_candidates(
+                row,
+                settings=settings,
+                crypto_policy=crypto_policy,
+                btc_1h_touch_policy=True,
+            )
+            best = candidates[0] if candidates else {}
+            status_counts[str(best.get("candidate_status") or "unknown")] += 1
+            reason_counts[str(best.get("reason") or "unknown")] += 1
+            selected = next((candidate for candidate in candidates if candidate.get("candidate_status") == CRYPTO_LIVE_QUALITY), None)
+            if selected is None:
+                continue
+            decision_ts = row["decision_ts"]
+            settlement_ts = row["settlement_ts"]
+            future_rows = [
+                future
+                for future in market_rows[idx + 1 :]
+                if isinstance(future.get("decision_ts"), datetime)
+                and future["decision_ts"] > decision_ts
+                and future["decision_ts"] < settlement_ts
+            ]
+            simulation = _simulate_crypto_touch_trade(row, future_rows, selected, settings=settings)
+            trades.append({**row, "simulation": simulation, "predicted_yes_dollars": row.get("mid_yes_dollars")})
+    values = [_decimal((row.get("simulation") or {}).get("net_pnl")) for row in trades]
+    fees = [_decimal((row.get("simulation") or {}).get("fees")) for row in trades]
+    touch_count = sum(1 for row in trades if (row.get("simulation") or {}).get("touched") is True)
+    settlement_hold_count = len(trades) - touch_count
+    bucket_matrix = _crypto_touch_bucket_matrix(trades, settings=settings)
+    empirical_summary = _crypto_empirical_bucket_summary(
+        bucket_matrix,
+        settings=settings,
+        crypto_policy=crypto_policy,
+        requested_asset_symbols=[asset],
+        force_requested_assets=True,
+    )
+    net = sum(values, Decimal("0"))
+    metrics = {
+        "objective": "touch_20pct_before_close",
+        "asset_symbols": [asset],
+        "sample_count": len(scoped_rows),
+        "resolved_sample_count": len(scoped_rows),
+        "strict_trade_eligible_count": sum(1 for row in scoped_rows if row.get("strict_trade_eligible")),
+        "trade_candidate_count": len(trades),
+        "current_model_live_quality_candidate_count": len(trades),
+        "live_quality_candidate_count": len(trades),
+        "touch_count": touch_count,
+        "touch_rate": _ratio(touch_count / len(trades)) if trades else 0.0,
+        "settlement_hold_count": settlement_hold_count,
+        "net_simulated_pl_dollars": float(net),
+        "fees_dollars": float(sum(fees, Decimal("0"))),
+        "hard_cap_breaches": sum(1 for value in values if value < Decimal("-1.0000")),
+        "pnl_per_candidate_dollars": float(net / Decimal(len(trades))) if trades else 0.0,
+        "candidate_status_counts": dict(status_counts),
+        "candidate_reason_counts": dict(reason_counts),
+        "bucket_matrix": bucket_matrix,
+        "allowed_bucket_keys": empirical_summary["allowed_bucket_keys"],
+        "blocked_bucket_keys": empirical_summary["blocked_bucket_keys"],
+        "empirical_bucket_gate": empirical_summary,
+        "fee_model_version": current_fee_model_version(),
+    }
+    return {
+        "status": "ok" if trades else "warn",
+        "objective": "touch_20pct_before_close",
+        "asset_symbols": [asset],
+        "metrics": metrics,
+        "bucket_matrix": bucket_matrix,
+        "trades": trades[:100],
+    }
+
+
+def _crypto_touch_replay_gate_reasons(metrics: dict[str, Any], *, settings: Settings) -> list[str]:
+    reasons: list[str] = []
+    if not metrics:
+        return ["BTC 1h touch replay artifact is missing."]
+    if metrics.get("backtest_missing"):
+        reasons.append("BTC 1h touch replay artifact is missing.")
+    candidates = int(metrics.get("current_model_live_quality_candidate_count", metrics.get("trade_candidate_count")) or 0)
+    min_candidates = max(1, int(settings.crypto_1h_touch_replay_min_candidates))
+    net_pl = float(metrics.get("net_simulated_pl_dollars") or 0.0)
+    min_net = float(settings.crypto_1h_touch_replay_min_net_pnl_dollars)
+    hard_cap_breaches = int(metrics.get("hard_cap_breaches") or 0)
+    max_hard_cap = int(settings.crypto_1h_touch_replay_max_hard_cap_breaches)
+    touch_rate = float(metrics.get("touch_rate") or 0.0)
+    min_touch_rate = float(settings.crypto_1h_touch_replay_min_touch_rate)
+    if candidates < min_candidates:
+        reasons.append(f"BTC 1h touch replay candidate count {candidates} below minimum {min_candidates}.")
+    if net_pl <= min_net:
+        reasons.append(f"BTC 1h touch replay net P/L ${net_pl:.2f} does not clear required positive threshold.")
+    if candidates >= min_candidates:
+        pnl_per_candidate = net_pl / candidates if candidates > 0 else 0.0
+        if pnl_per_candidate < float(settings.crypto_1h_touch_replay_min_pnl_per_candidate_dollars):
+            reasons.append(
+                f"BTC 1h touch replay P/L per candidate ${pnl_per_candidate:.4f} below minimum "
+                f"${float(settings.crypto_1h_touch_replay_min_pnl_per_candidate_dollars):.4f}."
+            )
+    if hard_cap_breaches > max_hard_cap:
+        reasons.append(f"BTC 1h touch replay hard-cap breaches {hard_cap_breaches} exceed limit {max_hard_cap}.")
+    if touch_rate < min_touch_rate:
+        reasons.append(f"BTC 1h touch replay touch rate {touch_rate:.1%} below minimum {min_touch_rate:.1%}.")
+    if not (metrics.get("allowed_bucket_keys") or []):
+        reasons.append("BTC 1h touch replay has no allowed bucket support.")
+    return reasons
 
 
 def _crypto_policy_metrics(policy_name: str, trade_rows: list[dict[str, Any]], *, settings: Settings) -> dict[str, Any]:

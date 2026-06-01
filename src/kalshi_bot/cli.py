@@ -786,6 +786,7 @@ async def _run_crypto_replay_command(args: argparse.Namespace, container: AppCon
         result = await container.crypto_replay_service.gate(
             frequency=args.frequency,
             asset_symbols=getattr(args, "assets", None),
+            objective=getattr(args, "objective", "settlement"),
         )
     elif args.crypto_replay_command == "run":
         result = await container.crypto_replay_service.run(
@@ -793,6 +794,7 @@ async def _run_crypto_replay_command(args: argparse.Namespace, container: AppCon
             days=args.days,
             limit=args.limit if args.limit and args.limit > 0 else None,
             asset_symbols=getattr(args, "assets", None),
+            objective=getattr(args, "objective", "settlement"),
         )
     elif args.crypto_replay_command == "validate":
         result = await container.crypto_replay_service.validate(
@@ -800,6 +802,7 @@ async def _run_crypto_replay_command(args: argparse.Namespace, container: AppCon
             days=args.days,
             limit=args.limit if args.limit and args.limit > 0 else None,
             asset_symbols=getattr(args, "assets", None),
+            objective=getattr(args, "objective", "settlement"),
         )
     else:
         raise ValueError(f"unknown crypto-replay command {args.crypto_replay_command}")
@@ -4496,6 +4499,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_replay_gate)
     crypto_replay_gate.add_argument("--frequency", default="15m")
     crypto_replay_gate.add_argument("--assets", nargs="*", default=None)
+    crypto_replay_gate.add_argument("--objective", choices=["settlement", "touch20"], default="settlement")
     for name in ("run", "validate"):
         crypto_replay_command = crypto_replay_subparsers.add_parser(name)
         add_kalshi_env_argument(crypto_replay_command)
@@ -4503,6 +4507,7 @@ def build_parser() -> argparse.ArgumentParser:
         crypto_replay_command.add_argument("--days", type=int, default=30)
         crypto_replay_command.add_argument("--limit", type=int, default=0)
         crypto_replay_command.add_argument("--assets", nargs="*", default=None)
+        crypto_replay_command.add_argument("--objective", choices=["settlement", "touch20"], default="settlement")
         crypto_replay_command.add_argument("--json", action="store_true")
 
     crypto_status = subparsers.add_parser("crypto-status")

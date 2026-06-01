@@ -30,7 +30,10 @@ logger = logging.getLogger(__name__)
 def _crypto_market_identity(market_ticker: str) -> tuple[str | None, str | None]:
     match = re.match(r"^KX([A-Z]+)(15M|1H)", str(market_ticker or "").upper())
     if match is None:
-        return None, None
+        hourly_match = re.match(r"^KX([A-Z]+)D-", str(market_ticker or "").upper())
+        if hourly_match is None:
+            return None, None
+        return hourly_match.group(1), "1h"
     frequency = "15m" if match.group(2) == "15M" else "1h"
     return match.group(1), frequency
 

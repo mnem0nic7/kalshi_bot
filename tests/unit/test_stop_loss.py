@@ -12,7 +12,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.services.stop_loss import (
     StopLossService, _midpoint, _momentum_slope, _peak_price_from_history,
     _position_opened_at_from_fills, _round_trip_net_return_ratio, _sell_price,
-    _trailing_loss_ratio,
+    _strategy_for_market_ticker, _trailing_loss_ratio,
 )
 
 
@@ -114,6 +114,10 @@ def test_round_trip_net_return_ratio_converts_no_sell_yes_price():
     assert ratio == pytest.approx(-0.30)
 
 
+def test_strategy_for_market_ticker_detects_hourly_d_suffix():
+    assert _strategy_for_market_ticker("KXBTCD-26MAY3121-T73799.99") == "CRYPTO_1H"
+
+
 class _FakeStopLossSession:
     async def __aenter__(self) -> "_FakeStopLossSession":
         return self
@@ -196,6 +200,79 @@ async def test_model_trained_replay_only_keeps_crypto_trailing_stop_active(monke
     assert result == {"submitted": True}
     submit.assert_called_once()
     assert submit.call_args.kwargs["trigger"] == "trailing_stop"
+
+
+@pytest.mark.asyncio
+async def test_crypto_1h_profit_protection_requires_profit_threshold_and_adverse_momentum(monkeypatch):
+    monkeypatch.setattr("kalshi_bot.services.stop_loss.PlatformRepository", _FakeStopLossRepo)
+    settings = Settings(
+        app_color="blue",
+        kalshi_taker_fee_rate=0,
+        stop_loss_threshold_pct=0.30,
+        stop_loss_enabled_strategies="CRYPTO_1H",
+        stop_loss_hard_stop_disabled_strategies="CRYPTO_1H",
+        stop_loss_profit_protection_threshold_pct_by_strategy={"CRYPTO_1H": 0.10},
+        stop_loss_momentum_min_hold_minutes_by_strategy={"CRYPTO_1H": 5},
+        stop_loss_momentum_slope_threshold_cents_per_min=-0.2,
+    )
+    service = StopLossService(settings, lambda: _FakeStopLossSession(), MagicMock())
+    submit = AsyncMock(return_value={"submitted": True})
+    monkeypatch.setattr(service, "_submit", submit)
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    position = _pos("yes", "1.00", "0.5000")
+    position.id = 1
+    position.market_ticker = "KXBTCD-26JUN0112-T73000"
+    position.created_at = now - timedelta(minutes=6)
+    ms = _ms("0.5500", "0.5700")
+    prices = [
+        _ph("0.7000", now - timedelta(minutes=5)),
+        _ph("0.6600", now - timedelta(minutes=4)),
+        _ph("0.6200", now - timedelta(minutes=3)),
+        _ph("0.5900", now - timedelta(minutes=2)),
+        _ph("0.5600", now - timedelta(minutes=1)),
+    ]
+
+    result = await service._evaluate_and_submit(position, ms, Decimal("0.5600"), prices, now)
+
+    assert result == {"submitted": True}
+    submit.assert_called_once()
+    assert submit.call_args.kwargs["trigger"] == "profit_protection"
+
+
+@pytest.mark.asyncio
+async def test_crypto_1h_profit_protection_does_not_fire_before_profit_threshold(monkeypatch):
+    monkeypatch.setattr("kalshi_bot.services.stop_loss.PlatformRepository", _FakeStopLossRepo)
+    settings = Settings(
+        app_color="blue",
+        kalshi_taker_fee_rate=0,
+        stop_loss_threshold_pct=0.30,
+        stop_loss_enabled_strategies="CRYPTO_1H",
+        stop_loss_hard_stop_disabled_strategies="CRYPTO_1H",
+        stop_loss_profit_protection_threshold_pct_by_strategy={"CRYPTO_1H": 0.10},
+        stop_loss_momentum_min_hold_minutes_by_strategy={"CRYPTO_1H": 5},
+        stop_loss_momentum_slope_threshold_cents_per_min=-0.2,
+    )
+    service = StopLossService(settings, lambda: _FakeStopLossSession(), MagicMock())
+    submit = AsyncMock()
+    monkeypatch.setattr(service, "_submit", submit)
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    position = _pos("yes", "1.00", "0.5000")
+    position.id = 1
+    position.market_ticker = "KXBTCD-26JUN0112-T73000"
+    position.created_at = now - timedelta(minutes=6)
+    ms = _ms("0.5200", "0.5400")
+    prices = [
+        _ph("0.6500", now - timedelta(minutes=5)),
+        _ph("0.6100", now - timedelta(minutes=4)),
+        _ph("0.5800", now - timedelta(minutes=3)),
+        _ph("0.5500", now - timedelta(minutes=2)),
+        _ph("0.5300", now - timedelta(minutes=1)),
+    ]
+
+    result = await service._evaluate_and_submit(position, ms, Decimal("0.5300"), prices, now)
+
+    assert result is None
+    submit.assert_not_called()
 
 
 # ── trailing loss ratio ──────────────────────────────────────────────────────

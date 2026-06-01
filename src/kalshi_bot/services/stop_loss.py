@@ -159,6 +159,26 @@ def _round_trip_net_return_ratio(
     return float(net_return / denominator)
 
 
+def _strategy_for_market_ticker(market_ticker: str) -> str | None:
+    ticker = str(market_ticker or "").upper()
+    if "15M" in ticker:
+        return "CRYPTO_15M"
+    if "1H" in ticker:
+        return "CRYPTO_1H"
+    series = ticker.split("-", 1)[0]
+    if series.startswith("KX") and series.endswith("D") and len(series) > 3:
+        return "CRYPTO_1H"
+    return None
+
+
+def _strategy_csv(value: str | None) -> set[str]:
+    return {
+        raw.strip().upper()
+        for raw in str(value or "").replace(";", ",").split(",")
+        if raw.strip()
+    }
+
+
 def _momentum_slope(prices: list[MarketPriceHistory]) -> float | None:
     """Return YES midpoint slope in ¢/min via linear regression, or None if < 5 valid points."""
     points = [
@@ -295,14 +315,17 @@ class StopLossService:
                         if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
                             return None
 
-            inferred_strategy = (
-                "CRYPTO_15M" if "15M" in position.market_ticker else
-                "CRYPTO_1H" if "1H" in position.market_ticker else None
-            )
+            inferred_strategy = _strategy_for_market_ticker(position.market_ticker)
+            enabled_strategies = _strategy_csv(self.settings.stop_loss_enabled_strategies)
+            if enabled_strategies and (inferred_strategy or "") not in enabled_strategies:
+                return None
             effective_threshold = (
                 self.settings.stop_loss_threshold_pct_by_strategy.get(inferred_strategy)
                 if inferred_strategy else None
             ) or self.settings.stop_loss_threshold_pct
+            hard_stop_disabled = (inferred_strategy or "") in _strategy_csv(
+                self.settings.stop_loss_hard_stop_disabled_strategies
+            )
             sell_px = _sell_price(ms, position.side)
             net_return_ratio = (
                 _round_trip_net_return_ratio(
@@ -313,7 +336,7 @@ class StopLossService:
                 if sell_px is not None
                 else None
             )
-            if net_return_ratio is not None and net_return_ratio <= -effective_threshold:
+            if not hard_stop_disabled and net_return_ratio is not None and net_return_ratio <= -effective_threshold:
                 result = await self._submit(
                     repo, position, sell_px, mid, abs(net_return_ratio), now,
                     kill_switch_enabled=kill_switch_enabled,
@@ -338,7 +361,7 @@ class StopLossService:
             trailing_ratio: float | None = None
             if peak is not None:
                 trailing_ratio = _trailing_loss_ratio(peak, mid)
-                if trailing_ratio >= effective_threshold:
+                if not hard_stop_disabled and trailing_ratio >= effective_threshold:
                     if sell_px is not None and sell_px > 0:
                         result = await self._submit(
                             repo, position, sell_px, mid, trailing_ratio, now,
@@ -351,7 +374,7 @@ class StopLossService:
 
             # Trigger 3: rapid adverse move — 2 consecutive per-check drops ≥ threshold,
             # bypasses the hold gate to catch fast crashes inside the min-hold window.
-            if self.settings.stop_loss_rapid_adverse_enabled and len(prev_mids) >= 2:
+            if not hard_stop_disabled and self.settings.stop_loss_rapid_adverse_enabled and len(prev_mids) >= 2:
                 threshold = Decimal(str(self.settings.stop_loss_rapid_adverse_dollars))
                 drop1 = prev_mids[-2][0] - prev_mids[-1][0]  # older→recent (adverse = positive)
                 drop2 = prev_mids[-1][0] - mid               # recent→current
@@ -394,7 +417,14 @@ class StopLossService:
                 return None
 
             profit = _profit_ratio(position, mid)
-            trigger = "profit_protection" if (profit is not None and profit >= self.settings.stop_loss_profit_protection_threshold_pct) else "momentum"
+            profit_threshold = (
+                self.settings.stop_loss_profit_protection_threshold_pct_by_strategy.get(inferred_strategy)
+                if inferred_strategy else None
+            ) or self.settings.stop_loss_profit_protection_threshold_pct
+            profit_protection_ready = profit is not None and profit >= profit_threshold
+            if hard_stop_disabled and not profit_protection_ready:
+                return None
+            trigger = "profit_protection" if profit_protection_ready else "momentum"
             result = await self._submit(
                 repo, position, sell_px, mid, trailing_ratio, now,
                 kill_switch_enabled=kill_switch_enabled,
