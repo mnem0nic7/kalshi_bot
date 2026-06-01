@@ -208,6 +208,18 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
+def _datetime_from_any(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return _as_utc(parsed)
+
+
 def _clamp(value: Decimal, low: Decimal = Decimal("0"), high: Decimal = Decimal("1")) -> Decimal:
     return min(high, max(low, value))
 
@@ -297,6 +309,32 @@ def _sell_side_price(snapshot: CryptoMarketSnapshotRecord, side: str) -> Decimal
     if no_bid is not None:
         return no_bid
     yes_ask = _sell_yes_price(snapshot, "no")
+    return quantize_price(Decimal("1.0000") - yes_ask) if yes_ask is not None else None
+
+
+def _terminal_price(raw: Decimal | float | str | None) -> Decimal | None:
+    if raw is None:
+        return None
+    price = _decimal(raw)
+    if price < Decimal("0") or price > Decimal("1"):
+        return None
+    return quantize_price(price)
+
+
+def _terminal_side_exit_price(snapshot: CryptoMarketSnapshotRecord, side: str) -> Decimal | None:
+    result = str(snapshot.settlement_result or "").strip().lower()
+    if result in {"yes", "no"}:
+        return _settlement_side_payout(snapshot, side)
+    if side == "yes":
+        direct = _terminal_price(snapshot.yes_bid_dollars)
+        if direct is not None:
+            return direct
+        no_ask = _terminal_price(snapshot.no_ask_dollars)
+        return quantize_price(Decimal("1.0000") - no_ask) if no_ask is not None else None
+    direct = _terminal_price(snapshot.no_bid_dollars)
+    if direct is not None:
+        return direct
+    yes_ask = _terminal_price(snapshot.yes_ask_dollars)
     return quantize_price(Decimal("1.0000") - yes_ask) if yes_ask is not None else None
 
 
@@ -403,6 +441,17 @@ def _realized_pnl(
     return ((exit_side_price - entry_side_price) * count_fp - entry_fee - exit_fee).quantize(Decimal("0.0001"))
 
 
+def _realized_pnl_without_exit_fee(
+    *,
+    entry_side_price: Decimal,
+    exit_side_price: Decimal,
+    count_fp: Decimal,
+    fee_rate: Decimal,
+) -> Decimal:
+    entry_fee = estimate_kalshi_taker_fee_dollars(price_dollars=entry_side_price, count=count_fp, fee_rate=fee_rate)
+    return ((exit_side_price - entry_side_price) * count_fp - entry_fee).quantize(Decimal("0.0001"))
+
+
 def net_profit_pct(
     *,
     entry_side_price: Decimal,
@@ -422,6 +471,22 @@ def net_profit_pct(
         count_fp=count_fp,
         fee_rate=fee_rate,
     ) / denominator).quantize(Decimal("0.0001"))
+
+
+def _net_profit_pct_from_realized(
+    *,
+    realized_pnl: Decimal,
+    entry_side_price: Decimal,
+    count_fp: Decimal,
+    fee_rate: Decimal,
+) -> Decimal | None:
+    if count_fp <= Decimal("0") or entry_side_price <= Decimal("0"):
+        return None
+    entry_fee = estimate_kalshi_taker_fee_dollars(price_dollars=entry_side_price, count=count_fp, fee_rate=fee_rate)
+    denominator = entry_side_price * count_fp + entry_fee
+    if denominator <= Decimal("0"):
+        return None
+    return (realized_pnl / denominator).quantize(Decimal("0.0001"))
 
 
 def _non_proxy_spot(row: CryptoSpotOHLCRecord) -> bool:
@@ -1242,6 +1307,90 @@ def _entry_ledger_decision(order_status: str, filled_count_fp: Decimal | None) -
     return True, "entry_submitted"
 
 
+def _entry_terminal_time(entry: dict[str, Any], snapshot: CryptoMarketSnapshotRecord) -> datetime | None:
+    values = [
+        _datetime_from_any(entry.get("close_time")),
+        _datetime_from_any(snapshot.close_time),
+        _datetime_from_any(snapshot.expected_expiration_time),
+    ]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def _terminal_close_due(entry: dict[str, Any], snapshot: CryptoMarketSnapshotRecord, *, now: datetime) -> bool:
+    result = str(snapshot.settlement_result or "").strip().lower()
+    if result in {"yes", "no"}:
+        return True
+    status = str(snapshot.status or "").strip().lower()
+    if status in {"closed", "settled", "finalized"}:
+        return True
+    terminal_time = _entry_terminal_time(entry, snapshot)
+    return terminal_time is not None and now >= terminal_time
+
+
+def _terminal_exit_yes_price(side: str, exit_side_price: Decimal) -> Decimal:
+    if side == "yes":
+        return exit_side_price
+    return quantize_price(Decimal("1.0000") - exit_side_price)
+
+
+def _mark_entry_terminal_closed(
+    entry: dict[str, Any],
+    *,
+    snapshot: CryptoMarketSnapshotRecord,
+    side: str,
+    exit_side_price: Decimal,
+    now: datetime,
+    settings: Settings,
+    trigger: str,
+    order_status: str = "not_submitted_terminal_close",
+    receipt: ExecReceiptPayload | None = None,
+    exit_client_order_id: str | None = None,
+) -> dict[str, Any]:
+    count_fp = _decimal(entry.get("count_fp") or "0")
+    entry_side = _decimal(entry.get("entry_side_price_dollars") or "0")
+    fee_rate = Decimal(str(settings.kalshi_taker_fee_rate))
+    realized = _realized_pnl_without_exit_fee(
+        entry_side_price=entry_side,
+        exit_side_price=exit_side_price,
+        count_fp=count_fp,
+        fee_rate=fee_rate,
+    )
+    profit_pct = _net_profit_pct_from_realized(
+        realized_pnl=realized,
+        entry_side_price=entry_side,
+        count_fp=count_fp,
+        fee_rate=fee_rate,
+    )
+    exit_yes = _terminal_exit_yes_price(side, exit_side_price)
+    entry.update(
+        {
+            "status": "closed",
+            "closed_at": now.isoformat(),
+            "exit_trigger": trigger,
+            "exit_yes_price_dollars": _money_text(exit_yes),
+            "exit_side_price_dollars": _money_text(exit_side_price),
+            "exit_order_status": order_status,
+            "settlement_result": snapshot.settlement_result,
+            "realized_pnl_dollars": _money_text(realized),
+            "net_profit_pct": str(profit_pct) if profit_pct is not None else None,
+        }
+    )
+    if exit_client_order_id:
+        entry["exit_client_order_id"] = exit_client_order_id
+        entry["exit_submitted_at"] = now.isoformat()
+    if receipt is not None:
+        entry["exit_receipt"] = receipt.model_dump(mode="json")
+    return {
+        "status": "terminal_closed",
+        "trigger": trigger,
+        "exit_order_status": order_status,
+        "exit_side_price_dollars": _money_text(exit_side_price),
+        "realized_pnl_dollars": _money_text(realized),
+        "net_profit_pct": str(profit_pct) if profit_pct is not None else None,
+    }
+
+
 def _exit_trigger_for_profit(
     profit_pct: Decimal,
     *,
@@ -1850,6 +1999,7 @@ class CryptoNonModelTouch20Service:
 
         evaluated: list[dict[str, Any]] = []
         exits: list[dict[str, Any]] = []
+        ledger_dirty = False
         for client_order_id, entry in open_entries:
             market_ticker = str(entry.get("market_ticker") or "")
             retry_at_raw = entry.get("next_exit_retry_at")
@@ -1883,6 +2033,35 @@ class CryptoNonModelTouch20Service:
             sell_yes = _sell_yes_price(snapshot, side)
             exit_side = _sell_side_price(snapshot, side)
             if sell_yes is None or exit_side is None:
+                if _terminal_close_due(entry, snapshot, now=now):
+                    terminal_exit_side = _terminal_side_exit_price(snapshot, side)
+                    if terminal_exit_side is not None:
+                        close_result = _mark_entry_terminal_closed(
+                            entry,
+                            snapshot=snapshot,
+                            side=side,
+                            exit_side_price=terminal_exit_side,
+                            now=now,
+                            settings=self.settings,
+                            trigger="terminal_close_after_market_close",
+                        )
+                        ledger_dirty = True
+                        evaluated.append(
+                            {
+                                "client_order_id": client_order_id,
+                                "market_ticker": market_ticker,
+                                **close_result,
+                            }
+                        )
+                        exits.append(
+                            {
+                                "entry_client_order_id": client_order_id,
+                                "exit_client_order_id": None,
+                                "market_ticker": market_ticker,
+                                **close_result,
+                            }
+                        )
+                        continue
                 evaluated.append({"client_order_id": client_order_id, "market_ticker": market_ticker, "status": "sell_quote_missing"})
                 continue
             count_fp = _decimal(entry.get("count_fp") or "0")
@@ -1900,6 +2079,7 @@ class CryptoNonModelTouch20Service:
             )
             protection = profit_protection_review(entry, spot=spot, net_profit=profit_pct, settings=self.settings, now=now)
             entry.update(protection["entry_updates"])
+            ledger_dirty = True
             trigger = _exit_trigger_for_profit(
                 profit_pct,
                 asset_symbol=asset,
@@ -1923,6 +2103,7 @@ class CryptoNonModelTouch20Service:
             )
             status = str(receipt.status or "")
             realized = _realized_pnl(entry_side_price=entry_side, exit_side_price=exit_side, count_fp=count_fp, fee_rate=Decimal(str(self.settings.kalshi_taker_fee_rate)))
+            terminal_close_result: dict[str, Any] | None = None
             entry.update(
                 {
                     "exit_client_order_id": exit_client_order_id,
@@ -1942,8 +2123,22 @@ class CryptoNonModelTouch20Service:
             elif status in {"cancelled", "canceled", "expired", "unfilled_cancelled"}:
                 entry["status"] = "open"
                 entry["next_exit_retry_at"] = (now + timedelta(seconds=60)).isoformat()
+            elif status.startswith("rejected") and _terminal_close_due(entry, snapshot, now=now):
+                terminal_close_result = _mark_entry_terminal_closed(
+                    entry,
+                    snapshot=snapshot,
+                    side=side,
+                    exit_side_price=exit_side,
+                    now=now,
+                    settings=self.settings,
+                    trigger=f"{trigger}_after_rejected_terminal_exit",
+                    order_status=status,
+                    receipt=receipt,
+                    exit_client_order_id=exit_client_order_id,
+                )
             else:
                 entry["status"] = "exit_submitted"
+            ledger_dirty = True
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                 if receipt.external_order_id or status not in {"shadow_skipped", "inactive_color_skipped", "write_credentials_missing"}:
@@ -1971,8 +2166,17 @@ class CryptoNonModelTouch20Service:
                     kalshi_env=self.settings.kalshi_env,
                 )
                 await session.commit()
-            exits.append({"entry_client_order_id": client_order_id, "exit_client_order_id": exit_client_order_id, "market_ticker": market_ticker, "trigger": trigger, "status": status, "net_profit_pct": str(profit_pct)})
-        if not exits:
+            exits.append(
+                {
+                    "entry_client_order_id": client_order_id,
+                    "exit_client_order_id": exit_client_order_id,
+                    "market_ticker": market_ticker,
+                    "trigger": trigger,
+                    "status": (terminal_close_result or {}).get("status") or status,
+                    "net_profit_pct": (terminal_close_result or {}).get("net_profit_pct") or str(profit_pct),
+                }
+            )
+        if ledger_dirty:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
                 ledger["updated_at"] = datetime.now(UTC).isoformat()

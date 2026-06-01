@@ -410,6 +410,54 @@ def test_exit_trigger_uses_asset_specific_stop_loss_override():
     ) == "stop_loss"
 
 
+def test_terminal_close_marks_expired_zero_price_position_closed_without_exit_fee():
+    settings = _settings()
+    now = datetime(2026, 6, 1, 12, 20, tzinfo=UTC)
+    snapshot = _snapshot(
+        status="closed",
+        close_time=now - timedelta(minutes=10),
+        expected_expiration_time=now - timedelta(minutes=5),
+        yes_bid_dollars=Decimal("0.0000"),
+        yes_ask_dollars=Decimal("0.0010"),
+        no_bid_dollars=Decimal("0.9990"),
+        no_ask_dollars=Decimal("1.0000"),
+        settlement_result=None,
+    )
+    entry = {
+        "status": "open",
+        "side": "yes",
+        "count_fp": "10.00",
+        "entry_side_price_dollars": "0.5900",
+        "close_time": (now - timedelta(minutes=5)).isoformat(),
+    }
+
+    assert rules._terminal_close_due(entry, snapshot, now=now) is True
+    exit_side = rules._terminal_side_exit_price(snapshot, "yes")
+    assert exit_side == Decimal("0.0000")
+
+    result = rules._mark_entry_terminal_closed(
+        entry,
+        snapshot=snapshot,
+        side="yes",
+        exit_side_price=exit_side,
+        now=now,
+        settings=settings,
+        trigger="terminal_close_after_market_close",
+    )
+
+    expected_realized = rules._realized_pnl_without_exit_fee(
+        entry_side_price=Decimal("0.5900"),
+        exit_side_price=Decimal("0.0000"),
+        count_fp=Decimal("10.00"),
+        fee_rate=Decimal(str(settings.kalshi_taker_fee_rate)),
+    )
+    assert result["status"] == "terminal_closed"
+    assert entry["status"] == "closed"
+    assert entry["exit_order_status"] == "not_submitted_terminal_close"
+    assert entry["exit_side_price_dollars"] == "0.0000"
+    assert entry["realized_pnl_dollars"] == str(expected_realized)
+
+
 def test_strategy_cap_uses_only_strategy_ledger_entries():
     ledger = {
         "positions": {
