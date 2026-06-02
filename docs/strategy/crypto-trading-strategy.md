@@ -123,10 +123,11 @@ their own strategy codes, such as `eth15m_touch20_rules`.
 
 ### Objective
 
-The objective is `touch_20pct_before_close`: buy a YES or NO contract early
-enough in the 15-minute market that the contract price can fluctuate upward, then
-sell when the executable exit price clears +20% net profit after estimated entry
-and exit taker fees.
+The objective is `touch_20pct_before_close`: buy a configured YES/NO contract
+early enough in the 15-minute market that the contract price can fluctuate
+upward, then sell when the executable exit price clears +20% net profit after
+estimated entry and exit taker fees. BTC currently defaults to a YES-only,
+30-50c entry-cost setup with nonnegative side-aligned spot momentum.
 
 This is not a settlement-edge strategy. A position can be profitable even if the
 contract later settles out of the money, provided the contract touches the exit
@@ -190,18 +191,26 @@ passes:
 11. Asset spot data is fresh under `CRYPTO_BTC15M_TOUCH20_SPOT_FRESH_SECONDS`
     and the spot source is not proxy-only.
 12. Candidate status is `live_quality` under the standalone rules engine.
-13. Candidate replay bucket is present in the gate artifact's
+13. Candidate side is allowed by `CRYPTO_BTC15M_TOUCH20_ALLOWED_SIDES`; BTC
+    defaults to YES-only.
+14. Entry ask is inside the configured entry band. BTC defaults to
+    `0.30 <= ask < 0.50`.
+15. Time to close is at least `CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE`;
+    BTC defaults to 720 seconds.
+16. Side-aligned spot momentum is at least
+    `CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM`; BTC defaults to 0.
+17. Candidate replay bucket is present in the gate artifact's
    `allowed_bucket_keys`.
-14. Candidate `rule_score` is at least `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE`.
-15. The candidate bucket is not blocked by strategy-owned live bucket controls.
-16. The strategy has no open or pending entry on the same Kalshi market.
-17. The market is not in the one-cycle cooldown after a strategy stop/terminal
+18. Candidate `rule_score` is at least `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE`.
+19. The candidate bucket is not blocked by strategy-owned live bucket controls.
+20. The strategy has no open or pending entry on the same Kalshi market.
+21. The market is not in the one-cycle cooldown after a strategy stop/terminal
     loss.
-18. Strategy-owned open plus pending notional is below
+22. Strategy-owned open plus pending notional is below
    `CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS`, default `$10`.
-19. The sized order notional is at least
+23. The sized order notional is at least
     `CRYPTO_BTC15M_TOUCH20_MIN_ORDER_NOTIONAL_DOLLARS`, default `$5`.
-20. The asset lane has `trading_enabled=true`; BTC uses
+24. The asset lane has `trading_enabled=true`; BTC uses
     `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
 
 If the first rules flag is true but the trading flag is false, the path can
@@ -236,7 +245,8 @@ The standalone rules score combines:
 - target-gap closeness
 - spread quality
 
-The default minimum score is `0.60`.
+The BTC default minimum score is `0.48`; asset lanes can override it in their
+own settings.
 
 ### Entry Candidate Blocks
 
@@ -246,11 +256,14 @@ A candidate is blocked when any of these are true:
 - spot data is stale, missing, or proxy-only
 - executable quote is missing
 - entry cost is below the minimum contract price
+- entry cost is at or above the maximum contract price
+- side is not allowed by the lane settings
+- side-aligned spot momentum is below the configured minimum
 - the +20% fee-aware target price is impossible
 - the target exit price is at or above `$1.00`
 - spread is above the tier limit
 - market age is below 60 seconds
-- time to close is below 300 seconds
+- time to close is below the configured minimum; BTC default is 720 seconds
 - standalone rule score is below the configured minimum
 - replay bucket is not allowed by the separate rules gate
 - replay bucket is blocked by live bucket controls
@@ -259,8 +272,8 @@ A candidate is blocked when any of these are true:
 - sized order notional is below the configured minimum
 - strategy cap or daily loss cap is exhausted
 
-The current entry window intentionally preserves the final 5-minute entry block:
-`time_to_close_seconds < 300` is too late for new entries.
+The current BTC entry window is deliberately early-biased. It preserves the
+final 5-minute block and currently requires at least 720 seconds to close.
 
 ### Spread And Price Limits
 
@@ -271,8 +284,9 @@ Default spread limits are strategy-local hard limits:
 | under `$0.20` | 1 cent |
 | `$0.20` and above | 2 cents |
 
-The entry ask must be at least `$0.10` by default through
-`CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS`. The calculated fee-aware
+The BTC entry ask must be at least `$0.30` by default through
+`CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS` and below `$0.50` through
+`CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS`. The calculated fee-aware
 target exit side price must be below `$1.00`.
 
 ### Candidate Ranking
@@ -367,8 +381,10 @@ generic `crypto-replay` command.
 
 Replay uses settled real quote-path rows only. It does not use proxy rows,
 trained model features, or trained model predictions. The current replay
-simulator version is `live_exit_v2`. For each historical candidate row it scans
-future same-market quote snapshots before close:
+simulator version is `live_exit_v2`, and the entry replay mode is
+`first_eligible_per_market`. For each market, replay enters only the first row
+that satisfies the strategy rules, then scans future same-market quote snapshots
+before close:
 
 1. If the candidate side first touches the fee-aware +20% target, replay
    simulates a take-profit exit.

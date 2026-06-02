@@ -46,6 +46,7 @@ TOUCH20_RULES_REMEDIATION_BLOCKED_BTC_BUCKETS = frozenset(
 class Touch20AssetSettings:
     rules_enabled: bool
     trading_enabled: bool
+    allowed_sides: tuple[str, ...]
     take_profit_pct: Decimal
     stop_loss_pct: Decimal
     min_market_age_seconds: int
@@ -66,6 +67,8 @@ class Touch20AssetSettings:
     profit_protection_floor_pct: Decimal
     loop_interval_seconds: int
     min_contract_price_dollars: Decimal
+    max_contract_price_dollars: Decimal
+    min_aligned_momentum: Decimal
     min_rule_score: Decimal
     quote_fresh_seconds: int
     spot_fresh_seconds: int
@@ -140,6 +143,18 @@ def _int_override(overrides: dict[str, Any], key: str, default: int) -> int:
         return default
 
 
+def _side_tuple_override(overrides: dict[str, Any], key: str, default: str) -> tuple[str, ...]:
+    raw = overrides.get(key, default)
+    if isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        values = str(raw or "").replace(";", ",").split(",")
+    sides = tuple(side for side in (str(value).strip().lower() for value in values) if side in {"yes", "no"})
+    return sides or tuple(
+        side for side in (str(value).strip().lower() for value in default.replace(";", ",").split(",")) if side in {"yes", "no"}
+    )
+
+
 def _asset_settings(settings: Settings, asset_symbol: str | None) -> Touch20AssetSettings:
     asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
     overrides = _asset_overrides(settings, asset)
@@ -149,6 +164,7 @@ def _asset_settings(settings: Settings, asset_symbol: str | None) -> Touch20Asse
     return Touch20AssetSettings(
         rules_enabled=_bool_override(overrides, "rules_enabled", enabled_default),
         trading_enabled=_bool_override(overrides, "trading_enabled", trading_default),
+        allowed_sides=_side_tuple_override(overrides, "allowed_sides", str(settings.crypto_btc15m_touch20_allowed_sides)),
         take_profit_pct=_decimal_override(overrides, "take_profit_pct", Decimal(str(settings.crypto_btc15m_touch20_take_profit_pct))),
         stop_loss_pct=_decimal_override(overrides, "stop_loss_pct", Decimal(str(settings.crypto_btc15m_touch20_stop_loss_pct))),
         min_market_age_seconds=_int_override(overrides, "min_market_age_seconds", int(settings.crypto_btc15m_touch20_min_market_age_seconds)),
@@ -169,6 +185,8 @@ def _asset_settings(settings: Settings, asset_symbol: str | None) -> Touch20Asse
         profit_protection_floor_pct=_decimal_override(overrides, "profit_protection_floor_pct", Decimal(str(settings.crypto_btc15m_touch20_profit_protection_floor_pct))),
         loop_interval_seconds=_int_override(overrides, "loop_interval_seconds", int(settings.crypto_btc15m_touch20_loop_interval_seconds)),
         min_contract_price_dollars=_decimal_override(overrides, "min_contract_price_dollars", Decimal(str(settings.crypto_btc15m_touch20_min_contract_price_dollars))),
+        max_contract_price_dollars=_decimal_override(overrides, "max_contract_price_dollars", Decimal(str(settings.crypto_btc15m_touch20_max_contract_price_dollars))),
+        min_aligned_momentum=_decimal_override(overrides, "min_aligned_momentum", Decimal(str(settings.crypto_btc15m_touch20_min_aligned_momentum))),
         min_rule_score=_decimal_override(overrides, "min_rule_score", Decimal(str(settings.crypto_btc15m_touch20_min_rule_score))),
         quote_fresh_seconds=_int_override(overrides, "quote_fresh_seconds", int(settings.crypto_btc15m_touch20_quote_fresh_seconds)),
         spot_fresh_seconds=_int_override(overrides, "spot_fresh_seconds", int(settings.crypto_btc15m_touch20_spot_fresh_seconds)),
@@ -714,6 +732,7 @@ def rules_candidates_for_snapshot(
     cfg = _asset_settings(settings, snapshot.asset_symbol)
     target_pct = cfg.take_profit_pct
     min_price = cfg.min_contract_price_dollars
+    max_price = cfg.max_contract_price_dollars
     min_score = cfg.min_rule_score
     candidates: list[dict[str, Any]] = []
     for side in ("yes", "no"):
@@ -729,7 +748,9 @@ def rules_candidates_for_snapshot(
         score_components: dict[str, str] = {}
         bucket_key = None
         bucket: dict[str, Any] = {}
-        if snapshot.status and snapshot.status not in {"open", "active"}:
+        if side not in cfg.allowed_sides:
+            reason = "side_not_allowed"
+        elif snapshot.status and snapshot.status not in {"open", "active"}:
             reason = "market_not_open"
         elif not spot.get("available"):
             reason = str(spot.get("reason") or "spot_data_missing_or_stale")
@@ -743,6 +764,8 @@ def rules_candidates_for_snapshot(
             reason = "market_too_late"
         elif entry < min_price:
             reason = "entry_price_below_min"
+        elif max_price > Decimal("0") and entry >= max_price:
+            reason = "entry_price_above_max"
         elif target_exit is None:
             reason = "target_profit_impossible_after_fees"
         elif target_exit >= Decimal("1.0000"):
@@ -781,7 +804,10 @@ def rules_candidates_for_snapshot(
                         else {}
                     ),
                 )
-                if score < min_score:
+                aligned_momentum = _decimal(score_components.get("aligned_momentum"))
+                if aligned_momentum < cfg.min_aligned_momentum:
+                    reason = "side_aligned_momentum_below_min"
+                elif score < min_score:
                     reason = "rule_score_below_min"
                 else:
                     status = "eligible"
@@ -801,6 +827,7 @@ def rules_candidates_for_snapshot(
                 "max_spread_dollars": _money_text(max_spread) if max_spread > Decimal("0") else None,
                 "market_age_seconds": market_age,
                 "time_to_close_seconds": time_to_close,
+                "allowed_sides": list(cfg.allowed_sides),
                 "bucket_key": bucket_key,
                 "bucket": bucket,
                 "rule_score": str(score) if score is not None else None,
@@ -1039,6 +1066,13 @@ def _gate_requirements(settings: Settings, *, asset_symbol: str = BTC15M_TOUCH20
     cfg = _asset_settings(settings, asset_symbol)
     return {
         "asset_symbol": _normalize_asset_symbol(asset_symbol),
+        "entry_replay_mode": "first_eligible_per_market",
+        "allowed_sides": list(cfg.allowed_sides),
+        "min_seconds_to_close": cfg.min_seconds_to_close,
+        "min_contract_price_dollars": float(cfg.min_contract_price_dollars),
+        "max_contract_price_dollars": float(cfg.max_contract_price_dollars),
+        "min_aligned_momentum": float(cfg.min_aligned_momentum),
+        "min_rule_score": float(cfg.min_rule_score),
         "min_trade_candidates": cfg.replay_min_candidates,
         "min_net_pl_dollars": float(cfg.replay_min_net_pnl_dollars),
         "min_pnl_per_candidate_dollars": float(cfg.replay_min_pnl_per_candidate_dollars),
@@ -1198,6 +1232,7 @@ def _evaluate_replay(
                     "simulation": simulation,
                 }
             )
+            break
     bucket_matrix = _bucket_matrix(trades, settings=settings, asset_symbol=asset)
     allowed_keys = [bucket["bucket_key"] for bucket in bucket_matrix if bucket.get("allowed")]
     blocked_keys = [bucket["bucket_key"] for bucket in bucket_matrix if not bucket.get("allowed")]
@@ -1221,6 +1256,7 @@ def _evaluate_replay(
         "asset_symbols": [asset],
         "sample_count": len(scoped_rows),
         "real_quote_path_row_count": len(scoped_rows),
+        "entry_replay_mode": "first_eligible_per_market",
         "trade_candidate_count": trade_count,
         "touch_count": touch_count,
         "touch_rate": float(Decimal(touch_count) / Decimal(trade_count)) if trade_count else 0.0,
@@ -2053,8 +2089,10 @@ class CryptoNonModelTouch20Service:
             "enabled": cfg.rules_enabled,
             "trading_enabled": cfg.trading_enabled,
             "settings": {
+                "allowed_sides": list(cfg.allowed_sides),
                 "take_profit_pct": str(cfg.take_profit_pct),
                 "stop_loss_pct": str(cfg.stop_loss_pct),
+                "min_seconds_to_close": cfg.min_seconds_to_close,
                 "max_open_notional_dollars": _money_text(cfg.max_open_notional_dollars),
                 "daily_loss_limit_dollars": _money_text(cfg.daily_loss_limit_dollars),
                 "min_order_notional_dollars": _money_text(cfg.min_order_notional_dollars),
@@ -2062,6 +2100,9 @@ class CryptoNonModelTouch20Service:
                 "max_bucket_consecutive_losses": cfg.max_bucket_consecutive_losses,
                 "max_replay_stop_loss_rate": str(cfg.max_replay_stop_loss_rate),
                 "max_replay_terminal_loss_rate": str(cfg.max_replay_terminal_loss_rate),
+                "min_contract_price_dollars": _money_text(cfg.min_contract_price_dollars),
+                "max_contract_price_dollars": _money_text(cfg.max_contract_price_dollars),
+                "min_aligned_momentum": str(cfg.min_aligned_momentum),
                 "min_rule_score": str(cfg.min_rule_score),
                 "quote_fresh_seconds": cfg.quote_fresh_seconds,
                 "spot_fresh_seconds": cfg.spot_fresh_seconds,

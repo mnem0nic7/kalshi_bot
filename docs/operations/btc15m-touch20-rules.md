@@ -10,9 +10,10 @@ crypto bot.
 
 ## Core Trading Logic
 
-The strategy buys a supported 15-minute YES or NO contract only when deterministic
-rules and replay-bucket evidence indicate the contract has a good chance to
-touch a +20% net executable profit before close.
+The strategy buys a supported 15-minute contract only when deterministic rules
+and replay-bucket evidence indicate the contract has a good chance to touch a
++20% net executable profit before close. BTC defaults to a stricter YES-only
+setup based on current live-faithful replay evidence.
 
 It does not try to predict settlement as its primary objective. The preferred
 outcome is:
@@ -35,7 +36,7 @@ Allowed:
 - assets: BTC, ETH, SOL, XRP, BNB, DOGE, HYPE
 - frequency: 15m only
 - market type: Kalshi crypto contracts
-- sides: YES buy or NO buy
+- sides: configured YES/NO buys; BTC default is YES only
 - entry: executable ask
 - exit: executable bid
 - process: `crypto_non_model_btc15m_touch20_production`
@@ -63,8 +64,10 @@ All live flags are disabled by default.
 |---|---:|---|
 | `CRYPTO_BTC15M_TOUCH20_RULES_ENABLED` | `false` | Enables the rules path to evaluate candidates. |
 | `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED` | `false` | Allows the rules path to submit entry orders. |
+| `CRYPTO_BTC15M_TOUCH20_ALLOWED_SIDES` | `yes` | Comma-separated allowed entry sides. BTC defaults to YES-only. |
 | `CRYPTO_BTC15M_TOUCH20_TAKE_PROFIT_PCT` | `0.20` | Net executable take-profit target. |
 | `CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT` | `0.20` | Net executable stop-loss trigger for strategy-owned positions. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE` | `720` | Minimum time to close for new entries. |
 | `CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS` | `10` | Strategy-local open plus pending notional cap. |
 | `CRYPTO_BTC15M_TOUCH20_DAILY_LOSS_LIMIT_DOLLARS` | `10` | Strategy-local daily realized loss stop. |
 | `CRYPTO_BTC15M_TOUCH20_MIN_ORDER_NOTIONAL_DOLLARS` | `5` | Minimum strategy entry notional after sizing. |
@@ -75,8 +78,10 @@ All live flags are disabled by default.
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_THRESHOLD_PCT` | `0.10` | Profit level that arms profit protection. |
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_FLOOR_PCT` | `0.05` | Armed profit-protection floor. |
 | `CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS` | `15` | Docker process loop sleep. |
-| `CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS` | `0.10` | Strategy-owned minimum entry ask. |
-| `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE` | `0.60` | Minimum standalone rules score for entry. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS` | `0.30` | Strategy-owned minimum entry ask. |
+| `CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS` | `0.50` | Strategy-owned maximum entry ask. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM` | `0.0` | Minimum side-aligned spot momentum. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE` | `0.48` | Minimum standalone rules score for entry. |
 | `CRYPTO_BTC15M_TOUCH20_QUOTE_FRESH_SECONDS` | `30` | Maximum age for live Kalshi quote snapshots. |
 | `CRYPTO_BTC15M_TOUCH20_SPOT_FRESH_SECONDS` | `180` | Maximum age for live asset spot rows. |
 | `CRYPTO_15M_TOUCH20_RULES_ASSETS` | `BTC` | Comma-separated assets for the Docker loop to evaluate. |
@@ -98,7 +103,7 @@ Example:
     "daily_loss_limit_dollars": 10,
     "take_profit_pct": 0.20,
     "stop_loss_pct": 0.20,
-    "min_rule_score": 0.60
+    "min_rule_score": 0.48
   }
 }
 ```
@@ -119,22 +124,26 @@ An entry can be submitted only when all of the following are true:
 9. YES bid, YES ask, NO bid, and NO ask are present.
 10. Asset spot features are fresh and non-proxy.
 11. Market age is at least 60 seconds.
-12. Time to close is at least 300 seconds.
-13. Entry ask is at least the configured minimum contract price, default `$0.10`.
-14. The +20% fee-aware target exit price is below `$1.00`.
-15. Spread is within tier limits: 1 cent under 20c, otherwise 2 cents.
-16. Standalone rule score clears the configured minimum.
-17. Candidate replay bucket is allowed by the asset-owned gate, such as
+12. Time to close is at least 720 seconds by default.
+13. Candidate side is allowed by `CRYPTO_BTC15M_TOUCH20_ALLOWED_SIDES`; BTC
+    defaults to YES-only.
+14. Entry ask is at least the configured minimum contract price, default `$0.30`.
+15. Entry ask is below the configured maximum contract price, default `$0.50`.
+16. Side-aligned spot momentum is nonnegative by default.
+17. The +20% fee-aware target exit price is below `$1.00`.
+18. Spread is within tier limits: 1 cent under 20c, otherwise 2 cents.
+19. Standalone rule score clears the configured minimum.
+20. Candidate replay bucket is allowed by the asset-owned gate, such as
     `btc15m_touch20_rules_gate:15m:BTC` or `eth15m_touch20_rules_gate:15m:ETH`.
-18. Candidate bucket is not blocked by live bucket controls.
-19. This strategy has no open or pending entry on the same Kalshi market.
-20. The market is not in the one-cycle cooldown after a strategy stop/terminal
+21. Candidate bucket is not blocked by live bucket controls.
+22. This strategy has no open or pending entry on the same Kalshi market.
+23. The market is not in the one-cycle cooldown after a strategy stop/terminal
     loss.
-21. Strategy-owned open plus pending notional remains within the `$10` cap.
-22. Sized order notional is at least the configured minimum, default `$5`.
-23. Operator approval checkpoint exists and references the latest passed gate
+24. Strategy-owned open plus pending notional remains within the `$10` cap.
+25. Sized order notional is at least the configured minimum, default `$5`.
+26. Operator approval checkpoint exists and references the latest passed gate
     version and replay simulator version.
-24. The asset lane has `trading_enabled=true`; BTC uses
+27. The asset lane has `trading_enabled=true`; BTC uses
     `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
 
 If the final trading flag is false, the process can still produce
@@ -208,6 +217,7 @@ Gate requirements:
 - real settled quote-path evidence present
 - no trained model usage
 - replay simulator version `live_exit_v2`
+- entry replay mode `first_eligible_per_market`
 - net simulated P/L above `$0.00` after live-faithful exits
 - P/L per candidate at least `$0.01` after fees
 - touch rate at least 25%
@@ -295,6 +305,12 @@ Then enable:
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT=0.20
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_ALLOWED_SIDES=yes
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE=720
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS=0.30
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS=0.50
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM=0.0
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE=0.48
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS=10
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_DAILY_LOSS_LIMIT_DOLLARS=10
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_ORDER_NOTIONAL_DOLLARS=5
