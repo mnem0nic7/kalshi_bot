@@ -913,8 +913,14 @@ class CryptoMarketService:
         frequency: str = "15m",
         status: str | None = "open",
         persist: bool = True,
+        asset_symbols: list[str] | None = None,
     ) -> list[CryptoMarket]:
+        requested_assets = set(normalize_asset_symbols(asset_symbols))
         series_rows = await self.discover_series(frequency=frequency)
+        if requested_assets:
+            series_rows = [
+                series for series in series_rows if normalize_asset_symbol(series.asset_symbol) in requested_assets
+            ]
         markets: list[CryptoMarket] = []
         for series in series_rows:
             response = await self.kalshi.list_markets(
@@ -1410,7 +1416,12 @@ class CryptoHistoryService:
         lookback_days = days or self.settings.crypto_history_lookback_days
         cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
         requested_assets = set(normalize_asset_symbols(asset_symbols))
-        live_markets = await self.market_service.discover_markets(frequency=frequency, status="open", persist=True)
+        live_markets = await self.market_service.discover_markets(
+            frequency=frequency,
+            status="open",
+            persist=True,
+            asset_symbols=sorted(requested_assets) or None,
+        )
         if requested_assets:
             live_markets = [
                 market for market in live_markets if normalize_asset_symbol(market.asset_symbol) in requested_assets
@@ -1701,7 +1712,12 @@ class CryptoHistoryService:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = set(normalize_asset_symbols(asset_symbols))
         observed_at = datetime.now(UTC)
-        markets = await self.market_service.discover_markets(frequency=freq, status="open", persist=False)
+        markets = await self.market_service.discover_markets(
+            frequency=freq,
+            status="open",
+            persist=False,
+            asset_symbols=sorted(requested_assets) or None,
+        )
         if requested_assets:
             markets = [market for market in markets if normalize_asset_symbol(market.asset_symbol) in requested_assets]
         stored = 0
@@ -5537,7 +5553,12 @@ class CryptoAutonomyService:
                 "app_color": self.settings.app_color,
             }
 
-        discovered = await self.market_service.discover_markets(frequency=freq, status="open", persist=True)
+        discovered = await self.market_service.discover_markets(
+            frequency=freq,
+            status="open",
+            persist=True,
+            asset_symbols=sorted(requested_assets) or None,
+        )
         if requested_assets:
             discovered = [market for market in discovered if normalize_asset_symbol(market.asset_symbol) in requested_assets]
         created: list[dict[str, Any]] = []

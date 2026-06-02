@@ -79,6 +79,17 @@ run_control() {
   run_migrate "${env_name}" "${cmd[@]}"
 }
 
+active_color_for_env() {
+  local env_name="$1"
+  run_control "${env_name}" python -m kalshi_bot.cli status \
+    | python3 -c 'import json, sys
+payload = json.load(sys.stdin)
+color = payload.get("active_color")
+if color not in {"blue", "green"}:
+    raise SystemExit(f"unexpected active_color: {color!r}")
+print(color)'
+}
+
 docker compose -f "${compose_file}" ${compose_env_file} config >/dev/null
 build_app_image
 docker compose -f "${compose_file}" ${compose_env_file} up -d postgres_demo postgres_production
@@ -97,10 +108,22 @@ fi
 if [[ "${migrate_status}" -ne 0 ]]; then
   exit "${migrate_status}"
 fi
+production_active_color="$(active_color_for_env production 2>/dev/null || true)"
+if [[ "${production_active_color}" != "blue" && "${production_active_color}" != "green" ]]; then
+  production_active_color="blue"
+fi
+export CRYPTO_CURRENT_APP_COLOR="${production_active_color}"
+export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${production_active_color}"
 runtime_services=(
-  app_demo_blue app_demo_green daemon_demo_blue daemon_demo_green
-  app_production_blue app_production_green daemon_production_blue daemon_production_green
+  app_demo_blue app_demo_green
+  app_production_blue app_production_green
 )
+if [[ "${ENABLE_DEMO_DAEMON:-true}" == "true" ]]; then
+  runtime_services+=(daemon_demo_blue daemon_demo_green)
+fi
+if [[ "${ENABLE_PRODUCTION_DAEMON:-true}" == "true" ]]; then
+  runtime_services+=(daemon_production_blue daemon_production_green)
+fi
 if [[ "${ENABLE_CRYPTO_1H_CONTAINER:-false}" == "true" ]]; then
   runtime_services+=(crypto_1h_production)
 fi
@@ -110,12 +133,18 @@ fi
 if [[ "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
   runtime_services+=(crypto_current_production)
 fi
+if [[ "${ENABLE_BTC15M_TOUCH20_CONTAINER:-true}" == "true" ]]; then
+  runtime_services+=(crypto_non_model_btc15m_touch20_production)
+fi
 docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build \
   "${runtime_services[@]}"
 wait_for_services_health 180 \
   app_demo_blue app_demo_green app_production_blue app_production_green
 if [[ "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
   wait_for_service_health crypto_current_production 60
+fi
+if [[ "${ENABLE_BTC15M_TOUCH20_CONTAINER:-true}" == "true" ]]; then
+  wait_for_service_health crypto_non_model_btc15m_touch20_production 60
 fi
 infra/scripts/sync-web-color.sh all
 # Stop and remove caddy explicitly before recreating to avoid Docker compose

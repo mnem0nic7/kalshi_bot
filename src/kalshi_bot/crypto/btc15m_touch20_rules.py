@@ -1872,13 +1872,16 @@ class CryptoNonModelTouch20Service:
                 asset_symbols=[asset],
                 since=cutoff,
                 limit=limit or 200_000,
+                defer_payload=True,
             )
             spot_rows = await repo.list_crypto_spot_ohlc(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
+                provider="coinbase",
                 asset_symbols=[asset],
                 since=cutoff,
-                limit=1_000_000,
+                limit=200_000,
+                defer_payload=True,
             )
             await session.commit()
         replay = _evaluate_replay(snapshots, spot_rows, settings=self.settings, asset_symbol=asset)

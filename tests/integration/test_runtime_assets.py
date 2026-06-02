@@ -29,6 +29,58 @@ def test_compose_file_declares_service_healthchecks() -> None:
     assert "${HTTPS_PORT:-443}:443" in compose_text
 
 
+def test_runtime_scripts_can_disable_generic_daemon_pairs() -> None:
+    start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
+    restart_color = Path("infra/scripts/restart-color.sh").read_text(encoding="utf-8")
+    blue_green = Path("scripts/blue_green_redeploy.sh").read_text(encoding="utf-8")
+
+    assert "ENABLE_DEMO_DAEMON" in start_stack
+    assert "ENABLE_PRODUCTION_DAEMON" in start_stack
+    assert "ENABLE_DEMO_DAEMON" in restart_color
+    assert "ENABLE_PRODUCTION_DAEMON" in restart_color
+    assert "ENABLE_DEMO_DAEMON" in blue_green
+    assert "ENABLE_PRODUCTION_DAEMON" in blue_green
+
+
+def test_runtime_scripts_align_btc_touch_singleton_to_active_color() -> None:
+    start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
+    restart_color = Path("infra/scripts/restart-color.sh").read_text(encoding="utf-8")
+    blue_green = Path("scripts/blue_green_redeploy.sh").read_text(encoding="utf-8")
+
+    assert "active_color_for_env()" in start_stack
+    assert 'export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${production_active_color}"' in start_stack
+    assert 'export CRYPTO_CURRENT_APP_COLOR="${production_active_color}"' in start_stack
+    assert "active_color_for_env()" in restart_color
+    assert 'export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${production_active_color}"' in restart_color
+    assert 'export CRYPTO_CURRENT_APP_COLOR="${production_active_color}"' in restart_color
+    assert 'export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${TARGET}"' in blue_green
+    assert 'export CRYPTO_CURRENT_APP_COLOR="${TARGET}"' in blue_green
+
+
+def test_btc_current_collector_refreshes_settled_labels() -> None:
+    compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
+    env_example = Path(".env.example").read_text(encoding="utf-8")
+
+    assert "CRYPTO_CURRENT_15M_SETTLED_EVERY_CYCLES" in compose_text
+    assert "CRYPTO_CURRENT_15M_SETTLED_DAYS" in compose_text
+    assert "crypto-history collect-settled" in compose_text
+    assert "--skip-candles" in compose_text
+    assert "--skip-quality" in compose_text
+    assert "CRYPTO_CURRENT_15M_SETTLED_EVERY_CYCLES=20" in env_example
+    assert "CRYPTO_CURRENT_15M_SETTLED_DAYS=3" in env_example
+
+
+def test_sync_web_color_can_disable_strategies_site_container() -> None:
+    sync_web_color = Path("infra/scripts/sync-web-color.sh").read_text(encoding="utf-8")
+    env_example = Path(".env.example").read_text(encoding="utf-8")
+
+    assert "ENABLE_WEB_STRATEGIES_CONTAINER" in sync_web_color
+    assert "ENABLE_WEB_STRATEGIES_CONTAINER=true" in env_example
+    assert 'web_services+=("web_strategies")' in sync_web_color
+    assert "stop web_strategies" in sync_web_color
+    assert "rm -f web_strategies" in sync_web_color
+
+
 def test_compose_declares_opt_in_crypto_1h_refresh_container() -> None:
     compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
     start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")

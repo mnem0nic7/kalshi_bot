@@ -547,21 +547,38 @@ services:
       - bash
       - -lc
       - |
+        cycle=0
         while true; do
+          cycle=$((cycle + 1))
           echo "starting crypto current collection" >&2
+          assets="${CRYPTO_CURRENT_15M_ASSETS:-BTC}"
+          assets="$${assets//,/ }"
           if ! kalshi-bot-cli crypto-history collect-open \
             --kalshi-env production \
             --frequency 15m \
-            --assets BNB BTC DOGE ETH HYPE SOL XRP \
+            --assets $$assets \
             --json; then
             echo "crypto current quote collection failed" >&2
           fi
           if ! kalshi-bot-cli crypto-spot collect-current \
             --kalshi-env production \
             --frequency 15m \
-            --assets BNB BTC DOGE ETH HYPE SOL XRP \
+            --assets $$assets \
             --json; then
             echo "crypto current spot collection failed" >&2
+          fi
+          settled_every="${CRYPTO_CURRENT_15M_SETTLED_EVERY_CYCLES:-20}"
+          if [[ "$$settled_every" =~ ^[0-9]+$ ]] && (( settled_every > 0 )) && { (( cycle == 1 )) || (( cycle % settled_every == 0 )); }; then
+            if ! kalshi-bot-cli crypto-history collect-settled \
+              --kalshi-env production \
+              --frequency 15m \
+              --assets $$assets \
+              --days "${CRYPTO_CURRENT_15M_SETTLED_DAYS:-3}" \
+              --skip-candles \
+              --skip-quality \
+              --json; then
+              echo "crypto current settlement label propagation failed" >&2
+            fi
           fi
           sleep 15
         done
@@ -576,6 +593,7 @@ services:
       CRYPTO_AUTONOMY_ENABLED: "false"
       CRYPTO_PRODUCTION_AUTONOMY_ENABLED: "false"
       CRYPTO_TRADING_ENABLED: "false"
+      CRYPTO_CURRENT_15M_ASSETS: ${PRODUCTION_CRYPTO_CURRENT_15M_ASSETS:-BTC}
 
   crypto_current_btc_1h_production:
     <<: *production-daemon-base

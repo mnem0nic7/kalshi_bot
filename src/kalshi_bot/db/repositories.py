@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
+from sqlalchemy.orm.attributes import set_committed_value
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.core.enums import RiskStatus, RoomOrigin, RoomStage
@@ -1425,14 +1427,148 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
 
         Unlike ``list_crypto_live_quote_snapshots``, this preserves every real
         quote row in the replay window so touch-target scans can observe the
-        intra-market path before settlement.  Rows must already have a settled
-        label propagated onto the live quote snapshot.
+        intra-market path before settlement.  Rows may either have a propagated
+        settlement label or join to the immutable ``settled_backfill`` row for
+        the same market.
         """
         env = self._resolved_kalshi_env(kalshi_env)
         symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        row_limit = max(1, int(limit or 200000))
+        bind = self.session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            from sqlalchemy import text as sql_text
+
+            label_where = [
+                "kalshi_env = :env",
+                "source_kind = 'settled_backfill'",
+                "settlement_result IN ('yes', 'no')",
+            ]
+            snapshot_where = [
+                "snapshot.kalshi_env = :env",
+                "snapshot.source_kind <> 'settled_backfill'",
+                "snapshot.yes_bid_dollars IS NOT NULL",
+                "snapshot.yes_ask_dollars IS NOT NULL",
+                "snapshot.no_bid_dollars IS NOT NULL",
+                "snapshot.no_ask_dollars IS NOT NULL",
+                "snapshot.market_ticker = labels.market_ticker",
+            ]
+            params: dict[str, Any] = {"env": env, "limit": row_limit}
+            if frequency is not None:
+                label_where.append("frequency = :frequency")
+                snapshot_where.append("snapshot.frequency = :frequency")
+                params["frequency"] = frequency
+            if symbols:
+                label_where.append("asset_symbol IN :symbols")
+                snapshot_where.append("snapshot.asset_symbol IN :symbols")
+                params["symbols"] = symbols
+            if since is not None:
+                label_where.append("observed_at >= :since")
+                snapshot_where.append("snapshot.observed_at >= :since")
+                params["since"] = since
+            raw = sql_text(
+                f"""
+                WITH labels AS (
+                    SELECT DISTINCT ON (market_ticker)
+                           market_ticker,
+                           settlement_result
+                    FROM crypto_market_snapshots
+                    WHERE {" AND ".join(label_where)}
+                    ORDER BY market_ticker, observed_at DESC
+                )
+                SELECT
+                    snapshot.id,
+                    snapshot.kalshi_env,
+                    snapshot.series_ticker,
+                    snapshot.market_ticker,
+                    snapshot.event_ticker,
+                    snapshot.asset_symbol,
+                    snapshot.frequency,
+                    snapshot.title,
+                    snapshot.status,
+                    snapshot.open_time,
+                    snapshot.close_time,
+                    snapshot.expected_expiration_time,
+                    snapshot.target_price_dollars,
+                    snapshot.yes_bid_dollars,
+                    snapshot.yes_ask_dollars,
+                    snapshot.no_bid_dollars,
+                    snapshot.no_ask_dollars,
+                    snapshot.last_price_dollars,
+                    snapshot.volume,
+                    snapshot.open_interest,
+                    labels.settlement_result,
+                    snapshot.observed_at,
+                    snapshot.source_kind,
+                    snapshot.created_at,
+                    snapshot.updated_at
+                FROM labels
+                JOIN LATERAL (
+                    SELECT
+                        id,
+                        kalshi_env,
+                        series_ticker,
+                        market_ticker,
+                        event_ticker,
+                        asset_symbol,
+                        frequency,
+                        title,
+                        status,
+                        open_time,
+                        close_time,
+                        expected_expiration_time,
+                        target_price_dollars,
+                        yes_bid_dollars,
+                        yes_ask_dollars,
+                        no_bid_dollars,
+                        no_ask_dollars,
+                        last_price_dollars,
+                        volume,
+                        open_interest,
+                        observed_at,
+                        source_kind,
+                        created_at,
+                        updated_at
+                    FROM crypto_market_snapshots AS snapshot
+                    WHERE {" AND ".join(snapshot_where)}
+                    ORDER BY snapshot.observed_at DESC
+                ) AS snapshot ON TRUE
+                ORDER BY snapshot.observed_at DESC, snapshot.market_ticker
+                LIMIT :limit
+                """
+            )
+            if symbols:
+                raw = raw.bindparams(bindparam("symbols", expanding=True))
+            await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
+            await self.session.execute(sql_text("SET LOCAL enable_bitmapscan = off"))
+            rows = (await self.session.execute(raw, params)).mappings().all()
+            return [SimpleNamespace(**dict(row)) for row in rows]
+
+        label_conditions = [
+            CryptoMarketSnapshotRecord.kalshi_env == env,
+            CryptoMarketSnapshotRecord.source_kind == "settled_backfill",
+            CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
+        ]
+        if frequency is not None:
+            label_conditions.append(CryptoMarketSnapshotRecord.frequency == frequency)
+        if symbols:
+            label_conditions.append(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
+        if since is not None:
+            label_conditions.append(CryptoMarketSnapshotRecord.observed_at >= since)
+        label_stmt = (
+            select(CryptoMarketSnapshotRecord.market_ticker, CryptoMarketSnapshotRecord.settlement_result)
+            .where(*label_conditions)
+            .order_by(CryptoMarketSnapshotRecord.observed_at.desc())
+        )
+        label_map: dict[str, str] = {}
+        for market_ticker, settlement_result in (await self.session.execute(label_stmt)).all():
+            ticker = str(market_ticker or "")
+            result = str(settlement_result or "").lower()
+            if ticker and result in {"yes", "no"} and ticker not in label_map:
+                label_map[ticker] = result
+        if not label_map:
+            return []
         conditions = [
             CryptoMarketSnapshotRecord.kalshi_env == env,
-            CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
             CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
             CryptoMarketSnapshotRecord.yes_bid_dollars.is_not(None),
             CryptoMarketSnapshotRecord.yes_ask_dollars.is_not(None),
@@ -1445,15 +1581,26 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             conditions.append(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
         if since is not None:
             conditions.append(CryptoMarketSnapshotRecord.observed_at >= since)
-        stmt = (
-            select(CryptoMarketSnapshotRecord)
-            .where(*conditions)
-            .order_by(CryptoMarketSnapshotRecord.observed_at.desc(), CryptoMarketSnapshotRecord.market_ticker)
-            .limit(limit)
-        )
-        if defer_payload:
-            stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
-        return list((await self.session.execute(stmt)).scalars())
+        snapshots: list[CryptoMarketSnapshotRecord] = []
+        tickers = list(label_map)
+        chunk_size = 1
+        for offset in range(0, len(tickers), chunk_size):
+            chunk = tickers[offset : offset + chunk_size]
+            stmt = (
+                select(CryptoMarketSnapshotRecord)
+                .where(*conditions, CryptoMarketSnapshotRecord.market_ticker.in_(chunk))
+                .order_by(CryptoMarketSnapshotRecord.observed_at.desc(), CryptoMarketSnapshotRecord.market_ticker)
+                .limit(row_limit)
+            )
+            if defer_payload:
+                stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
+            for snapshot in (await self.session.execute(stmt)).scalars():
+                joined = label_map.get(snapshot.market_ticker)
+                if str(snapshot.settlement_result or "").lower() not in {"yes", "no"} and joined in {"yes", "no"}:
+                    set_committed_value(snapshot, "settlement_result", joined)
+                snapshots.append(snapshot)
+        snapshots.sort(key=lambda row: (row.observed_at, row.market_ticker), reverse=True)
+        return snapshots[:row_limit]
 
     async def update_crypto_snapshot_settlement_result(
         self,
@@ -1497,6 +1644,46 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if not rows:
             return 0
         env = self._resolved_kalshi_env(kalshi_env)
+        bind = self.session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            from sqlalchemy import text as sql_text
+
+            filters = [
+                "kalshi_env = :kalshi_env",
+                "market_ticker = :market_ticker",
+                "source_kind != 'settled_backfill'",
+                "settlement_result IS NULL",
+            ]
+            params: dict[str, Any] = {"kalshi_env": env}
+            if frequency is not None:
+                filters.append("frequency = :frequency")
+                params["frequency"] = frequency
+            if observed_since is not None:
+                filters.append("observed_at >= :observed_since")
+                params["observed_since"] = observed_since
+            await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
+            await self.session.execute(sql_text("SET LOCAL enable_bitmapscan = off"))
+            stmt = sql_text(
+                f"""
+                UPDATE crypto_market_snapshots
+                SET settlement_result = :settlement_result,
+                    updated_at = now()
+                WHERE {" AND ".join(filters)}
+                """
+            )
+            total = 0
+            for market_ticker, settlement_result in rows:
+                result = await self.session.execute(
+                    stmt,
+                    {
+                        **params,
+                        "market_ticker": market_ticker,
+                        "settlement_result": settlement_result,
+                    },
+                )
+                if result.rowcount is not None and result.rowcount > 0:
+                    total += result.rowcount
+            return total
         total = 0
         for market_ticker, settlement_result in rows:
             stmt = (

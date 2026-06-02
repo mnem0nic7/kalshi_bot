@@ -57,11 +57,20 @@ run() { if [[ "${DRY_RUN}" == 1 ]]; then echo "  DRY-RUN> $*"; else eval "$*"; f
 # services that participate in the color flip (per-color)
 color_services() {
   local color="$1"
+  local services=("app_${ENV}_${color}")
   if [[ "${ENV}" == "production" ]]; then
-    echo "app_${ENV}_${color} daemon_${ENV}_${color} daemon_${ENV}_crypto_1h_${color}"
+    if [[ "${ENABLE_PRODUCTION_DAEMON:-true}" == "true" ]]; then
+      services+=("daemon_${ENV}_${color}")
+    fi
+    if [[ "${ENABLE_CRYPTO_1H_DAEMON:-true}" == "true" ]]; then
+      services+=("daemon_${ENV}_crypto_1h_${color}")
+    fi
   else
-    echo "app_${ENV}_${color} daemon_${ENV}_${color}"
+    if [[ "${ENABLE_DEMO_DAEMON:-true}" == "true" ]]; then
+      services+=("daemon_${ENV}_${color}")
+    fi
   fi
+  echo "${services[*]}"
 }
 
 # --- discover the active color from the deployment_control row -------------
@@ -139,9 +148,18 @@ run "docker exec $(container "app_${ENV}_${TARGET}") kalshi-bot-cli promote ${TA
 log "verifying"
 run "docker exec $(container "app_${ENV}_${TARGET}") kalshi-bot-cli status | python3 -c \"import sys,json; d=json.load(sys.stdin); print('active_color=%s kill_switch=%s lock=%s' % (d['active_color'], d['kill_switch_enabled'], d['execution_lock_holder']))\""
 
+if [[ "${ENV}" == "production" ]]; then
+  export CRYPTO_CURRENT_APP_COLOR="${TARGET}"
+  export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${TARGET}"
+fi
+
 if [[ "${ENV}" == "production" && "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
   log "recreating production crypto current collector"
   run "compose up -d --no-deps --force-recreate crypto_current_production"
+fi
+if [[ "${ENV}" == "production" && "${ENABLE_BTC15M_TOUCH20_CONTAINER:-true}" == "true" ]]; then
+  log "recreating production BTC 15m Touch20 process"
+  run "compose up -d --no-deps --force-recreate crypto_non_model_btc15m_touch20_production"
 fi
 
 # --- 5. optionally recreate the now-idle old color -------------------------

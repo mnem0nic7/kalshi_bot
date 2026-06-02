@@ -116,7 +116,12 @@ fi
 if [[ "${target_env}" == "all" || "${target_env}" == "production" ]]; then
   web_services+=("web_production")
 fi
-web_services+=("web_strategies")
+if [[ "${ENABLE_WEB_STRATEGIES_CONTAINER:-true}" == "true" ]]; then
+  web_services+=("web_strategies")
+else
+  docker compose -f "${compose_file}" ${compose_env_file} stop web_strategies 2>/dev/null || true
+  docker compose -f "${compose_file}" ${compose_env_file} rm -f web_strategies 2>/dev/null || true
+fi
 
 docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps --force-recreate \
   "${web_services[@]}"

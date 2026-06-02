@@ -85,6 +85,34 @@ wait_for_services_health() {
   return "${status}"
 }
 
+run_control() {
+  local env_name="$1"
+  shift
+  local -a cmd=("$@")
+  local primary_service="app_${env_name}_blue"
+  local secondary_service="app_${env_name}_green"
+  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q "${primary_service}" 2>/dev/null || true)" ]]; then
+    docker compose -f "${compose_file}" ${compose_env_file} exec -T "${primary_service}" "${cmd[@]}"
+    return
+  fi
+  if [[ -n "$(docker compose -f "${compose_file}" ${compose_env_file} ps --status running -q "${secondary_service}" 2>/dev/null || true)" ]]; then
+    docker compose -f "${compose_file}" ${compose_env_file} exec -T "${secondary_service}" "${cmd[@]}"
+    return
+  fi
+  docker compose -f "${compose_file}" ${compose_env_file} run --rm --no-deps "migrate_${env_name}" "${cmd[@]}"
+}
+
+active_color_for_env() {
+  local env_name="$1"
+  run_control "${env_name}" python -m kalshi_bot.cli status \
+    | python3 -c 'import json, sys
+payload = json.load(sys.stdin)
+color = payload.get("active_color")
+if color not in {"blue", "green"}:
+    raise SystemExit(f"unexpected active_color: {color!r}")
+print(color)'
+}
+
 envs=("demo" "production")
 if [[ "${target_env}" != "all" ]]; then
   envs=("${target_env}")
@@ -95,7 +123,13 @@ build_app_image
 for env_name in "${envs[@]}"; do
   app_service="app_${env_name}_${color}"
   daemon_service="daemon_${env_name}_${color}"
-  runtime_services=("${app_service}" "${daemon_service}")
+  runtime_services=("${app_service}")
+  if [[ "${env_name}" == "demo" && "${ENABLE_DEMO_DAEMON:-true}" == "true" ]]; then
+    runtime_services+=("${daemon_service}")
+  fi
+  if [[ "${env_name}" == "production" && "${ENABLE_PRODUCTION_DAEMON:-true}" == "true" ]]; then
+    runtime_services+=("${daemon_service}")
+  fi
   if [[ "${env_name}" == "production" && "${ENABLE_CRYPTO_1H_DAEMON:-true}" == "true" ]]; then
     runtime_services+=("daemon_production_crypto_1h_${color}")
   fi
@@ -106,10 +140,25 @@ for env_name in "${envs[@]}"; do
   wait_for_service_health "${app_service}" 180
 done
 
+production_active_color=""
+if [[ "${target_env}" == "all" || "${target_env}" == "production" ]]; then
+  production_active_color="$(active_color_for_env production 2>/dev/null || true)"
+  if [[ "${production_active_color}" != "blue" && "${production_active_color}" != "green" ]]; then
+    production_active_color="${color}"
+  fi
+  export CRYPTO_CURRENT_APP_COLOR="${production_active_color}"
+  export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${production_active_color}"
+fi
+
 if [[ ("${target_env}" == "all" || "${target_env}" == "production") && "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
   docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps \
     crypto_current_production
   wait_for_service_health crypto_current_production 60
+fi
+if [[ ("${target_env}" == "all" || "${target_env}" == "production") && "${ENABLE_BTC15M_TOUCH20_CONTAINER:-true}" == "true" ]]; then
+  docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps \
+    crypto_non_model_btc15m_touch20_production
+  wait_for_service_health crypto_non_model_btc15m_touch20_production 60
 fi
 
 infra/scripts/sync-web-color.sh "${target_env}"
