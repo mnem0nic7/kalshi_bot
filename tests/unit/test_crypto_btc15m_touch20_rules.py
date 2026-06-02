@@ -284,8 +284,19 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
         "net_simulated_pl_dollars": 1.00,
         "pnl_per_candidate_dollars": 0.02,
         "touch_rate": 0.25,
+        "stop_loss_rate": 0.10,
+        "terminal_loss_rate": 0.05,
         "hard_cap_breaches": 0,
         "allowed_bucket_keys": ["BTC|yes|20_30c|le_1c|5_10m"],
+        "simulator_version": rules.TOUCH20_RULES_REPLAY_SIMULATOR_VERSION,
+        "bucket_matrix": [
+            {
+                "bucket_key": "BTC|yes|20_30c|le_1c|5_10m",
+                "net_pnl": "1.0000",
+                "stop_loss_rate": 0.10,
+                "terminal_loss_rate": 0.05,
+            }
+        ],
     }
 
     assert rules.gate_reasons(good_metrics, settings=settings) == []
@@ -296,6 +307,21 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
     assert any("hard-cap" in reason for reason in rules.gate_reasons({**good_metrics, "hard_cap_breaches": 1}, settings=settings))
     assert any("allowed bucket" in reason for reason in rules.gate_reasons({**good_metrics, "allowed_bucket_keys": []}, settings=settings))
     assert any("trained model" in reason for reason in rules.gate_reasons({**good_metrics, "uses_trained_model": True}, settings=settings))
+    assert any("simulator version" in reason for reason in rules.gate_reasons({**good_metrics, "simulator_version": "touch_only_v1"}, settings=settings))
+    assert any("stop-loss rate" in reason for reason in rules.gate_reasons({**good_metrics, "stop_loss_rate": 0.36}, settings=settings))
+    assert any("terminal-loss rate" in reason for reason in rules.gate_reasons({**good_metrics, "terminal_loss_rate": 0.16}, settings=settings))
+    assert any(
+        "negative P/L" in reason
+        for reason in rules.gate_reasons(
+            {
+                **good_metrics,
+                "net_simulated_pl_dollars": -0.01,
+                "touch_rate": 0.90,
+                "bucket_matrix": [{**good_metrics["bucket_matrix"][0], "net_pnl": "-0.0100"}],
+            },
+            settings=settings,
+        )
+    )
 
 
 def test_future_quote_scan_detects_yes_and_no_touch():
@@ -344,6 +370,60 @@ def test_take_profit_uses_net_executable_after_fees():
 
     assert at_target is not None and at_target >= Decimal("0.2000")
     assert below_target is not None and below_target < Decimal("0.2000")
+
+
+def _replay_candidate(side: str = "yes", *, entry: str = "0.5000") -> dict:
+    return {
+        "side": side,
+        "execution_price_dollars": entry,
+        "target_exit_side_price_dollars": "0.6200",
+        "bucket_key": f"BTC|{side}|50_60c|le_1c|10_15m",
+        "rule_score": "0.8000",
+    }
+
+
+def test_live_faithful_replay_exits_take_profit_before_later_stop():
+    settings = _settings()
+    row = _snapshot(yes_ask_dollars=Decimal("0.5000"), yes_bid_dollars=Decimal("0.4900"), settlement_result="no")
+    future = [
+        _snapshot(observed_at=row.observed_at + timedelta(seconds=60), yes_bid_dollars=Decimal("0.7000")),
+        _snapshot(observed_at=row.observed_at + timedelta(seconds=120), yes_bid_dollars=Decimal("0.3000")),
+    ]
+
+    simulation = rules._simulate_replay_trade(row, future, _replay_candidate(), settings=settings)
+
+    assert simulation["exit_reason"] == "take_profit"
+    assert simulation["touched"] is True
+    assert simulation["stopped"] is False
+    assert simulation["exit_price_dollars"] == "0.7000"
+
+
+def test_live_faithful_replay_exits_stop_loss_before_later_take_profit():
+    settings = _settings()
+    row = _snapshot(yes_ask_dollars=Decimal("0.5000"), yes_bid_dollars=Decimal("0.4900"), settlement_result="yes")
+    future = [
+        _snapshot(observed_at=row.observed_at + timedelta(seconds=60), yes_bid_dollars=Decimal("0.3000")),
+        _snapshot(observed_at=row.observed_at + timedelta(seconds=120), yes_bid_dollars=Decimal("0.7000")),
+    ]
+
+    simulation = rules._simulate_replay_trade(row, future, _replay_candidate(), settings=settings)
+
+    assert simulation["exit_reason"] == "stop_loss"
+    assert simulation["touched"] is False
+    assert simulation["stopped"] is True
+    assert simulation["exit_price_dollars"] == "0.3000"
+
+
+def test_live_faithful_replay_terminal_closes_without_executable_exit():
+    settings = _settings()
+    row = _snapshot(yes_ask_dollars=Decimal("0.5000"), yes_bid_dollars=Decimal("0.4900"), settlement_result="no")
+
+    simulation = rules._simulate_replay_trade(row, [], _replay_candidate(), settings=settings)
+
+    assert simulation["exit_reason"] == "terminal_close"
+    assert simulation["terminal_closed"] is True
+    assert simulation["exit_price_dollars"] == "0.0000"
+    assert Decimal(simulation["net_pnl"]) < Decimal("0")
 
 
 def test_profit_protection_arms_only_after_threshold_then_exits_on_floor():
@@ -470,6 +550,121 @@ def test_strategy_cap_uses_only_strategy_ledger_entries():
     assert rules._open_pending_notional(ledger) == Decimal("6.0000")
 
 
+def test_live_bucket_controls_block_negative_and_consecutive_loss_buckets():
+    settings = _settings()
+    now = datetime(2026, 6, 1, 12, 30, tzinfo=UTC)
+    ledger = {
+        "asset_symbol": "BTC",
+        "positions": {
+            "b15t20r:e:loss1": {
+                "status": "closed",
+                "bucket_key": "BTC|yes|50_60c|le_1c|10_15m",
+                "exit_trigger": "stop_loss",
+                "realized_pnl_dollars": "-1.1000",
+                "closed_at": (now - timedelta(minutes=20)).isoformat(),
+            },
+            "b15t20r:e:loss2": {
+                "status": "closed",
+                "bucket_key": "BTC|no|30_40c|le_1c|10_15m",
+                "exit_trigger": "terminal_close_after_market_close",
+                "realized_pnl_dollars": "-0.1000",
+                "closed_at": (now - timedelta(minutes=10)).isoformat(),
+            },
+            "b15t20r:e:loss3": {
+                "status": "closed",
+                "bucket_key": "BTC|no|30_40c|le_1c|10_15m",
+                "exit_trigger": "stop_loss",
+                "realized_pnl_dollars": "-0.1000",
+                "closed_at": now.isoformat(),
+            },
+            "other:e:ignored": {
+                "status": "closed",
+                "bucket_key": "BTC|yes|50_60c|le_1c|10_15m",
+                "exit_trigger": "stop_loss",
+                "realized_pnl_dollars": "-99.0000",
+                "closed_at": now.isoformat(),
+            },
+        },
+    }
+
+    controls = rules._live_bucket_controls(ledger, settings=settings, asset_symbol="BTC")
+
+    assert "BTC|yes|50_60c|le_1c|10_15m" in controls["blocked_bucket_keys"]
+    assert "BTC|no|30_40c|le_1c|10_15m" in controls["blocked_bucket_keys"]
+    no_bucket = next(bucket for bucket in controls["buckets"] if bucket["bucket_key"] == "BTC|no|30_40c|le_1c|10_15m")
+    assert "bucket_consecutive_stop_or_terminal_losses" in no_bucket["block_reasons"]
+
+
+def test_duplicate_market_exposure_and_loss_cooldown_are_strategy_local():
+    now = datetime(2026, 6, 1, 12, 30, tzinfo=UTC)
+    ledger = {
+        "asset_symbol": "BTC",
+        "positions": {
+            "b15t20r:e:open": {
+                "status": "open",
+                "market_ticker": "KXBTC15M-DUP",
+                "entry_notional_dollars": "5.0000",
+            },
+            "manual": {
+                "status": "open",
+                "market_ticker": "KXBTC15M-DUP",
+                "entry_notional_dollars": "500.0000",
+            },
+            "b15t20r:e:loss": {
+                "status": "closed",
+                "market_ticker": "KXBTC15M-COOL",
+                "exit_trigger": "stop_loss",
+                "realized_pnl_dollars": "-0.5000",
+                "closed_at": (now - timedelta(minutes=5)).isoformat(),
+            },
+        },
+    }
+
+    exposure = rules._market_strategy_exposure(ledger, "KXBTC15M-DUP")
+    cooldown = rules._loss_cooldown_for_market(ledger, "KXBTC15M-COOL", now=now)
+
+    assert len(exposure) == 1
+    assert exposure[0]["client_order_id"] == "b15t20r:e:open"
+    assert cooldown is not None
+    assert cooldown["exit_trigger"] == "stop_loss"
+
+
+def test_min_order_notional_blocks_dust_sized_remaining_cap():
+    settings = _settings()
+    cfg = rules._asset_settings(settings, "BTC")
+    entry_price = Decimal("0.5000")
+    count = rules._count_for_cap(Decimal("4.9900"), entry_price)
+
+    assert count is not None
+    assert entry_price * count < cfg.min_order_notional_dollars
+
+
+def test_daily_loss_limit_input_is_still_strategy_local_and_utc_day_scoped():
+    now = datetime(2026, 6, 1, 12, 30, tzinfo=UTC)
+    ledger = {
+        "asset_symbol": "BTC",
+        "positions": {
+            "b15t20r:e:today": {
+                "status": "closed",
+                "realized_pnl_dollars": "-10.0000",
+                "closed_at": now.isoformat(),
+            },
+            "b15t20r:e:yesterday": {
+                "status": "closed",
+                "realized_pnl_dollars": "-10.0000",
+                "closed_at": (now - timedelta(days=1)).isoformat(),
+            },
+            "manual": {
+                "status": "closed",
+                "realized_pnl_dollars": "-99.0000",
+                "closed_at": now.isoformat(),
+            },
+        },
+    }
+
+    assert rules._daily_realized_pnl(ledger, now) == Decimal("-10.0000")
+
+
 def test_zero_fill_terminal_entry_status_does_not_reserve_strategy_cap():
     assert rules._entry_ledger_decision("canceled", Decimal("0")) == (
         False,
@@ -500,14 +695,41 @@ def test_noop_execution_status_does_not_update_strategy_ledger():
 
 
 def test_operator_approval_must_match_gate_version():
-    gate = type("Gate", (), {"version": "gate-v1", "status": "passed", "payload": {"passed": True}})()
+    stale_gate = type("Gate", (), {"version": "gate-v1", "status": "passed", "payload": {"passed": True}})()
+    gate = type(
+        "Gate",
+        (),
+        {
+            "version": "gate-v1",
+            "status": "passed",
+            "payload": {
+                "passed": True,
+                "simulator_version": rules.TOUCH20_RULES_REPLAY_SIMULATOR_VERSION,
+            },
+        },
+    )()
 
     assert rules._approval_valid({}, gate) == (False, "operator_approval_missing")
-    assert rules._approval_valid({"approved": True, "gate_version": "old"}, gate) == (
+    assert rules._gate_passed(stale_gate) is False
+    assert rules._approval_valid(
+        {"approved": True, "gate_version": "gate-v1", "simulator_version": rules.TOUCH20_RULES_REPLAY_SIMULATOR_VERSION},
+        stale_gate,
+    ) == (False, "gate_simulator_version_stale_or_missing")
+    assert rules._approval_valid({"approved": True, "gate_version": "gate-v1"}, gate) == (
+        False,
+        "operator_approval_simulator_version_mismatch",
+    )
+    assert rules._approval_valid(
+        {"approved": True, "gate_version": "old", "simulator_version": rules.TOUCH20_RULES_REPLAY_SIMULATOR_VERSION},
+        gate,
+    ) == (
         False,
         "operator_approval_gate_version_mismatch",
     )
-    assert rules._approval_valid({"approved": True, "gate_version": "gate-v1"}, gate) == (
+    assert rules._approval_valid(
+        {"approved": True, "gate_version": "gate-v1", "simulator_version": rules.TOUCH20_RULES_REPLAY_SIMULATOR_VERSION},
+        gate,
+    ) == (
         True,
         "operator_approval_valid",
     )

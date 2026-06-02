@@ -1,6 +1,6 @@
 # Crypto 15m Touch20 Rules Runbook
 
-Last updated: 2026-06-01
+Last updated: 2026-06-02
 
 This runbook covers the independent non-model 15-minute Touch20 rules strategy.
 BTC keeps the legacy strategy code `btc15m_touch20_rules`; other supported
@@ -22,7 +22,9 @@ outcome is:
 3. sell from the executable bid when net profit is at least +20% after estimated
    entry and exit taker fees
 
-If the +20% touch never occurs, replay assumes settlement hold. Live exits are
+Replay now mirrors live exit mechanics. It scans the future quote path for
+take-profit, stop-loss, and profit-protection exits, then terminal-closes at
+market close only when no executable exit occurs first. Live exits are
 strategy-owned and trigger on +20% net executable take-profit, -20% net
 executable stop loss, or armed profit protection.
 
@@ -65,6 +67,11 @@ All live flags are disabled by default.
 | `CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT` | `0.20` | Net executable stop-loss trigger for strategy-owned positions. |
 | `CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS` | `10` | Strategy-local open plus pending notional cap. |
 | `CRYPTO_BTC15M_TOUCH20_DAILY_LOSS_LIMIT_DOLLARS` | `10` | Strategy-local daily realized loss stop. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_ORDER_NOTIONAL_DOLLARS` | `5` | Minimum strategy entry notional after sizing. |
+| `CRYPTO_BTC15M_TOUCH20_MAX_BUCKET_LIVE_LOSS_DOLLARS` | `1` | Live bucket loss threshold that blocks more entries in that bucket. |
+| `CRYPTO_BTC15M_TOUCH20_MAX_BUCKET_CONSECUTIVE_LOSSES` | `2` | Consecutive stop/terminal losses that block a live bucket. |
+| `CRYPTO_BTC15M_TOUCH20_MAX_REPLAY_STOP_LOSS_RATE` | `0.35` | Max replay stop-loss rate for the gate and bucket allowance. |
+| `CRYPTO_BTC15M_TOUCH20_MAX_REPLAY_TERMINAL_LOSS_RATE` | `0.15` | Max replay terminal-loss rate for the gate and bucket allowance. |
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_THRESHOLD_PCT` | `0.10` | Profit level that arms profit protection. |
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_FLOOR_PCT` | `0.05` | Armed profit-protection floor. |
 | `CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS` | `15` | Docker process loop sleep. |
@@ -119,10 +126,15 @@ An entry can be submitted only when all of the following are true:
 16. Standalone rule score clears the configured minimum.
 17. Candidate replay bucket is allowed by the asset-owned gate, such as
     `btc15m_touch20_rules_gate:15m:BTC` or `eth15m_touch20_rules_gate:15m:ETH`.
-18. Strategy-owned open plus pending notional remains within the `$10` cap.
-19. Operator approval checkpoint exists and references the latest passed gate
-    version.
-20. The asset lane has `trading_enabled=true`; BTC uses
+18. Candidate bucket is not blocked by live bucket controls.
+19. This strategy has no open or pending entry on the same Kalshi market.
+20. The market is not in the one-cycle cooldown after a strategy stop/terminal
+    loss.
+21. Strategy-owned open plus pending notional remains within the `$10` cap.
+22. Sized order notional is at least the configured minimum, default `$5`.
+23. Operator approval checkpoint exists and references the latest passed gate
+    version and replay simulator version.
+24. The asset lane has `trading_enabled=true`; BTC uses
     `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
 
 If the final trading flag is false, the process can still produce
@@ -195,11 +207,16 @@ Gate requirements:
 - at least 50 candidates
 - real settled quote-path evidence present
 - no trained model usage
-- net simulated P/L above `$0.00`
-- P/L per candidate at least `$0.01`
+- replay simulator version `live_exit_v2`
+- net simulated P/L above `$0.00` after live-faithful exits
+- P/L per candidate at least `$0.01` after fees
 - touch rate at least 25%
+- stop-loss rate at or below 35%
+- terminal-loss rate at or below 15%
 - hard-cap breaches equal 0
 - at least one allowed bucket
+- no replay bucket with negative P/L, excessive stop losses, or excessive
+  terminal losses
 
 Approval checkpoint:
 
@@ -213,7 +230,9 @@ Non-BTC approvals are separate, for example:
 eth15m_touch20_rules_approval:<kalshi_env>:ETH:15m
 ```
 
-A new gate version invalidates old approval until the operator approves again.
+A new gate version or simulator version invalidates old approval until the
+operator approves again. The old Grantv approval for the touch-only simulator is
+expected to fail closed after this remediation.
 
 ## Dry Run
 
@@ -244,6 +263,7 @@ Expected safe statuses include:
 - `daily_loss_limit_blocked`
 - `no_candidate`
 - `strategy_cap_blocked`
+- `min_order_notional_blocked`
 - `trading_disabled`
 
 Only `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true` allows entry order
@@ -258,12 +278,16 @@ Before tiny-live:
 3. Confirm the asset's 15m quote collection is current.
 4. Confirm the asset spot rows are fresh and non-proxy.
 5. Confirm the asset-owned gate, such as `btc15m_touch20_rules_gate:15m:BTC`, is
-   passed.
+   passed with simulator version `live_exit_v2`.
 6. Confirm the selected dry-run candidate is in an allowed replay bucket.
-7. Confirm the strategy ledger has no stale pending notional.
-8. Confirm max strategy notional remains `$10`.
-9. Confirm the existing model-trained crypto bot remains unchanged.
-10. Approve the latest gate with `crypto-non-model-touch20 approve`.
+7. Confirm `live_bucket_controls.blocked_bucket_keys` does not include the
+   selected candidate bucket.
+8. Confirm the strategy ledger has no stale pending notional and no duplicate
+   strategy entry for the selected market.
+9. Confirm max strategy notional remains `$10` and daily loss limit remains
+   `$10`; do not override the daily-loss block as part of this remediation.
+10. Confirm the existing model-trained crypto bot remains unchanged.
+11. Approve the latest gate with `crypto-non-model-touch20 approve`.
 
 Then enable:
 
@@ -273,6 +297,7 @@ PRODUCTION_CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT=0.20
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS=10
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_DAILY_LOSS_LIMIT_DOLLARS=10
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_ORDER_NOTIONAL_DOLLARS=5
 ```
 
 For non-BTC lanes, run the same replay, gate, approve, status, run-once, and
@@ -350,13 +375,15 @@ Watch these first:
 - candidate funnel: market seen, quote valid, spot fresh, spread pass,
   entry-window pass, replay-bucket pass, selected, submitted, filled
 - gate health: candidate count, touch rate, net P/L, P/L per candidate,
-  allowed bucket count, blocked bucket count
+  allowed bucket count, blocked bucket count, exit reason counts, stop-loss
+  rate, terminal-loss rate, simulator version
 - trading quality: entry spread, exit spread, slippage, fill latency, partial
   fills, rejected orders, stale quote skips
 - P/L attribution: strategy-only realized/unrealized P/L, take-profit exits,
   profit-protection exits, settlement holds
-- risk: strategy open notional, pending notional, daily loss, cap blocks,
-  overlap with model-bot positions
+- risk: strategy open notional, pending notional, daily loss, cap blocks, live
+  bucket blocks, duplicate-market skips, cooldown skips, overlap with model-bot
+  positions
 - market regime: asset spot volatility, short-term momentum, distance to target,
   liquidity by price band, time-to-close bucket
 

@@ -33,6 +33,13 @@ BTC15M_TOUCH20_RULES_FREQ = "15m"
 BTC15M_TOUCH20_RULES_ASSET = "BTC"
 BTC15M_TOUCH20_RULES_INTERVAL_SECONDS = 900
 TOUCH20_RULES_SUPPORTED_ASSETS = frozenset({"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"})
+TOUCH20_RULES_REPLAY_SIMULATOR_VERSION = "live_exit_v2"
+TOUCH20_RULES_REMEDIATION_BLOCKED_BTC_BUCKETS = frozenset(
+    {
+        "BTC|yes|50_60c|le_1c|10_15m",
+        "BTC|no|30_40c|le_1c|10_15m",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,11 @@ class Touch20AssetSettings:
     replay_max_hard_cap_breaches: int
     max_open_notional_dollars: Decimal
     daily_loss_limit_dollars: Decimal
+    min_order_notional_dollars: Decimal
+    max_bucket_live_loss_dollars: Decimal
+    max_bucket_consecutive_losses: int
+    max_replay_stop_loss_rate: Decimal
+    max_replay_terminal_loss_rate: Decimal
     profit_protection_threshold_pct: Decimal
     profit_protection_floor_pct: Decimal
     loop_interval_seconds: int
@@ -148,6 +160,11 @@ def _asset_settings(settings: Settings, asset_symbol: str | None) -> Touch20Asse
         replay_max_hard_cap_breaches=_int_override(overrides, "replay_max_hard_cap_breaches", int(settings.crypto_btc15m_touch20_replay_max_hard_cap_breaches)),
         max_open_notional_dollars=_decimal_override(overrides, "max_open_notional_dollars", Decimal(str(settings.crypto_btc15m_touch20_max_open_notional_dollars))),
         daily_loss_limit_dollars=_decimal_override(overrides, "daily_loss_limit_dollars", Decimal(str(settings.crypto_btc15m_touch20_daily_loss_limit_dollars))),
+        min_order_notional_dollars=_decimal_override(overrides, "min_order_notional_dollars", Decimal(str(settings.crypto_btc15m_touch20_min_order_notional_dollars))),
+        max_bucket_live_loss_dollars=_decimal_override(overrides, "max_bucket_live_loss_dollars", Decimal(str(settings.crypto_btc15m_touch20_max_bucket_live_loss_dollars))),
+        max_bucket_consecutive_losses=_int_override(overrides, "max_bucket_consecutive_losses", int(settings.crypto_btc15m_touch20_max_bucket_consecutive_losses)),
+        max_replay_stop_loss_rate=_decimal_override(overrides, "max_replay_stop_loss_rate", Decimal(str(settings.crypto_btc15m_touch20_max_replay_stop_loss_rate))),
+        max_replay_terminal_loss_rate=_decimal_override(overrides, "max_replay_terminal_loss_rate", Decimal(str(settings.crypto_btc15m_touch20_max_replay_terminal_loss_rate))),
         profit_protection_threshold_pct=_decimal_override(overrides, "profit_protection_threshold_pct", Decimal(str(settings.crypto_btc15m_touch20_profit_protection_threshold_pct))),
         profit_protection_floor_pct=_decimal_override(overrides, "profit_protection_floor_pct", Decimal(str(settings.crypto_btc15m_touch20_profit_protection_floor_pct))),
         loop_interval_seconds=_int_override(overrides, "loop_interval_seconds", int(settings.crypto_btc15m_touch20_loop_interval_seconds)),
@@ -840,24 +857,102 @@ def _simulate_replay_trade(
     candidate: dict[str, Any],
     *,
     settings: Settings,
+    spot_index: dict[str, list[Any]] | None = None,
 ) -> dict[str, Any]:
+    asset = _normalize_asset_symbol(row.asset_symbol)
+    cfg = _asset_settings(settings, asset)
     side = str(candidate["side"])
     entry = _decimal(candidate["execution_price_dollars"])
     target_exit = _decimal(candidate["target_exit_side_price_dollars"])
     fee_rate = Decimal(str(settings.kalshi_taker_fee_rate))
-    touched = _first_touch(future_rows, side=side, target_exit_side_price=target_exit)
-    if touched is not None:
-        exit_row, exit_price = touched
-        exit_reason = "take_profit"
-        exit_observed_at = _snapshot_decision_time(exit_row)
-    else:
-        exit_price = _settlement_side_payout(row, side)
-        exit_reason = "settlement_hold"
-        exit_observed_at = _as_utc(row.close_time or row.expected_expiration_time) or _snapshot_decision_time(row)
     entry_fee = estimate_kalshi_taker_fee_dollars(price_dollars=entry, count=Decimal("1.00"), fee_rate=fee_rate)
-    exit_fee = estimate_kalshi_taker_fee_dollars(price_dollars=exit_price, count=Decimal("1.00"), fee_rate=fee_rate)
+    exit_price: Decimal | None = None
+    exit_reason = "terminal_close"
+    exit_observed_at = _as_utc(row.close_time or row.expected_expiration_time) or _snapshot_decision_time(row)
+    exit_fee = Decimal("0")
+    max_drawdown_pct: Decimal | None = None
+    min_exit_side_price: Decimal | None = None
+    protection_armed = False
+    previous_profit_pct: Decimal | None = None
+
+    for future in future_rows:
+        observed_at = _snapshot_decision_time(future)
+        side_price = _sell_side_price(future, side)
+        if side_price is None:
+            continue
+        profit_pct = net_profit_pct(
+            entry_side_price=entry,
+            exit_side_price=side_price,
+            count_fp=Decimal("1.00"),
+            fee_rate=fee_rate,
+        )
+        if profit_pct is None:
+            continue
+        max_drawdown_pct = profit_pct if max_drawdown_pct is None else min(max_drawdown_pct, profit_pct)
+        min_exit_side_price = side_price if min_exit_side_price is None else min(min_exit_side_price, side_price)
+        if profit_pct >= cfg.take_profit_pct:
+            exit_price = side_price
+            exit_reason = "take_profit"
+            exit_observed_at = observed_at
+            exit_fee = estimate_kalshi_taker_fee_dollars(price_dollars=exit_price, count=Decimal("1.00"), fee_rate=fee_rate)
+            break
+        if cfg.stop_loss_pct > Decimal("0") and profit_pct <= -cfg.stop_loss_pct:
+            exit_price = side_price
+            exit_reason = "stop_loss"
+            exit_observed_at = observed_at
+            exit_fee = estimate_kalshi_taker_fee_dollars(price_dollars=exit_price, count=Decimal("1.00"), fee_rate=fee_rate)
+            break
+        protection_armed = protection_armed or profit_pct >= cfg.profit_protection_threshold_pct
+        protection_trigger: str | None = None
+        if protection_armed and profit_pct <= cfg.profit_protection_floor_pct:
+            protection_trigger = "profit_protection_floor"
+        elif protection_armed and previous_profit_pct is not None and profit_pct < previous_profit_pct and spot_index:
+            spot = _spot_features_from_index(
+                spot_index,
+                decision_ts=observed_at,
+                freshness_reference=observed_at,
+                max_age_seconds=max(cfg.spot_fresh_seconds, BTC15M_TOUCH20_RULES_INTERVAL_SECONDS),
+            )
+            side_multiplier = Decimal("1") if side == "yes" else Decimal("-1")
+            adverse_spot = (
+                spot.get("available")
+                and (side_multiplier * _decimal(spot.get("return_1"))) < Decimal("0")
+                and (side_multiplier * _decimal(spot.get("return_3"))) < Decimal("0")
+            )
+            if adverse_spot:
+                protection_trigger = "profit_protection_adverse_momentum"
+        previous_profit_pct = profit_pct
+        if protection_trigger:
+            exit_price = side_price
+            exit_reason = protection_trigger
+            exit_observed_at = observed_at
+            exit_fee = estimate_kalshi_taker_fee_dollars(price_dollars=exit_price, count=Decimal("1.00"), fee_rate=fee_rate)
+            break
+
+    terminal = exit_price is None
+    if terminal:
+        exit_price = _settlement_side_payout(row, side)
+        realized = _realized_pnl_without_exit_fee(
+            entry_side_price=entry,
+            exit_side_price=exit_price,
+            count_fp=Decimal("1.00"),
+            fee_rate=fee_rate,
+        )
+        terminal_profit_pct = _net_profit_pct_from_realized(
+            realized_pnl=realized,
+            entry_side_price=entry,
+            count_fp=Decimal("1.00"),
+            fee_rate=fee_rate,
+        )
+        if terminal_profit_pct is not None:
+            max_drawdown_pct = terminal_profit_pct if max_drawdown_pct is None else min(max_drawdown_pct, terminal_profit_pct)
+        min_exit_side_price = exit_price if min_exit_side_price is None else min(min_exit_side_price, exit_price)
+    else:
+        gross = exit_price - entry
+        realized = (gross - entry_fee - exit_fee).quantize(Decimal("0.0001"))
+
     gross = exit_price - entry
-    net = gross - entry_fee - exit_fee
+    net = realized
     return {
         "side": side,
         "entry_price_dollars": _money_text(entry),
@@ -865,12 +960,17 @@ def _simulate_replay_trade(
         "exit_price_dollars": _money_text(exit_price),
         "exit_reason": exit_reason,
         "exit_observed_at": exit_observed_at.isoformat(),
-        "touched": touched is not None,
+        "touched": exit_reason == "take_profit",
+        "stopped": exit_reason == "stop_loss",
+        "terminal_closed": terminal,
         "gross_pnl": str(gross.quantize(Decimal("0.0001"))),
         "fees": str((entry_fee + exit_fee).quantize(Decimal("0.0001"))),
         "net_pnl": str(net.quantize(Decimal("0.0001"))),
+        "max_drawdown_pct": str((max_drawdown_pct or Decimal("0")).quantize(Decimal("0.0001"))),
+        "min_exit_side_price_dollars": _money_text(min_exit_side_price),
         "bucket_key": candidate.get("bucket_key"),
         "rule_score": candidate.get("rule_score"),
+        "simulator_version": TOUCH20_RULES_REPLAY_SIMULATOR_VERSION,
     }
 
 
@@ -886,14 +986,32 @@ def _bucket_matrix(trades: list[dict[str, Any]], *, settings: Settings, asset_sy
     cfg = _asset_settings(settings, asset)
     min_touch_rate = cfg.replay_min_touch_rate
     min_pnl_per = cfg.replay_min_pnl_per_candidate_dollars
+    max_stop_rate = cfg.max_replay_stop_loss_rate
+    max_terminal_rate = cfg.max_replay_terminal_loss_rate
     for key, rows in grouped.items():
         values = [_decimal((row.get("simulation") or {}).get("net_pnl")) for row in rows]
         touch_count = sum(1 for row in rows if (row.get("simulation") or {}).get("touched") is True)
+        stop_loss_count = sum(1 for row in rows if (row.get("simulation") or {}).get("exit_reason") == "stop_loss")
+        terminal_loss_count = sum(
+            1
+            for row in rows
+            if (row.get("simulation") or {}).get("terminal_closed") is True
+            and _decimal((row.get("simulation") or {}).get("net_pnl")) < Decimal("0")
+        )
         net = sum(values, Decimal("0"))
         sample_count = len(rows)
         touch_rate = Decimal(touch_count) / Decimal(sample_count) if sample_count else Decimal("0")
+        stop_loss_rate = Decimal(stop_loss_count) / Decimal(sample_count) if sample_count else Decimal("0")
+        terminal_loss_rate = Decimal(terminal_loss_count) / Decimal(sample_count) if sample_count else Decimal("0")
         pnl_per = net / Decimal(sample_count) if sample_count else Decimal("0")
-        allowed = sample_count >= 5 and net > Decimal("0") and touch_rate >= min_touch_rate and pnl_per >= min_pnl_per
+        allowed = (
+            sample_count >= 5
+            and net > Decimal("0")
+            and touch_rate >= min_touch_rate
+            and pnl_per >= min_pnl_per
+            and stop_loss_rate <= max_stop_rate
+            and terminal_loss_rate <= max_terminal_rate
+        )
         first = rows[0]
         candidate = first.get("candidate") if isinstance(first.get("candidate"), dict) else {}
         matrix.append(
@@ -903,7 +1021,11 @@ def _bucket_matrix(trades: list[dict[str, Any]], *, settings: Settings, asset_sy
                 "side": candidate.get("side"),
                 "sample_count": sample_count,
                 "touch_count": touch_count,
+                "stop_loss_count": stop_loss_count,
+                "terminal_loss_count": terminal_loss_count,
                 "touch_rate": float(touch_rate),
+                "stop_loss_rate": float(stop_loss_rate),
+                "terminal_loss_rate": float(terminal_loss_rate),
                 "net_pnl": str(net.quantize(Decimal("0.0001"))),
                 "pnl_per_candidate": str(pnl_per.quantize(Decimal("0.0001"))),
                 "allowed": allowed,
@@ -922,9 +1044,12 @@ def _gate_requirements(settings: Settings, *, asset_symbol: str = BTC15M_TOUCH20
         "min_pnl_per_candidate_dollars": float(cfg.replay_min_pnl_per_candidate_dollars),
         "max_hard_cap_breaches": cfg.replay_max_hard_cap_breaches,
         "min_touch_rate": float(cfg.replay_min_touch_rate),
+        "max_stop_loss_rate": float(cfg.max_replay_stop_loss_rate),
+        "max_terminal_loss_rate": float(cfg.max_replay_terminal_loss_rate),
         "requires_allowed_bucket_support": True,
         "requires_real_quote_path_evidence": True,
         "uses_trained_model": False,
+        "simulator_version": TOUCH20_RULES_REPLAY_SIMULATOR_VERSION,
     }
 
 
@@ -952,6 +1077,9 @@ def gate_reasons(metrics: dict[str, Any], *, settings: Settings, asset_symbol: s
     max_hard_cap = cfg.replay_max_hard_cap_breaches
     touch_rate = Decimal(str(metrics.get("touch_rate") or "0"))
     min_touch_rate = cfg.replay_min_touch_rate
+    stop_loss_rate = Decimal(str(metrics.get("stop_loss_rate") or "0"))
+    terminal_loss_rate = Decimal(str(metrics.get("terminal_loss_rate") or "0"))
+    simulator_version = str(metrics.get("simulator_version") or "")
     if candidates < min_candidates:
         reasons.append(f"{label} replay candidate count {candidates} below minimum {min_candidates}.")
     if net_pl <= min_net:
@@ -964,6 +1092,26 @@ def gate_reasons(metrics: dict[str, Any], *, settings: Settings, asset_symbol: s
         reasons.append(f"{label} replay hard-cap breaches {hard_cap_breaches} exceed limit {max_hard_cap}.")
     if touch_rate < min_touch_rate:
         reasons.append(f"{label} replay touch rate {float(touch_rate):.1%} below minimum {float(min_touch_rate):.1%}.")
+    if stop_loss_rate > cfg.max_replay_stop_loss_rate:
+        reasons.append(
+            f"{label} replay stop-loss rate {float(stop_loss_rate):.1%} exceeds maximum {float(cfg.max_replay_stop_loss_rate):.1%}."
+        )
+    if terminal_loss_rate > cfg.max_replay_terminal_loss_rate:
+        reasons.append(
+            f"{label} replay terminal-loss rate {float(terminal_loss_rate):.1%} exceeds maximum {float(cfg.max_replay_terminal_loss_rate):.1%}."
+        )
+    for bucket in metrics.get("bucket_matrix") or []:
+        if not isinstance(bucket, dict):
+            continue
+        key = str(bucket.get("bucket_key") or "unknown")
+        if _decimal(bucket.get("net_pnl") or "0") < Decimal("0"):
+            reasons.append(f"{label} replay bucket {key} has negative P/L.")
+        if Decimal(str(bucket.get("stop_loss_rate") or "0")) > cfg.max_replay_stop_loss_rate:
+            reasons.append(f"{label} replay bucket {key} stop-loss rate exceeds maximum.")
+        if Decimal(str(bucket.get("terminal_loss_rate") or "0")) > cfg.max_replay_terminal_loss_rate:
+            reasons.append(f"{label} replay bucket {key} terminal-loss rate exceeds maximum.")
+    if simulator_version != TOUCH20_RULES_REPLAY_SIMULATOR_VERSION:
+        reasons.append(f"{label} replay simulator version is stale or missing.")
     if not (metrics.get("allowed_bucket_keys") or []):
         reasons.append(f"{label} replay has no allowed bucket support.")
     return reasons
@@ -1040,7 +1188,7 @@ def _evaluate_replay(
                 for future in market_rows[idx + 1 :]
                 if _snapshot_decision_time(future) > decision_ts and _snapshot_decision_time(future) < settlement_ts
             ]
-            simulation = _simulate_replay_trade(row, future_rows, selected, settings=settings)
+            simulation = _simulate_replay_trade(row, future_rows, selected, settings=settings, spot_index=spot_index)
             trades.append(
                 {
                     "market_ticker": row.market_ticker,
@@ -1056,6 +1204,14 @@ def _evaluate_replay(
     values = [_decimal((trade.get("simulation") or {}).get("net_pnl")) for trade in trades]
     fees = [_decimal((trade.get("simulation") or {}).get("fees")) for trade in trades]
     touch_count = sum(1 for trade in trades if (trade.get("simulation") or {}).get("touched") is True)
+    stop_loss_count = sum(1 for trade in trades if (trade.get("simulation") or {}).get("exit_reason") == "stop_loss")
+    terminal_loss_count = sum(
+        1
+        for trade in trades
+        if (trade.get("simulation") or {}).get("terminal_closed") is True
+        and _decimal((trade.get("simulation") or {}).get("net_pnl")) < Decimal("0")
+    )
+    exit_reason_counts = Counter(str((trade.get("simulation") or {}).get("exit_reason") or "unknown") for trade in trades)
     net = sum(values, Decimal("0"))
     trade_count = len(trades)
     metrics = {
@@ -1068,16 +1224,27 @@ def _evaluate_replay(
         "trade_candidate_count": trade_count,
         "touch_count": touch_count,
         "touch_rate": float(Decimal(touch_count) / Decimal(trade_count)) if trade_count else 0.0,
-        "settlement_hold_count": trade_count - touch_count,
+        "stop_loss_count": stop_loss_count,
+        "stop_loss_rate": float(Decimal(stop_loss_count) / Decimal(trade_count)) if trade_count else 0.0,
+        "terminal_loss_count": terminal_loss_count,
+        "terminal_loss_rate": float(Decimal(terminal_loss_count) / Decimal(trade_count)) if trade_count else 0.0,
+        "settlement_hold_count": int(exit_reason_counts.get("terminal_close", 0)),
+        "exit_reason_counts": dict(exit_reason_counts),
+        "gross_simulated_pl_dollars": float(sum((_decimal((trade.get("simulation") or {}).get("gross_pnl")) for trade in trades), Decimal("0"))),
         "net_simulated_pl_dollars": float(net),
         "pnl_per_candidate_dollars": float(net / Decimal(trade_count)) if trade_count else 0.0,
         "fees_dollars": float(sum(fees, Decimal("0"))),
+        "max_trade_drawdown_pct": float(
+            min((_decimal((trade.get("simulation") or {}).get("max_drawdown_pct")) for trade in trades), default=Decimal("0"))
+        ),
         "hard_cap_breaches": sum(1 for value in values if value < Decimal("-1.0000")),
         "candidate_status_counts": dict(status_counts),
         "candidate_reason_counts": dict(reason_counts),
         "bucket_matrix": bucket_matrix,
         "allowed_bucket_keys": allowed_keys,
         "blocked_bucket_keys": blocked_keys,
+        "bucket_live_blocked_keys": [],
+        "simulator_version": TOUCH20_RULES_REPLAY_SIMULATOR_VERSION,
         "fee_model_version": current_fee_model_version(),
     }
     return {
@@ -1098,6 +1265,7 @@ def _artifact_summary(artifact: Any | None) -> dict[str, Any] | None:
         "status": getattr(artifact, "status", None),
         "sample_count": getattr(artifact, "sample_count", None),
         "passed": payload.get("passed") if isinstance(payload, dict) else None,
+        "simulator_version": payload.get("simulator_version") if isinstance(payload, dict) else None,
     }
 
 
@@ -1107,6 +1275,15 @@ def _gate_passed(gate: Any | None) -> bool:
     if str(getattr(gate, "status", "") or "").lower() != "passed":
         return False
     payload = getattr(gate, "payload", None)
+    metrics = getattr(gate, "metrics", None)
+    simulator_version = None
+    if isinstance(payload, dict):
+        requirements = payload.get("requirements") if isinstance(payload.get("requirements"), dict) else {}
+        simulator_version = payload.get("simulator_version") or requirements.get("simulator_version")
+    if simulator_version is None and isinstance(metrics, dict):
+        simulator_version = metrics.get("simulator_version")
+    if simulator_version != TOUCH20_RULES_REPLAY_SIMULATOR_VERSION:
+        return False
     if isinstance(payload, dict) and "passed" in payload:
         return payload.get("passed") is True
     return True
@@ -1122,6 +1299,18 @@ def _approval_valid(approval: dict[str, Any], gate: Any | None) -> tuple[bool, s
     gate_version = getattr(gate, "version", None)
     if not gate_version:
         return False, "gate_version_missing"
+    payload = getattr(gate, "payload", None)
+    metrics = getattr(gate, "metrics", None)
+    gate_simulator_version = None
+    if isinstance(payload, dict):
+        requirements = payload.get("requirements") if isinstance(payload.get("requirements"), dict) else {}
+        gate_simulator_version = payload.get("simulator_version") or requirements.get("simulator_version")
+    if gate_simulator_version is None and isinstance(metrics, dict):
+        gate_simulator_version = metrics.get("simulator_version")
+    if gate_simulator_version != TOUCH20_RULES_REPLAY_SIMULATOR_VERSION:
+        return False, "gate_simulator_version_stale_or_missing"
+    if str(approval.get("simulator_version") or "") != str(gate_simulator_version):
+        return False, "operator_approval_simulator_version_mismatch"
     if str(approval.get("gate_version") or "") != str(gate_version):
         return False, "operator_approval_gate_version_mismatch"
     return True, "operator_approval_valid"
@@ -1190,6 +1379,164 @@ def _daily_realized_pnl(ledger: dict[str, Any], now: datetime) -> Decimal:
         if closed_at.date() == now.astimezone(UTC).date():
             total += _decimal(entry.get("realized_pnl_dollars") or "0")
     return total.quantize(Decimal("0.0001"))
+
+
+def _market_strategy_exposure(ledger: dict[str, Any], market_ticker: str) -> list[dict[str, Any]]:
+    positions = ledger.get("positions") if isinstance(ledger.get("positions"), dict) else {}
+    prefix = _order_prefix(str(ledger.get("asset_symbol") or ""))
+    exposure: list[dict[str, Any]] = []
+    for client_order_id, entry in positions.items():
+        if not str(client_order_id).startswith(f"{prefix}:") or not isinstance(entry, dict):
+            continue
+        if str(entry.get("market_ticker") or "") != market_ticker:
+            continue
+        status = str(entry.get("status") or "")
+        if status in {"entry_submitted", "open", "exit_submitted"}:
+            exposure.append(
+                {
+                    "client_order_id": str(client_order_id),
+                    "status": status,
+                    "entry_notional_dollars": entry.get("entry_notional_dollars"),
+                }
+            )
+    return exposure
+
+
+def _loss_cooldown_for_market(
+    ledger: dict[str, Any],
+    market_ticker: str,
+    *,
+    now: datetime,
+    cooldown_seconds: int = BTC15M_TOUCH20_RULES_INTERVAL_SECONDS,
+) -> dict[str, Any] | None:
+    positions = ledger.get("positions") if isinstance(ledger.get("positions"), dict) else {}
+    prefix = _order_prefix(str(ledger.get("asset_symbol") or ""))
+    latest_loss: tuple[datetime, str, dict[str, Any]] | None = None
+    for client_order_id, entry in positions.items():
+        if not str(client_order_id).startswith(f"{prefix}:") or not isinstance(entry, dict):
+            continue
+        if str(entry.get("market_ticker") or "") != market_ticker:
+            continue
+        trigger = str(entry.get("exit_trigger") or "")
+        if "stop_loss" not in trigger and "terminal" not in trigger:
+            continue
+        if _decimal(entry.get("realized_pnl_dollars") or "0") >= Decimal("0"):
+            continue
+        closed_at = _datetime_from_any(entry.get("closed_at"))
+        if closed_at is None:
+            continue
+        if latest_loss is None or closed_at > latest_loss[0]:
+            latest_loss = (closed_at, str(client_order_id), entry)
+    if latest_loss is None:
+        return None
+    cooldown_until = latest_loss[0] + timedelta(seconds=cooldown_seconds)
+    if now >= cooldown_until:
+        return None
+    return {
+        "client_order_id": latest_loss[1],
+        "exit_trigger": latest_loss[2].get("exit_trigger"),
+        "realized_pnl_dollars": latest_loss[2].get("realized_pnl_dollars"),
+        "closed_at": latest_loss[0].isoformat(),
+        "cooldown_until": cooldown_until.isoformat(),
+    }
+
+
+def _bucket_proved_by_current_replay(bucket_key: str, gate_metrics: dict[str, Any] | None) -> bool:
+    metrics = gate_metrics or {}
+    if metrics.get("simulator_version") != TOUCH20_RULES_REPLAY_SIMULATOR_VERSION:
+        return False
+    if bucket_key not in {str(key) for key in (metrics.get("allowed_bucket_keys") or [])}:
+        return False
+    for bucket in metrics.get("bucket_matrix") or []:
+        if not isinstance(bucket, dict) or str(bucket.get("bucket_key") or "") != bucket_key:
+            continue
+        return (
+            bucket.get("allowed") is True
+            and _decimal(bucket.get("net_pnl") or "0") > Decimal("0")
+            and Decimal(str(bucket.get("stop_loss_rate") or "0")) <= Decimal(str(metrics.get("max_replay_stop_loss_rate") or "1"))
+        )
+    return False
+
+
+def _live_bucket_controls(
+    ledger: dict[str, Any],
+    *,
+    settings: Settings,
+    asset_symbol: str,
+    gate_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    asset = _normalize_asset_symbol(asset_symbol)
+    cfg = _asset_settings(settings, asset)
+    positions = ledger.get("positions") if isinstance(ledger.get("positions"), dict) else {}
+    prefix = _order_prefix(str(ledger.get("asset_symbol") or asset))
+    grouped: dict[str, list[tuple[datetime, str, dict[str, Any]]]] = defaultdict(list)
+    for client_order_id, entry in positions.items():
+        if not str(client_order_id).startswith(f"{prefix}:") or not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "") != "closed":
+            continue
+        bucket_key = str(entry.get("bucket_key") or "")
+        closed_at = _datetime_from_any(entry.get("closed_at"))
+        if not bucket_key or closed_at is None:
+            continue
+        grouped[bucket_key].append((closed_at, str(client_order_id), entry))
+
+    seeded_bucket_keys = set(TOUCH20_RULES_REMEDIATION_BLOCKED_BTC_BUCKETS if asset == BTC15M_TOUCH20_RULES_ASSET else frozenset())
+    for bucket_key in seeded_bucket_keys:
+        grouped.setdefault(bucket_key, [])
+
+    bucket_stats: list[dict[str, Any]] = []
+    blocked_keys: list[str] = []
+    for bucket_key, rows in grouped.items():
+        rows.sort(key=lambda item: item[0])
+        realized = sum((_decimal(entry.get("realized_pnl_dollars") or "0") for _, _, entry in rows), Decimal("0")).quantize(Decimal("0.0001"))
+        loss_count = sum(1 for _, _, entry in rows if _decimal(entry.get("realized_pnl_dollars") or "0") < Decimal("0"))
+        stop_terminal_losses = sum(
+            1
+            for _, _, entry in rows
+            if _decimal(entry.get("realized_pnl_dollars") or "0") < Decimal("0")
+            and ("stop_loss" in str(entry.get("exit_trigger") or "") or "terminal" in str(entry.get("exit_trigger") or ""))
+        )
+        consecutive = 0
+        for _, _, entry in reversed(rows):
+            trigger = str(entry.get("exit_trigger") or "")
+            if _decimal(entry.get("realized_pnl_dollars") or "0") < Decimal("0") and ("stop_loss" in trigger or "terminal" in trigger):
+                consecutive += 1
+            else:
+                break
+        reasons: list[str] = []
+        if realized <= -cfg.max_bucket_live_loss_dollars:
+            reasons.append("bucket_live_loss_limit")
+        if consecutive >= cfg.max_bucket_consecutive_losses:
+            reasons.append("bucket_consecutive_stop_or_terminal_losses")
+        if (
+            bucket_key in seeded_bucket_keys
+            and not rows
+            and not _bucket_proved_by_current_replay(bucket_key, gate_metrics)
+        ):
+            reasons.append("seeded_remediation_block")
+        if reasons:
+            blocked_keys.append(bucket_key)
+        bucket_stats.append(
+            {
+                "bucket_key": bucket_key,
+                "trade_count": len(rows),
+                "loss_count": loss_count,
+                "stop_or_terminal_loss_count": stop_terminal_losses,
+                "consecutive_stop_or_terminal_losses": consecutive,
+                "realized_pnl_dollars": _money_text(realized),
+                "blocked": bool(reasons),
+                "block_reasons": reasons,
+            }
+        )
+    bucket_stats.sort(key=lambda item: (item["blocked"], _decimal(item.get("realized_pnl_dollars") or "0")), reverse=True)
+    return {
+        "max_bucket_live_loss_dollars": _money_text(cfg.max_bucket_live_loss_dollars),
+        "max_bucket_consecutive_losses": cfg.max_bucket_consecutive_losses,
+        "seeded_blocked_bucket_keys": sorted(seeded_bucket_keys),
+        "blocked_bucket_keys": sorted(blocked_keys),
+        "buckets": bucket_stats,
+    }
 
 
 def _count_for_cap(remaining_cap: Decimal, entry_side_price: Decimal) -> Decimal | None:
@@ -1288,6 +1635,7 @@ def _entry_payload(
         "gate_artifact_type": getattr(gate, "artifact_type", None),
         "approval": {
             "gate_version": approval.get("gate_version"),
+            "simulator_version": approval.get("simulator_version"),
             "approved_by": approval.get("approved_by"),
             "approved_at": approval.get("approved_at"),
             "max_notional_dollars": approval.get("max_notional_dollars"),
@@ -1502,7 +1850,7 @@ class CryptoNonModelTouch20Service:
         metrics["dataset_source"] = "settled_live_quote_paths"
         reasons = gate_reasons(metrics, settings=self.settings, asset_symbol=asset)
         report = {
-            "schema_version": "btc15m-touch20-rules-backtest-v1",
+            "schema_version": "btc15m-touch20-rules-backtest-v2",
             "status": "pass" if not reasons else "warn",
             "kalshi_env": self.settings.kalshi_env,
             "frequency": freq,
@@ -1510,6 +1858,7 @@ class CryptoNonModelTouch20Service:
             "objective": "touch_20pct_before_close",
             "strategy": strategy,
             "uses_trained_model": False,
+            "simulator_version": TOUCH20_RULES_REPLAY_SIMULATOR_VERSION,
             "days": days,
             "metrics": metrics,
             "requirements": _gate_requirements(self.settings, asset_symbol=asset),
@@ -1562,7 +1911,10 @@ class CryptoNonModelTouch20Service:
                 "objective": "touch_20pct_before_close",
                 "strategy": strategy,
                 "uses_trained_model": False,
+                "simulator_version": metrics.get("simulator_version"),
+                "expected_simulator_version": TOUCH20_RULES_REPLAY_SIMULATOR_VERSION,
                 "backtest_version": getattr(backtest, "version", None),
+                "backtest_simulator_version": metrics.get("simulator_version"),
             }
             artifact = await repo.record_crypto_model_artifact(
                 frequency=freq,
@@ -1622,6 +1974,7 @@ class CryptoNonModelTouch20Service:
                 "frequency": freq,
                 "approved": True,
                 "gate_version": gate.version,
+                "simulator_version": TOUCH20_RULES_REPLAY_SIMULATOR_VERSION,
                 "approved_by": approved_by,
                 "approved_at": datetime.now(UTC).isoformat(),
                 "max_notional_dollars": _money_text(max_notional_dollars or cfg.max_open_notional_dollars),
@@ -1688,6 +2041,9 @@ class CryptoNonModelTouch20Service:
             )
             await session.commit()
         approval_valid, approval_reason = _approval_valid(approval, gate)
+        gate_metrics = dict(getattr(gate, "metrics", None) or {})
+        live_bucket_controls = _live_bucket_controls(ledger, settings=self.settings, asset_symbol=asset, gate_metrics=gate_metrics)
+        daily_pnl = _daily_realized_pnl(ledger, datetime.now(UTC))
         return {
             "status": "ok",
             "strategy": strategy,
@@ -1701,6 +2057,11 @@ class CryptoNonModelTouch20Service:
                 "stop_loss_pct": str(cfg.stop_loss_pct),
                 "max_open_notional_dollars": _money_text(cfg.max_open_notional_dollars),
                 "daily_loss_limit_dollars": _money_text(cfg.daily_loss_limit_dollars),
+                "min_order_notional_dollars": _money_text(cfg.min_order_notional_dollars),
+                "max_bucket_live_loss_dollars": _money_text(cfg.max_bucket_live_loss_dollars),
+                "max_bucket_consecutive_losses": cfg.max_bucket_consecutive_losses,
+                "max_replay_stop_loss_rate": str(cfg.max_replay_stop_loss_rate),
+                "max_replay_terminal_loss_rate": str(cfg.max_replay_terminal_loss_rate),
                 "min_rule_score": str(cfg.min_rule_score),
                 "quote_fresh_seconds": cfg.quote_fresh_seconds,
                 "spot_fresh_seconds": cfg.spot_fresh_seconds,
@@ -1711,6 +2072,8 @@ class CryptoNonModelTouch20Service:
             "approval_reason": approval_reason,
             "open_pending_notional_dollars": _money_text(_open_pending_notional(ledger)),
             "open_strategy_positions": len(_open_entries(ledger)),
+            "daily_realized_pnl_dollars": _money_text(daily_pnl),
+            "live_bucket_controls": live_bucket_controls,
         }
 
     async def run_once(self, *, frequency: str = "15m", asset_symbol: str = "BTC") -> dict[str, Any]:
@@ -1761,15 +2124,42 @@ class CryptoNonModelTouch20Service:
             await session.commit()
 
         gate_summary = _artifact_summary(gate)
+        gate_metrics = dict(getattr(gate, "metrics", None) or {})
+        live_bucket_controls = _live_bucket_controls(ledger, settings=self.settings, asset_symbol=asset, gate_metrics=gate_metrics)
+        live_bucket_blocks = {
+            str(bucket.get("bucket_key")): bucket
+            for bucket in live_bucket_controls.get("buckets", [])
+            if isinstance(bucket, dict) and bucket.get("blocked")
+        }
         if control.active_color != self.settings.app_color:
-            return {"status": "inactive_color", "strategy": strategy, "active_color": control.active_color, "app_color": self.settings.app_color, "gate": gate_summary}
+            return {
+                "status": "inactive_color",
+                "strategy": strategy,
+                "active_color": control.active_color,
+                "app_color": self.settings.app_color,
+                "gate": gate_summary,
+                "live_bucket_controls": live_bucket_controls,
+            }
         if control.kill_switch_enabled:
-            return {"status": "kill_switch_enabled", "strategy": strategy, "gate": gate_summary}
+            return {"status": "kill_switch_enabled", "strategy": strategy, "gate": gate_summary, "live_bucket_controls": live_bucket_controls}
         if not _gate_passed(gate):
-            return {"status": "gate_blocked", "strategy": strategy, "gate": gate_summary, "reason": f"{asset} 15m touch20 rules gate missing or blocked"}
+            return {
+                "status": "gate_blocked",
+                "strategy": strategy,
+                "gate": gate_summary,
+                "reason": f"{asset} 15m touch20 rules gate missing, blocked, or simulator-stale",
+                "live_bucket_controls": live_bucket_controls,
+            }
         approval_valid, approval_reason = _approval_valid(approval, gate)
         if not approval_valid:
-            return {"status": "approval_blocked", "strategy": strategy, "gate": gate_summary, "approval": approval, "reason": approval_reason}
+            return {
+                "status": "approval_blocked",
+                "strategy": strategy,
+                "gate": gate_summary,
+                "approval": approval,
+                "reason": approval_reason,
+                "live_bucket_controls": live_bucket_controls,
+            }
 
         daily_pnl = _daily_realized_pnl(ledger, now)
         daily_loss_limit = cfg.daily_loss_limit_dollars
@@ -1779,12 +2169,12 @@ class CryptoNonModelTouch20Service:
                 "strategy": strategy,
                 "daily_realized_pnl_dollars": _money_text(daily_pnl),
                 "daily_loss_limit_dollars": _money_text(daily_loss_limit),
+                "live_bucket_controls": live_bucket_controls,
             }
 
         funnel: Counter[str] = Counter()
         skipped: list[dict[str, Any]] = []
         candidates: list[dict[str, Any]] = []
-        gate_metrics = dict(getattr(gate, "metrics", None) or {})
         quote_fresh_seconds = max(1, cfg.quote_fresh_seconds)
         for snapshot in snapshots:
             funnel["market_seen"] += 1
@@ -1793,6 +2183,28 @@ class CryptoNonModelTouch20Service:
                 skipped.append({"market_ticker": snapshot.market_ticker, "reason": "stale_quote_snapshot"})
                 continue
             funnel["quote_fresh"] += 1
+            market_exposure = _market_strategy_exposure(ledger, snapshot.market_ticker)
+            if market_exposure:
+                funnel["strategy_market_overlap_blocked"] += 1
+                skipped.append(
+                    {
+                        "market_ticker": snapshot.market_ticker,
+                        "reason": "strategy_market_overlap_blocked",
+                        "strategy_exposure": market_exposure,
+                    }
+                )
+                continue
+            market_cooldown = _loss_cooldown_for_market(ledger, snapshot.market_ticker, now=now)
+            if market_cooldown:
+                funnel["strategy_market_cooldown"] += 1
+                skipped.append(
+                    {
+                        "market_ticker": snapshot.market_ticker,
+                        "reason": "strategy_market_loss_cooldown",
+                        "cooldown": market_cooldown,
+                    }
+                )
+                continue
             spot = _spot_features(
                 spot_rows,
                 decision_ts=observed_at,
@@ -1814,6 +2226,20 @@ class CryptoNonModelTouch20Service:
             if selected is None:
                 skipped.append({"market_ticker": snapshot.market_ticker, "reason": best.get("reason") or "no_live_candidate", "candidate_status": best.get("candidate_status")})
                 continue
+            bucket_key = str(selected.get("bucket_key") or "")
+            bucket_block = live_bucket_blocks.get(bucket_key)
+            if bucket_block:
+                funnel["live_bucket_blocked"] += 1
+                skipped.append(
+                    {
+                        "market_ticker": snapshot.market_ticker,
+                        "reason": "live_bucket_blocked",
+                        "bucket_key": bucket_key,
+                        "bucket_block": bucket_block,
+                    }
+                )
+                continue
+            funnel["live_bucket_pass"] += 1
             funnel["selected"] += 1
             candidates.append({"market": snapshot, "candidate": selected})
 
@@ -1843,6 +2269,7 @@ class CryptoNonModelTouch20Service:
                 "funnel": dict(funnel),
                 "skipped": skipped[:25],
                 "open_pending_notional_dollars": _money_text(open_pending_notional),
+                "live_bucket_controls": live_bucket_controls,
             }
             await self._log_cycle(result)
             return result
@@ -1854,6 +2281,7 @@ class CryptoNonModelTouch20Service:
                 "selected": _selection_summary(candidates[0]),
                 "open_pending_notional_dollars": _money_text(open_pending_notional),
                 "max_open_notional_dollars": _money_text(cap),
+                "live_bucket_controls": live_bucket_controls,
             }
             await self._log_cycle(result)
             return result
@@ -1872,6 +2300,22 @@ class CryptoNonModelTouch20Service:
                 "asset_symbol": asset,
                 "selected": _selection_summary(selected_item),
                 "remaining_cap_dollars": _money_text(remaining_cap),
+                "min_order_notional_dollars": _money_text(cfg.min_order_notional_dollars),
+                "live_bucket_controls": live_bucket_controls,
+            }
+            await self._log_cycle(result)
+            return result
+        order_notional = (entry_side_price * count_fp).quantize(Decimal("0.0001"))
+        if order_notional < cfg.min_order_notional_dollars:
+            result = {
+                "status": "min_order_notional_blocked",
+                "strategy": strategy,
+                "asset_symbol": asset,
+                "selected": _selection_summary(selected_item),
+                "order_notional_dollars": _money_text(order_notional),
+                "min_order_notional_dollars": _money_text(cfg.min_order_notional_dollars),
+                "remaining_cap_dollars": _money_text(remaining_cap),
+                "live_bucket_controls": live_bucket_controls,
             }
             await self._log_cycle(result)
             return result
@@ -1888,6 +2332,7 @@ class CryptoNonModelTouch20Service:
                 "gate": gate_summary,
                 "approval": approval,
                 "no_order_submitted": True,
+                "live_bucket_controls": live_bucket_controls,
             }
             await self._log_cycle(result)
             return result
@@ -1971,6 +2416,7 @@ class CryptoNonModelTouch20Service:
             "funnel": dict(funnel),
             "gate": gate_summary,
             "approval": approval,
+            "live_bucket_controls": live_bucket_controls,
         }
 
     async def exit_once(self, *, frequency: str = "15m", asset_symbol: str = "BTC") -> dict[str, Any]:

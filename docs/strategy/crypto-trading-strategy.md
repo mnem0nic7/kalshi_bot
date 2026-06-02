@@ -1,6 +1,6 @@
 # Crypto Trading Strategy
 
-Last updated: 2026-06-01
+Last updated: 2026-06-02
 
 This document is the operator-facing summary of the crypto trading system: what
 we trade, which strategy is active, which gates must pass before an order can go
@@ -35,7 +35,7 @@ own replay, P/L, and asset-mode gates pass.
 |---|---:|---|---|
 | `CRYPTO_15M` live-quality | Active shadow | Predict fair YES for 15-minute crypto markets and select the best fee-adjusted YES/NO buy candidate. | Per-asset live only after replay, asset-mode, risk, and execution gates pass. |
 | `CRYPTO_1H` live-quality | Active shadow | Predict fair YES for 1-hour crypto markets and select the best fee-adjusted YES/NO buy candidate. | Same per-asset live gates as `CRYPTO_15M`; ongoing collection runs in the crypto-only 1h daemon with `CRYPTO_AUTO_FREQUENCIES=1h`. |
-| `*_15m_touch20_rules` | Disabled by default except explicitly enabled lanes | Independent 15-minute, non-model Touch20 path for BTC, ETH, SOL, XRP, BNB, DOGE, and HYPE. It enters on a standalone rules score plus replay bucket evidence, exits at +20% net executable profit, and cuts at -20% net executable loss. | Requires the asset lane enabled, a passed asset-owned gate such as `btc15m_touch20_rules_gate:15m:BTC` or `eth15m_touch20_rules_gate:15m:ETH`, gate-version-matched operator approval, active color, kill switch off, fresh real quotes and spot, strategy cap room, and asset-lane `trading_enabled=true` before live order submission. |
+| `*_15m_touch20_rules` | Disabled by default except explicitly enabled lanes | Independent 15-minute, non-model Touch20 path for BTC, ETH, SOL, XRP, BNB, DOGE, and HYPE. It enters on a standalone rules score plus replay bucket evidence, exits at +20% net executable profit, and cuts at -20% net executable loss. | Requires the asset lane enabled, a passed asset-owned live-faithful gate such as `btc15m_touch20_rules_gate:15m:BTC` or `eth15m_touch20_rules_gate:15m:ETH`, gate/simulator-version-matched operator approval, active color, kill switch off, fresh real quotes and spot, live bucket controls, strategy cap room, min order notional, and asset-lane `trading_enabled=true` before live order submission. |
 | Crypto exploratory shadow | Active shadow | Collect candidate and quote evidence even when live edge is not present. | Never live eligible; evidence only. |
 | Per-asset policy promotion | Active control path | Stage asset-specific crypto policy in the active agent pack. | One asset at a time after live-path readiness passes. |
 | Crypto market making | Out of scope | Posting two-sided liquidity. | Not supported. |
@@ -180,7 +180,7 @@ passes:
 4. Deployment kill switch is off.
 5. The latest asset-owned gate artifact exists and is passed.
 6. The operator approval checkpoint exists and references that exact gate
-   version.
+   version and replay simulator version.
 7. Strategy-only realized P/L for the current UTC day is above the daily loss
    limit. Default loss limit is `$10`.
 8. At least one latest asset 15m snapshot is fresh under
@@ -193,9 +193,15 @@ passes:
 13. Candidate replay bucket is present in the gate artifact's
    `allowed_bucket_keys`.
 14. Candidate `rule_score` is at least `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE`.
-15. Strategy-owned open plus pending notional is below
+15. The candidate bucket is not blocked by strategy-owned live bucket controls.
+16. The strategy has no open or pending entry on the same Kalshi market.
+17. The market is not in the one-cycle cooldown after a strategy stop/terminal
+    loss.
+18. Strategy-owned open plus pending notional is below
    `CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS`, default `$10`.
-16. The asset lane has `trading_enabled=true`; BTC uses
+19. The sized order notional is at least
+    `CRYPTO_BTC15M_TOUCH20_MIN_ORDER_NOTIONAL_DOLLARS`, default `$5`.
+20. The asset lane has `trading_enabled=true`; BTC uses
     `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true`.
 
 If the first rules flag is true but the trading flag is false, the path can
@@ -247,6 +253,10 @@ A candidate is blocked when any of these are true:
 - time to close is below 300 seconds
 - standalone rule score is below the configured minimum
 - replay bucket is not allowed by the separate rules gate
+- replay bucket is blocked by live bucket controls
+- the same market already has a strategy open or pending entry
+- the market is in cooldown after a strategy stop/terminal loss
+- sized order notional is below the configured minimum
 - strategy cap or daily loss cap is exhausted
 
 The current entry window intentionally preserves the final 5-minute entry block:
@@ -356,13 +366,24 @@ Replay, gate, and approval are owned by `crypto-non-model-touch20`, not the
 generic `crypto-replay` command.
 
 Replay uses settled real quote-path rows only. It does not use proxy rows,
-trained model features, or trained model predictions. For each historical
-candidate row it scans future same-market quote snapshots before close:
+trained model features, or trained model predictions. The current replay
+simulator version is `live_exit_v2`. For each historical candidate row it scans
+future same-market quote snapshots before close:
 
 1. If the candidate side first touches the fee-aware +20% target, replay
    simulates a take-profit exit.
-2. If no touch occurs before close, replay simulates holding to settlement.
-3. Results are grouped into replay buckets used by live selection.
+2. If the candidate side first touches -20% net executable profit, replay
+   simulates a stop-loss exit.
+3. If profit protection arms at +10%, replay can exit on the configured floor or
+   adverse quote/spot momentum.
+4. If no executable exit occurs before close, replay terminal-closes at market
+   settlement.
+5. Results are grouped into replay buckets used by live selection.
+
+The gate passes only on live-faithful net P/L after fees. It also checks P/L per
+candidate, stop-loss rate, terminal-loss rate, hard-cap breaches, allowed bucket
+support, and bucket-level P/L. A bucket with negative replay P/L, excessive
+stop-losses, or excessive terminal losses is blocked.
 
 Each lane's gate artifact is separate from model and 1-hour Touch20 gates:
 
@@ -388,8 +409,9 @@ Non-BTC example:
 eth15m_touch20_rules_approval:<kalshi_env>:ETH:15m
 ```
 
-The approval checkpoint must reference the latest passed gate version. A new
-gate version invalidates old approval.
+The approval payload includes the passed gate version and simulator version.
+Any new gate or simulator version invalidates old approval until an operator
+approves again.
 
 Gate pass requirements:
 

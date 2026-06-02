@@ -357,6 +357,11 @@ class Settings(BaseSettings):
     crypto_btc15m_touch20_replay_max_hard_cap_breaches: int = 0
     crypto_btc15m_touch20_max_open_notional_dollars: float = 10.0
     crypto_btc15m_touch20_daily_loss_limit_dollars: float = 10.0
+    crypto_btc15m_touch20_min_order_notional_dollars: float = 5.0
+    crypto_btc15m_touch20_max_bucket_live_loss_dollars: float = 1.0
+    crypto_btc15m_touch20_max_bucket_consecutive_losses: int = 2
+    crypto_btc15m_touch20_max_replay_stop_loss_rate: float = 0.35
+    crypto_btc15m_touch20_max_replay_terminal_loss_rate: float = 0.15
     crypto_btc15m_touch20_profit_protection_threshold_pct: float = 0.10
     crypto_btc15m_touch20_profit_protection_floor_pct: float = 0.05
     crypto_btc15m_touch20_loop_interval_seconds: int = 15
