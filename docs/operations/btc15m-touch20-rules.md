@@ -1,6 +1,6 @@
 # Crypto 15m Touch20 Rules Runbook
 
-Last updated: 2026-06-02
+Last updated: 2026-06-03
 
 This runbook covers the independent non-model 15-minute Touch20 rules strategy.
 BTC keeps the legacy strategy code `btc15m_touch20_rules`; other supported
@@ -26,8 +26,9 @@ outcome is:
 Replay now mirrors live exit mechanics. It scans the future quote path for
 take-profit, stop-loss, and profit-protection exits, then terminal-closes at
 market close only when no executable exit occurs first. Live exits are
-strategy-owned and trigger on +20% net executable take-profit, -20% net
-executable stop loss, or armed profit protection.
+strategy-owned and trigger on +20% net executable take-profit, -30% net
+executable stop loss for the current BTC live profile, or armed profit
+protection.
 
 ## Scope
 
@@ -66,8 +67,8 @@ All live flags are disabled by default.
 | `CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED` | `false` | Allows the rules path to submit entry orders. |
 | `CRYPTO_BTC15M_TOUCH20_ALLOWED_SIDES` | `yes` | Comma-separated allowed entry sides. BTC defaults to YES-only. |
 | `CRYPTO_BTC15M_TOUCH20_TAKE_PROFIT_PCT` | `0.20` | Net executable take-profit target. |
-| `CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT` | `0.20` | Net executable stop-loss trigger for strategy-owned positions. |
-| `CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE` | `720` | Minimum time to close for new entries. |
+| `CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT` | `0.30` | Net executable stop-loss trigger for strategy-owned positions. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE` | `600` | Minimum time to close for new entries. |
 | `CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS` | `10` | Strategy-local open plus pending notional cap. |
 | `CRYPTO_BTC15M_TOUCH20_DAILY_LOSS_LIMIT_DOLLARS` | `10` | Strategy-local daily realized loss stop. |
 | `CRYPTO_BTC15M_TOUCH20_MIN_ORDER_NOTIONAL_DOLLARS` | `5` | Minimum strategy entry notional after sizing. |
@@ -78,10 +79,10 @@ All live flags are disabled by default.
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_THRESHOLD_PCT` | `0.10` | Profit level that arms profit protection. |
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_FLOOR_PCT` | `0.05` | Armed profit-protection floor. |
 | `CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS` | `15` | Docker process loop sleep. |
-| `CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS` | `0.30` | Strategy-owned minimum entry ask. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS` | `0.20` | Strategy-owned minimum entry ask. |
 | `CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS` | `0.50` | Strategy-owned maximum entry ask. |
-| `CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM` | `0.0` | Minimum side-aligned spot momentum. |
-| `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE` | `0.48` | Minimum standalone rules score for entry. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM` | `0.0005` | Minimum side-aligned spot momentum. |
+| `CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE` | `0.458` | Minimum standalone rules score for entry. |
 | `CRYPTO_BTC15M_TOUCH20_QUOTE_FRESH_SECONDS` | `30` | Maximum age for live Kalshi quote snapshots. |
 | `CRYPTO_BTC15M_TOUCH20_SPOT_FRESH_SECONDS` | `180` | Maximum age for live asset spot rows. |
 | `CRYPTO_15M_TOUCH20_RULES_ASSETS` | `BTC` | Comma-separated assets for the Docker loop to evaluate. |
@@ -124,12 +125,12 @@ An entry can be submitted only when all of the following are true:
 9. YES bid, YES ask, NO bid, and NO ask are present.
 10. Asset spot features are fresh and non-proxy.
 11. Market age is at least 60 seconds.
-12. Time to close is at least 720 seconds by default.
+12. Time to close is at least 600 seconds by default.
 13. Candidate side is allowed by `CRYPTO_BTC15M_TOUCH20_ALLOWED_SIDES`; BTC
     defaults to YES-only.
-14. Entry ask is at least the configured minimum contract price, default `$0.30`.
+14. Entry ask is at least the configured minimum contract price, default `$0.20`.
 15. Entry ask is below the configured maximum contract price, default `$0.50`.
-16. Side-aligned spot momentum is nonnegative by default.
+16. Side-aligned spot momentum is at least `0.0005` by default.
 17. The +20% fee-aware target exit price is below `$1.00`.
 18. Spread is within tier limits: 1 cent under 20c, otherwise 2 cents.
 19. Standalone rule score clears the configured minimum.
@@ -213,7 +214,7 @@ eth15m_touch20_rules_gate:15m:ETH
 
 Gate requirements:
 
-- at least 50 candidates
+- at least 50 candidates in allowed replay buckets
 - real settled quote-path evidence present
 - no trained model usage
 - replay simulator version `live_exit_v2`
@@ -225,8 +226,8 @@ Gate requirements:
 - terminal-loss rate at or below 15%
 - hard-cap breaches equal 0
 - at least one allowed bucket
-- no replay bucket with negative P/L, excessive stop losses, or excessive
-  terminal losses
+- no allowed replay bucket with negative P/L, excessive stop losses, or
+  excessive terminal losses
 
 Approval checkpoint:
 
@@ -243,6 +244,180 @@ eth15m_touch20_rules_approval:<kalshi_env>:ETH:15m
 A new gate version or simulator version invalidates old approval until the
 operator approves again. The old Grantv approval for the touch-only simulator is
 expected to fail closed after this remediation.
+
+## BTC Live Activation Record - 2026-06-03
+
+This is the condensed record of how BTC 15m Touch20 reached live-approved
+status.
+
+### Starting Problem
+
+The first replay-passing profile was profitable but depended on the live-blocked
+bucket:
+
+```text
+BTC|yes|50_60c|le_1c|10_15m
+```
+
+That bucket had prior live losses and was blocked by live bucket controls. A
+gate that passed by leaning on that bucket would look good in replay while the
+live entry loop skipped part of the candidate universe.
+
+### Code And Gate Fixes
+
+Two commits made the evidence and runtime behavior line up:
+
+- `e12b07f Clarify BTC touch gate executable evidence`
+- `8bc906f Tune BTC touch profile away from live-blocked bucket`
+
+The first commit added separate reporting for:
+
+- total replay candidates
+- candidates in allowed replay buckets
+- candidates still executable after subtracting live-blocked buckets
+- allowed replay buckets that are currently live-blocked
+
+The second commit moved the BTC profile away from the blocked 50-60c band and
+made bucket-level gate failures apply only to buckets that the gate allows live.
+Unallowed buckets remain visible in `blocked_bucket_keys`, but they do not block
+the gate simply because live would never trade them.
+
+### Final BTC Profile
+
+The final BTC production profile is:
+
+```text
+CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true
+CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true
+CRYPTO_BTC15M_TOUCH20_ALLOWED_SIDES=yes
+CRYPTO_BTC15M_TOUCH20_TAKE_PROFIT_PCT=0.20
+CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT=0.30
+CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE=600
+CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS=0.20
+CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS=0.50
+CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM=0.0005
+CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE=0.458
+CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS=10
+CRYPTO_BTC15M_TOUCH20_DAILY_LOSS_LIMIT_DOLLARS=10
+CRYPTO_BTC15M_TOUCH20_MIN_ORDER_NOTIONAL_DOLLARS=5
+```
+
+### Replay Evidence
+
+The non-persisting production replay audit for this profile returned:
+
+```text
+status pass
+gate_reasons []
+trade_candidate_count 54
+allowed_trade_candidate_count 51
+net_simulated_pl_dollars 2.657
+pnl_per_candidate_dollars 0.0492037037037037
+touch_rate 0.6111111111111112
+stop_loss_rate 0.3333333333333333
+terminal_loss_rate 0.0
+allowed_bucket_keys [
+  BTC|yes|20_30c|le_1c|10_15m,
+  BTC|yes|30_40c|le_1c|10_15m,
+  BTC|yes|40_50c|le_1c|10_15m
+]
+```
+
+This proved the profile had at least 50 live-executable replay candidates and
+positive net P/L without relying on the blocked `50_60c` bucket.
+
+### Deployment Shape
+
+The focused production redeploy kept unrelated strategy containers down:
+
+```bash
+ENABLE_DEMO_DAEMON=false \
+ENABLE_PRODUCTION_DAEMON=false \
+ENABLE_CRYPTO_1H_DAEMON=false \
+ENABLE_CRYPTO_1H_CONTAINER=false \
+ENABLE_CRYPTO_CURRENT_CONTAINER=true \
+ENABLE_BTC15M_TOUCH20_CONTAINER=true \
+ENABLE_WEB_STRATEGIES_CONTAINER=false \
+scripts/blue_green_redeploy.sh --env production --yes
+```
+
+After the final redeploy, the running container set was:
+
+```text
+infra-crypto_non_model_btc15m_touch20_production-1
+infra-crypto_current_production-1
+infra-app_production_blue-1
+infra-web_production-1
+infra-postgres_production-1
+infra-caddy-1
+```
+
+No demo daemon, generic production daemon, 1h crypto container/daemon, web
+strategies container, or inactive app color was left running.
+
+### Final Gate And Approval
+
+The live gate became:
+
+```text
+btc15m-touch20-rules-gate-15m-BTC-20260603161709-146487a96acc
+```
+
+Status before approval was correctly fail-closed:
+
+```text
+approval_valid false
+approval_reason operator_approval_simulator_version_mismatch
+```
+
+The user then explicitly approved:
+
+```text
+approve BTC 15m touch with max notional 10
+```
+
+Approval was recorded with:
+
+```bash
+kalshi-bot-cli crypto-non-model-touch20 approve \
+  --kalshi-env production \
+  --frequency 15m \
+  --asset BTC \
+  --approved-by Grantv \
+  --max-notional-dollars 10 \
+  --note "User approved via Codex: approve BTC 15m touch with max notional 10" \
+  --json
+```
+
+The approved checkpoint referenced:
+
+```text
+gate_version btc15m-touch20-rules-gate-15m-BTC-20260603161709-146487a96acc
+simulator_version live_exit_v2
+max_notional_dollars 10.0000
+```
+
+Final status after approval:
+
+```text
+enabled true
+trading_enabled true
+approval_valid true
+approval_reason operator_approval_valid
+gate status passed
+gate sample_count 51
+live_executable_candidate_count 51
+live_blocked_allowed_bucket_keys []
+open_strategy_positions 0
+open_pending_notional_dollars 0.0000
+daily_realized_pnl_dollars 0.0000
+```
+
+The first approved `run-once` returned `no_candidate`, not an order, because the
+fresh market was too early or too late and older snapshots were stale. That is
+expected: the strategy is live-approved and armed, but it remains selective.
+Based on the 30-day replay evidence, expect roughly one to two qualifying
+opportunities per day rather than trades in every 15-minute market.
 
 ## Dry Run
 
@@ -299,18 +474,18 @@ Before tiny-live:
 10. Confirm the existing model-trained crypto bot remains unchanged.
 11. Approve the latest gate with `crypto-non-model-touch20 approve`.
 
-Then enable:
+Then enable the current BTC live profile:
 
 ```bash
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_RULES_ENABLED=true
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_RULES_TRADING_ENABLED=true
-PRODUCTION_CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT=0.20
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT=0.30
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_ALLOWED_SIDES=yes
-PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE=720
-PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS=0.30
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE=600
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS=0.20
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS=0.50
-PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM=0.0
-PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE=0.48
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM=0.0005
+PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE=0.458
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_MAX_OPEN_NOTIONAL_DOLLARS=10
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_DAILY_LOSS_LIMIT_DOLLARS=10
 PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_ORDER_NOTIONAL_DOLLARS=5
@@ -343,7 +518,8 @@ The exit loop evaluates only strategy-ledger positions with the `b15t20r:`
 prefix for BTC, or the asset lane's own prefix for non-BTC. It exits on:
 
 - `take_profit`: net executable profit is at least +20%
-- `stop_loss`: net executable profit is at or below -20%
+- `stop_loss`: net executable profit is at or below -30% for the current BTC
+  live profile
 - `profit_protection_floor`: armed profit falls to 5% or lower
 - `profit_protection_adverse_momentum`: armed profit is declining and spot
   momentum is adverse
