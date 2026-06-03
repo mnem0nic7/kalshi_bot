@@ -60,14 +60,35 @@ def test_runtime_scripts_align_btc_touch_singleton_to_active_color() -> None:
 def test_btc_current_collector_refreshes_settled_labels() -> None:
     compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
     env_example = Path(".env.example").read_text(encoding="utf-8")
+    env_lines = set(env_example.splitlines())
 
+    assert "CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS:-0.55" in compose_text
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS=0.55" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS=0.55" in env_lines
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE=0.46" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_MIN_RULE_SCORE=0.46" in env_lines
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT=0.35" in env_lines
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE=600" in env_lines
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS=0.20" in env_lines
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM=0.0005" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT=0.35" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE=600" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS=0.20" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM=0.0005" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES" in compose_text
+    assert "crypto-non-model-touch20 replay" in compose_text
+    assert "crypto-non-model-touch20 gate" in compose_text
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES=80" in env_lines
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_DAYS=30" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES=80" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_DAYS=30" in env_lines
     assert "CRYPTO_CURRENT_15M_SETTLED_EVERY_CYCLES" in compose_text
     assert "CRYPTO_CURRENT_15M_SETTLED_DAYS" in compose_text
     assert "crypto-history collect-settled" in compose_text
     assert "--skip-candles" in compose_text
     assert "--skip-quality" in compose_text
-    assert "CRYPTO_CURRENT_15M_SETTLED_EVERY_CYCLES=20" in env_example
-    assert "CRYPTO_CURRENT_15M_SETTLED_DAYS=3" in env_example
+    assert "CRYPTO_CURRENT_15M_SETTLED_EVERY_CYCLES=20" in env_lines
+    assert "CRYPTO_CURRENT_15M_SETTLED_DAYS=3" in env_lines
 
 
 def test_sync_web_color_can_disable_strategies_site_container() -> None:

@@ -158,6 +158,9 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     replay_args = parser.parse_args(["crypto-replay", "gate", "--kalshi-env", "production", "--frequency", "15m"])
     status_args = parser.parse_args(["crypto-status", "--kalshi-env", "production"])
     autonomy_args = parser.parse_args(["crypto-autonomy", "run-once", "--kalshi-env", "production", "--frequency", "15m", "--json"])
+    touch_optimize_args = parser.parse_args(
+        ["crypto-non-model-touch20", "optimize", "--kalshi-env", "production", "--frequency", "15m", "--asset", "BTC", "--days", "30", "--top", "5", "--json"]
+    )
     policy_optimize_args = parser.parse_args(
         ["crypto-policy", "optimize", "--kalshi-env", "production", "--frequency", "15m", "--days", "30", "--assets", "BTC", "ETH", "--json"]
     )
@@ -246,6 +249,10 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert autonomy_args.command == "crypto-autonomy"
     assert autonomy_args.crypto_autonomy_command == "run-once"
     assert autonomy_args.kalshi_env == "production"
+    assert touch_optimize_args.command == "crypto-non-model-touch20"
+    assert touch_optimize_args.crypto_non_model_touch20_command == "optimize"
+    assert touch_optimize_args.asset == "BTC"
+    assert touch_optimize_args.top == 5
     assert policy_optimize_args.command == "crypto-policy"
     assert policy_optimize_args.crypto_policy_command == "optimize"
     assert policy_optimize_args.assets == ["BTC", "ETH"]
@@ -776,6 +783,36 @@ async def test_crypto_policy_optimize_command_outputs_json(capsys) -> None:
 
     assert exit_code == 0
     assert output["schema_version"] == "crypto-entry-policy-optimizer-v1"
+
+
+@pytest.mark.asyncio
+async def test_crypto_non_model_touch20_optimize_command_outputs_json(capsys) -> None:
+    class Touch20Service:
+        async def optimize(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs == {
+                "frequency": "15m",
+                "asset_symbol": "BTC",
+                "days": 30,
+                "limit": 0,
+                "top_n": 5,
+            }
+            return {"status": "no_passed_profile", "profiles": []}
+
+    args = SimpleNamespace(
+        crypto_non_model_touch20_command="optimize",
+        frequency="15m",
+        asset="BTC",
+        days=30,
+        limit=0,
+        top=5,
+    )
+    container = SimpleNamespace(crypto_non_model_touch20_service=Touch20Service())
+
+    exit_code = await cli_module._run_crypto_non_model_touch20_command(args, container)
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert output["status"] == "no_passed_profile"
 
 
 def test_crypto_live_path_stale_spot_is_advisory_not_readiness_blocker() -> None:

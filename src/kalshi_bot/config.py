@@ -348,9 +348,9 @@ class Settings(BaseSettings):
     crypto_btc15m_touch20_rules_trading_enabled: bool = False
     crypto_btc15m_touch20_allowed_sides: str = "yes"
     crypto_btc15m_touch20_take_profit_pct: float = 0.20
-    crypto_btc15m_touch20_stop_loss_pct: float = 0.20
+    crypto_btc15m_touch20_stop_loss_pct: float = 0.35
     crypto_btc15m_touch20_min_market_age_seconds: int = 60
-    crypto_btc15m_touch20_min_seconds_to_close: int = 720
+    crypto_btc15m_touch20_min_seconds_to_close: int = 600
     crypto_btc15m_touch20_replay_min_candidates: int = 50
     crypto_btc15m_touch20_replay_min_touch_rate: float = 0.25
     crypto_btc15m_touch20_replay_min_net_pnl_dollars: float = 0.0
@@ -366,10 +366,10 @@ class Settings(BaseSettings):
     crypto_btc15m_touch20_profit_protection_threshold_pct: float = 0.10
     crypto_btc15m_touch20_profit_protection_floor_pct: float = 0.05
     crypto_btc15m_touch20_loop_interval_seconds: int = 15
-    crypto_btc15m_touch20_min_contract_price_dollars: float = 0.30
-    crypto_btc15m_touch20_max_contract_price_dollars: float = 0.50
-    crypto_btc15m_touch20_min_aligned_momentum: float = 0.0
-    crypto_btc15m_touch20_min_rule_score: float = 0.48
+    crypto_btc15m_touch20_min_contract_price_dollars: float = 0.20
+    crypto_btc15m_touch20_max_contract_price_dollars: float = 0.55
+    crypto_btc15m_touch20_min_aligned_momentum: float = 0.0005
+    crypto_btc15m_touch20_min_rule_score: float = 0.46
     crypto_btc15m_touch20_quote_fresh_seconds: int = 30
     crypto_btc15m_touch20_spot_fresh_seconds: int = 180
     crypto_15m_touch20_rules_assets: str = "BTC"

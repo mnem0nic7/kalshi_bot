@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
+from functools import lru_cache
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -439,6 +440,7 @@ def _bucket_key(
     )
 
 
+@lru_cache(maxsize=512)
 def _target_exit_price_for_net_profit(entry_price: Decimal, *, target_pct: Decimal, fee_rate: Decimal) -> Decimal | None:
     count = Decimal("1.00")
     entry_fee = estimate_kalshi_taker_fee_dollars(price_dollars=entry_price, count=count, fee_rate=fee_rate)
@@ -1291,6 +1293,176 @@ def _evaluate_replay(
     }
 
 
+def _optimizer_profile_specs(settings: Settings, *, asset_symbol: str) -> list[dict[str, Any]]:
+    cfg = _asset_settings(settings, asset_symbol)
+
+    def spec(name: str, **updates: Any) -> dict[str, Any]:
+        return {"name": name, "settings_overrides": updates}
+
+    return [
+        spec("current"),
+        spec("cap_40c", crypto_btc15m_touch20_max_contract_price_dollars=0.40),
+        spec("cap_45c", crypto_btc15m_touch20_max_contract_price_dollars=0.45),
+        spec(
+            "min_25c_cap_40c",
+            crypto_btc15m_touch20_min_contract_price_dollars=0.25,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.40,
+        ),
+        spec(
+            "min_25c_cap_45c",
+            crypto_btc15m_touch20_min_contract_price_dollars=0.25,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.45,
+        ),
+        spec(
+            "min_20c_cap_40c",
+            crypto_btc15m_touch20_min_contract_price_dollars=0.20,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.40,
+        ),
+        spec(
+            "score_45_cap_40c",
+            crypto_btc15m_touch20_min_rule_score=0.45,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.40,
+        ),
+        spec(
+            "score_45_min_25c_cap_40c",
+            crypto_btc15m_touch20_min_rule_score=0.45,
+            crypto_btc15m_touch20_min_contract_price_dollars=0.25,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.40,
+        ),
+        spec(
+            "window_10m_min_25c_cap_40c",
+            crypto_btc15m_touch20_min_seconds_to_close=600,
+            crypto_btc15m_touch20_min_contract_price_dollars=0.25,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.40,
+        ),
+        spec(
+            "take_15pct_min_25c_cap_40c",
+            crypto_btc15m_touch20_take_profit_pct=0.15,
+            crypto_btc15m_touch20_min_contract_price_dollars=0.25,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.40,
+        ),
+        spec(
+            "stop_15pct_min_25c_cap_40c",
+            crypto_btc15m_touch20_stop_loss_pct=0.15,
+            crypto_btc15m_touch20_min_contract_price_dollars=0.25,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.40,
+        ),
+        spec(
+            "yes_no_min_25c_cap_40c",
+            crypto_btc15m_touch20_allowed_sides="yes,no",
+            crypto_btc15m_touch20_min_contract_price_dollars=0.25,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.40,
+        ),
+        spec(
+            "no_only_min_25c_cap_40c",
+            crypto_btc15m_touch20_allowed_sides="no",
+            crypto_btc15m_touch20_min_contract_price_dollars=0.25,
+            crypto_btc15m_touch20_max_contract_price_dollars=0.40,
+        ),
+        spec(
+            "current_rules_min_candidates_only",
+            crypto_btc15m_touch20_replay_min_candidates=min(cfg.replay_min_candidates, 15),
+        ),
+    ]
+
+
+def _profile_summary(
+    *,
+    name: str,
+    settings_overrides: dict[str, Any],
+    metrics: dict[str, Any],
+    reasons: list[str],
+    settings: Settings,
+    asset_symbol: str,
+) -> dict[str, Any]:
+    cfg = _asset_settings(settings, asset_symbol)
+    bucket_matrix = list(metrics.get("bucket_matrix") or [])
+    return {
+        "profile": name,
+        "status": "passed" if not reasons else "blocked",
+        "passed": not reasons,
+        "settings_overrides": dict(settings_overrides),
+        "requirements": _gate_requirements(settings, asset_symbol=asset_symbol),
+        "reason_count": len(reasons),
+        "gate_reasons": reasons,
+        "trade_candidate_count": int(metrics.get("trade_candidate_count") or 0),
+        "min_trade_candidates": cfg.replay_min_candidates,
+        "net_simulated_pl_dollars": float(metrics.get("net_simulated_pl_dollars") or 0.0),
+        "pnl_per_candidate_dollars": float(metrics.get("pnl_per_candidate_dollars") or 0.0),
+        "touch_rate": float(metrics.get("touch_rate") or 0.0),
+        "stop_loss_rate": float(metrics.get("stop_loss_rate") or 0.0),
+        "terminal_loss_rate": float(metrics.get("terminal_loss_rate") or 0.0),
+        "exit_reason_counts": dict(metrics.get("exit_reason_counts") or {}),
+        "allowed_bucket_keys": list(metrics.get("allowed_bucket_keys") or []),
+        "blocked_bucket_keys": list(metrics.get("blocked_bucket_keys") or []),
+        "bucket_matrix": bucket_matrix[:10],
+        "simulator_version": metrics.get("simulator_version"),
+    }
+
+
+def optimize_replay_profiles(
+    snapshots: list[CryptoMarketSnapshotRecord],
+    spot_rows: list[CryptoSpotOHLCRecord],
+    *,
+    settings: Settings,
+    asset_symbol: str = BTC15M_TOUCH20_RULES_ASSET,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
+    profiles: list[dict[str, Any]] = []
+    for profile in _optimizer_profile_specs(settings, asset_symbol=asset):
+        overrides = dict(profile.get("settings_overrides") or {})
+        profile_settings = settings.model_copy(update=overrides)
+        replay = _evaluate_replay(snapshots, spot_rows, settings=profile_settings, asset_symbol=asset)
+        metrics = dict(replay.get("metrics") or {})
+        reasons = gate_reasons(metrics, settings=profile_settings, asset_symbol=asset)
+        profiles.append(
+            _profile_summary(
+                name=str(profile.get("name") or "profile"),
+                settings_overrides=overrides,
+                metrics=metrics,
+                reasons=reasons,
+                settings=profile_settings,
+                asset_symbol=asset,
+            )
+        )
+
+    profiles.sort(key=_optimizer_profile_sort_key, reverse=True)
+    limit = max(0, int(top_n or 0))
+    shown = profiles if limit <= 0 else profiles[:limit]
+    return {
+        "status": "passed_profile_found" if any(profile.get("passed") for profile in profiles) else "no_passed_profile",
+        "asset_symbol": asset,
+        "profile_count": len(profiles),
+        "top_n": limit,
+        "best_profile": profiles[0] if profiles else None,
+        "profiles": shown,
+    }
+
+
+def _optimizer_profile_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    candidate_count = int(item.get("trade_candidate_count") or 0)
+    min_candidates = max(1, int(item.get("min_trade_candidates") or 0))
+    reason_count = int(item.get("reason_count") or 0)
+    net_pnl = float(item.get("net_simulated_pl_dollars") or 0.0)
+    pnl_per = float(item.get("pnl_per_candidate_dollars") or 0.0)
+    touch_rate = float(item.get("touch_rate") or 0.0)
+    allowed_bucket_count = len(item.get("allowed_bucket_keys") or [])
+    candidate_ratio = min(1.0, candidate_count / float(min_candidates))
+    profitable = net_pnl > 0.0 and pnl_per > 0.0
+    return (
+        bool(item.get("passed")),
+        profitable,
+        allowed_bucket_count > 0,
+        -reason_count,
+        pnl_per,
+        net_pnl,
+        touch_rate,
+        candidate_ratio,
+        candidate_count,
+    )
+
+
 def _artifact_summary(artifact: Any | None) -> dict[str, Any] | None:
     if artifact is None:
         return None
@@ -1923,6 +2095,60 @@ class CryptoNonModelTouch20Service:
                 await session.commit()
             report["version"] = artifact.version
         return report
+
+    async def optimize(
+        self,
+        *,
+        frequency: str = "15m",
+        asset_symbol: str = "BTC",
+        days: int = 30,
+        limit: int = 0,
+        top_n: int = 10,
+    ) -> dict[str, Any]:
+        freq = normalize_frequency(frequency) or "15m"
+        asset = _normalize_asset_symbol(asset_symbol)
+        if not _scope_supported(freq, asset):
+            return {"status": "unsupported_scope", "frequency": freq, "asset_symbol": asset}
+        cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            snapshots = await repo.list_crypto_settled_live_quote_path_snapshots(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                asset_symbols=[asset],
+                since=cutoff,
+                limit=limit or 200_000,
+                defer_payload=True,
+            )
+            spot_rows = await repo.list_crypto_spot_ohlc(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                provider="coinbase",
+                asset_symbols=[asset],
+                since=cutoff,
+                limit=200_000,
+                defer_payload=True,
+            )
+            await session.commit()
+        result = optimize_replay_profiles(
+            snapshots,
+            spot_rows,
+            settings=self.settings,
+            asset_symbol=asset,
+            top_n=top_n,
+        )
+        result.update(
+            {
+                "kalshi_env": self.settings.kalshi_env,
+                "frequency": freq,
+                "days": days,
+                "sample_count": len(snapshots),
+                "spot_row_count": len(spot_rows),
+                "persisted": False,
+                "simulator_version": TOUCH20_RULES_REPLAY_SIMULATOR_VERSION,
+            }
+        )
+        return result
 
     async def gate(self, *, frequency: str = "15m", asset_symbol: str = "BTC") -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"

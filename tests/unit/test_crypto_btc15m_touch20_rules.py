@@ -155,6 +155,8 @@ def test_spot_feature_index_is_asset_scoped_for_non_btc_lanes():
 
 
 def test_rules_candidate_uses_explicit_score_and_20pct_objective():
+    assert rules._asset_settings(_settings(), "BTC").max_contract_price_dollars == Decimal("0.55")
+
     candidates = rules.rules_candidates_for_snapshot(
         _snapshot(),
         settings=_settings(),
@@ -363,6 +365,7 @@ def test_future_quote_scan_detects_yes_and_no_touch():
 
 def test_take_profit_uses_net_executable_after_fees():
     settings = _settings()
+    rules._target_exit_price_for_net_profit.cache_clear()
     target_exit = rules._target_exit_price_for_net_profit(
         Decimal("0.2000"),
         target_pct=Decimal("0.20"),
@@ -385,6 +388,16 @@ def test_take_profit_uses_net_executable_after_fees():
 
     assert at_target is not None and at_target >= Decimal("0.2000")
     assert below_target is not None and below_target < Decimal("0.2000")
+    assert rules._target_exit_price_for_net_profit.cache_info().misses == 1
+    assert (
+        rules._target_exit_price_for_net_profit(
+            Decimal("0.2000"),
+            target_pct=Decimal("0.20"),
+            fee_rate=Decimal(str(settings.kalshi_taker_fee_rate)),
+        )
+        == target_exit
+    )
+    assert rules._target_exit_price_for_net_profit.cache_info().hits == 1
 
 
 def _replay_candidate(side: str = "yes", *, entry: str = "0.5000") -> dict:
@@ -442,7 +455,7 @@ def test_live_faithful_replay_terminal_closes_without_executable_exit():
 
 
 def test_live_faithful_replay_enters_only_first_eligible_row_per_market():
-    settings = _settings(crypto_btc15m_touch20_min_rule_score=0.48)
+    settings = _settings(crypto_btc15m_touch20_min_rule_score=0.48, crypto_btc15m_touch20_min_aligned_momentum=0.0)
     now = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
     first = _snapshot(observed_at=now, yes_bid_dollars=Decimal("0.2900"), yes_ask_dollars=Decimal("0.3000"))
     second = _snapshot(observed_at=now + timedelta(seconds=60), yes_bid_dollars=Decimal("0.3900"), yes_ask_dollars=Decimal("0.4000"))
@@ -453,6 +466,93 @@ def test_live_faithful_replay_enters_only_first_eligible_row_per_market():
     assert report["metrics"]["entry_replay_mode"] == "first_eligible_per_market"
     assert report["metrics"]["trade_candidate_count"] == 1
     assert report["trade_sample"][0]["decision_ts"] == now.isoformat()
+
+
+def test_optimizer_profiles_rank_passed_replay_profile():
+    settings = _settings(
+        crypto_btc15m_touch20_min_rule_score=0.45,
+        crypto_btc15m_touch20_replay_min_candidates=5,
+    )
+    start = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
+    snapshots = []
+    spot_rows = []
+    for idx in range(6):
+        decision_ts = start + timedelta(minutes=15 * idx)
+        market_ticker = f"KXBTC15M-OPT-{idx}"
+        snapshots.append(
+            _snapshot(
+                market_ticker=market_ticker,
+                event_ticker=f"KXBTC15M-OPT-E{idx}",
+                observed_at=decision_ts,
+                open_time=decision_ts - timedelta(seconds=60),
+                close_time=decision_ts + timedelta(seconds=840),
+                expected_expiration_time=decision_ts + timedelta(seconds=840),
+                yes_bid_dollars=Decimal("0.2900"),
+                yes_ask_dollars=Decimal("0.3000"),
+                no_bid_dollars=Decimal("0.6900"),
+                no_ask_dollars=Decimal("0.7100"),
+                settlement_result="yes",
+            )
+        )
+        snapshots.append(
+            _snapshot(
+                market_ticker=market_ticker,
+                event_ticker=f"KXBTC15M-OPT-E{idx}",
+                observed_at=decision_ts + timedelta(seconds=60),
+                open_time=decision_ts - timedelta(seconds=60),
+                close_time=decision_ts + timedelta(seconds=840),
+                expected_expiration_time=decision_ts + timedelta(seconds=840),
+                yes_bid_dollars=Decimal("0.4200"),
+                yes_ask_dollars=Decimal("0.4300"),
+                no_bid_dollars=Decimal("0.5600"),
+                no_ask_dollars=Decimal("0.5800"),
+                settlement_result="yes",
+            )
+        )
+        spot_rows.append(_spot_row(decision_ts - timedelta(minutes=15), Decimal("100.00") + Decimal(idx)))
+        spot_rows.append(_spot_row(decision_ts, Decimal("101.00") + Decimal(idx)))
+
+    result = rules.optimize_replay_profiles(
+        snapshots,
+        spot_rows,
+        settings=settings,
+        asset_symbol="BTC",
+        top_n=3,
+    )
+
+    assert result["status"] == "passed_profile_found"
+    assert result["profile_count"] >= 3
+    assert len(result["profiles"]) == 3
+    assert result["best_profile"]["passed"] is True
+    assert result["best_profile"]["trade_candidate_count"] >= 5
+
+
+def test_optimizer_sort_prefers_profitable_clean_near_miss_over_losing_large_sample():
+    profitable_near_miss = {
+        "passed": False,
+        "reason_count": 1,
+        "trade_candidate_count": 12,
+        "min_trade_candidates": 50,
+        "net_simulated_pl_dollars": 0.88,
+        "pnl_per_candidate_dollars": 0.0733,
+        "touch_rate": 0.667,
+        "allowed_bucket_keys": ["BTC|yes|30_40c|le_1c|10_15m"],
+    }
+    losing_large_sample = {
+        "passed": False,
+        "reason_count": 8,
+        "trade_candidate_count": 69,
+        "min_trade_candidates": 50,
+        "net_simulated_pl_dollars": -1.24,
+        "pnl_per_candidate_dollars": -0.0180,
+        "touch_rate": 0.348,
+        "allowed_bucket_keys": ["BTC|yes|30_40c|le_1c|10_15m"],
+    }
+
+    profiles = [losing_large_sample, profitable_near_miss]
+    profiles.sort(key=rules._optimizer_profile_sort_key, reverse=True)
+
+    assert profiles[0] is profitable_near_miss
 
 
 def test_profit_protection_arms_only_after_threshold_then_exits_on_floor():
@@ -473,7 +573,7 @@ def test_profit_protection_arms_only_after_threshold_then_exits_on_floor():
 
 
 def test_exit_trigger_includes_20pct_stop_loss_after_fees():
-    settings = _settings()
+    settings = _settings(crypto_btc15m_touch20_stop_loss_pct=0.20)
 
     assert rules._exit_trigger_for_profit(
         Decimal("0.2000"),
