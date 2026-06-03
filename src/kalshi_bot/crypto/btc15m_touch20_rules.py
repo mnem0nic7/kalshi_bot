@@ -1091,11 +1091,15 @@ def _gate_requirements(settings: Settings, *, asset_symbol: str = BTC15M_TOUCH20
 
 def _allowed_bucket_candidate_count(metrics: dict[str, Any], *, exclude_bucket_keys: Iterable[str] = ()) -> int:
     excluded = {str(key) for key in exclude_bucket_keys}
+    allowed_keys = {str(key) for key in (metrics.get("allowed_bucket_keys") or [])}
     count = 0
     for bucket in metrics.get("bucket_matrix") or []:
-        if not isinstance(bucket, dict) or bucket.get("allowed") is not True:
+        if not isinstance(bucket, dict):
             continue
-        if str(bucket.get("bucket_key") or "") in excluded:
+        key = str(bucket.get("bucket_key") or "")
+        if bucket.get("allowed") is not True and key not in allowed_keys:
+            continue
+        if key in excluded:
             continue
         count += int(bucket.get("sample_count") or 0)
     return count
@@ -1153,10 +1157,13 @@ def gate_reasons(metrics: dict[str, Any], *, settings: Settings, asset_symbol: s
         reasons.append(
             f"{label} replay terminal-loss rate {float(terminal_loss_rate):.1%} exceeds maximum {float(cfg.max_replay_terminal_loss_rate):.1%}."
         )
+    allowed_bucket_keys = {str(key) for key in (metrics.get("allowed_bucket_keys") or [])}
     for bucket in metrics.get("bucket_matrix") or []:
         if not isinstance(bucket, dict):
             continue
         key = str(bucket.get("bucket_key") or "unknown")
+        if bucket.get("allowed") is not True and key not in allowed_bucket_keys:
+            continue
         if _decimal(bucket.get("net_pnl") or "0") < Decimal("0"):
             reasons.append(f"{label} replay bucket {key} has negative P/L.")
         if Decimal(str(bucket.get("stop_loss_rate") or "0")) > cfg.max_replay_stop_loss_rate:

@@ -155,7 +155,7 @@ def test_spot_feature_index_is_asset_scoped_for_non_btc_lanes():
 
 
 def test_rules_candidate_uses_explicit_score_and_20pct_objective():
-    assert rules._asset_settings(_settings(), "BTC").max_contract_price_dollars == Decimal("0.55")
+    assert rules._asset_settings(_settings(), "BTC").max_contract_price_dollars == Decimal("0.50")
 
     candidates = rules.rules_candidates_for_snapshot(
         _snapshot(),
@@ -315,7 +315,15 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
                 "net_pnl": "1.0000",
                 "stop_loss_rate": 0.10,
                 "terminal_loss_rate": 0.05,
-            }
+            },
+            {
+                "bucket_key": "BTC|yes|40_50c|le_2c|10_15m",
+                "sample_count": 2,
+                "allowed": False,
+                "net_pnl": "-0.5000",
+                "stop_loss_rate": 0.50,
+                "terminal_loss_rate": 0.00,
+            },
         ],
     }
 
