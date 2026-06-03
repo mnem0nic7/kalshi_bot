@@ -298,6 +298,7 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
         "uses_trained_model": False,
         "real_quote_path_row_count": 500,
         "trade_candidate_count": 50,
+        "allowed_trade_candidate_count": 50,
         "net_simulated_pl_dollars": 1.00,
         "pnl_per_candidate_dollars": 0.02,
         "touch_rate": 0.25,
@@ -309,6 +310,8 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
         "bucket_matrix": [
             {
                 "bucket_key": "BTC|yes|20_30c|le_1c|5_10m",
+                "sample_count": 50,
+                "allowed": True,
                 "net_pnl": "1.0000",
                 "stop_loss_rate": 0.10,
                 "terminal_loss_rate": 0.05,
@@ -318,7 +321,13 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
 
     assert rules.gate_reasons(good_metrics, settings=settings) == []
     assert "artifact is missing" in rules.gate_reasons({}, settings=settings)[0]
-    assert any("candidate count" in reason for reason in rules.gate_reasons({**good_metrics, "trade_candidate_count": 49}, settings=settings))
+    assert any(
+        "candidate count" in reason
+        for reason in rules.gate_reasons(
+            {**good_metrics, "trade_candidate_count": 60, "allowed_trade_candidate_count": 49},
+            settings=settings,
+        )
+    )
     assert any("net P/L" in reason for reason in rules.gate_reasons({**good_metrics, "net_simulated_pl_dollars": -0.01}, settings=settings))
     assert any("touch rate" in reason for reason in rules.gate_reasons({**good_metrics, "touch_rate": 0.24}, settings=settings))
     assert any("hard-cap" in reason for reason in rules.gate_reasons({**good_metrics, "hard_cap_breaches": 1}, settings=settings))

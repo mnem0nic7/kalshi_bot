@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from functools import lru_cache
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -1089,6 +1089,18 @@ def _gate_requirements(settings: Settings, *, asset_symbol: str = BTC15M_TOUCH20
     }
 
 
+def _allowed_bucket_candidate_count(metrics: dict[str, Any], *, exclude_bucket_keys: Iterable[str] = ()) -> int:
+    excluded = {str(key) for key in exclude_bucket_keys}
+    count = 0
+    for bucket in metrics.get("bucket_matrix") or []:
+        if not isinstance(bucket, dict) or bucket.get("allowed") is not True:
+            continue
+        if str(bucket.get("bucket_key") or "") in excluded:
+            continue
+        count += int(bucket.get("sample_count") or 0)
+    return count
+
+
 def gate_reasons(metrics: dict[str, Any], *, settings: Settings, asset_symbol: str = BTC15M_TOUCH20_RULES_ASSET) -> list[str]:
     asset = _normalize_asset_symbol(asset_symbol)
     cfg = _asset_settings(settings, asset)
@@ -1103,7 +1115,12 @@ def gate_reasons(metrics: dict[str, Any], *, settings: Settings, asset_symbol: s
     real_quote_rows = int(metrics.get("real_quote_path_row_count") or 0)
     if not metrics.get("backtest_missing") and real_quote_rows <= 0:
         reasons.append(f"{label} replay has no settled real quote-path evidence.")
-    candidates = int(metrics.get("trade_candidate_count") or 0)
+    total_candidates = int(metrics.get("trade_candidate_count") or 0)
+    candidates = (
+        int(metrics.get("allowed_trade_candidate_count") or _allowed_bucket_candidate_count(metrics))
+        if metrics.get("bucket_matrix") is not None
+        else total_candidates
+    )
     min_candidates = cfg.replay_min_candidates
     net_pl = Decimal(str(metrics.get("net_simulated_pl_dollars") or "0"))
     min_net = cfg.replay_min_net_pnl_dollars
@@ -1117,7 +1134,7 @@ def gate_reasons(metrics: dict[str, Any], *, settings: Settings, asset_symbol: s
     terminal_loss_rate = Decimal(str(metrics.get("terminal_loss_rate") or "0"))
     simulator_version = str(metrics.get("simulator_version") or "")
     if candidates < min_candidates:
-        reasons.append(f"{label} replay candidate count {candidates} below minimum {min_candidates}.")
+        reasons.append(f"{label} allowed replay candidate count {candidates} below minimum {min_candidates}.")
     if net_pl <= min_net:
         reasons.append(f"{label} replay net P/L ${float(net_pl):.2f} does not clear required positive threshold.")
     if pnl_per < min_pnl_per:
@@ -1251,6 +1268,7 @@ def _evaluate_replay(
     exit_reason_counts = Counter(str((trade.get("simulation") or {}).get("exit_reason") or "unknown") for trade in trades)
     net = sum(values, Decimal("0"))
     trade_count = len(trades)
+    allowed_trade_candidate_count = _allowed_bucket_candidate_count({"bucket_matrix": bucket_matrix})
     metrics = {
         "objective": "touch_20pct_before_close",
         "strategy": _strategy_code(asset),
@@ -1260,6 +1278,7 @@ def _evaluate_replay(
         "real_quote_path_row_count": len(scoped_rows),
         "entry_replay_mode": "first_eligible_per_market",
         "trade_candidate_count": trade_count,
+        "allowed_trade_candidate_count": allowed_trade_candidate_count,
         "touch_count": touch_count,
         "touch_rate": float(Decimal(touch_count) / Decimal(trade_count)) if trade_count else 0.0,
         "stop_loss_count": stop_loss_count,
@@ -1386,6 +1405,9 @@ def _profile_summary(
         "reason_count": len(reasons),
         "gate_reasons": reasons,
         "trade_candidate_count": int(metrics.get("trade_candidate_count") or 0),
+        "allowed_trade_candidate_count": int(
+            metrics.get("allowed_trade_candidate_count") or _allowed_bucket_candidate_count({"bucket_matrix": bucket_matrix})
+        ),
         "min_trade_candidates": cfg.replay_min_candidates,
         "net_simulated_pl_dollars": float(metrics.get("net_simulated_pl_dollars") or 0.0),
         "pnl_per_candidate_dollars": float(metrics.get("pnl_per_candidate_dollars") or 0.0),
@@ -1441,7 +1463,7 @@ def optimize_replay_profiles(
 
 
 def _optimizer_profile_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
-    candidate_count = int(item.get("trade_candidate_count") or 0)
+    candidate_count = int(item.get("allowed_trade_candidate_count") or item.get("trade_candidate_count") or 0)
     min_candidates = max(1, int(item.get("min_trade_candidates") or 0))
     reason_count = int(item.get("reason_count") or 0)
     net_pnl = float(item.get("net_simulated_pl_dollars") or 0.0)
@@ -1467,13 +1489,33 @@ def _artifact_summary(artifact: Any | None) -> dict[str, Any] | None:
     if artifact is None:
         return None
     payload = getattr(artifact, "payload", None)
+    metrics = getattr(artifact, "metrics", None)
+    metrics = metrics if isinstance(metrics, dict) else {}
     return {
         "artifact_type": getattr(artifact, "artifact_type", None),
         "version": getattr(artifact, "version", None),
         "status": getattr(artifact, "status", None),
         "sample_count": getattr(artifact, "sample_count", None),
+        "trade_candidate_count": metrics.get("trade_candidate_count"),
+        "allowed_trade_candidate_count": metrics.get("allowed_trade_candidate_count"),
+        "allowed_bucket_keys": list(metrics.get("allowed_bucket_keys") or []),
+        "blocked_bucket_keys": list(metrics.get("blocked_bucket_keys") or []),
         "passed": payload.get("passed") if isinstance(payload, dict) else None,
         "simulator_version": payload.get("simulator_version") if isinstance(payload, dict) else None,
+    }
+
+
+def _gate_live_evidence(metrics: dict[str, Any], live_bucket_controls: dict[str, Any]) -> dict[str, Any]:
+    blocked_keys = {str(key) for key in (live_bucket_controls.get("blocked_bucket_keys") or [])}
+    allowed_keys = {str(key) for key in (metrics.get("allowed_bucket_keys") or [])}
+    live_blocked_allowed_keys = sorted(allowed_keys & blocked_keys)
+    return {
+        "trade_candidate_count": int(metrics.get("trade_candidate_count") or 0),
+        "allowed_trade_candidate_count": int(
+            metrics.get("allowed_trade_candidate_count") or _allowed_bucket_candidate_count(metrics)
+        ),
+        "live_executable_candidate_count": _allowed_bucket_candidate_count(metrics, exclude_bucket_keys=blocked_keys),
+        "live_blocked_allowed_bucket_keys": live_blocked_allowed_keys,
     }
 
 
@@ -2186,7 +2228,7 @@ class CryptoNonModelTouch20Service:
                 artifact_type=gate_artifact_type,
                 version=_version(f"btc15m-touch20-rules-gate-{freq}-{asset}", payload),
                 status="passed" if payload["passed"] else "blocked",
-                sample_count=int(metrics.get("trade_candidate_count") or 0),
+                sample_count=int(metrics.get("allowed_trade_candidate_count") or _allowed_bucket_candidate_count(metrics)),
                 metrics=metrics,
                 payload=payload,
                 kalshi_env=self.settings.kalshi_env,
@@ -2337,6 +2379,7 @@ class CryptoNonModelTouch20Service:
                 "spot_fresh_seconds": cfg.spot_fresh_seconds,
             },
             "gate": _artifact_summary(gate),
+            "gate_live_evidence": _gate_live_evidence(gate_metrics, live_bucket_controls),
             "approval": approval,
             "approval_valid": approval_valid,
             "approval_reason": approval_reason,
