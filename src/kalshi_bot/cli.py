@@ -876,6 +876,12 @@ async def _run_crypto_non_model_touch20_command(args: argparse.Namespace, contai
             include_joined_fallback=not getattr(args, "skip_joined_fallback", False),
         )
     elif args.crypto_non_model_touch20_command == "optimize":
+        profile_names = [
+            item.strip()
+            for value in (getattr(args, "profiles", None) or [])
+            for item in str(value or "").replace(";", ",").split(",")
+            if item.strip()
+        ]
         result = await container.crypto_non_model_touch20_service.optimize(
             frequency=args.frequency,
             asset_symbol=args.asset,
@@ -883,6 +889,7 @@ async def _run_crypto_non_model_touch20_command(args: argparse.Namespace, contai
             limit=args.limit,
             top_n=args.top,
             include_joined_fallback=not getattr(args, "skip_joined_fallback", False),
+            profile_names=profile_names or None,
         )
     elif args.crypto_non_model_touch20_command == "gate":
         result = await container.crypto_non_model_touch20_service.gate(
@@ -4614,6 +4621,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_non_model_touch20_optimize.add_argument("--days", type=int, default=30)
     crypto_non_model_touch20_optimize.add_argument("--limit", type=int, default=0)
     crypto_non_model_touch20_optimize.add_argument("--top", type=int, default=10)
+    crypto_non_model_touch20_optimize.add_argument("--profiles", action="append", default=None)
     crypto_non_model_touch20_optimize.add_argument("--skip-joined-fallback", action="store_true")
     crypto_non_model_touch20_optimize.add_argument("--json", action="store_true")
     crypto_non_model_touch20_approve = crypto_non_model_touch20_subparsers.add_parser("approve")

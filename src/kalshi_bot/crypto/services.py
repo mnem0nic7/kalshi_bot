@@ -1677,29 +1677,15 @@ class CryptoHistoryService:
                 )
             await session.commit()
             if propagate_settlement_labels:
-                recent_live_snapshots = await repo.list_crypto_market_snapshots(
-                    frequency=freq,
-                    kalshi_env=self.settings.kalshi_env,
-                    asset_symbols=expected_assets,
-                    since=cutoff,
-                    limit=200_000,
-                    match_frequency_duration=True,
-                )
-                live_tickers_needing_labels = {
-                    row.market_ticker
-                    for row in recent_live_snapshots
-                    if row.source_kind != "settled_backfill" and row.settlement_result is None
-                }
-                settlement_label_live_ticker_count = len(live_tickers_needing_labels)
                 settlement_labels = {
                     market.market_ticker: str(market.settlement_result or "").lower()
                     for market in settled_markets
                     if str(market.settlement_result or "").lower() in {"yes", "no"}
                     and _settled_label_matches_requested_duration(market, freq)
-                    and market.market_ticker in live_tickers_needing_labels
                 }
                 settlement_label_items = list(settlement_labels.items())
                 settlement_label_candidates = len(settlement_label_items)
+                settlement_label_live_ticker_count = settlement_label_candidates
                 label_propagation_batch_size = 250
                 for offset in range(0, len(settlement_label_items), label_propagation_batch_size):
                     batch = dict(settlement_label_items[offset : offset + label_propagation_batch_size])
@@ -1708,6 +1694,7 @@ class CryptoHistoryService:
                         kalshi_env=self.settings.kalshi_env,
                         frequency=freq,
                         observed_since=cutoff,
+                        require_quote_path=True,
                     )
                     await session.commit()
                 await session.commit()

@@ -368,6 +368,7 @@ class Settings(BaseSettings):
     crypto_btc15m_touch20_loop_interval_seconds: int = 15
     crypto_btc15m_touch20_min_contract_price_dollars: float = 0.20
     crypto_btc15m_touch20_max_contract_price_dollars: float = 0.50
+    crypto_btc15m_touch20_max_spread_dollars: float = 0.0
     crypto_btc15m_touch20_min_aligned_momentum: float = 0.0005
     crypto_btc15m_touch20_min_rule_score: float = 0.458
     crypto_btc15m_touch20_bucket_price_band_cents: int = 10
@@ -401,6 +402,7 @@ class Settings(BaseSettings):
     crypto_1h_touch20_loop_interval_seconds: int = 15
     crypto_1h_touch20_min_contract_price_dollars: float = 0.20
     crypto_1h_touch20_max_contract_price_dollars: float = 0.50
+    crypto_1h_touch20_max_spread_dollars: float = 0.10
     crypto_1h_touch20_min_aligned_momentum: float = 0.0005
     crypto_1h_touch20_min_rule_score: float = 0.458
     crypto_1h_touch20_bucket_price_band_cents: int = 10
@@ -408,6 +410,7 @@ class Settings(BaseSettings):
     crypto_1h_touch20_bucket_time_band_minutes: int = 15
     crypto_1h_touch20_quote_fresh_seconds: int = 30
     crypto_1h_touch20_spot_fresh_seconds: int = 3600
+    crypto_1h_touch20_entry_qualified_market_limit: int = 500
     crypto_1h_touch20_rules_assets: str = "BTC"
     crypto_1h_touch20_asset_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
 

@@ -268,7 +268,7 @@ def _asset_settings(
         loop_interval_seconds=_int_override(overrides, "loop_interval_seconds", int(_touch_setting(settings, freq, "loop_interval_seconds", settings.crypto_btc15m_touch20_loop_interval_seconds))),
         min_contract_price_dollars=_decimal_override(overrides, "min_contract_price_dollars", Decimal(str(_touch_setting(settings, freq, "min_contract_price_dollars", settings.crypto_btc15m_touch20_min_contract_price_dollars)))),
         max_contract_price_dollars=_decimal_override(overrides, "max_contract_price_dollars", Decimal(str(_touch_setting(settings, freq, "max_contract_price_dollars", settings.crypto_btc15m_touch20_max_contract_price_dollars)))),
-        max_spread_dollars=_decimal_override(overrides, "max_spread_dollars", Decimal("0")),
+        max_spread_dollars=_decimal_override(overrides, "max_spread_dollars", Decimal(str(_touch_setting(settings, freq, "max_spread_dollars", settings.crypto_btc15m_touch20_max_spread_dollars)))),
         min_aligned_momentum=_decimal_override(overrides, "min_aligned_momentum", Decimal(str(_touch_setting(settings, freq, "min_aligned_momentum", settings.crypto_btc15m_touch20_min_aligned_momentum)))),
         min_rule_score=_decimal_override(overrides, "min_rule_score", Decimal(str(_touch_setting(settings, freq, "min_rule_score", settings.crypto_btc15m_touch20_min_rule_score)))),
         bucket_price_band_cents=_bucket_price_band_cents(
@@ -2593,6 +2593,13 @@ def _optimizer_replay_fetch_window(
     return max(0, min_seconds_to_close), max(0, min_market_age_seconds)
 
 
+def _entry_qualified_market_limit(settings: Settings, *, frequency: str, row_limit: int) -> int:
+    if _normalize_touch_frequency(frequency) == "1h":
+        configured = max(1, int(getattr(settings, "crypto_1h_touch20_entry_qualified_market_limit", 500) or 500))
+        return max(1, min(int(row_limit), configured))
+    return max(1, min(int(row_limit), max(10_000, int(row_limit) // 20)))
+
+
 def _settings_with_optimizer_asset_overrides(
     settings: Settings,
     *,
@@ -2696,11 +2703,24 @@ def optimize_replay_profiles(
     asset_symbol: str = BTC15M_TOUCH20_RULES_ASSET,
     frequency: str = BTC15M_TOUCH20_RULES_FREQ,
     top_n: int = 10,
+    profile_names: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     asset = _normalize_asset_symbol(asset_symbol) or BTC15M_TOUCH20_RULES_ASSET
     freq = _normalize_touch_frequency(frequency)
+    requested_profiles = {
+        str(name).strip()
+        for name in (profile_names or [])
+        if str(name).strip()
+    }
     profiles: list[dict[str, Any]] = []
-    for profile in _optimizer_profile_specs(settings, asset_symbol=asset, frequency=freq):
+    profile_specs = _optimizer_profile_specs(settings, asset_symbol=asset, frequency=freq)
+    if requested_profiles:
+        profile_specs = [
+            profile
+            for profile in profile_specs
+            if str(profile.get("name") or "") in requested_profiles
+        ]
+    for profile in profile_specs:
         overrides = dict(profile.get("settings_overrides") or {})
         profile_settings = _settings_with_optimizer_asset_overrides(
             settings,
@@ -2738,6 +2758,7 @@ def optimize_replay_profiles(
         "status": _optimizer_result_status(profiles),
         "asset_symbol": asset,
         "frequency": freq,
+        "profile_filter": sorted(requested_profiles),
         "profile_count": len(profiles),
         "top_n": limit,
         "best_profile": profiles[0] if profiles else None,
@@ -2957,32 +2978,35 @@ def _loss_cooldown_for_market(
 ) -> dict[str, Any] | None:
     positions = ledger.get("positions") if isinstance(ledger.get("positions"), dict) else {}
     prefix = _order_prefix(str(ledger.get("asset_symbol") or ""), frequency=str(ledger.get("frequency") or BTC15M_TOUCH20_RULES_FREQ))
-    latest_loss: tuple[datetime, str, dict[str, Any]] | None = None
+    latest_exit: tuple[datetime, str, dict[str, Any]] | None = None
     for client_order_id, entry in positions.items():
         if not str(client_order_id).startswith(f"{prefix}:") or not isinstance(entry, dict):
             continue
         if str(entry.get("market_ticker") or "") != market_ticker:
             continue
         trigger = str(entry.get("exit_trigger") or "")
-        if "stop_loss" not in trigger and "terminal" not in trigger:
+        is_loss_exit = "stop_loss" in trigger or "terminal" in trigger
+        is_tp_exit = "take_profit" in trigger
+        if not is_loss_exit and not is_tp_exit:
             continue
-        if _decimal(entry.get("realized_pnl_dollars") or "0") >= Decimal("0"):
+        # Loss exits: only cooldown on negative P&L. TP exits: always cooldown.
+        if is_loss_exit and _decimal(entry.get("realized_pnl_dollars") or "0") >= Decimal("0"):
             continue
         closed_at = _datetime_from_any(entry.get("closed_at"))
         if closed_at is None:
             continue
-        if latest_loss is None or closed_at > latest_loss[0]:
-            latest_loss = (closed_at, str(client_order_id), entry)
-    if latest_loss is None:
+        if latest_exit is None or closed_at > latest_exit[0]:
+            latest_exit = (closed_at, str(client_order_id), entry)
+    if latest_exit is None:
         return None
-    cooldown_until = latest_loss[0] + timedelta(seconds=cooldown_seconds)
+    cooldown_until = latest_exit[0] + timedelta(seconds=cooldown_seconds)
     if now >= cooldown_until:
         return None
     return {
-        "client_order_id": latest_loss[1],
-        "exit_trigger": latest_loss[2].get("exit_trigger"),
-        "realized_pnl_dollars": latest_loss[2].get("realized_pnl_dollars"),
-        "closed_at": latest_loss[0].isoformat(),
+        "client_order_id": latest_exit[1],
+        "exit_trigger": latest_exit[2].get("exit_trigger"),
+        "realized_pnl_dollars": latest_exit[2].get("realized_pnl_dollars"),
+        "closed_at": latest_exit[0].isoformat(),
         "cooldown_until": cooldown_until.isoformat(),
     }
 
@@ -3412,7 +3436,11 @@ class CryptoNonModelTouch20Service:
             quote_path_kwargs = {
                 "entry_min_seconds_to_close": fetch_min_seconds,
                 "entry_min_market_age_seconds": fetch_min_market_age,
-                "entry_qualified_market_limit": max(1, min(row_limit, max(10_000, row_limit // 20))),
+                "entry_qualified_market_limit": _entry_qualified_market_limit(
+                    self.settings,
+                    frequency=freq,
+                    row_limit=row_limit,
+                ),
             }
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -3491,6 +3519,7 @@ class CryptoNonModelTouch20Service:
         limit: int = 0,
         top_n: int = 10,
         include_joined_fallback: bool = True,
+        profile_names: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         freq = _normalize_touch_frequency(frequency)
         asset = _normalize_asset_symbol(asset_symbol)
@@ -3508,7 +3537,11 @@ class CryptoNonModelTouch20Service:
             quote_path_kwargs = {
                 "entry_min_seconds_to_close": fetch_min_seconds,
                 "entry_min_market_age_seconds": fetch_min_market_age,
-                "entry_qualified_market_limit": max(1, min(row_limit, max(10_000, row_limit // 20))),
+                "entry_qualified_market_limit": _entry_qualified_market_limit(
+                    self.settings,
+                    frequency=freq,
+                    row_limit=row_limit,
+                ),
             }
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -3539,6 +3572,7 @@ class CryptoNonModelTouch20Service:
             asset_symbol=asset,
             frequency=freq,
             top_n=top_n,
+            profile_names=profile_names,
         )
         result.update(
             {
@@ -4279,7 +4313,8 @@ class CryptoNonModelTouch20Service:
                 entry["net_profit_pct"] = str(profit_pct)
             elif status in {"cancelled", "canceled", "expired", "unfilled_cancelled"}:
                 entry["status"] = "open"
-                entry["next_exit_retry_at"] = (now + timedelta(seconds=60)).isoformat()
+                retry_delay = 10 if "stop_loss" in trigger else 60
+                entry["next_exit_retry_at"] = (now + timedelta(seconds=retry_delay)).isoformat()
             elif status.startswith("rejected") and _terminal_close_due(entry, snapshot, now=now):
                 terminal_close_result = _mark_entry_terminal_closed(
                     entry,

@@ -1936,12 +1936,65 @@ async def test_crypto_history_collect_settled_skips_propagation_without_live_quo
 
     assert result["status"] == "ok"
     assert result["settled_markets_stored"] == 1
-    assert result["settlement_label_candidates"] == 0
-    assert result["settlement_label_live_ticker_count"] == 0
+    assert result["settlement_label_candidates"] == 1
+    assert result["settlement_label_live_ticker_count"] == 1
     assert result["settlement_labels_propagated"] == 0
     assert len(snapshots) == 1
     assert snapshots[0].source_kind == "settled_backfill"
     assert snapshots[0].settlement_result == "yes"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_live_tickers_needing_settlement_labels_is_ticker_only_and_duration_scoped(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+
+    observed_at = datetime.now(UTC) - timedelta(minutes=30)
+    open_time = observed_at - timedelta(minutes=20)
+    close_time = open_time + timedelta(hours=1)
+    daily_close_time = open_time + timedelta(days=1)
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        for market_ticker, asset_symbol, frequency, settlement_result, source_kind, close in [
+            ("KXBTC-1H-LIVE", "BTC", "1h", None, "live_quote_evidence", close_time),
+            ("KXBTC-1H-LIVE", "BTC", "1h", None, "live_quote_evidence", close_time),
+            ("KXBTC-1H-SETTLED", "BTC", "1h", "yes", "live_quote_evidence", close_time),
+            ("KXBTC-1H-BACKFILL", "BTC", "1h", "yes", "settled_backfill", close_time),
+            ("KXBTC-DAILY", "BTC", "1h", None, "live_quote_evidence", daily_close_time),
+            ("KXETH-1H-LIVE", "ETH", "1h", None, "live_quote_evidence", close_time),
+        ]:
+            await repo.record_crypto_market_snapshot(
+                kalshi_env=settings.kalshi_env,
+                series_ticker=market_ticker.rsplit("-", 1)[0],
+                market_ticker=market_ticker,
+                asset_symbol=asset_symbol,
+                frequency=frequency,
+                status="closed",
+                open_time=open_time,
+                close_time=close,
+                observed_at=observed_at,
+                settlement_result=settlement_result,
+                source_kind=source_kind,
+                payload={"large": "ignored"},
+            )
+        await session.commit()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session)
+        tickers = await repo.list_crypto_live_tickers_needing_settlement_labels(
+            frequency="1h",
+            kalshi_env=settings.kalshi_env,
+            asset_symbols=["BTC"],
+            since=observed_at - timedelta(minutes=1),
+            match_frequency_duration=True,
+        )
+        await session.commit()
+
+    assert tickers == ["KXBTC-1H-LIVE"]
     await engine.dispose()
 
 
@@ -2036,6 +2089,101 @@ def test_settled_quote_path_entry_selector_requires_strict_non_terminal_quotes()
 
 
 @pytest.mark.asyncio
+async def test_settled_quote_path_entry_window_uses_joined_fallback_postgres_sql() -> None:
+    class _Dialect:
+        name = "postgresql"
+
+    class _Bind:
+        dialect = _Dialect()
+
+    now = datetime(2026, 6, 4, 13, tzinfo=UTC)
+    row = {
+        "id": 123,
+        "kalshi_env": "production",
+        "series_ticker": "KXBTC",
+        "market_ticker": "KXBTC-1H",
+        "event_ticker": "KXBTC-1H",
+        "asset_symbol": "BTC",
+        "frequency": "1h",
+        "title": "BTC hourly",
+        "status": "active",
+        "open_time": now - timedelta(minutes=20),
+        "close_time": now + timedelta(minutes=40),
+        "expected_expiration_time": now + timedelta(minutes=40),
+        "target_price_dollars": Decimal("100000"),
+        "yes_bid_dollars": Decimal("0.3100"),
+        "yes_ask_dollars": Decimal("0.3200"),
+        "no_bid_dollars": Decimal("0.6800"),
+        "no_ask_dollars": Decimal("0.6900"),
+        "last_price_dollars": Decimal("0.3100"),
+        "volume": 10,
+        "open_interest": 20,
+        "settlement_result": "yes",
+        "observed_at": now,
+        "source_kind": "live_quote_evidence",
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    class _Result:
+        def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
+            self._rows = rows or []
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        def get_bind(self) -> _Bind:
+            return _Bind()
+
+        async def execute(self, statement, params=None) -> _Result:
+            sql = str(statement)
+            self.calls.append((sql, dict(params or {})))
+            if "labels AS" in sql:
+                return _Result([row])
+            return _Result()
+
+    fake_session = _FakeSession()
+    repo = PlatformRepository(fake_session, kalshi_env="production")  # type: ignore[arg-type]
+
+    rows = await repo.list_crypto_settled_live_quote_path_snapshots(
+        frequency="1h",
+        kalshi_env="production",
+        asset_symbols=["BTC"],
+        since=now - timedelta(days=30),
+        limit=100,
+        include_joined_fallback=True,
+        entry_min_seconds_to_close=300,
+        entry_min_market_age_seconds=60,
+        entry_qualified_market_limit=10,
+    )
+
+    query_sql, query_params = next((sql, params) for sql, params in fake_session.calls if "labels AS" in sql)
+    assert len(rows) == 1
+    assert rows[0].market_ticker == "KXBTC-1H"
+    assert rows[0].settlement_result == "yes"
+    assert "WITH entry_rows AS" in query_sql
+    assert "JOIN labels" in query_sql
+    assert "JOIN crypto_market_snapshots AS label" in query_sql
+    assert "entry.yes_bid_dollars > 0" in query_sql
+    assert "EXISTS" in query_sql
+    assert "entry_label.market_ticker = entry.market_ticker" in query_sql
+    assert "labels.settlement_result" in query_sql
+    assert "snapshot.market_ticker = entry_markets.market_ticker" in query_sql
+    assert query_params["entry_seconds"] == 300
+    assert query_params["entry_min_market_age_seconds"] == 60
+    assert query_params["entry_market_limit"] == 10
+    assert query_params["frequency"] == "1h"
+    assert query_params["symbols"] == ["BTC"]
+
+
+@pytest.mark.asyncio
 async def test_settlement_result_propagation_uses_per_ticker_postgres_updates() -> None:
     class _Dialect:
         name = "postgresql"
@@ -2081,6 +2229,21 @@ async def test_settlement_result_propagation_uses_per_ticker_postgres_updates() 
     assert update_calls[1][1]["settlement_result"] == "no"
     assert all(params["frequency"] == "1h" for _, params in update_calls)
     assert all(params["observed_since"] == observed_since for _, params in update_calls)
+
+    quote_filtered_session = _FakeSession()
+    quote_filtered_repo = PlatformRepository(quote_filtered_session, kalshi_env="production")  # type: ignore[arg-type]
+    await quote_filtered_repo.update_crypto_snapshot_settlement_results(
+        {"KXBTC-1H": "yes"},
+        kalshi_env="production",
+        frequency="1h",
+        observed_since=observed_since,
+        require_quote_path=True,
+    )
+    quote_filtered_sql = next(
+        sql for sql, _ in quote_filtered_session.calls if "UPDATE crypto_market_snapshots" in sql
+    )
+    assert "snapshot.yes_bid_dollars IS NOT NULL" in quote_filtered_sql
+    assert "snapshot.no_ask_dollars IS NOT NULL" in quote_filtered_sql
 
 
 @pytest.mark.asyncio

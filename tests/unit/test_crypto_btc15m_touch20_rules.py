@@ -963,6 +963,27 @@ def test_optimizer_profiles_rank_passed_replay_profile():
     assert result["best_profile"]["trade_candidate_count"] >= 5
 
 
+def test_optimizer_profile_filter_limits_evaluated_profiles():
+    settings = _settings()
+
+    result = rules.optimize_replay_profiles(
+        [],
+        [],
+        settings=settings,
+        asset_symbol="BTC",
+        frequency="1h",
+        profile_names=["current", "yes_no_take10_maxspread10_open_s25"],
+        top_n=5,
+    )
+
+    assert result["profile_filter"] == ["current", "yes_no_take10_maxspread10_open_s25"]
+    assert result["profile_count"] == 2
+    assert [profile["profile"] for profile in result["profiles"]] == [
+        "current",
+        "yes_no_take10_maxspread10_open_s25",
+    ]
+
+
 def test_optimizer_marks_replay_candidate_floor_relaxation_non_promotable():
     base = _settings(
         crypto_1h_touch20_replay_min_candidates=50,
@@ -1032,6 +1053,13 @@ def test_one_hour_optimizer_fetch_window_matches_loose_profile_entry_window():
 
     assert min_seconds_to_close == 300
     assert min_market_age_seconds == 60
+
+
+def test_one_hour_entry_qualified_market_limit_uses_configured_cap():
+    settings = _settings(crypto_1h_touch20_entry_qualified_market_limit=250)
+
+    assert rules._entry_qualified_market_limit(settings, frequency="1h", row_limit=50_000) == 250
+    assert rules._entry_qualified_market_limit(settings, frequency="1h", row_limit=100) == 100
 
 
 def test_one_hour_optimizer_profiles_include_coarse_time_bucket_options():
